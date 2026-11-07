@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
+from jax.typing import DTypeLike
 
 from dew._records import JSON
 from dew.nn.attention import AttentionImpl
@@ -89,10 +90,11 @@ def scan_ordered(tokens: jax.Array, scan_order: str, H_P: int, W_P: int
     return jnp.take(tokens, order, axis=1, unique_indices=True), inverse_permutation(order)
 
 
-def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
-    """2D sincos position embedding permuted into the scan order, so token i of
+def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str,
+                           dtype: DTypeLike = np.float32):
+    """2D sincos position embedding in `dtype` permuted into the scan order, so token i of
     the sequence carries the signal for the 2D position it came from."""
-    pos_embed = build_2d_sincos_pos_embed(emb_dim, H_P, W_P)
+    pos_embed = build_2d_sincos_pos_embed(emb_dim, H_P, W_P, dtype)
     order = scan_indices(scan_order, H_P, W_P)
     return pos_embed if order is None else pos_embed[order]
 
@@ -233,7 +235,8 @@ class PatchSequenceEmbed(nn.Module):
         _, H, W, _ = x.shape
         tokens, inv_idx = self.patch_embed.scanned(x, self.scan_order)
         pos_embed = scan_ordered_pos_embed(
-            self.emb_features, H // self.patch_size, W // self.patch_size, self.scan_order)
+            self.emb_features, H // self.patch_size, W // self.patch_size, self.scan_order,
+            at_least_fp32(tokens.dtype))
         tokens = tokens + jnp.asarray(pos_embed, dtype=tokens.dtype)[None, :, :]
         return tokens, inv_idx
 

@@ -1,18 +1,15 @@
 """How a JSON-lines or text file is cut into byte ranges a streamed read reads (`Files.manifest`):
 equal ranges of at least `shard_bytes`, each read from its first line start, which its reader finds
-within its own bytes, and refused where one record runs through all of them."""
+within its own bytes, each record read whole by the range it starts in."""
 
 import io
 import itertools
 import json
 
 import pytest
+from data_support import LATEST
 
-from dew.data.plan import PLAN_VERSIONS
 from dew.data.sources import Files
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def test_an_empty_file_holds_no_range_beside_one_that_holds_records(tmp_path):
@@ -39,21 +36,22 @@ def test_a_files_byte_ranges_are_equal_and_never_shorter_than_its_shard_bytes(tm
 
 
 @pytest.mark.parametrize("kind", ["jsonl", "text"])
-def test_a_record_longer_than_shard_bytes_is_refused_by_the_range_it_runs_through(tmp_path, kind):
-    """A record longer than a range runs through the whole of it, so the range starts no record and
-    a reader given only it would read nothing: its reader refuses it, naming shard_bytes and the
-    remedy, having read no more of the record than its own range's bytes."""
+def test_a_record_longer_than_shard_bytes_is_read_whole_by_the_range_it_starts_in(tmp_path, kind):
+    """A record longer than a range runs through the whole of the ranges after the one it starts in, which
+    start no record and read none, having read no more of it than their own bytes; the range it starts in
+    reads it whole, so every record is read once (row 1828: such a range was refused, and a valid long
+    record could not stream)."""
     lines = [json.dumps({"id": 0}), json.dumps({"id": 1, "pad": "x" * 5_000}), json.dumps({"id": 2})]
     (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
     stored = Files(str(tmp_path / "rows.jsonl"), format=kind, shard_bytes=1_000)
-    spanned = [shard for shard in stored.manifest(LATEST).shards
+    shards = stored.manifest(LATEST).shards
+    spanned = [shard for shard in shards
                if shard.start > len(lines[0]) + 1 and shard.stop < len(lines[0]) + len(lines[1]) + 2]
     assert spanned
-    with pytest.raises(ValueError):
-        list(stored.manifest(LATEST).reader(spanned[0]))
-    whole = Files(str(tmp_path / "rows.jsonl"), format=kind, shard_bytes=10_000)
-    rows = [row for shard in whole.manifest(LATEST).shards for row in whole.manifest(LATEST).reader(shard)]
-    assert [row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows] == [0, 1, 2]
+    read = [list(stored.manifest(LATEST).reader(shard)) for shard in shards]
+    assert all(not rows for shard, rows in zip(shards, read, strict=True) if shard in spanned)
+    ids = [row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for rows in read for row in rows]
+    assert ids == [0, 1, 2]
 
 
 def test_a_line_start_is_found_a_chunk_at_a_time_within_the_range_it_is_sought_in():

@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -170,7 +171,9 @@ def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_p
     """An interruption that reaches `start` while its group starts (in its lifeline's or its gate's Popen,
     or while its gate is released and executes the command) leaves nothing of it: its command, once it
     runs, does not outlive the start that raised, though its owner, the test, runs on, and no lifeline of
-    it nor descriptor it opened is left. Alarms a millisecond apart land across the start's steps."""
+    it nor descriptor it opened is left. Alarms a millisecond apart land across the start's steps. The
+    command writes its id whole (a write beside it renamed into place), so a command stopped as it wrote
+    leaves none to read, never a part."""
     armed = {"on": False}
 
     def interrupt(number: int, frame: object) -> None:
@@ -186,7 +189,8 @@ def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_p
             armed["on"] = True
             signal.setitimer(signal.ITIMER_REAL, 0.001 * (step + 1))
             try:
-                started = start(["sh", "-c", f"echo $$ > {recorded}; exec sleep 600"])
+                started = start(["sh", "-c", f"echo $$ > {recorded}.part && mv {recorded}.part {recorded}; "
+                                              "exec sleep 600"])
                 armed["on"] = False
             except Interrupted:
                 interrupted += 1
@@ -207,6 +211,45 @@ def test_a_start_interrupted_before_its_command_runs_leaves_nothing_behind(tmp_p
     while lifelines() > held and time.monotonic() < deadline:
         time.sleep(0.1)
     assert interrupted and not survivors
+    assert (len(os.listdir("/proc/self/fd")), lifelines()) == (descriptors, held)
+
+
+@pytest.mark.parametrize(("opened", "nth"), [("pipe2", 1), ("pipe2", 2), ("pipe2", 3), ("pipe", 1),
+                                             ("pipe", 2)])
+def test_a_start_interrupted_as_a_descriptor_opens_leaves_it_closed(opened, nth):
+    """An interruption that lands the moment one of `start`'s descriptors opens (its own pipes, `os.pipe2`,
+    or the one Popen opens to hear its child's execution, `os.pipe`), before anything holds it, closes it
+    and leaves no lifeline once `start` raises: the signal reaches the main thread, whose handler raises
+    there, as a Ctrl-C or a deadline's alarm does, while the start runs on. A millisecond's alarm reached
+    that moment rarely, leaking the pair (two trains' cleanup reds)."""
+    calls = {"seen": 0}
+    main = threading.main_thread().ident
+    assert main is not None
+
+    def interrupt(number: int, frame: object) -> None:
+        raise Interrupted
+
+    def profile(frame: object, event: str, called: object) -> None:
+        if event == "c_return" and called is getattr(os, opened):
+            calls["seen"] += 1
+            if calls["seen"] == nth:
+                signal.pthread_kill(main, signal.SIGALRM)
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    descriptors, held = len(os.listdir("/proc/self/fd")), lifelines()
+    try:
+        # On whichever thread the start opens its descriptors.
+        sys.setprofile(profile)
+        threading.setprofile(profile)
+        with pytest.raises(Interrupted):
+            try:
+                stop(start(["sleep", "600"]))
+            finally:
+                sys.setprofile(None)
+                threading.setprofile(None)
+    finally:
+        signal.signal(signal.SIGALRM, previous)
+    assert calls["seen"] >= nth
     assert (len(os.listdir("/proc/self/fd")), lifelines()) == (descriptors, held)
 
 

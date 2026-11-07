@@ -89,6 +89,20 @@ def prompts(inputs) -> dict[str, str]:
     return {name: bytes(np.asarray(inputs[name], np.uint8)).decode() for name in SAVED if name in inputs}
 
 
+_ENCODINGS: dict[int, tuple[object, object]] = {}
+"""Each conditioner's encode, compiled once (`encoded`), by the conditioner's identity, held with it."""
+
+
+def encoded(encoder, params, tokens):
+    """`encoder`'s conditions of `tokens`, its encode compiled once a conditioner, as a pipeline runs it:
+    each draw's prompts encoded by one program where its CLIP towers ran op by op, 147 s of the SDXL image
+    walk's 263 (row 4625)."""
+    held = _ENCODINGS.get(id(encoder))
+    if held is None or held[0] is not encoder:
+        held = _ENCODINGS[id(encoder)] = (encoder, jax.jit(encoder.encode))
+    return held[1](params, tokens)
+
+
 def conditions(source, texts=SAVED, extended=False):
     """The conditions of `texts`' prompt and negative, SDXL's second tower's with them where `extended`."""
     encoder = source.inputs.conditions["conditioning"].encoder
@@ -96,8 +110,8 @@ def conditions(source, texts=SAVED, extended=False):
     positive = {"text": texts["prompt"], **({"second": texts["prompt_2"]} if extended else {})}
     negative = {"text": texts["negative"], "negative": True,
                 **({"second": texts["negative_2"]} if extended else {})}
-    return ({"conditioning": encoder.encode(params, encoder.tokenize([positive]))},
-            {"conditioning": encoder.encode(params, encoder.tokenize([negative]))})
+    return ({"conditioning": encoded(encoder, params, encoder.tokenize([positive]))},
+            {"conditioning": encoded(encoder, params, encoder.tokenize([negative]))})
 
 
 def task_kind(source, meta):
@@ -187,9 +201,6 @@ def public_start(task, source, start, meta, key, given, null, process, times, by
     return task.prepare(**shared, initial=prior)
 
 
-TRAINED_SEEDS = 8
-"""Every task's declared seeds for check 1 of its trained UNet against Diffusers' (`diffusers_reads`),
-sized by `seeds_for` paired with Dew's on armada (11-06): 8 at each of the eight tasks."""
 TRAINED_TIME = 10.0
 """The timestep the trained UNet is read at."""
 
@@ -201,8 +212,8 @@ def diffusers_reads(task, source, export, model, variables, noise, given):
     writes back untrained), and its declared UNet holds Dew's trained one
     on par (check 1) over drawn noise, prompt states, pooled embedding and
     inpaint channels, of `noise`'s and `given`'s shapes, at `given`'s time
-    ids, both measured from Diffusers' own UNet run in float64."""
-    from reference_error import as_given, assert_as_exact
+    ids, both measured from Diffusers' own UNet run in float64 (`assert_export_recomputes`)."""
+    from diffusion_support import assert_export_recomputes
     from safetensors.numpy import load_file
 
     from dew.diffusion.process import DenoisingCondition
@@ -241,10 +252,9 @@ def diffusers_reads(task, source, export, model, variables, noise, given):
             sample = np.concatenate([drawn["noise"], *(drawn[name] for name in spatial)], -1)
             return predict(sample, TRAINED_TIME, drawn["context"], drawn.get("pooled"),
                            None if condition.time_ids is None else np.asarray(condition.time_ids))
-        return as_given(run)
+        return run
 
-    assert_as_exact(dew, diffusers(False), draw, f"{task} trained UNet", seeds=TRAINED_SEEDS,
-                    truth_fn=diffusers(True))
+    assert_export_recomputes(jax.jit(dew), diffusers, draw, f"{task} trained UNet")
 
 
 def train_and_reload(task, source, reference, key, given, noise):

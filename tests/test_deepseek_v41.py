@@ -306,6 +306,7 @@ def held_to_the_release(plain, variables, rows, site: str, start: int = 0):
     return recorded_site(RECORDING, site, lambda seed: {"input_ids": rows[int(seed)]}, twin)
 
 
+@pytest.mark.shared_setup("recorded_rows")
 def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source, recorded_rows):
     """Uncached, three padding slots inside each row leave each real token's sliding window counting
     its row's real tokens (`counted_places`), as a cache's slots count them, and its compressed windows
@@ -336,6 +337,7 @@ SHIFT = 8
 rate, so a query that read entries by its given place would see SHIFT // rate windows of later tokens."""
 
 
+@pytest.mark.shared_setup("recorded_rows")
 def test_shifted_positions_compute_the_unshifted_rows_logits(source, recorded_rows):
     """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
     compressed entry is visible by its window's tokens' ranks and rotates at its window's first given
@@ -356,6 +358,7 @@ def test_shifted_positions_compute_the_unshifted_rows_logits(source, recorded_ro
                     reference, draw, "shifted positions", seeds=seeds, truth_fn=truth)
 
 
+@pytest.mark.shared_setup("recorded_rows")
 def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source, recorded_rows):
     """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
     time: each compressed entry rotates at its window's first given place, which the cache carries

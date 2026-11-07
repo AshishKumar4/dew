@@ -37,11 +37,10 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.vision import tower_variables as vision_variables
+from dew.nn.vision import tower_layout, tower_variables as vision_variables
 from dew.nn.vision.gemma4 import (
     Gemma4Projector,
     Gemma4Vision,
-    export_gemma4_vision_config,
     gemma4_projector_layouts,
     gemma4_tower_layouts,
     translate_gemma4_projector_config,
@@ -271,20 +270,31 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
                 and projection.clone(parent=None, name=None, dtype=None, precision=None) == expected):
             raise ValueError("DiffusionGemma's vision_config describes a Gemma 4 tower and its projector, "
                              f"not {tower!r} with {projection!r}")
-        config["vision_config"] = export_gemma4_vision_config(tower)
+        config["vision_config"] = tower_layout("gemma4").vision_config(tower)
     return config
 
 
-def _refuse_unreadable(config: Mapping[str, object]) -> None:
-    """The published implementation, transformers' DiffusionGemmaForBlockDiffusion
-    (5.16.1), builds a routed mixture on every layer and a vision tower: a
-    config without `text_config.num_experts` or `vision_config` is one it
-    cannot build (modeling_diffusion_gemma.py:616, 1019), so files written in
-    its layout would be read by no one."""
+def publishable(model: DiffusionGemma) -> bool:
+    """Whether transformers' DiffusionGemmaForBlockDiffusion can build the config `model` publishes
+    (`_unbuildable`): a block decoder with none of what it requires exports as its run's native release
+    (`dew.interop.releases.native_plan`)."""
+    return not _unbuildable(published_config(model))
+
+
+def _unbuildable(config: Mapping[str, object]) -> list[str]:
+    """What `config` lacks of what the published implementation, transformers'
+    DiffusionGemmaForBlockDiffusion (5.16.1), builds: a routed mixture on every layer and a vision tower
+    (modeling_diffusion_gemma.py:616, 1019), so files written in its layout without them would be read by
+    no one."""
     text = config.get("text_config")
-    missing = [name for name, present in (
+    return [name for name, present in (
         ("text_config.num_experts", isinstance(text, Mapping) and text.get("num_experts")),
         ("vision_config", config.get("vision_config"))) if not present]
+
+
+def _refuse_unreadable(config: Mapping[str, object]) -> None:
+    """Refuse a config transformers' class cannot build (`_unbuildable`)."""
+    missing = _unbuildable(config)
     if missing:
         raise ValueError(
             f"this DiffusionGemma has no {' or '.join(missing)}, and transformers' "

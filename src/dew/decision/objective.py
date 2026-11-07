@@ -55,7 +55,6 @@ from dew.objectives.base import (
     joined,
     model_rngs,
 )
-from dew.objectives.routing import refuse_fixed_router
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -102,8 +101,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     each row's right option, with `label_smoothing` spread evenly over its
     options. `shuffle_options` and `none_of_the_above` augment the rows as
     `Encoding` describes, a choice of fewer than `none_of_the_above_options`
-    options drawing no "none of the above" (a yes or a no), and `data`
-    supplies their pipeline steps. The
+    options drawing no "none of the above" (by default three: a yes or a no draws none, where it would
+    change what the question asks; a run recorded before keeps its recorded floor,
+    `dew.registry.Registered.defaults`), and `data` supplies their pipeline steps. The
     training stream and the validation pass pack rows first-fit into windows
     of the layout's `max_len` tokens (`packing`), as many rows, questions and
     options as its `bounds` let a window hold, so a step pays for its tokens
@@ -144,6 +144,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Each packed row's own length, not its window's."""
         return _rows(batch, self.spans_in_context)[0]
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """Each window's width, read from its shape: the most its packed rows' lengths sum to, which a
+        window's `scored_tokens` counts. A run with a token budget or cadence bounds its committed tokens
+        by it without reading its token clock off the devices after every step, which stopped its steps
+        running ahead of the devices (row 4740)."""
+        return int(np.shape(batch["segments"])[-1])
 
     def model_flops(self, model, batch: Batch) -> float:
         """One backbone pass, its cross-attention over each row's context where rows carry one
@@ -242,7 +249,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None,
-                 none_of_the_above_options: int = 0):
+                 none_of_the_above_options: int = 3):
         held: Variables | None = None
         widths: tuple[int | None, int] | None = None
         self.image_processor = None
@@ -278,9 +285,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             variables is OMITTED and isinstance(backbone, Pretrained)) else ()
         if variables is not OMITTED:
             held = variables
-        # Its backbone's routers train by the decision loss alone (`dew.objectives.routing`), over the
-        # backbone's own tree.
-        refuse_fixed_router(module, None, None if held is None else part(held, "backbone"))
         if tokenizer is None:
             raise ValueError("a decision model lays its rows out with a tokenizer; pass tokenizer=")
         if not 0.0 <= label_smoothing < 1.0:

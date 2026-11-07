@@ -305,7 +305,7 @@ def profile():
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
-                      profile=ProfileWindow("profile", steps=2))
+                      profile=ProfileWindow("profile", steps=2, wait=True))
     trainer.fit(data, steps=5)
     # End snippet: profile
     assert any(Path("profile").rglob("*.xplane.pb"))

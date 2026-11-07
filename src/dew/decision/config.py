@@ -165,6 +165,12 @@ class DecisionRunConfig(DecoderRunConfig):
     """Whether a question row reads its options in parallel, each at positions of its own after the
     question (`QuestionLayout.parallel`), which a head that reads option slots needs. None keeps the
     layout's own."""
+    shared_state: int | None = None
+    """The most questions a row asks over one copy of their request's state, each read as its own row reads
+    it (`QuestionLayout.shared_state`). None keeps a row a question, each with its state."""
+    siblings: bool | None = None
+    """Whether a question of a row over one state also reads the questions before it in the row
+    (`QuestionLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
     unit: Unit | None = None
     """How a question row's `segments` encode their text, piece by piece or whole
     (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""
@@ -421,7 +427,8 @@ class DecisionRunConfig(DecoderRunConfig):
         if any(value is None for value in stated):
             return None
         widest = {"options": max(integer(value, "slots.options") for value in stated)}
-        fields = self.objective.fields
+        # The objective's arguments as it builds them: those the run states over those it recorded defaulted.
+        fields = {**self.objective.defaults, **self.objective.fields}
         rate = number(fields.get("none_of_the_above") or 0.0, "none_of_the_above")
         fewest = integer(fields.get("none_of_the_above_options") or 0, "none_of_the_above_options")
         return option_width(widest, rate, fewest)

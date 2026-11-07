@@ -56,6 +56,39 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
 
 
+def test_a_stack_dump_asked_over_and_over_never_kills_a_pytest_whose_threads_run(ci, tmp_path):
+    """The dump a task asks of its pytest past its deadline (executed.py's SIGUSR2) never kills it, however a
+    running thread's frames change under it: asked three thousand times over threads recursing as a test runs,
+    the run passes and its stacks are written (CPython issue 116008: faulthandler's native handler walked the
+    other threads' frames without the GIL; 2026-11-07, a group of interpreted kernels past its deadline died
+    of a segmentation fault with no report)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_busy.py": (
+        "import os, subprocess, sys, threading, time\n\n\n"
+        "def deep(n):\n    a, b, c = 1, 2, 3\n    if n:\n        deep(n - 1)\n\n\n"
+        "def test_busy():\n"
+        "    stop = threading.Event()\n\n"
+        "    def work():\n"
+        "        while not stop.is_set():\n"
+        "            deep(123)\n"
+        "    workers = [threading.Thread(target=work) for _ in range(4)]\n"
+        "    for worker in workers:\n"
+        "        worker.start()\n"
+        "    # The dump asked from outside the process, as a task's deadline asks it, over and over.\n"
+        "    asking = ('import os, signal, sys, time\\nfor _ in range(3000):\\n'\n"
+        "              '    os.kill(int(sys.argv[1]), signal.SIGUSR2)\\n    time.sleep(0.001)\\n')\n"
+        "    sender = subprocess.Popen([sys.executable, '-c', asking, str(os.getpid())])\n"
+        "    while sender.poll() is None:\n"
+        "        time.sleep(0.05)\n"
+        "    stop.set()\n"
+        "    for worker in workers:\n"
+        "        worker.join()\n")})
+    ci.task("3.12", ["tests/test_busy.py"], "", tmp_path / "rows.json", 120.0, cache="off", grace=5.0)
+    [row] = json.loads((tmp_path / "rows.json").read_text())["rows"]
+    assert row["exitCode"] == 0, row["output"][-3000:]
+    assert "(most recent call first)" in (tmp_path / "rows.json.stacks").read_text()
+
+
 def wheel(root: Path) -> Path:
     """A wheel of one empty package, a release check's requirement that uv installs from its file alone."""
     path = root / "unused-1.0-py3-none-any.whl"

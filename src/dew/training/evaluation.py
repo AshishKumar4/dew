@@ -40,6 +40,7 @@ from dew.distributed.batches import (
     with_host,
 )
 from dew.distributed.placement import MeshSpec
+from dew.nn.kernels.options import program
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
 from dew.training.cadence import Counted
 from dew.training.tracker import Tracker, write_artifact
@@ -274,7 +275,7 @@ class Evaluation:
             key: int | jax.Array, metrics: Sequence[Metric] = (),
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
-            schedule_step: int | jax.Array | None = None, loss: bool = False,
+            schedule_step: int | jax.Array | np.ndarray | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
             updates: int | jax.Array | None = None,
             scored_to: str | os.PathLike[str] | None = None) -> Evaluation:
@@ -364,7 +365,8 @@ class Evaluation:
 
     @classmethod
     def _episodes(cls, episodes: Episodes, variables: Variables, *, key: jax.Array, step: int | jax.Array,
-                  schedule_step: int | jax.Array | None, updates: int | jax.Array | None, split: str,
+                  schedule_step: int | jax.Array | np.ndarray | None, updates: int | jax.Array | None,
+                  split: str,
                   warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array] | None
                   ) -> Evaluation:
         """`run`'s evaluation of a split scored by its episodes: its metrics checked and agreed as a data
@@ -486,7 +488,7 @@ def _agree_configuration(
                 lambda: [checked(), loss, training, warm])
 
 
-def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | None,
+def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | np.ndarray | None,
            averaged: Variables | None, training: Mapping[str, jax.Array] | None = None,
            updates: int | jax.Array | None = None) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
     """Draw the event's clocks and RNG, and the identity every rank reports.
@@ -529,8 +531,15 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
 def _folded(key: jax.Array, word: int) -> jax.Array:
     """`jax.random.fold_in(key, word)`, the host integer placed beside the
     key by name rather than moved there implicitly by the fold: on the key's
-    devices, or uncommitted with an uncommitted key."""
-    return jax.random.fold_in(key, jax.device_put(np.uint32(word), key.sharding if key.committed else None))
+    devices, or uncommitted with an uncommitted key. Folded by a program of
+    Dew's (`_fold`), as every program a run runs is, so one compiled ahead
+    runs in its place (`dew.nn.kernels.options.taking`)."""
+    return _fold(key, jax.device_put(np.uint32(word), key.sharding if key.committed else None))
+
+
+@program
+def _fold(key: jax.Array, word: jax.Array) -> jax.Array:
+    return jax.random.fold_in(key, word)
 
 
 def _score_split(objective: Objective[Loss, Effects], variables: Variables, batches,

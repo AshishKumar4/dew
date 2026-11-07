@@ -16,7 +16,7 @@ import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
 from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import chunk_on, token_by_token
+from test_recurrence_chunk import chunk_on, cotangents, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -59,12 +59,9 @@ GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES fo
 def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
     """A draw's operands (`draw`), its documents' starts taken out (`restarted` puts them back: they are not
     differentiable), and cotangents of its output, in `dtype`, and its final memory, fp32, from the seed's
-    own key."""
+    own stream (`cotangents`)."""
     (operands,) = draw(dtype, seed, **shape)
-    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
-    return dataclasses.replace(operands, starts=None), (
-        jax.random.normal(keys[0], operands.value.shape).astype(dtype),
-        jax.random.normal(keys[1], operands.state.shape))
+    return dataclasses.replace(operands, starts=None), cotangents(operands, seed)
 
 
 def restarted(fn, case: str):
@@ -224,8 +221,8 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
     mma.sync's bundles, on par from float64
     with the same launches at 64 (check 1, the truth the recurrence a token at a time in float64): the output,
     final memory and every operand's gradient in bf16 (row 4770). No rule derives 128 at the scoreboard's
-    geometries, whose launches at 128 pass a GPU's resources (`template.chunks`' candidates, jsf-chunkchoice),
-    so the launches are called as the rule calls them."""
+    geometries, whose launches at 128 pass a GPU's resources (`template.chunk_of`'s step down,
+    jsf-chunkchoice), so the launches are called as the rule calls them."""
     hooks, dtype = case_hooks(case), jnp.bfloat16
     bundle = {'wgmma': bundles.INTERPRETED, 'mma.sync': bundles.of('sm80', jnp.bfloat16)}[family]
     (sample, _) = drawn(dtype, 0, **geometry(case))

@@ -1,8 +1,8 @@
 """The parts a decoder family is built from, which imports no family.
 
-The config readers (`base_config`, `translated`), the maps between Dew's
-parameter paths and a checkpoint's tensor names (`dew_path`,
-`hf_tensor_name`, `Renames`), tensors a checkpoint stores packed (`Packed`),
+The config's shared parts (`decoder_layout`, `translated`), the shared decoder's tensor
+names both ways (`DECODER_ROUTES`, `spelled`, `prediction_routes`; a family's
+own through `dew.interop.layouts`), tensors a checkpoint stores packed (`Packed`),
 the shared export writer (`decoder_tensors`, `leaf_layouts`) and the entry type
 (`DecoderFamily`). Each module in `dew.interop.families` builds its entries
 from these, `decoder_families` orders the entries, and `hf_decoders` reads
@@ -10,9 +10,11 @@ and writes checkpoints through that table: each imports only what precedes it.
 """
 
 import dataclasses
+import math
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
@@ -21,9 +23,25 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
+from dew._model_types import SANDWICH_NORMS
 from dew.batch import unboxed
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.layouts import (
+    Condition,
+    Config,
+    ConfigLayout,
+    Copy,
+    Rebased,
+    Renames,
+    Route,
+    Routes,
+    Slot,
+    Spelled,
+    Table,
+    after,
+    nested,
+    one_of,
+)
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import HostArray, WeightLayout
 from dew.interop.unread import Stored, equal, valued
@@ -70,7 +88,7 @@ def hf_activation(activation: GatedActivation) -> str:
     """The `hidden_act` a family's config names an activation by; Kimi K3's
     SiTU carries its betas in fields of its own and has no such name."""
     if isinstance(activation, Situ):
-        refuse('mlp', "SiTU is named only by Kimi K3's own config fields")
+        refuse_export('mlp', "SiTU is named only by Kimi K3's own config fields")
     return _HF_ACTIVATIONS[activation]
 
 
@@ -108,7 +126,7 @@ def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new')
     by, its tanh GELU spelled `tanh`; any other `mlp` is refused."""
     if isinstance(mlp, str) and mlp in {ours for ours, _, _ in _UNGATED}:
         return tanh if mlp == 'gelu' else _HF_ACTIVATIONS[mlp]
-    return refuse('mlp', f'{family} writes only an ungated GELU or ReLU')
+    return refuse_export('mlp', f'{family} writes only an ungated GELU or ReLU')
 
 
 GEMMA3_MODEL_TYPE = 'gemma3_text'
@@ -212,6 +230,15 @@ def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
             - {key for key in hf_config if str(key).startswith('_')})
 
 
+def context_lengths(hf_config: Mapping[str, object], default: int | None = None) -> tuple[int, int | None]:
+    """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
+    `DEFAULT_MAX_SEQ_LEN`, and the context (`max_position_embeddings`, its `context_length`): the
+    stated one, else `default`, the source config class's own, None where neither is."""
+    stated = hf_config.get('max_position_embeddings', default)
+    context = None if stated is None else _records.integer(stated, 'max_position_embeddings')
+    return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
+
+
 def refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
@@ -256,15 +283,26 @@ def refuse_encoder_fields(text: Mapping[str, object]) -> None:
                     "the decoder has no cross attention, no encoder to tie against and no pruned heads")
 
 
+class ExportRefused(ValueError):
+    """A model its family's layout cannot write: a field its config has no spelling for, a computation its
+    reference does not run (`refuse_export`), a config that reads back as another model
+    (`hf_decoders.refuse_lossy_export`). `dew.interop.layouts.source_layout` reports it as `Unwritable`."""
+
+
+def refuse_export(field: str, detail: str) -> NoReturn:
+    """Refuse to write a model's `field` in its family's layout, saying why (`detail`)."""
+    raise ExportRefused(f"{field}: {detail}")
+
+
 def fixed_fields(model: CausalTransformer, fixed: Mapping[str, object], message: str) -> None:
-    """Refuse `model` wherever it disagrees with a value its family fixes.
+    """Refuse to write `model` wherever it disagrees with a value its family fixes.
 
     `message` is formatted with the expected value, so each family's refusal
     names itself and what it computes.
     """
     for name, expected in fixed.items():
         if getattr(model, name) != expected:
-            refuse(name, message.format(expected))
+            refuse_export(name, message.format(expected))
 
 
 type Llama3Ramp = NativeFields[RopeScaling]
@@ -333,8 +371,8 @@ def folder_name(folder: str, name: str) -> str:
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
-    """Return the kind records of a translated config, which `base_config` always
-    sets, for a family that adds its own to them."""
+    """Return the kind records of a translated config, which the shared decoder's layer kinds always
+    set (`decoder_layout`), for a family that adds its own to them."""
     kinds = config.get('kinds')
     if kinds is None:
         refuse('kinds', 'the shared decoder fields carry one record per named kind')
@@ -467,8 +505,8 @@ def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None,
     `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
     `rotary_emb_base` and `rotary_pct`), else the config class's defaults: its `spelling`'s base, as
     `rope_records` reads it, and `default_factor`. A None default is a class that has none, whose
-    config states the value or is refused. The rest is the entry without its factor, which a family
-    whose rotary may scale hands `base_config`'s rope reader."""
+    config states the value or is refused. The rest is the entry without its factor, which
+    `plain_partial_rope` holds to the plain rotary."""
     entry = _records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
 
     def stated(key: str, field: str, default: float | None) -> float:
@@ -483,11 +521,13 @@ def partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None,
 
 def plain_partial_rope(hf_config: Mapping[str, object], spelling: RopeSpelling | None, *,
                        default_factor: float | None, reference: str,
-                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
-    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`), with
-    `layout` the entry's fields that place the rotated pairs. A scaled type or any other field
-    refuses, naming `reference`'s rotary."""
-    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor)
+                       layout: tuple[str, ...] = (), factor_field: str = 'partial_rotary_factor',
+                       theta_field: str = 'rope_theta') -> tuple[float, float]:
+    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain (`partial_rope`, its flat
+    fields `factor_field` and `theta_field`), with `layout` the entry's fields that place the rotated
+    pairs. A scaled type or any other field refuses, naming `reference`'s rotary."""
+    theta, factor, rest = partial_rope(hf_config, spelling, default_factor=default_factor,
+                                       factor_field=factor_field, theta_field=theta_field)
     rope_type = rest.get('rope_type', rest.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
@@ -771,148 +811,6 @@ def yarn_record(entry: Mapping[str, object], field: str, max_pos: int | None) ->
     )
 
 
-def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
-    """Return one feed-forward width, or Gemma 3n's list of one per layer.
-
-    configuration_gemma3n.py expands an int to a list, so a config it wrote
-    carries the list. A list of one repeated value is that value.
-    """
-    stated = hf_config['intermediate_size']
-    if isinstance(stated, (list, tuple)):
-        widths = _records.integers(stated, 'intermediate_size')
-        return widths[0] if len(set(widths)) == 1 else widths
-    return _records.integer(stated, 'intermediate_size')
-
-
-_OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias',
-                              'mlp_bias'})
-"""Fields `base_config` reads for a family whose reference reads them, and
-accepts unread at a value that computes nothing. rope_local_base_freq is
-read by the families whose class reads it, through their `RopeSpelling`."""
-
-
-def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
-    """Whether the config's `field` computes what leaving it out computes."""
-    value = hf_config[field]
-    if field == 'layer_types' and isinstance(value, (list, tuple)):
-        return all(layer == 'full_attention' for layer in value)
-    return value is None or value is False
-
-
-def context_lengths(hf_config: Mapping[str, object], default: int | None = None) -> tuple[int, int | None]:
-    """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
-    `DEFAULT_MAX_SEQ_LEN`, and the context (`max_position_embeddings`, its `context_length`): the
-    stated one, else `default`, the source config class's own, None where neither is."""
-    stated = hf_config.get('max_position_embeddings', default)
-    context = None if stated is None else _records.integer(stated, 'max_position_embeddings')
-    return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
-
-
-def base_config(hf_config: Mapping[str, object], used: set[str], *,
-                 rope: Ropes | RopeSpelling,
-                 layer_types: tuple[str, ...] | None = None,
-                 qk_norm: bool = False, scale_after_cast: bool = True,
-                 tie_embeddings: bool = False,
-                 reads: frozenset[str] = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
-                 ) -> DecoderFields:
-    """Read the projection geometry and decoder fields every family shares.
-
-    A ramp both kinds share is the model's; a ramp the full layers alone
-    carry (OLMo 3's spelling) lands on the full kind, because a kind's None
-    rides the model's value and cannot turn a ramp off.
-
-    `reads` names the `_OPTIONAL_FIELDS` the family's reference reads.
-    LlamaConfig, for one, declares neither layer_types nor sliding_window,
-    and LlamaAttention attends every key, so a Llama config that states a
-    window is refused rather than read as one transformers never applies.
-    An unread field at the value it would compute anyway (a null window,
-    attention_bias false, every layer full) is accepted.
-    """
-    for unread in _OPTIONAL_FIELDS - reads:
-        if unread in hf_config and _neutral(hf_config, unread):
-            used.add(unread)
-    hidden = _records.integer(hf_config['hidden_size'], 'hidden_size')
-    heads = _records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
-    kv_heads = hf_config.get('num_key_value_heads')
-    head_dim = _records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
-    used.update(('hidden_size', 'num_attention_heads', 'num_key_value_heads', 'head_dim'))
-
-    activation = _records.text(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
-                      'hidden_act/hidden_activation')
-    used.update(('hidden_act', 'hidden_activation'))
-    mapped = ACTIVATIONS.get(activation)
-    if mapped is None:
-        refuse(f"hidden_act {activation!r}",
-                f"the gated MLP supports {sorted(ACTIVATIONS)}")
-
-    ropes = read_rope(hf_config, used, rope) if isinstance(rope, RopeSpelling) else rope
-    rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
-    if 'layer_types' in reads:
-        layer_types = specified_layer_types(hf_config, used, layer_types)
-    elif layer_types is None:
-        layer_types = ("full_attention",) * _records.integer(
-            hf_config["num_hidden_layers"], "num_hidden_layers"
-        )
-    stated_window = hf_config.get('sliding_window') if 'sliding_window' in reads else None
-    if 'sliding_window' in reads:
-        used.add('sliding_window')
-    if 'sliding_attention' in layer_types and stated_window is None:
-        refuse("layer_types with sliding attention",
-                "sliding_window is not set, so the window has no size")
-    sliding_window = (_records.integer(stated_window, 'sliding_window')
-                      if 'sliding_attention' in layer_types else None)
-
-    kinds = decoder_kinds(layer_types, sliding_window, rope_local_theta, None, None)
-    capacity, context = context_lengths(hf_config)
-    config: DecoderFields = native_fields(CausalTransformer)(
-        vocab_size=_records.integer(hf_config['vocab_size'], 'vocab_size'),
-        emb_features=hidden,
-        num_layers=_records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
-        num_heads=heads,
-        num_kv_heads=heads if kv_heads is None else _records.integer(kv_heads, 'num_key_value_heads'),
-        head_dim=head_dim,
-        mlp=mapped,
-        mlp_features=_mlp_features(hf_config),
-        max_seq_len=capacity,
-        context_length=context,
-        rope_theta=rope_theta,
-        layer_types=layer_types,
-        kinds={},
-        norm_eps=_records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
-        # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
-        # into the activations after casting them (modeling_qwen3.py:61-64,
-        # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
-        # norms scale in fp32 and cast the product (modeling_gemma3.py:147-150,
-        # modeling_gemma4.py:197-215, modeling_qwen3_5.py:732-737).
-        scale_after_cast=scale_after_cast,
-        qk_norm=qk_norm,
-        attention_bias='attention_bias' in reads and config_flag(hf_config, 'attention_bias', default=False),
-        mlp_bias='mlp_bias' in reads and config_flag(hf_config, 'mlp_bias', default=False),
-        # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
-        # others do not, so a config that omits the field (gemma-3-1b-pt
-        # does) takes its family's default.
-        tie_embeddings=config_flag(hf_config, 'tie_word_embeddings', default=tie_embeddings),
-    )
-    config['kinds'] = kinds
-    used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
-                 'rms_norm_eps', 'tie_word_embeddings'))
-    used.update(reads & {'attention_bias', 'mlp_bias'})
-
-    # A ramp both kinds share is the model's. Where the kinds' ramps differ, each lands on its own
-    # kind: a kind inherits the model's ramp, so a model-level one beside a kind's own would give
-    # that kind two (transformers dispatches each kind's record on its own).
-    apart = ropes.scaling is not None and (ropes.full_only or ropes.local_scaling is not None)
-    if ropes.scaling is not None:
-        if apart and 'sliding_attention' in layer_types:
-            full = kinds.setdefault('full_attention', native_fields(LayerKind)())
-            full['rope_scaling'] = ropes.scaling
-        else:
-            config['rope_scaling'] = ropes.scaling
-    if ropes.local_scaling is not None:
-        kinds['sliding_attention']['rope_scaling'] = ropes.local_scaling
-    return config
-
-
 def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     """A ramp read from one layer type's record of nested rope_parameters, as transformers 5.16.1
     computes it: its YaRN truncation is the config's top-level `rope_parameters.get("truncate", True)`
@@ -921,9 +819,6 @@ def nested_ramp(ramp: Ramp | None) -> Ramp | None:
     if ramp is None or ramp['rope_type'] != 'yarn':
         return ramp
     return native_fields(YarnScaling)(**{**ramp, 'truncate': True})
-
-
-
 
 
 def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
@@ -970,6 +865,10 @@ def translate_family_config(hf_config: Mapping[str, object],
                 refuse(f"{alias}={value!r} beside {canonical}={spelled[canonical]!r}", "they name one field")
             spelled[canonical] = value
             used.add(alias)
+    for legacy, canonical in (family.legacy if own else {}).items():
+        if legacy in spelled:
+            spelled[canonical] = spelled.pop(legacy)
+            used.add(legacy)
     for repeat, canonical in (family.repeated if own else {}).items():
         if repeat in spelled:
             # A rope field transformers 5 writes into rope_parameters is stated there.
@@ -1169,26 +1068,8 @@ def _norm_names(sandwich: bool) -> dict[str, str]:
     return SANDWICH_NORMS if sandwich else _PRE_NORMS
 
 
-def dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Map one HF tensor name to its path in a CausalTransformer's variables.
-
-    The first name is the collection: `params` for a weight, `moe` for
-    DeepSeek's balancing bias. That bias is router state a training step
-    moves, not a parameter, so it lands where `Router` keeps it. None means
-    the tensor is the tied lm_head copy. Prediction layers use their own
-    family path rather than being discarded. An unexplained tensor name
-    raises before any checkpoint is accepted.
-    """
-    parts = hf_name.split('.')
-    if (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
-            and parts[3:5] == ['mlp', 'gate'] and parts[5] in _MOE_STATE):
-        return ('moe', f'layers_{parts[2]}', 'mlp', 'gate', parts[5])
-    path = _param_path(parts, config)
-    return None if path is None else ('params', *path)
-
-
 # The decoder's tensors outside its layers, read one way on load and the
-# other on export.
+# other on export (`TRUNK_ROUTES`).
 _TRUNK: Mapping[str, tuple[str, ...]] = {
     'model.norm.weight': ('norm', 'scale'), 'model.norm.bias': ('norm', 'bias'),
     'model.embed_tokens.weight': ('embed_tokens', 'embedding'),
@@ -1199,7 +1080,6 @@ _TRUNK: Mapping[str, tuple[str, ...]] = {
     'model.per_layer_model_projection.weight': ('per_layer_model_projection', 'kernel'),
     'model.per_layer_projection_norm.weight': ('per_layer_projection_norm', 'scale'),
 }
-_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
 
 
 def dense_modules(layers: int) -> tuple[str, ...]:
@@ -1215,12 +1095,6 @@ def dense_modules(layers: int) -> tuple[str, ...]:
 # norm is a scale. The values norm carries no weight, so it maps nothing.
 _PER_LAYER_INPUTS = {'per_layer_input_gate': 'kernel', 'per_layer_projection': 'kernel',
                      'post_per_layer_input_norm': 'scale'}
-
-
-type Renames = tuple[tuple[str, str], ...]
-"""A family's own names onto the ones `dew_path` reads, as (source, shared)
-pairs of dotted fragments: a load respells left to right, an export right to
-left, so one table holds both directions."""
 
 
 MOE_NAMES: Renames = (('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w2', 'down_proj'),
@@ -1241,103 +1115,48 @@ MEGATRON_NAMES: Renames = (
 """Megatron's trunk, attention output and MLP, as BLOOM and Falcon keep them."""
 
 
-def renamed(name: str, renames: Renames, *, export: bool = False) -> str:
-    """Respell `name` through `renames` in one pass over its dotted parts.
-
-    At each part the first pair whose fragment starts there replaces it and
-    the pass moves past it, so a respelled part is never read again and the
-    reverse pass undoes the forward one.
-    """
-    pairs = [(old.split('.'), new) for old, new in
-             ((shared, source) if export else (source, shared) for source, shared in renames)]
-    parts, spelled, index = name.split('.'), [], 0
-    while index < len(parts):
-        for old, new in pairs:
-            if parts[index:index + len(old)] == old:
-                spelled.append(new)
-                index += len(old)
-                break
-        else:
-            spelled.append(parts[index])
-            index += 1
-    return '.'.join(spelled)
+def own_routes(leaves: Leaves, *, layer: bool = True, when: Condition | None = None) -> tuple[Route, ...]:
+    """A family's own tensors (`leaves`, by their names past `model.layers.N.` where `layer`, else whole)
+    as routes onto their paths under `params`, a layer's in its own (`layers_N`)."""
+    if not layer:
+        return tuple(Route(name, 'params/' + '/'.join(path), when=when) for name, path in leaves.items())
+    return tuple(in_layer(name, '/'.join(path), when=when) for name, path in leaves.items())
 
 
-def renamed_path(renames: Renames, name: str, config: Mapping[str, object], *, leaves: Leaves | None = None,
-                 layer_leaves: Leaves | None = None) -> tuple[str, ...] | None:
-    """`dew_path` of a family whose names differ from the shared ones by
-    `renames`, and that holds tensors the shared map has no place for:
-    `leaves` by their whole name, `layer_leaves` by their name below
-    `model.layers.N.`, each spelled after the renames and placed under
-    `params`, a layer's in its own."""
-    spelled = renamed(name, renames)
-    if leaves is not None and spelled in leaves:
-        return ('params', *leaves[spelled])
-    parts = spelled.split('.', 3)
-    if (layer_leaves is not None and len(parts) == 4 and parts[:2] == ['model', 'layers']
-            and parts[2].isdigit() and parts[3] in layer_leaves):
-        return ('params', f'layers_{parts[2]}', *layer_leaves[parts[3]])
-    return dew_path(spelled, config)
+def spelled(renames: Renames, *, leaves: Leaves | None = None, layer_leaves: Leaves | None = None,
+            routes: Routes | None = None) -> Routes:
+    """The routes of a family whose names differ from the shared ones by `renames` and that holds
+    tensors the shared table has no place for: `leaves` by their whole name, `layer_leaves` by their name
+    below `model.layers.N.`, each spelled after the renames; any other through `routes` (the shared
+    decoder's, `DECODER_ROUTES`, by default)."""
+    return Spelled(renames, Table(*own_routes(leaves or {}, layer=False), *own_routes(layer_leaves or {}),
+                                  DECODER_ROUTES if routes is None else routes))
 
 
-def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object], *,
-                 leaves: Leaves | None = None, layer_leaves: Leaves | None = None,
-                 sandwich_norms: bool = False) -> str | None:
-    """`renamed_path` backwards: the source name of the leaf `dew_name` (its path past the
-    collection, dotted), a `leaves` or `layer_leaves` one's by its table, any other's
-    `hf_tensor_name`, respelled in the family's own names."""
-    path = tuple(dew_name.split('.'))
-    name = next((spelled for spelled, leaf in (leaves or {}).items() if leaf == path), None)
-    layer = path[0].removeprefix('layers_')
-    if name is None and layer_leaves is not None and layer != path[0] and layer.isdigit():
-        tail = next((spelled for spelled, leaf in layer_leaves.items() if leaf == path[1:]), None)
-        name = None if tail is None else f'model.layers.{layer}.{tail}'
-    if name is None:
-        name = hf_tensor_name(dew_name, config, sandwich_norms=sandwich_norms)
-    return None if name is None else renamed(name, renames, export=True)
+def declared_depths(field: str = 'num_nextn_predict_layers') -> Condition:
+    """A route's `depth` slot held to one of the depths the record declares in `field`, a model building
+    no others."""
+    def declared(config: Config, slots: Mapping[str, str]) -> bool:
+        return int(slots.get('depth', '0')) < _records.integer(config.get(field) or 0, field)
+    return declared
 
 
-type BlockPath = Callable[[str], tuple[str, ...] | None]
-"""A family's path for one block tensor, named as its trunk's layer 0's."""
-
-
-def _declared_depth(name: str, index: int | str | None, declared: int) -> int:
-    """`index`, a depth's number or its digits, refused unless it is one of the `declared` depths."""
-    depth = int(index) if isinstance(index, str) and index.isdigit() else index
-    if not isinstance(depth, int) or not 0 <= depth < declared:
-        raise ValueError(f"{name} names an undeclared prediction depth")
-    return depth
-
-
-def prediction_path(name: str, prefix: str, index: int | str | None, declared: int, tail: str,
-                    leaves: Mapping[str, tuple[str, ...]], block: BlockPath) -> tuple[str, ...] | None:
-    """The path of `name`, a tensor of prediction depth (or drafting stage)
-    `index` under the variables' `{prefix}_{index}`: its own leaf in
-    `leaves` by its `tail`, or its block's, which `block` places as the
-    trunk's layer 0's and this rebases. An index past the `declared` count
-    names no depth the model builds, and is refused by name; the families
-    keep their own spellings and architectures."""
-    depth = _declared_depth(name, index, declared)
-    if tail in leaves:
-        return ('params', f'{prefix}_{depth}', *leaves[tail])
-    path = block(tail)
-    return None if path is None else (path[0], f'{prefix}_{depth}', 'block', *path[2:])
-
-
-def prediction_name(dew_name: str, prefix: str, leaves: Mapping[str, tuple[str, ...]],
-                    block: Callable[[tuple[str, ...]], str | None]) -> tuple[int, str | None]:
-    """`prediction_path` backwards: the depth of `dew_name`, a leaf of prediction depth (or drafting
-    stage) `{prefix}_{d}` by its dotted path, and its tensor's name past its depth's stem, which the
-    family composes: its own leaf's in `leaves`, or its block's, which `block` names from the leaf's
-    path inside the block as the trunk's layer 0's (None for a leaf its release stores none of)."""
-    first, *rest = dew_name.split('.')
-    depth = int(first.removeprefix(f'{prefix}_'))
-    own = {path: name for name, path in leaves.items()}.get(tuple(rest))
-    if own is not None:
-        return depth, own
-    if not rest or rest[0] != 'block':
-        raise ValueError(f"{dew_name!r} is no parameter of a {prefix} depth")
-    return depth, block(tuple(rest[1:]))
+def prediction_routes(stored: str, prefix: str, own: Leaves, block: Routes, *,
+                      block_stored: str | None = None, slots: Mapping[str, Slot] | None = None,
+                      when: Condition | None = None,
+                      base: str = 'model.layers.0.') -> Table:
+    """A prediction depth's (or drafting stage's) tensors, its leaves under the variables'
+    `{prefix}_{depth}`: its own (`own`, by their names past `stored`, a template holding its `depth`,
+    `model.layers.{depth}.`, or none for a single one, `mtp.`), and its block's under `block_stored`
+    (`stored` where None), which `block` names as the trunk's layer 0's (`base`, `Rebased`); held where
+    `when` holds (`declared_depths`)."""
+    held = MappingProxyType(dict(slots or {}))
+    under = stored if block_stored is None else block_stored
+    depth = '{depth}' if '{depth}' in under else '0'
+    return Table(
+        *(Route(stored + name, f'params/{prefix}_{depth}/' + '/'.join(path), held, when)
+          for name, path in own.items()),
+        Rebased(under, f'{prefix}_{depth}/block', block, held, when, base=base))
 
 
 PREDICTION_INPUTS: Mapping[str, tuple[str, ...]] = {
@@ -1348,29 +1167,47 @@ tensor names DeepSeek-V3 and Nemotron-H's releases share."""
 PREDICTION_LEAVES: Mapping[str, tuple[str, ...]] = {
     **PREDICTION_INPUTS, 'shared_head.norm.weight': ('final_norm', 'scale')}
 """A DeepSeek-V3 prediction depth's own leaves, by its tensor names after
-`model.layers.{num_layers + d}.` (`layer_depth_path`)."""
+`model.layers.{num_layers + d}.` (`layer_depth_routes`)."""
 PREDICTION_STEP_END: Mapping[str, tuple[str, ...]] = {'final_layernorm.weight': ('final_norm', 'scale')}
 """A prediction depth's output norm where its release names it `final_layernorm` (Nemotron-H's last
 block of a step, HY-3's depth), the leaf DeepSeek-V3's `shared_head.norm` fills."""
 
 
-def prediction_copy_path(tail: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The trunk leaf a prediction depth's copy of the trunk's table or head fills, by its name `tail`
-    past `model.layers.{num_layers + d}.` (`embed_tokens.weight`, `shared_head.head.weight`), which
-    `translate_weights` checks against the trunk's: a tied trunk keeps the head in the embedding, which
-    stores the same [vocab, features] the copy does, an untied one the head's own kernel; None for any
-    other name."""
-    if tail == 'embed_tokens.weight':
-        return ('params', 'embed_tokens', 'embedding')
-    if tail == 'shared_head.head.weight':
-        return (('params', 'embed_tokens', 'embedding') if config['tie_embeddings']
-                else ('params', 'lm_head', 'kernel'))
-    return None
+def _trunk_layers(config: Config) -> int:
+    return _records.integer(config['num_layers'], 'num_layers')
+
+
+def _depths(config: Config) -> int:
+    return _records.integer(config.get('num_nextn_predict_layers') or 0, 'num_nextn_predict_layers')
+
+
+DEPTH = after(_trunk_layers)
+"""A prediction depth stored as the layer past the trunk's, DeepSeek-V3's `model.layers.{num_layers + d}`."""
+
+
+def prediction_copies(stored: str, slots: Mapping[str, Slot] | None = None,
+                      count: Callable[[Config], int] = _depths, *,
+                      written: bool = True, declared: bool = True) -> tuple[Routes, ...]:
+    """A declared prediction depth's copies of the trunk's table and head, by their names past `stored`
+    (`embed_tokens.weight`, `shared_head.head.weight`), which a load checks against the trunk's leaf and,
+    where the release stores them (`written`), an export writes from it: a tied trunk keeps the head in
+    the embedding, which stores the same [vocab, features] the copy does, an untied one the head's own
+    kernel. A copy of a depth the record does not declare is no tensor of it, but where the depths are
+    read apart (`declared` False: a type verified from parts reads a released depth's copies as the
+    trunk's, leaving the depth itself unread)."""
+    held = MappingProxyType(dict(slots or {}))
+    within = declared_depths() if declared else None
+    routes = (Route(stored + 'embed_tokens.weight', 'params/embed_tokens/embedding', held, within),
+              Route(stored + 'shared_head.head.weight', 'params/embed_tokens/embedding', held,
+                    both(within, _tied)),
+              Route(stored + 'shared_head.head.weight', 'params/lm_head/kernel', held,
+                    both(within, _untied)))
+    return tuple(Copy(route, 'depth', count) for route in routes) if written else routes
 
 
 def layer_depth(name: str, config: Mapping[str, object]) -> int | None:
     """The prediction depth of `name` in DeepSeek-V3's layout, the `d` of `model.layers.{num_layers +
-    d}.*`, or None for the trunk's (`layer_depth_path`)."""
+    d}.*`, or None for the trunk's (`layer_depth_routes`)."""
     parts = name.split('.')
     trunk = _records.integer(config['num_layers'], 'num_layers')
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() and int(parts[2]) >= trunk:
@@ -1378,221 +1215,273 @@ def layer_depth(name: str, config: Mapping[str, object]) -> int | None:
     return None
 
 
-def layer_depth_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The path of `name` in DeepSeek-V3's layout, which GLM's MoE releases
-    share: prediction depth d at `model.layers.{num_layers + d}.*`, its own
-    leaves (`PREDICTION_LEAVES`), a block named as a trunk layer's, and
-    copies of the trunk's embedding and head, which map to the trunk's
-    leaves (`prediction_copy_path`). Any other name is the trunk's,
-    `dew_path`'s."""
-    index = layer_depth(name, config)
-    if index is None:
-        return dew_path(name, config)
-    tail = '.'.join(name.split('.')[3:])
-    depths = _records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
-    depth = _declared_depth(name, index, depths)
-    copy = prediction_copy_path(tail, config)
-    if copy is not None:
-        return copy
-    return prediction_path(name, 'mtp', depth, depths, tail, PREDICTION_LEAVES,
-                           lambda block: dew_path('model.layers.0.' + block, config))
+def layer_depth_routes(trunk: Routes, *, copies: bool = True) -> Table:
+    """The routes of DeepSeek-V3's layout, which GLM's MoE releases share: prediction depth d at
+    `model.layers.{num_layers + d}.*`, its own leaves (`PREDICTION_LEAVES`), a block named as a trunk
+    layer's, and copies of the trunk's embedding and head (`prediction_copies`), which a release that
+    holds none (`copies` False, GLM-5 Next's) reads where present and never writes; any other name is
+    the trunk's, `trunk`'s."""
+    stored, slots = 'model.layers.{depth}.', {'depth': DEPTH}
+    return Table(*prediction_copies(stored, slots, written=copies),
+                 prediction_routes(stored, 'mtp', PREDICTION_LEAVES, trunk, slots=slots,
+                                   when=declared_depths()),
+                 trunk)
 
 
+def _tied(config: Config, slots: Mapping[str, str]) -> bool:
+    return bool(config['tie_embeddings'])
 
 
-def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the params-tree path of a split HF tensor name, or None for the tied head."""
-    hf_name = '.'.join(parts)
-    if hf_name in _TRUNK:
-        return _TRUNK[hf_name]
-    if len(parts) == 3 and parts[:2] == ['model', 'hc_head'] and parts[2] in _V4_HEAD:
-        return ('hc_head', parts[2])
-    if parts == ['lm_head', 'weight']:
-        return None if config['tie_embeddings'] else ('lm_head', 'kernel')
-    if parts == ['lm_head', 'bias']:
-        return ('head_bias',)
-
-    if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
-        path = _layer_param_path(parts, config)
-        if path is not None:
-            return (f'layers_{parts[2]}', *path)
-    raise ValueError(f"unknown tensor name {hf_name!r}")
+def _untied(config: Config, slots: Mapping[str, str]) -> bool:
+    return not config['tie_embeddings']
 
 
-def _layer_param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The path within one decoder layer, before adding its layer-bank name."""
-    module, leaf = parts[3], parts[-1]
-    if config.get('hyper_connections') is not None:
-        path = _hyper_connection_param_path(parts)
-        if path is not None:
-            return path
-    if module in _PROJECTIONS and len(parts) == 6:
-        sublayer = parts[4]
-        if sublayer in _PROJECTIONS[module] and leaf in ('weight', 'bias'):
-            # torch Linear holds [out, in]; Dense keeps [in, out]
-            return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
-        if module == 'self_attn' and sublayer in _HEAD_NORMS and leaf == 'weight':
-            return (module, sublayer, 'scale')
-        if module == 'self_attn' and sublayer in _MLA_PROJECTIONS and leaf in ('weight', 'bias'):
-            return (module, sublayer, 'kernel' if leaf == 'weight' else 'bias')
-        if module == 'self_attn' and sublayer in _MLA_NORMS and leaf == 'weight':
-            return (module, sublayer, 'scale')
-    if module == 'self_attn':
-        return _attention_param_path(parts)
-    if len(parts) == 5 and module in ('attn_hc', 'ffn_hc') and leaf in _V4_HC:
-        # mHC's residual mapping around each sublayer, its tensors in
-        # the reference's own layout (modeling_deepseek_v4.py:902-913).
-        return (module, leaf)
-    if (len(parts) == 8 and module == 'mlp' and parts[4] == 'experts'
-            and parts[5].isdigit() and parts[6] in MOE_SHARED and leaf == 'weight'):
-        # model.layers.N.mlp.experts.K.{gate,up,down}_proj.weight, one
-        # tensor per expert, stacked by _stack_experts below.
-        return ('mlp', 'experts', parts[5], parts[6], 'kernel')
-    if (len(parts) == 7 and module == 'mlp' and parts[4] == 'shared_experts'
-            and parts[5] in MOE_SHARED and leaf == 'weight'):
-        # The dense shared experts beside them, one MLP however many the
-        # config counts.
-        return ('mlp', 'shared_experts', parts[5], 'kernel')
-    if (module == 'linear_attn'
-            and _records.strings(config['layer_types'], 'layer_types')[int(parts[2])] == 'linear_attention'):
-        tail = tuple(parts[4:])
-        if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'weight':
-            return ('self_attn', tail[0], 'kernel')
-        if tail in _LINEAR_LEAVES:
-            return ('self_attn', *tail)
-    if len(parts) == 5 and leaf == 'weight' and module in _PER_LAYER_INPUTS:
-        return (module, _PER_LAYER_INPUTS[module])
-    norms = _norm_names(bool(config.get('sandwich_norms')))
-    if len(parts) == 5 and module in norms and leaf in ('weight', 'bias'):
-        return (norms[module], 'scale' if leaf == 'weight' else 'bias')
-    return None
+def in_trunk(config: Config, slots: Mapping[str, str]) -> bool:
+    """Whether a route's `layer` is one of the trunk's (a prediction depth stored past them is not); a
+    record that states no depth (a block's own, read alone) bounds none."""
+    return 'num_layers' not in config or int(slots['layer']) < _trunk_layers(config)
 
 
-def _hyper_connection_param_path(parts: list[str]) -> tuple[str, ...] | None:
-    """The V4 stream mappings and attention leaves in a hyper-connected layer."""
-    module = parts[3]
-    if len(parts) == 4 and module.startswith(('hc_attn_', 'hc_ffn_')):
-        site, suffix = module[3:].split('_', 1)
-        if suffix in ('fn', 'base', 'scale'):
-            return (f'{site}_hc', suffix)
-    if module == 'self_attn':
-        tail = tuple(parts[4:])
-        kda = KDA_LEAVES.get('.'.join(parts[3:]))
-        if kda is not None:
-            return kda
-        if len(tail) == 2 and tail[0] == 'indexer' and tail[1] in (
-                'index_kpool_compress_ape', 'index_kpool_compress_gate'):
-            return (module, *tail)
-    return None
+def layer_type(config: Config, layer: str) -> str:
+    """The kind of layer `layer` in the record (`layer_types`), full attention where it states none."""
+    types = config.get('layer_types')
+    return 'full_attention' if types is None else _records.strings(types, 'layer_types')[int(layer)]
 
 
-def _attention_param_path(parts: list[str]) -> tuple[str, ...] | None:
-    """The sparse selector's leaves, followed by DeepSeek V4's nested leaves."""
-    if len(parts) == 7 and parts[4] == 'indexer':
-        # model.layers.N.self_attn.indexer.{wq_b,wk,weights_proj}.weight
-        # and k_norm.{weight,bias}: the sparse selector's own tensors.
-        sublayer, leaf = parts[5], parts[6]
-        if sublayer in ('wq_b', 'wk', 'weights_proj') and leaf == 'weight':
-            return ('self_attn', 'indexer', sublayer, 'kernel')
-        if sublayer == 'k_norm' and leaf in ('weight', 'bias'):
-            return ('self_attn', 'indexer', sublayer, 'scale' if leaf == 'weight' else 'bias')
-    tail = _v4_attention_leaf(parts[4:])
-    return None if tail is None else ('self_attn', *tail)
+def both(*conditions: Condition | None) -> Condition:
+    """A condition holding where each of `conditions` holds (None always does)."""
+    held = tuple(condition for condition in conditions if condition is not None)
+    return lambda config, slots: all(condition(config, slots) for condition in held)
 
 
-def _v4_attention_leaf(tail: list[str]) -> tuple[str, ...] | None:
-    """Return DeepSeek V4's own leaf under `self_attn`, or None for another family's.
-
-    The reference nests a compressor under the layer, an indexer under a
-    compressor and a scorer under the indexer, each holding projections and
-    norms of the same names, so the nesting is read off the name and the
-    leaf under it decides the kind (_V4_PROJECTIONS, _V4_NORMS, _V4_TENSORS).
-    """
-    prefix: tuple[str, ...] = ()
-    while len(tail) > 1 and tail[0] in _V4_MODULES:
-        prefix, tail = (*prefix, tail[0]), tail[1:]
-    if len(tail) == 1 and tail[0] in _V4_TENSORS:
-        return (*prefix, tail[0])
-    if len(tail) == 2 and tail[1] == 'weight':
-        if tail[0] in _V4_PROJECTIONS:
-            return (*prefix, tail[0], 'kernel')
-        if tail[0] in _V4_NORMS:
-            return (*prefix, tail[0], 'scale')
-    return None
+def in_layer(stored: str, leaf: str | None, slots: Mapping[str, Slot] | None = None,
+             when: Condition | None = None) -> Route:
+    """A route below a trunk layer: `stored` past `model.layers.{layer}.`, `leaf` past its parameters'
+    `layers_{layer}` (None for a tensor that fills no leaf)."""
+    return Route('model.layers.{layer}.' + stored, None if leaf is None else 'params/layers_{layer}/' + leaf,
+                 MappingProxyType(dict(slots or {})), both(in_trunk, when))
 
 
-def _dense_decoder_weights(family: "DecoderFamily", model: CausalTransformer, variables: Mapping[str, object],
-                           config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
-    if model.per_layer_input_dim or model.sharing_layers or model.v_norm:
-        raise ValueError(
-            'per-layer input embeddings, KV sharing and the values norm have '
-            'no counterpart in this dense tensor encoder: per_layer_input_dim, '
-            'kv_shared_layers or v_norm is set')
-    mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
-    # The rotary's width lays out no tensor: whether the written config states it is
-    # `refuse_lossy_export`'s to say.
-    if model.output_gate or any(mixer is not None and not isinstance(mixer, AttentionMixer)
-                                for mixer in mixers):
-        raise ValueError(
-            'the attention output gate and a mixer other than attention have no counterpart in this '
-            'dense tensor encoder')
-    if model.mixture is not None and family.export_path is None:
-        raise ValueError('a model with a mixture has no routed tensor writer in this family')
-    return decoder_tensors(family, model, variables, config)
+def linear_routes(stored: str, leaf: str, slots: Mapping[str, Slot] | None = None,
+                  when: Condition | None = None) -> tuple[Route, Route]:
+    """A layer's linear maps: torch's `weight` the Dense `kernel` (its two axes swapped, `stored_order`),
+    its `bias` the bias."""
+    return (in_layer(stored + '.weight', leaf + '/kernel', slots, when),
+            in_layer(stored + '.bias', leaf + '/bias', slots, when))
+
+
+def _hyper(config: Config, slots: Mapping[str, str]) -> bool:
+    return config.get('hyper_connections') is not None
+
+
+def _linear_layer(config: Config, slots: Mapping[str, str]) -> bool:
+    return layer_type(config, slots['layer']) == 'linear_attention'
+
+
+def _sandwich(config: Config, slots: Mapping[str, str]) -> bool:
+    return bool(config.get('sandwich_norms'))
+
+
+def _plain(config: Config, slots: Mapping[str, str]) -> bool:
+    return not config.get('sandwich_norms')
+
+
+V4_NEST = nested(*_V4_MODULES)
+"""DeepSeek V4's nested attention modules: a compressor under the layer, an indexer under a compressor
+and a scorer under the indexer, each holding projections and norms of the same names
+(modeling_deepseek_v4.py:379-382, :446-450, :490-496)."""
+
+
+TRUNK_ROUTES = Table(
+    *(Route(name, 'params/' + '/'.join(path)) for name, path in _TRUNK.items()),
+    Route('model.hc_head.{part}', 'params/hc_head/{part}', MappingProxyType({'part': one_of(*_V4_HEAD)})),
+    # A tied checkpoint's head is the embedding's copy: no leaf of its own (`DecoderFamily.source_path`).
+    Route('lm_head.weight', None, when=_tied),
+    Route('lm_head.weight', 'params/lm_head/kernel', when=_untied),
+    Route('lm_head.bias', 'params/head_bias'),
+    # The router state a training step moves, not a parameter: it lands where `Router` keeps it.
+    Route('model.layers.{layer}.mlp.gate.{state}', 'moe/layers_{layer}/mlp/gate/{state}',
+          MappingProxyType({'state': one_of(*_MOE_STATE)}), in_trunk),
+)
+"""The decoder's tensors outside its layers, and its routers' state."""
+
+
+DELTA_NET_ROUTES = (
+    in_layer('linear_attn.{projection}.weight', 'self_attn/{projection}/kernel',
+             {'projection': one_of(*_LINEAR_PROJECTIONS)}, _linear_layer),
+    *(in_layer('linear_attn.' + '.'.join(leaf), 'self_attn/' + '/'.join(leaf), when=_linear_layer)
+      for leaf in sorted(_LINEAR_LEAVES)),
+)
+"""Qwen3.5's delta net, the block's mixer on a linear layer, under its own names, landing where self_attn
+does. A hyper-connected layer's Kimi Delta Attention holds leaves of the same names under self_attn's, which
+the shared table writes; a family whose hyper-connected layers hold a delta net instead (Qwen4-Exp) names
+these first."""
+
+
+LAYER_ROUTES = Table(
+    # V4's stream mappings and its hyper-connected layers' attention leaves.
+    in_layer('hc_{site}_{part}', '{site}_hc/{part}', {'site': one_of('attn', 'ffn'), 'part': one_of(*_V4_HC)},
+             _hyper),
+    *(in_layer(name, '/'.join(path), when=_hyper) for name, path in KDA_LEAVES.items()),
+    in_layer('self_attn.indexer.{part}', 'self_attn/indexer/{part}',
+             {'part': one_of('index_kpool_compress_ape', 'index_kpool_compress_gate')}, _hyper),
+    # torch Linear holds [out, in]; Dense keeps [in, out].
+    *(route for module, projections in _PROJECTIONS.items()
+      for route in linear_routes(module + '.{projection}', module + '/{projection}',
+                                 {'projection': one_of(*projections)})),
+    in_layer('self_attn.{norm}.weight', 'self_attn/{norm}/scale', {'norm': one_of(*_HEAD_NORMS)}),
+    *linear_routes('self_attn.{projection}', 'self_attn/{projection}',
+                   {'projection': one_of(*_MLA_PROJECTIONS)}),
+    in_layer('self_attn.{norm}.weight', 'self_attn/{norm}/scale', {'norm': one_of(*_MLA_NORMS)}),
+    # The sparse selector's own tensors.
+    in_layer('self_attn.indexer.{projection}.weight', 'self_attn/indexer/{projection}/kernel',
+             {'projection': one_of('wq_b', 'wk', 'weights_proj')}),
+    in_layer('self_attn.indexer.k_norm.weight', 'self_attn/indexer/k_norm/scale'),
+    in_layer('self_attn.indexer.k_norm.bias', 'self_attn/indexer/k_norm/bias'),
+    # DeepSeek V4's attention leaves, nested as its modules are (`V4_NEST`).
+    in_layer('self_attn.{nest}{tensor}', 'self_attn/{nest}{tensor}',
+             {'nest': V4_NEST, 'tensor': one_of(*_V4_TENSORS)}),
+    in_layer('self_attn.{nest}{projection}.weight', 'self_attn/{nest}{projection}/kernel',
+             {'nest': V4_NEST, 'projection': one_of(*_V4_PROJECTIONS)}),
+    in_layer('self_attn.{nest}{norm}.weight', 'self_attn/{nest}{norm}/scale',
+             {'nest': V4_NEST, 'norm': one_of(*_V4_NORMS)}),
+    # mHC's residual mapping around each sublayer, in the reference's own layout
+    # (modeling_deepseek_v4.py:902-913).
+    in_layer('{module}.{part}', '{module}/{part}',
+             {'module': one_of('attn_hc', 'ffn_hc'), 'part': one_of(*_V4_HC)}),
+    # One tensor an expert, stacked by `_stack_experts`; the dense shared experts beside them, one MLP
+    # however many the config counts.
+    in_layer('mlp.experts.{expert}.{projection}.weight', 'mlp/experts/{expert}/{projection}/kernel',
+             {'projection': one_of(*MOE_SHARED)}),
+    in_layer('mlp.shared_experts.{projection}.weight', 'mlp/shared_experts/{projection}/kernel',
+             {'projection': one_of(*MOE_SHARED)}),
+    # Qwen3.5's delta net, the block's mixer, lands where self_attn does.
+    *DELTA_NET_ROUTES,
+    *(in_layer(f'{module}.weight', f'{module}/{leaf}') for module, leaf in _PER_LAYER_INPUTS.items()),
+    *(route for theirs, ours in _PRE_NORMS.items()
+      for route in (in_layer(f'{theirs}.weight', f'{ours}/scale', when=_plain),
+                    in_layer(f'{theirs}.bias', f'{ours}/bias', when=_plain))),
+    *(route for theirs, ours in SANDWICH_NORMS.items()
+      for route in (in_layer(f'{theirs}.weight', f'{ours}/scale', when=_sandwich),
+                    in_layer(f'{theirs}.bias', f'{ours}/bias', when=_sandwich))),
+)
+"""A decoder layer's tensors, by the names every family's table reads (`DECODER_ROUTES`)."""
+
+
+DECODER_ROUTES = Table(TRUNK_ROUTES, LAYER_ROUTES)
+"""The shared decoder's tensor names, both ways: the HF dense decoder schema and the tensors any family
+holds beside it under the same names (MLA's, DeepSeek V4's, Qwen3.5's delta net, the routed experts), so
+a tensor that is present maps, whatever the family. The first name is the collection: `params` for a
+weight, `moe` for a router's balancing state, which a training step moves."""
+
+
+DEEPSEEK_ROUTES = layer_depth_routes(DECODER_ROUTES)
+"""DeepSeek-V3's names (`layer_depth_routes` over the shared decoder's), which V2, V3.2 and GLM's MoE
+releases share."""
+
+
+def model_record(model: CausalTransformer) -> Mapping[str, object]:
+    """The record a family's routes read an export's conditions from, as a load reads them from the
+    translated config (`DecoderFields`): the model's own fields, its layer kinds resolved
+    (`per_layer_types`)."""
+    record = {declared.name: getattr(model, declared.name) for declared in dataclasses.fields(model)
+              if declared.name not in ('parent', 'name')}
+    record.update(layer_types=model.per_layer_types, head_dim=model.features_per_head,
+                  num_kv_heads=model.kv_heads)
+    return record
+
+
+def unrouted(family: "DecoderFamily", model: CausalTransformer,
+             variables: Mapping[str, object]) -> list[tuple[str, ...]]:
+    """The parameters and router state of `variables` (abstract ones will do) no route of `family`
+    writes: what its layout cannot hold of `model`, which an export refuses (`decoder_tensors`) and
+    `source_layout` reports. A leaf of another collection no route names is one its release derives
+    (a rotary table, a token map), which no export writes."""
+    record = model_record(model)
+    return [path for path, leaf in _export_leaves(model, variables) if path[0] in ('params', 'moe')
+            and family.tensor_name(path, record) is None
+            and (_slices(path, leaf) == (path,)
+                 or any(family.tensor_name(piece, record) is None for piece in _slices(path, leaf)))]
+
+
+def _export_leaves(model: CausalTransformer,
+                   variables: Mapping[str, object]) -> list[tuple[tuple[str, ...], object]]:
+    """Each leaf an export writes, by its path, collection first: every collection's but the decode
+    cache's (Gemma 4's frozen layer scalars among its constants)."""
+    variables = unboxed(variables)
+    tree = variables if 'params' in variables else {'params': variables}
+    if not isinstance(tree.get('params'), Mapping):
+        raise ValueError('params must contain the decoder parameter tree')
+    leaves = []
+    for collection, held in tree.items():
+        if collection == 'cache' or not isinstance(held, Mapping):
+            continue
+        leaves += [((collection, *path), value) for path, value in flatten_dict(dict(held)).items()]
+    return leaves
+
+
+def _slices(path: tuple[str, ...], leaf) -> tuple[tuple[str, ...], ...]:
+    """The paths a stacked leaf is written as where no route names it whole, one a slice on its first
+    axis (`expert_path`): a layer's experts' kernels (the routed MLP's projections, the value experts'),
+    a table's row shards (`SLICED`); any other leaf its own."""
+    if len(path) >= 3 and path[-3] in SLICED and path[-1] in ('kernel', 'embedding') and np.ndim(leaf) >= 1:
+        return tuple(expert_path(path, index) for index in range(np.shape(leaf)[0]))
+    return (path,)
 
 
 def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables: Mapping[str, object],
                     config: Mapping[str, object]) -> LazyTensors:
-    """Write every parameter under the name `family` gives it (`DecoderFamily.tensor_name`).
+    """Write every leaf under the name `family`'s routes give it (`DecoderFamily.tensor_name`), and each
+    tensor its release stores again beside the leaf it copies (`Routes.copies`), refusing a leaf no
+    route writes (`unrouted`).
 
-    Each is bound by `leaf_layouts`, and the family's `packed` tensors are
-    built from their parts. Gemma 4's layer scalars are read from the
-    collection `model.layer_scalar` names.
+    Each is bound by `leaf_layouts`, and the family's `packed` tensors are built from their parts.
+    Gemma 4's layer scalars are read from the collection `model.layer_scalar` names.
     """
-    variables = unboxed(variables)
-    params = variables.get('params', variables)
-    if not isinstance(params, Mapping):
-        raise ValueError('params must contain the decoder parameter tree')
-    tree = variables if 'params' in variables else {'params': params}
-    leaves: dict[tuple[str, ...], object] = {
-        ('params', *path): value for path, value in flatten_dict(dict(params)).items()}
-    state = tree.get('moe')
-    if isinstance(state, Mapping):
-        leaves.update({('moe', *path): value for path, value in flatten_dict(dict(state)).items()})
-    constants = tree.get(LAYER_SCALAR_COLLECTIONS['frozen'])
-    if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
-        leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
-                       if path[-1] == 'layer_scalar'})
-    # The stacked experts' leaves, each written one tensor an expert: the routed MLP's projections and the
-    # value experts' (`RoutedValues`), whose router sits beside them unstacked.
-    stacked = {'mlp': None if model.mixture is None else model.mixture.experts,
-               'self_attn': None if model.value_experts is None else model.value_experts.experts}
+    record = model_record(model)
+    missing = unrouted(family, model, variables)
+    if missing:
+        raise ExportRefused(f"{', '.join('/'.join(path) for path in missing)} has no tensor in the "
+                            f"{family.export_model_type} layout, so the model cannot be written as it")
+
+    leaves = dict(_export_leaves(model, variables))
 
     def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
-        count = stacked.get(path[2]) if len(path) == 6 else None
-        if (count is not None and path[3] == 'experts' and path[-1] == 'kernel'
-                and (path[2] == 'mlp' or path[4] == 'v_proj')):
-            named = tuple(family.tensor_name('.'.join(expert_path(path, expert)[1:]), config)
-                          for expert in range(count))
-            if any(name is None for name in named):
-                raise ValueError(f'{path} has no tensor name for each expert')
-            return tuple(name for name in named if name is not None)
-        return family.tensor_name('.'.join(path[1:]), config)
+        # A stacked leaf a route names whole is one tensor (fused experts); else one tensor a slice.
+        whole = family.tensor_name(path, record)
+        slices = _slices(path, leaves[path])
+        if whole is not None or slices == (path,):
+            return whole
+        named = [family.tensor_name(piece, record) for piece in slices]
+        return tuple(name for name in named if name is not None) if None not in named else None
 
-    layouts = leaf_layouts(leaves, names)
+    layouts = leaf_layouts(leaves, names, family.folded)
+    for name, path in family.routes.copies(record):
+        if name not in layouts and path in leaves:
+            layouts[name] = leaf_layouts({path: leaves[path]}, lambda _, name=name: name)[name]
+    derived = {} if family.derived is None else dict(family.derived(record))
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
     packed = family.packed if family.packs(config) else ()
-    return layout_tensors(packed_layouts(layouts, packed, geometry), tree, model.layer_scalar)
+    tree = unboxed(variables)
+    tensors = layout_tensors(packed_layouts(layouts, packed, geometry),
+                             tree if 'params' in tree else {'params': tree}, model.layer_scalar, derived)
+    rows = family.head_rows
+    if rows is None:
+        return tensors
+    return LazyTensors(tensors.specs, lambda name: rows.write(name, tensors[name], record))
 
 
 def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
-                 names: Callable[[tuple[str, ...]], str | tuple[str, ...] | None]) -> dict[str, WeightLayout]:
+                 names: Callable[[tuple[str, ...]], str | tuple[str, ...] | None],
+                 folded: Collection[str] = ()) -> dict[str, WeightLayout]:
     """Bind each leaf, by its path collection first, to the source tensor `names` gives it.
 
     A leaf is stored as the load oriented it (`stored_order`), a matrix
-    kernel's two axes swapped. None writes nothing, as for the tied head. A
+    kernel's two axes swapped, and one whose path ends in a `folded` suffix
+    (`DecoderFamily.folded`) as a matrix, its leading axes folded into the
+    rows. None writes nothing, as for the tied head. A
     tuple names one source tensor per expert of a stacked leaf, in expert
     order: the slices the load stacked (`expert_slot`).
     """
@@ -1610,9 +1499,12 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
         else:
             raise ValueError(f"{'.'.join(path)} holds {value.shape}, not one slice for each of "
                              f"{len(named)} named experts")
-        # A tree built natively stores each leaf as it is shaped: no grouped rows folded.
-        order = stored_order(path, len(shape), len(shape))
-        stored = shape if order is None else tuple(shape[axis] for axis in order)
+        # A tree built natively stores each leaf as it is shaped, but where its release folds it.
+        fold = len(shape) > 2 and '/'.join(path).endswith(tuple(folded))
+        order = stored_order(path, 2 if fold else len(shape), len(shape))
+        stored: tuple[int, ...] = shape if order is None else tuple(shape[axis] for axis in order)
+        if fold:
+            stored = (math.prod(stored[:-1]), *stored[-1:])
         for target, expert in slices:
             if target in layouts:
                 raise ValueError(f"{'.'.join(path)} and {layouts[target].paths[0]} both write {target}")
@@ -1667,58 +1559,6 @@ def layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, 
                 for name, layout in layouts.items()}}
     return LazyTensors(specs, lambda name: (
         layouts[name].export(variables, scalar_mode) if name in layouts else kept[name]))
-
-
-def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
-                   sandwich_norms: bool = False) -> str | None:
-    """Map one flattened dew param path to its HF tensor name, or None.
-
-    None is the tied lm_head, whose embedding copy is written instead.
-    `sandwich_norms` names the norms around each block as Gemma 2's family does.
-    """
-    parts = dew_name.split('.')
-    if tuple(parts) in _TRUNK_NAMES:
-        return _TRUNK_NAMES[tuple(parts)]
-    if parts == ['lm_head', 'kernel']:
-        return None if config['tie_word_embeddings'] else 'lm_head.weight'
-    if parts == ['head_bias']:
-        return 'lm_head.bias'
-
-    if parts[0].startswith('layers_'):
-        index = parts[0].removeprefix('layers_')
-        module, leaf = parts[1], parts[-1]
-        if (module == 'mlp' and len(parts) == 6 and parts[2] == 'experts' and parts[3].isdigit()
-                and parts[4] in MOE_SHARED and leaf == 'kernel'):
-            return f'model.layers.{index}.mlp.experts.{parts[3]}.{parts[4]}.weight'
-        if (module == 'mlp' and len(parts) == 5 and parts[2] == 'shared_experts'
-                and parts[3] in MOE_SHARED and leaf == 'kernel'):
-            return f'model.layers.{index}.mlp.shared_experts.{parts[3]}.weight'
-        if module == 'mlp' and len(parts) == 4 and parts[2] == 'gate' and leaf in _MOE_STATE:
-            return f'model.layers.{index}.mlp.gate.{leaf}'
-        if len(parts) == 3 and _PER_LAYER_INPUTS.get(module) == leaf:
-            return f'model.layers.{index}.{module}.weight'
-        if len(parts) == 4 and module in _PROJECTIONS:
-            if parts[2] in _PROJECTIONS[module] and leaf in ('kernel', 'bias'):
-                return (f'model.layers.{index}.{module}.{parts[2]}.'
-                        + ('weight' if leaf == 'kernel' else 'bias'))
-            if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
-                return f'model.layers.{index}.self_attn.{parts[2]}.weight'
-        if len(parts) == 3 and module == 'self_attn' and leaf == 'sinks':
-            # A layer's learned sink logits, which `dew_path` reads under this name (`_V4_TENSORS`).
-            return f'model.layers.{index}.self_attn.sinks'
-        types = config.get('layer_types')
-        if (module == 'self_attn' and types is not None
-                and _records.strings(types, 'layer_types')[int(index)] == 'linear_attention'):
-            # Qwen3.5's delta net under its own name, as `dew_path` reads it (`_LINEAR_PROJECTIONS`).
-            tail = tuple(parts[2:])
-            if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'kernel':
-                return f'model.layers.{index}.linear_attn.{tail[0]}.weight'
-            if tail in _LINEAR_LEAVES:
-                return f'model.layers.{index}.linear_attn.' + '.'.join(tail)
-        theirs = {ours: hf for hf, ours in _norm_names(sandwich_norms).items()}
-        if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
-            return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
-    raise ValueError(f"unknown parameter path {dew_name!r}")
 
 
 @dataclass(frozen=True)
@@ -2047,6 +1887,31 @@ class MaskedWalk:
 
 
 @dataclass(frozen=True)
+class HeadRows:
+    """Stored tensors (by their name's `suffixes`) whose rows a release orders otherwise within each
+    attention head than Dew's leaf does: each `[heads * head_dim, ...]`, a head's rows in `order`'s order
+    by the record (GPT-J's interleaved rotary pairs, which the shared rotate-half arithmetic reads
+    permuted). A load takes each head's rows in that order (`read`), an export puts them back (`write`):
+    one declaration, both directions."""
+
+    suffixes: tuple[str, ...]
+    order: Callable[[Mapping[str, object]], np.ndarray]
+
+    def _ordered(self, tensor: Stored, config: Mapping[str, object], order: np.ndarray) -> Stored:
+        heads = _records.integer(config['num_heads'], 'num_heads')
+        width = _records.integer(config['head_dim'], 'head_dim')
+        return tensor.reshape(heads, width, *tensor.shape[1:])[:, order].reshape(tensor.shape)
+
+    def read(self, name: str, tensor: Stored, config: Mapping[str, object]) -> Stored:
+        return self._ordered(tensor, config, self.order(config)) if name.endswith(self.suffixes) else tensor
+
+    def write(self, name: str, tensor: np.ndarray, config: Mapping[str, object]) -> np.ndarray:
+        if not name.endswith(self.suffixes):
+            return tensor
+        return np.asarray(self._ordered(tensor, config, np.argsort(self.order(config))))
+
+
+@dataclass(frozen=True)
 class DecoderFamily:
     """Holds one family's config, tensor paths and export vocabulary.
 
@@ -2059,27 +1924,32 @@ class DecoderFamily:
     """
 
     model_types: tuple[str, ...]
-    translate_config: Callable[[Mapping[str, object], set[str]], DecoderFields]
+    config: ConfigLayout[CausalTransformer]
+    """The family's config, both ways (`dew.interop.layouts.ConfigLayout`): the record a source config
+    states (`translate_config`) and the keys a model's fields state in it (`export_fields`), read and
+    written by the same parts."""
     matches: Callable[[CausalTransformer], bool]
     export_model_type: str
     architecture: str
-    export_fields: Callable[[CausalTransformer], Mapping[str, object]]
     preserve_source_layout: bool = field(kw_only=True)
     """Bind source tensor names/config for export instead of deriving them from the model."""
-    weight_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None] = dew_path
+    routes: Routes = DECODER_ROUTES
+    """The family's tensor names, both ways (`dew.interop.layouts`): a load reads each stored tensor into
+    its leaf through them (`weight_path`) and an export writes each leaf back under its name
+    (`decoder_tensors`); a leaf no route writes is one the family cannot write. The shared decoder's
+    (`DECODER_ROUTES`) by default."""
     prediction_depth: Callable[[str, Mapping[str, object]], int | None] = lambda name, config: None
     """The prediction depth (or DSpark stage) a source tensor belongs to, the `d` of the `mtp_{d}` or
-    `dspark_{d}` its `weight_path` places it under, or None for the trunk's: a load keeping fewer
+    `dspark_{d}` its `routes` place it under, or None for the trunk's: a load keeping fewer
     depths drops the others' tensors by it before any is read (`Pretrained.load(prediction_depths=)`).
-    A family whose `weight_path` places depths names its own; the others hold none."""
-    export_path: Callable[[str, Mapping[str, object]], str | None] | None = None
-    """The source name of a dew path; None is the shared names (`hf_tensor_name`)."""
-    export_weights: Callable[["DecoderFamily", CausalTransformer, Mapping[str, object], Mapping[str, object]],
-                             Mapping[str, np.ndarray]] = _dense_decoder_weights
-    """Whole-variable encoder, given its family; the families with one add
-    their checks, storage or names to the shared writer (`decoder_tensors`,
-    `leaf_layouts`)."""
-    sandwich_norms: bool = False
+    A family whose `routes` place depths names its own; the others hold none."""
+    derived: Callable[[Mapping[str, object]], Mapping[str, np.ndarray]] | None = None
+    """The tensors a release stores that its record derives, by their names (Qwen4-Exp's n-gram tables'
+    lookups): a load checks each against them (`prepare`) and places none, an export writes them from the
+    model's record (`decoder_tensors`), one declaration both ways."""
+    head_rows: HeadRows | None = None
+    """Stored tensors whose rows within each head a release orders otherwise (`HeadRows`), read and written
+    through the one declaration."""
     prepare: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """Storage the path map cannot read as stored that no `packed` entry
     describes: GPT-2's causal buffers, GPT-NeoX's head-interleaved qkv,
@@ -2105,6 +1975,11 @@ class DecoderFamily:
     """Suffixes of the 1-D source tensors a checkpoint stores longer than their
     leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare` checks and
     trims the tail; export writes the zeros back (`WeightLayout.padded`)."""
+    folded: tuple[str, ...] = ()
+    """Suffixes of the leaves of more than two axes a release stores as a matrix, the leaf's axes after
+    its first swapped and the rest folded into its rows: DeepSeek V4's grouped output projection,
+    `[groups, in, rank]` stored `[groups * rank, in]` (`deepseek.v4_prepare` reads it back). An export
+    writes them so (`decoder_tensors`)."""
     constants: Callable[[Path, Mapping[str, object]], Mapping[str, object]] = lambda directory, record: {}
     """The `constants` entries a family derives from its source directory beside
     the tensors (`with_constants`), which no export writes back: V4.1's engram token map."""
@@ -2128,6 +2003,10 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
+    legacy: Mapping[str, str] = field(default_factory=dict)
+    """The config class's legacy names of its fields, each read as its field over the field's own spelling
+    where a config states both (NemotronHConfig.__post_init__'s, configuration_nemotron_h.py:145-162);
+    written as the field."""
     prediction_counts: tuple[str, ...] = ('num_nextn_predict_layers',)
     """The fields the family's config counts its multi-token prediction depths by, as its config class
     names them; an alias that spells one (`aliases`) counts it too (`kept_depths`)."""
@@ -2199,14 +2078,34 @@ class DecoderFamily:
         # One read of each tensor: a lazy mapping builds a tensor on every access
         # (`LazyTensors`), and `prepare` and the stored tensors share these.
         stored = dict(tensors)
-        return packed_readings(self.prepare(stored, config), self.packed, config, stored=stored,
+        prepared = self.prepare(stored, config)
+        if self.head_rows is not None:
+            prepared = {name: self.head_rows.read(name, tensor, config) for name, tensor in prepared.items()}
+        return packed_readings(prepared, self.packed, config, stored=stored,
                                path=lambda part: self.source_path(part, config))
 
-    def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
-        """The source name the dew path `name` exports under."""
-        if self.export_path is None:
-            return hf_tensor_name(name, config, sandwich_norms=self.sandwich_norms)
-        return self.export_path(name, config)
+    def translate_config(self, hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+        """The record `hf_config`, the family's own spelling of its fields (`translated` reads its aliases,
+        defaults and repeats first), states (`config`), each key read added to `used`."""
+        return self.config.read(hf_config, used, NativeFields(CausalTransformer, {}))
+
+    def export_fields(self, model: CausalTransformer) -> Mapping[str, object]:
+        """The family's own keys `model`'s fields state (`config`), beside the shared ones
+        `hf_decoders.export_config` writes."""
+        return self.config.write(model)
+
+    def weight_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+        """The leaf the stored tensor `name` fills (`routes`), None for one that fills none of its own (a
+        tied head's copy); an unexplained name raises before any checkpoint is accepted."""
+        found = self.routes.read(name, config)
+        if found is None:
+            raise ValueError(f"unknown tensor name {name!r}")
+        return found.path
+
+    def tensor_name(self, path: tuple[str, ...], config: Mapping[str, object]) -> str | None:
+        """The name the leaf at `path` (its collection first) is stored under (`routes`), None where no
+        route writes it, a leaf the family cannot write."""
+        return self.routes.write(path, config)
 
     def packing(self, name: str) -> Packed | None:
         """The `packed` entry the source tensor `name` is, if any."""
