@@ -971,8 +971,8 @@ s, rows 1849, 2193, 4344; `GPU_ONLY`)."""
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
                                     if family not in GPU_TRITON_FAMILIES])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges(family):
-    """The Triton mainloop's default form finite over every family (`default_is_finite`): its program walks
-    under the default's guards as the plain-JAX mainloop's does (`algebra.walked`: its sums' headroom, the
+    """The Triton mainloop's default form finite over every family (`default_is_finite`): its launches take
+    the default's guards as the Mosaic mainloop's do (`algebra.walked_launches`: its sums' headroom, the
     fold's reach), as the template's production route runs it on an sm80 or later GPU (ledger 1637)."""
     default_is_finite(family, "triton")
 
