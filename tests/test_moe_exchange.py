@@ -63,35 +63,88 @@ def test_exchange_retains_outputs_and_all_differentiable_inputs(
             np.testing.assert_array_equal(projection['kernel'][top_k:], 0)
 
 
-def primitives(jaxpr: jax.extend.core.Jaxpr) -> list[str]:
-    """Every primitive `jaxpr` runs, its sub-jaxprs' (a shard_map's body, a scan's) included."""
-    names = []
+def equations(jaxpr: jax.extend.core.Jaxpr) -> list[jax.extend.core.JaxprEqn]:
+    """Every equation `jaxpr` runs, its sub-jaxprs' (a shard_map's body, a loop's, a branch's) included."""
+    found = []
     for equation in jaxpr.eqns:
-        names.append(equation.primitive.name)
+        found.append(equation)
         for value in equation.params.values():
             for held in value if isinstance(value, (tuple, list)) else (value,):
                 if isinstance(held, jax.extend.core.ClosedJaxpr):
-                    names += primitives(held.jaxpr)
+                    found += equations(held.jaxpr)
                 elif isinstance(held, jax.extend.core.Jaxpr):
-                    names += primitives(held)
-    return names
+                    found += equations(held)
+    return found
+
+
+def primitives(jaxpr: jax.extend.core.Jaxpr) -> list[str]:
+    """Every primitive `jaxpr` runs, its sub-jaxprs' included (`equations`)."""
+    return [equation.primitive.name for equation in equations(jaxpr)]
 
 
 @pytest.mark.parametrize("skewed", [False, True], ids=["even", "skewed"])
-def test_a_dropless_exchange_moves_its_rows_in_one_ragged_all_to_all_each_way(skewed):
-    """An expert mesh's dropless exchange sends each shard its rows in one `lax.ragged_all_to_all` and
-    takes them back in one more, the collective XLA runs, whatever the routing's skew: no rounds of
-    equal buckets, no loop over them (ledger 1711); its gradient moves its rows by the same collective."""
+def test_a_dropless_exchange_receives_a_balanced_share_a_round(skewed):
+    """An expert mesh's dropless exchange sends each shard its rows by `lax.ragged_all_to_all`, the collective
+    XLA runs, and takes them back by another, a round at a time: a round's receiving buffer holds every
+    device's balanced share once (its slots over the shards), where it held every device's slots whatever
+    the routing (row 4596), and a skewed routing's overflow takes further rounds of the same collective;
+    its gradient moves its rows by the same collective. Here each of 8 devices holds 3 tokens of 2 slots,
+    6 slots over 4 shards, so a round receives 2 rows from each device, 8 in all, where it held 24."""
     x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed))
     layer = ExpertMLP(8, 12, 8).clone(dispatch='exchange')
     parameters = nn.unbox(ExpertMLP(8, 12, 8).init(jax.random.key(19), x, weights, indices))
     with jax.set_mesh(MeshSpec(expert=4, fsdp=2).build()):
-        forward = primitives(jax.make_jaxpr(layer.apply)(parameters, x, weights, indices).jaxpr)
+        forward = equations(jax.make_jaxpr(layer.apply)(parameters, x, weights, indices).jaxpr)
         backward = primitives(jax.make_jaxpr(jax.grad(functools.partial(objective, layer, indices),
                                                       has_aux=True))(parameters, x, weights).jaxpr)
-    assert forward.count("ragged_all_to_all") == 2 and "all_to_all" not in forward and "scan" not in forward
+    exchanges = [equation for equation in forward if equation.primitive.name == "ragged_all_to_all"]
+    # The first round's pair and the further rounds' loop's.
+    assert len(exchanges) == 4 and not any(equation.primitive.name == "all_to_all" for equation in forward)
+    assert max(equation.outvars[0].aval.shape[0] for equation in exchanges) == 8
     # JAX's transpose of the collective exchanges its offsets by an all_to_all of its own.
-    assert "ragged_all_to_all" in backward and "scan" not in backward
+    assert "ragged_all_to_all" in backward
+
+
+@pytest.mark.parametrize("spec, exchanged", [
+    (MeshSpec(expert=4, fsdp=2), True), (MeshSpec(expert=2, fsdp=4), True), (MeshSpec(fsdp=8), False)],
+    ids=["4-way", "2-way", "no-expert-axis"])
+def test_an_expert_mesh_exchanges_by_default_and_any_other_mesh_dispatches_globally(spec, exchanged):
+    """A mixture's default dispatch (`'auto'`) keeps an expert mesh's experts in place, exchanging the
+    tokens (`ragged_all_to_all`), and gathers no expert's weights; on a mesh without an expert axis it
+    dispatches globally, as `'global'` does (ledger 1711: on a 4-way expert mesh, the global dispatch
+    gathered every expert's weights, 200,704 bytes of eight, where the exchange moved 4,096)."""
+    x, weights, indices = map(jnp.asarray, routing_case(24, 8, 2, skewed=False))
+    layer = ExpertMLP(8, 12, 8)
+    parameters = nn.unbox(layer.init(jax.random.key(19), x, weights, indices))
+    with jax.set_mesh(spec.build()):
+        ran = primitives(jax.make_jaxpr(layer.apply)(parameters, x, weights, indices).jaxpr)
+        named = layer.clone(dispatch="exchange" if exchanged else "global")
+        named = primitives(jax.make_jaxpr(named.apply)(parameters, x, weights, indices).jaxpr)
+    assert ("ragged_all_to_all" in ran) == exchanged
+    assert ran == named
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("expert, exchanged", [(4, True), (1, False)], ids=["expert-mesh", "no-expert-axis"])
+def test_a_config_built_runs_step_exchanges_on_an_expert_mesh_by_default(tmp_path, expert, exchanged):
+    """An LM run built from its config, a mixture of eight experts at its default dispatch, lowers its
+    training step (`--trainer.lower-for`) with the exchange's `ragged_all_to_all` on a 4-way expert mesh
+    and with none where the mesh has no expert axis (ledger 1711's flow, row 4615)."""
+    import dataclasses
+
+    from run_kinds import lm, trained
+
+    from dew.training._lowering import Lowered, custom_calls
+
+    run = lm(tmp_path, drawn=False)
+    fields = {**run.model.fields, "mixture": {"experts": 8, "top_k": 2, "expert_features": 16}}
+    run = dataclasses.replace(run, model=dataclasses.replace(run.model, fields=fields))
+    with pytest.raises(Lowered) as lowered:
+        trained(run, tmp_path, "lowered", trainer={"mesh": MeshSpec(expert=expert, fsdp=8 // expert),
+                                                   "lower_for": "sm90"})
+    # The collective as the lowered program calls it (JAX lowers it to a custom call of its name).
+    calls = custom_calls(lowered.value.lowered)
+    assert any(call.target == "ragged_all_to_all" for call in calls) == exchanged
 
 
 def test_exchange_preserves_placed_expert_and_width_gradients():
@@ -108,7 +161,9 @@ def test_exchange_preserves_placed_expert_and_width_gradients():
     x, weights, indices = (jax.device_put(value, token_spec) for value in (x, weights, indices))
     specs = ((NamedSharding(mesh, P()), token_spec), (parameter_specs, token_spec, token_spec))
     with jax.set_mesh(mesh):
-        expected = jax.jit(jax.value_and_grad(functools.partial(objective, model, indices),
+        # The global dispatch named: the default exchanges on this expert mesh.
+        named = model.clone(dispatch='global')
+        expected = jax.jit(jax.value_and_grad(functools.partial(objective, named, indices),
                             (0, 1, 2), has_aux=True), out_shardings=specs)(parameters, x, weights)
         actual = jax.jit(jax.value_and_grad(functools.partial(
             objective, model.clone(dispatch='exchange'), indices),

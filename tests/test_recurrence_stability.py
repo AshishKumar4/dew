@@ -31,10 +31,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from port_support import row_names_port
 from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
 
-from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
@@ -403,7 +404,7 @@ def ssd_port(hooks, *args, **kwargs):
     port), interpreted off a GPU as the CPU suite runs a port a call names, at the default product
     precision its fp32 products are declared at (`recurrence_chunk._port_precision`; the suite's lanes
     configure 'highest')."""
-    with generation.chosen(ssd="pallas"), jax.default_matmul_precision("default"):
+    with row_names_port("ssd", "pallas"):
         return chunk(hooks, *args, **kwargs)
 
 

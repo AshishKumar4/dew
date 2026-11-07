@@ -27,6 +27,7 @@ from memory_support import (
     layer,
     written,
 )
+from port_support import row_names_port
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
@@ -733,7 +734,6 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
-    from dew.nn.kernels.generation import chosen
     from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
     from dew.nn.mixers.memory import InContextMemoryMixer
     from dew.quantization import QUANTIZATION, InputQuantization
@@ -766,9 +766,7 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
             climbed.append(stronger)
         return marked, [rung.recompute_record() for rung in climbed]
 
-    # The port at the default product precision its fp32 products are declared at
-    # (`recurrence_chunk._port_precision`; the suite's lanes configure 'highest').
-    with chosen(gated_delta_rule="fla"), jax.default_matmul_precision("default"):
+    with row_names_port("gated_delta_rule", "fla"):
         delta, delta_rungs = kept(layer("delta_rule"))
         quantized, _ = kept(layer("delta_rule"), quantized=True)
     titans, titans_rungs = kept(layer("titans"))

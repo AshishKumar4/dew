@@ -1,5 +1,7 @@
 """Router losses and bias effects over the real queries of packed documents."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -14,14 +16,14 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.objectives.routing import ExpertBalance, RoutedStatistics
+from dew.objectives.routing import ExpertBalance, RoutedStatistics, UntrainedRouter
 
 
 @pytest.fixture(scope="module", params=[0, 1], ids=["trunk", "mtp"])
 def routed(request):
     model = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True), qk_norm=False,
                             num_nextn_predict_layers=request.param)
-    # Its one expert's renormalized weight is 1 (`Mixture.fixed_weights`): the balance loss trains its router.
+    # Its one expert's renormalized weight is 1 (`dew.nn.moe.weighs_one`): the balance loss trains its router.
     drawn = LMObjective(model, 8, balance=ExpertBalance(aux_loss_alpha=0.2)).init(jax.random.key(0))
     variables = unfreeze(dict(nn.unbox(drawn)))
     params = variables["params"]
@@ -54,64 +56,136 @@ def padded(kind, extra, *, empty=False):
     return batch, 0 if kind == "pad_id" else None
 
 
-def test_a_router_no_loss_term_reaches_is_refused_before_it_trains():
-    """A softmax top-1 router renormalized over its one expert weighs it by 1 whatever it scores
-    (`Mixture.fixed_weights`), so no term of a plain loss reaches it: an objective training it with no
-    balance loss or z-loss is refused, naming norm_topk_prob=False (ledger 4551), and every way its router
-    learns or is left alone is not: weighed by its score, a balance loss, a z-loss, its router's kernel
-    among no trained parameters, or a balancing bias beside one of those."""
+def lowered(objective: LMObjective) -> None:
+    """Lower one training step of `objective` through a trainer (`lower_for`, its trace alone): returns where
+    the step traces, raises where it refuses."""
+    import optax
+
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training._lowering import Lowered
+
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=MeshSpec(),
+                      layout=Layout(min_shard=64))
+    trainer.lower_for = "sm90"
+    with pytest.raises(Lowered):
+        trainer.compile(trainer.initial_state(), {TEXT_KEY: jnp.zeros((8, 9), jnp.int32)})
+
+
+def test_a_router_no_loss_term_reaches_is_refused_where_its_run_trains():
+    """A top-1 router renormalized over its one expert weighs it by 1 whatever it scores (`weighs_one`,
+    softmax's and a sigmoid's alike), so no term of a plain loss reaches it: a training step that trains it
+    with no balance loss or z-loss is refused where the trainer traces it, naming norm_topk_prob=False
+    (ledgers 4551, 4591-4593), wherever the router sits (a feed-forward's mixture, an MLP in the mixer's
+    slot, a parallel mixer's routed branch); every way its router learns or is left alone is not: weighed
+    by its score, a balance loss, a z-loss, its router frozen, top-2 routing; and a model scored, which
+    trains nothing, is not."""
     from dew.batch import freeze
-    from dew.nn.value_experts import ValueExperts
+    from dew.nn.mixers import AttentionMixer
+    from dew.nn.mixers.mlp import MLPMixer
+    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 
     fixed = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True))
-    with pytest.raises(ValueError):
-        LMObjective(fixed, 8)
-    with pytest.raises(ValueError):
-        LMObjective(fixed, 8, balance=ExpertBalance(balance_rate=0.05))
+    sigmoid = fixed.clone(mixture=Mixture(experts=2, top_k=1, score_function="sigmoid"))
+    for refused in (LMObjective(fixed, 8), LMObjective(fixed, 8, balance=ExpertBalance(balance_rate=0.05)),
+                    LMObjective(sigmoid, 8)):
+        with pytest.raises(UntrainedRouter):
+            lowered(refused)
     weighed = fixed.clone(mixture=Mixture(experts=2, top_k=1, bias=True, norm_topk_prob=False))
-    LMObjective(weighed, 8)
-    LMObjective(fixed, 8, balance=ExpertBalance(aux_loss_alpha=0.2))
-    LMObjective(fixed, 8, balance=ExpertBalance(router_z_loss=0.1, balance_rate=0.05))
     drawn = nn.unbox(LMObjective(weighed, 8).init(jax.random.key(0)))
-    LMObjective(fixed, 8, variables=freeze(drawn, lambda path: "gate" not in map(str, path)))
+    for trains in (LMObjective(weighed, 8), LMObjective(fixed, 8, balance=ExpertBalance(aux_loss_alpha=0.2)),
+                   LMObjective(fixed, 8, balance=ExpertBalance(router_z_loss=0.1, balance_rate=0.05)),
+                   LMObjective(fixed, 8, variables=freeze(drawn, lambda path: "gate" not in map(str, path))),
+                   LMObjective(fixed.clone(mixture=Mixture(experts=2, top_k=2)), 8)):
+        lowered(trains)
     # A split that freezes something else still trains the router.
-    with pytest.raises(ValueError):
-        LMObjective(fixed, 8, variables=freeze(drawn, lambda path: "embed_tokens" not in map(str, path)))
-    # Beside it, value experts of two that a sigmoid weighs train their router from the loss, which the
-    # fixed router, frozen, leaves alone.
-    valued = fixed.clone(value_experts=ValueExperts(experts=2, top_k=2))
-    held = nn.unbox(LMObjective(valued.clone(mixture=weighed.mixture), 8).init(jax.random.key(0)))
-    LMObjective(valued, 8, variables=freeze(held, lambda path: "gate" not in map(str, path)))
-    for routed in ({"experts": 2, "top_k": 2}, {"experts": 2, "top_k": 1, "score_function": "sigmoid"}):
-        LMObjective(fixed.clone(mixture=Mixture(**routed)), 8)
-    # A layer kind's MLP mixer routes by its own mixture, as Nemotron-H's do.
-    mixed = decoder().clone(layer_types=("routed",), kinds={"routed": {"mixer": {
-        "class": "mlp", "fields": {"intermediate_size": 16, "mixture": {"experts": 2, "top_k": 1}}}}})
-    with pytest.raises(ValueError):
-        LMObjective(mixed, 8)
-    # A prediction depth's feed-forward kind, which fills no trunk layer, routes by its own too.
-    predicting = decoder().clone(num_nextn_predict_layers=1, mtp_feedforward_type="routed", kinds={
-        "routed": {"mixer": {"class": "mlp", "fields": {"intermediate_size": 16,
-                                                         "mixture": {"experts": 2, "top_k": 1}}}}})
-    with pytest.raises(ValueError):
-        LMObjective(predicting, 8, mtp_weight=0.3)
-    # Its depth frozen beside a trunk of two experts a token, which trains its own router from the loss.
-    trunked = predicting.clone(mixture=Mixture(experts=2, top_k=2))
-    tree = nn.unbox(LMObjective(trunked, 8, mtp_weight=0.3, balance=ExpertBalance(aux_loss_alpha=0.2)).init(
-        jax.random.key(0)))
-    LMObjective(trunked, 8, mtp_weight=0.3,
-                variables=freeze(tree, lambda path: not str(path[1]).startswith("mtp_")))
-    # A depth that builds its mixer from the trunk's kind, the trunk frozen, still trains that router.
-    inherited = mixed.clone(num_nextn_predict_layers=1)
-    tree = nn.unbox(inherited.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
-    with pytest.raises(ValueError):
-        LMObjective(inherited, 8, mtp_weight=0.3,
-                    variables=freeze(tree, lambda path: not str(path[1]).startswith("layers_")))
-    # Gemma 4's parallel branch routes beside the dense MLP.
-    parallel = decoder().clone(mixture=Mixture(experts=2, top_k=1, parallel=True, expert_features=16))
-    tree = nn.unbox(parallel.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
-    with pytest.raises(ValueError):
-        LMObjective(parallel, 8, variables=tree)
+    with pytest.raises(UntrainedRouter):
+        lowered(LMObjective(fixed, 8, variables=freeze(drawn,
+                                                       lambda path: "embed_tokens" not in map(str, path))))
+    # An MLP in the mixer's slot (Nemotron-H's) and a parallel mixer's routed branch route by their own.
+    routed = MLPMixer(intermediate_size=16, mixture=Mixture(experts=2, top_k=1))
+    parallel = ParallelMixer(branches=(ParallelBranch("attention", AttentionMixer(), 0.8, 0.6),
+                                       ParallelBranch("experts", routed, 1.3, 0.7)))
+    for model in (decoder().clone(layer_types=("routed",), kinds={"routed": {"mixer": routed}}),
+                  decoder().clone(mixer=parallel)):
+        with pytest.raises(UntrainedRouter):
+            lowered(LMObjective(model, 8))
+    # A softmax over a single expert weighs it by 1, normalized or not.
+    with pytest.raises(UntrainedRouter):
+        lowered(LMObjective(fixed.clone(mixture=Mixture(experts=1, top_k=1, norm_topk_prob=False)), 8))
+    # A model scored trains no router.
+    scorer = LMObjective(fixed, 8)
+    variables = nn.unbox(scorer.init(jax.random.key(1)))
+    batch = {TEXT_KEY: jnp.zeros((2, 9), jnp.int32)}
+    scored, _ = scorer.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(2), None))
+    assert np.isfinite(float(scored))
+
+
+def refused_where_traced(objective, batch) -> bool:
+    """Whether one differentiated pass of `objective`'s loss over `batch`, as a training step realizes it,
+    trains a router no term of its loss reaches (`refuse_fixed_routers`), whatever its routers' paths."""
+    from dew.nn.moe import fixed_routers
+    from dew.objectives.routing import refuse_fixed_routers
+
+    variables = nn.unbox(objective.init(jax.random.key(0)))
+    with fixed_routers() as found:
+        jax.vjp(lambda params: objective.scalar_loss({**variables, "params": params}, batch, step())[0],
+                variables["params"])
+    try:
+        refuse_fixed_routers(found)
+    except UntrainedRouter:
+        return True
+    return False
+
+
+def test_a_fixed_router_is_found_by_what_its_step_differentiates_wherever_it_is_stored():
+    """A fixed router is trained where the step differentiates its scores' parameters, whatever path a
+    store holds them under, and a loss balances it where any term of it reads the routers, the objective's
+    own or a model's within it: a scanned stack's router, its layers one stacked run or a period's, is
+    refused as a layer at a time's is, and balanced alike; a distillation's teacher, whose frozen router
+    the student's step never differentiates, is not, beside a student weighed by its score; and a PPO
+    actor's balance loss, its actor's own, trains the actor's router and not a critic's (review of
+    4591-4593)."""
+    from objective_cases import SEQ_LEN, decoder as case_decoder
+    from rl_cases import packed
+
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.rl import PPOObjective, ValueHead
+
+    def ppo(seq_len, *, balance, critic=None):
+        return PPOObjective(teacher, seq_len, critic=ValueHead(critic or case_decoder()), balance=balance)
+
+    def rollout(objective_for):
+        """`objective_for`'s objective and packed rows with the rollout's baseline and returns, aligned with
+        its responses, which PPO's loss reads."""
+        objective, rows = packed(objective_for)
+        mask = np.asarray(rows["response_mask"], np.float32)
+        return objective, {**rows, "old_values": np.zeros_like(mask), "returns": mask}
+
+    fixed = decoder().clone(mixture=Mixture(experts=2, top_k=1, bias=True))
+    with pytest.raises(UntrainedRouter):
+        lowered(LMObjective(fixed.clone(num_layers=4, scan_layers=True), 8))
+    lowered(LMObjective(fixed.clone(num_layers=4, scan_layers=True), 8,
+                        balance=ExpertBalance(aux_loss_alpha=0.2)))
+    # A periodic run's router, its period's layer inside the run's scan, meets its routing as sown.
+    periodic = fixed.clone(num_layers=4, scan_layers=True,
+                           layer_types=("sliding_attention", "full_attention") * 2,
+                           kinds={"sliding_attention": {"window": 4}})
+    with pytest.raises(UntrainedRouter):
+        lowered(LMObjective(periodic, 8))
+    lowered(LMObjective(periodic, 8, balance=ExpertBalance(aux_loss_alpha=0.2)))
+    window = {TEXT_KEY: jnp.ones((2, SEQ_LEN + 1), jnp.int32)}
+    weighed = case_decoder().clone(mixture=Mixture(experts=2, top_k=1, norm_topk_prob=False))
+    teacher = case_decoder().clone(mixture=Mixture(experts=2, top_k=1))
+    taught = DistillationObjective(LMObjective(weighed, SEQ_LEN), LMObjective(teacher, SEQ_LEN))
+    assert not refused_where_traced(taught, window)
+    assert refused_where_traced(DistillationObjective(LMObjective(teacher, SEQ_LEN),
+                                                      LMObjective(weighed, SEQ_LEN)), window)
+    for balance, refused in ((None, True), (ExpertBalance(aux_loss_alpha=0.2), False)):
+        assert refused_where_traced(*rollout(functools.partial(ppo, balance=balance))) is refused
+    # The actor's balance term reads the actor's routers alone: a critic's fixed router it trains beside
+    # them is not balanced by it.
+    assert refused_where_traced(*rollout(functools.partial(
+        ppo, balance=ExpertBalance(aux_loss_alpha=0.2), critic=teacher)))
 
 
 @pytest.mark.parametrize("seq_aux", [False, True])
