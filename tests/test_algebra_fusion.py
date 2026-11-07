@@ -651,7 +651,7 @@ def _divided_by(divisor):
 
     def program(x, w):
         widened = x.astype(jnp.float32)
-        mean = jnp.sum(widened * widened, axis=-1, keepdims=True) * held
+        mean = jnp.sum(widened * widened, axis=-1, keepdims=True) / held
         return (widened * jax.lax.rsqrt(mean + 1e-6) * w.astype(jnp.float32)).astype(x.dtype)
     return program
 
@@ -674,8 +674,8 @@ def _stream_read_early(x, branch, w):
 WRITTEN_AS_PROGRAMS = {
     "the first of two results normed": (_first_normed, 1),
     "the second of two results normed": (_second_normed, 1),
-    "a statistic over the width": (_divided_by(1 / 256), 1),
-    "a statistic over twice the width": (_divided_by(2 / 256), 0),
+    "a statistic over the width": (_divided_by(256.0), 1),
+    "a statistic over twice the width": (_divided_by(512.0), 0),
     "a statistic of the elements in another order": (_permuted_statistic, 0),
 }
 """Programs the compile point writes, each with the norms it writes in it: the same structure apart only
