@@ -56,8 +56,6 @@ from torch_precision import float64
 from transformers import AutoModelForCausalLM
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from reference_error import assert_same_artifact
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 GENERATORS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny")
@@ -118,6 +116,11 @@ def workflow_outputs(model, reference, dtype: torch.dtype) -> dict[str, np.ndarr
 
 
 def write_workflow() -> None:
+    # The gate's artifact check reads Dew: imported where it runs, so a reference environment of torch alone
+    # imports this module's readers (`decoder`, tools/beam_worker.py's).
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from reference_error import assert_same_artifact
+
     directory = FIXTURES / "diffusion-gemma-workflow"
     with np.load(directory / "reference.npz") as stored:
         reference = {key: stored[key] for key in stored.files}
