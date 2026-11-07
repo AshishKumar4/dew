@@ -908,8 +908,10 @@ def test_a_qwen35_checkpoint_serves_each_question_from_its_shared_turn_encoded_o
 
     source = Pretrained.load(str(QWEN35), dtype="float32")
     served = TextGeneration(source.model, source.variables, sampling=Sampling(temperature=0, pad_token_id=0))
+    # Sixteen draws a request, as `WIDE_HYBRID`'s: at eight its scores' paired ratio stays unresolved
+    # within 512 seeds.
     assert_served_as_exact(served, SEGMENT, f"Qwen3.5 shared turn {hits}", serving=HYBRID_SHARED, hits=hits,
-                           rounds=rounds, budget=8)
+                           rounds=rounds, budget=16)
 
 
 def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
