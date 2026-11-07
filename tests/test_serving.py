@@ -11,6 +11,7 @@ import dataclasses
 import functools
 import itertools
 import threading
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -888,6 +889,29 @@ def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry(requests
     """`assert_reads_a_shared_prefix`'s sites of 512 seeds, a store of one entry's, which CI draws in map
     tasks of 128."""
     assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
+
+
+QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny"
+"""A Qwen3.5 checkpoint (its byte-vocabulary text decoder): three gated delta net layers, each a recurrent
+memory and a four-tap conv tail a row keeps, and one of gated full attention, whose keys a server pages."""
+
+
+@pytest.mark.parametrize("hits, rounds", [((0, 6, 12), None), ((12,), (3,))], ids=["one-a-round", "at-once"])
+def test_a_qwen35_checkpoint_serves_each_question_from_its_shared_turn_encoded_once(hits, rounds):
+    """Shared-prefix serving end to end on a Qwen3.5 checkpoint as `Pretrained.load` reads it: a request's
+    chat turn and state, a segment each question past it declares shared (`SEGMENT`), is encoded once, and
+    each question is served from what the segment left, its attention pages, each gated delta net's
+    recurrent memory and conv tail, kept at the segment's end and copied into its row, asked one a round
+    or all at once. Each question draws what it draws alone and scores it as a full forward does
+    (check 1)."""
+    from dew.interop import Pretrained
+
+    source = Pretrained.load(str(QWEN35), dtype="float32")
+    served = TextGeneration(source.model, source.variables, sampling=Sampling(temperature=0, pad_token_id=0))
+    # Sixteen draws a request, as `WIDE_HYBRID`'s: at eight its scores' paired ratio stays unresolved
+    # within 512 seeds.
+    assert_served_as_exact(served, SEGMENT, f"Qwen3.5 shared turn {hits}", serving=HYBRID_SHARED, hits=hits,
+                           rounds=rounds, budget=16)
 
 
 def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
