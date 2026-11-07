@@ -377,14 +377,19 @@ def test_an_fp32_call_on_an_h100_infers_on_the_template_and_trains_on_xla(width,
     assert not launches(trained, 4)
 
 
+@pytest.mark.parametrize("form", ["fast", "accurate"])
 @pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
 def test_a_dense_bias_infers_on_the_template_and_trains_on_it_where_it_measured_faster(generation_name,
-                                                                                      causal):
+                                                                                      causal, form):
     """A bf16 call whose bias varies by query, lowered for an H100 and an A100: one no derivative is taken of
-    runs the template's launch on both; a differentiated one runs it causal on the H100 alone, xla's
-    attention elsewhere (`attention_kernels._attention_preferred`, M-DD-8)."""
+    runs the template's launch on both; a differentiated one in the fast form runs it causal on the H100
+    alone, xla's attention elsewhere (`attention_kernels._attention_preferred`, M-DD-8), and in the accurate
+    form everywhere, which xla's attention does not compute."""
     from kernel_compile import lowered_for
+
+    from dew.nn.kernels.generation import run_precision
+    from dew.nn.precision import Numerics
     shape = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16)
     bias = jax.ShapeDtypeStruct((1, 2, 512, 512), jnp.float32)
 
@@ -396,11 +401,13 @@ def test_a_dense_bias_infers_on_the_template_and_trains_on_it_where_it_measured_
         return out, pull(dout)
 
     def launches(fn, args):
-        text = lowered_for(fn, args, generation_name).as_text()
+        with run_precision(Numerics(forms=form)):
+            text = lowered_for(fn, args, generation_name).as_text()
         return "mosaic_gpu" in text or "xla.gpu.triton" in text
 
     assert launches(attend, (shape, shape, shape, bias))
-    assert launches(trained, (shape, shape, shape, bias, shape)) == (causal and generation_name == "sm90")
+    assert launches(trained, (shape, shape, shape, bias, shape)) == (
+        form == "accurate" or (causal and generation_name == "sm90"))
 
 
 @pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])
