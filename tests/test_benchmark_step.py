@@ -162,11 +162,12 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
 def test_the_tools_step_is_the_program_a_runs_first_step_compiles(monkeypatch):
     """The step the tool times (`benchmark_models.compiled_step`) is the program a run's first step compiles:
     lowered for a GPU (`lower_for`), the tool's compile and a fit over the same batches lower one program
-    (`dew.training.ahead.program_of`), the tool handing its compile each batch as fit hands its step, its
-    rows marked, its work counted and its host fields apart (`dew.training.ahead.step_batch`, row 3700)."""
+    (`dew.nn.kernels.options.program_digest`), the tool handing its compile each batch as fit hands its
+    step, its rows marked, its work counted and its host fields apart (`dew.training.ahead.step_batch`, row
+    3700)."""
     from dew.data.dataset import Loader
+    from dew.nn.kernels.options import program_digest
     from dew.training._lowering import Lowered
-    from dew.training.ahead import program_of
 
     tool = load("benchmark_step")
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
@@ -180,7 +181,7 @@ def test_the_tools_step_is_the_program_a_runs_first_step_compiles(monkeypatch):
         trainer.lower_for = "sm90"
         with pytest.raises(Lowered) as raised:
             run(trainer)
-        return program_of(raised.value.lowered)
+        return program_digest(raised.value.lowered)
 
     def timed(trainer):
         with models.compiled_step(case, trainer):

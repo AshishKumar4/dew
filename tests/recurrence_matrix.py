@@ -5,8 +5,7 @@ Its cells run generation.CHOICES' `gated_delta_rule` and `ssd`. Each takes the c
 (`recurrence_chunk.chunk`) of a form, forward and backward in one program as a layer's training step takes
 them, with the kernel the cell names (`generation.chosen`):
 - the recurrence template ('mosaic_gpu');
-- the portable math ('xla');
-- its derived forms ('derived', the delta rule's).
+- the portable math ('xla', the template's plain-JAX mainloop).
 
 Its output, final memory and every operand's gradient are held to its reference's (check 1): the form's
 port where it takes the call, fla's kernels for the delta rule's forms ('fla'), mamba_ssm's for the rated scan
@@ -44,11 +43,11 @@ PORTS = {"gated_delta_rule": "fla", "ssd": "pallas"}
 CHOICES = frozenset({"gated_delta_rule", "ssd"})
 """The generation.CHOICES entries the family's cells run (row 184): the chunked op's selectors'."""
 
-KERNELS = {"gated_delta_rule": frozenset({"mosaic_gpu", "xla", "derived", "fla"}),
+KERNELS = {"gated_delta_rule": frozenset({"mosaic_gpu", "xla", "fla"}),
            "ssd": frozenset({"mosaic_gpu", "xla", "pallas", "tpu"})}
 """The kernels each choice's cells run under test (row 4513), each taken by its route (the cell asserts it):
-the template, the portable math and its derived forms, each port held to the portable math, and the rated
-scan's TPU kernel on the TPU tier (a v6e or a v5e, as the tier's Colab TPU is)."""
+the template, the portable math (its plain-JAX mainloop), each port held to the portable math, and the
+rated scan's TPU kernel on the TPU tier (a v6e or a v5e, as the tier's Colab TPU is)."""
 
 
 def _op(hooks) -> str:
@@ -144,17 +143,15 @@ def supported(case: dict[str, str]) -> bool:
 CASES = (
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'),
     ('sm90', 'kimi delta attention', 'xla', 'float32', 'packed'),
-    ('sm80', 'write gate', 'derived', 'bfloat16', 'packed'),
-    ('sm80', 'rated scan', 'pallas', 'float32', 'one'),
-    ('sm80', 'gated delta net', 'fla', 'float32', 'packed'),
+    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'packed'),
+    ('sm80', 'gated delta net', 'fla', 'float32', 'one'),
+    ('sm90', 'rated scan', 'pallas', 'float32', 'one'),
+    ('sm80', 'kimi delta attention', 'xla', 'bfloat16', 'one'),
+    ('sm90', 'gated delta net', 'fla', 'bfloat16', 'packed'),
+    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'packed'),
+    ('sm80', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'one'),
+    ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'),
     ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'),
-    ('sm90', 'write gate', 'derived', 'float32', 'one'),
-    ('sm90', 'rated scan', 'pallas', 'bfloat16', 'packed'),
-    ('sm80', 'gated delta net', 'xla', 'bfloat16', 'one'),
-    ('sm80', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'packed'),
-    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'),
-    ('sm90', 'gated delta net', 'derived', 'bfloat16', 'one'),
-    ('sm90', 'kimi delta attention', 'derived', 'bfloat16', 'one'),
     ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
 )
 
@@ -170,22 +167,24 @@ TPU_CASES = (
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change)."""
 
 
-def _on_par(family: str, case: tuple[str, ...]) -> None:
+def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> None:
     """The chunked op's training step of `case` on its GPU, its kernel named, on par with its reference's
-    (`_reference`; check 1, the recurrence a token at a time in float64 the truth): the output, the final
-    memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
+    (`_reference`; check 1, the recurrence a token at a time in float64 the truth) over `seeds` draws: the
+    output, the final memory and every operand's gradient. Its routes are its family's (`CHOICES`)."""
     named = dict(zip(AXES[family], case, strict=True))
     hooks, starts = FORMS[named["form"]], _starts(named)
 
     def truth(operands):
         return _wide(token_by_token(hooks, dataclasses.replace(operands, starts=starts)))
 
+    step = jax.jit(_step(named, named["kernel"]))
+    # Its routes read from one draw's step: a check-1 site's judge pools its map tasks' records, running none.
     with generation.routes() as found:
-        assert_as_exact(jax.jit(_step(named, named["kernel"])), jax.jit(_step(named, _reference(named))),
-                        functools.partial(_drawn, named), "-".join(case), seeds=FEWEST_SEEDS,
-                        truth_fn=with_gradients(truth))
+        jax.block_until_ready(step(*_drawn(named, 0)))
     assert {route.choice for route in found} <= CHOICES
     assert any(route.kernel == named["kernel"] for route in found)
+    assert_as_exact(step, jax.jit(_step(named, _reference(named))), functools.partial(_drawn, named),
+                    "-".join(case), seeds=seeds, truth_fn=with_gradients(truth))
 
 
 @cell("recurrence", covers=lambda case: dict(zip(AXES["recurrence"], case, strict=True)))

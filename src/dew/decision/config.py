@@ -146,8 +146,8 @@ class DecisionRunConfig(DecoderRunConfig):
     None keeps the layout's own, a release's named and a fresh head's described, which its record holds
     as the build resolved it (`layout_writing`); a run that leaves it None and resumes takes the saved
     run's (`BUILT`, `RunConfig.resumed`). A run saved before this field reads `named`, as it ran, and one
-    whose record holds None the writing its checkpoint's layout states (`dew.config.earlier_option_text`,
-    `earlier_option_writing`). A joint row
+    whose record holds None the writing its checkpoint's layout states
+    (`dew.config.earlier.earlier_option_text`, `earlier_option_writing`). A joint row
     names each option by its key beside its description in its schema, the named writing, and has no
     other."""
     segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
@@ -165,6 +165,12 @@ class DecisionRunConfig(DecoderRunConfig):
     """Whether a question row reads its options in parallel, each at positions of its own after the
     question (`QuestionLayout.parallel`), which a head that reads option slots needs. None keeps the
     layout's own."""
+    shared_state: int | None = None
+    """The most questions a row asks over one copy of their request's state, each read as its own row reads
+    it (`QuestionLayout.shared_state`). None keeps a row a question, each with its state."""
+    siblings: bool | None = None
+    """Whether a question of a row over one state also reads the questions before it in the row
+    (`QuestionLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
     unit: Unit | None = None
     """How a question row's `segments` encode their text, piece by piece or whole
     (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""
@@ -421,7 +427,8 @@ class DecisionRunConfig(DecoderRunConfig):
         if any(value is None for value in stated):
             return None
         widest = {"options": max(integer(value, "slots.options") for value in stated)}
-        fields = self.objective.fields
+        # The objective's arguments as it builds them: those the run states over those it recorded defaulted.
+        fields = {**self.objective.defaults, **self.objective.fields}
         rate = number(fields.get("none_of_the_above") or 0.0, "none_of_the_above")
         fewest = integer(fields.get("none_of_the_above_options") or 0, "none_of_the_above_options")
         return option_width(widest, rate, fewest)

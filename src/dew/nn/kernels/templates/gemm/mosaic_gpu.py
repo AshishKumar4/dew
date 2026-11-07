@@ -589,7 +589,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                       transpose_lhs=transpose_lhs, depth=k2, width=n)
     _gmm_refused(rhs, tiles, (rows, k, matrices, k2, n), dense=dense, first=first, paired=paired)
     _tables_refused(gather, scatter, tiles, family_of(tiles, lhs.dtype), prologue=prologue, dense=dense,
-                    transpose_lhs=transpose_lhs)
+                    transpose_lhs=transpose_lhs, block_scaled=mx_scales is not None)
     rows = rows if gather is None else gather.shape[0]
     accumulators = 1 if paired is None else 2
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
@@ -1080,15 +1080,29 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
 
 
 def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
-                    transpose_lhs: bool) -> None:
+                    transpose_lhs: bool, block_scaled: bool = False) -> None:
     """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows
-    (`Family.gathers_rows`), of no prologue, transposed rows or dense call, and of a scattered one
-    (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
-    if gather is not None and (prologue is not None or dense or transpose_lhs or not family.gathers_rows):
+    (`Family.gathers_rows`), of no prologue, transposed rows, dense call or block scales (`mx_scales`,
+    whose rows' scales its loads read in the rows' order, not gathered: tcgen05's bundle gathers), and of a
+    scattered one (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
+    if gather is not None and (prologue is not None or dense or transpose_lhs or block_scaled
+                               or not family.gathers_rows):
         raise ValueError(f"a gathered product's rows are a ring family's gather, with no prologue, "
-                         f"transposed rows or dense call, not {tiles}'s")
+                         f"transposed rows, dense call or block scales, not {tiles}'s")
     if scatter is not None and (dense or not family.gathers_rows):
         raise ValueError(f"scattered rows are a grouped call's on a ring family, not {tiles}'s")
+
+
+def _tgmm_tables_refused(tables: tuple, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
+                         k_major: bool, step_scaled: bool) -> None:
+    """Dew: `tgmm`'s refusal of a gathered operand (`tables`, each operand's) but on a family that gathers
+    rows, of no rows-contiguous layout, step scales or dense call, and the rows' table of no prologue (which
+    `gmm`'s refuses alike, `_tables_refused`)."""
+    if any(table is not None for table in tables) and (
+            dense or k_major or step_scaled or not family.gathers_rows
+            or (tables[0] is not None and prologue is not None)):
+        raise ValueError(f"a gathered kernel gradient's rows are a ring family's gather, with no prologue on "
+                         f"gathered rows, rows-contiguous layout, step scales or dense call, not {tiles}'s")
 
 
 def _gmm_refused(rhs, tiles: Tiles, extents: tuple, *, dense: bool, first, paired) -> None:
@@ -1516,7 +1530,8 @@ def _rhs_index(transpose_rhs: bool):
 def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
          multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False, prologue=None,
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False,
-         dense: bool = False, k_major: bool = False, step_scales: tuple | None = None) -> jax.Array:
+         dense: bool = False, k_major: bool = False, step_scales: tuple | None = None,
+         gather: tuple | None = None) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
     `tiles.block_m` and the width by `tiles.block_n`, and the tile takes one multiprocessor;
@@ -1534,35 +1549,48 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     prologue or split; with `step_scales` besides (`row_scales` `[rows / 128, depth]`, `column_scales`
     `[rows / 128, width]`, fp32; exact sums, 128-row steps), each step's partial times its depth rows' and
     columns' scales before its add (`gmm`'s `step_scales`: a blockwise FP8 recipe's kernel gradient, row
-    4518)."""
+    4518). `gather`, a table for either operand (`(lhs_table, rhs_table)`, int32 `[rows]` or None), makes
+    the rows that operand's rows at the table's entries, read where they lie (`gmm`'s `gather`: a mixture of
+    experts' tokens, and a scattered product's cotangent at its slots, row 1376), on a ring family's
+    producer, with no prologue, rows-contiguous layout, step scales or dense call."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     if k_major and (prologue is not None or tiles.splits > 1 or (step_scales is not None and (
             not exact_sums or block_k != STEP_SCALE_DEPTH))):
         raise ValueError(f"a rows-contiguous kernel gradient takes no prologue or split, and its step "
                          f"scales an exact {STEP_SCALE_DEPTH}-row step, not {tiles}")
+    tables = (None, None) if gather is None else tuple(gather)
+    _tgmm_tables_refused(tables, tiles, family_of(tiles, lhs.dtype), prologue=prologue, dense=dense,
+                         k_major=k_major, step_scaled=step_scales is not None)
     m, k = lhs.shape if k_major else lhs.shape[::-1]
     n, k2 = rhs.shape if k_major else rhs.shape[::-1]
+    k, k2 = (rows if table is None else table.shape[0] for rows, table in zip((k, k2), tables, strict=True))
     g = group_sizes.shape[0]
     if k != k2 or m % block_m or n % block_n or tiles.cluster != 1:
         raise ValueError(f"a [{k}, {m}] by [{k2}, {n}] kernel gradient does not take {tiles}")
-    # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group; to whole row blocks where the
-    # family's loads read past an operand unpredicated (its last group's last block).
-    multiple = 8 if family_of(tiles, lhs.dtype).bounded_loads else math.lcm(8, block_k)
-    row_axis = 1 if k_major else 0
-    lhs, rhs = rows_padded(lhs, row_axis, multiple), rows_padded(rhs, row_axis, multiple)
-    k = lhs.shape[row_axis]
-    prologue_operands = sides_padded(prologue_operands, prologue_axes, multiple)
-
     group_sizes = group_sizes.astype(jnp.int32)
     out_dtype = jnp.dtype(out_dtype)
     if tiles.splits > 1:
         # Each group's rows in `splits` runs of whole steps from the group's first block, the first and last
-        # clipped to its rows: each run a group of its own, its fp32 partial summed after.
+        # clipped to its rows: each run a group of its own, its fp32 partial summed after. The operands go
+        # as they came, the run's call padding them (a padded table and its ungathered operand would meet
+        # at two row counts).
         sliced = _sliced(group_sizes, block_k, tiles.splits)
         partials = tgmm(lhs, rhs, sliced, tiles=dataclasses.replace(tiles, splits=1), out_dtype=jnp.float32,
                         multiprocessors=multiprocessors, interpret=interpret, prologue=prologue,
-                        prologue_operands=prologue_operands, prologue_axes=prologue_axes)
+                        prologue_operands=prologue_operands, prologue_axes=prologue_axes, gather=gather)
         return partials.reshape(g, tiles.splits, m, n).sum(axis=1).astype(out_dtype)
+    # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group; to whole row blocks where the
+    # family's loads read past an operand unpredicated (its last group's last block). A table is padded to
+    # whole row blocks always, a pad reading row 0 of its operand, which stays as it is: its producer reads
+    # a step's entries by plain loads, which no TMA bounds (`_walked_rows`).
+    multiple = 8 if family_of(tiles, lhs.dtype).bounded_loads else math.lcm(8, block_k)
+    row_axis = 1 if k_major else 0
+    lhs, rhs = (rows_padded(operand, row_axis, multiple) if table is None else operand
+                for operand, table in zip((lhs, rhs), tables, strict=True))
+    tables = tuple(None if table is None else rows_padded(table.astype(jnp.int32), 0, math.lcm(8, block_k))
+                   for table in tables)
+    k = -(-k // multiple) * multiple
+    prologue_operands = sides_padded(prologue_operands, prologue_axes, multiple)
     group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
     # The groups walked longest first (`_segmented`), a group's tiles their steps (ties in their order).
     order = jnp.argsort(-group_num_blocks).astype(jnp.int32)
@@ -1575,7 +1603,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     walked = g * (m // block_m) * (n // block_n)
     programs = launched(family_of(tiles, lhs.dtype), multiprocessors, walked, tail)
     return _tgmm_streamed(
-        (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts, order),
+        (lhs, rhs, *tables), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts,
+                              order),
         (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=programs,
         interpret=interpret, prologue=prologue, prologue_operands=prologue_operands,
         prologue_axes=prologue_axes, exact_sums=exact_sums, tail=tail, k_major=k_major,
@@ -1600,10 +1629,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     signalling a semaphore, which the first waits on and adds before storing the tile. Interpreted, one
     program walks every program's tiles in turn (the interpreter runs its programs one after another, each
     paying its own setup), a balanced tail's programs ordered so no semaphore is needed (`tail.ordered`).
-    `operands` are padded and `groups` is `_group_blocks`' with the sizes first (`tgmm`)."""
-    lhs, rhs = operands
+    `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
+    lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
-    _, m, n, g = shape
+    k, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers = tiles.warpgroups
     depth_half = block_m // consumers
@@ -1619,6 +1648,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
     def body(sizes_gmem, starts_gmem, ends_gmem, blocks_gmem, block_starts_gmem, order_gmem, lhs_gmem,
              rhs_gmem, *refs):
+        table_gmems, refs = _tables_placed(tables, refs)
         *side_gmems, o_gmem = refs if tail is None else refs[:-1]
         scale_gmems, side_gmems = _scales_apart(side_gmems, step_scales is not None)
         ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
@@ -1627,7 +1657,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
             _tgmm_scheduled, groups=(sizes_gmem, blocks_gmem, block_starts_gmem, order_gmem),
             operands=(lhs_gmem, rhs_gmem, side_gmems), tail=tail, programs=multiprocessors, grid=grid,
             tiles=tiles, stepped=stepped, prologue_axes=prologue_axes, interpreted=bool(interpret),
-            k_major=k_major, scale_gmems=scale_gmems)
+            k_major=k_major, scale_gmems=scale_gmems, table_gmems=table_gmems)
 
         def scope(fixed_smems, fixed_barriers, *meeting, streams):
             halves = meeting[0] if meeting else None
@@ -1688,7 +1718,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
-                                             swizzles=SCALE_SWIZZLES if step_scales is not None else None))
+                                             swizzles=SCALE_SWIZZLES if step_scales is not None else None,
+                                             **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
     # A balanced tail's partials: each program's, a consumer's share of a tile each, of the tile its range
@@ -1699,20 +1730,45 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
                            consumers=consumers, interpret=interpret, approx_math=False, name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
-                           cost=unit_cost.estimate(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands,
-                                                   out_type))
-    return kernel(*groups, lhs, rhs, *(step_scales or ()), *prologue_operands)[0]
+                           cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
+    present = tuple(table for table in tables if table is not None)
+    return kernel(*groups, lhs, rhs, *present, *(step_scales or ()), *prologue_operands)[0]
+
+
+def _tables_placed(tables: tuple, refs: tuple) -> tuple:
+    """Dew: a `tgmm` kernel's gather tables' references, each operand's (None where it has none), leading
+    the rest, and the references after them."""
+    placed = []
+    for table in tables:
+        placed.append(None if table is None else refs[0])
+        refs = refs if table is None else refs[1:]
+    return tuple(placed), refs
+
+
+def _tgmm_gathered(tables: tuple, blocks: dict, interpret: bool) -> dict:
+    """Dew: a gathered kernel gradient's streams (`family.streams`' arguments, `_gathered`'s for `gmm`): each
+    gathered operand's ring (`ring_0` the rows', `ring_1` the cotangent's) its producer's gather, or
+    interpreted each of a step's rows its copies (`mosaic.piece_copies`, at no stated swizzle)."""
+    names = tuple(name for name, table in zip(('ring_0', 'ring_1'), tables, strict=True) if table is not None)
+    if not names:
+        return {}
+    if interpret:
+        return {'copies': {name: blocks[name][0][0] * mosaic.piece_copies(blocks[name][0], blocks[name][1],
+                                                                          None, 1) for name in names}}
+    return {'gathered': names}
 
 
 def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail | None, programs: int,
                     grid: tuple, tiles: Tiles, stepped: tuple, prologue_axes: tuple,
-                    interpreted: bool, k_major: bool = False, scale_gmems=None) -> tuple:
+                    interpreted: bool, k_major: bool = False, scale_gmems=None,
+                    table_gmems: tuple = (None, None)) -> tuple:
     """Dew: a streamed kernel gradient's tile at the persistent walk's `index` (`mosaic.Family.persist`'s
     schedule): whether its program walks any of its rows, how many steps, its streams' views (step `j` its
     group's `j`-th row block from the program's first, at the tile's depth and columns), and its group,
     depth and columns, its group's steps, the program's first of them, its partials' gatherer (`walked`)
     and its program. `groups` are the group sizes', block counts', first blocks' and walking order's
-    references and `operands` the rows', cotangent's and side operands'."""
+    references, `operands` the rows', cotangent's and side operands', and `table_gmems` each operand's
+    gather table (a gathered operand's step its rows at the table's entries, `mosaic.Rows` of one row)."""
     sizes_gmem, blocks_gmem, block_starts_gmem, order_gmem = groups
     lhs_gmem, rhs_gmem, side_gmems = operands
     index = tail_of.ordered(tail, index, programs, interpreted)
@@ -1730,9 +1786,15 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
     def rows_block(j):
         return 0, first + j
 
+    def gathered_rows(table, block):
+        return lambda j: mosaic.Rows(table, (first + j) * tiles.block_k, (block,), 1)
+
     views = ({'ring_0': (lhs_gmem.at[depth], rows_block), 'ring_1': (rhs_gmem.at[columns], rows_block)}
              if k_major else
-             {'ring_0': (lhs_gmem.at[:, depth], row_block), 'ring_1': (rhs_gmem.at[:, columns], row_block)})
+             {name: (gmem.at[:, extent], row_block) if table is None else (gmem, gathered_rows(table, block))
+              for name, gmem, table, extent, block in zip(('ring_0', 'ring_1'), (lhs_gmem, rhs_gmem),
+                                                          table_gmems, (depth, columns), (m_i, n_i),
+                                                          strict=True)})
     if scale_gmems is not None:
         # Its depth rows' scales and its columns', a step's row of each at the tile's (`step_scales`).
         views['row_scales'] = (scale_gmems[0].at[:, depth], row_block)

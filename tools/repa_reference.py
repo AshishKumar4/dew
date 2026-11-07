@@ -10,7 +10,7 @@
 Each case lands its inputs, the projector's weights in Flax's layout, and
 the loss in float64 and float32.
 
-Two more fixtures:
+One more fixture:
 
 - composed.npz: REPA's whole training loss as train.py takes it,
   `loss_mean + proj_loss_mean * proj_coeff` over `SILoss.__call__` (linear
@@ -27,10 +27,6 @@ Two more fixtures:
   ORDERS orders of the stand-in's hidden units (tests/residual_orders.py),
   for tests/reference_error.py's K-order rule; order 1 in float64 is
   checked to land on the float64 gradient.
-- preprocessed.npz: 256-pixel images through `preprocess_raw_image`'s
-  "dinov2" branch (/255, ImageNet's normalization, bicubic to 224) and
-  iREPA's `DINOv2Encoder.preprocess`, then iREPA's `spatial_zscore` of
-  them read as features, as published.
 
     PYTHONPATH=src python tools/repa_reference.py
 """
@@ -243,31 +239,6 @@ def composed() -> None:
     print(f"{FIXTURE}: REPA's composed loss and its gradient")
 
 
-def preprocessed() -> None:
-    generator = np.random.default_rng(12)
-    pixels = generator.integers(0, 256, (2, 256, 256, 3), dtype=np.uint8)
-    from torchvision.transforms import Normalize
-    repa = definitions(REPA + "train.py", ("preprocess_raw_image",),
-                     {"torch": torch, "Normalize": Normalize, **TIMM})
-    irepa = definitions(IREPA + "vision_encoder.py", ("DINOv2Encoder",),
-                      {"torch": torch, "Normalize": Normalize, "VisionEncoder": object, "Dict": dict,
-                       "Optional": object, **TIMM})
-    zscore = definitions(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
-    arrays = {"pixels": pixels, "gamma": np.asarray(GAMMA)}
-    for dtype, suffix in ((torch.float64, "_f64"), (torch.float32, "")):
-        raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
-        dinov2 = repa["preprocess_raw_image"](raw, "dinov2")
-        encoder = types.SimpleNamespace(resolution=256)
-        same = irepa["DINOv2Encoder"].preprocess(encoder, raw)
-        assert torch.equal(same, dinov2), "REPA's and iREPA's DINOv2 preprocessing differ"
-        features = dinov2.permute(0, 2, 3, 1).reshape(2, -1, 3)
-        arrays[f"dinov2{suffix}"] = features.double().numpy()
-        arrays[f"zscore{suffix}"] = zscore(features, alpha=GAMMA).double().numpy()
-    np.savez(FIXTURE / "preprocessed.npz", **arrays)
-    print(f"{FIXTURE}: REPA's and iREPA's DINOv2 preprocessing at 256 pixels")
-
-
 if __name__ == "__main__":
     main()
     composed()
-    preprocessed()

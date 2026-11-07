@@ -1,19 +1,24 @@
 """Rows where a table says (row 1376): a gathered ring (`Ring`), a stream whose rows each lie where a table
 says, a mixture of experts' tokens read in their own order, loaded by the producer warpgroup's cp.async
-copies, and a scattered store (`scattered_rows`), an output's rows each written where a permutation says,
-both through `inline_mgpu`'s lane-level code (Pallas's warpgroup semantics reach no thread's own copy,
-address or mbarrier)."""
+copies (Hopper's) or by TMA's four-row gathers (`Committed`, tcgen05's load warp), and a scattered store
+(`scattered_rows`), an output's rows each written where a permutation says, each through `inline_mgpu`'s
+lane-level code (Pallas's warpgroup semantics reach no thread's own copy, address or mbarrier)."""
 
 import dataclasses
 import functools
 
 import jax.numpy as jnp
+import numpy as np
 from jax._src.lib.mlir.dialects import gpu as mgpu_gpu, llvm as mgpu_llvm, nvvm as mgpu_nvvm, scf as mgpu_scf
 from jax.experimental import pallas as pl
-from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
+from jax.experimental.mosaic.gpu import (
+    fragmented_array as mgpu_fragments,
+    launch_context as mgpu_launch,
+    utils as mgpu_utils,
+)
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
-from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref
+from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref, vector as mgpu_vector
 
 from dew.nn.kernels.templates import mosaic, resources
 
@@ -67,16 +72,46 @@ class Ring(mosaic.Ring):
         return self.smem.at[slot]
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, swizzle: int | None = None) -> dict:
-    """A gathered `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, their rows
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, swizzle: int | None = None,
+         released_by_products: bool = False) -> dict:
+    """A gathered ring's allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, their rows
     staged at `swizzle` bytes (where None, the widest a row fills, `resources.widest_swizzle`, as layout
     inference stages an ungathered ring's: a value column block's 32 bf16 columns at 64), a load mbarrier
     each in shared memory (`uint64`, `Ring.initialized`) and a release barrier each that `consumers` arrive
-    at."""
+    at, or, `released_by_products`, that the products reading a slot arrive at once by their commit
+    (`Committed`'s: tcgen05's, `mosaic.ring`'s alike)."""
     swizzle = swizzle or resources.widest_swizzle(dtype, block[-1])
+    consumed = (plgpu.Barrier(num_barriers=stages, orders_tensor_core=True) if released_by_products
+                else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
     return {'smem': mosaic.staged((stages, *block), dtype, swizzle),
-            'full': plgpu.SMEM((stages,), jnp.uint64),
-            'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
+            'full': plgpu.SMEM((stages,), jnp.uint64), 'consumed': consumed}
+
+
+@dataclasses.dataclass(frozen=True)
+class Committed(Ring):
+    """A gathered ring tcgen05's load warp fills and its products give back (`mosaic_sm100.CommittedRing`'s
+    release, their commit arriving at the slot's): each step's rows by TMA's four-row gathers (`tma_rows`,
+    `cp.async.bulk.tensor.2d...tile::gather4`, sm100's), one thread issuing them all and arriving once at the
+    slot's load mbarrier, expecting their bytes, which the copies complete. A row alone by tiled TMA is a
+    copy of its own (an 8-row tile's slice no swizzled box takes); a gather moves four."""
+
+    def load(self, turn: mosaic.Turn, view) -> None:
+        slot = mosaic.opaque(turn.slot)
+        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
+            self.consumed.at[slot], parity=turn.freed))
+        tokens, rows = view
+        height, width = self.block
+        [depth] = rows.rest
+        swizzle = mosaic.swizzle_transforms(tokens.dtype, mosaic.SWIZZLE_BYTES)
+        refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType(),
+                plgpu.Layout.WG_SPLAT(()))
+        copies = functools.partial(tma_rows, swizzle=mosaic.SWIZZLE_BYTES)
+        plgpu.inline_mgpu(arg_types=refs)(lambda ctx, *refs: copies(ctx, *refs))(
+            tokens, rows.table.at[pl.ds(rows.start, height)], self.smem.at[slot],
+            self.full.at[pl.ds(slot, 1)], jnp.asarray(depth * width, jnp.int32))
+
+    def release(self, turn: mosaic.Turn) -> None:
+        plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
 
 
 def barrier_of(memref) -> mgpu_utils.BarrierRef:
@@ -148,6 +183,48 @@ def gathered_copies(source, rows, slot, barrier, *, swizzle: int) -> None:
     mgpu_nvvm.cp_async_mbarrier_arrive(tracked.get_ptr())
     mgpu_utils.warpgroup_barrier()
     tracked.arrive(predicate=mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARPGROUP))
+
+
+def tma_rows(ctx, source, rows, slot, barrier, column, *, swizzle: int) -> None:
+    """`Committed.load`'s copies: row `r` of `slot` (`[height, width]`, 8-row tiles at `swizzle` bytes)
+    row `rows[r]` of `source` (the tokens, whole: TMA's descriptor is of a kernel argument) from `column`,
+    each 8-row tile's rows by two four-row gathers (`LaunchContext.async_copy`'s gather, its indices
+    `TMA_INDICES_4_LAYOUT`: every thread holds them, the warpgroup's first thread issues: the load warp's,
+    `mosaic_sm100.LOAD_WARP`), after that thread's one arrival at `barrier` expecting every row's bytes."""
+    i32 = mgpu_ir.IntegerType.get_signless(32)
+    index = mgpu_ir.IndexType.get()
+    shape = tuple(mgpu_ir.MemRefType(slot.type).shape)
+    tile_rows, tile_columns = shape[2], shape[3]
+    width = shape[1] * tile_columns
+    element = mgpu_ir.MemRefType(source.type).element_type
+    tracked = barrier_of(barrier)
+    total = shape[0] * tile_rows * width * mgpu_utils.bitwidth(element) // 8
+    mgpu_nvvm.mbarrier_arrive_expect_tx(tracked.get_ptr(), mgpu_utils.c(total, i32),
+                                        predicate=mgpu_utils.single_thread_predicate(
+                                            mgpu_utils.ThreadSubset.WARPGROUP))
+    layout = mgpu_fragments.TMA_INDICES_4_LAYOUT
+    vector = mgpu_ir.VectorType.get((4,), i32)
+    start = splat_value(column)
+    for tile in range(shape[0]):
+        # The tile's entries, four a register, every thread the same (`layout`), each a load of its own: a
+        # tile's first entry lies where its group's rows start, at no 16-byte alignment.
+        registers = [mgpu_vector.from_elements(vector, [
+            mgpu_memref.load(rows, [mgpu_utils.c(tile * tile_rows + 4 * part + lane, index)])
+            for lane in range(4)]) for part in range(tile_rows // 4)]
+        indices = mgpu_fragments.FragmentedArray(
+            _registers=_registered(registers, layout, tile_rows), _layout=layout, _is_signed=False)
+        ctx.async_copy(src_ref=source, dst_ref=mgpu_utils.memref_slice(slot, mgpu_utils.ds(tile, 1)),
+                       gmem_slice=(indices, mgpu_utils.ds(mgpu_arith.index_cast(index, start), width)),
+                       gmem_transform=mgpu_launch.TileTransform((tile_rows, tile_columns)), swizzle=swizzle,
+                       barrier=tracked, arrive=False)
+
+
+def _registered(registers: list, layout, rows: int):
+    """`registers` (each four entries) as a `FragmentedArray`'s of `rows` entries in `layout`."""
+    held = np.empty(layout.registers_shape((rows,)), dtype=object)
+    for at, register in zip(np.ndindex(held.shape), registers, strict=True):
+        held[at] = register
+    return held
 
 
 def scattered_rows(smem, out: mosaic.Scattered, row_start, first, stored, column) -> None:

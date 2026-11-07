@@ -1412,12 +1412,14 @@ class Issuer[Accumulator](abc.ABC):
 
         return resources.widest_swizzle(dtype, columns)
 
-    def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> tuple | dict:
+    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = ()) -> tuple | dict:
         """The memory a program's products take where the issuer keeps each product's accumulator itself
         (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
-        consumer role each), allocated at the program's scope: a role's own scope may not allocate (Mosaic
-        GPU's thread-collective allocations wait for every warpgroup); none where its products need none."""
-        del consumers, widths
+        consumer role each), and stages a register left operand of each `(depth, dtype)` in `lefts` where
+        it takes none in registers (`takes_register_left`: a shared tile a role), allocated at the program's
+        scope: a role's own scope may not allocate (Mosaic GPU's thread-collective allocations wait for
+        every warpgroup); none where its products need none."""
+        del consumers, widths, lefts
         return ()
 
     def product_shared(self, scratch) -> tuple:
@@ -1430,6 +1432,19 @@ class Issuer[Accumulator](abc.ABC):
         """Within the block, the program's product scratch (`product_scratch`'s, scoped) its products take."""
         del refs
         yield
+
+    def product_held(self, products: tuple | None) -> tuple:
+        """What `Family.scoped`'s `products` (`(consumers, widths, lefts)`) hold in shared memory
+        (`product_shared` of `product_scratch`): a launch's account of them, from the one tuple its scope
+        allocates."""
+        return () if products is None else self.product_shared(self.product_scratch(*products))
+
+    def product_addresses(self, products: tuple | None) -> int:
+        """The unaligned shared-memory words `Family.scoped`'s `products` keep beside what they hold
+        (`resources.Scope.addresses`): none, but where the issuer keeps its products in tensor memory, whose
+        allocation keeps its address in one (`resources.TMEM_ADDRESS_BYTES`)."""
+        del products
+        return 0
 
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
@@ -2181,6 +2196,20 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         (`resources.consumer_registers`). Each stages its share of the multiprocessor's shared memory
         (`resources.program_shared`), which may hold no tile at that many."""
         return resources.register_programs(self, consumers, registers)
+
+    def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
+        """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch
+        (`product_scratch`) scoped beside `allocations`, `body` traced within it (`products_in`), where the
+        issuer keeps any; `product_held` its account."""
+        scratch = () if products is None else self.product_scratch(*products)
+        if not scratch:
+            return super().scoped(body, *allocations, streams=streams, after_walks=after_walks)
+
+        def within(*refs, **named):
+            with self.products_in(refs[-1]):
+                return body(*refs[:-1], **named)
+
+        return super().scoped(within, *allocations, scratch, streams=streams, after_walks=after_walks)
 
 
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):

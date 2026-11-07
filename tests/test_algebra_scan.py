@@ -12,7 +12,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.extend import core as jcore
 from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, cost, linear_scan, scan
@@ -424,33 +423,35 @@ def test_a_derived_scan_holds_its_latest_splits_alone():
 @pytest.mark.parametrize(("update_fn", "operands", "draw_fn"),
                          [(gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)],
                          ids=["gated_delta", "kimi_delta"])
-def test_the_delta_rules_carry_reads_the_state_through_one_product_where_its_state_is_bounded(
-        update_fn, operands, draw_fn):
+def test_the_delta_rules_carry_from_a_ranged_state_computes_its_token_scan(update_fn, operands, draw_fn):
     """The delta rule's split (`carry.split`), its keys, write gates, log decays and values ranged (unit keys,
     so tokens' corrections overlap by at most their gates, under 1; decays at most 1; values under the draws'
-    8): where its entering state is ranged too
-    (`Scan.ranges`' "state"), its carry (`step` over a chunk's prepared values) reads the state through one
-    product, a matrix the chunk prepared times the state, the solve, the decays and every other product among
-    the prepared values. With no range on the state, the solve's distribution over `W h` makes an
-    intermediate of the state's magnitude no number bounds (§6.3), and the carry keeps it: more than one
-    product reads the state."""
+    8), its entering state ranged too (`Scan.ranges`' "state", where the solve need not distribute over
+    `W h`, §6.3) or not: a chunk's carry (`step` over its prepared values) from a drawn state within that
+    range on par with the token-by-token scan over the chunk, against the float64 truth (check 1)."""
     names = ("q", "k", "v", "g", "beta")
-    chunk = {name: value[:CHUNK] for name, value in zip(names, draw_fn(0), strict=True)}
     ranges = {"k": 1.0, "beta": 1.0, "overlap": 1.0, "g": (-np.inf, 0.0), "v": 8.0}
 
-    def carried_products(declared: dict) -> list[str]:
+    def draw(seed):
+        entering = np.random.default_rng([374, seed]).uniform(-64.0, 64.0, (KEY, VALUE)).astype(np.float32)
+        return (*(value[:CHUNK] for value in draw_fn(seed)), entering)
+
+    def tokens(q, k, v, g, beta, h):
+        for token in zip(q, k, v, g, beta, strict=True):
+            h = update_fn(h, *token)
+        return h
+
+    for declared in ({**ranges, "state": 64.0}, ranges):
         forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                            state=((KEY, VALUE), jnp.float32), ranges=declared),
                                  saturation=SATURATION)
-        prepared = forms.prepare(chunk)
-        carry = jax.make_jaxpr(lambda h: forms.step((jnp.zeros((KEY,), jnp.float32), h), prepared))(
-            jnp.zeros((KEY, VALUE)))
-        return list(_primitives(carry.jaxpr))
 
-    bounded = carried_products({**ranges, "state": 64.0})
-    assert bounded.count("dot_general") == 1, bounded
-    assert not any(name.startswith("custom_vjp") for name in bounded), bounded
-    assert carried_products(ranges).count("dot_general") > 1
+        def carried(*values, forms=forms):
+            prepared = forms.prepare(dict(zip(names, values[:-1], strict=True)))
+            return forms.step((jnp.zeros((KEY,), jnp.float32), values[-1]), prepared)[1]
+
+        label = f"{update_fn.__name__} carry, {'a ranged' if 'state' in declared else 'an unranged'} state"
+        assert_as_exact(jax.jit(carried), jax.jit(tokens), draw, label, seeds=16)
 
 
 def test_a_delta_rules_carry_stays_finite_wherever_the_token_scan_is():
@@ -478,6 +479,26 @@ def test_a_delta_rules_carry_stays_finite_wherever_the_token_scan_is():
     prepared = forms.prepare(chunk)
     outputs, (_, leaving) = forms.mapped(prepared, entering), forms.step(entering, prepared)
     assert np.all(np.isfinite(np.asarray(outputs))) and np.all(np.isfinite(np.asarray(leaving)))
+
+
+def test_a_chunks_adjoint_meets_its_decay_once():
+    """The gated delta rule's one-token chunk, its key and write gate unit on one key, its query and value
+    zero, its decay e^-1, entering a state of 2^120 on that key alone, with a cotangent of 2^20 on the state
+    it leaves: the token's correction cancels its write, so the state's cotangent through the decay is zero
+    on the key the state holds and so is the decay's gradient, and the derived chunk's adjoint
+    (`Derived.backward`, the token update replayed) keeps the entering state's cotangent and the decay's
+    gradient finite, the latter exactly zero (row 1966's head review). The key's and write gate's gradients
+    exceed float32's range at this state and cotangent."""
+    chunk = {"q": jnp.zeros((1, KEY)), "k": jnp.zeros((1, KEY)).at[0, 0].set(1.0),
+             "v": jnp.zeros((1, VALUE)), "g": jnp.full((1,), -1.0), "beta": jnp.ones((1,))}
+    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
+                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
+    entering = jnp.zeros((KEY, VALUE)).at[0].set(2.0 ** 120)
+    d_state, d_operands = forms.backward(chunk, (None, entering), jnp.full((KEY, VALUE), 2.0 ** 20),
+                                         jnp.zeros((1, VALUE)))
+    assert np.all(np.isfinite(np.asarray(d_state)))
+    assert np.all(np.isfinite(np.asarray(d_operands["g"])))
+    np.testing.assert_array_equal(d_operands["g"], jnp.zeros_like(chunk["g"]))
 
 
 def test_a_chunks_decay_gradient_reads_no_pair_of_its_future():
@@ -627,35 +648,20 @@ def test_a_walk_carries_its_state_in_one_dtype(dtype):
         assert state[0].dtype == jnp.dtype(jnp.float64 if dtype == jnp.float64 else jnp.float32)
 
 
-def _primitives(jaxpr):
-    """Each equation's primitive in `jaxpr` and in every jaxpr its equations hold (a jit's, a custom
-    derivative's), a cond's one branch (Dew's product a choice by platform, each branch one product)."""
-    for equation in jaxpr.eqns:
-        yield equation.primitive.name
-        inner = ([equation.params["branches"][-1].jaxpr] if equation.primitive.name == "cond"
-                 else jcore.jaxprs_in_params(equation.params))
-        for held in inner:
-            yield from _primitives(held)
-
-
-def adjoint(forms, chunk_of_values, count: int, issue=None, kept: bool = False):
+def adjoint(forms, chunk_of_values, count: int):
     """A loss's gradient through the derived forms: the chunks walked forward from a zero state (each
     entering state kept), then back through each chunk's `backward`, the cotangents of the outputs and the
-    final state the loss's (`COTANGENT`, a fixed draw), every product a mainloop's `issue`'s where given,
-    each chunk's solve the forward's inverse where `kept`, as a training forward keeps it."""
+    final state the loss's (`COTANGENT`, a fixed draw)."""
     def run(values, cotangents):
         d_outputs, d_final = cotangents
-        states, inverses = [forms.init({})], []
+        states = [forms.init({})]
         for index in range(count):
-            prepared = forms.prepare(chunk_of_values(values, index))
-            inverses.append(prepared.inverse if kept else None)
-            states.append(forms.step(states[-1], prepared))
+            states.append(forms.step(states[-1], forms.prepare(chunk_of_values(values, index))))
         d_state, grads = d_final, []
         for index in reversed(range(count)):
             chunk = chunk_of_values(values, index)
             d_state, d_chunk = forms.backward(chunk, states[index], d_state,
-                                              d_outputs[index * CHUNK:(index + 1) * CHUNK], issue,
-                                              inverse=inverses[index])
+                                              d_outputs[index * CHUNK:(index + 1) * CHUNK])
             grads.append(d_chunk)
         # A token operand's gradient each chunk's; a constant's (a rate, a skip) summed over them.
         return {name: jnp.concatenate([grad[name] for grad in reversed(grads)]) if grads[0][name].ndim
@@ -706,8 +712,7 @@ def test_the_ssd_chunks_adjoint_is_the_token_scans_gradient(draw_fn):
     assert_as_exact(jax.jit(as_derived), jax.jit(as_tokens), draw_with_cotangents, "ssd adjoint", seeds=16)
 
 
-def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16, issue=None,
-                         kept: bool = False) -> None:
+def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16) -> None:
     """`forms`' chunk adjoint of the delta rule `update_fn`, walked back from each chunk's entering state:
     each token operand's gradient on par with the token-by-token scan's against the float64 truth (check
     1), over `draw_fn`'s draws and a fixed cotangent's."""
@@ -716,7 +721,7 @@ def assert_delta_adjoint(forms, update_fn, draw_fn, label: str, seeds: int = 16,
     def chunked(values, index):
         return {name: value[index * CHUNK:(index + 1) * CHUNK] for name, value in values.items()}
 
-    derived = adjoint(forms, chunked, TOKENS // CHUNK, issue, kept)
+    derived = adjoint(forms, chunked, TOKENS // CHUNK)
 
     def draw_with_cotangents(seed):
         return (*draw_fn(seed), *cotangents_of(seed, (TOKENS, VALUE), (KEY, VALUE)))
@@ -741,44 +746,6 @@ def test_the_delta_rules_chunk_adjoint_is_the_token_scans_gradient(update_fn, op
     forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
                                        state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
     assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint")
-
-
-@pytest.mark.parametrize(("update_fn", "operands", "draw_fn"), [
-    (gated_delta, GATED, gated_draw), (kimi_delta, KIMI, kimi_draw)], ids=["gated_delta", "kimi_delta"])
-def test_the_delta_rules_chunk_adjoint_through_an_issuer_is_the_token_scans_gradient(update_fn, operands,
-                                                                                      draw_fn):
-    """The delta rules' chunk adjoints walked back through a mainloop's issuer: each product of the forward
-    the issuer's, each of its adjoint's the issuer's under the product's role (`_dlhs`, `_drhs`), and each
-    token operand's gradient on par with the token-by-token scan's against the float64 truth (check 1)."""
-    forms = scan.derive_scan(scan.Scan(update_fn, gated_readout, operands, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-    roles = set()
-
-    def issue(role, left, right):
-        roles.add(role)
-        return float32_matmul(left, right)
-
-    assert_delta_adjoint(forms, update_fn, draw_fn, f"{update_fn.__name__} adjoint through an issuer",
-                         issue=issue)
-    assert {"correct_dlhs", "correct_drhs", "gram_dlhs", "readout_memory_drhs"} <= roles, sorted(roles)
-
-
-def test_the_delta_rules_adjoint_from_the_kept_inverse_solves_nothing():
-    """The gated delta rule's chunk adjoint reading each chunk's solve's inverse as its training forward kept
-    it (`Prepared.inverse`, `backward`'s `inverse`): each token operand's gradient on par with the
-    token-by-token scan's against the float64 truth (check 1), and no product of the solve's doubling issued
-    again."""
-    forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
-                                       state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
-    roles = set()
-
-    def issue(role, left, right):
-        roles.add(role)
-        return float32_matmul(left, right)
-
-    assert_delta_adjoint(forms, gated_delta, gated_draw, "gated_delta adjoint from its kept inverse",
-                         issue=issue, kept=True)
-    assert "correct_dlhs" in roles and not any(role.startswith("inverse_merge") for role in roles), roles
 
 
 def kimi_draw_float16(seed):

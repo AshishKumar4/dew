@@ -379,6 +379,14 @@ class SavedRun:
         if record is None:
             raise ValueError("this checkpoint's objective declares no inference record; declare "
                              "Objective.inference_record, or call objective.pipeline(state)")
+        return cls.declared(str(directory), record, step)
+
+    @classmethod
+    def declared(cls, directory: str, record: Mapping[str, object], step: int) -> Self:
+        """The step `step` of the run in `directory` whose inference declaration is `record`, in the shapes
+        Dew writes now (`earlier_shapes`), refused where it describes no model or records fields its
+        objective does not write: the one check of a declaration, a run's (`at`) and a release's
+        (`dew.inference.models.ReleasedRun`)."""
         if 'unrecorded' in record:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = declared_objective(record)
@@ -387,12 +395,25 @@ class SavedRun:
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
-        return cls(str(directory), record, step)
+        return cls(directory, record, step)
 
     @property
     def objective(self) -> type[Objective]:
         """The objective class the run trained, which its record names (`declared_objective`)."""
         return declared_objective(self.record)
+
+    def averaged(self, ema: bool | None) -> bool:
+        """Whether the variables `variables(ema=ema)` reads are the run's average: never where its average is
+        its frozen reference (`Objective.ema_is_reference`), else `ema` where given, else whether the step
+        stored one."""
+        from dew.checkpoints import Checkpoints
+
+        if self.objective.ema_is_reference:
+            return False
+        if ema is not None:
+            return ema
+        with Checkpoints(self.directory) as checkpoints:
+            return checkpoints.stored(self.step).get("ema") is not None
 
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,
@@ -506,7 +527,8 @@ def saved_artifact(checkpoints: Checkpoints, step: int) -> Mapping[str, object] 
     """The inference declaration `step` of `checkpoints` records, in the shapes Dew writes now
     (`earlier_shapes`); None where its objective declares none. The one reader of a step's declaration:
     a saved run's (`SavedRun.at`) and the option writing its run record reads from it
-    (`dew.config.earlier_option_writing`). The packages it trusts are imported first, by its reader."""
+    (`dew.config.earlier.earlier_option_writing`). The packages it trusts are imported first, by its
+    reader."""
     record = checkpoints.artifact(step)
     return None if record is None else earlier_shapes(named_fields(record, 'checkpoint artifact'))
 

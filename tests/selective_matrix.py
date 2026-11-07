@@ -57,6 +57,13 @@ CASES = (
     ('sm90', 'saturated-steps'),
     ('sm90', 'documents'),
     ('sm90', 'long'),
+    ('sm80', 'bf16'),
+    ('sm80', 'fp32'),
+    ('sm80', 'decays-near-one'),
+    ('sm80', 'decays-near-zero'),
+    ('sm80', 'saturated-steps'),
+    ('sm80', 'documents'),
+    ('sm80', 'long'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the selector serves
 (`kernel_matrix.covering("selective_scan")`, regenerated where the axes or the selector's support change)."""

@@ -697,7 +697,7 @@ def sown_passes(obj, variables, batch, step):
     prepared, tokens, response, _, full_valid, canvas_mask, _ = obj._row(batch)
     noisy, selected, use_sc = obj._corrupted(response, canvas_mask, step)
     fields = prepared.token_fields
-    positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
+    positions, encoder_mask, encoder_keys, decoder_runs, decoder_valid, decoder_keys = _cache_geometry(
         full_valid, selected, obj.prompt_length, obj.canvas_size, fields.get("positions"),
         fields.get("image_groups"))
     model, params = obj.training_model, thaw(variables)
@@ -717,7 +717,8 @@ def sown_passes(obj, variables, batch, step):
         states, sown = model.apply(
             {**params, "cache": encoded["cache"]}, noisy, self_conditioning_logits=sc_logits,
             train=step.training, rngs=rngs, positions=positions[:, obj.prompt_length:],
-            attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys, states=True,
+            attention_key_runs=decoder_runs, attention_key_valid=decoder_valid,
+            attention_key_positions=decoder_keys, states=True,
             mutable=["qk"])
         return states, sown["qk"]
 

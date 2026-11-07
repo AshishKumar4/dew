@@ -328,3 +328,19 @@ class DeterministicObjective(Objective):
         preds = self.model.apply(step.ema, data, jnp.zeros((data.shape[0],), jnp.float32))
         return Representations(features=jnp.mean(preds, axis=(1, 2)),
                                labels=jnp.zeros((data.shape[0],), jnp.int32))
+
+
+EXPORT_SEEDS = 8
+"""Check 1's declared seeds for a trained denoiser against Diffusers' reading of its export."""
+
+
+def assert_export_recomputes(forward, reader, draw, label: str) -> None:
+    """Diffusers' own reading of an export recomputes the trained `forward(*inputs)` over the inputs the
+    seeds draw (`draw(seed)`), on par from float64 (check 1): Dew's trained forward against Diffusers'
+    float32 run, its float64 run the truth. `reader(wide)` is Diffusers' denoiser read from the export in
+    float32 or (`wide`) float64, a host function of a draw's inputs (`diffusers_consumer.denoiser`, or
+    `unet_predictor` for a UNet, which may be declared in Flax)."""
+    from reference_error import as_given, assert_as_exact
+
+    assert_as_exact(as_given(lambda *inputs: np.asarray(forward(*inputs))), as_given(reader(wide=False)),
+                    draw, label, seeds=EXPORT_SEEDS, truth_fn=as_given(reader(wide=True)))

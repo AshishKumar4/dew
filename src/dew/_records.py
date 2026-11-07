@@ -22,7 +22,7 @@ import functools
 import json
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from numbers import Real
 from typing import TYPE_CHECKING
 
@@ -263,6 +263,15 @@ def earlier_fields(value: JSON) -> JSON:
 
 _REMOVED_BY_NAME = {path.rsplit(":", 1)[-1]: names for path, names in REMOVED_FIELDS.items()}
 """`REMOVED_FIELDS` by class name, as a configuration's repr names it."""
+
+
+def without_fields(value: JSON, names: Collection[str]) -> JSON:
+    """`value` without a field of `names` in any record it nests, a list's records among them."""
+    if isinstance(value, list):
+        return [without_fields(part, names) for part in value]
+    if isinstance(value, dict):
+        return {key: without_fields(part, names) for key, part in value.items() if key not in names}
+    return value
 
 
 def without_removed(value: JSON) -> JSON:

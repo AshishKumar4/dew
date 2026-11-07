@@ -24,6 +24,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -551,7 +552,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     (JAX's `blackwell_ragged_dot_mgpu.py`'s schedule, CUTLASS's sm100 persistent GEMM)."""
 
     consumers = 1
-    gathers_rows = False  # its rings and roles are its own (`streams`, `persist`), a load warp's, no gather
+    gathers_rows = True  # its load warp's TMA four-row gathers (`gathered.Committed`, row 1376)
 
     turns = 2
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
@@ -569,13 +570,17 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
-        if gathered:
-            raise NotImplementedError("tcgen05's load warp gathers no rows (`gathers_rows`)")
+        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `mosaic.Ring`
+
         if multicast:
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
                                       "(`Topology`; not yet a stream of this bundle's)")
-        streams = {name: mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
-                                     copies=(copies or {}).get(name, 1), released_by_products=True)
+        # A gathered stream's rows are its load warp's four-row gathers (`gathered.Committed`).
+        streams = {name: gathered_rows.ring(shape, dtype, stages, swizzle=mosaic.SWIZZLE_BYTES,
+                                            released_by_products=True)
+                   if name in gathered else
+                   mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
+                               copies=(copies or {}).get(name, 1), released_by_products=True)
                    for name, (shape, dtype) in blocks.items()}
         # A block-scale stream's slots each pair with the tensor memory its products read them from: its
         # block's rows (`[rows / 128, depth / 128, 32, 16]`) by its depth's scales, a slot's columns each.
@@ -586,9 +591,13 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         return streams
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict:
+        from dew.nn.kernels.templates import gathered  # it builds on `mosaic.Ring`
+
         del views
-        return {name: ScaleRing(**scoped) if 'tmem' in scoped else CommittedRing(**scoped)
-                for name, scoped in allocated.items()}
+        # A gathered stream's load barriers are shared memory of its own (`gathered.ring`).
+        return {name: ScaleRing(**scoped) if 'tmem' in scoped
+                else CommittedRing(**scoped) if isinstance(scoped['full'].dtype, plgpu_core.BarrierType)
+                else gathered.Committed(**scoped) for name, scoped in allocated.items()}
 
     def roles_of(self, table: tuple, *, load: Callable[[], None], products: Callable[[], None]) -> None:
         """Each of a program's warpgroups its role (`mosaic.tabled`): the template's `table`, `(count,
@@ -613,6 +622,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             raise ValueError(f"a tcgen05 accumulator is {self.rows} rows on one CTA, not {sorted(rows)}")
         del in_flight  # the products' commit releases each step's slots
         rings = self.opened(streams)
+        for ring in rings.values():
+            ring.initialized()
         staging = self.output_staging(outputs, consumers)
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
@@ -705,7 +716,7 @@ def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
         pl.when(warp == MMA_WARP)(products)
 
 
-class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
+class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | jax.Array]):
     """tcgen05's issuer for 64-row tiles a consumer holds in registers (the recurrence's chunks, row 4747):
     each product into a scoped 64-row fp32 accumulator in tensor memory (one CTA's M=64 MMA, the half-lane
     layout `tcgen05.tmem_half_lane_layout`), its left operand from shared memory or, written there first,
@@ -742,22 +753,33 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
                                              mosaic.NARROWEST_SWIZZLE_BYTES)
                      if half % mosaic.swizzle_columns(dtype, swizzle) == 0), mosaic.NARROWEST_SWIZZLE_BYTES)
 
-    def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> dict:
+    def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = ()) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
         # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
         # refused one, jsf-tmem4). A 16-column product is issued 32 wide, its right operand padded
-        # (`_padded`), its sum's first columns read (`summed`).
+        # (`_padded`), its sum's first columns read (`summed`). A role's shared tile of each register left
+        # operand's depth and dtype in `lefts` (`register_products` stages one there).
         widths = tuple(sorted({max(width, PADDED) for width in widths}))
         return {"tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
                          for width in widths},
                 "padded": tuple(plgpu.SMEM((self.rows, PADDED), jnp.bfloat16,
                                            transforms=mosaic.swizzle_transforms(jnp.bfloat16, PADDED))
                                 for _ in range(consumers)),
+                "lefts": {_left_key(depth, dtype): tuple(
+                    plgpu.SMEM((self.rows, depth), dtype, transforms=mosaic.swizzle_transforms(dtype, depth))
+                    for _ in range(consumers)) for depth, dtype in dict.fromkeys(lefts)},
                 "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
 
+    def product_addresses(self, products: tuple | None) -> int:
+        # Its accumulators' tensor memory keeps its address in a word: every launch's compile was those 4
+        # bytes past its plan (the sm100 gate, jsf-g100fix).
+        return 0 if products is None else resources.TMEM_ADDRESS_BYTES
+
     def product_shared(self, scratch) -> tuple:
-        # Its accumulators are tensor memory: its padded right operands and its barrier are shared memory.
-        return (*scratch["padded"], scratch["done"])
+        # Its accumulators are tensor memory: its padded right operands, its staged left operands and its
+        # barrier are shared memory, as `product_scratch` allocates them.
+        return (*scratch["padded"], *(tile for tiles in scratch["lefts"].values() for tile in tiles),
+                scratch["done"])
 
     @contextlib.contextmanager
     def products_in(self, refs):
@@ -792,9 +814,12 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
         found = _awaited(tmem, done)
         return found if shape[1] >= PADDED else found[:, :shape[1]]
 
-    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
-                 ) -> Accumulator:
-        del interpret
+    def products(self, acc: Accumulator | jax.Array, lhs, rhs, interpret: bool, *, accumulate: bool = True
+                 ) -> Accumulator | jax.Array:
+        if not isinstance(acc, Accumulator):
+            # A sum the walk carries in registers: the product in a fresh accumulator, added to it.
+            return acc + self.summed(acc.shape, lambda fresh: self.products(fresh, lhs, rhs, interpret),
+                                     interpret)
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         if rhs.shape[1] < PADDED:
             rhs = self._padded(rhs)
@@ -817,13 +842,39 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
         plgpu.commit_smem()
         return padded
 
-    def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
+    def register_products(self, acc: Accumulator | jax.Array, parts, rhs, interpret: bool
+                          ) -> Accumulator | jax.Array:
         # A 64-row product takes no left operand from tensor memory (tcgen05.py: M=128 alone) nor registers:
-        # its callers stage it (`operands_in_registers` False).
-        raise NotImplementedError(f"{self.name} takes a register left operand staged (`Family.staged`)")
+        # each part is staged into the building role's shared tile of its depth and dtype
+        # (`product_scratch`'s lefts), made visible to the tensor core's proxy, multiplied from there, and
+        # its product's commit awaited before the next part, or the caller, may write the tile again (the
+        # tensor core reads it as it runs). A sum the walk carries in registers takes the parts' products
+        # in a fresh accumulator, added to it (`summed`).
+        if not isinstance(acc, Accumulator):
+            return acc + self.summed(acc.shape, lambda fresh: self.register_products(
+                fresh, parts, rhs, interpret), interpret)
+        _, done = self._scratch(acc.shape[1])
+        for part in parts:
+            tile = self._left(part)
+            plgpu.store(tile, part, optimized=False)
+            plgpu.commit_smem()
+            acc = self.products(acc, tile, rhs, interpret)
+            plgpu.tcgen05_commit_arrive(done)
+            plgpu.barrier_wait(done)
+        return acc
+
+    def _left(self, part: jax.Array):
+        """The building role's shared tile for a register left operand like `part` (`register_products`)."""
+        rows, depth = part.shape
+        tiles = self._scoped()["lefts"].get(_left_key(depth, part.dtype))
+        if tiles is None or rows != self.rows:
+            raise ValueError(f"{self.name} stages a {self.rows}-row register left operand of its program's "
+                             f"product scratch (`product_scratch`'s lefts), not {part.shape} {part.dtype}")
+        return tiles[mosaic.ROLE.get()]
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        raise NotImplementedError(f"{self.name} takes a register left operand staged (`Family.staged`)")
+        return self.summed((lhs.shape[0], rhs.shape[1]), lambda acc: self.register_products(
+            acc, (lhs,), rhs, interpret), interpret)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
         def issue(acc):
@@ -833,8 +884,12 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
 
         return self.summed(shape, issue, interpret)
 
-    def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
-        # Its products done (a commit awaited), its value read, `value` added, written back.
+    def added_into(self, acc: Accumulator | jax.Array, value: jax.Array, interpret: bool
+                   ) -> Accumulator | jax.Array:
+        # Its products done (a commit awaited), its value read, `value` added, written back; a sum the
+        # walk carries in registers takes `value` there.
+        if not isinstance(acc, Accumulator):
+            return acc + value
         del interpret
         _, done = self._scratch(acc.shape[1])
         plgpu.tcgen05_commit_arrive(done)
@@ -843,7 +898,10 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
         plgpu.commit_tmem()
         return dataclasses.replace(acc, accumulate=True)
 
-    def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
+    def rescaled_products(self, acc: Accumulator | jax.Array, scale, parts, rhs, interpret: bool
+                          ) -> Accumulator | jax.Array:
+        if not isinstance(acc, Accumulator):
+            return self.register_products(scale(acc), parts, rhs, interpret)
         _, done = self._scratch(acc.shape[1])
         plgpu.tcgen05_commit_arrive(done)
         plgpu.barrier_wait(done)
@@ -885,6 +943,11 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
 
 PADDED = 32
 """The fewest columns a 64-row tcgen05 product takes (`Tcgen05ChunksIssuer._padded`)."""
+
+
+def _left_key(depth: int, dtype) -> str:
+    """A staged left operand's tile's name in a program's product scratch (`product_scratch`'s lefts)."""
+    return f"{depth}:{jnp.dtype(dtype).name}"
 
 CHUNKS = Tcgen05Chunks()
 """tcgen05's bundle for the recurrence's 64-row chunks."""
