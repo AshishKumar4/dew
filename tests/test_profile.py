@@ -135,6 +135,34 @@ profile.exported()
     assert record["export_status"] == "completed"
 
 
+def test_a_program_that_cannot_create_a_process_exports_its_capture_as_it_stops(tmp_path, native_reports):
+    """A program whose sandbox forbids it to create processes (the live site's guest policy, a seccomp
+    filter on fork and clone, `site/live/container/guest_limits.py`) stops its capture without waiting and
+    exports it in its own process, where its exporter's process could not start: the stop returns with the
+    manifest written, and `exported` has none to wait for."""
+    limits = Path(dew.__file__).resolve().parents[2] / "site" / "live" / "container" / "guest_limits.py"
+    script = f"""
+import importlib.util
+import jax.numpy as jnp
+import dew
+from dew.telemetry import profile
+spec = importlib.util.spec_from_file_location("guest_limits", {str(limits)!r})
+limits = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(limits)
+limits.install("train")
+profiler = dew.Profiler({str(tmp_path / "capture")!r}).start()
+(jnp.ones((32, 32)) @ jnp.ones((32, 32))).block_until_ready()
+profiler.stop(wait=False)
+profile.exported()
+"""
+    source = str(Path(dew.__file__).resolve().parents[1])
+    path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
+    subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
+                   env={**os.environ, "PYTHONPATH": path})
+    record = manifest(*captures(tmp_path / "capture"))
+    assert record["capture_status"] == record["export_status"] == "completed"
+
+
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):
     failure = ValueError("user computation failed")
     with pytest.raises(ValueError) as raised, dew.Profiler(tmp_path):
