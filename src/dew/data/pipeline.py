@@ -880,7 +880,7 @@ class Phases:
     """Pipelines a run reads one after another, each to its end (`ends`). Every phase batches alike, as
     compiling phases refuses otherwise (`dew.data.compile`): a phase's end on the step clock is counted
     in steps of the first phase's batch, which phases of other batches would misplace (row 3940); each
-    phase's own steps counted toward its end would let them differ, which no phase does yet."""
+    phase's own steps counted toward its end would let them differ, which no phase does yet (row 4812)."""
 
     pipelines: tuple[Pipeline, ...]
     ends: tuple[int | None, ...]
