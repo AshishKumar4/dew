@@ -977,6 +977,84 @@ def _chained(a, b, c, *, m_warps: int, interpret: bool):
                          interpret=interpret, name="chained")(a, b, c)
 
 
+LANDED = 64
+"""A landed product's rows, depth and columns: one warpgroup's tile."""
+
+READS = ("product", "summed", "read", "accumulated", "added_into")
+"""The warpgroup accumulator's read paths (`mosaic_sm90.WgmmaIssuer`): a scoped product's value, a summed
+one's, a walk's accumulator read in it, the walk's results, and a value added into an accumulator."""
+
+
+def _negated(a, b, *, path: str, interpret: bool):
+    """`-(a @ b)` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup), the accumulator read along `path`
+    (`READS`) and negated before it is stored: a pure op on the accumulator's registers, which a read that
+    did not order its uses after the products' wait would form before the products land (row 4346)."""
+    from dew.nn.kernels.templates import mosaic_sm90, resources
+
+    family = mosaic_sm90.FED
+    shape = (LANDED, LANDED)
+
+    def body(a_gmem, b_gmem, out_gmem):
+        def scoped(a_smem, b_smem, out_smem):
+            mosaic.copied(a_gmem, a_smem)
+            mosaic.copied(b_gmem, b_smem)
+            mosaic.synced(interpret)
+            if path == "product":
+                value = family.product(a_smem, b_smem, shape, interpret=interpret)
+            elif path == "summed":
+                value = family.summed(shape, lambda acc: family.products(acc, a_smem, b_smem, interpret),
+                                      interpret)
+            else:
+                def step(index, carry, accumulators):
+                    del index
+                    (acc,) = accumulators
+                    acc = family.products(acc, a_smem, b_smem, interpret, accumulate=False)
+                    if path == "read":
+                        # Stored where it is read, inside the walk.
+                        plgpu.store(out_smem, -family.read(acc), optimized=False)
+                    elif path == "added_into":
+                        acc = family.added_into(acc, jnp.zeros(shape, jnp.float32), interpret)
+                    return carry, (acc,)
+
+                _, (value,) = family.accumulated((mosaic.Loop(step, 0, 1),), jnp.int32(0), (shape,), interpret)
+            if path != "read":
+                plgpu.store(out_smem, -value, optimized=False)
+            mosaic.synced(interpret)
+            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED, copy=mosaic.coalesced,
+                              widest=resources.copied_rows(LANDED, jnp.float32))
+
+        swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
+        pl.run_scoped(scoped, *(mosaic.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
+                      mosaic.plain(shape, jnp.float32), collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((LANDED, LANDED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="negated")(a, b)
+
+
+def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
+    """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a pure op
+    on its registers, `-(a @ b)` exactly over small integers, where an op ordered above the products' wait
+    stored zeros (row 4346)."""
+    keys = jax.random.split(jax.random.key(7))
+    a, b = (jax.random.randint(key, (LANDED, LANDED), -2, 3).astype(jnp.bfloat16) for key in keys)
+    expected = -(np.asarray(a, np.float32) @ np.asarray(b, np.float32))
+    np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(_negated, path=path,
+                                                                       interpret=False))(a, b)), expected)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("path", READS)
+def test_every_warpgroup_read_path_gives_the_products_value(path):
+    """Interpreted (Mosaic GPU's interpreter, its waits no-ops): each warpgroup accumulator read path
+    (`READS`) negates `a @ b` exactly; on an H100 the same kernel is the GPU flow's
+    (`every_warpgroup_read_lands_its_products_on_an_h100`)."""
+    keys = jax.random.split(jax.random.key(7))
+    a, b = (jax.random.randint(key, (LANDED, LANDED), -2, 3).astype(jnp.bfloat16) for key in keys)
+    np.testing.assert_array_equal(np.asarray(_negated(a, b, path=path, interpret=True)),
+                                  -(np.asarray(a, np.float32) @ np.asarray(b, np.float32)))
+
+
 def _chained_operands(rows: int):
     """Small integers whose chained products are exact in fp32, the first's (at most 128) in bf16."""
     keys = jax.random.split(jax.random.key(5), 3)
