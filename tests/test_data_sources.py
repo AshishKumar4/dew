@@ -23,20 +23,17 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
+from data_support import LATEST
 from reader_support import assert_a_rewrite_moves_the_identity, assert_resumes_where_it_stopped
 from storage_support import moto_bucket
 from token_support import export_byte_tokens
 
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
-from dew.data.plan import PLAN_VERSIONS
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
 from dew.data.storage import Store
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def test_memory_columns_snapshot_changes_with_content():

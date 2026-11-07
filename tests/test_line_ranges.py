@@ -7,12 +7,9 @@ import itertools
 import json
 
 import pytest
+from data_support import LATEST
 
-from dew.data.plan import PLAN_VERSIONS
 from dew.data.sources import Files
-
-LATEST = PLAN_VERSIONS[-1]
-"""The data plan version a new run reads by, whose shards a manifest here names."""
 
 
 def test_an_empty_file_holds_no_range_beside_one_that_holds_records(tmp_path):

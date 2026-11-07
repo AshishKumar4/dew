@@ -923,6 +923,71 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     assert stored == kept
 
 
+def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci, tmp_path, monkeypatch,
+                                                                             cache_worker):
+    """A task keeps each test it passed in its artifacts as it ends (tools/armada/progress.py), and an attempt
+    armada starts after recalling one (ARMADA_RESUME, the artifacts the recalled attempt kept, #4544) sets
+    those aside and runs the rest: its row green with every test's seconds, the earlier attempt's among them,
+    its progress carrying them for a later recall, and no record written, as no record holds the earlier
+    attempt's opens. It sets aside exactly those tests, never one whose id theirs begins (pytest's --deselect
+    matches by prefix: train 671's review)."""
+    (tmp_path / "tests/test_resumed.py").write_text(
+        "from pathlib import Path\n"
+        "def test_first():\n"
+        "    with Path('ran').open('a') as ran: ran.write('first ')\n"
+        "def test_first_again():\n"
+        "    with Path('ran').open('a') as ran: ran.write('again ')\n")
+    interpreter(tmp_path, "3.12")
+    url, stored, _ = cache_worker
+    cached(monkeypatch, url)
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    out = tmp_path / "verdict.json"
+    # An attempt that ran whole kept both tests as it went.
+    [row] = armada_task(ci, monkeypatch, out, policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    progress = tmp_path / "artifacts" / "progress.jsonl"
+    kept = [json.loads(line)["node"] for line in progress.read_text().splitlines()]
+    assert kept == ["tests/test_resumed.py::test_first", "tests/test_resumed.py::test_first_again"]
+    # The next, recalled after its first test: that one set aside, the one its name begins run, both in
+    # its row.
+    (tmp_path / "resume").mkdir()
+    (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
+    progress.unlink()
+    (tmp_path / "ran").unlink()
+    monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
+    stored.clear()
+    [row] = armada_task(ci, monkeypatch, out, policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "ran").read_text() == "again "
+    assert set(row["tests"]) == {f"tests/test_resumed.py::test_first{end}" for end in ("", "_again")}
+    assert [json.loads(line)["node"] for line in progress.read_text().splitlines()] == kept
+    assert stored == {}
+    # A split group resumed sets its tests aside after split.py cuts its file, as every group's container
+    # cuts it whole: a cut of the rest alone would run another group's tests and none of some (train 674's
+    # review: weights 1, 3, 1, 3 cut in three, the second group's first test passed, its second never ran).
+    (tmp_path / "tests/test_cut.py").write_text("from pathlib import Path\n" + "".join(
+        f"def test_{index}():\n    with Path('ran').open('a') as ran: ran.write('{index}')\n"
+        for index in range(4)))
+    nodes = [f"tests/test_cut.py::test_{index}" for index in range(4)]
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [1.0, 3.0, 1.0, 3.0],
+                                                                           strict=True))))
+    monkeypatch.delenv("ARMADA_RESUME")
+    (tmp_path / "ran").unlink()
+    progress.unlink()
+    assert ci.task("3.12", ["tests/test_cut.py"], "2/3", out, 600.0) == 0
+    assert (tmp_path / "ran").read_text() == "23"
+    (tmp_path / "resume" / "progress.jsonl").write_text(progress.read_text().splitlines()[0] + "\n")
+    (tmp_path / "ran").unlink()
+    monkeypatch.setenv("ARMADA_RESUME", str(tmp_path / "resume"))
+    # The group's green record of the whole run gone, as a recalled attempt wrote none.
+    stored.clear()
+    assert ci.task("3.12", ["tests/test_cut.py"], "2/3", out, 600.0) == 0
+    assert (tmp_path / "ran").read_text() == "3"
+    [row] = json.loads(out.read_text())["rows"]
+    assert set(row["tests"]) == set(nodes[2:])
+
+
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,
                                                                                   cache_worker):
     """A file that ran green is reused by a later task on the same CPU class while its inputs are
@@ -1782,6 +1847,44 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                 (tmp_path / path).parent.rmdir()
         elif path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+            (tmp_path / path).write_text(source)
+        assert run() == runs, path
+        assert run() == runs, path
+
+
+def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whose_imports_it_changes(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """tools/ is a namespace package, which a test imports from (`from tools import x`): an __init__.py added
+    to it, which runs on every such import and makes it a regular package, reruns each row that imported
+    from it, and its removal again (train 672's review: no row's key held tools' own lookup); a helper
+    under tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported
+    that name, and one of another name reruns none."""
+    (tmp_path / "tools").mkdir(exist_ok=True)
+    (tmp_path / "tools/helper.py").write_text("def value(): return 1\n")
+    written(tmp_path, {
+        "test_tooled.py": "import sys\nsys.path.insert(0, '.')\n\n\ndef test_tooled():\n"
+                          "    from tools.helper import value\n"
+                          "    import json\n"
+                          "    with open('runs', 'a') as runs: runs.write('x')\n"
+                          "    assert value() and json.dumps(1)\n"})
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    out = tmp_path / "verdict.json"
+
+    def run() -> int:
+        ci.task("3.12", ["tests/test_tooled.py"], "", out, 600.0)
+        assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [0]
+        return len((tmp_path / "runs").read_text())
+
+    assert run() == 1
+    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 3),
+                               ("tests/unrelated_helper.py", "VALUE = 1\n", 3),
+                               ("tests/json.py", "def dumps(value): return str(value)\n", 4)):
+        if source is None:
+            (tmp_path / path).unlink()
+        else:
             (tmp_path / path).write_text(source)
         assert run() == runs, path
         assert run() == runs, path

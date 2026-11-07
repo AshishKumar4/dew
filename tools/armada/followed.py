@@ -220,9 +220,13 @@ LOOKUP = "lookup:"
 """What an import's search of a checkout directory for a name is recorded under (`missed`), the directory
 and the name: ci.py's `contents` keys the entries there an import of the name finds (a module, a package, an
 extension), so the name's arrival reruns the run whose import of it failed, and no other name's does."""
-IMPORTED = "import:"
-"""What a top-level module a run imported is recorded under (executed.py): a helper of that name under
-tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
+
+
+def shadowing(name: str) -> str:
+    """What module `name`, which a run imported, is recorded under: the lookup of its top-level name in
+    tests/ (`LOOKUP`), which leads sys.path, so a helper of that name arriving there, which would shadow it,
+    reruns the run (ci.py's `looked_up`), and one of another name does not."""
+    return f"{LOOKUP}tests/{name.partition('.')[0]}"
 
 
 def opening(recorded: Callable[[str], None], root: str) -> None:
@@ -395,13 +399,13 @@ def closed_imports(seen: set[str], root: str):
 
 def imports(write: Callable[[str], None]):
     """The import system's first finder that passes each module imported by name, a statement's or
-    `importlib.import_module`'s, to `write` as the top-level name a helper under tests/ would shadow
-    (`IMPORTED`); it finds nothing itself."""
+    `importlib.import_module`'s, to `write` as the lookup a helper under tests/ would shadow it at
+    (`shadowing`); it finds nothing itself."""
 
     class Imports:
         @staticmethod
         def find_spec(name, path=None, target=None):
-            write(f"{IMPORTED}{name.partition('.')[0]}")
+            write(shadowing(name))
 
     return Imports
 
@@ -456,7 +460,7 @@ def follow() -> None:
     write("inherited", int(os.environ.get(FRACTION, "") == os.environ.get("DEW_EXECUTED_SHARE", "")))
     write("began", time.time())
     for name in list(sys.modules):
-        write("file", f"{IMPORTED}{name.partition('.')[0]}")
+        write("file", shadowing(name))
 
     def started(code, offset):
         if code.co_name == OPENED[0] and code.co_filename.endswith(OPENED[1]):

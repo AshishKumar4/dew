@@ -49,7 +49,7 @@ from jax.typing import DTypeLike
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
 
 from .flops import conv_flops
-from .precision import biased
+from .precision import biased, exact_products
 from .sharding import auto_part, automatic_axes, in_pipeline_stage
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -230,6 +230,8 @@ def _conv_general_dilated(
             and (padding == 'SAME' or padding == ((dilation[0], dilation[0]),) * 2)
             and batch_group_count == 1 and preferred_element_type is None and out_sharding is None
             and lhs.dtype == rhs.dtype and lhs.dtype in (jnp.float32, jnp.bfloat16)
+            # The forms multiply exactly and sum in fp32: a declaration narrowing the operands goes to lax.
+            and exact_products(precision, lhs.dtype)
             and jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
             == jax.lax.ConvDimensionNumbers((0, 3, 1, 2), (3, 2, 0, 1), (0, 3, 1, 2))):
         # bf16 is faster polyphase, fp32 materialized (`_materialized_depthwise_3x3`).
@@ -252,17 +254,19 @@ def _placed(inputs: jax.Array, spatial: int, strides: Sequence[int],
     return _unreplicated(convolve(inputs), spatial)
 
 
-def convolution(inputs: jax.Array, kernel: jax.Array, padding: Sequence[tuple[int, int]]) -> jax.Array:
+def convolution(inputs: jax.Array, kernel: jax.Array, padding: Sequence[tuple[int, int]],
+                out_dtype: DTypeLike | None = None) -> jax.Array:
     """`Conv`'s stride-1 convolution of `inputs` `[batch, *spatial, features]`
     by a `[*spatial, in, out]` kernel of the inputs' dtype that the caller
     holds, placed and dispatched as `Conv` places and dispatches its own:
     the product of a layer that transforms its kernel first
-    (`dew.nn.mp.MPConv`)."""
+    (`dew.nn.mp.MPConv`). `out_dtype` is the dtype it sums and returns in,
+    the inputs' where None (a model's output head: `output_dtype`)."""
     spatial = kernel.ndim - 2
     letters = "HWD"[:spatial]
     return _placed(inputs, spatial, (1,) * spatial, lambda x: _conv_general_dilated(
         x, _whole(kernel), (1,) * spatial, padding,
-        dimension_numbers=(f"N{letters}C", f"{letters}IO", f"N{letters}C")))
+        dimension_numbers=(f"N{letters}C", f"{letters}IO", f"N{letters}C"), preferred_element_type=out_dtype))
 
 
 class Conv(nn.Conv):

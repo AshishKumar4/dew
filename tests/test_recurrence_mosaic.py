@@ -192,11 +192,11 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     # The l2 norm takes the queries and keys to fp32 at least before the rule reads them.
     query, key = ((x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in (given.query, given.key))
                   if hooks.l2norm else (given.query, given.key))
+    dtype = jnp.result_type(query, key, given.value)
+    rounded = fast_rounding(dtype) if hooks.rated else chunk_rounding(hooks.delta, dtype)
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
-                                floor=hooks.floor, bound=hooks.inverse_bound,
-                                rounded=fast_rounding() if hooks.rated else chunk_rounding(
-                                    hooks.delta, jnp.result_type(query, key, given.value)))
+                                floor=hooks.floor, bound=hooks.inverse_bound, rounded=rounded)
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -919,7 +919,10 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
     def selected() -> str:
         return recurrence_chunk.port_kernel(*operands, bound=1.0, product='training', report=False)
 
-    with report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)):
+    # The run's rounded products are its declaration's at the default precision (`rounds_products`; the
+    # suite's lanes configure 'highest').
+    with (report.refusals(), generation.assumed('sm90'), recurrence_chunk.recomputing(('delta_memory',)),
+          jax.default_matmul_precision('default')):
         target = template.Mosaic.launched()
         assert selected() == 'mosaic_gpu'
         training = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))

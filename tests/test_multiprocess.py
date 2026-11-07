@@ -263,7 +263,8 @@ def test_a_pools_cooldown_across_its_uneven_tail_reads_its_shares_as_its_run_doe
     assert len(reports[0]["cooled"]) == 1 and np.isfinite(reports[0]["cooled"]).all()
     planned = clocked_pool(tmp_path / "planned", 2, deal="order", cooldown=True)
     alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal="order", cooldown=True)
-    # The same programs over the same rows, a sum of two devices' parts in either order.
+    # The same programs over the same rows, a sum of two devices' parts in either order: one SPMD program
+    # over one two-device mesh, whichever processes hold its devices (row 3177).
     assert len(planned[0]["cooled"]) == 1 and planned[0]["cooled"] == alone[0]["cooled"]
 
 
@@ -1519,7 +1520,8 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
                                    rtol=1e-5, atol=1e-6)
     assert any(value < 0 for row in single["drawn_behavior"] for value in row)
     # A task takes a resident global array without fetching it to the host;
-    # each rank generates from its own rows exactly as the direct call does.
+    # each rank generates from its own rows exactly as the direct call does:
+    # one generation program over the same rows, moved, not computed (row 3177).
     for report in reports:
         assert report["resident_addressable"] is False
         assert report["resident_tokens"] == report["direct_tokens"]

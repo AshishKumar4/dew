@@ -32,6 +32,7 @@ from dew.batch import (
     coordinates,
     flat_field,
     laid_coordinates,
+    prefix_sum,
     probed,
     real_places,
     shifted_span,
@@ -88,7 +89,7 @@ class BlockSFTStatistics:
 
 def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, canvas_size: int,
                     positions: jax.Array | None = None, image_groups: jax.Array | None = None):
-    """Build the attention masks and positions of one SFT step.
+    """Build the attention visibility and positions of one SFT step.
 
     They represent the reference's circular overlay without mutating the
     encoder's K/V.
@@ -97,8 +98,14 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     noisy keys overwrite physical slots modulo the full prompt+response cache
     length. Dew's cache packs valid encoder keys; mapping physical slots to
     their packed indices preserves that source behavior, including padding.
-    Concatenated old/new keys with an exclusion mask are the same attention
-    operation as the reference's overwritten buffer, up to reduction order.
+    Concatenated old/new keys, of which the response reads the visible ones,
+    are the same attention operation as the reference's overwritten buffer,
+    up to reduction order. The response reads them as three runs (the
+    template's spans, each run's places non-decreasing, a sliding layer's
+    window searched within each): the old keys the overwrite left, physical
+    slots [selected * canvas, prompt + selected * canvas) packed, the noisy
+    keys written over the selected canvas, and those that wrapped to slots
+    [0, selected * canvas); the keys' validity marks which of them it reads.
     """
     batch, total = valid.shape
     response = total - prompt_length
@@ -119,11 +126,20 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
                       | ((physical[None, :] - prompt_length) // canvas_size <= selected[:, None]))
     old_keys = jnp.take_along_axis(allowed & ~overwritten, ordered, axis=-1) & packed_valid
     new_keys = jnp.take_along_axis(allowed, write_slots, axis=-1)
-    decoder_mask = jnp.broadcast_to(jnp.concatenate([old_keys, new_keys], axis=-1)[:, None, :],
-                                    (batch, response, total + response))
+    decoder_valid = jnp.concatenate([old_keys, new_keys], axis=-1)
+    # The valid physical slots before each slot, so a physical slot's packed index.
+    packed_before = jnp.pad(prefix_sum(valid, dtype=jnp.int32), ((0, 0), (1, 0)))
+    start = selected * canvas_size
+    runs = jnp.stack([
+        jnp.stack([packed_before[jnp.arange(batch), start],
+                   packed_before[jnp.arange(batch), prompt_length + start]], axis=-1),
+        jnp.stack([jnp.full((batch,), total), jnp.full((batch,), total + canvas_size)], axis=-1),
+        jnp.stack([total + response - start, jnp.full((batch,), total + response)], axis=-1),
+    ], axis=1).astype(jnp.int32)
+    decoder_runs = jnp.broadcast_to(runs[:, None], (batch, response, 3, 2))
     decoder_positions = positions[:, prompt_length:]
     key_positions = jnp.concatenate([packed_positions, decoder_positions], axis=-1)
-    return positions, encoder_mask, packed_positions, decoder_mask, key_positions
+    return positions, encoder_mask, packed_positions, decoder_runs, decoder_valid, key_positions
 
 
 def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
@@ -458,7 +474,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         noisy, selected, use_sc = self._corrupted(response, canvas_mask, step)
         fields = prepared.token_fields
         groups = flat_field(fields, "image_groups")
-        positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
+        positions, encoder_mask, encoder_keys, decoder_runs, decoder_valid, decoder_keys = _cache_geometry(
             full_valid, selected, self.prompt_length, self.canvas_size,
             token_positions(fields), None if groups is None else jnp.asarray(groups))
         model = self.training_model
@@ -490,7 +506,8 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
             read = model.apply(
                 {**probed(params, probes), "cache": cache}, noisy, self_conditioning_logits=sc_logits,
                 train=train, rngs=rngs, positions=positions[:, self.prompt_length:],
-                attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
+                attention_key_runs=decoder_runs, attention_key_valid=decoder_valid,
+                attention_key_positions=decoder_keys,
                 states=True, mutable=observed or False, **at_progress)
             return read if observed else (read, {})
 

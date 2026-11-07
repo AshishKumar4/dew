@@ -147,6 +147,20 @@ def test_labels_named_by_none_take_the_names_their_tokenizer_spells_as_one_token
     assert named.spelled(gpt2, 2) == named
 
 
+def test_labels_a_vocabulary_spells_as_one_token_are_refused_and_skipped():
+    """Two labels a vocabulary spells as one token (the tiny Gemma's spells A to Z as its unknown token)
+    are refused where a layout names them, which no readout could tell apart, every answer uniform, and
+    skipped where it names none, so a run letters the options it tells apart or is refused (row 4676)."""
+    gemma = HFTokenizer(str(Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"),
+                        local_files_only=True)
+    with pytest.raises(ValueError):
+        Labels(names=("A", "B")).ids(gemma, 2)
+    with pytest.raises(ValueError):
+        Labels().spelled(gemma, 2)
+    own = Labels(variants=("{}",), names=("token4", "token5"))
+    assert len(set(own.ids(gemma, 2))) == 2
+
+
 def test_more_options_than_letters_ask_for_one_label_their_structures_indented(qwen):
     """A choice of more options than letters asks for one label, by the cue past them, each line under
     the layout's own label; a structured description and a structured state are indented JSON."""

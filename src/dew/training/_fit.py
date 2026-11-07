@@ -338,6 +338,11 @@ class FitRun:
     a schedule (`Trainer._scheduled`)."""
     tracing: bool = False
     traced: int = 0
+    window: Profiler | None = None
+    """The profiler whose capture the open profile window writes (`open_window`), none once it closes."""
+    window_paused: bool = False
+    """Whether the open window's capture is stopped for work beside the steps (`outside_window`), to start
+    again before the next step's read."""
     other: float = 0.0
     first_step: float | None = None
     preempted: int | None = None
@@ -383,17 +388,36 @@ class FitRun:
                     compiled: bool) -> None:
         """Open the profile window's capture before an iteration's first read, so the step row records
         the read it waits on, once its warmup steps have run and the run's first step has `compiled`:
-        the window holds steps, not the compile."""
-        if (profiler is not None and profile is not None and not self.tracing and self.traced == 0
+        the window holds steps, not the compile. A window whose capture stopped for work beside the steps
+        (`outside_window`) starts its next capture here."""
+        if self.window is not None and self.window_paused:
+            start_capture(self.window)
+            self.window_paused = False
+        elif (profiler is not None and profile is not None and not self.tracing and self.traced == 0
                 and seen >= profile.warmup and compiled):
             start_capture(profiler)
-            self.tracing = True
+            self.tracing, self.window = True, profiler
+
+    @contextlib.contextmanager
+    def outside_window(self) -> Iterator[None]:
+        """A block of the work between two steps (an evaluation, a save, a cooldown branch) run outside the
+        open profile window's capture: it stops before the block and starts again before the next step's
+        read (`open_window`), so the window holds training steps alone, over a capture of each run of them,
+        and no capture ends empty. The log the run takes at its cadence and an observer's call stay in it:
+        the loop's own cadenced reads of its steps, which a profile of the loop shows; work inside a step's
+        iteration (a rollout, a new shape's compile) stays too, as the step it serves."""
+        if self.window is not None and not self.window_paused:
+            stop_capture(self.window, self.loss)
+            self.window_paused = True
+        yield
 
     def close_window(self, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
         it until the run's cleanup waits for them and its outcome reports the window
-        (`Trainer._reported_outcome`)."""
-        stop_capture(profiler, self.loss)
+        (`Trainer._reported_outcome`); a capture stopped for work beside the steps has stopped already."""
+        if not self.window_paused:
+            stop_capture(profiler, self.loss)
+        self.window, self.window_paused = None, False
         self.profiled = (self.traced, self.current, str(profiler.directory))
 
     def committed_examples(self, interval: Interval, points: Sequence[int], state: TrainState,
