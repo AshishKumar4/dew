@@ -1240,6 +1240,39 @@ def test_a_shared_key_backward_over_a_partial_key_tile_reads_no_padded_key():
 
 
 @INTERPRETS
+@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_three_consumers_holds_check_1_interpreted(call, training):
+    """The forward and the training forward on wgmma's three consumers a program (FlashAttention 3's 192-row
+    tile, `Wgmma.consumers`), under the interpreter, on par with the reference (check 1)."""
+    tiles = attention_mosaic.Tiles(64, 64, 2, 3, family=WGMMA)
+    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
+                   value_width=64, tiles=tiles, training=training)
+
+
+@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
+@pytest.mark.parametrize("consumers", [2, 3])
+def test_the_forwards_schedule_holds_every_property_in_every_interleaving(consumers, training):
+    """The forward's launch on wgmma at `consumers` a program over 192 queries and 128 keys, traced as an
+    H100 builds it: every interleaving of its warpgroups and its loads' landings explored
+    (`ring_protocol.explore`), no deadlock and every barrier's phase whole. Its consumers' schedule turns
+    balance at any count (row 4840: at three the third made one fewer, and its partners' last turn waited
+    on a phase that never completed, the interpreted hang)."""
+    from ring_protocol import explore, programs
+
+    query, key = jnp.ones((1, 192, 1, 64), jnp.bfloat16), jnp.ones((1, 128, 1, 64), jnp.bfloat16)
+    spans = template.spans(192, 128, 1)
+    tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family=WGMMA)
+
+    def forward(query, key):
+        with generation.assumed("sm90"), tuning.pinned({attention_mosaic.MosaicForward: tiles}):
+            return attention_mosaic.forward(query, key, key, spans, residuals=training, interpret=False)
+
+    threads, arrivals = programs(forward, query, key, threads=consumers + 1)
+    assert explore(threads, arrivals) > 0
+
+
+@INTERPRETS
 def test_a_backward_whose_dkv_launch_holds_more_keys_than_its_dq_launch_writes_every_key_interpreted():
     """The backward in two launches, the dK/dV launch's two consumers each their own key block beside one
     dQ consumer (`dkv_consumers=2` on a producer's layout), over 192 keys, under the interpreter: the dK/dV
