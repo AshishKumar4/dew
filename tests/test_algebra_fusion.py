@@ -217,7 +217,7 @@ def _attention_routes(trace) -> list[str]:
 
 @pytest.mark.parametrize("spelling", list(SPELLINGS))
 def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
-    """A plain JAX or Flax program's softmax attention (`dew.algebra.attention_regions`) compiled through
+    """A plain JAX or Flax program's softmax attention (`dew.algebra.recognize`) compiled through
     `dew.jit` on an H100 runs the kernel Dew's selector gives the call (FlashAttention, or the template a call
     names), where the program as written runs XLA's; on this host, its output and gradients under the
     template (its portable mainloop) on par with the program as written (check 1)."""
@@ -273,7 +273,7 @@ FORMS = {
     "twice the default scale": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
                                                      implementation="xla"),
-        lambda q, k, v: {}),
+        None),
     "a causal window": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
                                                      implementation="xla"),
@@ -281,33 +281,34 @@ FORMS = {
     "a softcap": (softcapped_attention, lambda q, k, v: {"causal": True, "softcap": 50.0}),
 }
 """Each plain program's attention under a form beside the default scale and a causal mask, and the arguments
-Dew's own attention takes for it."""
+Dew's own attention takes for it; None where no call of Dew's computes it (a scale other than the default:
+another constant), which the compile point keeps as written."""
 
 
 @pytest.mark.parametrize("form", list(FORMS))
 def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes(form):
-    """A plain program's attention under a mask or bias it draws from its inputs, a scale a power of two past
-    the default, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel Dew's
-    own attention call under those arguments routes to (none where that is XLA's), where the program as
-    written runs XLA's; on this host, under the template, its output and gradients on par with the program
-    as written (check 1)."""
+    """A plain program's attention under a mask or bias it draws from its inputs, a causal window or a
+    softcap, compiled through `dew.jit` on an H100, runs the kernel Dew's own attention call under those
+    arguments routes to (none where that is XLA's), and under a scale no call of Dew's takes runs as
+    written, XLA's; on this host, under the template, its output and gradients on par with the program as
+    written (check 1)."""
     from attention_oracle import attention_on_par
     from contract_support import normal_drawn
 
     import dew
-    from dew.algebra.attention_regions import KEPT
+    from dew.algebra.recognize import KEPT
     from dew.nn.attention import scaled_dot_product_attention
 
     attend, arguments = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
 
     def own(q, k, v):
-        return scaled_dot_product_attention(q, k, v, **arguments(q, k, v))
+        return scaled_dot_product_attention(q, k, v, scale_logits=True, **arguments(q, k, v))
 
     with generation.assumed("sm90"):
         assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
-        expected = [kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
-                    if kernel not in KEPT]
+        expected = [] if arguments is None else [
+            kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes)) if kernel not in KEPT]
         assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):

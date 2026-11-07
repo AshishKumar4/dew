@@ -68,8 +68,8 @@ class Family(NamedTuple):
     candidates: Callable[[fusion.Index, int], Iterator[Candidate]]
 
 
-def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = frozenset()) -> list[
-        fusion.Written]:
+def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = frozenset(), *,
+               families: Sequence[Family] = ()) -> list[fusion.Written]:
     """Every region of `jaxpr` (`index`'s) the e-graph proves computes a family's call and whose call takes
     a kernel of Dew's, written as that call (the module's account): the families in order, so a gated
     norm's activation is the norm's rather than a SwiGLU's, an anchor's candidates in the order its family
@@ -79,7 +79,7 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = f
     accurate = generation.numerics().forms == "accurate"
     found: list[fusion.Written] = []
     claimed: set[int] = set(held)
-    for family in FAMILIES:
+    for family in families or FAMILIES:
         for place, equation in enumerate(jaxpr.eqns):
             if place in claimed or not _holds(equation, family.anchor):
                 continue
@@ -607,7 +607,8 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
     other operand or its source, its result that product's output or a value made of it by up to three (a
     layout, a cast); a value the region reads beside them a bias where it is floating and a mask where it is
     boolean, a mask of constants alone folded into the region (`_canonical`); each scalar constant a softcap,
-    or none, the call causal or not, and its softmax in float32 or in its operands' dtype, each tried. Its
+    or none, the call causal or not, its softmax in float32 or in its operands' dtype, and its scale on the
+    query before the product (Flax's) or on the float32 logits after it (jax.nn's), each tried. Its
     declaration is the call's portable path, Flax's reference attention op for op
     (`implementation='reference'`)."""
     anchor = index.jaxpr.eqns[place].outvars[0]
@@ -681,13 +682,14 @@ def _attention_candidates(q, k, v, output, extra, softcaps) -> Iterator[Candidat
 
     dtype = output.aval.dtype
     boolean = extra is not None and extra.aval.dtype == jnp.bool_
-    for causal, softcap, wide in itertools.product((False, True), softcaps, (True, False)):
-        def attend(query, key, value, *given, causal=causal, softcap=softcap, wide=wide,
+    for causal, softcap, wide, after in itertools.product((False, True), softcaps, (True, False),
+                                                          (True, False)):
+        def attend(query, key, value, *given, causal=causal, softcap=softcap, wide=wide, after=after,
                    implementation='auto'):
             extra_ = given[0] if given else None
             return scaled_dot_product_attention(
                 query, key, value, implementation=implementation, causal=causal, softcap=softcap,
-                force_fp32_for_softmax=wide, mask=extra_ if boolean else None,
+                force_fp32_for_softmax=wide, scale_logits=after, mask=extra_ if boolean else None,
                 bias=None if boolean else extra_).astype(dtype)
 
         operands = (q, k, v, *([extra] if extra is not None else []))
@@ -714,6 +716,11 @@ def _attention_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
     return any(route.choice == "attention" and route.kernel not in KEPT for route in found)
 
 
-FAMILIES = (Family("exp", _attentions), Family("rsqrt", _norms), Family("logistic", _swiglus))
+ATTENTION = (Family("exp", _attentions),)
+"""Attention, recognized before the products, so a product inside it is none of theirs."""
+NORMS = (Family("rsqrt", _norms), Family("logistic", _swiglus))
+"""The norms, after the products, so an epilogue's norm is the product's; a gated norm before a SwiGLU, so its
+activation is the norm's."""
+FAMILIES = ATTENTION + NORMS
 """The calls the compile point recognizes, in the order it looks for them: attention first, so a product
 inside it is none of a norm's, then the norms, so a gated norm's activation is the norm's."""
