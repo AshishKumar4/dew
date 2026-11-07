@@ -88,6 +88,10 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                                        "distribution": ("compressed-tensors", "0.17.1")}
             for family, kinds in (("storage", ("fp8", "nvfp4")), ("nvfp4_qdq", ("unrounded", "e4m3")))
             for kind in kinds},
+         "lm-steps": {"test": "test_reference_runs", "arms": "qwen3-tiny", "worker": "lm_steps_worker.py",
+                      "reference": "huggingface/transformers 5.16.1 with pytorch/pytorch 2.14.0",
+                      "license": "Apache-2.0", "distribution": ("transformers", "5.16.1"), "host": True,
+                      "outputs": True},
          "qwen-image-export": {"test": "test_qwen_image_source", "arms": "export",
                                "worker": "qwen_image_export_reference.py",
                                "reference": "huggingface/diffusers 6256aa7666cedd47443adc8f82da9a10e110b09c",
