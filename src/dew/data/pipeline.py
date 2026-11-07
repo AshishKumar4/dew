@@ -1479,7 +1479,8 @@ def schedule(stages: Sequence[tuple[Dataset, float | None]]) -> Pipeline:
     ends at the step whose commit reaches its tokens, on every process alike, so its last step may
     commit past them; one that a single step's commit passes reads nothing. A corpus that an earlier
     stage read continues from where it left it, and what the run had read ahead of the end is not
-    trained on. Each stage is a whole chain, laid out and batched as it reads."""
+    trained on. Each stage is a whole chain, laid out and batched as it reads, every stage in one
+    batch (`Phases`: row 4812)."""
     if not stages:
         raise ValueError("a schedule needs at least one (dataset, tokens)")
     budgets = [tokens for _, tokens in stages]
