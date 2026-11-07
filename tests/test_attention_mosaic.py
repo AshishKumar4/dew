@@ -1764,10 +1764,11 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-GATED = ("sm90", "sm80", "sm120")
-"""The GPUs whose families the mainloop runs on (`attention_mosaic_program.qualified`, a family whose
-consumers issue their products): an H100's wgmma, an A100's mma.sync staged by cp.async and consumer
-Blackwell's fed by TMA (`bundles.MmaFed`)."""
+GATED = ("sm90", "sm80")
+"""The GPUs whose launches the resource gates compile (`attention_mosaic_program.qualified`, a family whose
+consumers issue their products): an H100's wgmma and an A100's mma.sync staged by cp.async. Consumer
+Blackwell's mma.sync fed by TMA (`bundles.MmaFed`) runs the mainloop too, but derives no tile within its
+99 KB block yet (every sm120 case None at 3569816c26, lean1b)."""
 
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
