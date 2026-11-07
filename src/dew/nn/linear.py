@@ -380,33 +380,48 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
-def tree_windows(tree: tuple[int, ...], width: int) -> np.ndarray:
-    """Each tree token's conv window, `[S, width + 1]` indices into the held history then the call's tokens
-    (`tree_conv`): its `width` predecessors on its path, oldest first, its ancestors and past the tree's
-    root the history's last columns, then itself."""
-    windows = np.zeros((len(tree), width + 1), np.int32)
-    for token, parent in enumerate(tree):
-        path, behind = [width + token], width - 1
-        while len(path) <= width:
-            if parent >= 0:
-                path.append(width + parent)
-                parent = tree[parent]
-            else:
-                path.append(behind)
-                behind -= 1
-        windows[token] = path[::-1]
-    return windows
+def tree_paths(tree: tuple[int, ...], width: int) -> np.ndarray:
+    """Each tree token's whole path, `[S, width + depth + 1]` indices into the held history then the call's
+    tokens (`tree_conv`), oldest first: -1 past its start where its path is shorter than the deepest, the
+    history's `width` columns, its ancestors from the tree's root, then itself."""
+    paths = []
+    for token in range(len(tree)):
+        path, parent = [width + token], tree[token]
+        while parent >= 0:
+            path.append(width + parent)
+            parent = tree[parent]
+        paths.append([*range(width), *path[::-1]])
+    longest = max(len(path) for path in paths)
+    return np.asarray([[-1] * (longest - len(path)) + path for path in paths], np.int32)
 
 
-def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, parts=None, dtype=None,
+def tree_windows(tree: tuple[int, ...], width: int, valid: jax.Array) -> jax.Array:
+    """Each tree token's conv window per row, `[B, S, width + 1]` indices into the held history then the
+    call's tokens (`tree_conv`): the `width` real tokens before it on its path (`valid` `[B, S]`), its
+    ancestors and past the tree's root the history's last columns, oldest first, then itself, as a cached
+    call's conv skips a token it does not hold without advancing its history (`held_conv1d`)."""
+    paths = tree_paths(tree, width)
+    held = jnp.concatenate([jnp.ones((valid.shape[0], width), bool), valid], axis=1)
+    real = ((paths >= 0) & held[:, np.maximum(paths, 0)]).at[..., -1].set(values=True)
+    # The token itself counts 1, its nearest real predecessor 2, and so on back from the path's end.
+    behind = jnp.cumsum(real[..., ::-1], axis=-1)[..., ::-1]
+    picked = jnp.stack([jnp.argmax(real & (behind == width + 1 - place), axis=-1)
+                        for place in range(width + 1)], axis=-1)
+    return jnp.take_along_axis(jnp.broadcast_to(paths, (*valid.shape, paths.shape[-1])), picked, axis=-1)
+
+
+def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, valid=None, parts=None, dtype=None,
               activation: bool = True):
     """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree_parents`): each token of `mixed`
-    `[B, S, D]` convolved over the `K-1` tokens before it on its path, its ancestors, and past the root
-    the held `history` `[B, K-1, D]`, as `causal_conv1d` convolves the window it ends (`tree_windows`);
-    its `parts`, `dtype` and `activation` are `causal_conv1d`'s."""
+    `[B, S, D]` convolved over the `K-1` real tokens before it on its path (`valid` `[B, S]`, every token
+    where None), its ancestors, and past the root the held `history` `[B, K-1, D]`, as `causal_conv1d`
+    convolves the window it ends (`tree_windows`); its `parts`, `dtype` and `activation` are
+    `causal_conv1d`'s."""
     batch, length, features = mixed.shape
     width = taps.shape[1] - 1
-    windows = jnp.concatenate([history.astype(mixed.dtype), mixed], axis=1)[:, tree_windows(tree, width)]
+    valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
+    gathered = jnp.concatenate([history.astype(mixed.dtype), mixed], axis=1)
+    windows = jax.vmap(lambda row, index: row[index])(gathered, tree_windows(tree, width, valid))
     convolved = causal_conv1d(windows.reshape(batch * length, width + 1, features), taps, activation,
                               bias=bias, parts=parts, dtype=dtype)
     if parts is None:
@@ -426,17 +441,19 @@ def call_tree(parents: tuple[int, ...] | None, key_runs, key_positions) -> tuple
 
 
 def tree_scan(module: nn.Module, mixed, taps, bias, tree: tuple[int, ...], rule,
-              sequence: Sequence[jax.Array], *, state: str = 'ssm_state', state_dtype=None, parts=None,
-              dtype=None):
+              sequence: Sequence[jax.Array], *, valid=None, state: str = 'ssm_state', state_dtype=None,
+              parts=None, dtype=None):
     """`held_scan`'s conv and scan over a tree call (`tree_conv`, `tree_rule`): each token convolved over
-    its path from the row's held `conv_state`, and advanced by `rule(convolved, *sequence, held)` (each
-    `[B, 1, ...]`, the convolved `parts` where given) from its parent's state, the held `state` past the
-    root, in `state_dtype`; the cache left as it was, which a verify replays its accepted path into."""
+    its path's real tokens (`valid` `[B, S]`, every token where None) from the row's held `conv_state`,
+    and advanced by `rule(convolved, *sequence, held)` (each `[B, 1, ...]`, the convolved `parts` where
+    given) from its parent's state, the held `state` past the root, in `state_dtype`, a token the row does
+    not hold passing its parent's state on; the cache left as it was, which a verify replays its accepted
+    path into."""
     if not module.has_variable('cache', state):
         raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
     held = module.get_variable('cache', state)
-    convolved = tree_conv(mixed, taps, bias, module.get_variable('cache', 'conv_state'), tree, parts=parts,
-                          dtype=dtype)
+    convolved = tree_conv(mixed, taps, bias, module.get_variable('cache', 'conv_state'), tree, valid=valid,
+                          parts=parts, dtype=dtype)
     pieces = convolved if isinstance(convolved, tuple) else (convolved,)
     count = len(pieces)
 
@@ -444,14 +461,16 @@ def tree_scan(module: nn.Module, mixed, taps, bias, tree: tuple[int, ...], rule,
         pieced, rest, prior = operands[:count], operands[count:-1], operands[-1]
         return rule(pieced if parts is not None else pieced[0], *rest, prior)
 
-    out = tree_rule(step, tree, (*pieces, *sequence), held.astype(state_dtype or held.dtype))
+    out = tree_rule(step, tree, (*pieces, *sequence), held.astype(state_dtype or held.dtype), valid=valid)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
-def tree_rule(rule, tree: tuple[int, ...], operands: Sequence[jax.Array], held: jax.Array):
+def tree_rule(rule, tree: tuple[int, ...], operands: Sequence[jax.Array], held: jax.Array, *, valid=None):
     """A tree call's recurrence: each token advanced by `rule(*its operands [B, 1, ...], state)` from its
-    parent's state, the held `held` past the root, in tree order: its outputs `[B, S, ...]`. The tokens'
-    own states are not kept: a verify replays its accepted path into the cache it was called on."""
+    parent's state, the held `held` past the root, in tree order: its outputs `[B, S, ...]`. A token a row
+    does not hold (`valid` `[B, S]`) passes its parent's state to its children, as a cached call's scan
+    leaves its state past such a token. The tokens' own states are not kept: a verify replays its accepted
+    path into the cache it was called on."""
     parents = jnp.asarray(tree, jnp.int32)
 
     def advance(states, token):
@@ -459,6 +478,9 @@ def tree_rule(rule, tree: tuple[int, ...], operands: Sequence[jax.Array], held: 
         prior = jnp.where(parent >= 0, states[jnp.maximum(parent, 0)], held)
         out, final = rule(*(jax.lax.dynamic_slice_in_dim(operand, token, 1, 1) for operand in operands),
                           prior)
+        if valid is not None:
+            kept = jnp.asarray(valid, bool)[:, token].reshape((-1,) + (1,) * (prior.ndim - 1))
+            final = jnp.where(kept, final.astype(prior.dtype), prior)
         return states.at[token].set(final.astype(held.dtype)), out[:, 0]
 
     _, outs = jax.lax.scan(advance, jnp.zeros((len(tree), *held.shape), held.dtype), jnp.arange(len(tree)))
@@ -1017,7 +1039,7 @@ class GatedDeltaNet(nn.Module):
 
         return token
 
-    def _tree(self, mixed, g, beta, tree: tuple[int, ...], heads, widths, wide):
+    def _tree(self, mixed, g, beta, tree: tuple[int, ...], heads, widths, wide, valid):
         """A tree call's convolved tokens and recurrence (`tree_scan`): each token on its path, from the
         row's held history and state past the root, the cache left as it was."""
         def rule(convolved, g, beta, held):
@@ -1026,8 +1048,8 @@ class GatedDeltaNet(nn.Module):
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             return recurrent_gated_delta_rule(query, key, value, g, beta, held)
 
-        return tree_scan(self, mixed, self.conv1d()[0], None, tree, rule, (g, beta), state='recurrent_state',
-                         state_dtype=wide, parts=heads, dtype=wide)
+        return tree_scan(self, mixed, self.conv1d()[0], None, tree, rule, (g, beta), valid=valid,
+                         state='recurrent_state', state_dtype=wide, parts=heads, dtype=wide)
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
@@ -1099,7 +1121,7 @@ class GatedDeltaNet(nn.Module):
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
         if tree is not None:
-            out = self._tree(mixed, g, beta, tree, heads, widths, wide)
+            out = self._tree(mixed, g, beta, tree, heads, widths, wide, valid)
         elif shards > 1:
             if decode:
                 raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "

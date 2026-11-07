@@ -193,10 +193,30 @@ def test_a_latent_attention_cached_call_reads_by_its_runs_past_its_queries_valid
     np.testing.assert_array_equal(np.asarray(padded[:, -1]), np.asarray(real[:, -1]))
 
 
-def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str) -> None:
+@pytest.mark.parametrize("mixer", sorted(RECURRENT))
+def test_a_tree_token_a_row_does_not_hold_is_skipped_as_a_plain_cached_call_skips_it(mixer):
+    """A tree call whose rows hold different tokens (a verify's rows drafting trees of fewer tokens, the
+    rest padding): a recurrent stack reads each token as its path decoded alone with the same tokens held,
+    a token a row does not hold leaving its descendants' conv history and state as a plain cached call
+    leaves them, its real ancestors before it (`dew.nn.linear.tree_windows`, `tree_rule`), from the float64
+    run's (check 1). Here the first row holds no first child, so its child convolves the root and the
+    cache's history alone."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
+        max_seq_len=16, dtype="float32", layer_types=("linear_attention",) * 2,
+        kinds={"linear_attention": {"mixer": {"class": mixer, "fields": RECURRENT[mixer]}}})
+    held = np.ones((2, len(TREE)), bool)
+    held[0, 1] = False
+    assert_reads_paths(model, TREE, f"{mixer} tree past a token not held", valid=jnp.asarray(held))
+
+
+def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str, *,
+                       valid: jax.Array | None = None) -> None:
     """`model`'s tree call over `tree` past a cached prompt, each token at its depth's position and its
     attention's keys at theirs, on par with each token's root-to-token path decoded as a plain cached call
-    from the same cache, from the float64 run's (check 1), over drawn weights and ids."""
+    from the same cache, from the float64 run's (check 1), over drawn weights and ids; the tokens each row
+    holds `valid` (`[2, S]`, every one where None), each path's held alike, for a stack with no attention,
+    whose keys a tree's runs name whether held or not."""
     wide = float64_twin(model)
     rows = 2
 
@@ -215,6 +235,10 @@ def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: s
         slots = jnp.arange(model.max_seq_len).at[PROMPT:PROMPT + len(tree)].set(
             PROMPT + jnp.asarray(depths(tree)))
         keys = jnp.broadcast_to(slots, (rows, model.max_seq_len))
+        if valid is not None:
+            logits, _ = model.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
+                                    attention_tree=tree, rotary_positions=placed, attention_mask=valid)
+            return logits
         logits, _ = model.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
                                 attention_tree=tree, attention_key_runs=tree_runs(rows, PROMPT, tree),
                                 attention_key_positions=keys, rotary_positions=placed)
@@ -226,8 +250,9 @@ def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: s
             cache = cached(decoder, params, prompt)
             ends = []
             for path in paths(tree):
+                held = {} if valid is None else {"attention_mask": valid[:, jnp.asarray(path)]}
                 logits, _ = decoder.apply({**params, "cache": cache}, block[:, jnp.asarray(path)],
-                                          decode=True, mutable=["cache"])
+                                          decode=True, mutable=["cache"], **held)
                 ends.append(logits[:, -1])
             return jnp.stack(ends, axis=1)
         return each_path
