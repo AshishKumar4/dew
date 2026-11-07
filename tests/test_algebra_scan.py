@@ -485,8 +485,9 @@ def test_a_chunks_adjoint_meets_its_decay_once():
     zero, its decay e^-1, entering a state of 2^120 on that key alone, with a cotangent of 2^20 on the state
     it leaves: the token's correction cancels its write, so the state's cotangent through the decay is zero
     on the key the state holds and so is the decay's gradient, and the derived chunk's adjoint
-    (`Derived.backward`, the token update replayed) is finite, the state's two reads of the decay one
-    decayed state whose cotangent is summed before it meets the decay (row 1966's head review)."""
+    (`Derived.backward`, the token update replayed) keeps the entering state's cotangent and the decay's
+    gradient finite, the latter exactly zero (row 1966's head review). The key's and write gate's gradients
+    exceed float32's range at this state and cotangent."""
     chunk = {"q": jnp.zeros((1, KEY)), "k": jnp.zeros((1, KEY)).at[0, 0].set(1.0),
              "v": jnp.zeros((1, VALUE)), "g": jnp.full((1,), -1.0), "beta": jnp.ones((1,))}
     forms = scan.derive_scan(scan.Scan(gated_delta, gated_readout, GATED, walked="time",
@@ -494,7 +495,9 @@ def test_a_chunks_adjoint_meets_its_decay_once():
     entering = jnp.zeros((KEY, VALUE)).at[0].set(2.0 ** 120)
     d_state, d_operands = forms.backward(chunk, (None, entering), jnp.full((KEY, VALUE), 2.0 ** 20),
                                          jnp.zeros((1, VALUE)))
-    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves((d_state, d_operands)))
+    assert np.all(np.isfinite(np.asarray(d_state)))
+    assert np.all(np.isfinite(np.asarray(d_operands["g"])))
+    np.testing.assert_array_equal(d_operands["g"], jnp.zeros_like(chunk["g"]))
 
 
 def test_a_chunks_decay_gradient_reads_no_pair_of_its_future():
