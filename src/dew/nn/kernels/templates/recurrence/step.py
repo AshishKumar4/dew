@@ -20,7 +20,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence, tuning
+from dew.nn.kernels import recurrence, short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
 from dew.nn.precision import L2NORM_EPS, rms_weighted
 
@@ -267,11 +267,9 @@ class _Conv:
         streams = []
         for window, (first, width) in zip(windows, self.pieces, strict=True):
             weights = [self._load(taps.at[j], first, width).astype(jnp.float32) for j in range(len(window))]
-            pre = window[0] * weights[0]
-            for inputs, weight in zip(window[1:], weights[1:], strict=True):
-                pre = pre + inputs * weight
-            if self.conv.bias:
-                pre = pre + self._load(self.inputs['conv_bias'], first, width).astype(jnp.float32)
+            bias = (self._load(self.inputs['conv_bias'], first, width).astype(jnp.float32) if self.conv.bias
+                    else None)
+            pre = short_conv.preactivation(window, weights, bias)
             # SiLU as the reference's, the input times its sigmoid.
             streams.append(pre if self.conv.activation is None else pre * _sigmoid(pre))
         return tuple(streams)

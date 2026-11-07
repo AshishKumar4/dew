@@ -88,12 +88,13 @@ CONV: Op[ConvCase] = Op('short_conv', (Kernel('mosaic_gpu', SUPPORTS), Kernel('x
 
 def preactivation(window, taps, bias):
     """The conv's sum, tap by tap from the oldest token, then the bias: `window` and `taps` each tap's
-    inputs `[..., C]` and weights `[C]`, oldest first, in the sum's dtype (fp32 in the kernels; the portable
-    conv's and the decode reference's at least fp32), the one order every conv path adds in."""
-    total = window[0] * taps[0][None, :]
+    inputs `[..., C]` and weights `[C]` (a kernel's a thread's channels of each), oldest first, in the sum's
+    dtype (fp32 in the kernels; the portable conv's and the decode reference's at least fp32): the one order
+    and the one statement of it every conv path adds in, the template's conv and decode step included."""
+    total = window[0] * taps[0]
     for inputs, tap in zip(window[1:], taps[1:], strict=True):
-        total = total + inputs * tap[None, :]
-    return total if bias is None else total + bias[None, :]
+        total = total + inputs * tap
+    return total if bias is None else total + bias
 
 
 def _launched(interpret: bool):
