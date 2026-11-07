@@ -275,12 +275,17 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
                                 value.prologue_broadcast, value.epilogue_broadcast, value.accumulators))
 
     def keyed(self, ba):
-        """`tuning.KernelOp.keyed`, each side operand's dimension that follows the rows bucketed with the
-        tokens' (`ROWS`), so the launch a key measures loads side tiles over all its rows."""
+        """`tuning.KernelOp.keyed`, a call's tables (`gather`, `scatter`) bucketed as the tokens' rows are,
+        and each side operand's dimension that follows the rows bucketed with the product's rows (the
+        tokens', `ROWS`, or a gathered call's table's, `_rows_of`), so the launch a key measures loads side
+        tiles over all its rows, and a kernel gradient's table meets its ungathered operand at one count."""
         keyed = super().keyed(ba)
-        rows = keyed.arguments['tokens'].shape[0]
-        hooks = ba.arguments.get('hooks', NO_HOOKS)
         arguments = dict(keyed.arguments)
+        for name in ('gather', 'scatter'):
+            if arguments.get(name) is not None:
+                arguments[name] = jax.tree.map(tuning.bucketed, arguments[name])
+        rows = next(iter(jax.tree.leaves(arguments.get('gather'))), arguments['tokens']).shape[0]
+        hooks = ba.arguments.get('hooks', NO_HOOKS)
         for name, axes_of in (('prologue_operands', hooks.prologue_axes),
                               ('epilogue_operands', hooks.epilogue_axes)):
             if name in arguments:
@@ -559,8 +564,10 @@ class Tgmm(_Triton):
 
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
+             prologue_operands: tuple = (), gather: tuple | None = None, *, out_dtype: str, interpret: bool,
+             hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: Tile, return_residuals: bool = False):
+        del gather  # table rows are Mosaic GPU's alone (`tables`)
         if dense:
             # One group of every row: the plain tiled kernel (`Gmm._fwd`).
             from .templates.gemm import triton_dense
@@ -1248,8 +1255,8 @@ class MosaicTgmm(_Mosaic):
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
-        return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0], rows=tokens.shape[0],
-                                      depth=depth, width=width,
+        return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
+                                      rows=_rows_of(_TGMMS, ba.args), depth=depth, width=width,
                                       itemsizes=(tokens.dtype.itemsize, cotangent.dtype.itemsize),
                                       multiprocessors=_multiprocessors(target),
                                       step_seconds=mosaic_gpu.step_seconds(tile, target),
@@ -1312,14 +1319,15 @@ class MosaicTgmm(_Mosaic):
 
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
+             prologue_operands: tuple = (), gather: tuple | None = None, *, out_dtype: str, interpret: bool,
+             hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
              return_residuals: bool = False):
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
                                multiprocessors=self._programs(config),
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
-                               exact_sums=exact_sums, dense=dense), None
+                               exact_sums=exact_sums, dense=dense, gather=gather), None
 
 
 @functools.cache
@@ -1510,10 +1518,11 @@ class CutlassTgmm(_Cutlass):
     TILE: ClassVar[mosaic_gpu.Tiles] = dataclasses.replace(CUTLASS_TILE, cluster=1)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
+             prologue_operands: tuple = (), gather: tuple | None = None, *, out_dtype: str, interpret: bool,
+             hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
              return_residuals: bool = False):
-        del prologue_operands, interpret, hooks, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
+        del prologue_operands, gather, interpret, hooks, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
         _cutlass_registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))
@@ -1740,10 +1749,11 @@ class MosaicTpuTgmm(_MosaicTpu):
 
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
+             prologue_operands: tuple = (), gather: tuple | None = None, *, out_dtype: str, interpret: bool,
+             hooks: Hooks = NO_HOOKS,
              exact_sums: bool = False, dense: bool = False, config: mosaic_tpu.Blocks,
              return_residuals: bool = False):
-        del exact_sums, dense  # never set (`eligible`); a dense call is one group, as any
+        del exact_sums, dense, gather  # never set (`eligible`, `tables`); a dense call is one group, as any
         return mosaic_tpu.tgmm(tokens, cotangent, sizes, blocks=config, out_dtype=out_dtype,
                                interpret=TPU_INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes), None
@@ -1935,9 +1945,11 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     # An FP8 call's cells are its own: `DECLARED`'s receipts timed 16-bit products, and XLA's dot of FP8
     # operands sums narrower than the FP8 contract holds (row 1625), so the template takes them by default.
     eight = ' fp8' if any(jnp.dtype(argument.dtype) in EIGHT for argument in arguments[:2]) else ''
-    # A gathered call's cells are its own: no old route reads gathered rows, nor did a receipt time one.
-    gathered = len(arguments) > 7 and arguments[7] is not None
-    scattered = len(arguments) > 8 and arguments[8] is not None
+    # A gathered call's cells are its own: no old route reads gathered rows, nor did a receipt time one. A
+    # kernel gradient's tables (`tgmm_call`'s) are its fifth argument, a product's (`gmm_call`'s) its eighth.
+    tabled = 4 if launches is _TGMMS else 7
+    gathered = len(arguments) > tabled and arguments[tabled] is not None
+    scattered = launches is not _TGMMS and len(arguments) > 8 and arguments[8] is not None
     tables = f"{' gathered' if gathered else ''}{' scattered' if scattered else ''}"
     kind = f"{'dense' if options['dense'] else 'grouped'} {made}{eight}{tables}"
     call = base.call(launches, *arguments, **options)
@@ -1945,9 +1957,18 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
     paired = any(bound.arguments.get('paired') is not None for _, bound in call.bound.values())
-    rows = (arguments[7] if gathered else arguments[0]).shape[0]
+    rows = _rows_of(launches, arguments)
     return GroupedCase(placed, whole, product, rows, call, kind, paired=paired, gathered=gathered,
                        scattered=scattered)
+
+
+def _rows_of(launches, arguments) -> int:
+    """The rows a call's product walks: its tokens', or its gather table's where it gathers its tokens (a
+    kernel gradient's tokens' table, else its cotangent's, the tokens then whole)."""
+    if launches is _TGMMS:
+        tables = (arguments[4] if len(arguments) > 4 else None) or (None, None)
+        return next((table for table in tables if table is not None), arguments[0]).shape[0]
+    return (arguments[7] if len(arguments) > 7 and arguments[7] is not None else arguments[0]).shape[0]
 
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):
@@ -1987,12 +2008,17 @@ def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_oper
     return _GMMS, arguments, options
 
 
-def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dtype,
-              hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
+def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), gather: tuple | None = None, *,
+              out_dtype, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
+              dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` transposed times its rows of
     `cotangent`, both of one dtype, with the template's prologue
-    (`gemm.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
-    arguments = (tokens, cotangent, sizes, tuple(prologue_operands))
+    (`gemm.gemm_t`); `promoted` and `dense` as `gmm_call`'s; `gather`, a table for either operand
+    (`(tokens_table, cotangent_table)`, int32 `[rows]` or None), that operand's rows at its entries
+    (`gmm_call`'s `gather`: a mixture of experts' tokens and a scattered product's cotangent, read where
+    they lie), Mosaic GPU's launch's alone."""
+    arguments = (tokens, cotangent, sizes, tuple(prologue_operands),
+                 *(() if gather is None else (tuple(gather),)))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
                'exact_sums': promoted, 'dense': dense}
     return _TGMMS, arguments, options
