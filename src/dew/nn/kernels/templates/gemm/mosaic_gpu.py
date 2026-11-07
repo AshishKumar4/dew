@@ -647,7 +647,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
                          exact_sums=exact_sums, transpose_lhs=transpose_lhs, scales=scales,
                          step_scales=step_scales, scale_per=per, mx_scales=mx_scales, gather=gather,
-                         scatter=scatter)
+                         scatter=scatter, stored=None if scatter is None else rows)
     if tiles.splits > 1:
         # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
         total = functools.reduce(jnp.add, tuple(outs[0]))
@@ -718,12 +718,13 @@ def launched(family: mosaic.Family, multiprocessors: int, walked: int, tail: tai
 
 
 @tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
-                      'dense', 'tail', 'exact_sums', 'transpose_lhs', 'scale_per'))
+                      'dense', 'tail', 'exact_sums', 'transpose_lhs', 'scale_per', 'stored'))
 def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
                   transpose_lhs: bool = False, paired: jax.Array | None = None, tail=None,
                   exact_sums: bool = False, scales: jax.Array | None = None, step_scales: tuple | None = None,
-                  scale_per: int = 1, mx_scales: tuple | None = None, gather=None, scatter=None) -> tuple:
+                  scale_per: int = 1, mx_scales: tuple | None = None, gather=None, scatter=None,
+                  stored: int | None = None) -> tuple:
     """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
     its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
     on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
@@ -763,7 +764,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         (scale_gmems, mx_gmems, gather_gmem, scatter_gmem), refs = _scale_refs(refs, step_scales, mx_scales,
                                                                                  gather, scatter)
         prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
-        o_gmems, workspace = _outputs(o_gmems, tail, scatter_gmem, bool(interpret))
+        workspace = None
+        if tail is not None:
+            workspace, *o_gmems = o_gmems
+        o_gmems = _outputs(tuple(o_gmems), scatter_gmem, bool(interpret))
         ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
         meetings = _meetings(family, tiles, grid[0] * grid[1], multiprocessors, consumers, bool(interpret))
 
@@ -821,24 +825,23 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                              swizzles=SCALE_SWIZZLES if step_scales is not None
                                              else None, **_gathered(gather, tiles, lhs.dtype, interpret)))
 
-    # A depth split's outputs: each run's partial, a `[m, n]` slice of its own.
-    out_type = tuple(jax.ShapeDtypeStruct((m, n) if tiles.splits == 1 else (tiles.splits, m, n), dtype)
+    # A depth split's outputs: each run's partial, a `[m, n]` slice of its own. A scattered product's, its
+    # `stored` rows alone, which its table's entries land on, each once: its padded rows land nowhere, so
+    # rows past them would be declared and never written (NSNAN-2).
+    rows = m if stored is None else stored
+    out_type = tuple(jax.ShapeDtypeStruct((rows, n) if tiles.splits == 1 else (tiles.splits, rows, n), dtype)
                      for dtype in dtypes)
-    # A balanced tail's partials: each program's, a consumer's share of a tile each, of the tile its range
-    # starts inside and of the one it walks the first step of (`Family.fixed_up`'s `firsts`).
-    workspace = () if tail is None else (
-        jax.ShapeDtypeStruct((multiprocessors, 2, consumers, *part), jnp.float32),)
     operands = (lhs, rhs, *(() if paired is None else (paired,)), *(() if scales is None else (scales,)),
                 *(step_scales or ()), *(mx_scales or ()), *(() if gather is None else (gather,)),
                 *(() if scatter is None else (scatter,)))
-    kernel = family.kernel(body, out_type=(*out_type, *workspace),
+    kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
                            resident=tiles.programs, scalars=0 if dense else 1,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type))
-    outs = kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands)
-    return outs[:len(out_type)] if tail is not None else outs
+    return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
+                  *_workspace(tail, (multiprocessors, 2, consumers, *part)))
 
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, m: int, g: int,
@@ -1013,13 +1016,22 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
                          f"({family.name}'s do not, or its call or {tiles} is not one it takes)")
 
 
-def _outputs(o_gmems: tuple, tail, scatter_gmem, interpret: bool) -> tuple:
-    """Dew: a `gmm` kernel's outputs, each `mosaic.Scattered` through `scatter_gmem` where the call has one,
-    and a balanced tail's workspace (the last reference; None without a tail)."""
-    o_gmems, workspace = (o_gmems, None) if tail is None else (o_gmems[:-1], o_gmems[-1])
+def _outputs(o_gmems: tuple, scatter_gmem, interpret: bool) -> tuple:
+    """Dew: a `gmm` kernel's outputs, each `mosaic.Scattered` through `scatter_gmem` where the call has
+    one."""
     if scatter_gmem is not None:
-        o_gmems = tuple(mosaic.Scattered(o_gmem, scatter_gmem, interpret) for o_gmem in o_gmems)
-    return o_gmems, workspace
+        return tuple(mosaic.Scattered(o_gmem, scatter_gmem, interpret) for o_gmem in o_gmems)
+    return o_gmems
+
+
+def _workspace(tail, shape: tuple) -> tuple:
+    """Dew: a balanced tail's partials (`tail.Tail`): each program's, a consumer's share of a tile each, of
+    the tile its range starts inside and of the one it walks the first step of (`Family.fixed_up`'s
+    `firsts`), a ref the kernel writes in place, the last of its operands; none without a tail. Its slots
+    are written only where programs share a tile, so it is no declared output, which would leave the rest
+    unwritten (NSNAN-2), and it starts uninitialized (`lax.empty`: XLA's AllocateBuffer on a GPU, no
+    memset), as no slot is read before its program writes it."""
+    return () if tail is None else (jax.new_ref(lax.empty(shape, jnp.float32)),)
 
 
 def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
@@ -1659,7 +1671,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     def body(sizes_gmem, starts_gmem, ends_gmem, blocks_gmem, block_starts_gmem, order_gmem, lhs_gmem,
              rhs_gmem, *refs):
         table_gmems, refs = _tables_placed(tables, refs)
-        *side_gmems, o_gmem = refs if tail is None else refs[:-1]
+        *side_gmems, o_gmem = refs
+        workspace = None
+        if tail is not None:
+            *side_gmems, workspace = side_gmems
         scale_gmems, side_gmems = _scales_apart(side_gmems, step_scales is not None)
         ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
 
@@ -1716,10 +1731,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                     store(0, summed, o_gmem.at[g_i], place)
                     return
                 first, gathered = gathered
-                family.fixed_up(summed, refs[-1].at[:, 0, wg], None if ready is None else ready.at[:, wg],
+                family.fixed_up(summed, workspace.at[:, 0, wg], None if ready is None else ready.at[:, wg],
                                 program, first, gathered,
                                 lambda value: store(0, value, o_gmem.at[g_i], place),
-                                firsts=refs[-1].at[:, 1, wg])
+                                firsts=workspace.at[:, 1, wg])
 
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
@@ -1732,17 +1747,14 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                              **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
-    # A balanced tail's partials: each program's, a consumer's share of a tile each, of the tile its range
-    # starts inside and of the one it walks the first step of (`Family.fixed_up`'s `firsts`).
-    workspace = () if tail is None else (
-        jax.ShapeDtypeStruct((multiprocessors, 2, consumers, *part), jnp.float32),)
-    kernel = family.kernel(body, out_type=(out_type, *workspace),
+    kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
                            consumers=consumers, interpret=interpret, approx_math=False, name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     present = tuple(table for table in tables if table is not None)
-    return kernel(*groups, lhs, rhs, *present, *(step_scales or ()), *prologue_operands)[0]
+    return kernel(*groups, lhs, rhs, *present, *(step_scales or ()), *prologue_operands,
+                  *_workspace(tail, (multiprocessors, 2, consumers, *part)))
 
 
 def ragged_rows(m: int, *, prologue, k_major: bool) -> bool:
