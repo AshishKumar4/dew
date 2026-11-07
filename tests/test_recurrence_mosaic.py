@@ -186,14 +186,14 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
     (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
     hooks', its numbers the run's fast forms' where they are its forms (`rounded`, as its route resolves
-    it: a rated scan's mamba_ssm's, `recurrence_chunk.fast_rounding`, else the delta rule's and an fp32
-    call's two parts, `recurrence_chunk.chunk_rounding`)."""
+    it: a rated scan's mamba_ssm's, `recurrence_chunk.fast_rounding`, else the delta rule's alone,
+    `recurrence_chunk.chunk_rounding`)."""
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
-    # The l2 norm takes the queries and keys to fp32 at least before the rule reads them.
-    query, key = ((x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in (given.query, given.key))
-                  if hooks.l2norm else (given.query, given.key))
+    # The l2 norm rounds the queries and keys back to their own dtype before the rule reads them
+    # (`recurrence_chunk.chunk`, row 184).
+    query, key = given.query, given.key
     dtype = jnp.result_type(query, key, given.value)
     rounded = fast_rounding(dtype) if hooks.rated else chunk_rounding(hooks.delta, dtype)
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
