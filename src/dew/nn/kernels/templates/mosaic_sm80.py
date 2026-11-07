@@ -497,7 +497,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None):
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()):
+        if gathered:
+            raise NotImplementedError("emit_pipeline's cp.async copies gather no rows (`gathers_rows`)")
         _one(consumers, clustered=bool(multicast))
         # A stream's pieces each a block of `emit_pipeline`'s own, in whole 8-row tiles, joined by its
         # consumer.

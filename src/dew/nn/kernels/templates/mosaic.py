@@ -1758,12 +1758,13 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def streams(self, blocks: dict, stages: int, consumers: int,
                 multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None,
-                copies: dict[str, int] | None = None) -> Allocated:
+                copies: dict[str, int] | None = None, gathered: tuple[str, ...] = ()) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
         share, loaded once between them (`kernel`'s `cluster`), each `swizzles` names staged at its swizzle
         (`swizzle_for`; inference's own otherwise), each `copies` names a step's tile loaded in that many
-        copies (`Pieces`; one otherwise)."""
+        copies (`Pieces`; one otherwise), each `gathered` names a step's tile whose rows a table gathers (a
+        family that gathers rows alone, `gathers_rows`)."""
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
