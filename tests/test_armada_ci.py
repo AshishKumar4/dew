@@ -1317,10 +1317,11 @@ def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_
 def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci, tmp_path, monkeypatch,
                                                                              cache_worker):
     """A run that reads a checkout file and writes it keeps no key, however it writes it: Python's write, one
-    handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, or a
-    native writer (sqlite's): its key would hash the bytes the run left, not those it read, so it is never
-    reused and runs again (row 2559). A file a run only writes, as each run here appends to `runs`, is no
-    input and leaves its key."""
+    handle that reads and writes, a truncation, a mapped page, a removal and a new file in its place, through
+    an alias of what it read, under a nested hidden directory, a copy that puts the file's time back, or a
+    native writer (sqlite's); nor does one that found a file absent and made it: its key would hash the
+    checkout the run left, not what it read, so it is never reused and runs again (row 2559 and its review).
+    A file a run only writes, as each run here appends to `runs`, is no input and leaves its key."""
     import sqlite3
 
     counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
@@ -1331,6 +1332,12 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
         database.execute("create table t (x)")
     database.close()
     page = "    page = Path('docs/page.txt')\n"
+    # An alias of the page, a file under a nested hidden directory, and a file of the page's size whose copy
+    # over it puts its time back.
+    (tmp_path / "docs/link.txt").symlink_to("page.txt")
+    (tmp_path / "docs/.data").mkdir()
+    (tmp_path / "docs/.data/input.txt").write_text("input\n")
+    (tmp_path / "docs/same.txt").write_text("PAGE\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     for test, body in (
             ("plain", "    assert True\n"),
@@ -1343,11 +1350,19 @@ def test_a_run_that_writes_a_checkout_file_it_read_keeps_no_key_by_any_writer(ci
                        "        mapped[0:1] = mapped[0:1].upper()\n"),
             ("replaced", page + "    text = page.read_text()\n    page.unlink()\n"
                                 "    page.write_text(text)\n"),
+            ("aliased", "    assert Path('docs/link.txt').read_text()\n"
+                        "    Path('docs/page.txt').write_text('page\\n')\n"),
+            ("hidden", "    held = Path('docs/.data/input.txt')\n    held.write_text(held.read_text())\n"),
+            ("restored", page + "    assert page.read_text()\n    stamp = page.stat()\n"
+                                "    os.utime('docs/same.txt', ns=(stamp.st_atime_ns, stamp.st_mtime_ns))\n"
+                                "    shutil.copy2('docs/same.txt', page)\n"),
+            ("made", "    made = Path('docs/made.txt')\n    if not made.exists():\n"
+                     "        made.write_text('made\\n')\n"),
             ("native", "    with sqlite3.connect('tests/fixtures/rows.db') as database:\n"
                        "        database.execute('insert into t values (1)')\n"
                        "    database.close()\n")):
-        written(tmp_path, {"test_a.py": "import mmap\nimport os\nimport sqlite3\nfrom pathlib import Path\n"
-                                        "\n\ndef test_a():\n" + counted + body})
+        written(tmp_path, {"test_a.py": "import mmap\nimport os\nimport shutil\nimport sqlite3\n"
+                                        "from pathlib import Path\n\n\ndef test_a():\n" + counted + body})
         (tmp_path / "runs").unlink(missing_ok=True)
         commit(tmp_path, test)
         assert [run(), run()] == ([1, 1] if test == "plain" else [1, 2]), test

@@ -140,30 +140,40 @@ class Writes:
             self.fd = -1
 
 
-def stamps(root: str, hidden_inputs: tuple[str, ...]) -> dict[str, tuple[int, int, int]]:
-    """Each file of the checkout at `root`, by its path relative to it, with what any write of it changes: its
-    inode, its size and its modification time, whoever writes it and however (Python's open, a native
-    library's, a rename over it, a truncation, a mapped page, a removal and a new file in its place). Hidden
-    entries but `hidden_inputs`, bytecode caches and installed packages are none of it, as a record keeps none
-    of them (followed.py's `placed`)."""
-    found = {}
-    for directory, names, files in os.walk(root):
+def stamps(root: str, hidden_inputs: tuple[str, ...]) -> dict[str, tuple[int, int, int, int]]:
+    """Each file of the checkout at `root`, by its path relative to it (through a link as a reader names it),
+    with what any write of it changes: the inode, size, modification time and change time of what it names,
+    whoever writes it and however (Python's open, a native library's, a rename over it, a truncation, a copy
+    that puts its time back, a removal and a new file in its place). The checkout's hidden entries but
+    `hidden_inputs`, bytecode caches and installed packages are none of it, as a record keeps none of them
+    (followed.py's `placed`); a directory reached twice through links is walked once."""
+    found, walked = {}, set()
+    for directory, names, files in os.walk(root, followlinks=True):
+        held = os.stat(directory)
+        if (held.st_dev, held.st_ino) in walked:
+            names[:] = []
+            continue
+        walked.add((held.st_dev, held.st_ino))
         top = directory == root
         names[:] = [name for name in names if name not in ("__pycache__", "site-packages")
-                    and (not name.startswith(".") or (top and name in hidden_inputs))]
+                    and not (top and name.startswith(".") and name not in hidden_inputs)]
         for name in files:
-            if name.startswith(".") and not (top and name in hidden_inputs):
+            if top and name.startswith(".") and name not in hidden_inputs:
                 continue
             path = os.path.join(directory, name)
             try:
-                held = os.lstat(path)
-            except FileNotFoundError:
+                held = os.stat(path)
+            except FileNotFoundError:  # a link to nothing names no file
                 continue
-            found[os.path.relpath(path, root)] = (held.st_ino, held.st_size, held.st_mtime_ns)
+            found[os.path.relpath(path, root)] = (held.st_ino, held.st_size, held.st_mtime_ns,
+                                                  held.st_ctime_ns)
     return found
 
 
-def changed(before: dict[str, tuple[int, int, int]], after: dict[str, tuple[int, int, int]]) -> set[str]:
-    """The files of `before` (`stamps`) that `after` holds otherwise or not at all: written or removed between
-    them. A file `after` alone holds was made between them, which nothing before could read."""
-    return {path for path, stamp in before.items() if after.get(path) != stamp}
+def changed(before: dict[str, tuple[int, int, int, int]], after: dict[str, tuple[int, int, int, int]]
+            ) -> tuple[set[str], set[str]]:
+    """What changed between two `stamps` of a checkout: the files written, removed or made between them, and
+    the directories whose entries they changed (a made or removed file's), the checkout's own as `.`."""
+    files = {path for path, stamp in before.items() if after.get(path) != stamp} | (
+        after.keys() - before.keys())
+    return files, {os.path.dirname(path) or "." for path in before.keys() ^ after.keys()}

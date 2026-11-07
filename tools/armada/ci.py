@@ -1539,7 +1539,7 @@ def dumped(done: subprocess.Popen, stacks: Path) -> str:
 
 
 def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
-               stacks: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
+               stacks: Path) -> tuple[int, str, bool, str, set[str] | None, tuple[set[str], set[str]]]:
     """A task's pytest `command` run to its `deadline`: its exit code, output, whether it passed the deadline,
     its threads' stacks then (`dumped`), the data files it opened (`watched`), none where its group
     outlived the kill, and the checkout's files it wrote (`watched.changed`). pytest leads its own process
@@ -1733,11 +1733,21 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
             for parent in path.parents if parent == digests.FIXTURES or digests.FIXTURES in parent.parents}
 
 
-def wrote_inputs(depends: list[str], changed: Container[str]) -> bool:
-    """Whether a file of `depends`, a run's inputs (followed.py's records: a file read or probed, a module's
-    unit run), is among `changed`; a directory's listing (a lookup's) is none, as a file made in it is new."""
-    return any(item.removeprefix(followed.PROBED).partition(followed.CODE)[0] in changed
-               for item in depends if not item.startswith(followed.LOOKUP))
+def wrote_inputs(depends: list[str], changed: tuple[Container[str], Container[str]]) -> bool:
+    """Whether a run's inputs `depends` (followed.py's records) hold what `changed` (`watched.changed`: the
+    files written, removed or made, and the directories whose entries changed) says changed: a file read,
+    probed or run as a module; a directory listed; or an import's lookup (`followed.LOOKUP`), by the entries
+    of its name it finds (`digests.looked_up`)."""
+    files, entries = changed
+    for item in depends:
+        if item.startswith(followed.LOOKUP):
+            looked = item[len(followed.LOOKUP):]
+            if any(path == looked or path.startswith((f"{looked}.", f"{looked}/__init__")) for path in files):
+                return True
+        elif (path := item.removeprefix(followed.PROBED).partition(followed.CODE)[0]) in files \
+                or path in entries:
+            return True
+    return False
 
 
 def site_inputs(python: str, row_name: str, depends: list[str] | None) -> list[str] | None:
@@ -1789,7 +1799,7 @@ def drawn_whole(spans: list[tuple[int, int]], start: int, stop: int) -> bool:
 
 def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None, unkeyed: Container[str] = (),
-           changed: Container[str] = ()) -> None:
+           changed: tuple[Container[str], Container[str]] = ((), ())) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
     they read the backend and its peak memory on a GPU and its children's pools: `gpu_tier` reads the
