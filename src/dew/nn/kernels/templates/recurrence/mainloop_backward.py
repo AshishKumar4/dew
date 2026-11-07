@@ -13,8 +13,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels import generation, recurrence_algebra as algebra
+from dew.nn.kernels.templates import mosaic, product, resources
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
@@ -40,6 +40,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     prefix_reader,
     role_tiles,
     sequence_walk,
+    shared_allocation,
     staging_tiles,
     stream_blocks,
     stream_tile,
@@ -49,6 +50,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     vector_blocks,
     vector_views,
     walk_stores,
+    whole_blocks,
 )
 from dew.nn.precision import compensated_sum
 
@@ -589,11 +591,12 @@ def _values_gated_back(call: Call, slots, columns, out: Parts, dv, betas, skip) 
 
 
 def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, row, key_columns, first,
-                     chunk, block) -> dict:
+                     chunk, block, split=0, vq: int | None = None) -> dict:
     """`_query_key`'s streams' views (`stream_views`) for a program's key block `block` of chunk `chunk`, its
     key head's first value head `first`: the queries' and keys' block (`keyed`, their refs), and each step `i`
     the group's `i`-th value head's values, output gradient and corrected values' gradient (`served`) at
-    its columns, and its entered memory and leaving memory's gradient (`memory`) a head's rows apart."""
+    its columns, and its entered memory and leaving memory's gradient (`memory`) a head's rows apart; of
+    each value head's columns the `split`-th `vq` (all of them where None, `_query_key_split`)."""
     width, value_width, group = call.width, call.value_width, call.group
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     q_ref, k_ref = keyed
@@ -603,29 +606,36 @@ def _query_key_views(call: Call, keyed: tuple, served: tuple, memory: tuple, *, 
         # Without the delta rule no weights, so no stream of the corrected values' gradient.
         del operands["value_grads"]
     memory_row = (chunk * call.heads + first) * width + block * call.block
-    # Step `i` the `i`-th value head's columns: the view the group's value heads' rows.
-    columns = first * value_width
-    return {**stream_views(lambda i: (0, 0),
-                           queries=given.views(q_ref, row, call.chunk, key_columns, call.block),
-                           keys=given.views(k_ref, row, call.chunk, key_columns, call.block)),
-            **stream_views(lambda i: (0, i),
-                           **{name: operand.views(ref, row, call.chunk, columns, group * value_width)
+    vq = value_width if vq is None else vq
+    # Step `i` the `i`-th value head's columns from the split's, a value head's columns apart: the view from
+    # the first head's split to the last head's, `vq` blocks.
+    columns, apart, rows = first * value_width + split * vq, value_width // vq, call.chunk
+    return {**stream_views(lambda i: (0, 0), queries=given.views(q_ref, row, rows, key_columns, call.block),
+                           keys=given.views(k_ref, row, rows, key_columns, call.block)),
+            **stream_views(lambda i: (0, i * apart),
+                           **{name: operand.views(ref, row, rows, columns, (group - 1) * value_width + vq)
                               for name, (operand, ref) in operands.items()}),
             **stream_views(lambda i: (i * (width // call.block), 0),
-                           **{name: memories.views(ref, memory_row, group * width, 0, value_width)
+                           **{name: memories.views(ref, memory_row, group * width, split * vq, vq)
                               for name, ref in zip(("entered", "leaving"), memory, strict=True)})}
 
 
 def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequence, sums: dict, first,
-                     landing: dict) -> None:
+                     landing: dict, apart: bool = False) -> None:
     """`algebra.memory_gradients`' emit in `_query_key`: the weights' gradient (`kind` 'dw') in the
     operands' dtype to `weights` (its parts' views) as it is final, as fla's dqkwg writes it; the queries'
     and keys' ('dq', 'dk') to `sums[kind]` summed over the key head's value heads in fp32, stored at the
     first (`first`) and added at the rest (`Family.added`: a TMA reduction, or whole rows through
-    registers), each through its launch's landing tiles."""
+    registers), each through its launch's landing tiles. A value split's (`apart`) weights' gradient is its
+    split's own part of it, fp32, which XLA adds, stored as the queries' and keys' split sums are, through
+    their landing tile: through a tile of its own an H100 landed its stores at places its programs did not
+    own (marks of other programs' and foreign values, the same store interpreted exact; M-JS-8, row 4346)."""
     del block
     family = call.family
     if kind == "dw":
+        if apart:
+            family.stored([grad], weights, smem=landing["sums"])
+            return
         pieces = product.formed(grad.astype(jnp.float32), call.held.parts) if call.held.parts > 1 else (grad,)
         family.stored([piece.astype(call.held.stored) for piece in pieces], weights, smem=landing["weights"])
         return
@@ -649,6 +659,29 @@ def _memory_sum(call: Call, issue: Issuer, entered: Parts, leaving: Parts) -> ja
     return jnp.sum(entered.value().astype(jnp.float32) * leaving.value().astype(jnp.float32), axis=1)
 
 
+def _query_key_split(call: Call) -> int:
+    """`_query_key`'s value columns a program takes of each value head: the widest whole number of blocks
+    (`Call.block`) dividing the value width whose streams (each step's values, output gradient and
+    corrected values' gradient `[C, vq]`, its memories `[block, vq]`, the queries', keys' and scores'
+    gradient's blocks) fit the block's shared memory (`generation.shared_budget`), a block where none does:
+    an fp32 call's two parts at Qwen3.5-27B's widths took 237824 bytes and a 256-wide value row's 215040 on
+    an A100, past its 166912 (fp32-plan-sm90 at cdcd620ef, wide-backward). Halved instead, 192 columns took
+    96, a block and a half, and the split's programs read no column past their first block's. Each split's
+    bytes are the launch's own (`shared_allocation`, as `launch_kernel` lays it: its streams one deep, its
+    landing). Compiled as interpreted: the weights' gradient a split once landed zero natively, `-dw` read
+    from its accumulator, because CUDA 12.9's ptxas folded the read's sign flip (an xor) so that the
+    product's HGMMA wrote the zero register, not the split (row 4346: the JAX fork's float-sign-ops
+    lowering, post66; M-JS-22q native as interpreted)."""
+    def streamed(vq: int) -> int:
+        tiles, _ = _query_key_launched(call, vq)
+        _, scope, _, _ = shared_allocation(call, tiles, (), _query_key_landing(call, call.value_width // vq))
+        return resources.shared_bytes(call.family, scope(1))
+
+    budget = generation.shared_budget(call.target)
+    return next((vq for vq in whole_blocks(call.value_width, call.value_block) if streamed(vq) <= budget),
+                call.block)
+
+
 def _query_key_held(call: Call) -> Held:
     """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum
     (one accumulator over the value blocks), that sum gated, its scores' product, and a block's queries or
@@ -668,31 +701,35 @@ def _query_key_held(call: Call) -> Held:
         summed))
 
 
-def _query_key_landing(call: Call) -> dict:
-    """`_query_key`'s stores' tiles: the weights' gradient with the delta rule, in the held operand's form,
-    and the queries' and keys' sums."""
+def _query_key_landing(call: Call, splits: int) -> dict:
+    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule, its
+    own where a launch takes whole rows (a split's lands through the sums', `_gradient_stored`), and the
+    queries' and keys' sums."""
     chunk = call.chunk
     held = dataclasses.replace(call.held, rows=call.rows)
-    return {**({"weights": held.landing(chunk, call.block)} if call.delta else {}),
+    own = call.delta and splits == 1
+    return {**({"weights": held.landing(chunk, call.block)} if own else {}),
             "sums": ((chunk, call.block), jnp.float32)}
 
 
-def _query_key_launched(call: Call) -> tuple[dict, tuple]:
-    """`_query_key`'s streams, a value head's columns whole, and its outputs' types (the weights' gradient
-    the delta rule's alone)."""
+def _query_key_launched(call: Call, vq: int) -> tuple[dict, tuple]:
+    """`_query_key`'s streams at value split `vq` (`_query_key_split`) and its outputs' types, each split's
+    sums its own (the weights' gradient, the delta rule's alone, in fp32 where there are two splits or
+    more)."""
     chunk = call.chunk
-    width, columns, held, memories, given = (call.width, call.value_width, call.held, call.memories,
-                                             call.given)
+    width, held, memories, given = call.width, call.held, call.memories, call.given
+    splits = call.value_width // vq
     tiles = stream_blocks(queries=((chunk, call.block), given), keys=((chunk, call.block), given),
-                          values=((chunk, columns), held), out=((chunk, columns), given),
-                          **({"value_grads": ((chunk, columns), held)} if call.delta else {}),
-                          entered=((call.block, columns), memories),
-                          leaving=((call.block, columns), memories), ds=((chunk, chunk), _score_grads(call)))
-    keyed_out = jax.ShapeDtypeStruct((call.rows, call.heads // call.group * width), jnp.float32)
-    terms = jax.ShapeDtypeStruct((width // call.block, call.heads, call.rows), jnp.float32)
-    weights = dataclasses.replace(held, rows=call.rows).shape(call.heads * width)
+                          values=((chunk, vq), held), out=((chunk, vq), given),
+                          **({"value_grads": ((chunk, vq), held)} if call.delta else {}),
+                          entered=((call.block, vq), memories),
+                          leaving=((call.block, vq), memories), ds=((chunk, chunk), _score_grads(call)))
+    keyed_out = jax.ShapeDtypeStruct((call.rows, splits * call.heads // call.group * width), jnp.float32)
+    terms = jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.rows), jnp.float32)
+    weights = (dataclasses.replace(held, rows=call.rows).shape(call.heads * width) if splits == 1
+               else jax.ShapeDtypeStruct((call.rows, splits * call.heads * width), jnp.float32))
     return tiles, (keyed_out, keyed_out, *((weights,) if call.delta else ()), terms, terms,
-                   jax.ShapeDtypeStruct((width // call.block, call.heads, call.chunks * call.block),
+                   jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.chunks * call.block),
                                         jnp.float32))
 
 
@@ -710,27 +747,28 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     each token's (`algebra.memory_gradients`' `(after, leaving)`, which `gradients` sums over their ranges:
     summed here, their `[C, C]` tiles spilled 376 bytes a thread on an H100's), and the block's rows of `sum(S
     dS)`, the memory's decay's gradient across the chunk. `h` and `dh` the memories each chunk enters and its
-    leaving memory's gradient (`call.memories`). A program takes each value head's columns whole: where their
-    streams are past the block's shared memory the fast backward does not hold (`template.backward_holds`)
-    and the call trains on the port. Split across programs, each split's own sums, an H100 landed none of the
-    weights' gradient (M-JS-1, M-JS-8, M-JS-10: zeros, or other programs' tiles, through either landing tile;
-    interpreted exact), row 4346."""
+    leaving memory's gradient (`call.memories`). Where a value row's streams are past the block's shared
+    memory, a program takes a split of each value head's columns (`_query_key_split`), each split's sums its
+    own, which XLA adds, the scores' gradient's products the first split's alone."""
     chunk = call.chunk
     width, value_width, family = call.width, call.value_width, call.family
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
     grads = _score_grads(call)
-    blocks, group = value_width // call.block, call.group
+    vq = _query_key_split(call)
+    splits, blocks, group = value_width // vq, vq // call.block, call.group
+    keyed_width, key_blocks = call.heads // group * width, width // call.block
 
     def program(at, q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
                 beta_ref, *outs, streams, staging, landing):
         del staging
         dq_ref, dk_ref, *weights_ref, after_ref, leaving_ref, memory_ref = outs
         c, n, keyed = at["blocks"], at["chunks"], at["heads"]
+        split = at["values"]
         row, span, last = n * chunk, pl.ds(n * chunk, chunk), n * chunk + chunk - 1
         key_columns = keyed * width + c * call.block
         first = keyed * group
         views = _query_key_views(call, (q_ref, k_ref), (v_ref, do_ref, dv_ref), (h_ref, dh_ref), row=row,
-                                 key_columns=key_columns, first=first, chunk=n, block=c)
+                                 key_columns=key_columns, first=first, chunk=n, block=c, split=split, vq=vq)
         # Step `i` the group's `i`-th value head's scores' gradient; without the delta rule each step the key
         # head's, summed over its value heads (`_scores_back`).
         scored = (first, group) if call.delta else (keyed, 1)
@@ -750,12 +788,15 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
             ending, ending_low = (jnp.full((chunk,), ref[h, last]) for ref in (hi_ref, lo_ref))
             first_head = index == 0
 
-            columns = pl.ds(key_columns, call.block)
+            # Each split's sums its own, a split's columns after another's.
+            columns = pl.ds(split * keyed_width + key_columns, call.block)
             sums = {"dq": dq_ref.at[span, columns], "dk": dk_ref.at[span, columns]}
+            weights_at = h * width + c * call.block
             weights = (() if not weights_ref else
-                       held.views(weights_ref[0], row, chunk, h * width + c * call.block, call.block))
+                       held.views(weights_ref[0], row, chunk, weights_at, call.block) if splits == 1 else
+                       [weights_ref[0].at[span, pl.ds(split * call.heads * width + weights_at, call.block)]])
             stored = functools.partial(_gradient_stored, call, weights=weights, sums=sums, first=first_head,
-                                       landing=landing)
+                                       landing=landing, apart=splits > 1)
 
             issue = Issuer(call)
             ds = stream_tile(slots, "ds", grads) if scores else None
@@ -764,10 +805,19 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
                 functools.partial(column, "value_grads", held) if call.delta else None,
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
-                blocks, ds, gate, low, ending, ending_low, None, scale, issue.summed,
+                blocks, ds if splits == 1 else None, gate, low, ending, ending_low, None, scale, issue.summed,
                 emit=stored, row_scale=family.rows_of(beta_ref.at[h, span]) if call.gated_keys else None)
-            after_ref.at[c, h, span][...] = after
-            leaving_ref.at[c, h, span][...] = leaving
+            if splits > 1 and ds is not None:
+                # The scores' gradient's products the first split's alone, added after its memory products.
+                @pl.when(split == 0)
+                def _():
+                    keys, queries = whole("keys", given, 0), whole("queries", given, 0)
+                    for kind, lhs, rhs in (("dq", ds, keys), ("dk", ds.T, queries)):
+                        family.store_wait(0)
+                        family.added(issue("scores_dq", lhs, rhs), sums[kind], call.interpret,
+                                     smem=landing["sums"])
+            after_ref.at[split * key_blocks + c, h, span][...] = after
+            leaving_ref.at[split * key_blocks + c, h, span][...] = leaving
             # `sum(S dS)` over the block's rows, read here rather than both memories again: where products
             # read registers (mma.sync's), each value block's `S^T dS` diagonal, a product of the memories
             # as they lie in shared memory (their elementwise product held two fp32 tiles beside the step's
@@ -776,10 +826,9 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
             traced = functools.reduce(jnp.add, (
                 _memory_sum(call, issue, column("entered", memories, j), column("leaving", memories, j))
                 for j in range(blocks)))
-            memory_ref.at[c, h, pl.ds(n * call.block, call.block)][...] = traced
+            memory_ref.at[split * key_blocks + c, h, pl.ds(n * call.block, call.block)][...] = traced
             # The step's reduce-adds ('dq', 'dk', `Family.added`) waited on by design, not by 'dw''s store
-            # being emitted after them: Mosaic GPU waits on no copy at a kernel's exit (template numerics
-            # review 2026-10-26, P3-4).
+            # after them: Mosaic GPU waits on no copy at a kernel's exit (numerics review 10-26, P3-4).
             family.store_wait(0)
             return carry, accumulators
 
@@ -787,7 +836,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         return mosaic.Walk(views, step, steps=group, segments=() if call.delta else (
             (step, 0, 1), (functools.partial(step, scores=False), 1, group)))
 
-    tiles, out_type = _query_key_launched(call)
+    tiles, out_type = _query_key_launched(call, vq)
     # Each value head of the group: three memory products (two without the delta rule's weights) and the
     # scores' gradient's two, a key head's two without the delta rule.
     scores = 2 * chunk * chunk * call.block
@@ -795,11 +844,15 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
     work = Work(flops=2 * (each * group + scores * (not call.delta)), span=group)
     dq, dk, *weights, after, leaving, memory = launch_kernel(
         program, call, out_type=out_type,
-        grid=(width // call.block, call.chunks, call.heads // group),
-        grid_names=("blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
-        work=work, held=_query_key_held(call), landing=_query_key_landing(call))(
+        grid=(splits, width // call.block, call.chunks, call.heads // group),
+        grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
+        work=work, held=_query_key_held(call), landing=_query_key_landing(call, splits))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
-    dw = weights[0] if weights else None
+    # The splits' own sums added (one split's, as they are, where a program takes every value column).
+    if splits > 1:
+        dq, dk, *weights = (x.reshape(call.rows, splits, -1).sum(1) for x in (dq, dk, *weights))
+    after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
+    dw = None if not weights else weights[0] if splits == 1 else held.split(weights[0])
     return dq, dk, dw, after, leaving, memory
 
 
