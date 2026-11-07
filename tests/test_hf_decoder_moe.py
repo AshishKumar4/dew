@@ -327,7 +327,7 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     (`quantization.expert_leaf_axes`), its words, block scales and tensor scales sharded on the expert
     axis as the dense matrix's experts are, and its logits on par with the unplaced packed load's
     (check 1)."""
-    from dew.distributed.placement import MeshSpec
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.nn.kernels.gemm import NvFp4
     from dew.quantization import QUANTIZATION
 
@@ -345,7 +345,12 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     for path, bank in banks.items():
         experts = params[path].sharding.spec[0]
         assert experts is not None
-        assert all(leaf.sharding.spec[0] == experts for leaf in (bank.words, bank.scales, bank.scale))
+        for leaf in (bank.words, bank.scales, bank.scale):
+            # A leaf under the layout's least sharded size stays whole, as a dense one does
+            # (`Layout.min_shard`); the words, a bank's bulk, are past it.
+            first = None if leaf.size < Layout().min_shard else experts
+            assert (tuple(leaf.sharding.spec) or (None,))[0] == first, (path, leaf.shape, leaf.sharding)
+        assert bank.words.size >= Layout().min_shard
 
     def draw(seed: int):
         return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
