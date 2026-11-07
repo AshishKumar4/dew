@@ -171,9 +171,13 @@ _TAKEN: contextvars.ContextVar[Taken | None] = contextvars.ContextVar("dew_taken
 
 
 def program_digest(lowered: jax.stages.Lowered) -> str:
-    """A program as `lowered` holds it, its text's digest: two lowerings of one program agree, whichever
-    devices of one target they were lowered over."""
-    return hashlib.sha256(lowered.as_text().encode()).hexdigest()
+    """A program as `lowered` holds it, its text's digest beside its arguments' and results' trees and its
+    arguments' types: two lowerings of one program agree, whichever devices of one target they were
+    lowered over, and two whose texts agree only as JAX prunes an argument neither reads, which their
+    executables take in other trees, do not (a step's commit with its sample's summaries and without)."""
+    types = jax.tree.map(lambda aval: (aval.shape, str(aval.dtype), aval.weak_type), lowered.in_avals)
+    called = f"{lowered.in_tree}\n{lowered.out_tree}\n{types}"
+    return hashlib.sha256(f"{lowered.as_text()}\n{called}".encode()).hexdigest()
 
 
 @contextlib.contextmanager

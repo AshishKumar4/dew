@@ -94,6 +94,32 @@ def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_w
     np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
 
 
+def test_two_calls_whose_texts_agree_as_jax_prunes_an_unread_argument_each_take_their_own_executable():
+    """Two calls of one program whose lowered texts agree only as JAX prunes an argument neither reads,
+    held in other trees (a step's commit with its sample's summaries and without), compile apart while
+    collecting and each runs its own executable where handed (`program_digest` keys the trees too; row
+    4752's review: the second overwrote the first, whose call it then refused)."""
+    from dew.nn.kernels.options import collecting, owned_program, taking
+
+    placed = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    shape = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=placed)
+
+    def counted(values, unread):
+        return values + 1
+
+    with collecting() as collected:
+        owned_program(counted)(shape, None)
+        owned_program(counted)(shape, {"summaries": shape})
+    assert len(collected) == 2
+    values = jax.device_put(np.arange(4, dtype=np.float32), placed)
+    handed = {digest: lambda executable=executable: executable for digest, executable in collected.items()}
+    with taking(handed), Compiles(None) as compiles:
+        bare = owned_program(counted)(values, None)
+        held = owned_program(counted)(values, {"summaries": values})
+    assert [program.kind for program in compiles.programs].count("compiled") == 0
+    np.testing.assert_array_equal(np.asarray(bare), np.asarray(held))
+
+
 def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_its_own(tmp_path):
     """A run whose checkpoint holds a part-filled accumulation window compiles its step ahead: the state it
     resumes holds its window, so it builds none ahead, and its count of microbatches, a shape there, is

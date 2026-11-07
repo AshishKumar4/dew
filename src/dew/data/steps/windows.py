@@ -150,8 +150,10 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
                 if not len(windows):
                     raise
                 break
+            # A field's carry takes its rows' dtype: the empty one it starts from is no row's.
             self._held = {
-                name: np.concatenate([self._held[name], row[name]])
+                name: np.concatenate([self._held[name], row[name]]) if len(self._held[name])
+                else np.asarray(row[name])
                 for name in self._windows.fields
             }
         emitted = windows[0]
