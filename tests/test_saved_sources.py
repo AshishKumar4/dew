@@ -65,10 +65,11 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
 def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, monkeypatch):
     """A chat-format decision run, a joint head over Qwen 3.5's chat backbone, its rows framed as a
     conversation by the backbone's chat template, saved, is a source a second decision run names
-    (`--pretrained <run>`): the second trains on from the first's final weights, head and backbone, its
-    record names the run and step it read, and its task loads and answers (a run from a finished
-    chat-format run, which the export's Laya-only layout refused: "Laya's layout is a MarkerLayout over a
-    Hugging Face tokenizer", row 4310)."""
+    (`--pretrained <run>`): its release, written by `dew export` and by its task's `save_pretrained`,
+    reloads answering as the run, bit for bit; the second run trains on from the first's final weights,
+    head and backbone, its record names the run and step it read, and its task loads and answers (a run
+    from a finished chat-format run, which the export's Laya-only layout refused: "Laya's layout is a
+    MarkerLayout over a Hugging Face tokenizer", row 4310)."""
     from run_kinds import QWEN_TINY
 
     from dew.decision import Choice, Decide
@@ -80,6 +81,18 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     first = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False))
     state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
+    # Its release, written by `dew export` and by its task's `save_pretrained`, reloads answering as the run.
+    from dew._cli.main import main
+
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    task = Decide.from_run(str(source))
+    assert main(["export", str(source), str(tmp_path / "exported")]) == 0
+    task.save_pretrained(tmp_path / "saved")
+    for written in ("exported", "saved"):
+        reloaded = Decide.from_pretrained(tmp_path / written, attention_impl="xla")
+        for state_text in ("charged twice", "is the site down?"):
+            np.testing.assert_array_equal(reloaded(state_text, {"team": team})["team"].probabilities,
+                                          task(state_text, {"team": team})["team"].probabilities)
     run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest", "--max-len", "768"],
                                 default=decision(tmp_path, drawn=False))
     started = run.prepare().objective.init(jax.random.key(0))
@@ -88,7 +101,6 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     assert int(second.step) == 1
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
-    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
     answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
     assert np.isclose(float(np.sum(answer.probabilities)), 1.0)
 
