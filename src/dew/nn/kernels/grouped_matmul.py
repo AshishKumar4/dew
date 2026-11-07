@@ -597,21 +597,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
-        # A hooked or exactly summed call runs where its bundle's register model counts what they hold; a
-        # paired product's epilogue over its two accumulators alone every family's counts (`registers`).
-        family = self._family(ba, target)
-        hooked = ba.arguments['hooks'] != NO_HOOKS and not (family is not None and _pair_alone(ba, family))
-        summed = bool(ba.arguments.get('exact_sums'))
         # A prologue's side operand by group streams with no group's origin here; Triton's and the TPU's
         # launches read it at their tile's group (`axes.at_group`).
         grouped = any(GROUPS in axes for axes in ba.arguments['hooks'].prologue_axes)
-        # A step that prepares its operands (a prologue's rewrite, a consumer's own share of the rows' stage,
-        # an exactly summed step's product apart) runs in the consumer issuing its products.
-        prepared = ba.arguments['hooks'].prologue is not None or self.STAGED_ROWS or summed
-        return (first == second and (jnp.dtype(first).itemsize == 2 or self._fp8(ba, first, family))
-                and family is not None and not grouped
-                and (family.issues_in_consumers or not prepared)
-                and (family.counts_hooks or not hooked) and (family.counts_sums or not summed)
+        return (first == second and bool(self._families(ba, target)) and not grouped
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
                 and self.derived(ba, target) is not None)
@@ -743,24 +732,37 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         matrix's (`block_k`, or `block_n` read transposed)."""
         return config.block_m, config.block_k, *((config.block_n,) if ba.arguments.get('trans_rhs') else ())
 
-    def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
+    def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         """Whether an FP8 call (`product.EIGHT`) runs here: a forward product on warpgroup MMA, its matrix
         K-major (`trans_rhs`, as Hopper's FP8 tensor cores read both operands; an N-major FP8 matrix is
         refused, row 3620), with no hook, its running sum promoted every step (`exact_sums`)."""
-        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family is not None and family.takes_fp8
+        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family.takes_fp8
                 and ba.arguments['trans_rhs']
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
                 and bool(ba.arguments.get('exact_sums')))
 
-    def _family(self, ba, target) -> mosaic.Family | None:
-        """The bundle the launch runs on `target`: its instruction family's (`bundles.of`; its kernels state
-        their tiles' accumulators, `mosaic_gpu.gmm`'s and `tgmm`'s), none where the family has none (a
-        TPU's launches are their own; a CPU interprets a GPU's only where `generation.assumed` names it)."""
-        return bundles.of(target.generation, ba.arguments['tokens'].dtype, stated=True)
-
     def _families(self, ba, target) -> tuple[mosaic.Family, ...]:
-        """The bundles the launch may run on `target`, in preference order (`bundles.layouts`)."""
-        return bundles.layouts(target.generation, ba.arguments['tokens'].dtype, stated=True)
+        """The bundles the launch may run on `target`, in preference order: the most capable issuer's whose
+        bundle takes the call (`bundles.groups`, its kernels stating their tiles' accumulators,
+        `mosaic_gpu.gmm`'s and `tgmm`'s; `_takes`), so a call tcgen05's bundle refuses runs on mma.sync's
+        (row 4727); none where no issuer's does (a TPU's launches are their own; a CPU interprets a GPU's
+        only where `generation.assumed` names it)."""
+        found = bundles.groups(target.generation, ba.arguments['tokens'].dtype, stated=True)
+        return next((group for group in found if self._takes(ba, group[0])), ())
+
+    def _takes(self, ba, family: mosaic.Family) -> bool:
+        """Whether `family`'s bundle runs the call: 16-bit operands, or FP8 ones it takes (`_fp8`); a hooked
+        or exactly summed call where its register model counts what they hold (a paired product's epilogue
+        over its two accumulators alone every family's counts, `registers`); a step that prepares its
+        operands (a prologue's rewrite, a consumer's own share of the rows' stage, an exactly summed step's
+        product apart) where its consumers issue their products."""
+        dtype = ba.arguments['tokens'].dtype
+        hooked = ba.arguments['hooks'] != NO_HOOKS and not _pair_alone(ba, family)
+        summed = bool(ba.arguments.get('exact_sums'))
+        prepared = ba.arguments['hooks'].prologue is not None or self.STAGED_ROWS or summed
+        return ((jnp.dtype(dtype).itemsize == 2 or self._fp8(ba, dtype, family))
+                and (family.issues_in_consumers or not prepared)
+                and (family.counts_hooks or not hooked) and (family.counts_sums or not summed))
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -1340,9 +1342,9 @@ class MosaicMxGmm(MosaicGmm):
 
     BLOCK_SCALED: ClassVar[bool] = True
 
-    def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
+    def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted.
-        return (jnp.dtype(dtype) in EIGHT and family is not None and family.takes_block_scales
+        return (jnp.dtype(dtype) in EIGHT and family.takes_block_scales
                 and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
                 and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
 
@@ -1366,9 +1368,9 @@ class MosaicStepScaledTgmm(MosaicTgmm):
     FP8: ClassVar[bool] = True
     K_MAJOR: ClassVar[bool] = True
 
-    def _fp8(self, ba, dtype, family: mosaic.Family | None) -> bool:
+    def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its operands lie rows-contiguous, as Hopper's FP8 tensor cores read both.
-        return (jnp.dtype(dtype) in EIGHT and family is not None and family.takes_fp8
+        return (jnp.dtype(dtype) in EIGHT and family.takes_fp8
                 and ba.arguments['hooks'] == NO_HOOKS and bool(ba.arguments.get('exact_sums')))
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
@@ -1835,16 +1837,15 @@ _NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
 dense products the template's launches cannot run."""
 
 def _takes_pair(name: str, case: GroupedCase) -> bool:
-    """Whether the launches `name` take the paired product `case` whole: Mosaic GPU's on a family whose
-    register model counts its hooks (`mosaic.Family.counts_hooks`: warpgroup MMA), or on any family where
-    its only hook is the epilogue over its two accumulators (`_pair_alone`: mma.sync's SwiGLU, 254 to 255
-    registers and no spill at Qwen3-30B-A3B's and Qwen3.5-4B's gate|up on sm80, row 2100); every other
+    """Whether the launches `name` take the paired product `case` whole: Mosaic GPU's where a bundle takes it
+    (`MosaicGmm._takes`: one whose register model counts its hooks, `mosaic.Family.counts_hooks`, or any
+    where its only hook is the epilogue over its two accumulators, `_pair_alone`: mma.sync's SwiGLU, 254 to
+    255 registers and no spill at Qwen3-30B-A3B's and Qwen3.5-4B's gate|up on sm80, row 2100); every other
     hands it on (`APART`)."""
-    family = bundles.of(case.call.target.generation, jnp.bfloat16, stated=True)
-    if name != MosaicGmm.name or family is None:
-        return False
     bound = case.call.bound.get(name)
-    return bound is not None and (family.counts_hooks or _pair_alone(bound[1], family))
+    if name != MosaicGmm.name or bound is None:
+        return False
+    return bool(MosaicGmm()._families(bound[1], case.call.target))
 
 
 def _pair_alone(ba, family: mosaic.Family) -> bool:
