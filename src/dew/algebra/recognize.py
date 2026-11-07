@@ -85,17 +85,38 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = f
             spans = [(candidate, places) for candidate in family.candidates(index, place)
                      if (places := _between(index, candidate.operands, candidate.outputs)) is not None
                      and not claimed & set(places)]
-            equal = _lazily(lambda spans=spans: _equalities(index, spans, accurate))
-            for number, (candidate, places) in enumerate(spans):
-                def decide(number=number, candidate=candidate, equal=equal) -> bool:
-                    return equal()[number] and candidate.taken()
-
-                if fusion._decided(jaxpr, places, candidate.operands, candidate.outputs, decide):
-                    found.append(fusion.Written(places, candidate.operands, candidate.outputs, places[-1],
-                                                candidate.call))
-                    claimed.update(places)
-                    break
+            written = _first_equal(jaxpr, index, spans, accurate)
+            if written is not None:
+                found.append(written)
+                claimed.update(written.places)
     return found
+
+
+def _first_equal(jaxpr: jcore.Jaxpr, index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
+                 accurate: bool) -> fusion.Written | None:
+    """The first of an anchor's candidates whose call takes a kernel of Dew's and whose region the e-graph
+    proves computes it, written as its call; None where none is. Each region's candidates are weighed in one
+    e-graph (`_equalities`), built only once a candidate of it is weighed, so an anchor whose largest region
+    is its call's builds one; each decision fusion's (`fusion._decided`), held by its region's structure."""
+    regions: dict[tuple[int, ...], list[int]] = {}
+    for number, (_, places) in enumerate(spans):
+        regions.setdefault(places, []).append(number)
+    weighed: dict[tuple[int, ...], dict[int, bool]] = {}
+
+    def equal(number: int) -> bool:
+        places = spans[number][1]
+        if places not in weighed:
+            members = [spans[member] for member in regions[places]]
+            weighed[places] = dict(zip(regions[places], _equalities(index, members, accurate), strict=True))
+        return weighed[places][number]
+
+    for number, (candidate, places) in enumerate(spans):
+        def decide(number=number, candidate=candidate) -> bool:
+            return candidate.taken() and equal(number)
+
+        if fusion._decided(jaxpr, places, candidate.operands, candidate.outputs, decide):
+            return fusion.Written(places, candidate.operands, candidate.outputs, places[-1], candidate.call)
+    return None
 
 
 def _holds(equation: jcore.JaxprEqn, name: str) -> bool:
@@ -109,12 +130,6 @@ def _holds(equation: jcore.JaxprEqn, name: str) -> bool:
         return False
     inner = body.jaxpr if isinstance(body, jcore.ClosedJaxpr) else body
     return any(_holds(nested, name) for nested in inner.eqns)
-
-
-def _lazily(compute: Callable[[], list[bool]]) -> Callable[[], list[bool]]:
-    """`compute`'s result, computed at its first call alone: an anchor whose every candidate's decision is
-    held (`fusion._decided`) builds no e-graph."""
-    return functools.cache(compute)
 
 
 def _between(index: fusion.Index, operands: Sequence[jcore.Var],
