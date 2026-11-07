@@ -57,13 +57,15 @@ def fits(shape: tuple[int, ...], whole: bool) -> bool:
     return key_width % scan.THREADS == 0 and tiles and (not whole or value_width == scan.THREADS)
 
 
-def _halves(key_width: int) -> int:
+def _halves(key_width: int, interpret: bool) -> int:
     """The warpgroups a program's keys split between: two halves where the keys are a power of two of whole
     turns (`UNROLLED`) each, each half's sums a subtree of XLA's pairwise order, the two joined at its top
-    (`_joined`); else one. One warpgroup walking a head's 128 keys alone, a row's token held one program a
-    head, a gated delta net's step took an A100's 28 us against the Triton step's 17 at one row (M-JS-20)."""
+    (`_Halves.joined_sums`), so the sums are the one warpgroup's bit for bit; else one. Interpreted, one:
+    Mosaic GPU's interpreter left the halves' barrier allocated under a mesh (jsf-perf7). One warpgroup
+    walking a head's 128 keys alone, a row's token held one program a head, a gated delta net's step took an
+    A100's 28 us against the Triton step's 17 at one row (M-JS-20)."""
     whole = key_width & (key_width - 1) == 0 and key_width >= 2 * UNROLLED
-    return 2 if whole else 1
+    return 2 if whole and not interpret else 1
 
 
 def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
@@ -100,7 +102,7 @@ def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: m
     active = (jnp.ones((rows,), jnp.int32) if operands.active is None
               else jnp.asarray(operands.active).astype(jnp.int32))
     names = tuple(given)
-    block, halves = _block(value_width), _halves(key_width)
+    block, halves = _block(value_width), _halves(key_width, interpret)
 
     def entry(active_ref, *refs):
         inputs = dict(zip(names, refs[:len(names)], strict=True))
