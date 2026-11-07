@@ -169,7 +169,8 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     cache = model.apply({**variables, "cache": cache}, inputs,
                         method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
                         mutable=["cache"])[1]["cache"]
-    return model.apply({**variables, "cache": cache}, canvas, **conditioning).astype(jnp.float32)
+    logits = model.apply({**variables, "cache": cache}, canvas, **conditioning)
+    return logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
 
 
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
