@@ -330,10 +330,17 @@ PACKED_FASTER = ("W13-a100-4-M-NS-8b-a100 (base/kernels 8d23bb9872, CUPTI, arms 
                  "0.119-0.398 ms against the matrix decoded once a call's 0.309-1.418 (2.6-3.6x), its "
                  "temporary memory 0.66-3.7 MB against 71-250 MB; at 4096 rows 4.4-4.7x slower, each row "
                  "tile decoding the matrix again")
-"""The receipt behind the packed NVFP4 kernel's declared cell (`NVFP4_CELLS`)."""
+"""The receipt behind the packed NVFP4 kernel's declared A100 cell (`NVFP4_CELLS`)."""
+PACKED_FASTER_SM90 = (
+    "W7-gh200-8-M-NS-8-h100 (base/kernels d4bb24d4f8, CUPTI, arms rotated): Llama-3-8B's q/o, up and down "
+    "projections at 1, 16 and 64 rows on a GH200, the packed kernel 0.059-0.193 ms against the matrix "
+    "decoded once a call's 0.142-0.505 (2.4x q/o, 4.5x up, 2.6x down), its temporary memory 0.2-3.7 MB "
+    "against 71-250 MB; at 4096 rows 5.2-5.3x slower, its stage decode unhidden under the products")
+"""The receipt behind the packed NVFP4 kernel's declared H100 cell (`NVFP4_CELLS`)."""
 
 NVFP4_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('sm80', 'decode'): ('packed', PACKED_FASTER),
+    ('sm90', 'decode'): ('packed', PACKED_FASTER_SM90),
 }
 """The NVFP4 product's declared cells (`selection.Op.declared`), (device generation, call size) to the
 packed kernel and its receipt: a literal of them, which the selector reads and thresh's declared-set seam
@@ -350,8 +357,8 @@ NVFP4: selection.Op[PackedCase] = selection.Op('nvfp4', (
     selection.Kernel('xla', (), generic=True)), lambda case: 'xla', declared=NVFP4_CELLS)
 """An NVFP4 product's selector (`nvfp4_product`): the matrix decoded once a call and its product (`gemm`),
 but the template's mainloop decoding each stage of the packed matrix in place (`mosaic_gpu.gmm`'s `scales`)
-where a receipt measured it faster (a decode-sized call on an A100: `NVFP4_CELLS`) or it is named
-(`generation.chosen(nvfp4='packed')`), and it plans a tile."""
+where a receipt measured it faster (a decode-sized call on an A100 or an H100: `NVFP4_CELLS`) or it is
+named (`generation.chosen(nvfp4='packed')`), and it plans a tile."""
 
 
 def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:

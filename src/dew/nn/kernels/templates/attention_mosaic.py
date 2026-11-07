@@ -181,7 +181,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
         name = generation.family(target.generation)
         query = ba.arguments["query"]
-        family = bundle(target.generation, query.dtype, query.shape[1])
+        family = bundle(target.generation, query.dtype)
         if family is None:
             return Refusal('family', f"the Mosaic mainloop has no bundle for {name or target.generation} yet")
         if (reason := self.refusal(ba, family)) is not None:
@@ -216,7 +216,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
         query = ba.arguments["query"]
-        family = bundle(target.generation, query.dtype, query.shape[1])
+        family = bundle(target.generation, query.dtype)
         return None if family is None or self.refusal(ba, family) is not None else family
 
     WALKED: ClassVar[str] = "block_k"
@@ -242,7 +242,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
         query = ba.arguments["query"]
-        family = bundle(target.generation, query.dtype, query.shape[1])
+        family = bundle(target.generation, query.dtype)
         if family is not None and (reason := self.refusal(ba, family)):
             raise NotImplementedError(reason)
         config = self.derived(ba, target)

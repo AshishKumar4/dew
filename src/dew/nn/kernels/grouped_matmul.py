@@ -942,6 +942,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return config.cluster if interpret else self._programs(config)
 
 
+SWAPPED_ROWS = 128
+"""The most rows of the matrix a swapped decode tile takes (`MosaicGmm.derived`): its matrix's stream is the
+walk, which more, shorter tiles spread over more programs, where the derivation's fewest loads a FLOP took
+the widest rows its registers hold: an A100's 2048 x 2048 decode product with the matrix lying `[width,
+depth]` derived 384 x 32 x 32 at three stages, 2.1x the time of the other layout's 128 x 32 x 64 at four at
+the same 96 programs, 4.2x XLA's (W50-a100-1-M-NS-19-a100)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class MosaicGmm(_Mosaic):
     """`Gmm` through the Mosaic GPU kernels (`mosaic_gpu.gmm`), exact sums too: an FP8 product's running sum
@@ -995,7 +1003,8 @@ class MosaicGmm(_Mosaic):
         swapped = self._swapped(ba, target)
         if swapped is None:
             return self._rastered(ba, super().derived(ba, target), target)
-        tile = self._derived(swapped, target, admits=lambda tile: self._left_fits(ba, tile))
+        tile = self._derived(swapped, target, admits=lambda tile: (self._left_fits(ba, tile)
+                                                                    and tile.block_m <= SWAPPED_ROWS))
         if tile is None:
             return None
         # Its few output tiles leave a wave's programs idle: its depth splits where the busiest program then
