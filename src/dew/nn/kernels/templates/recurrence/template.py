@@ -51,7 +51,7 @@ def _dtype(ba: tokamax.BoundArguments) -> jnp.dtype:
 def bundle(target: generation.GpuTarget, dtype=jnp.bfloat16) -> mosaic.Family | None:
     """The mainloop's bundle for `target`'s instruction family and a call of `dtype` (`bundles.of`), None
     where none claims it."""
-    return bundles.of(target.generation, mainloop.bundle_dtype(dtype))
+    return bundles.of(target.generation, mainloop.bundle_dtype(dtype), chunks=True)
 
 
 
