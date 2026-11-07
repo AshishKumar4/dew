@@ -424,6 +424,17 @@ class Decide(SavedRunTask, InItsForm):
         return format_unstated(head.release_format, backbone)
 
     @classmethod
+    def source_of(cls, run: SavedRun, *, mesh: "MeshSpec | Mesh | None", layout: "Placement | None",
+                  dtype: DTypeLike | None, param_dtype: DTypeLike | None) -> "PretrainedDecision":
+        """`run`, a step its native release holds, as the source a decision run that names it starts from
+        (`ReleasedTask.source_of`): the bundle of its task (`PretrainedDecision.of`), its head, layout,
+        calibration and weights the run's, under the numerics its step trained in (`SavedRun.formed`)."""
+        from dew.decision.sources import PretrainedDecision
+
+        task = cls.from_saved(run, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
+        return PretrainedDecision.of(run.formed(task))
+
+    @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
                    param_dtype: DTypeLike | None = None) -> Self:
