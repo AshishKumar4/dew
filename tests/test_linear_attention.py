@@ -59,7 +59,9 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
 
 SHARDED_SEEDS = 128
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
-`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+`seeds_for`: the fewest for which one device compared with itself resolves the factor. Run as map tasks of
+16 (`check1_shards`, whose counts the plan reads as literals): the interpreted step took over 180 s a case
+on CI's CPU, past its group's deadline."""
 
 
 @pytest.fixture(scope="module")
@@ -859,6 +861,7 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
 def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
@@ -906,6 +909,7 @@ RATED = kernel.Hooks(decay='scalar', rated=True, delta=False, skip=True)
 (`linear.KEY_STEP`) and Mamba-2's rated scan with its skip (`mamba2.SSD`)."""
 
 
+@pytest.mark.check1_shards(seeds=128, per_task=16)
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
 @pytest.mark.parametrize("form", ["a decay a key dimension", "a rated decay"])
