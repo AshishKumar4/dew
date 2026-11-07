@@ -74,6 +74,7 @@ def walked_grids(saved_pipelines) -> dict:
     return json.loads(printed.strip().splitlines()[-1])["grids"]
 
 
+@pytest.mark.shared_setup("walked_grids")
 @pytest.mark.parametrize("solver", sorted(SCHEDULERS))
 def test_native_solver_consumes_the_complete_source_grid(walked_grids, solver):
     assert "failed" not in walked_grids[solver], walked_grids[solver]["failed"]
