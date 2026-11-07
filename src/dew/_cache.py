@@ -169,6 +169,12 @@ def enable_compilation_cache(path: str):
     A directory named after the process first compiled holds the programs
     compiled after: JAX's cache is settled again at the next compile.
 
+    Each Pallas Mosaic GPU kernel a process lowers is kept beside them, in
+    `<path>/pallas`, keyed by the installed code and all the lowering reads
+    (Dew's JAX build's `jax_pallas_lowering_cache_dir`), so a later process
+    reads it back rather than lowering it again; a directory the user named
+    (`JAX_PALLAS_LOWERING_CACHE_DIR`) is theirs.
+
     A run under `--xla_gpu_deterministic_ops` keeps no picks (`keeps_picks`):
     jax 0.11.2's XLA measures nothing there and gives each instruction the
     first configuration that compiles, but would still take a stored pick
@@ -190,6 +196,8 @@ def enable_compilation_cache(path: str):
     # in the cache directory would name one directory for every jaxlib and write picks from a
     # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
     jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
+    if 'JAX_PALLAS_LOWERING_CACHE_DIR' not in os.environ:
+        jax.config.update('jax_pallas_lowering_cache_dir', os.path.join(path, 'pallas'))
     # JAX's defaults skip small and fast compilations; a run's many small programs (its schedule, its
     # metrics, its data's transforms) each compile again on every restart without them, so every
     # program is cached, unless the user named a threshold (JAX_PERSISTENT_CACHE_MIN_*), which is theirs.
