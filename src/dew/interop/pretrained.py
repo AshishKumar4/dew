@@ -2343,7 +2343,7 @@ def _translated(config: Mapping[str, object],
         from dew.interop.streaming import SourceLeaf
         from dew.nn.kernels.gemm import NvFp4
 
-        variables = jax.tree.map(lambda leaf: np.asarray(leaf) if isinstance(leaf, SourceLeaf) else leaf,
+        variables = jax.tree.map(lambda leaf: leaf.read() if isinstance(leaf, SourceLeaf) else leaf,
                                  variables, is_leaf=lambda leaf: isinstance(leaf, NvFp4))
     return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid,
                        stored)
