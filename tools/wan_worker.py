@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 ARCHIVE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "wan_transformer.tar.xz"
 
@@ -57,17 +57,13 @@ def run(site: str, directory: Path, cases: dict[str, np.ndarray]) -> dict[str, n
     narrow = WanTransformer3DModel.from_pretrained(checkpoint,
                                                    torch_dtype=torch.bfloat16 if half else torch.float32)
     wide = float64_twin(WanTransformer3DModel.from_pretrained(checkpoint, torch_dtype=torch.float32).eval())
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        inputs = {key.removeprefix(f"{name}."): value for key, value in cases.items()
-                  if key.startswith(f"{name}.")}
+    def answer(inputs):
         narrowed = flows(narrow.eval(), inputs, torch.bfloat16 if half else torch.float32, gradients=not half)
-        for leaf, value in narrowed.items():
-            out[f"{name}.reference.{leaf}"] = value.astype(np.float32)
         with widened():
-            for leaf, value in flows(wide, inputs, torch.float64, gradients=not half).items():
-                out[f"{name}.truth.{leaf}"] = value
-    return out
+            truth = flows(wide, inputs, torch.float64, gradients=not half)
+        return {leaf: value.astype(np.float32) for leaf, value in narrowed.items()}, truth
+
+    return drawn(cases, answer)
 
 
 if __name__ == "__main__":

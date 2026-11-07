@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from beam_reference import SETTINGS, searched
 from numerics_reference import FIXTURES, decoder
-from reference_worker import serve
+from reference_worker import drawn, serve
 from torch_precision import float64, float64_twin
 
 
@@ -28,17 +28,18 @@ def run(name: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         each.generation_config.eos_token_id = None
     with np.load(FIXTURES / name / "beam.npz") as stored:
         eos, pad = int(stored["eos"]), int(stored["pad"])
-    out = {}
-    for draw in sorted({key.split(".", 1)[0] for key in cases}):
-        ids = np.asarray(cases[f"{draw}.ids"])
+    def answer(inputs):
+        ids = np.asarray(inputs["ids"])
         mask = np.ones_like(ids, bool)
+        reference, truth = {}, {}
         for index, (penalty, early) in enumerate(SETTINGS):
             _, scores = searched(model, ids, mask, eos, pad, penalty, early)
+            reference[f"case_{index}"] = scores.astype(np.float32)
             with float64():
-                _, exact = searched(wide, ids, mask, eos, pad, penalty, early)
-            out[f"{draw}.reference.case_{index}"] = scores.astype(np.float32)
-            out[f"{draw}.truth.case_{index}"] = exact
-    return out
+                truth[f"case_{index}"] = searched(wide, ids, mask, eos, pad, penalty, early)[1]
+        return reference, truth
+
+    return drawn(cases, answer)
 
 
 if __name__ == "__main__":

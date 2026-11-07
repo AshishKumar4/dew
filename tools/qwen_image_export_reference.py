@@ -113,18 +113,17 @@ def run(models, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's output under the export's transformer, in float32 and float64."""
     import torch
     from diffusers_qwen_image_reference import transformer_call
+    from reference_worker import drawn
 
     from tools.torch_precision import float64
 
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        for kind, model, dtype in (("reference", models[0], torch.float32),
-                                   ("truth", models[1], torch.float64)):
-            given = [torch.from_numpy(cases[f"{name}.{key}"]).to(dtype)
-                     for key in ("packed", "context", "times")]
-            with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
-                out[f"{name}.{kind}.output"] = transformer_call(model, *given, GRID).numpy()
-    return out
+    def arm(inputs, model, dtype):
+        given = [torch.from_numpy(inputs[key]).to(dtype) for key in ("packed", "context", "times")]
+        with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+            return {"output": transformer_call(model, *given, GRID).numpy()}
+
+    return drawn(cases, lambda inputs: (arm(inputs, models[0], torch.float32),
+                                        arm(inputs, models[1], torch.float64)))
 
 
 if __name__ == "__main__":

@@ -6,8 +6,8 @@ llama-tiny and qwen3-tiny checkpoints over drawn prompts: three prompts,
 width three, three returned beams, six new tokens, an EOS that ends some
 beams inside the budget, under four settings of the length penalty and
 early stopping. Each draw's every ranking is decided by the selection margin
-in Dew's float64 search (`Beam.margins`), so a rounding cannot choose its
-beams.
+in Dew's float64 search (its `Beam.boundaries`, `selection_margins.top_margin`),
+so a rounding cannot choose its beams.
 
 One more oracle: over a two-token budget with the width set to the vocabulary the
 search is exhaustive, so the returned hypothesis has to be the best-scoring
@@ -78,11 +78,11 @@ SETTINGS = ((1.0, False), (0.0, True), (2.0, "never"), (-1.0, False))
 penalty that rewards, ignores and punishes length."""
 
 
-def _searched(pretrained, ids, eos: int, pad: int, penalty, early, *, margins: bool = False):
+def _searched(pretrained, ids, eos: int, pad: int, penalty, early, *, boundaries: bool = False):
     return generate(pretrained.model, pretrained.variables, jnp.asarray(ids, jnp.int32), NEW_TOKENS,
                     key=jax.random.key(0), sampling=Sampling(eos_token_ids=eos, pad_token_id=pad), n=WIDTH,
                     strategy=Beam(width=WIDTH, length_penalty=penalty, early_stopping=early, stop_ids=1,
-                                  margins=margins))
+                                  boundaries=boundaries))
 
 
 def _scored(found, penalty) -> np.ndarray:
@@ -102,8 +102,9 @@ def _special(name: str) -> tuple[int, int]:
 def beam_draw(name: str):
     """`draw(seed)` of checkpoint `name`: PROMPTS unpadded prompts of LENGTH tokens over its vocabulary but
     its EOS and pad, redrawn until Dew's float64 search decides every ranking of every setting by the
-    selection margin (`Beam.margins`, `selection_margins.MARGIN`), so float32 searches return its beams."""
-    from selection_margins import MARGIN, clearing
+    selection margin (`Beam.boundaries`, `selection_margins.top_margin` over each ranking's last score kept
+    and first passed over, at least `MARGIN`), so float32 searches return its beams."""
+    from selection_margins import MARGIN, clearing, top_margin
 
     vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
     eos, pad = _special(name)
@@ -115,8 +116,8 @@ def beam_draw(name: str):
         # In float64 in any process: a recorder's draws run where JAX's float64 is off.
         with jax.enable_x64(new_val=True):
             for penalty, early in SETTINGS:
-                found = _searched(truth, drawn["ids"], eos, pad, penalty, early, margins=True)
-                margins = np.asarray(found.margins)
+                found = _searched(truth, drawn["ids"], eos, pad, penalty, early, boundaries=True)
+                margins = top_margin(np.asarray(found.boundaries), 1)
                 if np.any(margins[np.isfinite(margins)] <= MARGIN):
                     return False
         return True
@@ -219,24 +220,28 @@ def test_asking_for_more_hypotheses_than_the_width_is_refused(model):
 
 @pytest.mark.parametrize(("penalty", "early", "width", "stop_ids"),
                          [(1.0, False, 2, 1), (0.5, True, 2, 1), (2.0, "never", 2, 1), (1.0, False, 1, 12)])
-def test_a_search_reports_its_margins_without_changing_its_beams(model, penalty, early, width, stop_ids):
-    """A search asked for its margins (`Beam.margins`) returns the beams, lengths, flags and likelihoods it
-    returns unasked, which reports none, a search keeping every candidate of its 13-token vocabulary among
-    them (one beam, twelve stop ids); under a model that scores every token alike each ranking it makes
-    ties, a margin of zero at every step it searches."""
+def test_a_search_reports_its_boundary_scores_without_changing_its_beams(model, penalty, early, width,
+                                                                          stop_ids):
+    """A search asked for its boundary scores (`Beam.boundaries`) returns the beams, lengths, flags and
+    likelihoods it returns unasked, which reports none, a search keeping every candidate of its 13-token
+    vocabulary among them (one beam, twelve stop ids); under a model that scores every token alike some
+    ranking it makes ties at every step it searches, a margin of zero (`selection_margins.top_margin`)."""
+    from selection_margins import top_margin
+
     module, params = model
 
-    def search(variables, *, margins):
+    def search(variables, *, boundaries):
         return generate(module, variables, jnp.asarray([PROMPT], jnp.int32), 3, key=jax.random.key(0),
                         sampling=Sampling(eos_token_ids=4, pad_token_id=0), n=width,
                         strategy=Beam(width=width, length_penalty=penalty, early_stopping=early,
-                                      stop_ids=stop_ids, margins=margins))
+                                      stop_ids=stop_ids, boundaries=boundaries))
 
-    asked, unasked = search(params, margins=True), search(params, margins=False)
-    assert unasked.margins is None
+    asked, unasked = search(params, boundaries=True), search(params, boundaries=False)
+    assert unasked.boundaries is None
     for field in ("tokens", "lengths", "terminated", "raw_log_probs"):
         np.testing.assert_array_equal(np.asarray(getattr(asked, field)), np.asarray(getattr(unasked, field)))
-    alike = np.asarray(search(jax.tree.map(jnp.zeros_like, params), margins=True).margins)
+    tied = search(jax.tree.map(jnp.zeros_like, params), boundaries=True).boundaries
+    alike = top_margin(np.asarray(tied), 1).min(axis=-1)
     assert np.all(alike[:, 0] == 0) and np.all((alike == 0) | np.isposinf(alike))
 
 

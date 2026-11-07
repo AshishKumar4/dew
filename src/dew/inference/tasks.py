@@ -306,7 +306,7 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    terminated=generated.terminated & (lengths <= budget),
                    behavior_log_probs=generated.behavior_log_probs[:, :budget],
                    raw_log_probs=generated.raw_log_probs[:, :budget],
-                   margins=None if generated.margins is None else generated.margins[:, :budget])
+                   boundaries=None if generated.boundaries is None else generated.boundaries[:, :budget])
 
 
 def declared_objective(record: Mapping[str, object]) -> type[Objective]:

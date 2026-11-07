@@ -94,10 +94,10 @@ def steps_draw(seed: int) -> dict[str, np.ndarray]:
     return clearing(lambda key: {"tokens": _steps_rows(key)}, clears, tries=64)(seed)
 
 
-def fine_tuned(_, inputs) -> dict:
-    """Dew's trainer over a draw's rows: each step's loss and the global norm of the gradient it handed the
-    solver (the value torch's `clip_grad_norm_` returns)."""
-    tokens = inputs["tokens"]
+@functools.cache
+def _fine_tuning(rows: tuple[int, ...], dtype: str):
+    """qwen3-tiny's trainer and its step compiled for a batch of `rows`' shape in `dtype`, once a process:
+    each draw places a fresh state and runs this step (`fine_tuned`)."""
     pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32", attention_impl="xla")
     objective = LMObjective(pretrained, WIDTH - 1, ema_decay=None)
     schedule = Cosine(peak_value=OPTIONS["lr_peak"], warmup_steps=OPTIONS["warmup"],
@@ -108,7 +108,15 @@ def fine_tuned(_, inputs) -> dict:
     trainer = Trainer(objective, solver, key=jax.random.key(0), mesh=MeshSpec(), checkpoints=None,
                       tracker=None)
     state, _, _ = trainer.place()
-    step = trainer.compile(state, {TEXT_KEY: tokens[0]})
+    return trainer, trainer.compile(state, {TEXT_KEY: np.zeros(rows, dtype)})
+
+
+def fine_tuned(_, inputs) -> dict:
+    """Dew's trainer over a draw's rows: each step's loss and the global norm of the gradient it handed the
+    solver (the value torch's `clip_grad_norm_` returns)."""
+    tokens = inputs["tokens"]
+    trainer, step = _fine_tuning(tokens[0].shape, str(tokens.dtype))
+    state, _, _ = trainer.place()
     losses, norms = [], []
     for rows in tokens:
         state, loss, _, _, _, committed = step(state, {TEXT_KEY: rows})

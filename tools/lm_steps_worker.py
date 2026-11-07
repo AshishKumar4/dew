@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from reference_worker import serve
+from reference_worker import drawn, serve
 from torch_precision import float64
 from transformers import AutoModelForCausalLM
 
@@ -83,14 +83,12 @@ def _steps(dtype: torch.dtype, tokens: np.ndarray) -> dict[str, list[float]]:
 
 def answered(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's steps, in float32 and float64."""
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        tokens = cases[f"{name}.tokens"]
-        for kind, dtype in (("reference", torch.float32), ("truth", torch.float64)):
-            for leaf, values in run(dtype, tokens).items():
-                wide = np.float64 if kind == "truth" else np.float32
-                out[f"{name}.{kind}.{leaf}"] = np.asarray(values, wide)
-    return out
+    def answer(inputs):
+        return tuple({leaf: np.asarray(values, dtype)
+                      for leaf, values in run(precision, inputs["tokens"]).items()}
+                     for precision, dtype in ((torch.float32, np.float32), (torch.float64, np.float64)))
+
+    return drawn(cases, answer)
 
 
 if __name__ == "__main__":

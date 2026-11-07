@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 CODECS = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs"
 FAMILIES = ("storage", "nvfp4_qdq")
@@ -45,14 +45,14 @@ def run(family: str, kind: str, cases: dict[str, np.ndarray]) -> dict[str, np.nd
         elif hasattr(module, "quantization_status"):
             # The decoded weights' QDQ again is redundant; the input QDQ stays (tools/nvfp4_qdq_reference.py).
             module.quantization_status = QuantizationStatus.COMPRESSED
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        ids = torch.from_numpy(np.asarray(cases[f"{name}.ids"])).long()
+    def answer(inputs):
+        ids = torch.from_numpy(np.asarray(inputs["ids"])).long()
         with torch.no_grad():
-            out[f"{name}.reference.logits"] = model(ids, use_cache=False).logits.numpy()
+            reference = model(ids, use_cache=False).logits.numpy()
         with float64(), torch.no_grad(), quantized_as_published():
-            out[f"{name}.truth.logits"] = exact(ids, use_cache=False).logits.numpy()
-    return out
+            return {"logits": reference}, {"logits": exact(ids, use_cache=False).logits.numpy()}
+
+    return drawn(cases, answer)
 
 
 if __name__ == "__main__":
