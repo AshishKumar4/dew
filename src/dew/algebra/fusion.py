@@ -77,8 +77,8 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
                              lambda region=region: _takes(fused_gemm, jaxpr, region))]
     if not attention and not products:
         return jaxpr
-    written = [Written(region.places, (region.query, region.key, region.value), (region.output,),
-                       region.places[-1], attention_regions.written(region)) for region in attention]
+    written = [Written(region.places, region.operands, (region.output,), region.places[-1],
+                       attention_regions.written(region)) for region in attention]
     written += [Written(region.places, region.inputs, region.outputs, region.at,
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm)) for region in products]
     return _spliced(jaxpr, written)
