@@ -1874,22 +1874,29 @@ class RunConfig:
         earlier shape of a saved run is (`earlier_run`), and its data plan version, where it resumes no
         run that recorded one, this Dew's (`PLAN_VERSIONS`): the one place a run's version is resolved,
         on each path a run trains by (`prepare`, and `readied`, which a run trained in Python reaches
-        alone), before its data compiles or its record is written; and each class it names, its model's
-        and its objective's, with every argument it leaves unstated as the saved run recorded it
-        (`_defaulted_as`), so a default changed since resumes the run as it trained (row 2938). Its
-        other fields as they are where it resumes no run (`TrainerConfig.resumes`)."""
+        alone), before its data compiles or its record is written; and, resolving every field (no
+        `paths`), as `prepare` does before it builds them, each class it names, its model's and its
+        objective's, with every argument it leaves unstated as the saved run recorded it
+        (`_defaulted_as`), so a default changed since resumes the run as it trained (row 2938); an
+        objective built already is compared as built (`check_resume`). Its other fields as they are where
+        it resumes no run (`TrainerConfig.resumes`)."""
         trainer = self.trainer
         built = self.BUILT if paths is None else paths
         unset = [path for path in built if _holds(self, path) and _recorded_at(self, path) is None]
         run = self
-        if trainer.name is not None and trainer.resume != "never" and trainer.resumes():
+        # The classes' defaults are resolved where the run builds its objective and model from them
+        # (`prepare`, every field), never where they are built already (`readied`'s data plan version).
+        defaulting = paths is None
+        if ((unset or defaulting) and trainer.name is not None and trainer.resume != "never"
+                and trainer.resumes()):
             with trainer.checkpoints(trainer.name) as checkpoints:
                 saved = self._saved_record(trainer.directory(trainer.name), checkpoints)
             recorded = None if saved is None else self._saved_as(saved)
             # A field of a record the saved run held none of (a teacher it had not) takes nothing.
             if recorded is not None:
                 run = self.override({path: _recorded_at(recorded, path) for path in unset
-                                     if _holds(recorded, path)})._defaulted_as(recorded)
+                                     if _holds(recorded, path)})
+                run = run._defaulted_as(recorded) if defaulting else run
         if "data_plan_version" in built and run.data_plan_version is None:
             run = dataclasses.replace(run, data_plan_version=PLAN_VERSIONS[-1])
         return run
