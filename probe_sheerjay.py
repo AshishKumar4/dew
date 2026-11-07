@@ -77,6 +77,17 @@ print("K", mode, "exactzero", np.asarray(zero).ravel().tolist(), flush=True)
 cases = [("scalar delta", "aligned keys", "log_decay"),
          ("gated", "aligned keys", "gate"),
          ("vector delta", "steep then mild", "state")]
+if len(sys.argv) > 2 and sys.argv[2] == "gate":
+    from test_recurrence_stability import _gradient_holds_check_1
+    jax.config.update("jax_enable_x64", False)
+    for name, regime, leaf in cases:
+        try:
+            _gradient_holds_check_1(name, regime)
+            print("K", mode, name, regime, "CHECK1 PASS", flush=True)
+        except Exception as error:
+            for line in str(error).splitlines():
+                print("K", mode, name, regime, "CHECK1 FAIL", type(error).__name__, line, flush=True)
+    raise SystemExit
 for name, regime, leaf in cases:
     hooks = SITES[name]
     candidate = without_ynn(with_gradients(functools.partial(chunk_on, "xla", hooks, chunk_size=CHUNK)))
@@ -84,7 +95,8 @@ for name, regime, leaf in cases:
     truth = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
     ratios, mine, theirs, rawmine, rawtheirs = [], [], [], [], []
     for seed in range(8):
-        args = cotangents(hooks, regime, seed)
+        with jax.experimental.enable_x64(False):
+            args = cotangents(hooks, regime, seed)
         a, b, t = candidate(*args), reference(*args), truth(*widened(args))
         av, bv, tv = (np.asarray(getattr(x[1], leaf), np.float64) for x in (a, b, t))
         size, ea = row_errors(av, tv)
