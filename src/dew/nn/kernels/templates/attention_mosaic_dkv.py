@@ -498,7 +498,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
         name=name,
-        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
+        reducing_warpgroups=reducing(family, consumers, walk.reduces),
         # The products this launch issues (`stated`): its `S` and `dP` recomputed, its share of dV's, and
         # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it
         # owns (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.

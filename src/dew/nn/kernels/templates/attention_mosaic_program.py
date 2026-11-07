@@ -471,24 +471,60 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
 
 
-def reducing(family: mosaic.Family, consumers: int, *hooks, guarded: bool = False, scaled: bool = False
-             ) -> int:
+def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, guarded: bool = False,
+             scaled: bool = False) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
-    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a hook's
-    unit row, which the fork selects by a reduction across warps (ledger 1428), and a `guarded` launch's
-    keys' value magnitudes, its tile's columns reduced across the warps holding them
-    (`Family.key_magnitudes`), or a launch's rows reduced to their block's flag (`guarded` too: the plain
-    launch that flags its rows, `attention_mosaic_forward._Flags`), or a `scaled` step's tile reduced to its
-    largest across the warps holding its rows (`algebra.running_parts`, an fp16 fused backward's), so every
-    warpgroup of a launch that runs a hook (`hooks`, its score and output hooks, None where it has none),
-    guards or scales; none otherwise."""
-    if guarded or scaled or any(hook is not None for hook in hooks):
+    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
+    `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
+    ledger 1428; an output hook's, untraced), and a `guarded` launch's keys' value magnitudes, its tile's
+    columns reduced across the warps holding them (`Family.key_magnitudes`), or a launch's rows reduced to
+    their block's flag (`guarded` too: the plain launch that flags its rows,
+    `attention_mosaic_forward._Flags`), or a `scaled` step's tile reduced to its largest across the warps
+    holding its rows (`algebra.running_parts`, an fp16 fused backward's), so every warpgroup of a launch that
+    runs such a hook, guards or scales; none otherwise."""
+    if guarded or scaled or hooked:
         return family.warpgroups(consumers)
     return 0
 
 
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
                  differentiated: bool = False) -> list[jax_core.Jaxpr]:
+def hook_reduces(hooks: Hooks | None) -> bool:
+    """Whether the score hook may reduce across warps (`reducing`): traced, never run, on a tile with its
+    pullback, it forms or reads a value but a scalar or a whole tile (a unit row, `k_pos[:1, :]`, ledger
+    1428; a sum along an axis) or nests a computation but a call's (a branch, a loop); a fingerprint (a keyed
+    launch's hook) counted so. Gemma 2's softcap forms none, so its launches reserve no scratch: its
+    backward's one launch 256 wide on an H100 fits beside it (row 3704: 233,568 bytes with it, past the
+    block's 232,448). False without a hook."""
+    if hooks is None or hooks.score_mod is None:
+        return False
+    if not callable(hooks.score_mod):
+        return True
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _hook_reduces(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _hook_reduces(score_mod, params: tuple) -> bool:
+    """`hook_reduces` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    tile = (TILE_SIDES[0], TILE_SIDES[0])
+    traced = _score_jaxprs(score_mod, params, tile, differentiated=True)
+    return any(_off_tile(jaxpr, tile) for jaxpr in traced)
+
+
+def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
+    """Whether an equation of `jaxpr` forms or reads a value but a scalar or a `tile`, or nests a computation
+    but a call's (a jitted helper's, a custom derivative's primal), whose own equations are read so."""
+    for eqn in jaxpr.eqns:
+        if any(getattr(var.aval, "shape", ()) not in ((), tile) for var in (*eqn.invars, *eqn.outvars)):
+            return True
+        nested = list(jax_core.jaxprs_in_params(eqn.params))
+        called = ("jaxpr" in eqn.params or "call_jaxpr" in eqn.params) and len(nested) == 1
+        if nested and not (called and not _off_tile(nested[0], tile)):
+            return True
+    return False
+
+
     """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
     `differentiated`, its pullback along the logits and its floating parameters) and the output hook."""
     traced = []
