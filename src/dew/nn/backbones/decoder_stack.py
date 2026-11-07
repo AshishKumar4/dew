@@ -398,9 +398,8 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
 
             repeats = count // len(run.specs) if periodic else count
             # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
-            # reading its row in place into the collections they join (`_rows_joined`), recomputed in the backward
-            # (`_ROWS_RECOMPUTED`); every other
-            # collection scans its stacked layers.
+            # reading its row in place into the collections they join (`_rows_joined`), recomputed in the
+            # backward (`_ROWS_RECOMPUTED`); every other collection scans its stacked layers.
             rows = tuple(run.variables.get(LAYER_ROWS, {}))
             if rows:
                 def scanned(layer, carry, per_layer_input, index, *, scanned=scanned, rows=rows):
