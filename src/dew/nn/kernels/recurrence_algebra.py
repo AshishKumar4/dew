@@ -42,12 +42,13 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
-from dew.nn.kernels.generation import linear_map
+from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
 from dew.nn.precision import (
     compensated_add,
+    compensated_sum,
     exact_float32,
     float32_einsum,
     float32_matmul,
@@ -544,14 +545,36 @@ def readout_entered_gradient(decayed_query, weights, scores, cotangent, issue: I
     return memory - issue("corrected", jnp.swapaxes(weights, -1, -2), corrected)
 
 
+LEFT_CHUNK = 8
+"""The read width each piece of a readout's gradient in its decayed operand sums (`_remembered_left`)."""
+
+
+def _remembered_left(entered, cotangent, issue: Issue, name: str, shape: tuple[int, ...]):
+    """`cotangent @ entered^T`, the readout's gradient in its decayed operand: over the read width in pieces
+    of LEFT_CHUNK, each piece's product issued and the pieces summed rounded once (`compensated_sum`), so
+    its rounding is a piece's whatever order a backend's product sums in. As one product of the whole width,
+    XLA:CPU's order put Mamba-2's C gradient 1.61 times the token scan's distance from float64 where a
+    chunk's decays reach e^-45 (row 4543). Summed back to the decayed operand's `shape` where `entered`'s
+    batch axes broadcast it (`unbroadcast`)."""
+    width = entered.shape[-1]
+    pieces = [issue(name, cotangent[..., start:start + LEFT_CHUNK],
+                    jnp.swapaxes(entered[..., start:start + LEFT_CHUNK], -1, -2))
+              for start in range(0, width, LEFT_CHUNK)]
+    left = pieces[0] if len(pieces) == 1 else compensated_sum(jnp.stack(pieces), (0,))
+    return left if left.shape == shape else unbroadcast(left, shape)
+
+
 def _remembered_tangent(issue, name, primals, tangents):
-    """The product's tangent, its `entered` side linear in `entered` with the transpose
-    `_remembered_transpose`, in forward and reverse mode alike."""
+    """The product's tangent, linear in each side: its `entered` side with the transpose
+    `_remembered_transpose`, its decayed side with `_remembered_left`, in forward and reverse mode alike."""
     decayed, entered = primals
     d_decayed, d_entered = tangents
     read = linear_map(lambda decayed, entered: issue(name, decayed, entered),
                       functools.partial(_remembered_transpose, issue=issue, name=name), decayed, d_entered)
-    return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
+    moved = linear_map(lambda entered, decayed: issue(name, decayed, entered),
+                       functools.partial(_remembered_left, issue=issue, name=name, shape=d_decayed.shape),
+                       entered, d_decayed)
+    return remembered(decayed, entered, issue, name), moved + read
 
 
 remembered = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order")(
