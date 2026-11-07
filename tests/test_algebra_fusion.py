@@ -424,9 +424,11 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
         assert set(fused(lambda: dew.jit(program).trace(*shapes))) == expected
     sizes = [shape.shape for shape in shapes]
     draw = normal_drawn(43, *sizes, sizes[0], dtype=jnp.bfloat16)
-    assert_as_exact(jax.jit(with_gradients(dew.jit(program))), jax.jit(with_gradients(program)), draw,
-                    f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
-                        lambda *x: program(*(a.astype(jnp.float64) for a in x))))
+    # Under the H100's decisions, so the compile point writes the norm; on this host its portable arithmetic.
+    with generation.assumed("sm90"):
+        assert_as_exact(jax.jit(with_gradients(dew.jit(program))), jax.jit(with_gradients(program)), draw,
+                        f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
+                            lambda *x: program(*(a.astype(jnp.float64) for a in x))))
 
 
 def _rows_inverse(x):
@@ -459,19 +461,22 @@ so every axis has the feature axis's extent)."""
 
 
 @pytest.mark.parametrize("program", list(NEAR_NORMS))
-def test_a_plain_program_near_a_norm_stays_as_written(program):
-    """A program whose arithmetic is no RMSNorm or SwiGLU though its equations resemble one (the statistics
-    or the weight laid along another axis, a nested program only named silu, a mean scaled by zero, the
-    region's own sum read as its weight) runs as written through `dew.jit` on an H100: no fused norm, and
-    its value the program's own, bitwise."""
+def test_a_plain_program_near_a_norm_computes_as_written(program):
+    """A program whose arithmetic resembles an RMSNorm or SwiGLU without being one (the statistics or the
+    weight laid along another axis, a nested program only named silu, a mean scaled by zero, the region's own
+    sum read as its weight), compiled through `dew.jit` on an H100, computes what it does as written: its
+    output and gradients on par with the program's (check 1), whatever of it the compile point writes as
+    Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as written)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
     import dew
 
     fn = NEAR_NORMS[program]
-    x = jax.random.normal(jax.random.key(3), (256, 256), jnp.float32).astype(jnp.bfloat16)
-    w = jax.random.normal(jax.random.key(4), (256,), jnp.float32)
-    shapes = (jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct(w.shape, w.dtype))
-    with generation.assumed("sm90"), generation.routes() as found:
-        dew.jit(fn).trace(*shapes)
-    assert not [route for route in found if route.choice in ("rms_norm", "swiglu") and route.kernel != "xla"]
-    np.testing.assert_array_equal(np.asarray(dew.jit(fn)(x, w), np.float32),
-                                  np.asarray(jax.jit(fn)(x, w), np.float32))
+    draw = normal_drawn(47, (256, 256), (256,), (256, 256), dtype=jnp.bfloat16)
+    # Under an H100's decisions, so the compile point writes what it matches; on this host Dew's norms run
+    # their portable arithmetic.
+    with generation.assumed("sm90"):
+        assert_as_exact(jax.jit(with_gradients(dew.jit(fn))), jax.jit(with_gradients(fn)), draw,
+                        f"dew.jit {program}", seeds=8,
+                        truth_fn=with_gradients(lambda *x: fn(*(a.astype(jnp.float64) for a in x))))
