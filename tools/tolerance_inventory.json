@@ -765,10 +765,6 @@
    "comparisons": 1,
    "lane": "Training"
   },
-  "tools/layout_parity.py": {
-   "comparisons": 1,
-   "lane": "Accuracy Gate"
-  },
   "tools/lora_reference.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
