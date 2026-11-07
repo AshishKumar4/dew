@@ -1230,12 +1230,13 @@ def _gated(target: str, group: tuple):
     return pytest.param(target, group, id=label)
 
 
-@pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90')
+@pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90', 'sm100')
                                            for group in GATE_GROUPS])
 def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
-    """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
-    CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
-    227 KB) and tensor memory and at most its plan's shared memory (`template.planned`, from which
+    """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100, H100 and B200
+    (mma.sync on TMA rings, `bundles.of`, until its tcgen05 bundle is given) on this CPU
+    (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
+    227 KB, 227 KB) and tensor memory and at most its plan's shared memory (`template.planned`, from which
     the tiles are derived, `planned_failures`), no launch the template's legality holds spills a register (a
     refused tile's compiled as the model's evidence, `KernelCase.required`), and each launch's register model
     decides as ptxas's need does, admitting a tile or refusing it (row 1971,
