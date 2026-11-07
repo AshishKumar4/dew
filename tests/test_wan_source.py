@@ -43,6 +43,7 @@ from interop_support import (
     extract_fixture,
     fixture_arrays,
     source_transformer,
+    torch_arms,
 )
 from reference_error import as_given, assert_as_exact
 from reference_runs import assert_arms_as_recorded
@@ -223,21 +224,13 @@ def sources(walk):
 
 
 def source_arms(sources, run):
-    """`run(pipe, dtype, *inputs)` as given over the float32 pipeline, and over the float64 one widened."""
+    """`run(pipe, dtype, *inputs)` over the float32 pipeline, and over the float64 one inside its widening
+    (`torch_arms`)."""
     import torch
 
     narrow, wide, widening = sources
-
-    @as_given
-    def reference(*inputs):
-        with torch.no_grad():
-            return run(narrow, torch.float32, *inputs)
-
-    @as_given
-    def truth(*inputs):
-        with widening(), torch.no_grad():
-            return run(wide, torch.float64, *inputs)
-    return reference, truth
+    return torch_arms(lambda *inputs: run(narrow, torch.float32, *inputs),
+                      lambda *inputs: run(wide, torch.float64, *inputs), widening=widening)
 
 
 WORDS = ("a", "red", "cat", "on", "mat", "tiny", "boat", "sea", "blue", "small", "dog", "tree")

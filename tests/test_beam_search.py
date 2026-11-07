@@ -217,18 +217,20 @@ def test_asking_for_more_hypotheses_than_the_width_is_refused(model):
                  strategy=Beam(width=2), n=3)
 
 
-@pytest.mark.parametrize(("penalty", "early"), [(1.0, False), (0.5, True), (2.0, "never")])
-def test_a_search_reports_its_margins_without_changing_its_beams(model, penalty, early):
+@pytest.mark.parametrize(("penalty", "early", "width", "stop_ids"),
+                         [(1.0, False, 2, 1), (0.5, True, 2, 1), (2.0, "never", 2, 1), (1.0, False, 1, 12)])
+def test_a_search_reports_its_margins_without_changing_its_beams(model, penalty, early, width, stop_ids):
     """A search asked for its margins (`Beam.margins`) returns the beams, lengths, flags and likelihoods it
-    returns unasked, which reports none; under a model that scores every token alike each ranking it makes
+    returns unasked, which reports none, a search keeping every candidate of its 13-token vocabulary among
+    them (one beam, twelve stop ids); under a model that scores every token alike each ranking it makes
     ties, a margin of zero at every step it searches."""
     module, params = model
 
     def search(variables, *, margins):
         return generate(module, variables, jnp.asarray([PROMPT], jnp.int32), 3, key=jax.random.key(0),
-                        sampling=Sampling(eos_token_ids=4, pad_token_id=0), n=2,
-                        strategy=Beam(width=2, length_penalty=penalty, early_stopping=early, stop_ids=1,
-                                      margins=margins))
+                        sampling=Sampling(eos_token_ids=4, pad_token_id=0), n=width,
+                        strategy=Beam(width=width, length_penalty=penalty, early_stopping=early,
+                                      stop_ids=stop_ids, margins=margins))
 
     asked, unasked = search(params, margins=True), search(params, margins=False)
     assert unasked.margins is None

@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, packed, unpacked
+from interop_support import extract_fixture, packed, torch_arms, unpacked
 from reference_error import GateFailure, as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
@@ -201,23 +201,6 @@ def pipelines(source):
     return narrow, wide
 
 
-def source_arms(pipe, run, *, wide: bool):
-    """`run(pipe, *inputs)` as given under `torch.no_grad`, inside `float64` for the `wide` pipeline, its
-    tensors returned as NumPy arrays."""
-    import contextlib
-
-    import torch
-
-    from tools.torch_precision import float64
-
-    @as_given
-    def given(*inputs):
-        with float64() if wide else contextlib.nullcontext(), torch.no_grad():
-            return jax.tree.map(lambda out: out.numpy() if isinstance(out, torch.Tensor) else out,
-                                run(pipe, *inputs))
-    return given
-
-
 def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipeline_record, pipelines):
     """The conditioner composes what `encode_prompt` composes, on par with it over drawn prompts (check 1),
     its float64 run the truth.
@@ -246,8 +229,8 @@ def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipe
         return {"context": embeds, "pooled": pooled}
 
     narrow, wide = pipelines
-    reference = source_arms(narrow, encode_prompt, wide=False)
-    truth = source_arms(wide, encode_prompt, wide=True)
+    reference, truth = torch_arms(lambda *inputs: encode_prompt(narrow, *inputs),
+                                  lambda *inputs: encode_prompt(wide, *inputs))
     assert_as_exact(as_given(lambda indices: encoded(prompts(indices))), reference, prompt_draw,
                     "Flux prompt encoding", seeds=PIPELINE_SEEDS, truth_fn=truth)
     # The distilled guidance rides in as a model input, at the value the pipeline defaults to, and guidance
@@ -305,8 +288,9 @@ def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record
                 "images": pipe(**options, output_type="np").images}
 
     narrow, wide = pipelines
-    assert_as_exact(walked, source_arms(narrow, called, wide=False), draw, "Flux pipeline walk",
-                    seeds=PIPELINE_SEEDS, truth_fn=source_arms(wide, called, wide=True))
+    reference, truth = torch_arms(lambda *inputs: called(narrow, *inputs),
+                                  lambda *inputs: called(wide, *inputs))
+    assert_as_exact(walked, reference, draw, "Flux pipeline walk", seeds=PIPELINE_SEEDS, truth_fn=truth)
 
 
 def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_path):

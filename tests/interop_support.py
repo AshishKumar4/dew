@@ -138,32 +138,51 @@ def assert_exported_decoder_follows_transformers(loaded, directory: Path, draw, 
     np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
 
 
-def transformers_arms(model, run, *, source=None, twin=None):
-    """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
-    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by the float64
-    twin (`tools.torch_precision.float64_twin`) of `source`, by default `model`, inside `float64`, each
-    run `as_given`, its tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly.
-    A narrower `model` (bfloat16) is measured from its stored weights' truth: `source`, the float32
-    load. `twin` is the twin itself where the reference builds its own (a PEFT model's)."""
+def torch_arms(reference, truth, *, widening=None):
+    """Check 1's reference and truth over torch: `reference(*inputs)` and `truth(*inputs)`, each run
+    `as_given` under `torch.no_grad`, the truth inside `widening` (`tools.torch_precision.float64` where
+    None), their tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly."""
     import torch
 
-    from tools.torch_precision import float64, float64_twin
+    from tools.torch_precision import float64
+
+    def as_numpy(out):
+        if not isinstance(out, torch.Tensor):
+            return out
+        held = out.detach()
+        return (held.float() if held.dtype == torch.bfloat16 else held).numpy()
+
+    def numpy(tree):
+        return jax.tree.map(as_numpy, tree)
+
+    def arm(call, context):
+        @as_given
+        def given(*inputs):
+            with context(), torch.no_grad():
+                return numpy(call(*inputs))
+        return given
+
+    return arm(reference, contextlib.nullcontext), arm(truth, float64 if widening is None else widening)
+
+
+def transformers_arms(model, run, *, source=None, twin=None):
+    """Check 1's reference and truth over the transformers `model` (`torch_arms`): `run(model, *inputs)` on
+    a draw's inputs as torch tensors (integers as int64), by `model` and by the float64 twin
+    (`tools.torch_precision.float64_twin`) of `source`, by default `model`. A narrower `model` (bfloat16)
+    is measured from its stored weights' truth: `source`, the float32 load. `twin` is the twin itself where
+    the reference builds its own (a PEFT model's)."""
+    import torch
+
+    from tools.torch_precision import float64_twin
 
     def tensor(value):
         value = np.asarray(value)
         return torch.from_numpy(value.astype(np.int64) if np.issubdtype(value.dtype, np.integer) else value)
 
-    def arm(network, precision):
-        @as_given
-        def given(*inputs):
-            with precision(), torch.no_grad():
-                return jax.tree.map(lambda out: (out.float() if out.dtype == torch.bfloat16 else out).numpy(),
-                                    run(network, *map(tensor, inputs)))
-        return given
-
     if twin is None:
         twin = float64_twin(model if source is None else source)
-    return arm(model, contextlib.nullcontext), arm(twin, float64)
+    return torch_arms(lambda *inputs: run(model, *map(tensor, inputs)),
+                      lambda *inputs: run(twin, *map(tensor, inputs)))
 
 
 def peft_twin(model):
@@ -491,9 +510,9 @@ def clearing_selections(loaded, draw, label: str, *, stable: bool = True, tries:
     """`draw`, for a decoder that selects discontinuously (a mixture's routing, a lightning indexer's
     top-k, Gemma 3n's gaussian top-k), redrawn until its selections clear `margin` (float32 runs'
     `selection_margins.MARGIN` where None), so the narrow runs and the float64 run select alike
-    (`selection_margins.clearing`, at most `tries` draws a seed); `draw` itself otherwise. A selection the compared runs could break a tie of
-    differently clears none where one of them is not `stable` (torch's `topk`,
-    `selection_margins.margin`)."""
+    (`selection_margins.clearing`, at most `tries` draws a seed); `draw` itself otherwise. A selection the
+    compared runs could break a tie of differently clears none where one of them is not `stable` (torch's
+    `topk`, `selection_margins.margin`)."""
     import jax.numpy as jnp
     import selection_margins
 

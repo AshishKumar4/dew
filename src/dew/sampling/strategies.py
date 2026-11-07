@@ -417,16 +417,27 @@ class Beam:
         return _beam_search(state, start, ops, transform, stopping, budget, n, self)
 
 
-def _ranked(scores: jax.Array, k: int, margins: bool):
-    """`lax.top_k(scores, k)`'s values and indices, and where `margins` the gap between the k-th score and
-    the next over the larger of the two's magnitudes, else None; infinite where the next is a dead slot's
-    (`DEAD`, an empty completed slot or a beam no longer scored), which no live hypothesis is near."""
+def _ranked(scores: jax.Array, k: int, margins: bool, *cutoffs: int):
+    """`lax.top_k(scores, k)`'s values and indices, and where `margins` the least gap, at the k-th score and
+    at each of `cutoffs` (a count the search keeps of these too), between the last score kept and the next,
+    over the larger of the two's magnitudes, else None; infinite where the next is a dead slot's (`DEAD`, an
+    empty completed slot or a beam no longer scored), which no live hypothesis is near, or where the
+    ranking keeps every score, passing none over."""
     if not margins:
         return (*lax.top_k(scores, k), None)
-    values, index = lax.top_k(scores, k + 1)
-    kept, passed = values[..., k - 1], values[..., k]
-    scale = jnp.maximum(jnp.maximum(jnp.abs(kept), jnp.abs(passed)), jnp.finfo(values.dtype).tiny)
-    return values[..., :k], index[..., :k], jnp.where(passed > DEAD / 2, (kept - passed) / scale, jnp.inf)
+    ranked = min(k + 1, scores.shape[-1])
+    values, index = lax.top_k(scores, ranked)
+    gaps = []
+    for cut in (k, *cutoffs):
+        if cut >= ranked:
+            continue
+        kept, passed = values[..., cut - 1], values[..., cut]
+        scale = jnp.maximum(jnp.maximum(jnp.abs(kept), jnp.abs(passed)), jnp.finfo(values.dtype).tiny)
+        gaps.append(jnp.where(passed > DEAD / 2, (kept - passed) / scale, jnp.inf))
+    margin = jnp.full(values.shape[:-1], jnp.inf, values.dtype)
+    for gap in gaps:
+        margin = jnp.minimum(margin, gap)
+    return values[..., :k], index[..., :k], margin
 
 
 def _beam_rows(parent, prompts: int, width: int):
@@ -574,8 +585,9 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
     checkify.check(jnp.all(wellformed(scores).reshape(prompts, width) | ~genuine),
                    "the transform chain left a live beam without a distribution to search")
     vocab = scores.shape[-1]
+    # The candidates' first `width`, which the completed set admits its arrivals from, a cutoff too.
     best, index, margin = _ranked((scores.reshape(prompts, width, vocab)
-                                   + live[:, :, None]).reshape(prompts, width * vocab), keep, margins)
+                                   + live[:, :, None]).reshape(prompts, width * vocab), keep, margins, width)
     return (best, index, jnp.take_along_axis(raw.reshape(prompts, width * vocab), index, axis=1), vocab,
             margin)
 

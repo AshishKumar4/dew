@@ -24,7 +24,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import tool_support
-from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
+from interop_support import (
+    assert_transformer_exports,
+    extract_fixture,
+    fixture_arrays,
+    source_transformer,
+    torch_arms,
+)
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
@@ -176,22 +182,12 @@ PIPELINE_SEEDS = 8
 each check confirmed them."""
 
 
-def torch_arms(run):
-    """`run(dtype, *inputs)` as given in float32, and in float64 inside `float64` (each a reference arm), its
-    tensors as NumPy arrays."""
+def dtype_arms(run):
+    """`run(dtype, *inputs)` in float32, and in float64 inside `float64` (`torch_arms`)."""
     import torch
 
-    from tools.torch_precision import float64
-
-    def arm(dtype):
-        @as_given
-        def given(*inputs):
-            with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
-                found = run(dtype, *inputs)
-                return jax.tree.map(
-                    lambda out: out.detach().numpy() if isinstance(out, torch.Tensor) else out, found)
-        return given
-    return arm(torch.float32), arm(torch.float64)
+    return torch_arms(lambda *inputs: run(torch.float32, *inputs),
+                      lambda *inputs: run(torch.float64, *inputs))
 
 
 def vae_walk(model, dtype, inputs):
@@ -251,7 +247,7 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, name)
         grad_code = jax.grad(lambda code: jnp.sum(autoencoder.decode(params, code) * probe))(code)
         return {"latent": latent, "pixels": pixels, "grad_image": grad_image, "grad_code": grad_code}
 
-    reference, truth = torch_arms(lambda dtype, inputs: vae_walk(models[dtype], dtype, inputs))
+    reference, truth = dtype_arms(lambda dtype, inputs: vae_walk(models[dtype], dtype, inputs))
     assert_as_exact(jax.jit(walked), reference, draw, f"{name} walk", seeds=PIPELINE_SEEDS, truth_fn=truth)
 
 
@@ -368,25 +364,14 @@ def klein_pipelines(source):
 
 
 def klein_arms(pipelines, run):
-    """`run(pipe, dtype, *inputs)` as given over the float32 pipeline, and over its float64 twin widened,
-    its tensors as NumPy arrays."""
+    """`run(pipe, dtype, *inputs)` over the float32 pipeline, and over its float64 twin walked widened
+    (`torch_arms`, the twin's walk its own widening)."""
     import torch
 
     narrow, wide, widened_walk = pipelines
-
-    def numpy(tree):
-        return jax.tree.map(lambda out: out.numpy() if isinstance(out, torch.Tensor) else out, tree)
-
-    @as_given
-    def reference(*inputs):
-        with torch.no_grad():
-            return numpy(run(narrow, torch.float32, *inputs))
-
-    @as_given
-    def truth(*inputs):
-        with torch.no_grad():
-            return numpy(widened_walk(lambda pipe, dtype: run(pipe, dtype, *inputs), wide))
-    return reference, truth
+    return torch_arms(lambda *inputs: run(narrow, torch.float32, *inputs),
+                      lambda *inputs: widened_walk(lambda pipe, dtype: run(pipe, dtype, *inputs), wide),
+                      widening=contextlib.nullcontext)
 
 
 def test_klein_prompt_encoding_matches_the_source_pipeline(klein, klein_pipelines, record):
@@ -471,7 +456,7 @@ def assert_mistral3_reads_as_flux2_dev(directory, encoder) -> None:
         return Flux2Pipeline._get_mistral_3_small_prompt_embeds(models[dtype], tokenizer, words(*rows),
                                                                 dtype=dtype, device=torch.device("cpu"))
 
-    reference, truth = torch_arms(embeds)
+    reference, truth = dtype_arms(embeds)
     def encoded(*rows):
         return encoder.encode(encoder.params, encoder.tokenize(words(*rows))).context
 
