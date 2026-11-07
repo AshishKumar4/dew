@@ -1,0 +1,40 @@
+diff --git a/tools/nvfp4_qdq_reference.py b/tools/nvfp4_qdq_reference.py
+--- a/tools/nvfp4_qdq_reference.py
++++ b/tools/nvfp4_qdq_reference.py
+@@ -113,6 +113,7 @@ def checkpoint(e4m3: bool) -> None:
+         if hasattr(module, "quantization_status"):
+             module.quantization_status = QuantizationStatus.COMPRESSED
+     direct_float = torch.Tensor.float
++    direct_to = torch.Tensor.to
+ 
+     def quantize_wide(module, value, base_name, args):
+         # The quantizer defines the discrete function in fp32. Its stored
+@@ -121,6 +122,7 @@ def checkpoint(e4m3: bool) -> None:
+         overall = module.input_global_scale
+         module.input_global_scale = torch.nn.Parameter(direct_float(overall), requires_grad=False)
+         try:
+-            return forward_quantize(module, direct_float(value), base_name, args).double()
++            with patch.object(torch.Tensor, "to", direct_to):
++                return forward_quantize(module, direct_float(value), base_name, args).double()
+         finally:
+             module.input_global_scale = overall
+diff --git a/tools/codec_worker.py b/tools/codec_worker.py
+--- a/tools/codec_worker.py
++++ b/tools/codec_worker.py
+@@ -45,6 +45,7 @@ def readers(directory: Path, *, input_qdq: bool):
+             elif not input_qdq:
+                 module.quantization_enabled = False
+     direct_float = torch.Tensor.float
++    direct_to = torch.Tensor.to
+ 
+     def quantize_wide(module, value, base_name, args):
+         # The quantizer's stored global stays float32 though the model around it widens.
+@@ -52,6 +53,7 @@ def readers(directory: Path, *, input_qdq: bool):
+         overall = module.input_global_scale
+         module.input_global_scale = torch.nn.Parameter(direct_float(overall), requires_grad=False)
+         try:
+-            return forward_quantize(module, direct_float(value), base_name, args).double()
++            with patch.object(torch.Tensor, "to", direct_to):
++                return forward_quantize(module, direct_float(value), base_name, args).double()
+         finally:
+             module.input_global_scale = overall
