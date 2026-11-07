@@ -273,16 +273,20 @@ class NvFp4:
         return cls.of(*(jax.vmap(one) if x.ndim == 3 else one)(x))
 
     @classmethod
-    def of(cls, codes: jax.Array, scales: jax.Array, scale) -> "NvFp4":
-        """The matrix of `codes` (`[depth, width]`, each an E2M1 value, in the depths' own order, or a bank's
-        `[groups, depth, width]`), its block scales `scales` (`[..., depth / 16, width]` float8_e4m3fn) and
-        its tensor scale `scale` (one a matrix): a checkpoint's NVFP4 weight, its codes packed in the staged
-        order, K-major."""
+    def of(cls, codes, scales, scale) -> "NvFp4":
+        """The matrix of `codes` (`[depth, width]`, or a bank's `[groups, depth, width]`, in the depths' own
+        order: each an E2M1 value, or its 4-bit code as a uint8 nibble, its sign bit 3), its block scales
+        `scales` (`[..., depth / 16, width]` float8_e4m3fn) and its tensor scale `scale` (one a matrix): a
+        checkpoint's NVFP4 weight, its codes packed in the staged order, K-major. NumPy codes, scales and
+        scale give a NumPy matrix (packed on the host, nothing copied to a device: a load places each
+        expert shard's itself)."""
         depth = codes.shape[-2]
         if depth % NVFP4_STAGE:
             raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_STAGE}s, not {depth}")
-        words = jax.vmap(_staged_words)(codes) if codes.ndim == 3 else _staged_words(codes)
-        return cls(jnp.swapaxes(words, -1, -2), jnp.swapaxes(scales, -1, -2), jnp.asarray(scale, jnp.float32))
+        host = isinstance(codes, np.ndarray) and isinstance(scales, np.ndarray)
+        xp = np if host and not isinstance(scale, jax.Array) else jnp
+        words = _staged_words(codes, xp)
+        return cls(xp.swapaxes(words, -1, -2), xp.swapaxes(scales, -1, -2), xp.asarray(scale, xp.float32))
 
     def codes(self) -> jax.Array:
         """Its codes' values (`[..., depth, width]` float32, each code's E2M1 value) in the depths' own
@@ -332,11 +336,18 @@ def _codes(words: jax.Array, *, staged: bool = False) -> jax.Array:
     return codes[np.argsort(staged_rows(codes.shape[0]))] if staged else codes
 
 
-def _staged_words(codes: jax.Array) -> jax.Array:
-    """`codes` (values, `[depth, width]`, in the depths' own order) packed in the staged order (`NvFp4`)."""
-    ordered = codes[staged_rows(codes.shape[0])]
-    bits_ = jax.lax.bitcast_convert_type(ordered.astype(jnp.float32), jnp.uint32)
-    return bits.packed(bits.encoded(bits_, bits.E2M1).T, bits.E2M1).T
+def _staged_words(codes, xp=jnp):
+    """`codes` (`[..., depth, width]` in the depths' own order: E2M1 values, or uint8 nibbles, the codes
+    themselves) packed in the staged order (`NvFp4`), uint32 `[..., depth / 8, width]`, by `xp`'s arrays
+    (NumPy's on the host)."""
+    ordered = codes[..., staged_rows(codes.shape[-2]), :]
+    if xp.dtype(ordered.dtype) == xp.dtype(xp.uint8):
+        nibbles = ordered.astype(xp.uint32)
+    else:
+        fp32 = ordered.astype(xp.float32)
+        words = fp32.view(np.uint32) if xp is np else jax.lax.bitcast_convert_type(fp32, jnp.uint32)
+        nibbles = bits.encoded(words, bits.E2M1, xp)
+    return xp.swapaxes(bits.packed(xp.swapaxes(nibbles, -1, -2), bits.E2M1, xp), -1, -2)
 
 
 NVFP4_ROW = 'ledger 3621'

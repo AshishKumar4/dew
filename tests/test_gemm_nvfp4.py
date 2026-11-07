@@ -191,3 +191,18 @@ def test_an_nvfp4_banks_packed_grouped_product_is_its_decoded_banks_product(gene
     for group, (first, last) in enumerate(itertools.pairwise(starts)):
         truth[first:last] = np.asarray(rows[first:last], np.float64) @ values[group]
     np.testing.assert_array_equal(np.asarray(got, np.float64), truth)
+
+
+def test_an_nvfp4_bank_packs_its_nibbles_on_the_host_as_its_values():
+    """A bank's codes given as uint8 nibbles in NumPy (row 4516: a checkpoint's E2M1 codes, never floats)
+    pack on the host, `gemm.NvFp4.of` returning NumPy words, scales and scale, bitwise the words of the
+    same codes given as their E2M1 values on the device."""
+    rng = np.random.default_rng(13)
+    nibbles = rng.integers(0, 16, size=(2, 256, 64)).astype(np.uint8)
+    scales = np.exp2(rng.integers(-3, 4, size=(2, 16, 64))).astype(jnp.float8_e4m3fn)
+    scale = np.asarray([0.5, 0.25], np.float32)
+    host = gemm.NvFp4.of(nibbles, scales, scale)
+    assert all(isinstance(field, np.ndarray) for field in (host.words, host.scales, host.scale))
+    values = np.where(nibbles >= 8, -1.0, 1.0) * np.asarray(E2M1)[nibbles & 7]
+    device = gemm.NvFp4.of(jnp.asarray(values, jnp.float32), jnp.asarray(scales), jnp.asarray(scale))
+    np.testing.assert_array_equal(host.words, np.asarray(device.words))
