@@ -6,6 +6,7 @@ rounding of a boundary picks other keys, units or experts in other runs, a diffe
 bounds (docs/design/testing.md asks a stated margin of such a draw)."""
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
