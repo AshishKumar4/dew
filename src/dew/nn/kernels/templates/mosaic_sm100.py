@@ -343,15 +343,19 @@ class CommittedRing(mosaic.Ring):
         plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
 
 
-SCALES = jnp.dtype(jnp.float8_e8m0fnu)
-"""A block-scale stream's dtype (`Tcgen05Rings.streams`): an MX product's E8M0 scales, tiled in shared memory
-as `tcgen05.scales_layout` lays them out, `[rows / 128, depth / 128, 32, 16]` a step's block."""
+BLOCK_SCALED_COLUMNS = 128
+"""The columns of one block-scale tile's rows (`SCALE_TILE`): a block-scaled product's tile is whole 128s."""
+
+SCALE_TILE = (32, 16)
+"""A block-scale stream's tile (`Tcgen05Rings.streams`): a block-scaled product's scales (an MX product's
+E8M0, an NVFP4 one's E4M3), tiled in shared memory as `tcgen05.scales_layout` lays them out, `[rows / 128,
+scale tiles, 32, 16]` a step's block, four scales of each of 128 rows a tile."""
 
 
 @dataclasses.dataclass(frozen=True)
 class ScaleRing(CommittedRing):
-    """A block-scale stream's ring (`SCALES`): each slot's shared-memory tiles paired with the tensor memory
-    its products read them from (`Tcgen05Issuer.scaled_products`), a slot's columns of `tmem`. A slot's
+    """A block-scale stream's ring (`SCALE_TILE`): each slot's shared-memory tiles paired with the tensor
+    memory its products read them from (`Tcgen05Issuer.scaled_products`), a slot's columns of `tmem`. A slot's
     scales are copied to its tensor memory by the product warp before its products (tcgen05.cp then
     tcgen05.mma, pipelined in issue order: PTX ISA 9.7.18.6.2), and again only once its products' commit has
     released the slot and the producer refilled it, so no copy overwrites scales a product still reads."""
@@ -549,6 +553,11 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
     the other."""
 
+    def column_unit(self, dtype) -> int:
+        # A packed 4-bit operand's swizzled row spans 256 of them along its depth (K-major, as tcgen05 reads
+        # E2M1), not along a tile's columns: the columns step by the 128 its block scales' tiles take.
+        return min(super().column_unit(dtype), BLOCK_SCALED_COLUMNS)
+
     def tensor_columns(self, columns: int, accumulators: int) -> int:
         # Each turn holds every accumulator of a tile (`persist`).
         return self.turns * columns * accumulators
@@ -567,8 +576,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         # A block-scale stream's slots each pair with the tensor memory its products read them from: its
         # block's rows (`[rows / 128, depth / 128, 32, 16]`) by its depth's scales, a slot's columns each.
         for name, (shape, dtype) in blocks.items():
-            if jnp.dtype(dtype) == SCALES:
-                streams[name]['tmem'] = plgpu.TMEM((shape[0] * 128, stages * shape[1] * 4), SCALES,
+            if tuple(shape[-2:]) == SCALE_TILE:
+                streams[name]['tmem'] = plgpu.TMEM((shape[0] * 128, stages * shape[1] * 4), dtype,
                                                    layout=plgpu.TMEMLayout.SCALES_LAYOUT)
         return streams
 
