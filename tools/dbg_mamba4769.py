@@ -17,6 +17,8 @@ name='AntonV/mamba2-130m-hf';rev='05e8773fc4ac1cd067e8a18a5c45372ce5178405'
 torch.set_num_threads(2)
 jax.config.update('jax_enable_x64',True)
 mode=sys.argv[1]
+direct=mode.endswith('_direct')
+if direct:mode=mode[:-7]
 if mode=='source':
  for obj in [getattr(mm.Mamba2Mixer,'torch_forward',mm.Mamba2Mixer.forward),mm.mamba2_chunk_scan,mm.segment_sum]:
   print('K SOURCE',obj.__name__,inspect.getfile(obj),flush=True)
@@ -35,19 +37,45 @@ def emit(label,a,b,t):
  a=np.asarray(a);b=np.asarray(b);t=np.asarray(t)
  ea,eb=rms(a-t),rms(b-t)
  print('K ERROR',label,'dew',ea,'torch',eb,'ratio',ea/eb if eb else 0,'maxdelta',np.max(np.abs(a-b)),flush=True)
-if mode in ('control','fixed'):
+if mode in ('control','fixed','control_dyn','dense4','densewide','denseplain','wide_cpu'):
+ if mode=='wide_cpu':
+  from dew.nn import precision
+  os.environ[precision.WIDE_CPU_ARITHMETIC]='1'
+ if mode in ('dense4','densewide','denseplain'):
+  import dew.nn.mixers.mamba2 as dm
+  original_dot=dm.float32_dot_general
+  def altered(lhs,rhs,dimension_numbers,precision=None,preferred_element_type=None,**kwargs):
+   if mode=='denseplain':return original_dot(lhs,rhs,dimension_numbers,precision=precision,preferred_element_type=preferred_element_type,**kwargs)
+   ((lc,rc),(lb,rb))=dimension_numbers
+   if mode=='densewide':
+    return jax.lax.dot_general(lhs.astype(jnp.float64),rhs.astype(jnp.float64),dimension_numbers,precision=precision,**kwargs).astype(jnp.result_type(lhs,rhs))
+   assert len(lc)==len(rc)==1
+   ll=jnp.split(lhs,4,axis=lc[0]);rr=jnp.split(rhs,4,axis=rc[0])
+   terms=[jax.lax.dot_general(a,b,dimension_numbers,precision=precision,**kwargs) for a,b in zip(ll,rr)]
+   return (terms[0]+terms[1])+(terms[2]+terms[3])
+  dm.float32_dot_general=altered
  if mode=='fixed':
   import dew.nn.kernels.recurrence_algebra as ra
   from dew.algebra import forms
   print('K FORMS',forms,flush=True)
- loaded=Pretrained.load(name,revision=rev,dtype='float32',param_dtype='float32',attention_impl='xla')
- run=jax.jit(lambda x:loaded.model.apply(loaded.variables,x))
+ print('K LOAD_START',time.time(),flush=True)
+ if direct:
+  from types import SimpleNamespace
+  from dew.interop import mamba2 as adapter
+  from dew.interop.hf_decoders import translate_weights
+  config=adapter.config_from_hf(source.config.to_dict())
+  model=config.value.clone(dtype=jnp.float32,attention_impl='xla')
+  variables=translate_weights({k:v.detach().numpy() for k,v in source.state_dict().items()},config,'mamba2')
+  loaded=SimpleNamespace(model=model,variables=variables)
+ else:loaded=Pretrained.load(name,revision=rev,dtype='float32',param_dtype='float32',attention_impl='xla')
+ print('K LOAD_DONE',time.time(),flush=True)
+ run=jax.jit(loaded.model.apply)
  for seed in range(16):
   drawn=np.random.default_rng([242,seed]).choice(tokens,size=ids.shape).astype(np.int32)
   with torch.no_grad():
    b=source(torch.from_numpy(drawn.astype(np.int64)),use_cache=False).logits.numpy()
    with float64():t=twin(torch.from_numpy(drawn.astype(np.int64)),use_cache=False).logits.numpy()
-  a=np.asarray(run(jnp.asarray(drawn)))
+  a=np.asarray(run(loaded.variables,jnp.asarray(drawn)))
   emit(str(seed),a,b,t)
  sys.exit()
 if mode=='layers' or mode.startswith('stages'):
@@ -64,7 +92,7 @@ if mode=='layers' or mode.startswith('stages'):
  model=Mamba2(emb_features=cfg.hidden_size,num_heads=cfg.num_heads,head_dim=cfg.head_dim,state_size=cfg.state_size,n_groups=cfg.n_groups,conv_kernel=cfg.conv_kernel,chunk_size=cfg.chunk_size,use_bias=cfg.use_bias,use_conv_bias=cfg.use_conv_bias,norm_eps=cfg.layer_norm_epsilon,dtype=jnp.float32)
  run=jax.jit(model.apply)
  for i,l in enumerate(source.backbone.layers):
-  if mode.startswith('stages') and i!=int(mode.split(':')[1]):continue
+  if mode.startswith('stages') and mode.split(':')[1]!='all' and i!=int(mode.split(':')[1]):continue
   x,t=saved[i]
   with torch.no_grad():b=getattr(l.mixer,'torch_forward',l.mixer.forward)(torch.from_numpy(x.astype(np.float32))).numpy()
   p=mamba2_layer_params({k:v.detach().numpy() for k,v in l.mixer.state_dict().items()})
@@ -84,6 +112,33 @@ if mode=='layers' or mode.startswith('stages'):
     tx=torch.from_numpy(x)
     pt=wide.in_proj(tx);pn=narrow.in_proj(ta(x))
     emit('in_proj',dwmethod(lambda m,z:m.in_proj(z),tx),pn.numpy(),pt.numpy())
+    def dots(label,inp,weight,truth,reference):
+     xx=ja(inp);ww=ja(weight).T
+     rounded_truth=np.asarray(xx,dtype=np.float64)@np.asarray(ww,dtype=np.float64)
+     for blocks in (1,2,4,8,16,32):
+      def product(x,w):
+       xs=jnp.split(x,blocks,axis=-1);ws=jnp.split(w,blocks,axis=0)
+       terms=[jnp.matmul(a,b,precision=jax.lax.Precision.HIGHEST) for a,b in zip(xs,ws)]
+       while len(terms)>1:terms=[a+b for a,b in zip(terms[::2],terms[1::2])]
+       return terms[0]
+      out=np.asarray(jax.jit(product)(xx,ww))
+      emit(label+'-blocks-'+str(blocks),out,reference,truth)
+      print('K DOTINTRINSIC',label,blocks,rms(out-rounded_truth),rms(reference-rounded_truth),flush=True)
+     if label=='in_proj' and jax.default_backend()=='cpu':
+      for chains in (1,2,4,8):
+       def accumulated(x,w):
+        xx=jnp.moveaxis(x,-1,0).reshape(-1,chains,*x.shape[:-1])
+        ww=w.reshape(-1,chains,w.shape[-1])
+        def one(acc,parts):
+         v,k=parts
+         return acc+v[...,None]*k[:,None,None,:],None
+        final,_=jax.lax.scan(one,jnp.zeros((chains,*x.shape[:-1],w.shape[-1]),jnp.float32),(xx,ww))
+        while final.shape[0]>1:final=final[::2]+final[1::2]
+        return final[0]
+       got=np.asarray(jax.jit(accumulated)(xx,ww))
+       base=np.asarray(jax.jit(lambda x,w:x@w)(xx,ww))
+       print('K DOTCHAINS',chains,'native-delta',rms(got-base),'equal',np.mean(got==base),'error',rms(got-rounded_truth),flush=True)
+    dots('in_proj',tx,narrow.in_proj.weight,pt.numpy(),pn.numpy())
     gate,mixed,raw=pt.split([wide.intermediate_size,wide.conv_dim,wide.num_heads],dim=-1)
     ct=F.silu(wide.conv1d(mixed.transpose(1,2))[:,:,:mixed.shape[1]]).transpose(1,2)
     cn=F.silu(narrow.conv1d(ta(mixed.numpy()).transpose(1,2))[:,:,:mixed.shape[1]]).transpose(1,2)
@@ -115,6 +170,19 @@ if mode=='layers' or mode.startswith('stages'):
     xa,dta,aaa,ba,cca,dda=(ja(v) for v in (xt,dt,at,bt,ctt,wide.D))
     ya,fa=jax.jit(lambda *v:chunk_ssd(*v,chunk_size=wide.chunk_size))(xa,dta,aaa,ba,cca,dda)
     emit('SSD-output',ya,yn.numpy(),yt.numpy());emit('SSD-final',fa,fn.numpy(),ft.numpy())
+    print('K SSD_ROUTE',rc.scan_kernel(cca,ba,xa,aaa*dta,dta,chunk_size=wide.chunk_size),flush=True)
+    if jax.default_backend()=='gpu':
+     from dew.nn.mixers.mamba2 import recurrent_ssd
+     ryo,ryf=jax.jit(recurrent_ssd)(xa,dta,aaa,ba,cca,dda)
+     emit('SSD-recurrent-output',ryo,yn.numpy(),yt.numpy())
+     for size in (16,32,64,128):
+      sy,sf=jax.jit(lambda *v:chunk_ssd(*v,chunk_size=size))(xa,dta,aaa,ba,cca,dda)
+      emit('SSD-chunk-'+str(size),sy,yn.numpy(),yt.numpy())
+     if hasattr(rc,'chunk_delta_rule'):
+      heads=wide.num_heads//wide.n_groups
+      pyo,pyf=jax.jit(lambda q,k,v,g,b:rc.chunk_delta_rule(q,k,v,g[...,None],b,None,wide.chunk_size,delta=False,scale=1.0,dtype=jnp.float32))(jnp.repeat(cca,heads,axis=2),jnp.repeat(ba,heads,axis=2),xa,aaa*dta,dta)
+      pyo=pyo+xa*dda[...,None]
+      emit('SSD-portable-output',pyo,yn.numpy(),yt.numpy())
     ng=wide.num_heads//wide.n_groups
     bb,cc=(jnp.repeat(v,ng,axis=2) for v in (ba,cca))
     if hasattr(rc,'chunked'):
@@ -137,4 +205,5 @@ if mode=='layers' or mode.startswith('stages'):
     ot=wide.out_proj(gt);on=narrow.out_proj(ta(gt.numpy()))
     oa=dwmethod(lambda m,z:m.out_proj(z),gt)
     emit('out_proj',oa,on.numpy(),ot.numpy())
+    dots('out_proj',gt,narrow.out_proj.weight,ot.numpy(),on.numpy())
  print('K DONE',flush=True)
