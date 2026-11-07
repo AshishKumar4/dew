@@ -398,7 +398,8 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     at least fp32 and scales them after the product, as DeepSeek V4 does
     (modeling_deepseek_v4.py:708-736); the value product stays in the inputs'
     dtype. `scale_logits` forms the logits of the query and keys in their own
-    dtype as fp32 (the product's preferred type) and scales them after it, by
+    dtype as fp32 (the product's preferred type, at the dot algorithm jax.nn
+    names for 16-bit operands, `_jax_nn_algorithm`) and scales them after it, by
     `D ** -0.5` in fp32, the mask and softmax reading them in fp32: jax.nn's xla
     form (`jax.nn.dot_product_attention`) and the fused kernels' own, where
     flax's scales the query before the product and rounds its logits to its
@@ -418,22 +419,27 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         scaled_query, scoring = query, key
     else:
         scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
-    # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype.
+    # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype, at the dot algorithm
+    # it names (`_jax_nn_algorithm`).
     formed = at_least_fp32(dtype) if scale_logits else None
+    algorithm = _jax_nn_algorithm(dtype, precision) if scale_logits else None
+
+    def logits_of(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+        if algorithm is None:
+            return float32_einsum(subscripts, lhs, rhs, precision=precision, preferred_element_type=formed)
+        return jnp.einsum(subscripts, lhs, rhs, precision=algorithm, preferred_element_type=formed)
+
     if sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
-        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision,
-                                preferred_element_type=formed)
+        logits = logits_of('...qhd,...khd->...hqk', scaled_query, scoring)
     elif kv_heads == 1:
         # One key/value head (DeepSeek V4's): the query heads are a free dim beside the rows, and no
         # size-one head axis rides as a batch dim, which had XLA transpose the fp32 query for the
         # product (a V4 layer's training step on an H100, batch 4 by 2048: 2 GiB more and 5% slower).
-        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision,
-                                preferred_element_type=formed)
+        logits = logits_of('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :])
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision,
-                                preferred_element_type=formed).reshape(*rows, heads, length, keys)
+        logits = logits_of('...tkgd,...skd->...kgts', grouped, scoring).reshape(*rows, heads, length, keys)
     if wide_logits or scale_logits:
         logits = logits * width ** -0.5
     if softcap is not None:
@@ -475,6 +481,23 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
     return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
+
+
+def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
+    """The dot algorithm jax.nn's xla attention names for its logits' product
+    (`_dot_product_attention_core`), which the reference's jax.nn form
+    (`scale_logits`) declares as jax.nn does: a 16-bit operand's own product
+    with fp32 sums (bf16's `BF16_BF16_F32`, fp16's `F16_F16_F32`) where the
+    call states no precision above the default and the device runs it (a GPU
+    from `BF16_GPU` on for bf16, `bf16_dot_runs`; no TPU for fp16); None
+    otherwise, the call's own precision taking the product."""
+    if not asks_default_precision(precision):
+        return None
+    if dtype == jnp.bfloat16 and bf16_dot_runs():
+        return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    if dtype == jnp.float16 and generation.backend() != 'tpu':
+        return jax.lax.DotAlgorithmPreset.F16_F16_F32
+    return None
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
