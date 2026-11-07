@@ -166,12 +166,22 @@ class _Graph:
             eqn = self.jaxpr.eqns[place]
             inputs = [self.constant(var) for var in eqn.invars]
             if not eqn.effects and all(value is not None for value in inputs):
-                with jax.ensure_compile_time_eval():
-                    made = eqn.primitive.bind(*inputs, **eqn.params)
-                made = made if eqn.primitive.multiple_results else [made]
-                value = np.asarray(made[eqn.outvars.index(atom)])
+                value = _evaluated(eqn, inputs, eqn.outvars.index(atom))
         self._constants[atom] = value
         return value
+
+
+def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int):
+    """`eqn`'s output `index` over concrete `inputs`, evaluated on this host's CPU (a compile-only mesh's
+    devices run nothing); None where the host evaluates it to no value (no CPU backend, or the primitive has
+    no rule there), so a region whose mask is not read keeps its program's own math."""
+    try:
+        cpu = jax.devices("cpu")[0]
+        with jax.ensure_compile_time_eval(), jax.default_device(cpu):
+            made = eqn.primitive.bind(*inputs, **eqn.params)
+        return np.asarray((made if eqn.primitive.multiple_results else [made])[index])
+    except (RuntimeError, ValueError, TypeError, AttributeError, NotImplementedError):
+        return None
 
 
 def _matched(graph: _Graph, exp_place: int) -> Attention | None:
