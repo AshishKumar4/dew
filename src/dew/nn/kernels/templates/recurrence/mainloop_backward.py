@@ -481,15 +481,17 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
         before_store = walk_stores(family, width // call.block + 1)
 
         def step(role):
-            (staged, (second,)), lands = roled(role)
+            (*staged, (second,)), lands = roled(role)
+            # A key slice's memory operand and, where a chunk is wider than a key slice, the chunk's apart.
+            sliced, chunked = staged[0], staged[-1]
             # The decayed output gradient fp32 as two parts against the queries (fla's split product, 16 of
             # its significand's bits): one part put the initial memory's gradient 5 to 7 times the port's
             # distance from float64. Its first part reuses the memory products' tile, each consumed before
             # the next stages; an fp32 call's two parts are the memory products' own (a third took the
             # product's parts apart, each its own accumulator: 277 values live at the walk's peak against a
             # 16-bit call's 133, 100 bytes spilled on an H100, back-need at 5cec06bd8).
-            issue = Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
-                                   "reads": staged if len(staged) > 1 else (*staged, second)})
+            issue = Issuer(call, {"values_dv": sliced, "weights_dv": chunked,
+                                   "reads": chunked if len(chunked) > 1 else (*chunked, second)})
             return functools.partial(_reverse_step, lands, issue, walked + role * bv, pl.ds(role * bv, bv))
 
         def _reverse_step(lands, issue, column, columns, f, slots, grad, accumulators):
@@ -534,7 +536,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2), work=work,
                          held=_reverse_held(call, bv, gates=gates, skips=skips), consumers=walkers,
                          live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
-                         staging=(*staging_tiles(held, (call.block, bv)),
+                         staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
                                   (plgpu.SMEM((chunk, bv), held.stored),)),
                          once=finals,
                          landing={**memory_landing(call, bv), "corrected": grads.landing(chunk, bv),
