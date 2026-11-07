@@ -25,7 +25,11 @@ from reference_error import as_given, assert_as_exact, assert_rounds_where_the_r
 from reference_runs import assert_as_exact_as_recorded
 from tool_support import run_from
 
-from dew.interop.towers.mimo_audio import translate_mimo_audio_config, translate_mimo_audio_weights
+from dew.interop.towers.mimo_audio import (
+    tokenizer_mel,
+    translate_mimo_audio_config,
+    translate_mimo_audio_weights,
+)
 from dew.nn.mimo_audio import AudioTokenizerEncoder, MiMoAudioCodeEncoder, MiMoAudioTokenizer, batch_longest
 from dew.nn.norms import RMSNorm
 from dew.nn.quantizers import residual_quantize
@@ -58,8 +62,9 @@ def mel_draw(seed: int) -> dict[str, np.ndarray]:
 
 
 def mel_frames(_, inputs) -> dict:
-    """MiMo's log mel frames of a draw's waveform (`MiMoAudioTokenizer.mel`), float32 on the host."""
-    return {"mel": MiMoAudioTokenizer().mel()(inputs["waveform"])}
+    """MiMo's log mel frames of a draw's waveform (`dew.interop.towers.mimo_audio.tokenizer_mel`), float32 on
+    the host."""
+    return {"mel": tokenizer_mel(MiMoAudioTokenizer())(inputs["waveform"])}
 
 
 def pipeline_arms(_):

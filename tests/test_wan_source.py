@@ -46,9 +46,9 @@ from interop_support import (
 from one_draw import assert_as_exact_as_the_reference, assert_no_less_exact
 from reference_error import widened
 
-from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, read_transformer, wan_fields, wan_path
 from dew.nn.backbones.wan import WanTransformer
+from dew.nn.inputs import DenoisingCondition
 from dew.objectives.diffusion import DiffusionObjective
 
 ROOT = Path(__file__).resolve().parents[1]
