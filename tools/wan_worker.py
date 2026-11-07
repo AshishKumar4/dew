@@ -1,5 +1,6 @@
-"""Diffusers' own `WanTransformer3DModel` (Diffusers 0.34.0, the cohort tests/fixtures/wan_transformer.tar.xz
-was saved by, tools/diffusers_wan_reference.py) run on drawn latents, prompt states and cotangents: the
+"""Diffusers' own `WanTransformer3DModel` (the test extra's release, the cohort
+tests/fixtures/wan_transformer.tar.xz was saved by, tools/diffusers_wan_reference.py) run on drawn latents,
+prompt states and cotangents: the
 reference arm of tools/venv_reference.py's `wan-<case>` and `wan-bf16-<case>` sites (its protocol
 tools/reference_worker.py), run in an environment of that Diffusers and torch, on the CPU.
 
