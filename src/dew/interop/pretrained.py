@@ -404,21 +404,23 @@ class Pretrained:
             # cross-attention is its source's extension, which no family writes: the bundle is its
             # source's, carrying the run's model, as `with_cross_attention` attaches it, and `save`
             # refuses it.
-            decoder = model if isinstance(model, MediaWrapper) else from_record(CausalTransformer, model)
-            crossing = isinstance(decoder, CausalTransformer) and decoder.cross_attention is not None
             generation = (masked_generation_config(budget, None, held.eos_token_ids)
                           if isinstance(held, MaskedSettings) else
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
-            bundle = replace(PretrainedDecoder.from_model(
-                decoder.with_cross_attention(None) if crossing else decoder, variables, tokenizer=tokenizer,
-                generation_config=generation), processor=processor)
-            if crossing:
-                bundle = replace(bundle, model=decoder)
+            if isinstance(model, MediaWrapper):
+                bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
+                                                      generation_config=generation)
+            else:
+                decoder = from_record(CausalTransformer, model)
+                source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
+                                                      tokenizer=tokenizer, generation_config=generation)
+                bundle = replace(source, model=decoder)
+            bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
                 bundle = PretrainedMaskedDecoder(
-                    from_record(CausalTransformer, decoder), bundle.variables, bundle.processor,
+                    from_record(CausalTransformer, model), bundle.variables, bundle.processor,
                     bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
