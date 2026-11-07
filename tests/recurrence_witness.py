@@ -1,9 +1,9 @@
 """Check 2's native step witness for the recurrence template (row 2084, link 3): each record its launches
 store between them, held inside its launch step's enclosure on the native records that step reads.
 
-The template's launches already store a chunk's inverse less its unit diagonal `a`, its weighted keys `w`
-(the solve), the memory it enters `h`, its corrected values `c` (the states), and its output `o` (the
-output); `mainloop.kept_forward` returns them (`recorded`). For the gated delta rule with a decay a head, each
+The template's launches already store a chunk's inverse less its unit diagonal `a`, its weighted keys `w` (the
+solve), the memory it enters `h`, its corrected values `c` (the states), and its output `o` (the output);
+`chunk_forward.kept_forward` returns them (`recorded`). For the gated delta rule with a decay a head, each
 chunk and head (`chunk_step`):
 
 1. `a` from the keys, write gates and log decays: the system `tril(beta (k k^T) exp2(g_s - g_t))`, inverted by
@@ -53,7 +53,7 @@ from op_certificates import (
 
 from dew.nn.kernels import recurrence_algebra
 from dew.nn.kernels.templates import bundles
-from dew.nn.kernels.templates.recurrence import mainloop
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop
 
 CHUNK = mainloop.CHUNK
 LOG2E = recurrence_algebra.LOG2_E
@@ -759,23 +759,23 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
              floor: float | None = None, carried: bool = True, delta: bool = True,
              rounded: bool | None = None, walked: bool = False) -> Run:
     """The records of the gated delta rule's training call on the template, forced (`generation.chosen`) at
-    JAX's own default precision as a model trains it: `mainloop.kept_forward` at the tiles the route takes
-    (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
+    JAX's own default precision as a model trains it: `chunk_forward.kept_forward` at the tiles the route
+    takes (`tuning.seen`), its output and final memory bit for bit the route's training forward's (the certify
     build is the production program), on the device's bundle, interpreted off a GPU. A call no gradient
     follows runs another program, its states and output in one walk that never stores the states it reads
-    (`mainloop.forward`), which this witness does not hold. Operands `[1, T, ...]`. With
-    `carried`, each chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to
-    it, whose final memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`,
-    each chunk's: end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's
-    documents (`starts` `[1, T]`) lay their own chunks (`laid_chunks`), a document beginning inside a chunk
-    included, its first chunk entering the zero memory. Without the `delta` rule, the template's op as the
-    SSD's route calls it (`recurrence_chunk.template_rule`, scale 1, its output in the operands' dtype),
-    `rounded` as the route's fast forms round it unless given (a 16-bit call's keys then take the write
-    gate, `mainloop.Call.gated_keys`; unrounded, Lightning's, its values held in parts). An fp32 call's
-    operands and passed values are held in parts as the mainloop holds them (`Lane.held`, `Lane.given`),
-    each record their sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay
-    a head runs its fused walk (`mainloop._scan`, `kept_forward` keeping nothing), whose records are its
-    inverse, output and final memory (`WALKED`)."""
+    (`chunk_forward.forward`), which this witness does not hold. Operands `[1, T, ...]`. With `carried`, each
+    chunk's fp32 memory leaving it: the same launches at the same tiles over the chunks up to it, whose final
+    memory, rounded as the launch stores `h`, is the next chunk's `h` bit for bit (`seams`, each chunk's:
+    end_j == start_{j+1}); without, the initial and the final memories alone. A packed call's documents
+    (`starts` `[1, T]`) lay their own chunks (`laid_chunks`), a document beginning inside a chunk included,
+    its first chunk entering the zero memory. Without the `delta` rule, the template's op as the SSD's route
+    calls it (`recurrence_chunk.template_rule`, scale 1, its output in the operands' dtype), `rounded` as the
+    route's fast forms round it unless given (a 16-bit call's keys then take the write gate,
+    `mainloop.Call.gated_keys`; unrounded, Lightning's, its values held in parts). An fp32 call's operands and
+    passed values are held in parts as the mainloop holds them (`Lane.held`, `Lane.given`), each record their
+    sum. `walked`, the inference forward no gradient follows: a 16-bit call's under a decay a head runs its
+    fused walk (`mainloop._scan`, `kept_forward` keeping nothing), whose records are its inverse, output and
+    final memory (`WALKED`)."""
     import jax
     import jax.numpy as jnp
 
@@ -793,7 +793,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     if rounded is None:
         rounded = recurrence_chunk.chunk_rounding(delta, dtype) if delta else recurrence_chunk.fast_rounding()
     family = mainloop.family_of(dtype) or bundles.INTERPRETED
-    # The parts its operands and passed values take (`mainloop.prepared`'s `given` and `held`): one of a
+    # The parts its operands and passed values take (`chunk_forward.prepared`'s `given` and `held`): one of a
     # 16-bit value; an fp32 one's three, or under the fast forms its family's (`mainloop._fast_parts`).
     wide = jnp.dtype(dtype) == jnp.float32
     fast = 1 if family.takes_tf32 and family.transposes_tf32 else mainloop.FAST_PARTS
@@ -818,7 +818,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x, starts=starts):
-            return jax.jit(lambda *x: mainloop.kept_forward(
+            return jax.jit(lambda *x: chunk_forward.kept_forward(
                 *x, tiles=tiles, starts=starts, max_segments=max_segments, floor=floor, scale=scale,
                 delta=delta, rounded=rounded, family=family, keeps=not walked,
                 interpret=generation.backend() != "gpu"))(*x)
@@ -1413,7 +1413,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x):
-            _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
+            _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
                                                          delta=delta, family=family, interpret=interpret)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
                                                            rounded=rounded, delta=delta, family=family,
@@ -1650,7 +1650,7 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
                    if isinstance(op, template.Mosaic)]
 
         def kept(*x):
-            _, _, (inverse, held) = mainloop.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
+            _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
                                                          floor=FLOOR, family=family, interpret=interpret)
             grads, saved = mainloop_backward.kept_backward(
                 *x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded, floor=FLOOR, family=family,

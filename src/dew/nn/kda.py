@@ -271,7 +271,8 @@ class KimiDeltaAttention(nn.Module):
         `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them."""
         hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid'))
         return fused_token(hooks, taps,
-                           heads=(self.num_heads,) * 3, widths=(self.head_dim,) * 3,
+                           heads=(self.num_heads, self.num_heads, self.num_heads),
+                           widths=(self.head_dim, self.head_dim, self.head_dim),
                            per_row={'log_decay': g[:, 0], 'beta': beta[:, 0], 'z': gate[:, 0]}, per_head={},
                            weight=lambda: self.o_norm.variables['params']['weight'], valid=valid,
                            dtype=self.o_norm.dtype, starts=starts)

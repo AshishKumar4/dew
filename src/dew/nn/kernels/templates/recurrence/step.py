@@ -181,8 +181,8 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
             keyed = [convolved[1 + 2 * p:3 + 2 * p] for p in range(block.heads)]
             # The block's heads' values, a thread a channel as the block lays them (`_Block.layout`).
             value = convolved[0].reshape(block.heads, block.columns)
-        writes = [_staged(hooks, inputs, token, p, *keyed[p], vectors, exchanged, interpret=interpret)
-                  for p in range(block.heads)]
+        writes = [_staged(hooks, inputs, token, p, keyed[p][0], keyed[p][1], vectors, exchanged,
+                          interpret=interpret) for p in range(block.heads)]
         mosaic.synced(interpret)
         out = _stepped(hooks, state_ref, state_out, value, vectors, token.per_head(writes), token)
         out = _epilogue(hooks, inputs, token, out, value, exchanged, interpret=interpret)
@@ -221,7 +221,7 @@ class _Conv:
     value head."""
 
     inputs: dict
-    moved: object
+    moved: jax.Ref
     token: _Token
     conv: recurrence.Conv
     key_heads: int
@@ -304,11 +304,8 @@ def _staged(hooks, inputs, token: _Token, index: int, query, key, vectors, excha
     key_width = vectors.shape[2]
     layout = scan.blocked(key_width)
     if hooks.l2norm:
-        # `l2norm`'s scale, its root and quotient each rounded once (rsqrt's approximation 2 ulp off).
-        def scale(x):
-            return 1.0 / jnp.sqrt(scan.summed(x * x, exchanged, interpret=interpret) + L2NORM_EPS)
-
-        query, key = query * scale(query), key * scale(key)
+        query, key = (x * scan.inverse_norm(x, L2NORM_EPS, exchanged, interpret=interpret)
+                      for x in (query, key))
         query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
     elif hooks.scale is not None:
         query = query * hooks.scale
