@@ -17,6 +17,7 @@ import json
 import os
 import signal
 import sys
+import threading
 
 import lifetime
 import pytest
@@ -36,12 +37,22 @@ if lifetime.log is None:
 # signal ends a process that has not registered it. Taken out of the environment, so no pytest a test starts
 # writes over either.
 if stacks := os.environ.pop("DEW_STACKS", None):
-    # A Python handler, which holds the GIL while it walks every thread: faulthandler's native one walks the
-    # other threads' frames as they change and killed the process mid-dump (CPython issue 116008; 2026-11-07,
-    # a group of interpreted kernels past its deadline died of a segmentation fault with no report).
+    # A thread of its own takes the signal (`sigwait`) and walks every thread holding the GIL, so no frame
+    # changes under it: faulthandler's native handler walked them without it and killed the process mid-dump
+    # (CPython issue 116008; 2026-11-07, a group of interpreted kernels past its deadline died of a
+    # segmentation fault with no report), and a Python handler runs only once the main thread is back in the
+    # interpreter, which a stall in native code (an XLA compile, a wait on a device, a collective) never is
+    # (row 4828). The signal is blocked here, before this pytest starts any other thread, so every thread
+    # after inherits the block and the signal waits for the dumping thread alone.
     written = os.open(stacks, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    signal.signal(signal.SIGUSR2,
-                  lambda signum, frame: faulthandler.dump_traceback(written, all_threads=True))
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR2})
+
+    def dumping() -> None:
+        while True:
+            signal.sigwait({signal.SIGUSR2})
+            faulthandler.dump_traceback(written, all_threads=True)
+
+    threading.Thread(target=dumping, name="deadline-stacks", daemon=True).start()
     with open(f"{stacks}.part", "w") as pid:
         pid.write(str(os.getpid()))
     os.replace(f"{stacks}.part", f"{stacks}.pid")
