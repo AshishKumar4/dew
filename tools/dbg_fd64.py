@@ -36,9 +36,16 @@ def arrays(state):
     return result
 ra,da = arrays(refstate),arrays(dewstate)
 for k in ra:
+    if k not in ("", "embed", "embed/patch_embed", "conditioning", "conditioning/time_embed",
+                 "conditioning/time_embed/layers_0", "conditioning/time_embed/layers_1",
+                 "conditioning/text_context_proj", "dit_block_0"):
+        continue
     if k in da and ra[k].shape == da[k].shape:
         a,b = np.asarray(ra[k]),np.asarray(da[k])
         print("K INTER",k,a.dtype,b.dtype,"rms",float(np.sqrt(np.mean((a-b)**2))),"rel",float(np.linalg.norm(a-b)/np.linalg.norm(a)))
+    elif k == "conditioning/text_context_proj":
+        a,b=np.mean(np.asarray(ra[k]),axis=1),np.asarray(da[k])
+        print("K TEXT_POOLED",float(np.sqrt(np.mean((a-b)**2))),float(np.linalg.norm(a-b)/np.linalg.norm(a)))
     else: print("K UNMATCHED",k,ra[k].shape)
 with w.applying(case,"float64") as apply:
     ref = apply(params,{k:v for k,v in inputs.items() if not k.startswith("param.")})
@@ -46,3 +53,5 @@ ours = t.computing(case)(jnp.float64,inputs)
 for k in ours:
     a,b=np.asarray(ref[k]),np.asarray(ours[k])
     print("K FINAL",k,"rms",float(np.sqrt(np.mean((a-b)**2))),"rel",float(np.linalg.norm(a-b)/np.linalg.norm(a)))
+    if mode == "fixed":
+        assert np.linalg.norm(a-b)/np.linalg.norm(a) < 1e-14, k
