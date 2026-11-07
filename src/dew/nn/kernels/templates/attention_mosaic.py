@@ -630,7 +630,7 @@ general registers (P2R) until the selects that read them (`_anchor_registers`)."
 
 
 def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
-    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `gradient.grad_scores`)
+    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `attention_backward_algebra.softmax_cotangents`)
     across the step, from the compares that form it to the selects that read it: its predicates packed a
     bit an entry; a row pass's of them, a role's rows, pending, all but those its predicate registers hold
     (`PREDICATE_REGISTERS`); and the places it compares, the keys' column vector and the anchor keys' row

@@ -433,7 +433,7 @@ def test_a_derived_backward_masks_an_empty_querys_overflowing_product():
     """Two fp32 queries over one key, the second seeing none, the value's first component 2^127 and the second
     query's output cotangent 4 there: its product `dP` is 2^129, past fp32's largest, beside a weight of 0.
     Under the derived backward every gradient is finite, as the reference's are: the cotangents are masked
-    where a query sees no key (`softmax_cotangents`, as `grad_scores`), not multiplied by its zero weight."""
+    where a query sees no key (`softmax_cotangents`), not multiplied by its zero weight."""
     query, key, value, dout = one_key(jnp.float32, [[0.0], [0.0]], [[0.0]], [[2.0 ** 127]],
                                              [[0.0], [4.0]])
     spans = template.KeySpans(jnp.asarray([[0, 1]], jnp.int32), jnp.asarray([[1, 1]], jnp.int32), None, None,

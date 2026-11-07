@@ -145,7 +145,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
 
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,
             chosen, *, masked: bool):
-    """A backward tile's weights unnormalized and over `total`, its score cotangents (`gradient.grad_scores`)
+    """A backward tile's weights unnormalized and over `total`, its score cotangents (`attention_backward_algebra.softmax_cotangents`)
     and the score hook's slopes (`gradient.tile_logits`), from its products `s` and `dp`, its coordinates, its
     hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics, each a
     vector or a function reading it where it is used (a stream's stage, `_dkv_step`)."""

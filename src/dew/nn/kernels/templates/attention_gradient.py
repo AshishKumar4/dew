@@ -1,7 +1,7 @@
 """The attention backward's tile algebra, what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK
 and dQ) on natural logits: a tile's logits recomputed under the score hook and their derivatives
-(`tile_logits`, `scored`, `pulled`), its weights and score cotangents (`grad_scores`), each query's dQ sums
-about its anchor key (`DqSums`, `dq_step`, `dq_finish`), the anchors themselves (`off_anchor`, `centre_step`)
+(`tile_logits`, `scored`, `pulled`), its weights and score cotangents (`attention_backward_algebra.softmax_cotangents`), each query's dQ sums
+about its anchor key (`DqSums`, `dq_issued`, `dq_finish`), the anchors themselves (`off_anchor`, `centre_step`)
 and the dropout's (`dropped_products`). The forward's algebra and the products' operand parts every launch
 shares are `attention_algebra`'s; the declared backward and its derived forms
 `attention_backward_algebra`'s."""
@@ -22,7 +22,6 @@ from dew.nn.kernels.templates.attention_algebra import (
     WEIGHT_SHIFT,
     Parts,
     Recompute,
-    cotangent_product,
     expand,
     exponent,
     finite,
@@ -31,8 +30,6 @@ from dew.nn.kernels.templates.attention_algebra import (
     normalized_rows,
     power2,
     split_output,
-    summed_products,
-    value_operands,
     weights_parts,
 )
 from dew.nn.precision import Running, added_to, compensated_sum, compensates_loops, running_sum, running_total
@@ -249,7 +246,7 @@ def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift:
 class DqSums(NamedTuple):
     """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and
     QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
-    (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums, the hook
+    (the forward's, or the first pass's; `attention_backward_algebra.softmax_cotangents`); and the unnormalized weights' row sums, the hook
     parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's, scaled and pulled
     through the hook over the prior denominator, held as its coefficients' magnitude
     `keyed_mass · 2^keyed_shift` (`[bq]` each, the mantissa at most the keys' count, the exponent the
@@ -310,7 +307,7 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
 
 def dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
              kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
-    """A dQ tile's row sums (`dq_step`): the HEAD and QUERY parameters' pullbacks of the cotangents and of
+    """A dQ tile's row sums (`dq_issued`): the HEAD and QUERY parameters' pullbacks of the cotangents and of
     the weights, the cotangents' and the weights' sums; and the weights pulled through the score hook."""
     _, pieces = pulled(cotangents, slopes, seen, kinds)
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
@@ -326,7 +323,7 @@ def dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
 
 def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
              scale: float, kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
-    """`dq_step`'s row sums after a tile and dQ's score cotangents pulled and scaled, whose parts
+    """`dq_issued`'s row sums after a tile and dQ's score cotangents pulled and scaled, whose parts
     (`cotangent_parts`, `formed_parts`) a mainloop adds to dQ, into its accumulator in place where it can: the
     whole of the fast form's step, and the accurate form's with `keyed_terms` where it takes no score
     hook."""
@@ -342,7 +339,7 @@ def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: fl
     every weight at its maximum: the weights over it sum to at most one, so their product with the keys is a
     mean of them, finite wherever they are, and the scale is the mass's, its mantissa and exponent apart
     (`dq_finish`). One product, no exponent a row; a score hook's coefficients rescale a row's sums each
-    tile instead (`dq_step`)."""
+    tile instead (`dq_issued`)."""
     scale_mantissa, scale_exponent = _static_split(scale)
     keyed = weights_parts(weights * expand(inverse(prior), weights), dtype, rows)
     return (sums._replace(keyed_mass=jnp.full_like(sums.keyed_mass, scale_mantissa),
@@ -357,8 +354,8 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
     pullbacks and, in the accurate form, the keyed mass and exponent); dQ's parts (`cotangent_parts`), whose
     products with the keys join dQ; and in the accurate form the keyed parts (`weights_parts`), whose products
     join the keyed sums behind the row factor `(factor, parts)` the sums take first (None: none); None in the
-    fast form. `dq_step` takes these products as the Triton and plain-JAX mainloops do; a mainloop that issues
-    them in place takes the same parts. dQ's come as its scaled cotangents, whose parts a mainloop forms
+    fast form. Every mainloop issues these products (`attention_program.dq_sums`, the Mosaic dQ launch), in
+    place or by its own dot. dQ's come as its scaled cotangents, whose parts a mainloop forms
     (`cotangent_parts`) or forms a part at a time (`formed_parts`)."""
     if not accurate or slopes is None:
         terms, parts = dq_terms(sums, weights, cotangents, slopes, seen, scale=scale, kinds=kinds,
@@ -390,29 +387,6 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
             (before * over, weights_parts(coefficients * expand(over, coefficients), dtype, rows)))
 
 
-def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
-            prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
-            dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool) -> DqSums:
-    """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
-    (`pulled`) and scaled, times the keys (`cotangent_product`, in the form `accurate` names); the HEAD and
-    QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row) and of the weights,
-    which take those gradients to the refined D (`dq_finish`); the weights' sums unnormalized; and in the
-    accurate form the weights' product with the keys over the prior denominator, which takes dQ there too.
-    The fast form leaves dQ at the first pass's D (the forward's anchored one, `split_delta`, or the dQ
-    launch's own, `off_anchor_delta`), FlashAttention's arithmetic, its `keyed` sums untouched: a
-    parameter's gradient sums its cotangents over every key and query, a position's or a scale's times
-    each, so the first pass's D error enters it multiplied (ALiBi's slope 2.3 to 6.7 times the reference's
-    error at its first D), where dQ's per query is FlashAttention's."""
-    terms, parts, keyed = dq_issued(sums, weights, cotangents, slopes, seen, key.dtype, prior, scale=scale,
-                                    kinds=kinds, summed=summed, accurate=accurate)
-    terms = terms._replace(dq=sums.dq + cotangent_product(parts, key, dot, accurate=accurate))
-    if keyed is None:
-        return terms
-    factor, keyed_parts = keyed
-    scaled = sums.keyed if factor is None else expand(factor, sums.keyed) * sums.keyed
-    return terms._replace(keyed=scaled + summed_products(keyed_parts, key, dot))
-
-
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
               shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array, *,
               accurate: bool):
@@ -424,7 +398,7 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     (`weighed`). In the accurate form dQ takes it too, less the refinement times its weights' product with
     the keys (`keyed`): a query's dQ cancels across its keys exactly as its cotangents sum to 0, so the D it
     takes must be the one whose cotangents do, not the first pass's; the fast form leaves dQ at the first
-    pass's (`dq_step`). Returns dQ, the refined `D - c`, the denominator, the keys' share of the weights,
+    pass's (`dq_issued`). Returns dQ, the refined `D - c`, the denominator, the keys' share of the weights,
     and the hook gradients."""
     total = state_total + sums.mass
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
@@ -478,75 +452,6 @@ def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.A
     if multiplier is None:
         return products
     return jax.lax.optimization_barrier(products * multiplier)
-
-
-def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array,
-                multiplier: jax.Array | None = None, weights: jax.Array | None = None) -> jax.Array:
-    """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
-    `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
-    denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every intermediate
-    lies where the reference's does (a weight below fp32's range keeps its share beside a large product, and
-    none overflows that the reference keeps); zero where unseen (`where_seen`). The anchor key's own
-    `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding, so a query that
-    sees one key has no cotangent, as the reference's: FlashAttention's order, `(dP - D) / T` with no anchor
-    test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
-    key" and causal windows' first queries: rows whose float64 gradient is exactly 0). That is the accurate
-    form's. The fast form's (`weights` given, the normalized weights its launch forms anyway) is
-    FlashAttention's order about the anchor, `weights ((dP - c) - (D - c))`, its anchor test the accurate
-    form's alone (`at_anchor` None)."""
-    products = dropped_products(products, multiplier)
-    relative = products - expand(anchor, products)
-    if at_anchor is not None:
-        relative = jnp.where(at_anchor, 0.0, relative)
-    if weights is not None:
-        # The weights a launch forms anyway times `(dP - c) - (D - c)`: one product fewer an entry (the fast
-        # backward's dK/dV launch: FMUL 112 to 96 at Qwen3-8B's widths, ptxas 12.9 sm90a).
-        return where_seen(seen, weights * (relative - expand(delta, relative)), 0.0)
-    centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
-    return where_seen(seen, exponentials * centred, 0.0)
-
-
-class TileScores(NamedTuple):
-    """A key tile's softmax as a backward recomputes it (`tile_scores`), fp32 `[bq, bk]`."""
-
-    exponentials: jax.Array
-    """`exp(s - m)` against the forward's maximum (`below`)."""
-    weights: jax.Array
-    """The exponentials over each query's denominator."""
-    cotangents: jax.Array
-    """The score cotangents `p (dP - D)` (`grad_scores`)."""
-
-
-def tile_scores(logits: jax.Array, products: jax.Array, peak: jax.Array, total: jax.Array, anchor: jax.Array,
-                delta: jax.Array, seen: jax.Array | None, at_anchor: jax.Array | None, how: Recompute = PLAIN,
-                *, multiplier: jax.Array | None = None) -> TileScores:
-    """A key tile's softmax and score cotangents under the forward's maximum `peak` and denominator `total`,
-    its weights recomputed as the forward computed them (`how`, `normalized`) and its cotangents from the
-    products `dP = dO V^T` about each query's `anchor` (`grad_scores`, a dropping call's `multiplier` on
-    them): the one step a plain backward's dQ and dK/dV launches each take of a tile (the Pallas-Triton
-    and portable mainloops'), whichever of its parts they read."""
-    inverse_total = inverse(total)
-    exponentials, weights = normalized(logits, peak, inverse_total, how)
-    cotangents = grad_scores(exponentials, products, anchor, delta, seen, at_anchor, inverse_total,
-                             multiplier=multiplier)
-    return TileScores(exponentials, weights, cotangents)
-
-
-def dkv_step(dk: jax.Array, dv: jax.Array, scores: TileScores, slopes, seen: jax.Array | None,
-             kinds: tuple[Kind, ...], query: jax.Array, dout: jax.Array, total: jax.Array, *, scale: float,
-             transposed: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool,
-             multiplier: jax.Array | None = None) -> tuple[jax.Array, jax.Array, tuple]:
-    """A query tile's share of a key tile's dK and dV `[bk, D]` under `scores` (`tile_scores`), by the
-    mainloop's transposed product (`transposed(a, b) = aᵀ @ b`): dV from the unnormalized weights against
-    `dO / T` (`value_operands`, under a dropping call's `multiplier`), dK from the score cotangents through
-    the hook (`pulled`) at the call's whole `scale` against the call's own queries (`cotangent_product`); and
-    the hook's pieces (`pulled`), which each mainloop writes or sums where its parameters lie."""
-    logits, pieces = pulled(scores.cotangents, slopes, seen, kinds)
-    dv = dv + transposed(*value_operands(scores.exponentials, scores.weights, dout, total,
-                                         multiplier=multiplier))
-    dk = dk + cotangent_product(logits * scale, query, transposed, accurate=accurate)
-    return dk, dv, pieces
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
