@@ -55,6 +55,9 @@ LAYERS: Mapping[str, Contract] = {
         ("dew.objectives",), (), ("dew.training", "dew.config", "dew.checkpoints", "dew._cli")),
     "only the reinforcement-learning packages import dew.rl": Contract(
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
+    # A model computes; where a release stores its tensors and config is dew.interop's (row 4264). The
+    # Models contract's other crossings (diffusion, quantization, conditioning, data) are row 4265's.
+    "models import no weight interop": Contract(("dew.nn",), (), ("dew.interop",)),
 }
 """The contracts, by name. Each holds on main; a layer whose crossings are still open joins when its owner
 settles them (rows 4264-4270, records/themes.md's RT07)."""
