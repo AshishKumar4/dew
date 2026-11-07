@@ -570,11 +570,27 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: dict[int, jax.Arr
         core = inner[0] if jnp.shape(inner[0]) == target else jax.lax.reshape(inner[0], target)
         return [_unsqueezed(core, out.shape, squeezed)]
     elif any(jnp.shape(value) != () and jnp.shape(value) != out.shape for value in operands):
-        return None
+        if any(jnp.ndim(value) not in (0, len(out.shape)) for value in operands):
+            return None
+        # An operand of one element along an axis the result spans is broadcast along it, as the
+        # equation reads it: laid out to the result's axes of more than one element (`_broadcast`).
+        inner = [_broadcast(value, out.shape, squeezed) if jnp.ndim(value) else value for value in operands]
     core_shape = jax.eval_shape(lambda *values: equation.primitive.bind(*values, **params), *inner).shape
     inner_equation = equation.replace(params=params, outvars=[jcore.Var(out.update(shape=core_shape))])
     core = _normal(inner_equation, inner, widened, laid)[0]
     return [_unsqueezed(core, out.shape, squeezed)]
+
+
+def _broadcast(value, shape: tuple[int, ...], squeezed: dict[int, jax.Array]):
+    """`value`, of the rank of `shape` and one element along each axis it does not share, broadcast to
+    `shape`'s axes of more than one element over its erased form (`_squeeze`)."""
+    if jnp.shape(value) == tuple(shape):
+        return _squeeze(value, squeezed)
+    kept = [axis for axis, size in enumerate(jnp.shape(value)) if size != 1]
+    targets = [axis for axis, size in enumerate(shape) if size != 1]
+    at = {axis: place for place, axis in enumerate(targets)}
+    return jax.lax.broadcast_in_dim(_squeeze(value, squeezed), tuple(shape[axis] for axis in targets),
+                                    tuple(at[axis] for axis in kept))
 
 
 def _squeeze(value, squeezed: dict[int, jax.Array]):
