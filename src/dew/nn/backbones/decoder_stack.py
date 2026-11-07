@@ -412,28 +412,31 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             rows = tuple(run.variables.get(LAYER_ROWS, {}))
             repeats = count // len(run.specs) if periodic else count
 
-            def scanned(layer, carry, per_layer_input, *, store=store, step=step):
-                return step(layer, carry, per_layer_input, store)[0], None
+            policy = _rows_recomputed(remat)
 
-            if rows:
-                policy = _rows_recomputed(remat)
+            def scanned(layer, carry, index, *, store=store, step=step, rows=rows, inputs=inputs,
+                        policy=policy):
+                # The iteration's per-layer input, its layers along axis 2.
+                per_layer_input = jax.tree.map(
+                    lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, axis=2, keepdims=False), inputs)
 
-                def scanned(layer, carry, per_layer_input, index, *, layered=scanned, rows=rows,
-                            policy=policy):
-                    def read(layer, carry, per_layer_input, index):
-                        return nn.map_variables(
-                            layered, (LAYER_ROWS, *rows), init=False, mutable=False,
-                            trans_in_fn=functools.partial(_rows_joined, index=index))(
-                                layer, carry, per_layer_input)
-                    return nn.remat(read, policy=policy, prevent_cse=False)(
-                        layer, carry, per_layer_input, index)
+                def layered(layer, carry):
+                    return step(layer, carry, per_layer_input, store)[0]
+
+                if not rows:
+                    return layered(layer, carry), None
+
+                def read(layer, carry, index):
+                    return nn.map_variables(layered, (LAYER_ROWS, *rows), init=False, mutable=False,
+                                            trans_in_fn=functools.partial(_rows_joined, index=index))(
+                        layer, carry)
+                return nn.remat(read, policy=policy, prevent_cse=False)(layer, carry, index), None
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`).
             x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
                            variable_broadcast=LAYER_ROWS if rows else False, split_rngs={True: True},
-                           in_axes=(2, 0) if rows else 2, length=repeats,
-                           metadata_params={nn.PARTITION_NAME: None})(
-                run, x, inputs, *((jnp.arange(repeats),) if rows else ()))
+                           length=repeats, metadata_params={nn.PARTITION_NAME: None})(
+                run, x, jnp.arange(repeats))
     return x
 
 

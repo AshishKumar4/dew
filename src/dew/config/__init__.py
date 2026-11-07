@@ -1353,14 +1353,10 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
-def _without(record: JSON, names: tuple[str, ...]) -> JSON:
+def _without(record: Mapping[str, JSON], names: tuple[str, ...]) -> dict[str, JSON]:
     """`record` without a field of `names` wherever it nests one: a wrapper's language model's, a decision
-    run's backbone's among them."""
-    if isinstance(record, Mapping):
-        return {key: _without(value, names) for key, value in record.items() if key not in names}
-    if isinstance(record, list):
-        return [_without(value, names) for value in record]
-    return record
+    run's backbone's among them (`_records.without_fields`)."""
+    return {key: _records.without_fields(value, names) for key, value in record.items() if key not in names}
 
 
 def _holds(config: "RunConfig", path: str) -> bool:

@@ -687,9 +687,12 @@ class CausalTransformer(LinearProducts):
             return StackView(self.groups)
         # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
         # split where its adapter's targets do (`scanned_like`).
-        return StackView(self.apply(jax.tree.map(
+        view = self.apply(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
-            method=lambda module: module.groups))
+            method=lambda module: StackView(module.groups))
+        if not isinstance(view, StackView):
+            raise TypeError(f"expected the stack's view from the model, got {type(view).__name__}")
+        return view
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
         """Resolve every kind the pattern names, plus the kinds of the prediction depths and the drafter.
