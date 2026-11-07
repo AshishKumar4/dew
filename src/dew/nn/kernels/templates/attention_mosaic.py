@@ -1123,7 +1123,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # queries first, each consumer its own keys, on a family that waits across programs.
         if config.fused and deterministic_ops_requested() and not (
                 self.form in ("full", "causal") and family is not None and family.fixes_up
-                and config.queries_first and not (config.shared_keys or config.shared_dq)):
+                and config.queries_first and not (config.shared_keys or config.shared_dq)
+                and (ba.arguments["interpret"] or self._all_resident(ba, config, target))):
             return False
         if config.producer_dq and not config.shared_dq:
             # The producer adds a shared dQ's staged shares alone (`mosaic.Outbox`).
@@ -1285,6 +1286,22 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
             layout, tiles.consumers, self.score_mod), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
+
+    def _all_resident(self, ba: tokamax.BoundArguments, config: BackwardTiles,
+                      target: generation.GpuTarget) -> bool:
+        """Whether every program of the fused launch at `config` is resident at once (spec §6: a launch whose
+        programs wait on earlier turns, `Family.ticketed`, runs only so): its grid's programs, a query head's
+        key blocks each, within the multiprocessors times the programs one holds at its registers
+        (`Family.programs`) and its shared memory (row 4732)."""
+        query, key = ba.arguments["query"], ba.arguments["key"]
+        family = bundle_of(config, query.dtype)
+        if family is None or not target.multiprocessors:
+            return False
+        programs = query.shape[0] * query.shape[2] * -(-key.shape[1] // (config.consumers * config.block_k))
+        resident = family.programs(config.consumers, self.registers(ba, config))
+        if target.shared_limit:
+            resident = min(resident, max(1, target.shared_limit // self.staged_bytes(ba, config, target)))
+        return programs <= target.multiprocessors * resident
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
         # None on a family that budgets none (`Family.budgets_registers`), which holds every config.
