@@ -385,6 +385,8 @@ def _unmasked(graph: _Graph, logits, places: list[int]):
     if jax_name(eqn.primitive) in ("jit", "pjit"):
         if eqn.params.get("name") != "_where":
             return logits, True, identity
+        if len(eqn.invars) != 3:
+            return nothing
         mask, kept, fill = eqn.invars
         inner = eqn.params["jaxpr"].jaxpr
         axes, perm = _laid(inner, 0, rank), _laid(inner, 1, rank)
