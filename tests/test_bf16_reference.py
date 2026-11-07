@@ -45,6 +45,8 @@ from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
 from dew.nn.inputs import ModelInputs
+from dew.nn.kernels import generation
+from dew.nn.precision import ACCURATE
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny",
@@ -220,10 +222,13 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
     Dew's with bf16 parameters at 1.05 (5.24), ratio 0.95; the two bf16
     runs are 1.56 apart at most because each is that far from the truth,
     not because either computes something else. Dew in bf16 over fp32
-    masters, the training configuration, sits at 0.53. In fp32 Dew is at
-    8.6e-05 and transformers at 4.9e-05 (ratio 1.78: the SSD sums its chunks
-    in another order). Each is held over MAMBA2_SEEDS prompts drawn from
-    the text's tokens (check 1)."""
+    masters, the training configuration, sits at 0.53. In fp32 Dew runs its
+    accurate forms (`ACCURATE`), the IEEE products transformers' fp32 run
+    takes: under its fast forms a GPU's products are TF32-class, as
+    mamba_ssm's are, which put Dew on an H100 2.975 times the CPU arm's
+    distance from float64 where both on a CPU sit at 1.45 (ledger 4769).
+    Each is held over MAMBA2_SEEDS prompts drawn from the text's tokens
+    (check 1)."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -250,5 +255,9 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
                                              twin=twin)
         pretrained = Pretrained.load(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
                                      param_dtype=dtype, attention_impl="xla")
-        assert_as_exact(lambda drawn, model=pretrained: model.model.apply(model.variables, drawn).astype(
-            jnp.float32), reference, draw, f"{MAMBA2_130M} {dtype}", seeds=MAMBA2_SEEDS, truth_fn=truth)
+
+        def dew(drawn, model=pretrained, accurate=dtype == "float32"):
+            with generation.run_precision(ACCURATE) if accurate else contextlib.nullcontext():
+                return model.model.apply(model.variables, drawn).astype(jnp.float32)
+
+        assert_as_exact(dew, reference, draw, f"{MAMBA2_130M} {dtype}", seeds=MAMBA2_SEEDS, truth_fn=truth)
