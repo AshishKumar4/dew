@@ -146,3 +146,38 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
         held.append(compile_ahead(run, token_rows(VOCAB, 1, SEQ + 1)).temp_bytes)
     plain, scanned = held
     assert scanned <= plain, (scanned, plain)
+
+
+PLANNED_SEEDS = 8
+"""Check 1's declared seeds for the scanned steps updating in their backward against a layer at a time's,
+sized by `seeds_for` on armada."""
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("optimizer", [ADAMW, GROUPED], ids=["adamw", "groups"])
+def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(optimizer, monkeypatch):
+    """Two steps of a decoder whose one stage scans its layers, each updating them in its backward
+    (`Transaction.planned`: the step runs `in_backward.scanned_run`), leave its variables, optimizer state
+    and EMA as a checkpoint holds them on par with the same steps a layer at a time, whose update reads the
+    whole gradient (check 1, against one device's float64): the plan's update of a layer's slice of the
+    state is the whole update's (row 4857)."""
+    from test_stage_local import decoder as stage_decoder, draw, initials, stepped
+
+    from dew.nn import in_backward
+
+    runs = []
+    scanned_run = in_backward.scanned_run
+
+    def counted(*args, **kwargs):
+        runs.append(args[0])
+        return scanned_run(*args, **kwargs)
+    monkeypatch.setattr(in_backward, "scanned_run", counted)
+    scanned, plain = stage_decoder(scan_layers=True), stage_decoder()
+    initial = initials(plain, optimizer)
+    one_stage = MeshSpec(fsdp=2)
+    updating = stepped(scanned, optimizer, one_stage, 2, initial)
+    whole = stepped(plain, optimizer, one_stage, 2, initial)
+    truth = stepped(plain, optimizer, MeshSpec(), 1, initial, exact=True)
+    assert_as_exact(updating, whole, draw, "a scanned step updating in its backward", seeds=PLANNED_SEEDS,
+                    truth_fn=truth)
+    assert runs, "the scanned step updates its run in its backward"
