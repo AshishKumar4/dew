@@ -276,10 +276,9 @@ def math(q, k, v, g, beta, h0, starts=None):
     head `[B, T, H]` or per key dimension `[B, T, H, K]`, a row's packed documents starting at `starts`
     (`[B, T]`), as the port runs them."""
     starts = None if starts is None else jnp.asarray(starts)
-    work = jnp.promote_types(jnp.result_type(q, k, v), jnp.float32)
     tiles = recurrence_chunk.Tiles(recurrence_chunk.CHUNK_SIZE)
     return recurrence_chunk.xla_mainloop(tiles, q, k, v, g, beta, h0, starts, scale=k.shape[-1] ** -0.5,
-                                         delta=True, dtype=work)
+                                         delta=True)
 
 
 HEADS = 8
