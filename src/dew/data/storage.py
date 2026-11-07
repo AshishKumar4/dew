@@ -392,6 +392,10 @@ def _counted(counts: object) -> dict[str, float]:
     return {str(name): float(value) for name, value in counts.items()}
 
 
+type Held = Mapping[str, Held] | Sequence[Held] | str | int | float | bool | None
+"""A reader's position as it holds it: JSON's values, its records any mapping (a mix's `SharedMapping`)."""
+
+
 class PositionText:
     """A reader's positions written as JSON (`json.dumps`'s text), each a value a JSON config carries
     (`dew._records.json_value`), its mirror counters emptied (`MIRRORED`, `MIRRORS`: a read's metrics, not its
@@ -403,16 +407,16 @@ class PositionText:
     owns one, writing its positions on one thread."""
 
     def __init__(self) -> None:
-        self._held: dict[int, tuple[object, str]] = {}
+        self._held: dict[int, tuple[Held, str]] = {}
 
-    def __call__(self, state: object) -> bytes:
-        kept: dict[int, tuple[object, str]] = {}
+    def __call__(self, state: Held) -> bytes:
+        kept: dict[int, tuple[Held, str]] = {}
         text = self._text(state, kept)
         # The values the last position held alone: whatever the next holds that this one did not is new.
         self._held = kept
         return text.encode()
 
-    def _text(self, value: object, kept: dict[int, tuple[object, str]]) -> str:
+    def _text(self, value: Held, kept: dict[int, tuple[Held, str]]) -> str:
         if value is None or isinstance(value, (bool, int, float, str)):
             return json.dumps(value)
         if isinstance(value, (list, tuple)):
@@ -430,7 +434,7 @@ class PositionText:
                                    f"{self._text(entry, kept)}" for name, entry in emptied.items()) + "}"
         raise ValueError(f"data position={value!r}: this field is not a value a JSON config carries")
 
-    def _shared(self, value: object, kept: dict[int, tuple[object, str]]) -> str:
+    def _shared(self, value: Held, kept: dict[int, tuple[Held, str]]) -> str:
         """`value`'s text, a shared mapping's: the text it was written as while a position held it last."""
         held = kept.get(id(value)) or self._held.get(id(value))
         if held is None or held[0] is not value:
