@@ -107,6 +107,7 @@ __all__ = [
     "Logits",
     "LogitsFromHidden",
     "Looping",
+    "MediaWrapper",
     "ModelKwarg",
     "OutputTable",
     "Predicting",
@@ -562,6 +563,18 @@ class CountedDecisions(Protocol):
         """The head's work over rows of `lengths` tokens, their real questions and options, its spans
         pooled over `pooled` tokens a row where they are not the row's (a context's)."""
         ...
+
+
+@runtime_checkable
+class MediaWrapper(Protocol):
+    """A multimodal wrapper: media towers and their projectors around the language model it holds
+    (`language_model`), its release a wrapper of its `family`'s (`dew.interop.wrappers`)."""
+
+    @property
+    def language_model(self) -> nn.Module: ...
+
+    @property
+    def family(self) -> str: ...
 
 
 @runtime_checkable
