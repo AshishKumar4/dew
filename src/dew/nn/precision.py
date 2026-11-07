@@ -1079,7 +1079,7 @@ def vanishing(dtype, base2: bool = False) -> float:
     exponents join it (each at most zero): below the base's logarithm of its least subnormal (`exp(-105)` and
     `exp2(-151)` are zero in fp32). A prefix summing one with the others loses them (two of -2**127 are
     -inf; one of -2**70 loses a later -1 to its rounding), so a chunk's decays restart past it
-    (`recurrence_algebra.decays`, `dew.algebra.scan`)."""
+    (`dew.algebra.scan`'s decays)."""
     least = math.log(float(jnp.finfo(dtype).smallest_subnormal))
     return math.floor(least / (math.log(2.0) if base2 else 1.0)) - 1
 

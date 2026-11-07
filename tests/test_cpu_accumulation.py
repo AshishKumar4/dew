@@ -279,16 +279,12 @@ def test_a_product_that_states_its_own_derivative_keeps_it(kind):
 
 
 def test_a_portable_recurrence_product_sums_in_float64():
-    """The recurrence's portable products (`recurrence_algebra.portable` and the weighed `paired`)
-    are real CPU execution's, and sum in float64: 1 exactly over the cancelling terms."""
-    from dew.nn.kernels.recurrence_algebra import paired, portable
+    """The recurrence's portable products (`recurrence_algebra.portable`, the derived forms' issuer) are
+    real CPU execution's, and sum in float64: 1 exactly over the cancelling terms."""
+    from dew.nn.kernels.recurrence_algebra import portable
 
     lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
     assert np.asarray(jax.jit(lambda lhs, rhs: portable("product", lhs, rhs))(lhs, rhs)).tolist() == [[1.0]]
-    left, right = CANCELLING[None, :], np.ones((1, 3), np.float32)
-    decay = np.ones((1, 1, 3), np.float32)
-    weighed = jax.jit(lambda *operands: paired("product", *operands))(left, right, decay)
-    assert np.asarray(weighed).tolist() == [[1.0]]
 
 
 @pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
