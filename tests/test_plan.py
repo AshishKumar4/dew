@@ -622,6 +622,11 @@ def test_a_waiting_window_reports_in_a_run_that_cannot_create_a_process(tmp_path
     script = f"""
 import importlib.util, os, sys
 sys.path.insert(0, {str(root / "tests")!r})
+# A uid of its own, mapped to the test's, so the threads the policy counts are this guest's alone.
+uid = os.getuid()
+os.unshare(os.CLONE_NEWUSER)
+with open("/proc/self/uid_map", "w") as handle:
+    handle.write(f"{{uid}} {{uid}} 1\\n")
 import jax, jax.numpy as jnp, numpy as np, optax
 from affine_run import Replaying
 from dew.data.dataset import Loader
