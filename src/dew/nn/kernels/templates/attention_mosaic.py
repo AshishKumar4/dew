@@ -55,6 +55,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
 )
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, staged_parts, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    BACKWARD_CONSUMERS,
     BackwardTiles,
     Tiles,
     _block,
@@ -1227,7 +1228,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
-        dkv = {"dkv_family": fed[0].name, "dkv_consumers": fed[0].consumers} if fed else {}
+        # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
+        dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
+               if fed else {})
         deterministic = deterministic_ops_requested()
         found = []
         if not deterministic:
