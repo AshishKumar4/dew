@@ -14,7 +14,9 @@ def staged(call,keys):
   swizzle=mosaic.swizzle_for(tile.dtype,algebra.SUB)
   return pg.SMEM(tile.shape,tile.dtype,transforms=mosaic.swizzle_transforms(tile.dtype,swizzle))
  pairs,squares,gated,*other=tiles
- return (pairs,jax.tree.map(narrow,squares),gated,*other),landing
+ squares=jax.tree.map(narrow,squares)
+ gated=jax.tree.map(narrow,gated) if 'squares-only' not in sys.argv else gated
+ return (pairs,squares,gated,*other),landing
 kb._key_pairs_staged=staged
 target,index=sys.argv[1],int(sys.argv[2])
 cases=t.compiled_cases(target,{},[],{},only=t.GATE_GROUPS[index])
