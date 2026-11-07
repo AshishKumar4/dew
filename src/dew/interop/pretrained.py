@@ -2304,7 +2304,7 @@ def _translated(config: Mapping[str, object],
     media wrapper or DiffusionGemma translated and checked against its tree, and any stored input scales
     bound. No processor, generation config or bundle is built."""
     banks: dict[str, object] = {}
-    placing = streaming
+    placing, given = streaming, tensors
     if packed_experts:
         tensors, banks = _packed_banks(tensors, config)
         # Its leaves translated as views read when placed, as a streaming load's: the banks' unread leaves
@@ -2313,6 +2313,15 @@ def _translated(config: Mapping[str, object],
     tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
+    if banks:
+        # The banks are the source's quantized weights too (MXFP4's, `_packed_banks`), which an export
+        # writes back as it stored them.
+        from dew.interop.codecs import MXFP4 as codec
+
+        specs = tensor_specs(given)
+        quantized_tensors = tuple(sorted((*quantized_tensors, *banks)))
+        stored = {**stored, **{part: specs[part] for name in banks for part in codec.partners(name)}}
+        scale_dtype = codec.scale_dtype(given)
     match route:
         case DiffusionGemmaRoute():
             from dew.interop import diffusion_gemma
