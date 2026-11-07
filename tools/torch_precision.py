@@ -113,8 +113,10 @@ def widened():
 @contextlib.contextmanager
 def widened_softmax():
     """`softmax(..., dtype=torch.float32)`, the pin transformers' eager attention and routers carry, in
-    float64."""
-    with replaced((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax))):
+    float64: the function's and the tensor method's (DiffusionGemma's self-conditioning calls
+    `logits.softmax(..., dtype=torch.float32)`, which put its float64 truth 1.4e-7 from float64)."""
+    with replaced((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax)),
+                  (torch.Tensor, "softmax", dtype_widened(torch.Tensor.softmax))):
         yield
 
 
