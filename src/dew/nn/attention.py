@@ -390,7 +390,9 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
     per head in the softmax's denominator (`sink_softmax`). Keys and values
     may carry fewer heads. Without sinks they repeat to the query's, as flax
-    repeats them, which keeps flax's rounding; with sinks the query heads
+    repeats them, which keeps flax's rounding, but in jax.nn's form
+    (`scale_logits`), whose query heads group over their key head as jax.nn's
+    do (`_grouped_as_jax_nn`); with sinks the query heads
     group over their key head and no key or value repeats, as the decode
     selector (`attention_kernels.decodes`) needs where it routes a sink
     layer here rather than to the fused decode kernel, which takes sinks on a
@@ -398,7 +400,8 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     at least fp32 and scales them after the product, as DeepSeek V4 does
     (modeling_deepseek_v4.py:708-736); the value product stays in the inputs'
     dtype. `scale_logits` forms the logits of the query and keys in their own
-    dtype as fp32 (the product's preferred type) and scales them after it, by
+    dtype as fp32 (the product's preferred type, at the dot algorithm jax.nn
+    names for 16-bit operands, `_jax_nn_algorithm`) and scales them after it, by
     `D ** -0.5` in fp32, the mask and softmax reading them in fp32: jax.nn's xla
     form (`jax.nn.dot_product_attention`) and the fused kernels' own, where
     flax's scales the query before the product and rounds its logits to its
@@ -412,28 +415,38 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     dtype = query.dtype
     *rows, length, heads, width = query.shape
     kv_heads, keys = key.shape[-2], key.shape[-3]
+    if scale_logits and sinks is None and not dropout_rate and kv_heads != heads:
+        attend = functools.partial(reference_attention, softcap=softcap, precision=precision,
+                                   force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
+                                   scale_logits=True, mask_fill=mask_fill)
+        return _grouped_as_jax_nn(attend, query, key, value, mask, bias)
     if wide_logits:
         scaled_query, scoring = query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
     elif scale_logits:
         scaled_query, scoring = query, key
     else:
         scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
-    # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype.
+    # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype, at the dot algorithm
+    # it names (`_jax_nn_algorithm`).
     formed = at_least_fp32(dtype) if scale_logits else None
+    algorithm = _jax_nn_algorithm(dtype, precision) if scale_logits else None
+
+    def logits_of(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+        if algorithm is None:
+            return float32_einsum(subscripts, lhs, rhs, precision=precision, preferred_element_type=formed)
+        return jnp.einsum(subscripts, lhs, rhs, precision=algorithm, preferred_element_type=formed)
+
     if sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
-        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision,
-                                preferred_element_type=formed)
+        logits = logits_of('...qhd,...khd->...hqk', scaled_query, scoring)
     elif kv_heads == 1:
         # One key/value head (DeepSeek V4's): the query heads are a free dim beside the rows, and no
         # size-one head axis rides as a batch dim, which had XLA transpose the fp32 query for the
         # product (a V4 layer's training step on an H100, batch 4 by 2048: 2 GiB more and 5% slower).
-        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision,
-                                preferred_element_type=formed)
+        logits = logits_of('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :])
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision,
-                                preferred_element_type=formed).reshape(*rows, heads, length, keys)
+        logits = logits_of('...tkgd,...skd->...kgts', grouped, scoring).reshape(*rows, heads, length, keys)
     if wide_logits or scale_logits:
         logits = logits * width ** -0.5
     if softcap is not None:
@@ -475,6 +488,50 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
     return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
+
+
+def _grouped_as_jax_nn(attend: Callable, query, key, value, mask, bias) -> jax.Array:
+    """`attend` (the reference's jax.nn form, `scale_logits`) over query heads grouped as jax.nn groups them
+    (`_dot_product_attention_xla`): the query `[..., T, K, G, D]`, a mask or bias of every head
+    `[..., K, G, T, S]` (one shared by the heads read whole), the call mapped over the group with the keys
+    and values whole, so each product is one dot over the grouped batch and no key or value repeats; out
+    `[..., T, H, Dv]`."""
+    *rows, length, heads, width = query.shape
+    kv_heads = key.shape[-2]
+    groups = heads // kv_heads
+
+    def grouped(operand):
+        # A mask's or bias's axis of the group, its heads split as the query's; None where the heads share it.
+        if operand is None or jnp.ndim(operand) < 3 or jnp.shape(operand)[-3] == 1:
+            return operand, None
+        *leading, _, queries, keys = jnp.shape(operand)
+        return jnp.reshape(operand, (*leading, kv_heads, groups, queries, keys)), len(leading) + 1
+
+    (mask, mask_axis), (bias, bias_axis) = grouped(mask), grouped(bias)
+    axis = len(rows) + 2
+    each = jax.vmap(lambda query, mask, bias: attend(query, key, value, mask=mask, bias=bias),
+                    in_axes=(axis, mask_axis, bias_axis), out_axes=axis)
+    out = each(query.reshape(*rows, length, kv_heads, groups, width), mask, bias)
+    return out.reshape(*rows, length, heads, value.shape[-1])
+
+
+def _jax_nn_algorithm(dtype, precision) -> jax.lax.DotAlgorithmPreset | None:
+    """The dot algorithm jax.nn's xla attention names for its logits' product
+    (`_dot_product_attention_core`), which the reference's jax.nn form
+    (`scale_logits`) declares as jax.nn does: a 16-bit operand's own product
+    with fp32 sums (bf16's `BF16_BF16_F32`, fp16's `F16_F16_F32`) where the
+    call states no precision above the default and the platform it is placed
+    on lowers it (`placed_platform`: bf16's everywhere but a GPU before
+    `BF16_GPU`, `bf16_dot_runs`; fp16's on a GPU alone, where a CPU's dot and
+    a TPU's refuse it, jax.nn's own attention with them); None otherwise, the
+    call's own precision taking the product."""
+    if not asks_default_precision(precision):
+        return None
+    if dtype == jnp.bfloat16 and bf16_dot_runs():
+        return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    if dtype == jnp.float16 and generation.placed_platform() == 'gpu':
+        return jax.lax.DotAlgorithmPreset.F16_F16_F32
+    return None
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,

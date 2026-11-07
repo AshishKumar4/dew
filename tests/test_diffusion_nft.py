@@ -282,3 +282,18 @@ def test_an_inpainting_rollout_samples_and_trains_with_its_masked_image_inputs()
     flipped = {**batch, "spatial": {**batch["spatial"], "mask": 1 - batch["spatial"]["mask"]}}
     losses = [float(nft.scalar_loss(initial.variables, held, step)[0]) for held in (batch, flipped)]
     assert np.isfinite(losses).all() and losses[0] != losses[1]
+
+
+def test_a_rollouts_program_traces_under_a_compile_only_mesh():
+    """A rollout's program traced under its devices' mesh, a compile-only GPU's whose devices run nothing
+    here, makes its sampler's grid on this host (`programs.on_host`), as a step compiled ahead traces it."""
+    from dew.training.ahead import compile_only_gpus
+
+    nft = objective()
+    rollout = NFTRollout(nft, reward, groups=2, steps=5, train_steps=3)
+    params = jax.eval_shape(nft.init, jax.random.key(0))
+    prompts = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype),
+                           nft.inputs.tokenize(PROMPTS[:2]))
+    key = jax.eval_shape(lambda: jax.random.key(0))
+    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("sm90", 1)), ("data",))):
+        jax.jit(rollout._generate_impl).trace(params, prompts, key)
