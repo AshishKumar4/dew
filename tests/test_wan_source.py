@@ -131,7 +131,7 @@ def flowing(name: str, *, gradients: bool):
         probe = jnp.asarray(inputs["probe"], dtype)
         grads = jax.grad(lambda *args: jnp.sum(flow(*args) * probe), argnums=(0, 1, 2))(
             held, latents, context)
-        native = [grads[1], grads[2], *(layout.export({"params": grads[0]}) for _, layout in tensors)]
+        native = [grads[1], grads[2], *(layout.source_array({"params": grads[0]}) for _, layout in tensors)]
         flat = jnp.concatenate([jnp.ravel(jnp.asarray(leaf)) for leaf in native])
         return {"output": output, "gradients": flat}
     return dew
