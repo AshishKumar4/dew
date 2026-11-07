@@ -230,10 +230,82 @@ def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list
 
 
 def evaluable(equation: jcore.JaxprEqn) -> bool:
-    """Whether XLA's evaluator computes `equation` to find an offset: no side effect, no custom call and
-    no device index, in it or any program it runs (`UNEVALUATED`)."""
-    return (not equation.effects and named(equation.primitive) not in UNEVALUATED
-            and all(evaluable(inner) for body in bodies(equation) for inner in body.eqns))
+    """Whether XLA's evaluator computes `equation` to find an offset, as the host computes it here: no side
+    effect, no custom call and no device index (`UNEVALUATED`), a call whose program's equations are all
+    so, or one of the operations the host computes in NumPy (`_HOST`)."""
+    if equation.effects or named(equation.primitive) in UNEVALUATED:
+        return False
+    body = called(equation)
+    if body is not None:
+        return all(evaluable(inner) for inner in body.eqns)
+    return named(equation.primitive) in _HOST and not bodies(equation)
+
+
+def _divided(dividend: np.ndarray, divisor: np.ndarray) -> np.ndarray:
+    """XLA's division: an integer's rounded toward zero, as C divides."""
+    if not np.issubdtype(dividend.dtype, np.integer):
+        return np.true_divide(dividend, divisor).astype(dividend.dtype)
+    quotient = np.abs(dividend) // np.abs(divisor)
+    return np.where((dividend < 0) != (divisor < 0), -quotient, quotient).astype(dividend.dtype)
+
+
+def _dotted(lhs: np.ndarray, rhs: np.ndarray, *, dimension_numbers, preferred_element_type=None,
+            **_) -> np.ndarray:
+    """`dot_general` in NumPy: the contracting axes summed, the batch axes first, then each side's free
+    axes in order, as XLA lays out a product."""
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+    letters = iter("abcdefghijklmnopqrstuvwxyz")
+    left = [next(letters) for _ in range(lhs.ndim)]
+    right = [next(letters) for _ in range(rhs.ndim)]
+    for lhs_axis, rhs_axis in zip((*lhs_contract, *lhs_batch), (*rhs_contract, *rhs_batch), strict=True):
+        right[rhs_axis] = left[lhs_axis]
+    batch = [left[axis] for axis in lhs_batch]
+    free = [letter for axis, letter in enumerate(left) if axis not in (*lhs_contract, *lhs_batch)] + [
+        letter for axis, letter in enumerate(right) if axis not in (*rhs_contract, *rhs_batch)]
+    dtype = preferred_element_type or np.result_type(lhs, rhs)
+    return np.einsum(f"{''.join(left)},{''.join(right)}->{''.join(batch + free)}", lhs, rhs).astype(dtype)
+
+
+_HOST: Mapping[str, Callable[..., np.ndarray]] = {
+    "add": np.add, "sub": np.subtract, "mul": np.multiply, "div": _divided, "rem": np.fmod,
+    "neg": np.negative, "abs": np.abs, "sign": np.sign, "max": np.maximum, "min": np.minimum,
+    "lt": np.less, "le": np.less_equal, "gt": np.greater, "ge": np.greater_equal, "eq": np.equal,
+    "ne": np.not_equal, "and": np.bitwise_and, "or": np.bitwise_or, "xor": np.bitwise_xor, "not": np.invert,
+    "shift_left": np.left_shift, "shift_right_arithmetic": np.right_shift,
+    "select_n": lambda which, *cases: np.choose(np.asarray(which, np.int32), cases),
+    "clamp": lambda low, value, high: np.clip(value, low, high),
+    "convert_element_type": lambda value, *, new_dtype, **_: value.astype(new_dtype),
+    "integer_pow": lambda value, *, y: np.power(value, y).astype(value.dtype),
+    "reshape": lambda value, *_, new_sizes, **__: value.reshape(new_sizes),
+    "broadcast_in_dim": lambda value, *_, shape, broadcast_dimensions, **__: np.broadcast_to(
+        np.expand_dims(value, [axis for axis in range(len(shape)) if axis not in broadcast_dimensions])
+        if value.ndim < len(shape) else value, shape),
+    "squeeze": lambda value, *, dimensions: np.squeeze(value, dimensions),
+    "copy": np.copy, "copy_p": np.copy, "dot_general": _dotted,
+}
+"""The operations an offset's arithmetic takes, as the host computes them in NumPy, each over arrays of
+its operands' dtypes, with its equation's parameters: XLA's evaluator computes offsets on the host, which
+a dispatch of each operation through JAX would compile on the default device, a run's GPU among them
+(row 4752: five such programs compiled on a run's GPU)."""
+
+_PARAMETERS = frozenset({"convert_element_type", "integer_pow", "reshape", "broadcast_in_dim", "squeeze",
+                         "dot_general"})
+"""The operations of `_HOST` that read their equation's parameters."""
+
+
+def _computed(equation: jcore.JaxprEqn, operands: Sequence[np.ndarray]) -> list[np.ndarray]:
+    """`equation`'s results computed on the host (`_HOST`), a call's through its program."""
+    body = called(equation)
+    if body is not None:
+        values = dict(zip(body.invars, operands, strict=True))
+        for inner in body.eqns:
+            values.update(zip(inner.outvars, _computed(inner, [
+                values[value] if computed(value) else np.asarray(value.val) for value in inner.invars]),
+                strict=True))
+        return [values[value] if computed(value) else np.asarray(value.val) for value in body.outvars]
+    name = named(equation.primitive)
+    params = equation.params if name in _PARAMETERS else {}
+    return [np.asarray(_HOST[name](*operands, **params))]
 
 
 def byte_strides(shape: Sequence[int], itemsize: int) -> list[int]:
@@ -433,10 +505,10 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
     """`offsets`' values at the loop's turn whose counter is `turn`, each computed from it by those of
     `counting`, the equations computing values from the counter and literals alone, it reads, as XLA's
     evaluator computes them at each turn (`EvaluateByteOffsetAtIteration`)."""
-    values: dict = {} if counter is None else {counter: np.int32(turn)}
+    values: dict = {} if counter is None else {counter: np.asarray(turn, np.int32)}
 
     def read(value):
-        return values[value] if computed(value) else value.val
+        return values[value] if computed(value) else np.asarray(value.val)
 
     needed = {offset for offset in offsets if computed(offset)}
     reading = []
@@ -444,19 +516,17 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
         if needed.intersection(equation.outvars):
             reading.append(equation)
             needed.update(value for value in equation.invars if computed(value))
-    # The evaluator computes on the host, outside any mesh a plan for compile-only devices sets.
-    with jax.set_mesh(None), jax.ensure_compile_time_eval():
-        for equation in reversed(reading):
-            operands = list(map(read, equation.invars))
-            if named(equation.primitive) == "dot_general" and len(operands) == 3:
-                # A product with its bias, as the derivation reads a sum XLA's GEMM computes
-                # (`biased`): the product of the first two, plus the third.
-                *operands, bias = operands
-                out = equation.primitive.bind(*operands, **equation.params) + bias
-            else:
-                out = equation.primitive.bind(*operands, **equation.params)
-            values.update(zip(equation.outvars, out if equation.primitive.multiple_results else [out],
-                              strict=True))
+    # The evaluator computes on the host (`_HOST`), compiling nothing on any device.
+    for equation in reversed(reading):
+        operands = list(map(read, equation.invars))
+        if named(equation.primitive) == "dot_general" and len(operands) == 3:
+            # A product with its bias, as the derivation reads a sum XLA's GEMM computes
+            # (`biased`): the product of the first two, plus the third.
+            *operands, bias = operands
+            out = [_computed(equation, operands)[0] + bias]
+        else:
+            out = _computed(equation, operands)
+        values.update(zip(equation.outvars, out, strict=True))
     return [int(read(offset)) for offset in offsets]
 
 
