@@ -178,3 +178,118 @@ def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew
         expected = jax.jit(plain)(*operands)
         assert_equal(outside(*operands), expected)
         assert_equal(inside(*operands), expected)
+
+
+def jax_attention(*, causal: bool):
+    """jax.nn's attention as a plain program writes it (its XLA form)."""
+    def attend(q, k, v):
+        return jax.nn.dot_product_attention(q, k, v, is_causal=causal, implementation="xla")
+    return attend
+
+
+def flax_attention(*, causal: bool):
+    """Flax's attention as a Flax model writes it, its causal mask built from the rows."""
+    from flax import linen as nn
+
+    def attend(q, k, v):
+        mask = nn.make_causal_mask(jnp.ones(q.shape[:2])) if causal else None
+        return nn.dot_product_attention(q, k, v, mask=mask)
+    return attend
+
+
+def input_masked(q, k, v):
+    """jax.nn's attention under a mask drawn from the queries, which the compile point leaves as written."""
+    rows = (q[..., :1] > 0).transpose(0, 2, 1, 3)
+    mask = jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]))
+    return jax.nn.dot_product_attention(q, k, v, mask=mask, implementation="xla")
+
+
+SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2, True),
+             "jax.nn, grouped": (jax_attention(causal=False), 2, False),
+             "flax causal": (flax_attention(causal=True), 4, True),
+             "flax": (flax_attention(causal=False), 4, False)}
+"""Each plain program's attention, its key heads over 4 query heads, and whether it is causal."""
+
+
+def _attention_routes(trace) -> list[str]:
+    """The kernels the attention routes `trace()` reports name."""
+    with generation.routes() as found:
+        trace()
+    return [route.kernel for route in found if route.choice == "attention"]
+
+
+@pytest.mark.parametrize("spelling", list(SPELLINGS))
+def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
+    """A plain JAX or Flax program's softmax attention (`dew.algebra.attention_regions`) compiled through
+    `dew.jit` on an H100 runs the kernel Dew's selector gives the call (FlashAttention, or the template a call
+    names), where the program as written runs XLA's; on this host, its output and gradients under the
+    template (its portable mainloop) on par with the program as written (check 1)."""
+    from attention_oracle import attention_on_par, kept
+    from contract_support import normal_drawn
+
+    import dew
+
+    attend, key_heads, causal = SPELLINGS[spelling]
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),
+              *(jax.ShapeDtypeStruct((2, 128, key_heads, 64), jnp.bfloat16),) * 2)
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
+        assert "flash" in _attention_routes(lambda: dew.jit(attend).trace(*shapes))
+        with generation.chosen(attention="template"):
+            assert "template" in _attention_routes(lambda: dew.jit(attend).trace(*shapes))
+    draw = normal_drawn(37, (2, 64, 4, 32), (2, 64, key_heads, 32), (2, 64, key_heads, 32), (2, 64, 4, 32),
+                        dtype=jnp.bfloat16)
+    with generation.chosen(attention="template"):
+        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {spelling}",
+                         keep=kept(64, 64, causal=causal))
+
+
+def test_a_plain_programs_attention_under_a_mask_of_its_inputs_stays_as_written():
+    """Attention under a mask the program draws from its inputs is no region of Dew's (its mask read at no
+    compile): `dew.jit` runs it as written, its attention XLA's own on an H100."""
+    import dew
+
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: dew.jit(input_masked).trace(*shapes))
+
+
+def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None):
+    """Causal softmax attention as a program writes it out (its products as einsums, a causal where, the
+    safe softmax), each keyword a way it computes something other than attention: a finite fill keeping the
+    future keys' weight, logits truncated or narrowed through `logits_cast`, a maximum's initial value above
+    the logits, each row divided by another row's sum (heads and rows swapped in its broadcast), the sum
+    narrowed through `sum_cast` (to float16, where 65536 keys' sum overflows)."""
+    def attend(q, k, v):
+        s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+        if logits_cast is not None:
+            s = s.astype(logits_cast).astype(jnp.float32)
+        s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, fill)
+        e = jnp.exp(s - jax.lax.stop_gradient(jnp.max(s, -1, keepdims=True, initial=initial)))
+        total = jnp.sum(e, -1)
+        if sum_cast is not None:
+            total = total.astype(sum_cast).astype(total.dtype)
+        if other_rows:
+            total = jax.lax.broadcast_in_dim(total, (*e.shape[:-1], 1), (0, 2, 1))
+        else:
+            total = total[..., None]
+        return jnp.einsum("bhts,bshd->bthd", (e / total).astype(v.dtype), v)
+    return attend
+
+
+@pytest.mark.parametrize(("variant", "options"), [("attention", {}), ("finite fill", {"fill": 0.0}),
+                                                  ("truncated logits", {"logits_cast": jnp.int32}),
+                                                  ("initial above", {"initial": 1e30}),
+                                                  ("another row's sum", {"other_rows": True}),
+                                                  ("logits narrowed", {"logits_cast": jnp.float16}),
+                                                  ("sum narrowed", {"sum_cast": jnp.float16})])
+def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
+    """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100; written out with
+    any step computing otherwise (a finite fill, truncated or narrowed logits, an initial maximum above the
+    logits, a row normalized by another's sum, a sum narrowed past its range), it stays as written, XLA's."""
+    import dew
+
+    shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
+    with generation.assumed("sm90"):
+        routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
+    assert bool(routes) == (variant == "attention"), routes

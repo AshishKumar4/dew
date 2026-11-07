@@ -661,7 +661,10 @@ the choice, so a resume runs the kernels the run ran.
 `dew.jit(function, **jit_args)` compiles a plain JAX or Flax function as `jax.jit` does (static arguments,
 donation, placements) through Dew's compile point: its matrix products, alone or with the elementwise work
 after them (`x @ w`, `dy @ w.T`, `x.T @ dy`, and `jax.lax.ragged_dot`'s grouped forms), run Dew's kernel
-templates where their selectors give them on the device, and everything else stays XLA's. A choice named by
+templates where their selectors give them on the device, and its softmax attention as `jax.nn.dot_product_attention`
+(its XLA form) and Flax's `dot_product_attention` write it, with no mask or a causal one built from positions,
+at the default scale, runs the kernel Dew's attention selector gives the call (FlashAttention, cuDNN, the
+template), on par with the program's own rather than bitwise. Everything else stays XLA's. A choice named by
 `dew.kernels.use` holds here as in a layer. `jax.grad(dew.jit(f))` and `dew.jit(jax.grad(f))` reach the same
 kernels: the first rewrites `f` as it traces, the second rewrites the joint program. The caller holds the
 returned program; call it, or read `.lower(...)` and `.trace(...)` as on a jit.

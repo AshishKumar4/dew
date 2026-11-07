@@ -17,12 +17,14 @@ own precision and result dtype, so the fused region computes what the region did
 other region, and every body with none, is kept as traced: the body itself, so an unchanged body keeps its
 identity (`program._within`'s). A region's decision is held by its structure
 and the context it was weighed in (`_decided`), so every layer of a stack, and every retrace, weighs it once.
+A softmax attention (`attention_regions`) is found first and written as Dew's attention where a kernel of
+Dew's takes it, through the same splice (`_spliced`); a product inside it is none of the products' regions.
 """
 
 from __future__ import annotations
 
 import collections
-from collections.abc import Hashable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import NamedTuple
 
 import jax
@@ -59,12 +61,66 @@ class Region(NamedTuple):
 
 
 def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`jaxpr` with each region the template takes fused (the module's account); `jaxpr` itself where none
-    is."""
+    """`jaxpr` with each attention region a kernel of Dew's takes written as Dew's attention
+    (`attention_regions`) and each product region the template takes fused (the module's account); `jaxpr`
+    itself where none is."""
+    from dew.algebra import attention_regions
     from dew.nn.kernels import fused_gemm
 
-    taken = [region for region in _regions(jaxpr) if _decided(fused_gemm, jaxpr, region)]
-    return _spliced(jaxpr, taken, fused_gemm) if taken else jaxpr
+    index = Index(jaxpr)
+    attention = [region for region in attention_regions.regions(index)
+                 if _decided(jaxpr, region.places, _read(jaxpr, region.places), (region.output,),
+                             lambda region=region: attention_regions.taken(region))]
+    held = {place for region in attention for place in region.places}
+    products = [region for region in _regions(index) if not held & set(region.places)
+                and _decided(jaxpr, region.places, region.inputs, region.outputs,
+                             lambda region=region: _takes(fused_gemm, jaxpr, region))]
+    if not attention and not products:
+        return jaxpr
+    written = [Written(region.places, (region.query, region.key, region.value), (region.output,),
+                       region.places[-1], attention_regions.written(region)) for region in attention]
+    written += [Written(region.places, region.inputs, region.outputs, region.at,
+                        _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm)) for region in products]
+    return _spliced(jaxpr, written)
+
+
+def _read(jaxpr: jcore.Jaxpr, places: Sequence[int]) -> tuple[jcore.Var, ...]:
+    """The values the equations at `places` read that none of them makes, in the order they are read."""
+    made = {var for place in places for var in jaxpr.eqns[place].outvars}
+    return tuple(dict.fromkeys(var for place in places for var in jaxpr.eqns[place].invars
+                               if isinstance(var, jcore.Var) and var not in made))
+
+
+def _fusing(replay: Callable, fused_gemm) -> Callable:
+    """A product region's call: `fused_gemm.fused` over the region as the program wrote it (`_replayed`)."""
+    return lambda *inputs: fused_gemm.fused(replay, *inputs)
+
+
+class Index:
+    """A body's equations by the values they make (`producer`), each value's readers (`readers`: the places
+    of the equations that read it) and the values the body returns (`escaping`): what both region finders
+    read (`_regions`, `attention_regions.regions`)."""
+
+    def __init__(self, jaxpr: jcore.Jaxpr):
+        self.jaxpr = jaxpr
+        self.producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
+        self.readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
+        for place, equation in enumerate(jaxpr.eqns):
+            for var in equation.invars:
+                if isinstance(var, jcore.Var):
+                    self.readers[var].add(place)
+        self.escaping = {var for var in jaxpr.outvars if isinstance(var, jcore.Var)}
+
+
+class Written(NamedTuple):
+    """A region's equations (their places) replaced by one nested program of `call` over its `inputs`, making
+    its `outputs`, written at place `at` (`_spliced`)."""
+
+    places: tuple[int, ...]
+    inputs: tuple[jcore.Var, ...]
+    outputs: tuple[jcore.Var, ...]
+    at: int
+    call: Callable
 
 
 class Form(NamedTuple):
@@ -131,18 +187,12 @@ def _follows(operand: tuple[int, ...], shape: tuple[int, ...]) -> bool:
                            and all(axis in (1, extent) for axis, extent in zip(operand, shape, strict=True)))
 
 
-def _regions(jaxpr: jcore.Jaxpr) -> list[Region]:
+def _regions(index: Index) -> list[Region]:
     """Each product of `jaxpr` (`_form`) and the elementwise equations after it that read its values,
     each of the product's shape over operands that follow its tiles (`_follows`, `CONSUMERS`), up to the
     first equation outside them that reads one of their values, with the layout equations of its captured
     operands that no other equation reads (`CAPTURED`)."""
-    readers = collections.defaultdict(set)
-    for place, equation in enumerate(jaxpr.eqns):
-        for var in equation.invars:
-            if isinstance(var, jcore.Var):
-                readers[var].add(place)
-    escaping = {var for var in jaxpr.outvars if isinstance(var, jcore.Var)}
-    producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
+    jaxpr, readers, escaping, producer = index.jaxpr, index.readers, index.escaping, index.producer
     found: list[Region] = []
     claimed: set[int] = set()
     for start, equation in enumerate(jaxpr.eqns):
@@ -234,18 +284,18 @@ def _shapes(variables: Sequence[jcore.Var]) -> list[jax.ShapeDtypeStruct]:
 _held: collections.OrderedDict[Hashable, bool] = collections.OrderedDict()
 
 
-def _decided(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
-    """`_takes`'s decision of `region`, weighed once for its structure (`program.structure`'s, the
-    algebra's windows' key) in the context it is weighed in (`derive.context`: the mesh, the target, the
-    numerics and precision; and the kernel choices a call names), the latest `DECISIONS_HELD` held."""
+def _decided(jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.Var],
+             outputs: Sequence[jcore.Var], decide: Callable[[], bool]) -> bool:
+    """A region's decision (`decide`), weighed once for its structure (`program.structure`'s, the algebra's
+    windows' key) in the context it is weighed in (`derive.context`: the mesh, the target, the numerics and
+    precision; and the kernel choices a call names), the latest `DECISIONS_HELD` held."""
     from dew import _cache
     from dew.algebra import derive, program
 
-    window = jcore.Jaxpr([], list(region.inputs), list(region.outputs),
-                         [jaxpr.eqns[place] for place in region.places])
+    window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     key = (program.structure(window), derive.context(), _cache.KERNEL_CHOICES.value)
     if key not in _held:
-        _held[key] = _takes(fused_gemm, jaxpr, region)
+        _held[key] = decide()
         if len(_held) > DECISIONS_HELD:
             _held.popitem(last=False)
     _held.move_to_end(key)
@@ -270,16 +320,13 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
             and found.fused_seconds < found.unfused_seconds)
 
 
-def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Region], fused_gemm) -> jcore.Jaxpr:
-    """`jaxpr` with each of `regions`' equations replaced by one nested program of `fused_gemm.fused` over
-    the region (`_replayed`), its inputs the region's and its outputs the very values the region made,
-    written where the region's first reader stood."""
+def _spliced(jaxpr: jcore.Jaxpr, regions: Sequence[Written]) -> jcore.Jaxpr:
+    """`jaxpr` with each of `regions`' equations replaced by one nested program of its call over its inputs,
+    its outputs the very values the region made, written at its place."""
     removed = {place for region in regions for place in region.places}
     written: dict[int, list[jcore.JaxprEqn]] = {}
     for region in regions:
-        replay = _replayed(jaxpr, region, fused_gemm)
-        call = nested(lambda *inputs, replay=replay: fused_gemm.fused(replay, *inputs))
-        traced = jax.make_jaxpr(call)(*_shapes(region.inputs))
+        traced = jax.make_jaxpr(nested(region.call))(*_shapes(region.inputs))
         (equation,) = traced.jaxpr.eqns
         renamed = dict(zip(traced.jaxpr.invars, region.inputs, strict=True))
         written.setdefault(region.at, []).append(equation.replace(
