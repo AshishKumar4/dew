@@ -277,22 +277,32 @@ def packed(latent: np.ndarray) -> np.ndarray:
     return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(batch, height * width // 4, channels * 4)
 
 
-def assert_published_checkpoint(measured, name: str) -> None:
-    """A published checkpoint's batches as `tools.wrapper_checkpoint_parity.measure_checkpoint` measures
-    them: each batch's logits at every position as near its float64 truth as the reference's fp32 run
-    (the gate's one-draw rule), and Dew's greedy continuation the reference's wherever every step's top
-    reference logit clears the next by the gate's selection margin (`selection_margins.MARGIN`), so that
-    float32 rounding cannot pick another token. A continuation with a step nearer a tie decides
-    nothing, and is not compared."""
-    from one_draw import assert_as_exact_as_the_reference
+PUBLISHED_SEEDS = 8
+"""Check 1's declared seeds for a published checkpoint's batches (`assert_published_checkpoint`)."""
+
+
+def assert_published_checkpoint(checkpoint: str, revision: str, name: str) -> None:
+    """A published checkpoint at its pinned `revision`, run as `tools.wrapper_checkpoint_parity` runs it
+    (`checkpoint_runs`): each batch's logits at every position on par with the reference's fp32 run over
+    the text and image prompts PUBLISHED_SEEDS draw (`parity_batches`), its float64 run the truth (check 1),
+    and Dew's greedy continuation of the first draw the reference's wherever every step's top reference
+    logit clears the next by the gate's selection margin (`selection_margins.MARGIN`), so that float32
+    rounding cannot pick another token. A continuation with a step nearer a tie decides nothing, and is
+    not compared."""
     from selection_margins import MARGIN, top_margin
 
-    for row in measured:
-        assert row.truth.dtype == np.float64
-        label = f"published {name} {row.modality}"
-        assert_as_exact_as_the_reference(row.dew, row.reference, row.truth, label)
-        if np.all(top_margin(np.asarray(row.continuation_logits, np.float64), 1) > MARGIN):
-            np.testing.assert_array_equal(row.dew_continuation, row.reference_continuation)
+    from tools.wrapper_checkpoint_parity import checkpoint_runs, parity_batches
+
+    runs = checkpoint_runs(checkpoint, revision)
+    for index, modality in enumerate(("text", "image")):
+        def draw(seed, index=index):
+            return (parity_batches(runs.processor, runs.model_type, seed)[index],)
+
+        assert_as_exact(as_given(runs.dew), as_given(runs.reference), draw, f"published {name} {modality}",
+                        seeds=PUBLISHED_SEEDS, truth_fn=as_given(runs.truth))
+        mine, theirs, logits = runs.continued(draw(0)[0])
+        if np.all(top_margin(np.asarray(logits, np.float64), 1) > MARGIN):
+            np.testing.assert_array_equal(mine, theirs)
 
 
 def written_tensors(directory) -> dict[str, np.ndarray]:
