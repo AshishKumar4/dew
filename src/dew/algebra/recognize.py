@@ -599,11 +599,15 @@ def _constants(index: fusion.Index) -> frozenset[jcore.Var]:
     return _HELD_CONSTANTS[index]
 
 
-def _scalars(index: fusion.Index, places: Sequence[int]) -> list[float]:
-    """The scalar floating constants the equations at `places` read, each once: the static arguments a
-    family's call may take (an epsilon, a softcap)."""
+def _scalars(index: fusion.Index, places: Sequence[int], primitives: frozenset[str] | None = None) -> list[
+        float]:
+    """The scalar floating constants the equations at `places` read (those binding one of `primitives`,
+    where given), each once: the static arguments a family's call may take (an epsilon a sum adds, a
+    softcap)."""
     found: dict[float, None] = {}
     for place in places:
+        if primitives is not None and jax_name(index.jaxpr.eqns[place].primitive) not in primitives:
+            continue
         for atom in index.jaxpr.eqns[place].invars:
             value = atom.val if isinstance(atom, jcore.Literal) else index.consts.get(atom)
             if value is not None and np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype,
@@ -643,7 +647,7 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
             gates = [var for var in extras if var.aval.shape == row.aval.shape]
             if len(weights) > 1 or len(gates) > 1 or len(weights) + len(gates) != len(extras):
                 continue
-            epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or ())
+            epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or (), frozenset({"add"}))
             yield from _norm_candidates(index, row, output, weights[0] if weights else None,
                                         gates[0] if gates else None, epsilons)
 
