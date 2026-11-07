@@ -683,7 +683,7 @@ def test_the_rule_runs_at_every_geometry(label):
 @pytest.mark.parametrize("label", sorted(ROUTES))
 def test_both_routes_return_the_operands_common_dtype(label):
     """One contract whichever route a GPU's row picks: the port (`fla_rule`), at every geometry it takes
-    (`recurrence_chunk.PORT_SUPPORTS`' widths), and the portable math (`chunk_delta_rule`), at every geometry,
+    (`recurrence_chunk.PORT_SUPPORTS`' widths), and the portable math (`xla_mainloop`), at every geometry,
     return the output in the queries', keys' and values' common dtype, the final memory in at least
     fp32, and each operand's gradient in its own."""
     dtypes, width, heads, _, _, _ = ROUTES[label]

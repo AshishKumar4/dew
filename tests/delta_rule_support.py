@@ -19,7 +19,7 @@ import pytest
 from float64_terms import float64_terms
 from reference_error import widened, with_gradients
 
-from dew.nn.kernels import fla_gdn, recurrence_algebra, recurrence_chunk
+from dew.nn.kernels import fla_gdn, recurrence_chunk
 
 CHUNKED = 64
 """The port's chunk length in tokens: the chunks `fla_decay_parts` sums within and `plain_prefix`
@@ -200,12 +200,22 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     decay = jnp.where(lower[..., None], jnp.exp(gc[..., :, None, :] - gc[..., None, :, :]), 0.0)
     akk = jnp.where(strict, jnp.einsum('...sd,...td,...std->...st', k * beta, k, decay), 0.0)
     aqk = jnp.einsum('...sd,...td,...std->...st', q, k, decay)
-    inverse = recurrence_algebra.factor(-akk)
+    eye = jnp.eye(chunk, dtype=akk.dtype)
+    inverse = jax.scipy.linalg.solve_triangular(eye + akk, jnp.broadcast_to(eye, akk.shape), lower=True)
     w, u = inverse @ (k * beta * gated), inverse @ (v * beta)
     last_decay = jnp.exp(last - gc)
     leaving = k * last_decay
-    kept = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype)
-    entered, corrected, _ = recurrence_chunk.xla_chunk_states(k, w, u, gated, last_decay, h0, kept)
+
+    def carried(state, step):
+        # The chunk's corrected values from the memory it enters, then the memory it leaves.
+        k_c, w_c, u_c, gated_c, last_c = step
+        corrected = u_c - w_c @ state
+        written = jnp.swapaxes(k_c * last_c, -1, -2) @ corrected
+        return state * jnp.swapaxes(gated_c[..., -1:, :], -1, -2) + written, (state, corrected)
+
+    _, (entered, corrected) = jax.lax.scan(carried, h0, tuple(jnp.moveaxis(x, 2, 0)
+                                                              for x in (k, w, u, gated, last_decay)))
+    entered, corrected = jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2)
     daqk = jnp.where(lower, do @ jnp.swapaxes(corrected, -1, -2), 0.0)
     local = jnp.swapaxes(aqk, -1, -2) @ do
 
@@ -262,14 +272,14 @@ def fla_decay_terms(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
 
 
 def math(q, k, v, g, beta, h0, starts=None):
-    """The portable rule, value heads reading their key head, a decay per head `[B, T, H]` or per key
-    dimension `[B, T, H, K]`, a row's packed documents starting at `starts` (`[B, T]`), as the port
-    runs them."""
-    group = v.shape[2] // q.shape[2]
-    q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
+    """The portable rule (`recurrence_chunk.xla_mainloop`), value heads reading their key head, a decay per
+    head `[B, T, H]` or per key dimension `[B, T, H, K]`, a row's packed documents starting at `starts`
+    (`[B, T]`), as the port runs them."""
     starts = None if starts is None else jnp.asarray(starts)
-    return recurrence_chunk.chunk_delta_rule(q, k, v, g if g.ndim == 4 else g[..., None], beta, h0,
-                                             starts=starts)
+    work = jnp.promote_types(jnp.result_type(q, k, v), jnp.float32)
+    tiles = recurrence_chunk.Tiles(recurrence_chunk.CHUNK_SIZE)
+    return recurrence_chunk.xla_mainloop(tiles, q, k, v, g, beta, h0, starts, scale=k.shape[-1] ** -0.5,
+                                         delta=True, dtype=work)
 
 
 HEADS = 8
