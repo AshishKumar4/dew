@@ -42,7 +42,7 @@ def _model(dtype="float32", *, attention_impl="xla"):
                              mlp_features=32, max_seq_len=64, dtype=dtype, attention_impl=attention_impl)
 
 
-def _rollouts():
+def _rollouts(samples: int = 4):
     rng = np.random.default_rng(0)
 
     def ids(count):
@@ -52,7 +52,7 @@ def _rollouts():
         return tuple(float(value) for value in -rng.random(count))
 
     rollouts = []
-    for sample in range(4):
+    for sample in range(samples):
         first = Call(ids(3), ids(2), logps(2), "tool_calls", 0)
         # Append-only: the second prompt holds the first call's prompt and sampled ids.
         second = Call(first.prompt + first.tokens + ids(2), ids(3), logps(3), "tool_calls", 0)
@@ -103,13 +103,18 @@ PACKED_SEEDS = 128
 """Check 1's declared seeds for the packed step against the per-call step, sized by `seeds_for` paired:
 the two arms run one model over the same calls, so they share their upstream rounding."""
 
+PACKED_SAMPLES = 16
+"""The rollouts the packed step's check 1 reads: a norm's scale gradient sums its few entries over every
+position, and over four rollouts' the two arms' sums, rounded apart where XLA:CPU's fusions block them
+(row 4523), spread their error ratios past what 640 seeds resolve; over sixteen both decide."""
+
 
 @pytest.mark.parametrize("policy_loss", ["ppo", "cispo"])
 def test_packed_grpo_computes_per_call_grpo_on_the_unmerged_chains(policy_loss):
     """Packing preserves the per-call loss and gradients: the fp32 objective over the packed rows is on
     par with it over one row a call (check 1), each drawn policy and its reference 0.9 of it, the truth
     the per-call step in float64. Everything runs on CPU, since a TPU has no float64."""
-    rollouts = _rollouts()
+    rollouts = _rollouts(PACKED_SAMPLES)
     packed = pack(rollouts, WIDTH)
     assert packed[IDS_KEY].shape[0] < sum(len(rollout.calls) for rollout in rollouts)
     assert packed[SEGMENT_IDS_KEY].max() >= 2, "rows share chains"
