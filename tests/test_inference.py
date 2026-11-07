@@ -1427,5 +1427,5 @@ def test_a_served_walks_initial_state_traces_under_a_compile_only_mesh():
     grid = tuple(float(time) for time in np.asarray(process.times(4)))
     sample = jax.ShapeDtypeStruct((1, 4, 4, 1), jnp.float32)
     key = jax.eval_shape(lambda: jax.random.key(0))
-    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("h100", 1)), ("data",))):
+    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("sm90", 1)), ("data",))):
         jax.jit(lambda x, key: _initial(Euler(), process, grid, x, key)).trace(sample, key)

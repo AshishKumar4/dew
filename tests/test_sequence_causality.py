@@ -239,6 +239,6 @@ def test_a_walk_under_a_compile_only_mesh_evaluates_its_indices_on_this_host(nam
     function = {**ADMITTED, **REFUSED}[name]
     program = jax.make_jaxpr(function)(jnp.zeros((1, LENGTHS[0]), jnp.int32))
     outside = causality_refusal(program, 0, LENGTHS[0], (0,))
-    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("h100", 1)), ("data",))):
+    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("sm90", 1)), ("data",))):
         inside = causality_refusal(program, 0, LENGTHS[0], (0,))
     assert (inside is None) == (outside is None) == (name in ADMITTED)

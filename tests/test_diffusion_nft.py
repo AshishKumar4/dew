@@ -295,5 +295,5 @@ def test_a_rollouts_program_traces_under_a_compile_only_mesh():
     prompts = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), np.asarray(leaf).dtype),
                            nft.inputs.tokenize(PROMPTS[:2]))
     key = jax.eval_shape(lambda: jax.random.key(0))
-    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("h100", 1)), ("data",))):
+    with jax.set_mesh(jax.sharding.Mesh(np.array(compile_only_gpus("sm90", 1)), ("data",))):
         jax.jit(rollout._generate_impl).trace(params, prompts, key)
