@@ -265,6 +265,7 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
     env: dict[jcore.Var, object] = dict(zip(jaxpr.constvars, consts, strict=True))
     env.update(zip(jaxpr.invars, values, strict=True))
     widened: dict[int, object] = {}
+    laid: dict[int, tuple] = {}
 
     def read(atom):
         return atom.val if isinstance(atom, jcore.Literal) else env[atom]
@@ -277,7 +278,10 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
             given = operands[len(operands) - len(closed.jaxpr.invars):]
             outputs = _evaluated(closed.jaxpr, closed.consts, *given)
         else:
-            outputs = _normal(equation, operands, widened)
+            # A value of constants alone is computed where it is made, so the program and a declaration
+            # hold one constant (a mean of zeros, a mask of iotas) however each built it.
+            with jax.ensure_compile_time_eval():
+                outputs = _normal(equation, operands, widened, laid)
         env.update(zip(equation.outvars, outputs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
 
@@ -298,17 +302,28 @@ narrow float's, in float32 and rounded (its float normalization), on every backe
 writes a kernel for."""
 
 
-def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]) -> list:
+def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object],
+            laid: dict[int, tuple]) -> list:
     """`equation` bound over `operands` in the form recognition compares (`_canonical`): a square a value
     times itself, bit for bit; a narrow float's elementwise equation (`ROUNDED_ONCE`) its float32 one
     rounded once to the narrow dtype; a gradient's stop or a checkpoint's name its operand
     (`VALUE_IDENTITIES`); a float32 rounded to a narrow float's digits in place
     (`reduce_precision`) a round trip through that dtype; a value widened exactly and rounded back to its
-    own dtype that value itself (`widened`, each exact widening's result by its source). Every other
-    equation as it is."""
+    own dtype that value itself (`widened`, each exact widening's result by its source); a value less a
+    constant zero that value; a reshape that only adds unit axes the broadcast it is; and an elementwise
+    equation over values one layout made from equal shapes, beside scalars, that equation before the
+    layout (`laid`, each laid value by its source and layout). Every other equation as it is."""
     name = jax_name(equation.primitive)
     if name in VALUE_IDENTITIES:
         return list(operands)
+    if name == "sub" and _zero(operands[1]) and jnp.shape(operands[0]) == equation.outvars[0].aval.shape:
+        return [operands[0]]
+    if name in ("broadcast_in_dim", "reshape"):
+        return [_laid(equation, operands[0], laid)]
+    if name in ELEMENTWISE and len(equation.outvars) == 1:
+        lifted = _lifted(equation, operands, widened, laid)
+        if lifted is not None:
+            return [lifted]
     if name == "convert_element_type":
         return [_converted(operands[0], equation.params["new_dtype"], widened)]
     if name == "square" or (name == "integer_pow" and equation.params.get("y") == 2):
@@ -324,6 +339,64 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
         return [_converted(equation.primitive.bind(*wide, **equation.params), out, widened)]
     bound = equation.primitive.bind(*operands, **equation.params)
     return bound if equation.primitive.multiple_results else [bound]
+
+
+ELEMENTWISE = ROUNDED_ONCE | {"convert_element_type", "select_n", "integer_pow", "square", "sign", "floor",
+                             "ceil", "round", "pow", "atan2", "rem"}
+"""The equations computed element by element, which a layout of their operands commutes with exactly."""
+
+
+def _zero(value) -> bool:
+    """Whether `value` is a constant (computed, `_evaluated`) of zeros alone."""
+    return not isinstance(value, jax.core.Tracer) and not np.any(np.asarray(value))
+
+
+def _laid(equation: jcore.JaxprEqn, value, laid: dict[int, tuple]):
+    """A broadcast's or a reshape's result, a reshape that only adds unit axes written as the broadcast it
+    is, recorded in `laid` by its source and layout (`_lifted`)."""
+    shape = equation.outvars[0].aval.shape
+    if jax_name(equation.primitive) == "reshape":
+        dimensions = _unit_axes(jnp.shape(value), shape)
+        if dimensions is None:
+            return equation.primitive.bind(value, **equation.params)
+    else:
+        dimensions = tuple(equation.params["broadcast_dimensions"])
+    made = jax.lax.broadcast_in_dim(value, shape, dimensions)
+    if made is not value and isinstance(made, jax.core.Tracer):
+        laid[id(made)] = (value, (shape, dimensions))
+    return made
+
+
+def _unit_axes(before: tuple[int, ...], after: tuple[int, ...]) -> tuple[int, ...] | None:
+    """Where `before`'s axes lie in `after` where `after` is `before` with unit axes added; else None."""
+    dimensions, at = [], 0
+    for place, size in enumerate(after):
+        if at < len(before) and size == before[at]:
+            dimensions.append(place)
+            at += 1
+        elif size != 1:
+            return None
+    return tuple(dimensions) if at == len(before) else None
+
+
+def _lifted(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object], laid: dict[int, tuple]):
+    """An elementwise equation whose every operand but scalars one layout made, from sources of one shape:
+    the equation over the sources, then the layout; None where its operands are laid otherwise."""
+    layouts = {laid[id(value)][1] for value in operands if id(value) in laid}
+    sources = [laid[id(value)][0] if id(value) in laid else value for value in operands]
+    if len(layouts) != 1 or any(id(value) not in laid and jnp.ndim(value) != 0 for value in operands):
+        return None
+    if len({jnp.shape(source) for source, value in zip(sources, operands, strict=True)
+            if id(value) in laid}) != 1:
+        return None
+    (shape, dimensions), = layouts
+    inner = equation.replace(outvars=[jcore.Var(equation.outvars[0].aval.update(
+        shape=jnp.shape(next(source for source, value in zip(sources, operands, strict=True)
+                             if id(value) in laid))))])
+    made = _normal(inner, sources, widened, laid)[0]
+    result = jax.lax.broadcast_in_dim(made, shape, dimensions)
+    laid[id(result)] = (made, (shape, dimensions))
+    return result
 
 
 def _converted(value, dtype, widened: dict[int, object]):
