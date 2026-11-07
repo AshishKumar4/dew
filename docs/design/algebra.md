@@ -253,7 +253,10 @@ fitted to them, and a rule set ships only with measured receipts.
   output. Built today (`dew.algebra.fusion`): each product the GEMM template takes (x @ W, dy @ Wᵀ, xᵀ @ dy, and
   `ragged_dot_general`'s grouped forms), alone or with its elementwise consumers, is substituted at the compile
   point where its selector gives the template the launch, its consumers into the epilogue where fused prices
-  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450).
+  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450). Its
+  softmax attention, as jax.nn's XLA form and Flax's write it (no mask or a causal one of positions, the
+  default scale), is written as Dew's attention where Dew's selector gives the call a kernel of its own
+  (`dew.algebra.attention_regions`).
 
 ## 3. Verification
 

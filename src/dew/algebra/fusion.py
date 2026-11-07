@@ -17,6 +17,8 @@ own precision and result dtype, so the fused region computes what the region did
 other region, and every body with none, is kept as traced: the body itself, so an unchanged body keeps its
 identity (`program._within`'s). A region's decision is held by its structure
 and the context it was weighed in (`_decided`), so every layer of a stack, and every retrace, weighs it once.
+A softmax attention (`attention_regions`) is found first and written as Dew's attention where a kernel of
+Dew's takes it, through the same splice (`_spliced`); a product inside it is none of the products' regions.
 """
 
 from __future__ import annotations

@@ -37,7 +37,8 @@ from jax.extend import core as jcore
 from dew.nn.programs import jax_name
 
 MASK_ENTRIES = 1 << 26
-"""The most entries a mask is evaluated at to read whether it is causal; a larger one keeps its region XLA's."""
+"""The most entries a mask is evaluated at to read whether it is causal; a larger one keeps its region
+XLA's."""
 
 CASTS = frozenset({"convert_element_type"})
 
@@ -54,7 +55,8 @@ class Attention(NamedTuple):
     output: jcore.Var
     causal: bool
     shared: tuple[tuple[int, int, int], ...]
-    """Each axis q and k share, its value axis beside: (q's axis, k's axis, v's axis), in the product's order."""
+    """Each axis q and k share, its value axis beside: (q's axis, k's axis, v's axis), in the product's
+    order."""
     rows: tuple[int, ...]
     """q's free axes read as query rows (the causal row axis first), then its query heads (`heads`)."""
     heads: tuple[int, ...]
@@ -105,15 +107,22 @@ def written(region: Attention) -> Callable:
     return call
 
 
+KEPT = frozenset({"xla", "reference"})
+"""The attention kernels that compute as the program's own XLA does (Dew's reference attention among them):
+a region the selector gives one of keeps the program's math (`taken`)."""
+
+
 def taken(region: Attention) -> bool:
-    """Whether Dew's selector gives the region's call a kernel other than XLA's: the call traced over its
-    operands' shapes (`written`), its attention route read (`generation.routes`)."""
+    """Whether Dew's selector gives the region's call a kernel of its own (the template, FlashAttention,
+    cuDNN; none of `KEPT`): the call traced over its operands' shapes (`written`), its attention route read
+    (`generation.routes`)."""
     from dew.nn.kernels import generation
 
-    shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in (region.query, region.key, region.value)]
+    shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype)
+              for var in (region.query, region.key, region.value)]
     with generation.routes() as found:
         jax.eval_shape(written(region), *shapes)
-    return any(route.choice == "attention" and route.kernel != "xla" for route in found)
+    return any(route.choice == "attention" and route.kernel not in KEPT for route in found)
 
 
 class _Graph:
@@ -159,7 +168,8 @@ class _Graph:
             if not eqn.effects and all(value is not None for value in inputs):
                 with jax.ensure_compile_time_eval():
                     made = eqn.primitive.bind(*inputs, **eqn.params)
-                value = np.asarray((made if eqn.primitive.multiple_results else [made])[eqn.outvars.index(atom)])
+                made = made if eqn.primitive.multiple_results else [made]
+                value = np.asarray(made[eqn.outvars.index(atom)])
         self._constants[atom] = value
         return value
 
@@ -204,7 +214,8 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
     first, query, key, query_width, key_width, layout = _scaled_product(graph, scaled, places)
     if first is None:
         return None
-    region = _laid_out(graph, second, weights_read, query, key, layout, query_width, key_width, axis, mask, perm)
+    region = _laid_out(graph, second, weights_read, query, key, layout, query_width, key_width, axis, mask,
+                       perm)
     if region is None:
         return None
     places = sorted(set(places))
@@ -216,7 +227,8 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
     return region._replace(places=tuple(places))
 
 
-def _rows_maximum(graph: _Graph, centre, logits, scaled, perm: tuple[int, ...], places: list[int]) -> int | None:
+def _rows_maximum(graph: _Graph, centre, logits, scaled, perm: tuple[int, ...],
+                  places: list[int]) -> int | None:
     """The keys axis (the softmax's layout, `logits`') where `centre` is the logits' largest over it,
     broadcast back, held from its gradient, raised to a constant (jax.nn's `initial`) and laid out again in
     any order, through casts: a maximum of `logits` itself, or of `scaled` before the layout `perm` moved it
@@ -275,8 +287,8 @@ def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int
 
 def _unmasked(graph: _Graph, logits, places: list[int]):
     """`logits` past a constant mask (`jnp.where(mask, s, fill)`: a nested `_where`, or a `select_n`): the
-    scaled logits `s`, the mask's array at the logits' rank (True where there is none), and the logits' axes as
-    `s` lays them (`perm`: the logits' axis i is `s`'s `perm[i]`, a batched `_where` moving its batch axis
+    scaled logits `s`, the mask's array at the logits' rank (True where there is none), and the logits' axes
+    as `s` lays them (`perm`: the logits' axis i is `s`'s `perm[i]`, a batched `_where` moving its batch axis
     first); (None, None, None) where a mask is made from the program's inputs, holds more than MASK_ENTRIES
     entries, or is laid out otherwise than broadcast."""
     eqns, rank, nothing = graph.jaxpr.eqns, logits.aval.ndim, (None, None, None)
@@ -328,7 +340,8 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
             axes = tuple(axes[d] for d in permutation)
         elif name == "select_n":
             return axes if atom.aval.ndim == rank or index == 0 else None
-        elif name == "ne" and index == 0 and any(isinstance(v, jcore.Literal) and v.val == 0 for v in eqn.invars):
+        elif (name == "ne" and index == 0
+              and any(isinstance(v, jcore.Literal) and v.val == 0 for v in eqn.invars)):
             pass  # a float mask's predicate, x != 0: the mask's value read as booleans (`_unmasked`'s astype)
         elif name not in CASTS:
             return None
@@ -369,7 +382,8 @@ def _scaled_product(graph: _Graph, scaled, places: list[int]):
             return nothing
         numerator, denominator = eqns[divided].invars
         root = graph.constant(denominator)
-        if root is None or np.ndim(root) != 0 or not math.isclose(float(root), math.sqrt(width), rel_tol=1e-3):
+        if (root is None or np.ndim(root) != 0
+                or not math.isclose(float(root), math.sqrt(width), rel_tol=1e-3)):
             return nothing
         query = numerator
     elif not math.isclose(scale, width ** -0.5, rel_tol=1e-6):
