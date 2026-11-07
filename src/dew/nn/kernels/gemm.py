@@ -1236,7 +1236,13 @@ def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype
     (`recipe_projection`), as matrices: a dense projection's free rows against its kernel's contracted
     axes, a batched one's (a grouped output projection's, DeepSeek V4's `o_a_proj`) each batch member a
     group of rows against its own matrix, the result in `dot_general`'s order (batch, `lhs`'s free axes,
-    `rhs`'s); None where `recipe_projection` takes none of it."""
+    `rhs`'s); None where `recipe_projection` takes none of it, and where the run trains in no recipe before
+    any operand is laid out as matrices: an operand an explicit mesh axis splits takes no reshape that does
+    not state where its rows lie."""
+    from dew.nn.precision import recipe_role
+
+    if recipe_role() is None:
+        return None
     (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
     free = [axis for axis in range(lhs.ndim) if axis not in contracted + batched]
     free_rhs = [axis for axis in range(rhs.ndim) if axis not in against + batched_rhs]
