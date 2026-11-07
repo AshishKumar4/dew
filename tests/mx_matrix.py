@@ -1,13 +1,15 @@
-"""The MX product's check-1 matrix (tests/kernel_matrix.py): MXFP8 rows times each group's MXFP8 matrix
-(`gemm.mxfp8_product`, row 4519), each 32 depths of each scaled by its E8M0 scale in Blackwell's block-scaled
-tensor cores (`mosaic_gpu.gmm`'s `mx_scales`), on par with the decoded operands' product in XLA.
+"""The block-scaled product's check-1 matrix (tests/kernel_matrix.py): MXFP8 rows times each group's MXFP8
+matrix (`gemm.mxfp8_product`, row 4519), each 32 depths of each scaled by its E8M0 scale, or NVFP4's
+(`gemm.nvfp4_block_product`), each 16 depths by its E4M3 scale under a tensor scale, in Blackwell's
+block-scaled tensor cores (`mosaic_gpu.gmm`'s `mx_scales`), on par with the decoded operands' product in XLA.
 
 Each cell runs the product's forward alone: a recipe's gradients are their own MX products of requantized
 operands (row 2513). It is held to the product with the selector's other kernel named, `xla`
 (`generation.chosen`, check 1), from the decoded operands' product in float64.
 
 The kernel under test is the template, named where the cells run it (no receipt yet qualifies it, so its
-selector, `gemm.MXFP8`, takes it by name alone): the cells' `CHOICES` are `mxfp8`.
+selectors, `gemm.MXFP8` and `gemm.NVFP4_BLOCK_OP`, take it by name alone): the cells' `CHOICES` are `mxfp8`
+and `nvfp4_block`, a cell's its format's (`FORMATS`).
 
 What the route serves is read from the product's own selector: the product traced for its shapes as the
 case's generation with the template named, the route its choice reports the template.
@@ -30,11 +32,14 @@ from dew.nn.kernels import gemm, generation
 DEPTH = 256
 """The product's depth: eight 32-deep scale blocks."""
 SEEDS = 8
-CHOICES = frozenset({"mxfp8"})
-"""The `generation.CHOICES` entries the cells run: each cell asserts that the routes it records run `mxfp8`
-`mosaic_gpu` and every choice outside `CHOICES` at XLA."""
-KERNELS = {"mxfp8": frozenset({"mosaic_gpu"})}
+CHOICES = frozenset({"mxfp8", "nvfp4_block"})
+"""The `generation.CHOICES` entries the cells run: each cell asserts that the routes it records run its
+format's choice `mosaic_gpu` and every choice outside `CHOICES` at XLA."""
+KERNELS = {"mxfp8": frozenset({"mosaic_gpu"}), "nvfp4_block": frozenset({"mosaic_gpu"})}
 """The kernels under test of each choice the cells run: the template's block-scaled products."""
+FORMATS = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product, gemm.MX_BLOCK),
+           "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product, gemm.NVFP4_BLOCK)}
+"""Each format's choice, operand form, product and the depths a scale covers."""
 
 
 def _blocks(groups: int) -> jnp.ndarray:
@@ -43,14 +48,15 @@ def _blocks(groups: int) -> jnp.ndarray:
 
 
 def _operands(case: dict[str, str], seed: int) -> tuple:
-    """`case`'s rows and matrices, their 32-depth blocks' magnitudes spread over 2^-6 to 2^6."""
+    """`case`'s rows and matrices, each block of its format's depths spread over magnitudes 2^-6 to 2^6."""
     groups, width = int(case["groups"]), int(case["width"])
+    block = FORMATS[case["format"]][3]
     rows = 128 * int(jnp.sum(_blocks(groups)))
     rng = np.random.default_rng(seed)
 
     def drawn(shape):
-        spread = np.exp2(rng.integers(-6, 7, size=(*shape[:-1], shape[-1] // gemm.MX_BLOCK, 1)))
-        values = rng.normal(size=(*shape[:-1], shape[-1] // gemm.MX_BLOCK, gemm.MX_BLOCK)) * spread
+        spread = np.exp2(rng.integers(-6, 7, size=(*shape[:-1], shape[-1] // block, 1)))
+        values = rng.normal(size=(*shape[:-1], shape[-1] // block, block)) * spread
         return jnp.asarray(values.reshape(shape), jnp.float32)
 
     return drawn((rows, DEPTH)), drawn((groups, width, DEPTH))
@@ -59,43 +65,47 @@ def _operands(case: dict[str, str], seed: int) -> tuple:
 def supported(case: dict[str, str]) -> bool:
     """Whether the route serves `case` (tests/kernel_matrix.py): its product traced for its shapes as its
     generation within an abstract mesh of one of its devices, the template named, reports the template for
-    `mxfp8`."""
+    its format's choice."""
     rows, matrices = (jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _operands(case, 0))
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
+    choice = FORMATS[case["format"]][0]
     with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
-          generation.chosen(mxfp8="mosaic_gpu"), generation.routes() as routes):
-        def product(x, w):
-            return gemm.mxfp8_product(gemm.MxFp8.quantized(x), gemm.MxFp8.quantized(w),
-                                      _blocks(int(case["groups"])), out_dtype=case["out_dtype"])
-
-        jax.eval_shape(product, rows, matrices)
-    return [route.kernel for route in routes if route.choice == "mxfp8"] == ["mosaic_gpu"]
+          generation.routes() as routes):
+        jax.eval_shape(_product(case["format"], int(case["groups"]), case["out_dtype"], "mosaic_gpu"), rows,
+                       matrices)
+    return [route.kernel for route in routes if route.choice == choice] == ["mosaic_gpu"]
 
 
 CASES = (
-    ('sm100', '128', '1', 'float32'),
-    ('sm100', '128', '4', 'bfloat16'),
-    ('sm100', '256', '1', 'bfloat16'),
-    ('sm100', '256', '4', 'float32'),
+    ('sm100', 'mxfp8', '128', '1', 'float32'),
+    ('sm100', 'nvfp4', '256', '4', 'bfloat16'),
+    ('sm100', 'mxfp8', '128', '4', 'bfloat16'),
+    ('sm100', 'nvfp4', '256', '1', 'float32'),
+    ('sm100', 'mxfp8', '256', '1', 'bfloat16'),
+    ('sm100', 'nvfp4', '128', '4', 'float32'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("mxfp8")`'s pairs)."""
 
 
-def _product(groups: int, out_dtype: str, kernel: str):
-    """The product as `run(rows, matrices)`, `mxfp8` named `kernel`."""
-    def product(rows, matrices):
-        with generation.chosen(mxfp8=kernel):
-            return gemm.mxfp8_product(gemm.MxFp8.quantized(rows), gemm.MxFp8.quantized(matrices),
-                                      _blocks(groups), out_dtype=out_dtype)
-    return product
+def _product(format_: str, groups: int, out_dtype: str, kernel: str):
+    """The product of `format_` as `run(rows, matrices)`, its choice named `kernel`."""
+    choice, form, product, _ = FORMATS[format_]
+
+    def run(rows, matrices):
+        with generation.chosen(**{choice: kernel}):
+            operands = (form.quantized(rows), form.quantized(matrices))
+            return product(*operands, _blocks(groups), out_dtype=out_dtype)
+    return run
 
 
-def _truth(groups: int):
+def _truth(format_: str, groups: int):
     """The decoded operands' grouped product in float64."""
+    values = mx_values if format_ == "mxfp8" else nvfp4_values
+
     def truth(rows, matrices):
         wide = jnp.float64
-        x, w = gemm.MxFp8.quantized(rows).decoded(), gemm.MxFp8.quantized(matrices).decoded()
+        x, w = values(rows), values(matrices)
         return jax.lax.ragged_dot(x.astype(wide), jnp.swapaxes(w, 1, 2).astype(wide), 128 * _blocks(groups),
                                   precision=jax.lax.Precision.HIGHEST, preferred_element_type=wide)
     return truth
@@ -106,19 +116,19 @@ def _truth(groups: int):
     generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
     for case in CASES], ids="-".join)
 def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
-    """The MX product of `case` on its GPU through the template on par with the decoded operands' product in
-    XLA (check 1), from float64. The routes it records run `mxfp8` `mosaic_gpu` and every other choice at
-    XLA."""
+    """The block-scaled product of `case` on its GPU through the template on par with the decoded operands'
+    product in XLA (check 1), from float64. The routes it records run its format's choice `mosaic_gpu` and
+    every other choice at XLA."""
     combination = dict(zip(AXES["mxfp8"], case, strict=True))
-    groups, out_dtype = int(combination["groups"]), combination["out_dtype"]
+    format_, groups, out_dtype = combination["format"], int(combination["groups"]), combination["out_dtype"]
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic_gpu")),
-                        jax.jit(_product(groups, out_dtype, "xla")),
+        assert_as_exact(jax.jit(_product(format_, groups, out_dtype, "mosaic_gpu")),
+                        jax.jit(_product(format_, groups, out_dtype, "xla")),
                         lambda seed: _operands(combination, seed), "-".join(case), seeds=SEEDS,
-                        truth_fn=_truth(groups))
+                        truth_fn=_truth(format_, groups))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
-    assert ("mxfp8", "mosaic_gpu") in recorded and not unnamed, (sorted(recorded), unnamed)
+    assert (FORMATS[format_][0], "mosaic_gpu") in recorded and not unnamed, (sorted(recorded), unnamed)
 
 
 def mx_values(x: jax.Array) -> jax.Array:
