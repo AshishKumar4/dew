@@ -110,7 +110,10 @@ def code_unit(code: types.CodeType, root: str) -> str:
 
 def coded(event: str, args: tuple, root: str) -> str | None:
     """The unit (`code_unit`) of the checkout function whose code a run took (`object.__getattr__`'s audit of
-    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode)."""
+    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode). A take of
+    `inspect`'s for a signature, a code flag or a file (`SIGNED`), which pytest's collection makes of every
+    fixture a conftest defines, taken or not, reads what the module's top level holds alone: the function's
+    `def` line, its generator's or coroutine's mark (digests.py's `digested`) and its file (row 4385)."""
     if event != "object.__getattr__" or args[1] != "__code__" or getattr(taking, "code", False):
         return None
     taking.code = True
@@ -118,9 +121,24 @@ def coded(event: str, args: tuple, root: str) -> str | None:
         code = getattr(args[0], "__code__", None)
     finally:
         taking.code = False
-    if isinstance(code, types.CodeType) and checkout(code.co_filename, root):
-        return code_unit(code, root)
-    return None
+    if not isinstance(code, types.CodeType) or not checkout(code.co_filename, root):
+        return None
+    unit = code_unit(code, root)
+    # The frame that took it, beneath this and the audit hook that called it.
+    taker = sys._getframe(2).f_code
+    if taker.co_filename == INSPECT and taker.co_name in SIGNED and not unit.endswith(WHOLE):
+        return f"{code.co_filename[len(root):]}{CODE}{TOP}"
+    return unit
+
+
+INSPECT = os.path.join(os.path.dirname(os.__file__), "inspect.py")
+"""The standard library's `inspect`, by its file, which this module does not import: it imports what it
+must."""
+SIGNED = frozenset({"_signature_from_function", "_signature_is_functionlike", "_has_code_flag", "getfile"})
+"""`inspect`'s functions that take a function's code for what its `def` line and file decide alone, the same
+in Python 3.10 to 3.14: a signature (`signature`'s), a code flag (`isgeneratorfunction`'s,
+`iscoroutinefunction`'s) and the file (`getfile`'s). Its `findsource` and `getclosurevars` read the body, and
+so key it."""
 
 
 taking = threading.local()

@@ -1276,11 +1276,12 @@ def test_a_shared_modules_comments_and_docstrings_rekey_no_row_and_its_code_does
 
 def test_a_test_files_or_conftests_comments_and_docstrings_rerun_it_not_and_its_code_does(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A test file a run executes is its input by its code (followed.py's `WHOLE`), and a conftest by the units
-    the run executed, as any module (`code_unit`): an edit to a comment of either, or to the test file's
-    docstrings, which pytest's assertion rewriter reads to compile and no test reads, reruns nothing, as the
-    owner asks of a comment-only edit (row 4385: one conftest edit re-keyed every file); an edit to what either
-    does reruns the file. A test that reads its own text is that text's reader, keyed by its bytes."""
+    """A test file a run executes is its input by its code (followed.py's `WHOLE`), and a conftest by the
+    units the run executed, as any module (`code_unit`): an edit to a comment of either, or to the test
+    file's docstrings, which pytest's assertion rewriter reads to compile and no test reads, reruns nothing,
+    as the owner asks of a comment-only edit (row 4385: one conftest edit re-keyed every file); an edit to
+    what either does reruns the file. A test that reads its own text is that text's reader, keyed by its
+    bytes."""
     counted = "    with open('runs', 'a') as runs: runs.write('x')\n"
     fixture = "import pytest\n\n\n@pytest.fixture\ndef base():\n"
     written(tmp_path, {"conftest.py": fixture + "    return 1\n",
@@ -1348,11 +1349,13 @@ def test_a_change_to_the_selection_every_task_runs_under_rekeys_every_row_and_it
     """Every row's shared key holds the plan's code that decides which tests a row's run holds and how pytest
     is called (`selected`, `pytest_command`), which a green row's meaning rests on, and nothing of its wording
     (row 2558: a change to the selection reused rows its run would not give)."""
-    # The plan's own code from a copy of the harness, its checkout's inputs from this one, read only.
+    # The plan's own code from a copy of the harness beside the project file it reads as it loads, its
+    # checkout's inputs from this one, read only.
+    checkout = Path(__file__).resolve().parents[1]
     harness = tmp_path / "tools" / "armada"
-    shutil.copytree(Path(__file__).resolve().parents[1] / "tools" / "armada", harness,
-                    ignore=shutil.ignore_patterns("__pycache__"))
-    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    shutil.copytree(checkout / "tools" / "armada", harness, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy(checkout / "pyproject.toml", tmp_path)
+    monkeypatch.chdir(checkout)
     source = (harness / "ci.py").read_text()
 
     def shared_of(text: str) -> str:
