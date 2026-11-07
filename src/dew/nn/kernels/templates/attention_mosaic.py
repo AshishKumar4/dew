@@ -114,26 +114,41 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     where its family's products read operands from registers, a tile its transposed streams staged at the
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
     traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
-    of a smaller one). `tiles(rows, walked, consumers)` builds the config; `rows` a consumer's where given
+    of a smaller one). Where an `overlapped` step's family runs one consumer a program on registers it
+    budgets (no partner whose products a softmax runs under: mma.sync's), its consumer's rows twice the unit
+    too, each warp two of the products' row tiles, FlashAttention 2's 128-row tile on one warpgroup: of the
+    two, the more keys and queries a step takes, on a tie the more rows, each key tile's loads and fragments
+    read once for twice the queries (an A100 at width 128, 128 x 32 against 64 x 64, ptxas 250 and 189
+    registers spilling none; width 64, 128 x 64 against 64 x 128, two programs a multiprocessor against
+    one, et-a100tile2). `tiles(rows, walked, consumers)` builds the config; `rows` a consumer's where given
     (a backward's `fewer_rows`). None where no tile fits."""
-    rows = query_rows(family, dtype, held) if rows is None else rows
-    most = most_consumers(family, tiles(rows, family.rows, 1)) if overlapped else 1
+    unit = query_rows(family, dtype, held) if rows is None else rows
+    most = most_consumers(family, tiles(unit, family.rows, 1)) if overlapped else 1
+    wide = rows is None and overlapped and most == 1 and family.budgets_registers
 
-    def padded(consumers: int) -> int:
+    def padded(rows: int, consumers: int) -> int:
         return -(-held // (rows * consumers)) * rows * consumers
 
-    for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
-        if consumers > 1 and padded(consumers) - padded(consumers - 1) > held // 8:
-            # A count whose tile pads the held rows by more than an eighth of them beyond the next count's
-            # (a 192-row tile of three consumers over a 256-row shard pads it by half, where two consumers'
-            # 128 pad none): the call's padding is a copy and its last tile's work wasted.
-            continue
-        for extent in walks(family, dtype, walked):
-            for narrow in stagings(family):
-                config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
-                if fits(config):
-                    return config
-    return None
+    def first(rows: int) -> Config | None:
+        for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
+            if consumers > 1 and padded(rows, consumers) - padded(rows, consumers - 1) > held // 8:
+                # A count whose tile pads the held rows by more than an eighth of them beyond the next
+                # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
+                # consumers' 128 pad none): the call's padding is a copy and its last tile's work wasted.
+                continue
+            for extent in walks(family, dtype, walked):
+                for narrow in stagings(family):
+                    config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
+                    if fits(config):
+                        return config
+        return None
+
+    # Twice the unit where the held rows take it, padding them by no more than an eighth beyond the unit's.
+    candidates = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
+    found = [config for config in map(first, [*candidates, unit]) if config is not None]
+    if not found:
+        return None
+    return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers, config.block_q))
 
 
 def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
