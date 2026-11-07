@@ -1080,9 +1080,10 @@ class Trainer(Generic[Loss, Effects]):
 
         def lower(split: int, narrow: bool, footprint: Footprint | None = None, lowering=True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
+            # The search's first candidate takes the step compiled ahead, if any (`FitSearch.ahead`).
             return candidate_for(self, state, batch, schedule, placement, replicated, split, narrow,
                                    recorded_launches(recorded, rung), lowering=lowering, capacity=capacity,
-                                   footprint=footprint)
+                                   footprint=footprint, derived=search.ahead is None)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
