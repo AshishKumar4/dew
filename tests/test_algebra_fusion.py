@@ -369,10 +369,12 @@ def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
 @pytest.mark.parametrize("order", [("xla", "template"), ("template", "xla")],
                          ids=["xla first", "template first"])
 def test_a_bodys_attention_takes_each_scopes_kernel_choice(order):
-    """Written-out attention inside a scanned body, its one body traced through `dew.jit` under one kernel
-    choice and then another, in either order: each trace takes its own scope's choice, the template's
-    kernel under `attention="template"` and none under `attention="xla"`, not the body the earlier scope
-    rewrote."""
+    """Written-out attention inside a scanned body of a program held as a jaxpr, which every trace of it
+    binds again as the same body, traced through `dew.jit` under one kernel choice and then another, in
+    either order: each trace takes its own scope's choice, the template's kernel under
+    `attention="template"` and none under `attention="xla"`, not the body the earlier scope rewrote."""
+    from jax.extend.core import jaxpr_as_fun
+
     import dew
 
     attend = written_out()
@@ -383,11 +385,11 @@ def test_a_bodys_attention_takes_each_scopes_kernel_choice(order):
         return jax.lax.scan(one, q, None, length=2)[0]
 
     shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
-    traced = jax.jit(layers)
+    held = jaxpr_as_fun(jax.make_jaxpr(layers)(*shapes))
     with generation.assumed("sm90"):
         for choice in order:
             with dew.kernels.use(attention=choice):
-                routes = _attention_routes(lambda: dew.jit(traced).trace(*shapes))
+                routes = _attention_routes(lambda: dew.jit(held).trace(*shapes))
             assert bool(routes) == (choice == "template"), (choice, routes)
 
 
@@ -558,9 +560,6 @@ NEAR_NORMS = {
     "its own sum as the weight": lambda x, w: (
         x.astype(jnp.float32) * _rows_inverse(x)[:, None]
         * jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1)[None, :]).astype(x.dtype),
-    "a mean near the width": lambda x, w: (x.astype(jnp.float32) * jax.lax.rsqrt(
-        jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) / 256.001 + 1e-6)
-        * w.astype(jnp.float32)).astype(x.dtype),
     "a weight rounded to bf16 before it weighs": lambda x, w: (
         x.astype(jnp.float32) * _rows_inverse(x)[:, None]
         * (w.astype(jnp.float32) * 1.001).astype(jnp.bfloat16).astype(jnp.float32)).astype(x.dtype),
@@ -569,11 +568,26 @@ NEAR_NORMS = {
 so every axis has the feature axis's extent)."""
 
 
+@pytest.mark.parametrize("width", [256, 256.001])
+def test_a_norm_is_its_mean_over_the_rows_width_alone(width):
+    """A row's sum of squares over its width is its mean, which the compile point writes as Dew's norm; over
+    a divisor near the width, closer than any output of the row's dtype shows, it is no norm, and the
+    compile point writes none."""
+    def program(x, w):
+        widened = x.astype(jnp.float32)
+        inverse = jax.lax.rsqrt(jnp.sum(jnp.square(widened), axis=-1, keepdims=True) / width + 1e-6)
+        return (widened * inverse * w.astype(jnp.float32)).astype(x.dtype)
+
+    _, found = _norms_written(program, jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                              jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    assert found == (width == 256)
+
+
 @pytest.mark.parametrize("program", list(NEAR_NORMS))
 def test_a_plain_program_near_a_norm_computes_as_written(program):
     """A program whose arithmetic resembles an RMSNorm or SwiGLU without being one (the statistics or the
     weight laid along another axis, a nested program only named silu, a mean scaled by zero, the region's own
-    sum read as its weight, a mean over a width near the row's but not it, a weight rounded by a cast the
+    sum read as its weight, a weight rounded by a cast the
     norm would drop), compiled through `dew.jit` on an H100, computes what it does as written: its
     output and gradients on par with the program's (check 1), whatever of it the compile point writes as
     Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as written)."""
