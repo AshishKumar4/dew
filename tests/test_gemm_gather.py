@@ -24,6 +24,7 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
     with generation.assumed("sm90"):
         a_gathered_product_is_on_par(grouped_matmul.INTERPRETED)
         a_gathered_product_is_on_par(grouped_matmul.INTERPRETED, paired=True, scattered=True)
+        a_deep_gathered_step_reads_its_rows_as_their_copy_would(grouped_matmul.INTERPRETED)
     tokens, table = jnp.zeros((200, 128), jnp.bfloat16), jnp.zeros((256,), jnp.int32)
     with generation.assumed("sm80"), pytest.raises(ValueError):
         mosaic_gpu.gmm(tokens, jnp.zeros((4, 128, 256), jnp.bfloat16),
@@ -31,6 +32,26 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
                        tiles=mosaic_gpu.Tiles(128, 128, 32, 3, 1, family="mma.sync"), transpose_rhs=False,
                        out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
                        gather=table)
+
+
+def a_deep_gathered_step_reads_its_rows_as_their_copy_would(interpret):
+    """A gathered product's 256-deep step, four swizzled tiles a row (its rows' copies, `mosaic.row_copies`,
+    the load barrier's arrivals: counted apart, the packed NVFP4 bank's gathered walk hung): bitwise the same
+    tile's product of the rows gathered first, its groups ragged, one empty, rows past them."""
+    tiles = mosaic_gpu.Tiles(128, 128, 256, 2, 1, warpgroups=2, family='wgmma')
+    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    rng = np.random.default_rng(7)
+    tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 512)), jnp.bfloat16)
+    table = rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)]))
+    table = jnp.asarray(table, jnp.int32)
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(4, 512, 256)), jnp.bfloat16)
+
+    def product(rows, gather):
+        return mosaic_gpu.gmm(rows, matrices, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.float32,
+                              multiprocessors=4, interpret=interpret, gather=gather)
+
+    np.testing.assert_array_equal(np.asarray(product(tokens, table)),
+                                  np.asarray(product(tokens[table], None)))
 
 
 def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False, scattered: bool = False):
@@ -41,14 +62,14 @@ def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False, scatt
     a second matrix's product beside it; `scattered`, each row stored at its entry of a permutation (`gmm`'s
     `scatter`: the MoE's un-permute fused into the stores)."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
-    sizes = jnp.asarray([70, 0, 129, 51], jnp.int32)
+    sizes, depth = jnp.asarray([70, 0, 129, 51], jnp.int32), 128
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        tokens = jnp.asarray(rng.normal(size=(200, 128)), jnp.bfloat16)
+        tokens = jnp.asarray(rng.normal(size=(200, depth)), jnp.bfloat16)
         table = jnp.asarray(rng.permutation(np.concatenate([np.arange(150), rng.integers(0, 200, 106)])),
                             jnp.int32)
-        matrices = jnp.asarray(rng.normal(size=(2, 4, 128, 256)) / np.sqrt(128), jnp.bfloat16)
+        matrices = jnp.asarray(rng.normal(size=(2, 4, depth, 256)) / np.sqrt(depth), jnp.bfloat16)
         slots = jnp.asarray(rng.permutation(256), jnp.int32)
         return tokens, table, matrices, slots
 

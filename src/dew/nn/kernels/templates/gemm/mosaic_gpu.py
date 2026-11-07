@@ -1031,13 +1031,14 @@ def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
 
 def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
     """Dew: a gathered product's rows stream (`family.streams`' arguments): its producer's gather
-    (`gathered.Ring`), or interpreted, where no lane-level copy runs, a copy a row of each of its
-    swizzled tiles' columns (`Ring.parts`), that many arrivals at its load barrier; none ungathered."""
+    (`gathered.Ring`), or interpreted, where no lane-level copy runs, each row's copies (`Ring.parts`, its
+    slot staged where layout inference lays it out: `mosaic.row_copies` at no stated swizzle), that many
+    arrivals at its load barrier a row; none ungathered."""
     if gather is None:
         return {}
     if interpret:
-        unit = mosaic.swizzle_columns(dtype, mosaic.SWIZZLE_BYTES)
-        return {'copies': {'rows': tiles.block_m * max(1, tiles.block_k // unit)}}
+        copies = mosaic.row_copies((tiles.block_m, tiles.block_k), dtype, None)
+        return {'copies': {'rows': tiles.block_m * copies}}
     return {'gathered': ('rows',)}
 
 
