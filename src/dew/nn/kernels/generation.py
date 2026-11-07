@@ -268,8 +268,11 @@ _TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, None, scoped_vmem=16 * 2 
 
 def architecture(generation: str) -> Architecture | None:
     """The instruction family `generation` belongs to, from its compute capability alone, one rule a
-    capability (a TPU's generation), so a device no row names (B300, sm103) takes its family's facts;
-    None outside every family Dew knows (a GPU before Turing, a TPU no rule states, a CPU)."""
+    capability (a TPU's generation), so a device no row names (B300, sm103) takes its family's facts, and
+    an NVIDIA GPU past every rule (a capability Dew states none for yet) takes mma.sync's forms on TMA
+    rings, which every NVIDIA GPU from Hopper issues, with the newest such architecture's facts (consumer
+    Blackwell's): the Mosaic templates run wherever CUDA does (row 4727). None outside every family Dew
+    knows (a GPU before Ampere, a TPU no rule states, a CPU)."""
     found = capability(generation)
     if found is None:
         return _TPUS.get(generation)
@@ -282,15 +285,13 @@ def architecture(generation: str) -> Architecture | None:
         return _HOPPER
     if major in (10, 11):
         return _BLACKWELL
-    if major == 12:
-        return _BLACKWELL_CONSUMER
-    return None
+    return _BLACKWELL_CONSUMER if major >= 9 else None
 
 
 def family(generation: str) -> str | None:
     """The instruction family a template's mainloop claims `generation` by ('mma.sync', 'wgmma',
-    'tcgen05', 'tpu'), seen or unseen: a claim is a family, never a list of devices; None outside every
-    family (a Turing GPU, a CPU)."""
+    'tcgen05', 'tpu'), seen or unseen (an NVIDIA GPU past every rule claimed by mma.sync, `architecture`):
+    a claim is a family, never a list of devices; None outside every family (a Turing GPU, a CPU)."""
     found = architecture(generation)
     return None if found is None else found.family
 
