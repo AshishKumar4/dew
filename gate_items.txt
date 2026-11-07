@@ -1,0 +1,3 @@
+bare|8|1
+conditioned|8|1
+image|8|1
