@@ -10,6 +10,8 @@ import numpy as np
 from flax import struct
 from jax import lax
 
+from dew.nn.programs import on_host
+
 from .common import (
     Multistep,
     _check_endpoint_domain,
@@ -221,7 +223,7 @@ class DPMSolverSinglestep:
         steps = times.shape[0] - 1
         orders = self.order_list(steps)
         if orders:
-            with jax.ensure_compile_time_eval():
+            with on_host():
                 _, last_sigma = process.sampler_schedule.rates(times[-1:])
                 if bool(jnp.all(last_sigma == 0)):
                     orders[-1] = 1

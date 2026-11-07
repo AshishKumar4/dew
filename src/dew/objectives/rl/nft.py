@@ -44,6 +44,7 @@ from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.precision import at_least_fp32
+from dew.nn.programs import on_host
 from dew.objectives.base import OMITTED, TEACHER, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective, teacher_weights
 from dew.sampling.solvers import Solver
@@ -242,8 +243,10 @@ class NFTRollout(GroupedRollout):
         # The training process's grid, in the times its denoiser and forward map read, never a loaded
         # pipeline's table coordinates.
         process = objective.process
-        with jax.ensure_compile_time_eval():
-            times = process.times(self.steps)
+        # Computed on this host, whatever mesh the rollout's trace holds (`programs.on_host`): a compile-only
+        # mesh's devices run nothing here.
+        with on_host():
+            times = np.asarray(process.times(self.steps))
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         x_T = process.noise(noise_key, (count, *objective.latent_shape))
