@@ -71,7 +71,7 @@ def bundle_dtype(dtype) -> jnp.dtype:
 def family_of(dtype=jnp.bfloat16) -> mosaic.Family | None:
     """The bundle of the device's instruction family for a call of `dtype` (`bundles.of`), None where the
     mainloop has none (a CPU's)."""
-    return bundles.of(generation.device_generation(), bundle_dtype(dtype))
+    return bundles.of(generation.device_generation(), bundle_dtype(dtype), scoped=True)
 
 CHUNK = 64
 """Tokens a chunk, fla's."""
@@ -556,6 +556,9 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
     family = call.family
     staged, landed = _roles_staged(staging, landing, consumers)
     staged = (*staged, _landed(landed, family))
+    # The products' shared memory and barriers where the family keeps them (`Issuer.product_scratch`, which
+    # `launch_kernel` scopes beside the staging).
+    products = family.product_shared(family.product_scratch(consumers, _product_widths(blocks, staging)))
 
     def allocations(depth: int) -> dict:
         opened = {"walked": family.streams(blocks, depth, consumers, swizzles=swizzles)}
@@ -564,7 +567,8 @@ def shared_allocation(call: Call, blocks: dict, staging: tuple, landing: dict, *
         return opened
 
     def scope(depth: int) -> resources.Scope:
-        return allocation_scope(family, allocations(depth), staged, reduces=reduces, after=after)
+        return allocation_scope(family, allocations(depth), (*staged, *products), reduces=reduces,
+                                after=after)
 
     return allocations, scope, staged, landed
 
@@ -682,6 +686,16 @@ def _tile_at(index, grid: tuple, grid_names: tuple) -> dict:
     return indices
 
 
+def _product_widths(blocks: dict, staging: tuple) -> tuple[int, ...]:
+    """Each width a launch's products may take: a row or column count of a tile it streams or stages (a
+    product's right operand, as it is or transposed), the chunk's or a sub-chunk's (`algebra.SUB`, the
+    factored pairs' diagonal blocks), one a tensor instruction issues (16 to 256 columns, whole 16s)."""
+    shapes = [shape for shape, _ in blocks.values()]
+    shapes += [leaf.shape for leaf in jax.tree.leaves(staging) if hasattr(leaf, "shape")]
+    found = {CHUNK, algebra.SUB, *(extent for shape in shapes if len(shape) >= 2 for extent in shape[-2:])}
+    return tuple(sorted(width for width in found if 16 <= width <= 256 and width % 16 == 0))
+
+
 def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: dict, stages: int | tuple, live,
                   work: Work, held: Held, staging: tuple = (), once: dict | None = None,
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
@@ -744,7 +758,11 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
         return recorded
 
     def entry(*arrays):
-        def scoped(staged, *, streams):
+        def scoped(staged, products, *, streams):
+            with family.products_in(products):
+                return run(staged, streams=streams)
+
+        def run(staged, *, streams):
             *staged, lands = staged
             keys = _landing_keys(landing, family)
             lands = {name: lands[keys[name]] for name in landing}
@@ -754,40 +772,22 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                 runs its own roles (`sequence_walk`'s)."""
                 return program(at, *arrays, streams=streams, staging=tuple(staged), landing=lands)
 
-            if not persistent:
-                walked = given({axis: lax.axis_index(axis) for axis in grid_names})
-                if walked is not None:
-                    family.run(streams["walked"], walked, call.interpret)
+            if persistent:
+                _persisted(family, streams["walked"], given, live, arrays, grid, grid_names, call.interpret)
                 return
+            walked = given({axis: lax.axis_index(axis) for axis in grid_names})
+            if walked is not None:
+                family.run(streams["walked"], walked, call.interpret)
 
-            def tile(at: dict) -> mosaic.Walk:
-                """The tile's walk, which a persistent launch's program returns."""
-                walked = given(at)
-                assert walked is not None, "a persistent launch's program returns its tile's walk"
-                return walked
-
-            def schedule(index):
-                at = _tile_at(index, grid, grid_names)
-                walked = tile(at)
-                return live(at, arrays), walked.steps, walked.views, at
-
-            def issue(_, at, walk, *, active):
-                # A tile's steps store what they compute: nothing is left to finish.
-                if active:
-                    tile(at).persisted(walk)
-
-            def finish(*_, **__):
-                pass
-
-            family.persist(streams["walked"], (tiles,), schedule, issue, finish, consumers=1, axis="programs",
-                           outputs=(), interpret=call.interpret)
-
+        # The products' own memory where the family's issuer keeps each (`Issuer.product_scratch`): a
+        # product's width is one of its tiles' (its streams', its staging's) or the chunk's.
+        products = family.product_scratch(consumers, _product_widths(blocks, staging))
         if persistent:
-            family.scoped(scoped, staging, streams=streams)
+            family.scoped(scoped, staging, products, streams=streams)
         else:
             # An empty program scopes nothing (Mosaic GPU's interpreter takes a scope's allocations in turn).
             at = {axis: lax.axis_index(axis) for axis in grid_names}
-            pl.when(live(at, arrays))(lambda: family.scoped(scoped, staging, streams=streams))
+            pl.when(live(at, arrays))(lambda: family.scoped(scoped, staging, products, streams=streams))
 
     entry.__name__ = name
 
@@ -804,6 +804,34 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     return launched
 
 
+def _persisted(family: mosaic.Family, streams, given, live, arrays, grid: tuple, grid_names: tuple,
+               interpret: bool) -> None:
+    """A persistent launch's program (`launch_kernel`'s): `grid`'s tiles' walks, each its program's at the
+    tile's indices (`given`, `_tile_at`) where `live` holds, on the family's persist, its rings running on
+    across them."""
+    def tile(at: dict) -> mosaic.Walk:
+        """The tile's walk, which a persistent launch's program returns."""
+        walked = given(at)
+        assert walked is not None, "a persistent launch's program returns its tile's walk"
+        return walked
+
+    def schedule(index):
+        at = _tile_at(index, grid, grid_names)
+        walked = tile(at)
+        return live(at, arrays), walked.steps, walked.views, at
+
+    def issue(_, at, walk, *, active):
+        # A tile's steps store what they compute: nothing is left to finish.
+        if active:
+            tile(at).persisted(walk)
+
+    def finish(*_, **__):
+        pass
+
+    family.persist(streams, (math.prod(grid),), schedule, issue, finish, consumers=1, axis="programs",
+                   outputs=(), interpret=interpret)
+
+
 def _solving(call: Call) -> mosaic.Family:
     """The bundle the solve launch issues by: of the layouts the call's device takes (`bundles.layouts`), the
     first whose programs a multiprocessor holds most (`Family.programs`, a consumer role's), the call's own
@@ -815,7 +843,7 @@ def _solving(call: Call) -> mosaic.Family:
     (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's (`bundles.INTERPRETED`)."""
     if call.interpret:
         return call.family
-    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype))
+    layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), scoped=True)
     return max((call.family, *layouts), key=lambda layout: layout.programs(1))
 
 
@@ -2161,7 +2189,7 @@ def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
     family = call.family
     swizzle = resources.widest_swizzle(call.given.stored, call.width)
     if not family.operands_in_registers:
-        swizzle = min(swizzle, resources.widest_swizzle(call.memories.stored, bv))
+        swizzle = min(swizzle, family.right_swizzle(call.memories.stored, bv))
     while swizzle > mosaic.NARROWEST_SWIZZLE_BYTES and (
             _output_held(call, bv, swizzle).registers(family, _addressed(staging, landing))
             > family.registers(1)):

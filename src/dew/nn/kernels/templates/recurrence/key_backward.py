@@ -447,13 +447,22 @@ def _key_pairs_staged(call: Call, keys: int) -> tuple:
     gated down, staged once a key block) in `_parted`'s form, and the sub-chunks' references' plain tile; a
     key block's landing."""
     parted = _parted(call)
+    # The squares' and gated rows' sub-chunk products contract `algebra.SUB` rows, which tcgen05 issues in
+    # whole swizzles: their swizzle fits that depth, where inference's 128 bytes refused the launch on an
+    # sm100 ('K must be a multiple of 64, got: 16', jsf-gate100g).
+    transforms = mosaic.swizzle_transforms(parted.stored, mosaic.swizzle_for(parted.stored, algebra.SUB))
+
+    def sub_parts(columns):
+        return tuple(plgpu.SMEM((CHUNK, columns), parted.stored, transforms=transforms)
+                     for _ in range(parted.parts))
+
     # Where the call's pairs do not factor (`Call.factored`), a key block's keys and separated prefix below a
     # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads).
     padded = () if call.factored else (plgpu.SMEM((3, algebra.SUB + CHUNK, keys), jnp.float32),
                                        plgpu.SMEM((CHUNK + algebra.SUB, keys), jnp.float32))
     staging = ([staging_tiles(parted, (CHUNK, keys))[0] for _ in range(2)],
-               [staging_tiles(parted, (CHUNK, CHUNK))[0] for _ in range(2)],
-               [staging_tiles(parted, (CHUNK, keys))[0] for _ in range(2)],
+               [sub_parts(CHUNK) for _ in range(2)],
+               [sub_parts(keys) for _ in range(2)],
                plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32), *padded)
     return staging, {"block": _fp32(call).landing(CHUNK, keys)}
 
