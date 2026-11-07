@@ -191,15 +191,13 @@ def jax_attention(*, causal: bool):
     return attend
 
 
-def flax_attention(*, causal: bool, wide: bool = True):
-    """Flax's attention as a Flax model writes it, its causal mask built from the rows, its softmax in
-    float32 where `wide` (`force_fp32_for_softmax`, the kernels' arithmetic) and Flax's default, the
-    operands' dtype, else."""
+def flax_attention(*, causal: bool):
+    """Flax's attention as a Flax model writes it, its causal mask built from the rows."""
     from flax import linen as nn
 
     def attend(q, k, v):
         mask = nn.make_causal_mask(jnp.ones(q.shape[:2])) if causal else None
-        return nn.dot_product_attention(q, k, v, mask=mask, force_fp32_for_softmax=wide)
+        return nn.dot_product_attention(q, k, v, mask=mask)
     return attend
 
 
@@ -208,17 +206,6 @@ SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2, True),
              "flax causal": (flax_attention(causal=True), 4, True),
              "flax": (flax_attention(causal=False), 4, False)}
 """Each plain program's attention, its key heads over 4 query heads, and whether it is causal."""
-
-
-def test_flaxs_default_attention_softmax_in_bfloat16_is_kept_as_written():
-    """Flax's attention at its default, its softmax in the operands' bfloat16, compiled through `dew.jit` on
-    an H100, runs as written: Dew's call computes it only with its softmax in bfloat16, which no kernel of
-    Dew's takes, so no region is written as a kernel's (row 4783)."""
-    import dew
-
-    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
-    with generation.assumed("sm90"):
-        assert not _attention_routes(lambda: dew.jit(flax_attention(causal=True, wide=False)).trace(*shapes))
 
 
 def _attention_routes(trace) -> list[str]:
@@ -230,7 +217,7 @@ def _attention_routes(trace) -> list[str]:
 
 @pytest.mark.parametrize("spelling", list(SPELLINGS))
 def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
-    """A plain JAX or Flax program's softmax attention (`dew.algebra.recognize`) compiled through
+    """A plain JAX or Flax program's softmax attention (`dew.algebra.attention_regions`) compiled through
     `dew.jit` on an H100 runs the kernel Dew's selector gives the call (FlashAttention, or the template a call
     names), where the program as written runs XLA's; on this host, its output and gradients under the
     template (its portable mainloop) on par with the program as written (check 1)."""
@@ -286,7 +273,7 @@ FORMS = {
     "twice the default scale": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
                                                      implementation="xla"),
-        None),
+        lambda q, k, v: {}),
     "a causal window": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
                                                      implementation="xla"),
@@ -294,55 +281,47 @@ FORMS = {
     "a softcap": (softcapped_attention, lambda q, k, v: {"causal": True, "softcap": 50.0}),
 }
 """Each plain program's attention under a form beside the default scale and a causal mask, and the arguments
-Dew's own attention takes for it; None where no call of Dew's computes it (a scale other than the default:
-another constant), which the compile point keeps as written."""
+Dew's own attention takes for it."""
 
 
 @pytest.mark.parametrize("form", list(FORMS))
 def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes(form):
-    """A plain program's attention under a mask or bias it draws from its inputs, a causal window or a
-    softcap, compiled through `dew.jit` on an H100, runs the kernel Dew's own attention call under those
-    arguments routes to (none where that is XLA's), and under a scale no call of Dew's takes runs as
-    written, XLA's; on this host, under the template, its output and gradients on par with the program as
-    written (check 1)."""
+    """A plain program's attention under a mask or bias it draws from its inputs, a scale a power of two past
+    the default, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel Dew's
+    own attention call under those arguments routes to (none where that is XLA's), where the program as
+    written runs XLA's; on this host, under the template, its output and gradients on par with the program
+    as written (check 1)."""
     from attention_oracle import attention_on_par
     from contract_support import normal_drawn
 
     import dew
-    from dew.algebra.recognize import KEPT
+    from dew.algebra.attention_regions import KEPT
     from dew.nn.attention import scaled_dot_product_attention
 
     attend, arguments = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
 
     def own(q, k, v):
-        return scaled_dot_product_attention(q, k, v, scale_logits=True, **arguments(q, k, v))
+        return scaled_dot_product_attention(q, k, v, **arguments(q, k, v))
 
     with generation.assumed("sm90"):
         assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
-        expected = [] if arguments is None else [
-            kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes)) if kernel not in KEPT]
+        expected = [kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
+                    if kernel not in KEPT]
         assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):
         attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
                          truth=lambda *x: attend(*(a.astype(jnp.float64) for a in x)))
 
-def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None,
-                root=None):
+def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None):
     """Causal softmax attention as a program writes it out (its products as einsums, a causal where, the
     safe softmax), each keyword a way it computes something other than attention: a finite fill keeping the
     future keys' weight, logits truncated or narrowed through `logits_cast`, a maximum's initial value above
     the logits, each row divided by another row's sum (heads and rows swapped in its broadcast), the sum
-    narrowed through `sum_cast` (to float16, where 65536 keys' sum overflows), the queries divided by a
-    `root` near sqrt(D) but not it (Flax's division, its divisor another scale)."""
+    narrowed through `sum_cast` (to float16, where 65536 keys' sum overflows)."""
     def attend(q, k, v):
-        if root is not None:
-            # Flax's: the queries divided before the product, no scale after it.
-            s = jnp.einsum("bthd,bshd->bhts", q / jnp.float32(root).astype(q.dtype), k,
-                           preferred_element_type=jnp.float32)
-        else:
-            s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+        s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
         if logits_cast is not None:
             s = s.astype(logits_cast).astype(jnp.float32)
         s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, fill)
