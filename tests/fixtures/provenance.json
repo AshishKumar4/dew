@@ -3844,6 +3844,50 @@
    ],
    "note": "Float64 oracle widens upstream float32 casts, tools/diffusers_wan_reference.py:95."
   },
+  "wan/published.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The published tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-published on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "wan/published-bf16.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The published tiny Wan transformer read in bfloat16 by Diffusers 0.34.0 (its time embedder kept in float32), run by tools/wan_worker.py wan-bf16-published over each seed's drawn latents and prompt states: the flow in bfloat16 and, on its float64 twin, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "wan/variant.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The variant tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-variant on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
+  "wan/variant-bf16.npz": {
+   "tool": "tools/venv_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "WanTransformer3DModel"
+    }
+   ],
+   "note": "The variant tiny Wan transformer read in bfloat16 by Diffusers 0.34.0 (its time embedder kept in float32), run by tools/wan_worker.py wan-bf16-variant over each seed's drawn latents and prompt states: the flow in bfloat16 and, on its float64 twin, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
   "wan_vae.tar.xz": {
    "tool": "tools/diffusers_wan_vae_reference.py",
    "sources": [
