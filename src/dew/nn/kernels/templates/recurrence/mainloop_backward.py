@@ -1086,7 +1086,10 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
                 after_ref, decay_ref, *, streams, staging, landing):
         c, n, h = at["blocks"], at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        staged, *summing = staging
+        # The weighted system's tile and, where a chunk is wider than a key block, a block's apart: the
+        # products' operands in registers (the rest are streamed).
+        square, *rest = staging
+        blocked, summing = (rest[0], rest[1:]) if chunk != call.block else (square, rest)
         column = c * call.block
         views = stream_views(lower=held.views(a_ref, row, chunk, h * chunk, chunk),
                              keys=given.views(k_ref, row, chunk, h // call.group * width + column,
@@ -1109,7 +1112,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
                 stream_tile(slots, "lower", held), functools.partial(whole, "keys", given), 1,
                 functools.partial(whole, "w_grads", held), stream_tile(slots, "system", held), beta, gate,
                                                          low,
-                held.dtype, Issuer(call, dict.fromkeys(("inverse_t", "keys_dl", "keys_dlt"), staged)),
+                held.dtype, Issuer(call, {"inverse_t": blocked, "keys_dlt": square}),
                 emit=stored)
             summed, columns = summed_issuer(tuple(summing), call)
             decay_ref.at[c, h, span][...] = algebra.summed_pairs(pairs, summed, columns)
@@ -1137,6 +1140,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
                          grid_names=("blocks", "chunks", "heads"), blocks=tiles, stages=1,
                          live=chunk_liveness(7),
                          work=work, held=held_tiles,
-                         staging=staging_tiles(held, (chunk, chunk)) + summing_staging(call),
+                         staging=(staging_tiles(held, *dict.fromkeys(((chunk, chunk), (chunk, call.block))))
+                                  + summing_staging(call)),
                          landing={"block": held.landing(chunk, call.block)})(a, k, dw, dl, hi, lo, beta,
                                                                              taken)
