@@ -95,7 +95,7 @@ for name, regime, leaf in cases:
     truth = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
     ratios, mine, theirs, rawmine, rawtheirs = [], [], [], [], []
     for seed in range(8):
-        with jax.experimental.enable_x64(False):
+        with jax.enable_x64(new_val=False):
             args = cotangents(hooks, regime, seed)
         a, b, t = candidate(*args), reference(*args), truth(*widened(args))
         av, bv, tv = (np.asarray(getattr(x[1], leaf), np.float64) for x in (a, b, t))
