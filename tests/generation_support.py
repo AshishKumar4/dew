@@ -62,7 +62,7 @@ def lowers_as(name: str) -> bool:
     if not runnable(name):
         return False
     here = generation.device_generation()
-    return here == "cpu" or generation.gpu_target(name).tma == generation.gpu_target(here).tma
+    return here == "cpu" or generation.architecture(name).tma == generation.architecture(here).tma
 
 
 def lowers(name: str):
