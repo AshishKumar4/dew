@@ -39,6 +39,13 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
 
     name = "mma.sync.fed"
     consumers = 1
+    held_registers = 65
+    """mma.sync's measured whole (`MmaIssuer`'s 40) and the 25 its consumer-fed launches held past it on a
+    B200: ptxas's least register cap less the model over every recurrence gate launch at base e346aa4af72
+    (FS-CENSUSFED-100d), at most +25 (key_values_back), +24 (states), +22 (keys_back, values_back), +17
+    (query_key), where the same launches on cp.async held at most +21 and an RTX PRO 6000's at most +7
+    (FS-CENSUSFED-120): the ring each consumer fills, its slots, barrier phases and copy coordinates live
+    in its own registers, warpgroup MMA's producer's uniform ones."""
 
 
 def groups(generation_name: str, dtype, *, stated: bool = False, tpu: bool = False

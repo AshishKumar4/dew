@@ -366,7 +366,7 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
 
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
                         precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_seed=None,
-                        dropout_places=None, wide_logits=False):
+                        dropout_places=None, wide_logits=False, scale_logits=False):
     """Attend over [B, S, H, D] in plain XLA ops, every score policy on one pipeline.
 
     It is flax's reference attention, op for op: the query scaled by
@@ -386,6 +386,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     GPU. `wide_logits` computes the logits from the query and keys widened to
     at least fp32 and scales them after the product, as DeepSeek V4 does
     (modeling_deepseek_v4.py:708-736); the value product stays in the inputs'
+    dtype. `scale_logits` forms the logits of the query and keys in their own
+    dtype as fp32 (the product's preferred type) and scales them after it, by
+    `D ** -0.5` in fp32, the mask and softmax reading them in fp32: jax.nn's xla
+    form (`jax.nn.dot_product_attention`) and the fused kernels' own, where
+    flax's scales the query before the product and rounds its logits to its
     dtype.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
@@ -394,21 +399,27 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     kv_heads, keys = key.shape[-2], key.shape[-3]
     if wide_logits:
         scaled_query, scoring = query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
+    elif scale_logits:
+        scaled_query, scoring = query, key
     else:
         scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
+    # jax.nn's logits are its product's fp32 sums, never rounded to the operands' dtype.
+    formed = at_least_fp32(dtype) if scale_logits else None
     if sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
-        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision)
+        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision,
+                                preferred_element_type=formed)
     elif kv_heads == 1:
         # One key/value head (DeepSeek V4's): the query heads are a free dim beside the rows, and no
         # size-one head axis rides as a batch dim, which had XLA transpose the fp32 query for the
         # product (a V4 layer's training step on an H100, batch 4 by 2048: 2 GiB more and 5% slower).
-        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision)
+        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision,
+                                preferred_element_type=formed)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision).reshape(
-            *rows, heads, length, keys)
-    if wide_logits:
+        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision,
+                                preferred_element_type=formed).reshape(*rows, heads, length, keys)
+    if wide_logits or scale_logits:
         logits = logits * width ** -0.5
     if softcap is not None:
         logits = capped_logits(logits, softcap)
@@ -456,7 +467,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
                                  dropout_rng=None, deterministic=True, key_segment_ids=None,
                                  key_value_seq_starts=None, block_groups=None, image_groups=None,
-                                 key_valid=None, key_runs=None, places=None):
+                                 key_valid=None, key_runs=None, places=None, scale_logits=False):
     """Attend over [B, S, H, D] queries, keys and values: [B, S, H, Dv] out.
 
     `implementation` names the kernel (`AttentionImpl`, dispatched by
@@ -472,7 +483,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
     `sinks` is one learned value-free logit per query head in the denominator.
     `softcap` is Gemma 2's tanh on the scaled logits. `wide_logits` forms them
-    wide, which the reference alone does (`reference_only`). `segment_ids` `[B, S]`
+    wide, which the reference alone does (`reference_only`). `scale_logits`
+    applies the scale `D ** -0.5` to the fp32 logits after the product (jax.nn's
+    and the fused kernels' form) where by default the query in its dtype takes it
+    before (flax's): the reference path's arithmetic alone, which every route takes
+    as the default's (`reference_attention`). `segment_ids` `[B, S]`
     keeps each packed document to itself, 0 as padding (`document_mask`), and
     `max_segments`, static, bounds the documents a row holds
     (`Coordinates.max_segments`), which flash's packed sequences need.
@@ -553,7 +568,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-        softcap=softcap, wide_logits=wide_logits)
+        softcap=softcap, wide_logits=wide_logits, scale_logits=scale_logits)
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
@@ -692,7 +707,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
                      key_runs=None,
                      places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None,
-                     wide_logits: bool = False):
+                     wide_logits: bool = False, scale_logits: bool = False):
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
@@ -717,7 +732,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         return grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
-            key_value_seq_starts=key_value_seq_starts, wide_logits=wide_logits), query, key, value)
+            key_value_seq_starts=key_value_seq_starts, wide_logits=wide_logits, scale_logits=scale_logits),
+            query, key, value)
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
     starts = None if key_value_seq_starts is None else jnp.asarray(key_value_seq_starts, jnp.int32)
@@ -737,7 +753,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
         block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
         places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places,
-        wide_logits=wide_logits)
+        wide_logits=wide_logits, scale_logits=scale_logits)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs,
@@ -808,7 +824,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
                       segment_ids, max_segments, lengths, starts, block_groups=None, image_groups=None,
                       key_valid=None, key_runs=None, places=None, dropout_rate=0.0, dropout_seed=None,
-                      dropout_places=None, wide_logits: bool = False):
+                      dropout_places=None, wide_logits: bool = False, scale_logits: bool = False):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
@@ -855,8 +871,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
-                                   dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                                   dropout_places=dropout_places)
+                                   scale_logits=scale_logits, dropout_rate=dropout_rate,
+                                   dropout_seed=dropout_seed, dropout_places=dropout_places)
 
     # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
     if implementation not in ('decode', 'template'):

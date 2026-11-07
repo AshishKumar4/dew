@@ -377,6 +377,18 @@ class Rows:
     rows: int
 
 
+@dataclasses.dataclass(frozen=True)
+class Scattered:
+    """An output whose row `i` lands at row `table[i]` of `ref` (a product's rows written where a
+    permutation says, `staged_rows`: a mixture of experts' slots in token order, row 1376), `table` an int32
+    ref over the stored rows, a negative entry a row stored nowhere (padding); `interpreted`, copied a row at
+    a time, where no lane-level code runs."""
+
+    ref: Any
+    table: Any
+    interpreted: bool = False
+
+
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
@@ -606,7 +618,16 @@ def staged_rows(smem, value: jax.Array, o_gmem, row_start, first, stored, column
     """`value` written to the shared buffer `smem` in its dtype (`write`: its issuer's, `Issuer.written`),
     made visible to TMA, and its rows `first` to `first + stored` stored to `o_gmem` at row
     `row_start + first` and `column` (`store_rows`); the copies stay in flight (the caller waits before
-    `smem` is written again)."""
+    `smem` is written again). A `Scattered` output's rows each land where its table says, copied by the
+    warpgroup's threads (`gathered.scattered_rows`), done when it returns, its value written unoptimized
+    (no TMA copy reads the buffer, whose plain layout has no optimized transfer from a warpgroup MMA's)."""
+    if isinstance(o_gmem, Scattered):
+        plgpu.store(smem, value.astype(smem.dtype), optimized=False)
+        plgpu.commit_smem()
+        from dew.nn.kernels.templates import gathered  # it builds on `Ring`
+
+        gathered.scattered_rows(smem, o_gmem, row_start, first, stored, column)
+        return
     write(smem, value)
     plgpu.commit_smem()
     store_rows(smem, o_gmem, row_start, first, stored, column, most, least)
@@ -933,8 +954,8 @@ row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU inde
 
 def swizzle_columns(dtype, swizzle: int) -> int:
     """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
-    slice a load of a block swizzled along that axis takes."""
-    return swizzle // jnp.dtype(dtype).itemsize
+    slice a load of a block swizzled along that axis takes (a packed dtype's two a byte)."""
+    return swizzle * 8 // resources.element_bits(dtype)
 
 
 def swizzle_for(dtype, *contractions: int) -> int:
@@ -1969,27 +1990,6 @@ class Transport[Allocated, Opened](abc.ABC):
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
-    def ticketed(self, ready, ticket, body: Callable[[], None]) -> None:
-        """`body`, an add into global memory (`added`), in its turn among the programs adding there: once
-        `ticket` of them have signalled `ready` (one of `partials_ready`'s, counting the adds done), then its
-        writes complete and `ready` signalled, so the adds land in a fixed order (a deterministic sum,
-        FlashAttention 3's dQ semaphore); `body` alone where `ready` is None (interpreted, the programs'
-        order standing in)."""
-        if ready is None:
-            body()
-            return
-        # Wait without taking: the semaphore counts the adds done, each program's turn the count before it.
-        plgpu.semaphore_wait(ready, ticket, decrement=False, memory_scope="gpu")
-        body()
-        # Its writes complete in global memory before the next turn (`added_settled`).
-        self.added_settled()
-        plgpu.semaphore_signal(ready, 1, memory_scope="gpu")
-
-    @abc.abstractmethod
-    def added_settled(self) -> None:
-        """A program's adds into global memory complete (`added`), past any copy of its still in flight (a
-        TMA reduction's); a family that adds from its registers has none in flight."""
-
     def fixed_up(self, summed, partials, ready, program, first, gathered, store,
                  combine=operator.add, firsts=None) -> None:
         """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
@@ -2393,10 +2393,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             plgpu.commit_smem()
             plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")
 
-    def added_settled(self) -> None:
-        # Its adds are TMA reductions (`added`), each in flight past its issue until waited.
-        plgpu.wait_smem_to_gmem(0)
-
 
 def arrived(counter, contributors) -> jax.Array:
     """1 where this consumer warpgroup is the last of `contributors` to arrive at `counter` (a GPU-scope
@@ -2409,8 +2405,6 @@ def arrived(counter, contributors) -> jax.Array:
     semaphores alike)."""
     scalar = plgpu.Layout.WG_SPLAT(())
 
-    @plgpu.inline_mgpu(arg_types=(plgpu.RefType(), scalar),
-                       return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
     def ticket(ctx, ref, count):
         del ctx
         i32 = ir.IntegerType.get_signless(32)
@@ -2433,7 +2427,9 @@ def arrived(counter, contributors) -> jax.Array:
             result_types=i32, has_side_effects=True, convergent=True)
         return mgpu_fragments.FragmentedArray.splat(last, (), is_signed=True)
 
-    return ticket(counter, jnp.asarray(contributors, jnp.int32))
+    inline = plgpu.inline_mgpu(arg_types=(plgpu.RefType(), scalar),
+                               return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
+    return inline(ticket)(counter, jnp.asarray(contributors, jnp.int32))
 
 
 def summing(shape: tuple[int, ...], consumers: int) -> dict:

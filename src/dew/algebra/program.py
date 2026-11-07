@@ -26,7 +26,7 @@ from jax._src import config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
-from dew._cache import ALGEBRA
+from dew._cache import ALGEBRA, KERNEL_CHOICES
 from dew.algebra import cost, extract, fusion, rules, terms
 from dew.algebra.extract import Linear
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
@@ -722,8 +722,13 @@ def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels
         return closed
     if not all(isinstance(aval, ShapedArray) for aval in closed.in_avals):
         return closed
+    from dew.algebra import derive
+
     rewrites = _REWRITTEN.setdefault(closed, {})
-    key = (_deriving(accurate, saturation), kernels)
+    # With kernels, the context the substitutions are decided in too (`fusion._decided`'s: the mesh, the
+    # numerics, the kernel choices a call names), so a body rewritten under one choice is none of another's.
+    key = (_deriving(accurate, saturation), kernels,
+           (derive.context(), KERNEL_CHOICES.value) if kernels else None)
     if key not in rewrites:
         made = _rewritten(closed, accurate, saturation, kernels)
         rewrites[key] = None if made is closed else made

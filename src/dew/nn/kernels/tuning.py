@@ -129,6 +129,23 @@ class Unpinnable(ValueError):
         return type(self), (self.kernel, self.config, self.reason)
 
 
+class Untunable(ValueError):
+    """A tuning run (`tune`'s `measure`) of a step none of whose kernel launches is Dew's (`KernelOp`), the
+    Triton kernels it launches another library's (tokamax's), which keep their heuristic: the run asked to
+    measure configs and could measure none (row 2661)."""
+
+    def __init__(self, kernels: tuple[str, ...]):
+        named = ", ".join(kernels[:4]) + (", ..." if len(kernels) > 4 else "")
+        super().__init__(
+            f"tune_kernels measures Dew's own kernel launches, and this step launches none: its Triton "
+            f"kernels ({named}) are another library's, which keep their heuristic. Route its attention to "
+            "Dew's template (model.attention_impl='template') to measure it, or run without tune_kernels.")
+        self.kernels = kernels
+
+    def __reduce__(self):
+        return type(self), (self.kernels,)
+
+
 class Unreadable(ValueError):
     """A stored launch or timing this checkout cannot rebuild: another checkout's kernel, its fields or
     its config's, or JSON this module did not write. `_read` keeps such an entry as it is."""
@@ -1082,7 +1099,9 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     which tokamax reads its launches out of (`launches`), keeps it from the
     persistent cache, so reading them so took a lowering of its own, about
     62 s of each cold plan candidate's compile of the packed Qwen3.5-0.8B step
-    on an A100 (ledger 561). A launch without a pick takes its heuristic."""
+    on an A100 (ledger 561). A launch without a pick takes its heuristic. A measuring run of a step
+    with no launch of Dew's whose Triton kernels are another library's measures nothing it asked for, and is
+    refused (`Untunable`)."""
     if not generation.triton_runs():
         return lower(), "[]"
     with reading():
@@ -1090,10 +1109,22 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
         with seen() as found:
             lowered = lower()
         distinct = _distinct(found)
+        if measure and not distinct and (foreign := _foreign_kernels(lowered)):
+            raise Untunable(foreign)
         _settle(distinct, measure=measure)
         if _cache.KERNEL_TUNES.get_global() != tuned:
             lowered = lower()
     return lowered, dumps_launches([ba for _, ba in distinct])
+
+
+def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
+    """The Triton kernels `lowered` launches that no launch of Dew's traced (their names carry no launch's
+    digest, `report.kernel_of`): another library's, outside the tuner."""
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import report
+
+    return tuple(dict.fromkeys(call.name for call in kernel_calls(lowered, unrun=True)
+                               if call.kind == "triton" and report.kernel_of(call.name)[1] is None))
 
 
 def _distinct(found: list[Launch]) -> list[Launch]:
