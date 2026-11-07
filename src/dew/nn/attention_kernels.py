@@ -133,8 +133,6 @@ class AttentionCase:
 
     queries: int
     keys: int
-    rows: int = 1
-    """The calls' rows, every leading axis of `[B, T, N, D]`'s `B` (a batch, a sequence's chunks)."""
     heads: int
     kv_heads: int
     head_dim: int
@@ -172,6 +170,8 @@ class AttentionCase:
     run's numerics name it (`generation.numerics().forms`): the old routes compute their own arithmetic
     and take only 'fast', so an accurate call runs the template, or the reference path where the
     template does not take it."""
+    rows: int = 1
+    """The call's rows, every leading axis of the query's `[B, T, N, D]` (a batch, its chunks)."""
 
     @property
     def cell(self) -> tuple[str | None, str]:
