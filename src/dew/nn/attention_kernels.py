@@ -523,10 +523,12 @@ def _attention_preferred(case: AttentionCase) -> str:
     the template's forward took 0.32 to 0.72 of xla's time on an H100 and 0.47 to 1.04 on an A100 in 22 to
     73% less memory, a table every row shares or one a row, causal and full; its training step 0.62 to 0.96
     causal on an H100, but 1.07 to 1.48 full there and 1.12 to 2.23 on an A100 (M-DD-8, W55-gh200 and
-    W57-a100: bf16, 32/8 heads x 128, 2048 and 8192 tokens, B 1 and 4)."""
+    W57-a100: bf16, 32/8 heads x 128, 2048 and 8192 tokens, B 1 and 4). An accurate call trains on the
+    template whatever its bias, as 'inference' takes the fast form alone (xla's attention computes no
+    other)."""
     backend = generation.backend()
-    if backend == 'gpu' and case.dense_bias and not (case.causal
-                                                     and generation.gpu_target().architecture.wgmma):
+    if (backend == 'gpu' and case.dense_bias and case.form == "fast"
+            and not (case.causal and generation.gpu_target().architecture.wgmma)):
         return 'inference'
     return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
 
@@ -553,7 +555,7 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
-    Kernel[AttentionCase]('inference', TEMPLATE_SUPPORTS),
+    Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS)),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
