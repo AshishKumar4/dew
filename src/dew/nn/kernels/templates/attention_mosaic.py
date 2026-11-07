@@ -66,6 +66,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     extents,
     fewer_rows,
+    hook_reduces,
     launch_scope,
     layouts,
     most_consumers,
@@ -156,6 +157,10 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     keys: int = 0
     score_kinds: tuple[Kind, ...] = ()
     score_dtypes: tuple[str, ...] = ()
+    score_reduces: bool = False
+    """Whether its score hook may reduce across warps (`hook_reduces`), its launches' warpgroups reserving
+    their scratch (`reducing`), as its builder reads it off the hook: a keyed launch's hook is its
+    fingerprint, which keeps no trace of it."""
     scale: float = 1.0
     natural: bool = NATURAL
     subtracted: bool = False
@@ -578,7 +583,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
         guarded = algebra.headroom(_computed(ba)) and ba.arguments.get("residuals") is not Kept.SPLIT
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
-            family, config.consumers, self.score_mod, self.output_mod, guarded=guarded)))
+            family, config.consumers, self.score_reduces or self.output_mod is not None, guarded=guarded)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
                   columns: int | None = None) -> int | None:
@@ -907,7 +912,8 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        output_kinds=tuple(param.kind for param in hooks.output_params),
                        score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
-                       output_width=power_of_two(value.shape[3]), form=spans.form, keys=spans.keys,
+                       score_reduces=hook_reduces(hooks), output_width=power_of_two(value.shape[3]),
+                       form=spans.form, keys=spans.keys,
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
@@ -1342,7 +1348,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             # 64 x 64 reserves no reduction scratch, its lowering's 114,688 bytes the model's without it,
             # et-fused80).
             # The fused launch's dK and dV in the operands' dtype where it stores them so (`stores_typed`).
-            reduced = reducing(family, config.consumers, self.score_mod, scaled=staged_parts(dtype) > 1)
+            reduced = reducing(family, config.consumers, self.score_reduces, scaled=staged_parts(dtype) > 1)
             allocations = (_coop_allocations if config.shared_keys
                            else functools.partial(_fused_allocations, reduced=reduced))
             typed = {} if config.shared_keys else {"typed": stores_typed(
@@ -1359,7 +1365,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                                                              min(config.stages, padded_k // config.block_k)),
                              True))
         return max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
-            layout, tiles.consumers, self.score_mod), reduces=reduces))
+            layout, tiles.consumers, self.score_reduces), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
 
     def _all_resident(self, ba: tokamax.BoundArguments, config: BackwardTiles,
@@ -1459,7 +1465,7 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     op = MosaicBackward(score_mod=hooks.score_mod,
                         score_kinds=tuple(param.kind for param in hooks.score_params),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
-                        form=spans.form, keys=spans.keys,
+                        score_reduces=hook_reduces(hooks), form=spans.form, keys=spans.keys,
                         scale=logit_scale(query.shape[3], scale), natural=natural,
                         accurate=accurate, rounded=rounded,
                         score_slopes=(varying_slopes(hooks, DQ_GRADS), varying_slopes(hooks, DKV_GRADS)))

@@ -43,6 +43,9 @@ class _Backward:
     """Whether its score hook reads its queries' places and its keys' (`score_places`)."""
     dropped: bool
     """Whether the call drops entries (a `Dropout`)."""
+    reduces: bool
+    """Whether its score hook may reduce across warps (`hook_reduces`), its launches' warpgroups reserving
+    their scratch (`reducing`)."""
 
     def places_read(self, *, masked: bool | None = None) -> tuple[bool, bool]:
         """Whether a step surely reads its queries' places and its keys' (`algebra.places_read`), `masked` or
