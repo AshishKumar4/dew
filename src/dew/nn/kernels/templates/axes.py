@@ -6,6 +6,7 @@ mainloops, Pallas-Triton's), instead of each spelling the per-axis comprehension
 from collections.abc import Mapping, Sequence
 
 import jax
+import jax.numpy as jnp
 
 WHOLE = slice(None)
 """An axis taken whole (a view's slice along an axis it does not cut)."""
@@ -41,6 +42,16 @@ def at_group(axes: Sequence[str], shape: Sequence[int], group) -> dict:
     groups: its tile's `group` modulo the operand's groups, as a stacked layer's call numbers its groups
     past the layers before it (`dew.nn.kernels.gemm._grouped`)."""
     return {GROUPS: group % shape[axes.index(GROUPS)]} if GROUPS in axes else {}
+
+
+def at_rows(array: jax.Array, axes: Sequence[str], group_sizes: jax.Array, rows: int) -> jax.Array:
+    """A side operand of one value a group (its `GROUPS` axis, `[G, ...]`) at each of `rows` rows: each
+    group's value at each of its rows, a row past the groups' the last's (its output unrouted). Its
+    derivative, the repetition's transpose, sums each group's rows' cotangents: the group-aware reduction
+    its gradient is. The one group-to-row mapping: XLA's program's (`gemm._rows`) and a launch's of no depth
+    (`mosaic_gpu.gmm`)."""
+    return jnp.repeat(array, group_sizes.astype(jnp.int32), axis=list(axes).index(GROUPS),
+                      total_repeat_length=rows)
 
 
 def by_rows(tile: jax.Array, axes: Sequence[str], rows: int) -> jax.Array:

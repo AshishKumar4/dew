@@ -11,6 +11,7 @@ from typing import Protocol
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import mosaic, product
 
@@ -39,6 +40,11 @@ class Parts:
     @property
     def T(self) -> "Parts":
         return Parts((ref.T for ref in self.refs), self.dtype)
+
+    def rows(self, start, count: int) -> "Parts":
+        """Its rows `start` to `start + count`, each part's: a product of a block of them, the rest of the
+        tile staged once for the others (KDA's pairs, a key sub-chunk's)."""
+        return Parts((ref.at[pl.ds(start, count)] for ref in self.refs), self.dtype)
 
     def astype(self, dtype) -> "Parts":
         """The tile as `dtype`'s, which a product takes it as: its own dtype alone."""
@@ -117,7 +123,7 @@ class Issuer:
         """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
         accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
         attention's output, `algebra.key_decayed_output`). Each product's operands are staged as it is
-        issued, so `products` may form them one at a time (`algebra.key_decayed_pairs`, attention's parts), a
+        issued, so `products` may form them one at a time (`algebra.key_block_pairs`, attention's parts), a
         staging into a tile an issued product may still read waiting for the products in flight first
         (`Family.settled`); `retired`, each product done before the next is formed, so a register operand's
         registers are free again (attention's parts, formed a part at a time). A product of a scaled operand

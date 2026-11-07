@@ -61,11 +61,22 @@ def geometry(case: dict) -> tuple[int, int]:
     return case["shape"] if "shape" in case else core_geometry(case)
 
 
+FORWARD_TILES = tuple(attention_triton.Tiles(block_q, block_k, attention_triton.WARPS,
+                                            attention_triton.STAGES)
+                      for block_q in attention_triton.EXTENTS for block_k in attention_triton.EXTENTS)
+"""Every forward tile a derivation or a pin may run (`TritonForward.derived`, `tuning.pinned`): each of the
+extents by each."""
+
+BACKWARD_TILES = tuple(attention_triton.BackwardTiles(block_q, block_k, attention_triton.WARPS,
+                                                      attention_triton.STAGES, attention_triton.WARPS,
+                                                      attention_triton.STAGES)
+                       for block_q in attention_triton.EXTENTS for block_k in attention_triton.EXTENTS)
+"""Every backward tile a derivation or a pin may run (`TritonBackward.derived`), both launches at each."""
+
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
           attention_triton.Tiles(128, 64, 4, 2))
-"""The configs each case runs at on the CPU, where interpreting every tile the derivation steps through
-(`FORWARD_STEPS`) would take hours; a GPU runs each (`every_config_on_a_gpu`, a cell of
-tests/test_gpu_attention.py)."""
+"""The configs each case runs at on the CPU, where interpreting every tile (`FORWARD_TILES`) would take
+hours; a GPU runs each (`every_config_on_a_gpu`, a cell of tests/test_gpu_attention.py)."""
 
 
 def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 32):
@@ -137,9 +148,9 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
 
     def ours(query, key, value):
         if mainloop == "portable":
-            out = attention_portable.attend(query, key, value, spans, hooks, block_q=config.block_q,
-                                            block_k=config.block_k, pad=attention_triton.BLOCK,
-                                            residuals=residuals, natural=natural)
+            tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
+            out = attention_portable.xla_mainloop(tiles, query, key, value, spans, hooks, residuals=residuals,
+                                                  natural=natural)
         else:
             with tuning.pinned(pin):
                 out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
@@ -220,7 +231,7 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
 
 
 def every_config_on_a_gpu(config, case):
-    """Every tile the forward's derivation steps through (`FORWARD_STEPS`), bf16, every hook: over causal
+    """Every tile a derivation or a pin may run (`FORWARD_TILES`), bf16, every hook: over causal
     documents under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
     check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
 
@@ -377,10 +388,9 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
 
     def ours(query, key, value, dout, params, initial):
         if mainloop == "portable":
-            grads = attention_portable.backward(query, key, value, spans, hooked(params, initial), dout,
-                                                block_q=config.block_q, block_k=config.block_k,
-                                                pad=attention_triton.BLOCK, natural=natural,
-                                                accurate=accurate)
+            tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
+            grads = attention_portable.backward(tiles, query, key, value, spans, hooked(params, initial),
+                                                dout, natural=natural, accurate=accurate)
         else:
             with tuning.pinned(pins):
                 grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
@@ -665,7 +675,7 @@ def test_the_backward_walks_many_key_tiles(case):
 
 
 def every_backward_config_on_a_gpu(config, case):
-    """Every tile the backward's derivation steps through (`BACKWARD_STEPS`), bf16, a softcap, sinks and
+    """Every tile a derivation or a pin may run (`BACKWARD_TILES`), bf16, a softcap, sinks and
     ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
     each the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
     programs within a block's shared memory) on par with the reference, and each other refused where it is
@@ -776,9 +786,10 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     """A training step's backward at width 256 derived for an RTX PRO 6000 (sm120) said to hold an A100's
     block, and compiled for the GPU's own (a compile-only device on this CPU): XLA refuses the program,
     naming no kernel, where its launches ask more shared memory than the GPU's 99 KB block; the run's
-    compile (`report.kept`) refuses every Triton launch's config at once, each derivation takes its next
-    config, and the program compiles on its one recompile (row 3584), every miss recorded stepped and its
-    launch's config refused."""
+    compile (`report.kept`) refuses the configs of the traced Triton launches XLA refuses each compiled
+    alone (`report.refused_alone`), each at the bytes it asked, each derivation takes its next config, and
+    the program compiles on its one recompile (row 3584, audit group 71); the program's other Triton
+    launches keep theirs."""
     import dataclasses
 
     import kernel_compile
@@ -803,12 +814,22 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
         with generation.assumed(said), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm120")):
             return jax.jit(fresh).trace(*[shape] * 4).lower()
 
+    from dew.nn.kernels.lowered import triton_kernels
+
+    first = lowered()
+    alone = report.refused_alone(first)
+    every = set(triton_kernels(first))
     with report.refusals():
-        report.kept(lowered(), relower=lowered)
+        report.kept(first, relower=lowered)
         misses = [miss for miss in report.misses() if miss.shared is not None]
         refused = [config for _, config, _ in report.refused_launches()]
+    assert alone and set(alone) < every, (alone, every)
     assert misses and all(miss.stepped for miss in misses), misses
     assert {miss.config for miss in misses} == set(refused), (misses, refused)
+    # Each launch refused is one XLA refuses alone, at the bytes it asked alone (a launch the run did not
+    # trace, the backward's here, derives again with the forward it reads).
+    assert {(miss.kernel, miss.shared) for miss in misses} <= {
+        (report.kernel_of(name)[0], asked) for name, asked in alone.items()}, (misses, alone)
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
@@ -900,18 +921,22 @@ def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block
     assert not failures(found), "\n".join(failures(found))
 
 
-def test_a_training_forward_derives_the_largest_tile_its_threads_hold():
-    """The forward's derivation on an A100 at 128-wide heads: a plain walk takes the measured 128 by 64; a
-    training walk, whose anchor value row holds 128 more registers a thread, steps down to 64 by 64 (160
-    a thread), where the fixed space it replaced fell to its next fitting entry, 32 by 32, at two to three
-    times the time."""
-    import tokamax
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT],
+                         ids=["plain", "output", "split"])
+def test_a_forward_at_its_own_config_compiles_within_an_a100s_block(kept):
+    """A bf16 call's forward 128 wide, its plain walk, the training walk that keeps its output for D and the
+    one of split sums (whose anchor value row holds 128 more registers a thread), each at the config the
+    launch derives itself (no pin), compiled by XLA's CUDA backend for a compile-only A100 on this CPU
+    (tests/kernel_compile.py): within the block, spilling nothing."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
 
-    from dew.nn.kernels import generation
+    spans = template.spans(1024, 1024, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, 1024, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 1024, 2, 128), jnp.bfloat16)
 
-    arrays = {name: jax.ShapeDtypeStruct((1, 1024, heads, 128), jnp.bfloat16)
-              for name, heads in (("query", 4), ("key", 2), ("value", 2))}
-    op, target = attention_triton.TritonForward(), generation.TARGETS["sm80"]
-    plain = op.derived(tokamax.BoundArguments(op, arrays), target)
-    training = op.derived(tokamax.BoundArguments(op, {**arrays, "residuals": True}), target)
-    assert (plain, training) == (attention_triton.Tiles(128, 64, 4, 2), attention_triton.Tiles(64, 64, 4, 2))
+    def forward(query, key, value):
+        return attention_triton.forward(query, key, value, spans, residuals=kept)
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (query, key, key)))], "sm80")
+    assert not failures(found), "\n".join(failures(found))

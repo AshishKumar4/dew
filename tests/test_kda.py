@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import assert_certified
+from entered_support import LAYOUTS, assert_entered_as_own_rows
 from model_support import as_stepped, decode_through
 from reference_error import (
     assert_as_exact,
@@ -331,3 +332,24 @@ def test_padded_rows_preserve_the_memory_and_the_history():
                     truth_fn=lambda x: oracle_layer(x[:, real], jax.tree.map(
                         lambda leaf: jnp.asarray(leaf, jnp.float64), params), -5.0, 1e-5,
                         partial(oracle_chunk, chunk_size=4)))
+
+
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_documents_that_enter_another_read_its_memory_and_history_as_their_own_rows_do(layout):
+    """Kimi delta attention over rows of shared parts and the documents that enter them gives each
+    document's tokens, and the gradients through them, what its own row of the part it enters and itself
+    gives (check 1; `entered_support`, row 1506)."""
+    module, _, variables = layer_and_params(-5.0)
+    assert_entered_as_own_rows(module, variables, E, layout, "Kimi delta attention")
+
+
+def test_a_decode_token_on_the_fused_step_is_the_layers_own():
+    """A Kimi delta attention layer's decode tokens through the recurrence's fused step (the decode kernel
+    named 'fused', interpreted on a CPU, its conv, gates and update in one launch), on par (check 1) with the
+    layer's own unfused tokens, from the float64 layer's: the decode matrix's cell on a CPU
+    (`delta_decode_matrix.on_par`)."""
+    import delta_decode_matrix
+
+    delta_decode_matrix.on_par(('sm90', 'kimi delta attention', 'fused', 'float32'))
+
+

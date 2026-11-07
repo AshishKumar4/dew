@@ -71,7 +71,10 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.linear import (
     DepthwiseConv1d,
     call_tree,
+    decode_kernel,
     decode_step,
+    entered_scan,
+    fused_token,
     held_scan,
     over_sequence,
     sequence_conv,
@@ -105,15 +108,17 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     return out, jnp.swapaxes(final, -1, -2)
 
 
-def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=None):
+def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=None, entered=None):
     """`chunk_ssd` with its state `[B, H, N, P]`, keys by values, as the recurrence holds it
-    (`recurrence.Step`'s): the layer's own, which its decode cache holds so (`Mamba2`)."""
+    (`recurrence.Step`'s): the layer's own, which its decode cache holds so (`Mamba2`). Where `entered`
+    `[B, D]` is given, each packed document enters a state of its own, `held` `[B, D, H, N, P]`
+    (`recurrence_chunk.Chunk.entered`)."""
     operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
     x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
     dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
     held = None if held is None else jnp.asarray(held, work)
-    return chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts),
+    return chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts, entered=entered),
                  chunk_size=chunk_size, dtype=work)
 
 
@@ -150,6 +155,12 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         one_token, jnp.swapaxes(jnp.asarray(state, work), -1, -2),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
     return jnp.moveaxis(out, 0, 1), jnp.swapaxes(final, -1, -2)
+
+
+FUSED = Hooks(conv=recurrence.Conv('silu', order='vkq', bias=True), decay='scalar', delta=False, skip=True)
+"""Mamba2's decode token in the recurrence's step but its gated norm: its conv over x, B and C with their
+bias and silu (C the queries, B the keys, x the values: `ssd_as_delta`'s reading), the step's gates
+(`Mamba2._fused_token`) and the skip; its norm groups heads, so it runs after."""
 
 
 def decoded_ssd(x, dt, A, B, C, D, held=None, starts=None):
@@ -229,11 +240,12 @@ class Mamba2(nn.Module):
     (`recurrence_algebra.entering`); decoding and padded rows are refused there.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
-    of its attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"entered", "tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that enter another, each read
+    from the state and the conv history the one it enters ends with (`dew.nn.linear.entered_scan`), and a
+    tree's, with the key runs and positions of its attention beside it (`dew.nn.linear.call_tree`): on a tree
+    each token's path (`tree_scan`); no mask or bias, which a recurrence reading every earlier token of its
+    document has no way to narrow."""
 
     emb_features: int
     num_heads: int
@@ -346,6 +358,17 @@ class Mamba2(nn.Module):
                                    for width, factor in zip(widths, self.section_multipliers, strict=True)])
         return projected * factors
 
+    def _fused_token(self, taps, bias, dt, valid, starts):
+        """A decode token's conv, step and skip in one launch (`linear.fused_token` under `FUSED`): its
+        x, B and C convolved with their bias, the step through softplus with its bias and limit, the
+        decay `exp(A dt)`; the gated norm over its groups after (`_gated`)."""
+        hooks = dataclasses.replace(FUSED, gates=recurrence.Gates(write='step', limit=self.time_step_limit))
+        return fused_token(hooks, taps, heads=(self.n_groups, self.n_groups, self.num_heads),
+                           widths=(self.state_size, self.state_size, self.head_dim),
+                           per_row={'gate': dt[:, 0]},
+                           per_head={'log_a': self.A_log, 'bias': self.dt_bias, 'skip': self.D},
+                           weight=None, valid=valid, starts=starts, conv_bias=bias)
+
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -373,12 +396,27 @@ class Mamba2(nn.Module):
         shards = sequence_shards()
         given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
         tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
-        if tree is not None:
-            def rule(convolved, step, held):
-                return scan(convolved, dt=step, heads=heads, held=held)
+        if tree is not None or tokens.entered is not None:
+            if tree is not None:
+                def rule(convolved, step, held):
+                    return scan(convolved, dt=step, heads=heads, held=held)
 
-            out = tree_scan(self, mixed, taps, bias, tree, rule, (dt,), valid=valid, state_dtype=wide,
-                            dtype=compute)
+                out = tree_scan(self, mixed, taps, bias, tree, rule, (dt,), valid=valid, state_dtype=wide,
+                                dtype=compute)
+            else:
+                if decode or shards > 1:
+                    raise LayoutRefused("documents that enter another are read whole in their rows by a "
+                                        "training or scoring call; a decode step or a sequence axis splits "
+                                        "them")
+
+                def entered_rule(convolved, *, valid, starts, state, entered):
+                    return scan(convolved, dt, heads, starts=starts, valid=valid, held=state, entered=entered)
+
+                out = entered_scan(mixed, taps, bias, entered_rule, tokens,
+                                   (self.num_heads, self.state_size, self.head_dim), dtype=compute,
+                                   state_dtype=wide)
+                if valid is not None:
+                    out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self._gated(out, gate))
         if shards > 1:
             if decode:
@@ -392,10 +430,14 @@ class Mamba2(nn.Module):
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self._gated(out, gate))
-        out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
-                        (self.num_heads, self.state_size, self.head_dim),
+        state = (self.num_heads, self.state_size, self.head_dim)
+        token = None
+        if decode and length == 1 and decode_kernel(jax.ShapeDtypeStruct((batch, *state), wide), fuses=True,
+                                                    normed=False) == 'fused':
+            token = self._fused_token(taps, bias, dt, valid, tokens.starts)
+        out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads), state,
                         decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,
-                        dtype=compute)
+                        dtype=compute, token=token)
         if out is None:
             # Allocation only, as the delta net: init_cache's dummy token
             # must not consume a position or leave state behind.
@@ -408,7 +450,7 @@ class Mamba2(nn.Module):
 
 def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
          state_size: int, chunk_size: int, time_step_limit, starts=None, valid=None, held=None,
-         axis: str | None = None):
+         axis: str | None = None, entered=None):
     """The scan after the conv: `convolved` `[B, S, conv_dim]` split into
     `x`, `B` and `C`, the step through softplus with its bias and the limit,
     then the recurrent step for one token and the chunked scan otherwise.
@@ -432,10 +474,10 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     if valid is not None:
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
-    if length == 1 and axis is None:
+    if length == 1 and axis is None and entered is None:
         out, final = decoded_ssd(xs, step, A, B, C, D, held, starts)
     else:
-        out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts)
+        out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts, entered=entered)
     if axis is not None:
         log_decay = A * step                                # [B, S, H]
         if starts is not None:
@@ -485,6 +527,8 @@ class Mamba2Mixer(MixerBase):
     """
 
     residuals = ('context', 'scan', 'conv')
+    # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
+    packed_cache = True
     draws_init_std = True
 
     @property

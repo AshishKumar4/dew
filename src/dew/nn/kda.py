@@ -42,12 +42,16 @@ from dew.nn.dense import Dense
 
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
+from .kernels import recurrence
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed
 from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
     call_tree,
     decode_delta_rule,
+    decode_kernel,
+    entered_scan,
+    fused_token,
     held_scan,
     over_sequence,
     split_delta_rule,
@@ -90,9 +94,12 @@ class KimiDeltaAttention(nn.Module):
     `chunk_kda`, fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
-    of its attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
+    reads: ClassVar[frozenset[str]] = frozenset({"entered", "tree_parents", "key_runs", "key_positions"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that enter another, each read
+    from the memory and the conv history the one it enters ends with (`dew.nn.linear.entered_scan`), and a
+    tree's, with the key runs and positions of its attention beside it (`dew.nn.linear.call_tree`): on a tree
+    each token's path (`tree_scan`); no mask or bias, which a recurrence reading every earlier token of its
+    document has no way to narrow."""
 
     emb_features: int
     num_heads: int
@@ -189,6 +196,13 @@ class KimiDeltaAttention(nn.Module):
             # exp(0) = 1 and beta = 0 preserve the memory across a padded slot.
             g = jnp.where(valid[:, :, None, None], g, 0.0)
             beta = jnp.where(valid[:, :, None], beta, 0.0)
+        gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))
+        gate = gate.reshape(B, S, self.num_heads, self.head_dim)
+        token = None
+        if decode and S == 1 and decode_kernel(
+                jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
+                fuses=True) == 'fused':
+            token = self._fused_token(taps, g, beta, gate, valid, tokens.starts)
 
         def split(part):
             return part.reshape(B, S, self.num_heads, self.head_dim)
@@ -224,6 +238,23 @@ class KimiDeltaAttention(nn.Module):
 
             out = tree_scan(self, projected, taps, None, tree, along, (g, beta), valid=valid,
                             state='recurrent_state', state_dtype=wide, parts=heads, dtype=wide)
+        elif tokens.entered is not None:
+            if decode or shards > 1:
+                raise LayoutRefused("documents that enter another are read whole in their rows by a training "
+                                    "or scoring call; a decode step or a sequence axis splits them")
+
+            def entered_rule(convolved, *, valid, starts, state, entered):
+                query, key, value = (split(part) for part in convolved)
+                # A call's other tokens keep its memory, as padding does (exp(0) = 1, beta = 0).
+                kept_g = jnp.where(valid[:, :, None, None], g, 0.0)
+                kept_beta = jnp.where(valid[:, :, None], beta, 0.0)
+                return chunk_gated_delta_rule(query, key, value, kept_g, kept_beta, state, self.chunk_size,
+                                              starts=starts, max_segments=tokens.max_segments,
+                                              floor=self.lower_bound, write_bound=1.0, entered=entered)
+
+            out = entered_scan(projected, taps, None, entered_rule, tokens,
+                               (self.num_heads, self.head_dim, self.head_dim), parts=heads,
+                               dtype=projected.dtype if ported else wide, state_dtype=wide)
         elif shards > 1:
             if decode:
                 raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
@@ -239,13 +270,31 @@ class KimiDeltaAttention(nn.Module):
             out = held_scan(self, projected, taps, None, scan,
                             (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
                             state='recurrent_state', state_dtype=wide, conv_dtype=wide, parts=heads,
-                            dtype=projected.dtype if ported else wide)
+                            dtype=projected.dtype if ported else wide, token=token)
         if out is None:
             return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
-        gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))
-        gate = gate.reshape(B, S, self.num_heads, self.head_dim)
+        if token is not None:
+            # The fused step gated and normalized its output (`FUSED`).
+            return self.o_proj(out)
         out = self.o_norm(out, gate).reshape(B, S, self.qkv_features)
         return self.o_proj(out)
+
+    def _fused_token(self, taps, g, beta, gate, valid, starts):
+        """A decode token's conv, update and gated norm in one launch (`linear.fused_token` under
+        `FUSED`): its decay a key dimension, write gate and output gate a row's, as the layer forms them."""
+        hooks = dataclasses.replace(FUSED, output=recurrence.OutputNorm(self.norm_eps, 'sigmoid'))
+        return fused_token(hooks, taps,
+                           heads=(self.num_heads, self.num_heads, self.num_heads),
+                           widths=(self.head_dim, self.head_dim, self.head_dim),
+                           per_row={'log_decay': g[:, 0], 'beta': beta[:, 0], 'z': gate[:, 0]}, per_head={},
+                           weight=lambda: self.o_norm.variables['params']['weight'], valid=valid,
+                           dtype=self.o_norm.dtype, starts=starts)
+
+
+FUSED = recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='vector')
+"""Kimi delta attention's decode token whole in the recurrence's step: its conv and silu, the queries' and
+keys' l2 norm, the delta rule under a decay a key dimension and a write gate, the sigmoid-gated norm (the
+layer's epsilon, `KimiDeltaAttention._fused_token`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -256,6 +305,8 @@ class KimiDeltaAttentionMixer(MixerBase):
     and Kimi K3's `use_full_rank_gate` output gate."""
 
     residuals = DELTA_RULE_RESIDUALS
+    # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
+    packed_cache = True
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128

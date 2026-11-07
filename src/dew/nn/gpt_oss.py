@@ -26,7 +26,7 @@ from dew.nn.moe import (
     renormalized_softmax,
     weighs_one,
 )
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import float32_dot_general, projection_role
 from dew.nn.sharding import declared
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
@@ -140,8 +140,10 @@ class GptOssMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
-        logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype, kernel_axes=("embed", "exp"),
-                       precision=self.precision, name="router", dot_general=float32_dot_general)(x)
+        with projection_role("router"):  # The router keeps the run's dtypes under a recipe.
+            logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
+                           kernel_axes=("embed", "exp"), precision=self.precision, name="router",
+                           dot_general=float32_dot_general)(x)
         k = self.num_experts_per_tok
         if weighs_one(k, normalized=True):  # Its weights renormalize over the chosen experts.
             fixed_router((*self.path, "router"), self.variables["params"]["router"])

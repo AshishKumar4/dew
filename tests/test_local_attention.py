@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms, kept
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 from model_support import model_draw, stepped_outputs
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
@@ -534,10 +535,13 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
 
 def packed_windowed_bf16_attention_runs_its_band_on_par(without_deterministic_ops):
     """'auto' runs the band of a packed, windowed bf16 call, forward and gradients, on par with the xla band
-    over drawn calls (check 1, float64 the truth), padding rows included, on whatever kernel its route takes:
-    the accuracy gate and the measured speed decide the route, never one kernel's equality to another's
-    (bible §4). Under ledger row 1321 cuDNN's backward left dQ off zero on a query that reads one key, where
-    the xla band is exactly zero, which check 1's zero rows fail: a route through it is red here."""
+    over drawn calls (check 1 with each entry's float64 terms, `attention_terms`, as the attention matrix
+    judges), padding rows included, on whatever kernel its route takes: the accuracy gate and the measured
+    speed decide the route, never one kernel's equality to another's (bible §4). A query that reads one key
+    has a float64 dQ of 0 that a flash kernel's D (rowsum of its rounded output times dout) leaves a
+    rounding off; the terms size it, as the default form claims exact zeros only of a row of no keys
+    (docs/design/testing.md), which a padding row is and holds here (row 4464; row 1321's zero rule held
+    cuDNN to more than the default form claims)."""
     batch, length, heads, kv_heads, width, window = 1, 1024, 8, 2, 64, 256
     # Three documents fill 880 of 1024 rows; the rest is padding, segment 0.
     lengths = [300, 200, 380]
@@ -556,4 +560,10 @@ def packed_windowed_bf16_attention_runs_its_band_on_par(without_deterministic_op
         return jax.jit(with_gradients(lambda q, k, v: local_attention(
             q, k, v, window=window, segment_ids=segment_ids, implementation=implementation)))
 
-    assert_as_exact(band("auto"), band("xla"), draw, "packed windowed band", seeds=FEWEST_SEEDS)
+    # A query's keys: itself and the window's before it, in its own document (`local_attention`).
+    keep = kept(length, length, causal=True, sliding_window=window, segment_ids=segments)
+
+    def terms(query, key, value, cotangent):
+        return tuple(attention_terms(query, key, value, cotangent, keep)[:4])
+
+    assert_as_exact(band("auto"), band("xla"), draw, "packed windowed band", seeds=FEWEST_SEEDS, terms=terms)

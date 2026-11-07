@@ -12,6 +12,7 @@ from flax import linen as nn
 from model_support import TINY_DECODER, float64_twin
 from reference_error import assert_as_exact
 
+from dew.batch import Coordinates, Entered
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 VOCAB = 37
@@ -54,8 +55,8 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
     call's tokens in their order and an indexed latent attention selects among every key before each query,
     so each model refuses a tree call; a tree outside a cached call,
     without the key runs that mask its attention, of another length than the call's tokens, with a parent
-    not before its child, or branching without its tokens' positions (coordinates of validity alone
-    stating none) is refused."""
+    not before its child, branching without its tokens' positions (coordinates of validity alone
+    stating none), or beside documents that enter another is refused."""
     from dew.nn.engram import Engram
     from dew.nn.hyper_connections import HyperConnections
 
@@ -86,7 +87,10 @@ def test_a_tree_is_refused_where_a_layer_cannot_read_it_or_the_call_cannot_carry
             {"attention_tree": (-1, 0, 0), "attention_key_runs": runs},
             # Coordinates of validity alone state no position.
             {"attention_tree": (-1, 0, 0), "attention_key_runs": runs,
-             "attention_mask": jnp.ones((2, BLOCK))}]
+             "attention_mask": jnp.ones((2, BLOCK))},
+            # Documents that enter another beside a tree, which reads the cache as held.
+            {**tree, "coordinates": Coordinates(positions=placed, entered=Entered(
+                documents=jnp.ones((2, BLOCK), jnp.int32), entered=jnp.zeros((2, 1), jnp.int32)))}]
         for options in refused:
             with pytest.raises(ValueError):
                 model.apply(cache, block, mutable=["cache"], **{"decode": True, **options})

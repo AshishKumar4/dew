@@ -27,23 +27,6 @@ from dew.nn.kernels.templates import bundles, report, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
-def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
-    shapes = support.COMPILED_SHAPES.values()
-    assert max(shape["width"] for shape in shapes) == fla_gdn.WIDEST_KEYS == 256
-    assert max(shape["columns"] for shape in shapes) == fla_gdn.WIDEST == 128
-
-
-@pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
-                                          ("sm120", False), ("sm100", True), ("sm110", False),
-                                          ("cpu", False)])
-def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(target, wide):
-    """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere: on a
-    GPU the targets do not list (sm110), and on a CPU, which has no GPU's facts unless a test states the GPU
-    it emulates (`generation.assumed`)."""
-    with generation.assumed(target):
-        assert chunked_launch._wide() is wide
-
-
 def rule_launches(module) -> list:
     """The launches the rule of `module` (`fla_gdn`, `fla_kda`) makes forward and backward, as its trace
     records them (`tuning.seen`)."""
@@ -171,14 +154,16 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
     assert not failures(found), "\n".join(failures(found))
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
-    """Each of the short conv's training cases lowered as on the GPU and compiled by XLA's CUDA backend for a
-    compile-only device on this CPU (tests/kernel_compile.py), within the compile bound and the block's
-    shared memory."""
-    found = compile_kernels(conv_training_cases(), target)
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
+    """Each of the short conv's training cases (the recurrence template's conv, `templates.recurrence.conv`)
+    lowered as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
+    (tests/kernel_compile.py): within the block's shared memory, no register spilled."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    found = compile_mosaic_kernels(list(conv_training_cases()), target)
     assert len(found) == 2 * len(CONV_SHAPES) + 2
-    assert not failures(found), "\n".join(failures(found))
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 
@@ -186,28 +171,29 @@ def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_bl
 def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
     """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
     compile-only H100 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's
-    shared memory, no register spilled. The resource gate every Mosaic GPU mainloop takes."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    shared memory, no register spilled, its register model deciding as ptxas does (`model_failures`, row
+    1971). The resource gate every Mosaic GPU mainloop takes."""
+    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
 
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    args = (bf16((1024, 512)), bf16((4, 512, 1024)), jax.ShapeDtypeStruct((4,), jnp.int32))
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("sm90"):
+        ba = launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+
     def case(tiles):
-        def call():
-            def gmm(lhs, rhs, sizes):
-                hopper = generation.gpu_target("sm90")
-                return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False,
-                                      out_dtype=jnp.bfloat16, multiprocessors=hopper.multiprocessors)
+        with generation.assumed("sm90"):
+            model = _model(launch, ba, tiles)
+        return support.KernelCase(f"gmm {tiles}", lambda: launch.lowering(ba, tiles), {"dew_gmm": model})
 
-            return gmm, (jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
-                         jax.ShapeDtypeStruct((4, 512, 1024), jnp.bfloat16),
-                         jax.ShapeDtypeStruct((4,), jnp.int32))
-
-        return support.KernelCase(f"gmm {tiles}", call)
-
-    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1)),
-                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
+    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1, family='wgmma')),
+                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2,
+                                                          family='wgmma'))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
-    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    failed = mosaic_failures(found) + model_failures(found)
+    assert not failed, "\n".join(failed)
 
 
 @lowers("sm90")
@@ -224,7 +210,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     def call():
         def gmm(lhs, rhs, sizes):
             return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2,
-                                                                          cluster=2),
+                                                                          cluster=2, family='wgmma'),
                                   transpose_rhs=False, out_dtype=jnp.bfloat16, dense=True,
                                   multiprocessors=generation.gpu_target("sm90").multiprocessors)
 
@@ -279,12 +265,13 @@ def _lowering(forward, shapes, traced: list):
 
 @lowers("sm90")
 @pytest.mark.parametrize("exhausted", [False, True])
-def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhausted):
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fits(exhausted):
     """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
-    launch's config and lowers once more, where the derivation takes its next tile by its own rule; a
-    kernel spilling again is recorded and not stepped again. A paired SwiGLU forward whose model counts no
-    registers, compiled for a compile-only H100 on this CPU through ptxas. A derivation with no replacement
-    keeps its first program; the refusals saved with that program must derive it again."""
+    launch's config and lowers again, where the derivation takes its next tile by its own rule, for as long
+    as a config not refused before spills; the kept program's own spills are recorded and not stepped. A
+    paired SwiGLU forward whose model counts no registers, compiled for a compile-only H100 on this CPU
+    through ptxas. A derivation with no replacement keeps its first program; the refusals saved with that
+    program must derive it again."""
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
@@ -304,11 +291,11 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert not refused
         kept = first
     else:
-        first, kept = traced
-        assert kept != first
-        assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
-        assert all(miss.config == kept and not miss.stepped for miss in misses[1:])
-        assert [config for _, config, _ in refused] == [first]
+        *stepped, kept = traced
+        assert stepped and kept not in stepped
+        assert [miss.config for miss in misses if miss.stepped] == stepped
+        assert all(miss.config == kept for miss in misses if not miss.stepped)
+        assert {config for _, config, _ in refused} == set(stepped)
     # Another process seeded with the run's refusals (its plan's) derives the tile this compile kept.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -398,9 +385,9 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
         finally:
             stop.set()
         other.result()
-    first, kept = traced
-    assert kept != first
-    assert [config for _, config, _ in refused] == [first]
+    *stepped, kept = traced
+    assert stepped and kept not in stepped
+    assert {config for _, config, _ in refused} == set(stepped)
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
@@ -423,20 +410,27 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
 FP8_FORMS = ("forward fp8",)
 """The FP8 forms a family whose products take FP8 operands emits (`Family.takes_fp8`)."""
 
-HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
+EXACT_FORMS = ("kernel gradient exact fp32", "forward exact fp32", "input gradient exact fp32")
+"""The exactly summed forms a family whose model counts a running sum emits (`Family.counts_sums`): an fp32
+output of 16-bit products (`templates.product.promoted`)."""
+
+HOOKED_FORMS = ("normed biased forward", "normed biased input gradient",
                 "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
                 "cast forward", "gated forward", "gated kernel gradient", "residual forward",
-                "two bf16 outputs forward", "scaled forward", "row scaled forward", "paired swiglu forward",
-                "paired forward")
+                "two bf16 outputs forward", "scaled forward", "row scaled forward")
 """The hooked and exactly summed forms a family whose model counts what they hold emits
 (`Family.counts_hooks`): prologues (a norm, a cast, SwiGLU's gate tile), epilogues over side vectors and a
-side tile, a second output, a paired product, and the running sum, each priced by what it materializes
+side tile, a second output, and the running sum, each priced by what it materializes
 (`grouped_matmul._Mosaic.registers`)."""
+
+PAIRED_FORMS = ("paired swiglu forward", "paired forward")
+"""The paired products a family whose consumers issue no ring's loads emits beside those counting hooks,
+their only hook the epilogue over their two accumulators (`grouped_matmul._pair_alone`, row 2100)."""
 
 
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
-    """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `HOOKED_FORMS`) at a projection's extents: its name,
-    launch, abstract operands and options."""
+    """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `PAIRED_FORMS`, `HOOKED_FORMS`) at a projection's
+    extents: its name, launch, abstract operands and options."""
     from test_gemm_template import (
         biased,
         casted,
@@ -474,6 +468,9 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
         ("kernel gradient fp32", tgmm, (x, dy, sizes), backward),
         ("kernel gradient fp16", tgmm, (x16, dy16, sizes), backward),
         ("kernel gradient exact fp32", tgmm, (x, dy, sizes), {**backward, "exact_sums": True}),
+        ("forward exact fp32", gmm, (x, w, sizes), {**forward, "out_dtype": "float32", "exact_sums": True}),
+        ("input gradient exact fp32", gmm, (dy, w, sizes),
+         {**backward, "trans_rhs": True, "exact_sums": True}),
         ("normed biased forward", gmm,
          (x, w, sizes, (vector((rows,)), vector((depth,))), (vector((width,)),)),
          {**forward, "hooks": hooks(normed, (("rows",), ("depth",)), biased, (("columns",),))}),
@@ -532,15 +529,28 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
             if every_consumer_count:
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
-                for consumers in sorted({1, family.consumers}):
-                    # Each consumer keeps its share of the derived tile's rows, at as many of its stages as
-                    # the block holds (a one-consumer tile's deeper ring past two consumers' rows); one
-                    # consumer runs alone, a cluster being two consumers' (`mosaic_gpu.Tiles`).
-                    rows_ = config.block_m // config.warpgroups * consumers
-                    staged = (dataclasses.replace(config, warpgroups=consumers, block_m=rows_, stages=stages,
-                                                  cluster=config.cluster if consumers > 1 else 1)
+                for consumers in sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)}):
+                    # Each consumer keeps its share of the derived tile's rows, else the tile's rows split
+                    # among them where its registers hold no more (mma.sync's one-consumer tile, two of
+                    # whose shares no consumer holds), at as many of its stages as the block holds (a
+                    # one-consumer tile's deeper ring past two consumers' rows); one consumer runs alone, a
+                    # cluster being two consumers' (`mosaic_gpu.Tiles`).
+                    shares = dict.fromkeys((config.block_m // config.warpgroups * consumers, config.block_m))
+                    # As many programs a multiprocessor as the derived tile's, else one, whose registers its
+                    # consumers then share alone.
+                    residencies = dict.fromkeys((config.programs, 1))
+                    # At the derived step's depth, else twice it: two consumers each copy a share of a block's
+                    # first axis in whole 32-row parts (`Transport.shares_rows`), a transposed right
+                    # operand's its depth.
+                    depths = dict.fromkeys((config.block_k, 2 * config.block_k))
+                    staged = (_replaced(config, warpgroups=consumers, block_m=rows_, block_k=depth,
+                                        stages=stages, programs=programs,
+                                        cluster=config.cluster if consumers > 1 else 1)
+                              for rows_ in shares for depth in depths for programs in residencies
                               for stages in range(config.stages, 1, -1))
-                    tile = next((tile for tile in staged if launch.legal(ba, tile, target)), None)
+                    tile = next((tile for tile in staged
+                                 if isinstance(tile, mosaic_gpu.Tiles) and launch.legal(ba, tile, target)),
+                                None)
                     if tile is not None:
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
@@ -551,6 +561,15 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                                                 {kernel: _model(launch, ba, config)},
                                                 required=launch.legal(ba, config, target)))
     return cases
+
+
+def _replaced(config, **changes):
+    """`config` with `changes`, or its tile type's refusal of them (`mosaic_gpu.Tiles`' own checks, a
+    `ValueError`), which a search passes over."""
+    try:
+        return dataclasses.replace(config, **changes)
+    except ValueError as refusal:
+        return refusal
 
 
 def _model(launch, ba, config) -> resources.RegisterModel:
@@ -587,16 +606,23 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 
 
 def _emitted_forms(family, shape: str | None = None) -> set[str]:
-    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`): none without a
-    bundle, the hooked and exactly summed ones where its register model counts what they hold
-    (`Family.counts_hooks`), the FP8 ones where its products take FP8 (`Family.takes_fp8`);
-    at a projection `shape`, each whose output's width steps by the family's column unit, whose stores take
-    it (`Family.stores_columns`: a grouped product's rows ragged to one, a kernel gradient's whole role's)
-    and whose contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
+    """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `EXACT_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`):
+    none without a bundle, the exactly summed ones where its register model counts a running sum
+    (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the
+    paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
+    take FP8 (`Family.takes_fp8`); where its consumers do not issue their products, none whose step prepares
+    them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
+    first, an exactly summed step takes its product apart);
+    at a projection `shape`, each whose output's width steps by the family's column unit and whose
+    contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
     if family is None:
         return set()
-    forms = {*PLAIN_FORMS, *(HOOKED_FORMS if family.counts_hooks else ()),
+    paired = family.takes_pairs and (family.counts_hooks or not family.feeds_itself)
+    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if paired else ()), *(EXACT_FORMS if family.counts_sums else ()),
+             *(HOOKED_FORMS if family.counts_hooks else ()),
              *(FP8_FORMS if family.takes_fp8 else ())}
+    if not family.issues_in_consumers:
+        forms = {form for form in forms if "kernel gradient" not in form and form not in EXACT_FORMS}
     if shape is None:
         return forms
     _, depth, width, _ = GEMM_SHAPES[shape]
@@ -609,9 +635,7 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
         # An input gradient's output is the depth wide, contracting the width; every other form's output
         # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
         columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
-        stored = family.role_rows if "kernel gradient" in form else 1
-        return (columns % unit == 0 and family.stores_columns(columns, stored)
-                and ("kernel gradient" in form or contracted % step == 0))
+        return columns % unit == 0 and ("kernel gradient" in form or contracted % step == 0)
 
     return {form for form in forms if takes(form)}
 
@@ -619,12 +643,17 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
 def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
-    """Every GEMM Mosaic GPU launch form a generation's family emits (`_emitted_forms`) derives a tile at
-    every real projection (`_gemm_mainloop_cases`): an eligibility regression fails here rather than leaving
-    the compile gate fewer cases. A GPU whose family has no bundle (`bundles.of`: a B200's tcgen05, consumer
-    Blackwell's TMA-fed mma.sync) emits none."""
+    """Every GEMM Mosaic GPU launch form a generation emits derives a tile at every real projection
+    (`_gemm_mainloop_cases`), each on the most capable issuer whose bundle takes it (`bundles.groups`, its
+    launches stating their tiles' accumulators): a B200's kernel gradients and exact sums, which tcgen05's
+    bundle refuses, on mma.sync's (row 4727). An eligibility regression fails here rather than leaving the
+    compile gate fewer cases."""
     cases = _gemm_mainloop_cases(generation_name, shape)
-    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16), shape)
+    forms, taken = set(), set()
+    for group in bundles.groups(generation_name, jnp.bfloat16, stated=True):
+        own = _emitted_forms(group[0]) - taken
+        taken |= own
+        forms |= own & _emitted_forms(group[0], shape)
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
@@ -660,27 +689,40 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), a test
     each, at the tile its launch derives from the generation's facts and at each tile the derivation refused
     for its registers, compiled by Mosaic for a compile-only device of the generation on this CPU through
-    ptxas. Required launches must spill nothing. Rejected configurations supply model evidence; their spills
-    are refusals, never qualified launches. Compiler errors and missing reports fail either."""
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+    ptxas. Required launches must spill nothing, and their register model decide as ptxas does
+    (`model_failures`: the GEMM's models match the compiler on every case, row 1971). Rejected
+    configurations supply model evidence; their spills are refusals, never qualified launches. Compiler
+    errors and missing reports fail either."""
+    from kernel_compile import compile_mosaic_kernels, model_failures, mosaic_failures
 
     cases = _gate_cases(generation_name)[index:index + 1]
     found = compile_mosaic_kernels(cases, generation_name)
     failed = failures(found)
-    failed += mosaic_failures([record for case, record in zip(cases, found, strict=True) if case.required])
+    required = [record for case, record in zip(cases, found, strict=True) if case.required]
+    failed += mosaic_failures(required) + model_failures(required)
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
 
 
 @functools.cache
+@functools.cache
+def _contract_cases(generation_name: str) -> list:
+    """Each launch form at each consumer count of a family's contract (`_gemm_mainloop_cases(
+    every_consumer_count=True)`), at the first projection whose rows give it a legal tile (two consumers'
+    rows past a few rows a MoE expert takes, mma.sync's)."""
+    found: dict = {}
+    for shape in GEMM_SHAPES:
+        for case in _gemm_mainloop_cases(generation_name, shape, every_consumer_count=True):
+            found.setdefault(case.name.split(" Tiles(")[0], case)
+    return list(found.values())
+
+
 def _family_cases(generation_name: str) -> list:
-    """The family contract's cases (`_gemm_mainloop_cases(every_consumer_count=True)` at the first
-    projection) the compile gate does not already hold (`_gate_cases`)."""
+    """The family contract's cases (`_contract_cases`) the compile gate does not already hold
+    (`_gate_cases`)."""
     held = {_kernel_of(case.name) for case in _gate_cases(generation_name)}
-    return [case for case in _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)),
-                                                  every_consumer_count=True)
-            if _kernel_of(case.name) not in held]
+    return [case for case in _contract_cases(generation_name) if _kernel_of(case.name) not in held]
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -688,11 +730,11 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
     side vectors and tiles, several outputs, the running sum) at one consumer and at the family's most
-    (`_gemm_mainloop_cases(every_consumer_count=True)`)."""
+    (`_contract_cases`)."""
     family = bundles.of(generation_name, jnp.bfloat16)
     assert family is not None
-    cases = _gemm_mainloop_cases(generation_name, next(iter(GEMM_SHAPES)), every_consumer_count=True)
-    counts = sorted({1, family.consumers})
+    cases = _contract_cases(generation_name)
+    counts = sorted({1, min(family.consumers, mosaic_gpu.CONSUMERS)})
     expected = {f"{form} x{count}" for form in _emitted_forms(family) for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
     assert got == expected, (sorted(expected - got), sorted(got - expected))
@@ -775,6 +817,293 @@ def test_a_program_that_launches_no_triton_kernel_gives_no_evidence(generation_n
     assert failures(compile_kernels([case], generation_name))
 
 
+ROUTED_ROWS, ROUTED_DEPTH, ROUTED_WIDTH = 256, 512, 256
+"""A dense projection's rows, depth and width, its rows split over a route test's two devices."""
+
+
+def _projected(local: bool):
+    """A dense projection's forward and backward through the GEMM template (`gemm.gemm`, its launch chosen,
+    as the dense selector picks XLA's dot), the gradient in both operands: its rows per shard
+    (`sharding.manual_map`) where `local`, else left to the partitioner."""
+    from dew.nn import sharding
+    from dew.nn.kernels import gemm
+
+    def projected(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16)
+
+    def step(x, w):
+        # Mapped as it traces, on the mesh its program lowers for (`manual_map` reads the mesh in context).
+        specs = (PartitionSpec("data"), PartitionSpec())
+        forward = sharding.manual_map(projected, specs, PartitionSpec("data")) if local else projected
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            return jax.grad(lambda x, w: forward(x, w).astype(jnp.float32).sum(), argnums=(0, 1))(x, w)
+
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    return step, (shaped((ROUTED_ROWS, ROUTED_DEPTH)), shaped((ROUTED_DEPTH, ROUTED_WIDTH)))
+
+
+@pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
+def test_a_routes_launches_run_per_shard_with_only_their_planned_collectives(local):
+    """A dense projection's forward and backward through the GEMM template, its rows split over two
+    compile-only H100s and compiled for them: run per shard (`sharding.manual_map`), both gradients launch
+    (the forward's product, which no gradient reads, is the program's to drop), each reading its shard's
+    rows (the cotangent's, the input's), and the program sums by one all-reduce over the rows' axis (the
+    weight's gradient) and moves nothing (`kernel_compile.Expected`, its route evidence). Left to the
+    partitioner, the same evidence refuses the program (a null control): an opaque launch's operands
+    gathered to every device, or no program at all."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 2),), specs=(PartitionSpec("data"), None),
+                        launches=frozenset({"dew_gmm", "dew_tgmm"}),
+                        shards={"dew_gmm": (ROUTED_ROWS // 2, ROUTED_WIDTH), "dew_tgmm": (ROUTED_ROWS // 2,
+                                                                                     ROUTED_DEPTH)},
+                        collectives=frozenset({("all-reduce", frozenset({"data"}))}))
+    cases = [support.KernelCase("projection", lambda: _projected(local), expected=expected)]
+    found = compile_mosaic_kernels(cases, "sm90")
+    failed = route_failures(cases, found)
+    assert (failed == []) == local, failed
+
+
+def _gpt_oss_projected():
+    """gpt-oss-120b's expert projection (2880 wide and deep, four experts' rows) forward and backward through
+    the GEMM template, its launch named, the gradient in both operands."""
+    from dew.nn.kernels import gemm
+
+    def step(x, w, sizes):
+        def projected(x, w):
+            return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            return jax.grad(projected, argnums=(0, 1))(x, w)
+
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    return step, (shaped((512, 2880)), shaped((4, 2880, 2880)), jax.ShapeDtypeStruct((4,), jnp.int32))
+
+
+def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
+    """gpt-oss-120b's 2880-wide expert projection, forward and backward, the template named, compiled for a
+    compile-only A100: its program launches the template's grouped product and kernel gradient, a product
+    reading the experts' matrices whole (`kernel_compile.Expected`, its route evidence). Every tile width
+    dividing 2880 is an odd multiple of 64, whose ragged store's one-row rung no warpgroup's strided layout
+    holds: the template refused each such tile, so the call it was named for (row 4474), until that rung was
+    copied in a row's layout (`mosaic.copied`)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None, None, None),
+                        launches=frozenset({"dew_gmm", "dew_tgmm"}), shards={"dew_gmm": (4, 2880, 2880)})
+    cases = [support.KernelCase("gpt-oss projection", _gpt_oss_projected, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
+
+
+def _blockwise_projected():
+    """A blockwise-scaled FP8 MoE projection (`gemm.blockwise_fp8_product`, DeepSeek-V3's 1 x 128 rows and
+    128 x 128 weight blocks, eight experts) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def product(rows, matrices, sizes, row_scales, column_scales):
+        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+            return gemm.blockwise_fp8_product(rows, matrices, sizes, row_scales, column_scales,
+                                              out_dtype=jnp.bfloat16)
+
+    fp8 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return product, (fp8((4096, 2048)), fp8((8, 768, 2048)), jax.ShapeDtypeStruct((8,), jnp.int32),
+                     f32((16, 4096)), f32((8, 16, 6)))
+
+
+def test_an_hoppers_blockwise_fp8_product_runs_the_template_named_for_it():
+    """A blockwise-scaled FP8 MoE projection, the template named, compiled for a compile-only H100: its
+    program launches the template's grouped product, reading the experts' FP8 matrices whole
+    (`kernel_compile.Expected`, its route evidence; row 4518)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * 5, launches=frozenset({"dew_gmm"}),
+                        shards={"dew_gmm": (8, 768, 2048)})
+    cases = [support.KernelCase("blockwise fp8", _blockwise_projected, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm90")) == []
+
+
+def _nvfp4_projected(rows: int, named: str | None):
+    """An NVFP4 projection of `rows` rows (`gemm.nvfp4_product`, Llama-3-8B's up: 4096 deep, 14336 wide),
+    its kernel `named`, else the selector's."""
+    from dew.nn.kernels import gemm
+
+    matrix = gemm.NvFp4.of(jnp.zeros((4096, 14336), jnp.float32), jnp.ones((256, 14336), jnp.float8_e4m3fn),
+                           1.0)
+
+    def product(lhs):
+        with generation.chosen(**({} if named is None else {"nvfp4": named})):
+            return gemm.nvfp4_product(lhs, matrix, out_dtype=jnp.bfloat16)
+
+    return product, (jax.ShapeDtypeStruct((rows, 4096), jnp.bfloat16),)
+
+
+@pytest.mark.parametrize(("rows", "named"), [(64, "packed"), (16, None)], ids=["named", "decode-cell"])
+def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, named):
+    """An NVFP4 projection on a compile-only A100, its packed kernel named, or at a decode step's rows with no
+    kernel named (`gemm.NVFP4_CELLS`' A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the matrix
+    decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
+    route evidence), which ptxas compiles, its E4M3 block scales decoded by integer arithmetic
+    (`mosaic_gpu._e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
+    refused the kernel (W8-a100, M-NS-8; row 3621)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,), launches=frozenset({"dew_gmm"}))
+    cases = [support.KernelCase(f"nvfp4 {rows} rows", functools.partial(_nvfp4_projected, rows, named),
+                                expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
+
+
+def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
+    """An NVFP4 projection at a decode step's 16 rows on a compile-only H100, no kernel named
+    (`gemm.NVFP4_CELLS`' H100 decode cell, receipt W7-gh200-8-M-NS-8-h100: 2.4-4.5x the matrix decoded once a
+    call): its program launches the template's packed product (`kernel_compile.Expected`, its route
+    evidence)."""
+    _assert_launches("sm90", "nvfp4 16 rows", functools.partial(_nvfp4_projected, 16, None), 1, "dew_gmm")
+
+
+def test_a_hoppers_nvfp4_prefill_shares_its_stage_decode():
+    """An NVFP4 projection at a prefill's 4096 rows on a compile-only H100, its packed kernel named: its
+    consumers share each stage's decode, each its share of the columns, meeting at a named barrier
+    (`mosaic_gpu._shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm90", "nvfp4 4096 rows", functools.partial(_nvfp4_projected, 4096, "packed"), 1,
+                     "dew_gmm")
+
+
+def _gathered_projection():
+    """An expert projection of gathered rows (`gemm.gemm`'s `gather`: Qwen3-30B-A3B's gate|up, 2048 deep and
+    768 wide, eight experts, 1024 tokens of top-2 slots), its tokens read where they lie."""
+    from dew.nn.kernels import gemm
+
+    sizes = jnp.full((8,), 256, jnp.int32)
+
+    def product(tokens, table, first, second):
+        # Both projections, stacked: the gate's and the up's.
+        return jnp.stack(gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16,
+                                   out_dtypes=(jnp.bfloat16,) * 2, paired=second, gather=table))
+
+    return product, (jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((2048,), jnp.int32),
+                     *(jax.ShapeDtypeStruct((8, 2048, 768), jnp.bfloat16),) * 2)
+
+
+def test_a_hoppers_gathered_projection_runs_the_template_producers_gather():
+    """A paired expert projection of gathered rows on a compile-only H100 (row 1376): its own cell
+    ('grouped forward gathered', which no old route reads), its program launching the template's grouped
+    product, whose producer warpgroup gathers each step's rows by cp.async into the swizzled ring
+    (`gathered.Ring`), which ptxas compiles (`kernel_compile.Expected`, its route evidence)."""
+    _assert_launches("sm90", "gathered projection", _gathered_projection, 4, "dew_gmm")
+
+
+def test_a_b200s_gathered_projection_runs_the_template_load_warps_gathers():
+    """A paired expert projection of gathered rows on a compile-only B200 (row 1376): its program launches the
+    template's grouped product on tcgen05's bundle, whose load warp gathers each step's rows by TMA's
+    four-row gathers (`gathered.Committed`), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm100", "gathered projection", _gathered_projection, 4, "dew_gmm")
+
+
+def _gathered_projection_gradient():
+    """The reverse pass of an expert projection of gathered rows whose rows land at their slots (`gemm.gemm`'s
+    `gather` and `scatter`: Qwen3-30B-A3B's 2048-deep, 768-wide experts, eight, 1024 tokens of top-2 slots),
+    its kernel gradient reading the tokens and the cotangent where they lie (`gemm_t`'s `gather`)."""
+    from dew.nn.kernels import gemm
+
+    sizes = jnp.full((8,), 256, jnp.int32)
+
+    def gradient(tokens, table, slots, matrices, cotangent):
+        def product(tokens, matrices):
+            return gemm.gemm(tokens, matrices, sizes, out_dtype=jnp.bfloat16, gather=table, scatter=slots)
+
+        return jax.vjp(product, tokens, matrices)[1](cotangent)
+
+    return gradient, (jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
+                      *(jax.ShapeDtypeStruct((2048,), jnp.int32),) * 2,
+                      jax.ShapeDtypeStruct((8, 2048, 768), jnp.bfloat16),
+                      jax.ShapeDtypeStruct((2048, 768), jnp.bfloat16))
+
+
+def test_a_hoppers_gathered_projections_reverse_pass_reads_its_rows_where_they_lie():
+    """The reverse pass of a gathered, scattered expert projection on a compile-only H100 (row 1376): its
+    program launches the template's kernel gradient, whose producer gathers each step's token rows and
+    cotangent rows by cp.async (`gathered.Ring`), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm90", "gathered projection gradient", _gathered_projection_gradient, 5, "dew_tgmm")
+
+
+def _blockwise_gradient():
+    """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
+    deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def gradient(lhs_t, rhs_t, row_scales, column_scales):
+        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+            return gemm.blockwise_fp8_kernel_gradient(lhs_t, rhs_t, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
+                                                      row_scales, column_scales, out_dtype=jnp.float32)
+
+    fp8 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float8_e4m3fn)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return gradient, (fp8((2048, 8192)), fp8((768, 8192)), f32((64, 2048)), f32((64, 768)))
+
+
+def test_an_hoppers_blockwise_fp8_kernel_gradient_runs_the_template_named_for_it():
+    """A blockwise-scaled FP8 kernel gradient, the template named, compiled for a compile-only H100: its
+    program launches the template's kernel gradient (`kernel_compile.Expected`, its route evidence; row
+    4518)."""
+    _assert_launches("sm90", "blockwise fp8 gradient", _blockwise_gradient, 4, "dew_tgmm")
+
+
+def _assert_launches(target: str, name: str, case, operands: int, launch: str):
+    """`case`, compiled for a compile-only `target` on one device, its `operands` unplaced, launches the
+    template's `launch` (`kernel_compile.Expected`, its route evidence)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    expected = Expected(axes=(("data", 1),), specs=(None,) * operands, launches=frozenset({launch}))
+    cases = [support.KernelCase(name, case, expected=expected)]
+    assert route_failures(cases, compile_mosaic_kernels(cases, target)) == []
+
+
+def _mx_projection():
+    """An MX MoE projection (`gemm.mxfp8_product`: 2048 deep, 768 wide, eight experts of whole 128-row
+    blocks) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def product(rows, matrices):
+        with generation.chosen(mxfp8="mosaic_gpu"):
+            return gemm.mxfp8_product(gemm.MxFp8.quantized(rows), gemm.MxFp8.quantized(matrices),
+                                      jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]), out_dtype=jnp.bfloat16)
+
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return product, (f32((8192, 2048)), f32((8, 768, 2048)))
+
+
+def test_a_blackwells_mx_product_runs_the_template_named_for_it():
+    """An MX MoE projection, the template named, compiled for a compile-only B200: its program launches the
+    template's grouped product (`kernel_compile.Expected`, its route evidence), each 32 depths of its FP8
+    operands scaled in the block-scaled tensor cores' products (row 4519)."""
+    _assert_launches("sm100", "mx projection", _mx_projection, 2, "dew_gmm")
+
+
+def _nvfp4_block_projection():
+    """An NVFP4 MoE projection, both operands E2M1 (`gemm.nvfp4_block_product`: 2048 deep, 768 wide, eight
+    experts of whole 128-row blocks) through the template named."""
+    from dew.nn.kernels import gemm
+
+    def product(rows, matrices):
+        with generation.chosen(nvfp4_block="mosaic_gpu"):
+            operands = (gemm.NvFp4Block.quantized(rows), gemm.NvFp4Block.quantized(matrices))
+            return gemm.nvfp4_block_product(*operands, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
+                                            out_dtype=jnp.bfloat16)
+
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    return product, (f32((8192, 2048)), f32((8, 768, 2048)))
+
+
+def test_a_blackwells_nvfp4_product_runs_the_template_named_for_it():
+    """An NVFP4 MoE projection, the template named, compiled for a compile-only B200: its program launches
+    the template's grouped product (`kernel_compile.Expected`), each sixteen depths of its E2M1 operands
+    scaled by their E4M3 scales in the block-scaled tensor cores' products (`kind::mxf4nvf4`, row 4519)."""
+    _assert_launches("sm100", "nvfp4 projection", _nvfp4_block_projection, 2, "dew_gmm")
+
+
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
     A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
@@ -803,8 +1132,10 @@ def test_each_triton_call_needs_a_launch_of_its_own():
         lines = "\n".join(thunks).splitlines()
         dropped = next(index for index, line in enumerate(lines) if missing in line)
         without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
-        assert triton_evidence(calls, without) == {
-            "error": f"no launch of its own states the shared bytes of {said}"}
+        evidence = triton_evidence(calls, without)
+        # Refused, naming the call whose launch is gone, and no other.
+        assert "shared" not in evidence and said in evidence["error"].split()
+        assert ({"probe", "probe_headroom"} - {said}).isdisjoint(evidence["error"].split())
 
 
 def test_records_a_failed_process_of_their_own_wrote_are_refused():
@@ -830,7 +1161,7 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
-    overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024)
+    overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024, file=65536)
     disagreement = {**record, "models": {"k": overestimated.record()},
                     "kernels": [{**within, "need": 160}]}
     assert not mosaic_failures([disagreement])
@@ -862,12 +1193,59 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert mosaic_failures([{**record, "kernels": [unbound]}])
 
 
+def test_a_gate_holding_its_models_fails_a_spill_free_disagreement_and_an_unmodelled_launch():
+    """A family's gate that holds its register model to ptxas (`model_failures`, row 1971) fails a kernel
+    whose model decides otherwise than ptxas (here four programs where ptxas holds two) and a launch with
+    no model, as the resource gate fails a spill; a kernel whose model agrees passes."""
+    from kernel_compile import model_failures, mosaic_failures
+
+    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
+            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
+    kernel = {"kernel": "dew_gmm", "launch": None, "unread": [], "shared": 1024, "tmem": 0, "registers": 96,
+              "spilled": 0, "need": need}
+
+    def judged(most: int) -> list[str]:
+        model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024, file=65536)
+        record = {"name": "forward", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
+                  "models": {}, "lowered_models": {"dew_gmm": model.record()}, "kernels": [kernel]}
+        assert not mosaic_failures([record])
+        return model_failures([record])
+
+    assert judged(most=2) == []
+    assert judged(most=4)
+    unmodelled = {"name": "forward", "generation": "sm90", "limit": 232448, "tmem_limit": 0, "models": {},
+                  "lowered": {"dew_gmm": ["launch"]}, "kernels": [kernel]}
+    mosaic_failures([unmodelled])
+    assert model_failures([unmodelled])
+
+
+def test_a_kernel_is_judged_by_the_model_its_launch_lowered_not_the_cases_declared_one():
+    """A kernel whose launch lowered its own register model (`lowered_models`: its plan's two programs)
+    is judged by that model, whose residency ptxas's need was searched at: the case's declared model for
+    its name (a family's four programs by registers alone) states no decision this launch made, so it
+    adds no disagreement (row 1971: 381 of the gate's 511 recorded misses were the declared model's
+    residency against the lowered launch's need)."""
+    from kernel_compile import _register_evidence
+
+    declared = resources.RegisterModel(112, 255, 1, 4, 8, 0, shared=49232, file=65536)
+    lowered = resources.RegisterModel(112, 255, 1, 2, 8, 0, shared=49232, file=65536)
+    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
+            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
+    kernel = {"kernel": "dew_tgmm", "launch": None, "unread": [], "shared": 49232, "tmem": 0,
+              "registers": 96, "spilled": 0, "need": need}
+    record = {"name": "kernel gradient", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
+              "models": {"dew_tgmm": declared.record()}, "lowered_models": {"dew_tgmm": lowered.record()},
+              "kernels": [kernel]}
+    rows = _register_evidence(record)
+    assert rows and all(row["agrees"] for row in rows), rows
+
+
 def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
     """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
     (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
     from kernel_compile import PTX_MODULE, kernel_modules, reports, write_modules
 
-    from dew.training._lowering import KernelCall
+    from dew.nn.kernels.lowered import KernelCall
 
     calls = [KernelCall("mosaic_gpu", "k", b"", module, None, "0123456789") for module in ("aa", "bb")]
     assert kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
@@ -941,7 +1319,7 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     import subprocess
     import sys
 
-    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)"
+    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family='wgmma')"
     preamble = ("import json, sys\n"
                 "from dew.nn.kernels import tuning\n"
                 "from dew.nn.kernels.templates import report\n"
@@ -965,11 +1343,13 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
 
 
 def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
-    """Programs compiled at once (`report.compiled_at_once`) keep, in turn, the executables compiling them
-    one after another keeps, in the order given, each making its first compile in a thread of its own
-    (`report.attempts`): those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX
-    lowers a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads
-    without writing their context from 0.12.0.1.post54."""
+    """Programs compiled at once (`report.compiled_at_once`) return, in the order given, executables that
+    compute what their own programs do, as those compiled one after another do, on inputs that tell the
+    programs apart: those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX lowers
+    a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads without
+    writing their context from 0.12.0.1.post54; each program compiled once (`Compiles`' events). Each
+    executable's output is bitwise its own program's compiled by JAX (`Lowered.compile`): one module, one
+    compiler, one executable's arithmetic."""
     import threading
 
     from dew.nn.kernels.templates import report
@@ -987,13 +1367,20 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     for thread in threads:
         thread.join()
     shared = [jax.jit(function).lower(square, square) for function in functions]
+    keys = jax.random.split(jax.random.key(11))
+    x, y = (jax.random.normal(key, (256, 256), jnp.float32) for key in keys)
+    ran = []
     for lowerings in (apart, shared):
         with Compiles(None) as compiles:
             together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
                                                 for lowered in lowerings])
-        threads = [program.thread for program in compiles.programs if program.kind == "compiled"]
-        assert len(threads) == 3, threads
-        assert all(thread.startswith("dew-compile") for thread in threads), threads
+        assert len([program for program in compiles.programs if program.kind == "compiled"]) == len(functions)
         alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
-        assert [executable.as_text() for executable in together] == [
-            executable.as_text() for executable in alone]
+        ran.append((lowerings, [[np.asarray(executable(x, y)) for executable in executables]
+                                for executables in (together, alone)]))
+    # JAX's own compiles after every counted one, none of them a cache entry those read.
+    for lowerings, outputs in ran:
+        expected = [np.asarray(lowered.compile()(x, y)) for lowered in lowerings]
+        for got in outputs:
+            for value, want in zip(got, expected, strict=True):
+                np.testing.assert_array_equal(value, want)

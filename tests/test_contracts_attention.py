@@ -1,5 +1,5 @@
 """Float-range and nested-derivative contracts of attention's seams: the fused attention call in forward
-mode, its kernels' reverse rules, the paged decode kernel (ledger 2641; the harness is
+mode, its kernels' reverse rules, the paged decode kernel, a head's sinks (ledger 2641; the harness is
 tests/contract_support.py)."""
 
 import itertools
@@ -10,6 +10,7 @@ import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 
 from dew.nn import attention, kv_cache
+from dew.nn.kernels.templates import attention as template
 
 
 def plain_attention(query, key, value):
@@ -41,6 +42,22 @@ def test_a_fused_attention_call_in_forward_mode_holds_every_order(edge):
 
     assert_contract(fused, primals, direction, cotangent, f"a fused call in forward mode {edge}",
                     truth_fn=plain_attention, plain_fn=plain_attention)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_heads_sinks_hold_every_order(edge):
+    """`template.sinks`' spread of each head's sink over its batch rows and queries (reverse mode one
+    compensated sum, row 4524): every order runs, finite wherever float64 is a normal float32 and the plain
+    broadcast is."""
+    (values,) = normal_draw(4524, (3,), scale=EDGES[edge])
+    (direction,) = normal_draw(4525, (3,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(4526, (2, 3, 5))
+
+    def plain(values):
+        return jnp.broadcast_to(values[None, :, None], (2, 3, 5))
+
+    assert_contract(lambda values: template.sinks(values, 2, 5, 4).m, (values,), (direction,), cotangent,
+                    f"a head's sinks {edge}", plain_fn=plain)
 
 
 @pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(("template", "tpu"), EDGES)))

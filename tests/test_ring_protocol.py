@@ -19,7 +19,7 @@ from dew.nn.kernels.templates import mosaic_sm90
 
 BLOCK = (64, 64)
 
-BOUNDS = {"stages": (1, 2, 3, 4), "consumers": (1, 2), "tiles": ((3,), (2, 0, 3), (1, 4)),
+BOUNDS = {"stages": (1, 2, 3, 4), "consumers": (1, 2, 3), "tiles": ((3,), (2, 0, 3), (1, 4)),
           "in_flight": (0, 1), "unrolled": (False, True)}
 """The checked bounds: a ring's slots, its consumer warpgroups (the family's most, `Wgmma.consumers`), each
 persistent tile's steps (an empty tile among them, its walk inactive), a step's products in flight past it,
@@ -56,15 +56,19 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
                 views = {"a": (x_gmem, lambda step: (at(tile, starts) + step, 0))}
                 return steps > 0, steps, views, tile
 
-            def consumer(wg, tile, walk, store, *, active):
+            def issue(wg, tile, walk, *, active):
                 def step(index, slots, carry, accumulators):
                     slots["a"][0, 0]
                     return carry, accumulators
 
                 walk(step, None, ())
 
-            family.persist(streams, (len(tiles),), schedule, consumer, consumers=consumers, axis="programs",
-                           outputs=(), interpret=False, in_flight=in_flight, unrolled=unrolled)
+            def finish(*_, **__):
+                pass
+
+            family.persist(streams, (len(tiles),), schedule, issue, finish, consumers=consumers,
+                           axis="programs", outputs=(), interpret=False, in_flight=in_flight,
+                           unrolled=unrolled)
 
         family.scoped(scope, streams=family.streams({"a": (BLOCK, jnp.bfloat16)}, stages, consumers))
 

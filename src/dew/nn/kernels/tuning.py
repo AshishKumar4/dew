@@ -76,6 +76,7 @@ from dew import _cache, _coordination, _records
 from dew._files import write_atomically
 from dew._records import JSON
 from dew.algebra.terms import opaque, parameter_key
+from dew.nn import programs
 from dew.nn.kernels.options import owned_program
 
 from . import generation
@@ -126,6 +127,23 @@ class Unpinnable(ValueError):
     def __reduce__(self):
         # Rebuilt from its own fields, as a pickle or a process boundary carries it.
         return type(self), (self.kernel, self.config, self.reason)
+
+
+class Untunable(ValueError):
+    """A tuning run (`tune`'s `measure`) of a step none of whose kernel launches is Dew's (`KernelOp`), the
+    Triton kernels it launches another library's (tokamax's), which keep their heuristic: the run asked to
+    measure configs and could measure none (row 2661)."""
+
+    def __init__(self, kernels: tuple[str, ...]):
+        named = ", ".join(kernels[:4]) + (", ..." if len(kernels) > 4 else "")
+        super().__init__(
+            f"tune_kernels measures Dew's own kernel launches, and this step launches none: its Triton "
+            f"kernels ({named}) are another library's, which keep their heuristic. Route its attention to "
+            "Dew's template (model.attention_impl='template') to measure it, or run without tune_kernels.")
+        self.kernels = kernels
+
+    def __reduce__(self):
+        return type(self), (self.kernels,)
 
 
 class Unreadable(ValueError):
@@ -362,10 +380,10 @@ def loads_launches(text: str) -> list[tokamax.BoundArguments]:
 
 def dumps_picks(device_kind: str, picks) -> str:
     """`picks`, `(launch, Timings)` pairs measured on GPUs of `device_kind`, as the JSON Dew stores
-    them (`_read`): each launch with the jax it was measured under, its derived config (`gaps`) and
-    the configs that ran."""
+    them (`_read`): each launch with its derived config (`gaps`) and the configs that ran, in its jax's
+    own file (`cache.kernel_picks_path`)."""
     return json.dumps({"device_kind": device_kind, "data": [
-        {**_launch_json(ba), "jax": jax.__version__, "derived": encoded(ba.heuristics_config),
+        {**_launch_json(ba), "derived": encoded(ba.heuristics_config),
          "timings": _timings_json(timings)} for ba, timings in picks]})
 
 
@@ -586,7 +604,7 @@ class KernelOp(tokamax.Op):
         the packed Qwen3.5-0.8B step's 330 s compile on an A100 (ledger 554)."""
         def shaped(name: str, value):
             if name in self.ROWS and value is not None:
-                return _bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
+                return bucketed(jax.ShapeDtypeStruct(value.shape, value.dtype))
             # NumPy operands (an unpacked delta rule's chunk and span descriptors) key as JAX's do.
             return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
                                 if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
@@ -607,7 +625,7 @@ class KernelOp(tokamax.Op):
 
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
-        return type(key)({name: _bucketed(spec) if name in self.ROWS and spec is not None
+        return type(key)({name: bucketed(spec) if name in self.ROWS and spec is not None
                           else self.traced(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
 
@@ -850,7 +868,7 @@ def _pick(ba: tokamax.BoundArguments) -> Timings | None:
     return stored if isinstance(stored, Timings) and stored.fastest_config in ba.autotuning_configs else None
 
 
-def _bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
+def bucketed(spec: jax.ShapeDtypeStruct) -> jax.ShapeDtypeStruct:
     """`spec` with its leading (token) axis at the next power of two."""
     return jax.ShapeDtypeStruct((1 << max(spec.shape[0] - 1, 0).bit_length(), *spec.shape[1:]), spec.dtype)
 
@@ -870,17 +888,11 @@ def _resource_exhausted(error: Exception) -> bool:
 def materialized(op: KernelOp, ba: tokamax.BoundArguments):
     """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments, and
     `fill(arrays) -> (args, kwargs)`, its arguments with those arrays (or traced ones) in their places."""
-    leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
-                                    is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
-    places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
+    def described(leaf) -> bool:
+        return isinstance(leaf, jax.ShapeDtypeStruct)
 
-    def fill(arrays):
-        filled = list(leaves)
-        for index, array in zip(places, arrays, strict=True):
-            filled[index] = array
-        return jax.tree.unflatten(tree, filled)
-
-    return op.operands([leaves[index] for index in places], 0), fill
+    shapes, fill = programs.holes((ba.args, ba.kwargs), described, is_leaf=described)
+    return op.operands(shapes, 0), fill
 
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
@@ -974,8 +986,7 @@ def _read(path: str) -> tuple[Keyed, list]:
     (`_keyed`), and the stored entries they do not, as JSON: another
     checkout's launches (a kernel another branch adds, another branch's
     config fields, or another signature of a kernel, with an operand more or
-    one fewer, or a launch measured under another jax), which a write keeps
-    as they are. An entry is read only where its argument names are exactly
+    one fewer), which a write keeps as they are. An entry is read only where its argument names are exactly
     its kernel's parameters. Each launch is read alone, so one launch this
     checkout cannot read leaves the others readable. A missing file, or one
     that is not JSON, holds nothing."""
@@ -985,11 +996,10 @@ def _read(path: str) -> tuple[Keyed, list]:
 
 def _partitioned(path: str) -> tuple[list[tuple[dict, tuple[tokamax.BoundArguments, Timings]]], list]:
     """The entries of the store at `path` this checkout reads, each with its launch and timings, and the
-    entries it does not (`_read`): another checkout's, or one measured under another jax or written
-    before the store kept its jax."""
+    entries it does not (`_read`), another checkout's."""
     ours, foreign = [], []
     for entry in _stored(path):
-        if not isinstance(entry, dict) or entry.get("jax") != jax.__version__:
+        if not isinstance(entry, dict):
             foreign.append(entry)
             continue
         try:
@@ -1089,7 +1099,9 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     which tokamax reads its launches out of (`launches`), keeps it from the
     persistent cache, so reading them so took a lowering of its own, about
     62 s of each cold plan candidate's compile of the packed Qwen3.5-0.8B step
-    on an A100 (ledger 561). A launch without a pick takes its heuristic."""
+    on an A100 (ledger 561). A launch without a pick takes its heuristic. A measuring run of a step
+    with no launch of Dew's whose Triton kernels are another library's measures nothing it asked for, and is
+    refused (`Untunable`)."""
     if not generation.triton_runs():
         return lower(), "[]"
     with reading():
@@ -1097,10 +1109,22 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
         with seen() as found:
             lowered = lower()
         distinct = _distinct(found)
+        if measure and not distinct and (foreign := _foreign_kernels(lowered)):
+            raise Untunable(foreign)
         _settle(distinct, measure=measure)
         if _cache.KERNEL_TUNES.get_global() != tuned:
             lowered = lower()
     return lowered, dumps_launches([ba for _, ba in distinct])
+
+
+def _foreign_kernels(lowered: jax.stages.Lowered) -> tuple[str, ...]:
+    """The Triton kernels `lowered` launches that no launch of Dew's traced (their names carry no launch's
+    digest, `report.kernel_of`): another library's, outside the tuner."""
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import report
+
+    return tuple(dict.fromkeys(call.name for call in kernel_calls(lowered, unrun=True)
+                               if call.kind == "triton" and report.kernel_of(call.name)[1] is None))
 
 
 def _distinct(found: list[Launch]) -> list[Launch]:

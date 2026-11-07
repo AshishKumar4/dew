@@ -55,15 +55,38 @@ def _round(x: int, multiple: int) -> int:
     return -(-x // multiple) * multiple
 
 
+_stated: list = [None]
+"""The caller's statement of the GPU a call lowers for (`targeting`), None for this process's own."""
+
+
+def targeting(target) -> None:
+    """Take the GPU a call lowers for from `target()`: its generation ('sm90') and multiprocessors, or None
+    for this process's own GPU. A caller lowering for a GPU it has not attached (compile-only devices, a
+    program compiled ahead for another GPU) states it, so the kernel a call runs (FlashAttention-3 on sm90)
+    and the forward's split of its keys are the target's, not the host's."""
+    _stated[0] = target
+
+
+def _target() -> tuple[str, int]:
+    """The GPU a call lowers for: the caller's statement (`targeting`), else this process's own."""
+    if _stated[0] is not None and (stated := _stated[0]()) is not None:
+        return stated
+    return _own()
+
+
 @functools.cache
+def _own() -> tuple[str, int]:
+    device = jax.devices("gpu")[0]
+    return f"sm{device.compute_capability.replace('.', '')}", device.core_count
+
+
 def _multiprocessors() -> int:
-    return jax.devices("gpu")[0].core_count
+    return _target()[1]
 
 
-@functools.cache
 def _hopper() -> bool:
-    """Whether the device runs FlashAttention-3, which is built for sm90 alone."""
-    return f"sm{jax.devices('gpu')[0].compute_capability.replace('.', '')}" in _three
+    """Whether the GPU a call lowers for runs FlashAttention-3, which is built for sm90 alone."""
+    return _target()[0] in _three
 
 
 def _splits(work: int, slots: int, blocks: int) -> int:

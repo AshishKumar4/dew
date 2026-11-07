@@ -16,16 +16,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
 from dew.batch import Variables
-from dew.interop.components import bind_component
 from dew.nn.kernels.options import program
 
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import LatentNormalization, ModuleAutoEncoder, published_source
+from .api import LatentNormalization, ModuleAutoEncoder, bound_autoencoder, published_source
 from .kl import AutoencoderKL
 
 if TYPE_CHECKING:
@@ -103,13 +101,9 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
     model = AutoencoderKL.from_diffusers(config, compute)
     tensors = read_weights(directory)
-    frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
-                                 jnp.float32)
-    return bind_component(
-        directory, "vae", config, model,
-        lambda name, rank: None if name in STATISTICS else _vae_path(name, rank),
+    return bound_autoencoder(
+        directory, config, model, lambda name, rank: None if name in STATISTICS else _vae_path(name, rank),
         lambda bound: Flux2Autoencoder(model=model, params=bound, mean=tensors["bn.running_mean"],
                                        variance=tensors["bn.running_var"],
                                        epsilon=config.get("batch_norm_eps", 1e-4)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes,
-        inputs=(frame,), tensors=tensors)
+        params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes, tensors=tensors)

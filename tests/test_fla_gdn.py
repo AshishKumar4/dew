@@ -30,11 +30,11 @@ from sharded import assert_runs_per_shard
 
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_algebra, recurrence_chunk
+from dew.nn.kernels.lowered import triton_calls
 from dew.nn.kernels.recurrence import cumulated
 from dew.nn.kernels.recurrence_chunk import fla_rule
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.precision import l2norm
-from dew.training._lowering import triton_calls
 
 pytestmark = pytest.mark.kernel
 
@@ -679,7 +679,7 @@ def test_the_rule_runs_at_every_geometry(label):
 @pytest.mark.parametrize("label", sorted(ROUTES))
 def test_both_routes_return_the_operands_common_dtype(label):
     """One contract whichever route a GPU's row picks: the port (`fla_rule`), at every geometry it takes
-    (`recurrence_chunk.PORT_SUPPORTS`' widths), and the portable math (`chunk_delta_rule`), at every geometry,
+    (`recurrence_chunk.PORT_SUPPORTS`' widths), and the portable math (`xla_mainloop`), at every geometry,
     return the output in the queries', keys' and values' common dtype, the final memory in at least
     fp32, and each operand's gradient in its own."""
     dtypes, width, heads, _, _, _ = ROUTES[label]

@@ -128,21 +128,33 @@ def shaped(tile: dict) -> dict:
     return {name: (value.shape, value.dtype) for name, value in tile.items()}
 
 
-def walked(forms: derive.Derived, tiles: list[dict], product=None):
+def walked(forms: derive.Derived, tiles: list[dict], product=None, stepped=None):
     """The state after stepping each of `tiles` (its operands' tiles) in order, from the empty state, each
-    product `product`'s where given (a mainloop's issuer)."""
+    product `product`'s where given (a mainloop's issuer), each step's sums `stepped`'s where given (a
+    mainloop's own step, `Derived.step`'s)."""
     state = forms.init(shaped(tiles[0]))
     for tile in tiles:
-        state = forms.step(state, tile, product=product)
+        state = forms.step(state, tile, product=product, stepped=stepped)
     return state
 
 
-def walked_whole(forms: derive.Derived):
-    """The declaration's derived step over every key tile in order, finished: a function of (q, k, v)."""
+def stepping(kind: type, own):
+    """A mainloop's own step (`Derived.step`'s `stepped`) taking each state whose parts are of `kind` by
+    `own(state, part)`, every other the forms'."""
+    def stepped(states, parts):
+        return tuple(own(state, part) if isinstance(part, kind) else None
+                     for state, part in zip(states, parts, strict=True))
+
+    return stepped
+
+
+def walked_whole(forms: derive.Derived, stepped=None):
+    """The declaration's derived step over every key tile in order (each step's sums `stepped`'s where
+    given), finished: a function of (q, k, v)."""
     def run(q, k, v):
         values = operands(q, k, v)
-        return forms.finish(walked(forms, [tile_of(values, tile) for tile in range(KEYS // TILE)]), values,
-                            shapes=shaped(tile_of(values, 0)))
+        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
+        return forms.finish(walked(forms, tiles, stepped=stepped), values, shapes=shaped(tiles[0]))
 
     return run
 
@@ -182,21 +194,33 @@ def test_a_walks_sums_added_by_its_mainloop_take_each_tiles_factor_and_sum():
     against the float64 truth (check 1)."""
     forms = derive.derive(declared(attention), accurate=False, saturation=SATURATION)
 
-    def doubled(states, parts):
-        return tuple(state * part.factor + 2 * jnp.sum(part.terms, axis=-1)
-                     if isinstance(part, algebra_forms.Added) else None
-                     for state, part in zip(states, parts, strict=True))
+    doubled = stepping(algebra_forms.Added,
+                       lambda state, part: state * part.factor + 2 * jnp.sum(part.terms, -1))
 
-    def run(q, k, v):
-        values = operands(q, k, v)
-        tiles = [tile_of(values, tile) for tile in range(KEYS // TILE)]
-        state = forms.init(shaped(tiles[0]))
-        for tile in tiles:
-            state = forms.step(state, tile, stepped=doubled)
-        return forms.finish(state, values, shapes=shaped(tiles[0]))
+    halved = jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2)
+    assert_as_exact(jax.jit(walked_whole(forms, doubled)), halved, draw, "attention, its sums added twice",
+                    seeds=16)
 
-    assert_as_exact(jax.jit(run), jax.jit(lambda q, k, v: whole(attention)(q, k, v) / 2), draw,
-                    "attention, its sums added twice", seeds=16)
+
+def unscaled(q, k, v, rows, keys):
+    """A walked sum of local products that takes no rescale: each key's score times its value, summed."""
+    del rows, keys
+    return (q @ k.T) @ v
+
+
+def test_a_walks_plain_sums_of_products_are_the_mainloops_to_take():
+    """A walked sum of local products that takes no rescale (a backward's dQ over its key tiles) states its
+    tile's weights and values to a mainloop that takes its step (`Derived.step`'s `stepped`, `Accumulated`,
+    no factor): accumulated twice over, the walk's sum is the declared function's doubled, on par against the
+    float64 truth (check 1)."""
+    forms = derive.derive(declared(unscaled), accurate=False, saturation=SATURATION)
+
+    doubled = stepping(algebra_forms.Accumulated,
+                       lambda state, part: state + 2 * (part.weights @ part.values))
+
+    twice = jax.jit(lambda q, k, v: 2 * whole(unscaled)(q, k, v))
+    assert_as_exact(jax.jit(walked_whole(forms, doubled)), twice, draw,
+                    "a plain sum of products, accumulated twice", seeds=16)
 
 
 def test_a_walks_merge_by_its_mainloop_takes_each_sums_two_factors():
@@ -257,6 +281,33 @@ def raw(q, k, v, rows, keys):
 
 
 SCALE = WIDTH ** -0.5
+
+
+def test_a_maximum_read_only_floored_is_carried_from_its_floor():
+    """A walked maximum the declaration reads only floored at the least finite value (`held_floored`'s,
+    attention's `max(m, least)`) starts its walk at that floor, as the hand walk carries it, not at -inf,
+    and the walk is on par with the declared function against the float64 truth (check 1), the query that
+    sees no key among its rows."""
+    forms = derive.derive(declared(held_floored), accurate=False, saturation=SATURATION)
+    q, k, v = draw(0)
+    shapes = shaped(tile_of(operands(q, k, v), 0))
+    roles = [role for role, _ in forms.slots(shapes)]
+    peak = forms.init(shapes)[roles.index("max")]
+    np.testing.assert_array_equal(np.asarray(peak), np.full(peak.shape, np.finfo(peak.dtype).min))
+    assert_as_exact(jax.jit(walked_whole(forms)), jax.jit(whole(held_floored)), draw, "floored walk",
+                    seeds=16)
+
+
+def placed(q, k, v, rows, keys):
+    """Attention whose logits are placed on a one-device mesh mid-walk (`with_sharding_constraint`), as a
+    declaration traced under a mesh places them."""
+    del rows, keys
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",))
+    s = jax.lax.with_sharding_constraint((q @ k.T) * WIDTH ** -0.5,
+                                         jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec()))
+    m = jnp.max(s, axis=-1)
+    p = jnp.exp(s - m[:, None])
+    return (p @ v) / jnp.sum(p, axis=-1)[:, None]
 
 
 def natural_exp(x, scale=1.0):
@@ -390,11 +441,15 @@ def floored(q, k, v, rows, keys):
     return jnp.sum(jnp.exp(s - jnp.maximum(jnp.max(s, axis=-1), floor)[:, None]), axis=-1)
 
 
-def test_a_merge_of_a_shift_that_reads_an_operand_computes_the_declared_function():
+@pytest.mark.parametrize(("function", "walk"), [(floored, "merged"), (placed, "walked")],
+                         ids=["a shift reading an operand, merged", "a walked value placed on a mesh"])
+def test_a_declaration_walks_as_its_function(function, walk):
     """A walk whose shift reads an operand of the queries beside the walked maximum, walked in two halves
-    and merged: on par with the whole-operand function (check 1)."""
-    forms = derive.derive(declared(floored), accurate=False, saturation=SATURATION)
-    assert_as_exact(jax.jit(merged_whole(forms)), jax.jit(whole(floored)), draw, "floored merged", seeds=16)
+    and merged, and one whose declaration places a walked value on a mesh (a sharding constraint, which
+    leaves its values as they are), walked: each on par with the whole-operand function (check 1)."""
+    forms = derive.derive(declared(function), accurate=False, saturation=SATURATION)
+    walked = {"merged": merged_whole, "walked": walked_whole}[walk](forms)
+    assert_as_exact(jax.jit(walked), jax.jit(whole(function)), draw, f"{function.__name__} {walk}", seeds=16)
 
 
 def with_a_count(q, k, v, rows, keys):

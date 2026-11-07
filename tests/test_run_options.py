@@ -80,6 +80,23 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_runs_kernel_choices_reach_the_programs_it_traces_and_its_record(tmp_path):
+    """`kernels` names the kernel a run runs for an op (`dew.kernels.use`, row 4649), in every program it
+    traces: one its devices cannot run for its attention is refused as its step traces, the portable one
+    trains, and the run's record keeps the choice, which its resume reads."""
+    from run_kinds import lm
+
+    from dew.config import RunConfig
+    from dew.kernels import KernelRefused
+
+    run = lm(tmp_path, drawn=False)
+    with pytest.raises(KernelRefused):
+        trained(dataclasses.replace(run, kernels={"attention": "cudnn"}), tmp_path, "refused")
+    trained(dataclasses.replace(run, kernels={"attention": "xla"}), tmp_path, "chosen")
+    assert RunConfig.load(str(tmp_path / "runs" / "chosen")).kernels == {"attention": "xla"}
+
+
+@pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_path):
     """From Python, a kind's run trains under each option it states: another `trainer.key` is another

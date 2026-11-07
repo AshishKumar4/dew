@@ -79,7 +79,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from dew.mesh import logical_spec
-from dew.nn.derivatives import contracted
+from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import launches
 
 from ..precision import (
@@ -92,7 +92,7 @@ from ..precision import (
     rounded_to,
     two_product,
 )
-from ..sharding import automatic_axes, manual_map
+from ..sharding import automatic_axes, manual_map, on_shards, varying_like
 from . import generation, tuning
 from .generation import INHERENT, device_generation
 from .selection import Kernel, Op, Requirement, select
@@ -269,29 +269,49 @@ def _runs(case) -> bool:
 
 
 def _placed(axes, operands, *, whole_last: bool) -> bool:
-    """Whether the kernel can run on its `operands`' shards: none varies in a
-    `shard_map` that checks varying axes, and on a split mesh the caller
-    names the first one's logical axes (`axes`), which with `whole_last`
-    leave its last axis whole."""
-    if any(jax.typeof(operand).mat.varying for operand in operands if operand is not None):
+    """Whether the kernel can run on its `operands`' shards: on a split mesh
+    the caller names the first one's logical axes (`axes`), which with
+    `whole_last` leave its last axis whole, or every axis splitting it is
+    explicit, its type its placement (`_shard_spec`). In a `shard_map` checking varying
+    axes, each shard its own, the launch states its outputs' varying type
+    (`_varying`) where a GPU compiles it; Pallas's interpreter evaluates the
+    kernel's body on the shards' varying values, whose gathers by unvarying
+    indices JAX refuses, so an interpreted call runs XLA's arithmetic there."""
+    if not generation.triton_runs() and any(
+            jax.typeof(operand).mat.varying for operand in operands if operand is not None):
         return False
     if not automatic_axes():
         return True
-    first = operands[0]
-    return axes is not None and (not whole_last or len(logical_spec(axes, first.shape)) < first.ndim)
+    spec = _shard_spec(axes, operands[0])
+    return spec is not None and (not whole_last or len(spec) < operands[0].ndim or spec[-1] is None)
+
+
+def _shard_spec(axes, first) -> jax.sharding.PartitionSpec | None:
+    """How a split mesh places the `first` operand: as the logical `axes` the caller names, else as its
+    own type states where every axis splitting it is explicit (`jax.typeof(first).sharding`), None where
+    neither tells (an automatic axis XLA's partitioner places)."""
+    if axes is not None:
+        return logical_spec(axes, first.shape)
+    mesh = jax.sharding.get_abstract_mesh()
+    if any(mesh.axis_types[mesh.axis_names.index(name)] != jax.sharding.AxisType.Explicit
+           for name in automatic_axes()):
+        return None
+    return jax.typeof(first).sharding.spec
 
 
 def _per_shard(local, axes, operands, replicated):
     """`local(*operands)` as it runs: whole where no mesh axis splits, else on
-    each shard (`manual_map`), the operands placed as `axes` names and those
+    each shard (`on_shards`), the operands placed as `axes` names and those
     marked `replicated` (a norm's weight) whole on every shard, so the weight's
     gradient sums over the shards. Every output takes the first operand's place."""
     if not automatic_axes():
         return local(*operands)
-    spec = logical_spec(axes, operands[0].shape)
-    specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if whole else spec
-                  for operand, whole in zip(operands, replicated, strict=True))
-    return manual_map(local, specs, spec)(*operands)
+    spec = _shard_spec(axes, operands[0])
+    if spec is None:
+        raise ValueError("an automatic mesh axis no caller names splits the operands, which the kernel's "
+                         "selector refuses (`_placed`)")
+    whole = {index for index, replicated in enumerate(replicated) if replicated}
+    return on_shards(local, spec, operands, whole)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -359,9 +379,8 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
     Requirement('gate', lambda case: case.gate_fits, "a gate must match the normalized input's shape",
                 row=INHERENT),
     Requirement('placement', lambda case: case.placed,
-                "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, "
-                "or a shard_map that checks varying axes holds them, and a Pallas call states no varying "
-                "type", row='ledger 822'),
+                "a mesh splits RMSNorm's operands by automatic axes the caller does not name, or across "
+                "its features", row='ledger 822'),
 )
 """The fused norms' requirements: a plain, stream and gated RMSNorm over fp32 or bf16 rows of at most
 8192 features, with fp32 statistics, a vector weight, and operands placed as the kernel reads them."""
@@ -440,8 +459,7 @@ SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
                 "SwiGLU needs nonempty equal shapes, not broadcasting, or a packed [..., 2, H] gate and up",
                 row=INHERENT),
     Requirement('placement', lambda case: case.placed,
-                "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that "
-                "checks varying axes holds them, and a Pallas call states no varying type",
+                "a mesh splits SwiGLU's operands by automatic axes the caller does not name",
                 row='ledger 822'),
 )
 """The fused SiLU products' requirements: fp32 or bf16 operands of one shape, apart or packed, placed
@@ -494,7 +512,7 @@ def _weight(scale_ref, columns, width: int, offset: bool, stored, interpret: boo
 
 def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean_square_ref, *,
                  row_block: int, epsilon: float, offset: bool, stored, after_cast: bool,
-                 inverse_rounded: bool, activation: str, interpret: bool):
+                 inverse_rounded: bool, activation: str, weight_first: bool, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     row = pl.program_id(0) * row_block + jnp.arange(row_block)
@@ -516,7 +534,7 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
                      weight=weight, gate=gate, activation=activation,
                      rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret)
                      if after_cast and weight is not None
-                     else None)
+                     else None, weight_first=weight_first)
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(mean_square_ref.at[row], mean_square, mask=row < rows)
 
@@ -645,6 +663,36 @@ def _scale_sum(partial, correction):
     return compensated_total(pair, jnp.sum(partial, axis=0))
 
 
+def _varying(operands: tuple, outputs):
+    """`operands` (None where a call has none) each varying over every manual axis any varies over
+    (`sharding.varying_like`), and `outputs` (`jax.ShapeDtypeStruct`s, None where a call has none) of
+    their varying type: a Pallas call states its outputs' types, which a checked `shard_map` reads."""
+    present = [operand for operand in operands if operand is not None]
+    if not any(jax.typeof(operand).mat.varying for operand in present):
+        return operands, outputs
+    lifted = tuple(None if operand is None else varying_like(operand, *present) for operand in operands)
+    mat = jax.typeof(next(operand for operand in lifted if operand is not None)).mat
+    return lifted, jax.tree.map(
+        lambda shape: jax.ShapeDtypeStruct(shape.shape, shape.dtype, manual_axis_type=mat), outputs)
+
+
+def _typed(backward):
+    """`backward(saved, operands, cotangents)` with each operand's cotangent of the operand's varying type:
+    summed over each manual axis it varies over and its operand does not (a weight replicated in a checked
+    `shard_map`, whose shards' partial gradients its varying cast's transpose sums: `_varying`)."""
+    def typed(saved, operands, cotangents):
+        gradients = backward(saved, operands, cotangents)
+        return tuple(gradient if gradient is None or operand is None else _summed_to(gradient, operand)
+                     for gradient, operand in zip(gradients, operands, strict=True))
+    return typed
+
+
+def _summed_to(gradient: jax.Array, operand: jax.Array) -> jax.Array:
+    """`gradient` summed over each manual axis it varies over that `operand` does not."""
+    axes = tuple(sorted(jax.typeof(gradient).mat.varying - jax.typeof(operand).mat.varying))
+    return jax.lax.psum(gradient, axes) if axes else gradient
+
+
 class _Norm(NamedTuple):
     """One fused norm's static arithmetic: everything but its operands. The
     weight reaches the kernels in fp32, `stored` its own dtype, in which the
@@ -657,6 +705,9 @@ class _Norm(NamedTuple):
     activation: str
     interpret: bool
     inverse_rounded: bool = False
+    weight_first: bool = False
+    """The weight folded into the inverse before the rows (`precision.rms_weighted`'s, Flax's association):
+    the forward's one multiply's order; the reverse's math is the same."""
 
 
 @tuning.lowered_once(('kernel', 'name', 'outputs', 'grid', 'warps', 'interpret', 'arithmetic'))
@@ -664,7 +715,10 @@ def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warp
               arithmetic: tuple[tuple[str, Hashable], ...]):
     """`kernel` launched over `operands` (None where a call has none) with its `arithmetic`'s keyword
     arguments, lowered once a configuration (`tuning.lowered_once`): its outputs' shapes and dtypes, its grid,
-    warps and arithmetic static."""
+    warps and arithmetic static. In a `shard_map` checking varying axes, its operands are made varying over
+    every axis any of them varies over and its outputs vary over them too, as an elementwise primitive's do
+    (row 822)."""
+    operands, outputs = _varying(operands, outputs)
     return launches.pallas_call(
         functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=outputs,
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
@@ -684,7 +738,8 @@ class RmsForward(tuning.KernelOp):
 
     def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, gate: jax.Array | None, *,
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
-             interpret: bool, inverse_rounded: bool, config: RowsConfig, return_residuals: bool = False):
+             interpret: bool, inverse_rounded: bool, weight_first: bool, config: RowsConfig,
+             return_residuals: bool = False):
         rows, width = x.shape
         return _launched(
             x, branch, scale, gate, kernel=_rms_forward, name="rms_norm_forward",
@@ -695,7 +750,8 @@ class RmsForward(tuning.KernelOp):
             warps=config.warps, interpret=interpret, arithmetic=(
                 ('row_block', config.rows), ('epsilon', epsilon), ('offset', offset),
                 ('stored', jnp.dtype(stored)), ('after_cast', after_cast),
-                ('inverse_rounded', inverse_rounded), ('activation', activation)),
+                ('inverse_rounded', inverse_rounded), ('activation', activation),
+                ('weight_first', weight_first)),
         ), None
 
     def _get_heuristics_config(self, ba) -> RowsConfig:
@@ -801,7 +857,7 @@ def _stored(portable, norm: _Norm, at: int):
 
 
 def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after_cast: bool, portable, *,
-                    axes=None):
+                    axes=None, weight_first: bool = False):
     """The pre-norm seam fused: `(stream, y)`, the stream `x + branch` and its RMSNorm, `portable(x, branch,
     scale)` its arithmetic in XLA. The forward reads both addends once and writes the sum beside the norm;
     the reverse takes the stream's own cotangent into the norm's pass, so the sum of the two gradients is
@@ -811,11 +867,12 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     interprets where no Triton GPU runs it (`generation.triton_runs`), as the CPU suite calls it, and
     lowers for the assumed GPU within `generation.assumed`, as the GDN kernels decide. Every order of
     derivative goes through `portable` and each level's value through the kernels
-    (`generation.linear_tangent`)."""
+    (`generation.linear_tangent`). `weight_first` folds the weight into the inverse before the rows
+    (`_Norm.weight_first`)."""
     if branch is None:
         return x, rms_norm(x, scale, epsilon, dtype, offset, after_cast,
-                           lambda x, scale: portable(x, None, scale)[1], axes=axes)
-    norm = _norm(epsilon, dtype, offset, after_cast, scale)
+                           lambda x, scale: portable(x, None, scale)[1], axes=axes, weight_first=weight_first)
+    norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(weight_first=weight_first)
 
     def forward(x, branch, scale):
         outputs, mean_square = _rms_with_mean_square(x, branch, scale, None, norm)
@@ -829,16 +886,17 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
         return dstream, dstream, dscale
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, backward, _stored(portable, norm, 2)))
+        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 2), kind=KernelGlue()))
     return _per_shard(local, axes, (x, branch, _widened(scale)), (False, False, True))
 
 
 def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, portable, *, axes=None,
-             inverse_rounded: bool = False):
+             inverse_rounded: bool = False, weight_first: bool = False):
     """The fused RMSNorm alone, `portable(x, scale)` its arithmetic in XLA, differentiated as
     `stream_rms_norm` is. With `inverse_rounded` the inverse RMS rounds to `dtype` before it
-    multiplies, as `unweighted_rmsnorm` rounds it."""
-    norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded)
+    multiplies, as `unweighted_rmsnorm` rounds it; `weight_first` as `stream_rms_norm`'s."""
+    norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded,
+                                                                     weight_first=weight_first)
 
     def forward(x, scale):
         (_, y), mean_square = _rms_with_mean_square(x, None, scale, None, norm)
@@ -850,7 +908,7 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
         return dx, dscale
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, backward, _stored(portable, norm, 1)))
+        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 1), kind=KernelGlue()))
     return _per_shard(local, axes, (x, _widened(scale)), (False, True))
 
 
@@ -870,7 +928,7 @@ def gated_rms_norm(x, gate, scale, epsilon: float, dtype, activation: str, porta
         return _rms_backward_call(x, scale, gate, mean_square, dy, None, norm)
 
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
-        generation.linear_tangent(forward, backward, _stored(portable, norm, 2)))
+        generation.linear_tangent(forward, _typed(backward), _stored(portable, norm, 2), kind=KernelGlue()))
     return _per_shard(local, axes, (x, gate, _widened(scale)), (False, False, True))
 
 
@@ -1049,8 +1107,8 @@ def swiglu(gate, up, portable, *, axes=None):
     interpret = not generation.triton_runs()
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(lambda gate, up: (_swiglu(gate, up, interpret), ()),
-                                  lambda saved, operands, dy: _swiglu_bwd(interpret, operands, dy),
-                                  portable))
+                                  _typed(lambda saved, operands, dy: _swiglu_bwd(interpret, operands, dy)),
+                                  portable, kind=KernelGlue()))
     return _per_shard(local, axes, (gate, up), (False, False))
 
 
@@ -1062,8 +1120,8 @@ def packed_swiglu(gate_up, portable, *, axes=None):
     interpret = not generation.triton_runs()
     local = contracted("test_the_fused_norms_and_products_hold_every_order")(
         generation.linear_tangent(lambda gate_up: (_packed(gate_up, interpret), ()),
-                                  lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy),
-                                  portable))
+                                  _typed(lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy)),
+                                  portable, kind=KernelGlue()))
 
     if not automatic_axes():
         return local(gate_up)

@@ -17,7 +17,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Generic
 
 import jax
@@ -1271,13 +1271,16 @@ class Transaction:
         refuse_fixed_routers(fixed)
         return realized
 
-    def step(self, *, realize=None, host=False):
+    def step(self, *, realize=None, host=False, frozen: Sequence[tuple[str, ...]] = ((FROZEN,),)):
         """Build the function that runs one attempt over the shared phases.
 
         A host-master step compiles each phase on its own and replays in a
         Python loop, because its realizations cross an eager transport
         boundary. A resident step traces the phases together and replays
-        inside `lax` control flow.
+        inside `lax` control flow. A host step's commit reads none of the
+        trees at `frozen`, those it keeps beside the accelerator
+        (`dew.training.execution.frozen_trees`): they cross to no other
+        device and stay the arrays the state holds (`apart`).
         """
         realize = self.realize if realize is None else realize
         # Each host phase is a program over the objective's modules, compiled through Dew's compile point
@@ -1386,7 +1389,7 @@ class Transaction:
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
                 return self.past(finish, state, gradient, batch, aux, pending, gradient, attempt, tokens,
                                  probed)
-            moving, held = apart(state)
+            moving, held = apart(state, frozen)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)
             return together(advanced, held), loss, aux, committed
