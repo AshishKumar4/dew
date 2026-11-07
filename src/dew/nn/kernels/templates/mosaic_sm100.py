@@ -351,8 +351,8 @@ scale tiles, 32, 16]` a step's block, four scales of each of 128 rows a tile."""
 
 @dataclasses.dataclass(frozen=True)
 class ScaleRing(CommittedRing):
-    """A block-scale stream's ring (`SCALE_TILE`): each slot's shared-memory tiles paired with the tensor memory
-    its products read them from (`Tcgen05Issuer.scaled_products`), a slot's columns of `tmem`. A slot's
+    """A block-scale stream's ring (`SCALE_TILE`): each slot's shared-memory tiles paired with the tensor
+    memory its products read them from (`Tcgen05Issuer.scaled_products`), a slot's columns of `tmem`. A slot's
     scales are copied to its tensor memory by the product warp before its products (tcgen05.cp then
     tcgen05.mma, pipelined in issue order: PTX ISA 9.7.18.6.2), and again only once its products' commit has
     released the slot and the producer refilled it, so no copy overwrites scales a product still reads."""
