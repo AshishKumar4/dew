@@ -1407,20 +1407,29 @@ def _input_cotangents(lhs, d_products: tuple, matrices: tuple, group_sizes, prol
     summed as the gradient's own dtype sums (`_gemm`'s `summed_as`); each cotangent's rows read at
     `plain`'s `gather` where given (a scattered product's cotangent, read where its rows landed).
     A gathered product's `lhs` is its tokens, whose dtype alone is read (no prologue rewrites its rows)."""
-    out = (jnp.dtype(lhs.dtype),) if len(matrices) == 1 else (at_least_fp32(lhs.dtype),)
     options = {'interpret_on_cpu': plain['interpret_on_cpu'], 'precision': plain['precision'],
                'transpose_rhs': not plain['transpose_rhs'], 'dense': plain['dense'], 'first': plain['first'],
                'gather': plain['gather']}
-    d_operand = functools.reduce(jnp.add, (jnp.asarray(_gemm(d, matrix.astype(compute), group_sizes, None, (),
-                                                             (), None, (), (), out, several=False,
-                                                             summed_as=(lhs.dtype,), **options))
-                                           for d, matrix in zip(d_products, matrices, strict=True)))
+    # A paired product's first product, wide, is added in the second's epilogue (`_added`): the same sum,
+    # rounded once, with no pass of XLA's own between them (row 2164: FSPAIRED2's 0.42 ms add).
+    wide, d_operand = at_least_fp32(lhs.dtype), None
+    for at, (d, matrix) in enumerate(zip(d_products, matrices, strict=True)):
+        out = wide if at < len(matrices) - 1 or (at and prologue is not None) else jnp.dtype(lhs.dtype)
+        sides = () if d_operand is None else (d_operand,)
+        d_operand = jnp.asarray(_gemm(d, matrix.astype(compute), group_sizes, None, (), (),
+                                      _added if sides else None, sides, (('rows', 'columns'),) * len(sides),
+                                      (out,), several=False, summed_as=(lhs.dtype,), **options))
     if prologue is None:
         return d_operand.astype(lhs.dtype), ()
     d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes, group_sizes,
                                              d_operand)
     return d_lhs.astype(lhs.dtype), tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays,
                                                                                 strict=True))
+
+
+def _added(acc, prior):
+    """An accumulator plus a wide product before it (`_input_cotangents`' paired sum)."""
+    return acc + prior
 
 
 def _kernel_gradient(lhs, d_product, matrix, group_sizes, prologue, prologue_arrays, prologue_axes, compute,
