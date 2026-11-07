@@ -415,8 +415,8 @@ def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, valid=None, 
     """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree_parents`): each token of `mixed`
     `[B, S, D]` convolved over the `K-1` real tokens before it on its path (`valid` `[B, S]`, every token
     where None), its ancestors, and past the root the held `history` `[B, K-1, D]`, as `causal_conv1d`
-    convolves the window it ends (`tree_windows`); its `parts`, `dtype` and `activation` are
-    `causal_conv1d`'s."""
+    convolves the window it ends (`tree_windows`), a token the row does not hold zero as `_masked_conv1d`
+    leaves it; its `parts`, `dtype` and `activation` are `causal_conv1d`'s."""
     batch, length, features = mixed.shape
     width = taps.shape[1] - 1
     valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
@@ -424,9 +424,12 @@ def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, valid=None, 
     windows = jax.vmap(lambda row, index: row[index])(gathered, tree_windows(tree, width, valid))
     convolved = causal_conv1d(windows.reshape(batch * length, width + 1, features), taps, activation,
                               bias=bias, parts=parts, dtype=dtype)
-    if parts is None:
-        return convolved[:, -1].reshape(batch, length, -1)
-    return tuple(piece[:, -1].reshape(batch, length, -1) for piece in convolved)
+
+    # A token the row does not hold convolves nothing, as a cached call's masked conv leaves it.
+    def held(piece):
+        return jnp.where(valid[:, :, None], piece[:, -1].reshape(batch, length, -1), 0)
+
+    return held(convolved) if parts is None else tuple(held(piece) for piece in convolved)
 
 
 def call_tree(parents: tuple[int, ...] | None, key_runs, key_positions) -> tuple[int, ...] | None:
