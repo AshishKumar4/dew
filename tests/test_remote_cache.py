@@ -540,6 +540,43 @@ def test_a_bundle_fetched_while_another_file_runs_is_not_that_files(tmp_path):
     assert [key for key, _ in remote_cache.unpacked(bundle)] == ["jit_other-1"]
 
 
+def test_a_tasks_switches_of_bundle_list_the_cache_directory_once_and_each_keeps_its_own(cache_worker,
+                                                                                          tmp_path):
+    """A task's files switch bundles without listing JAX's cache directory each time (watched.py's `Writes`
+    reports what arrives in it): one listing as the first bundle opens, however many programs the directory
+    holds, and each file's bundle holds the programs its own tests compiled, none restored or compiled under
+    another (row 3496: a 140-file task's 281 listings of 602,483 restored programs took 727 s of 1,074 s)."""
+    import os
+    import sys
+
+    url, stored, _ = cache_worker
+    for index in range(2000):
+        compiled(tmp_path, f"jit_old_{index}-1")
+    stored["/jax/cpu/bundles/tests/test_0.py"] = remote_cache.packed([("jit_restored-1", b"r")])
+    listed: list[str] = []
+    watching = [True]
+
+    def audited(event: str, args: tuple) -> None:
+        if watching[0] and event == "os.scandir" and args and os.fspath(args[0]) == str(tmp_path):
+            listed.append(event)
+
+    sys.addaudithook(audited)
+    try:
+        cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+        files = [f"tests/test_{index}.py" for index in range(20)]
+        for index, file in enumerate(files):
+            cache.opened(file)
+            compiled(tmp_path, f"jit_{index}-1")
+            cache.closed(file)
+        cache.drain()
+    finally:
+        watching[0] = False
+    assert len(listed) == 1
+    for index, file in enumerate(files):
+        held = {key for key, _ in remote_cache.unpacked(stored[f"/jax/cpu/bundles/{file}"])}
+        assert held == ({f"jit_{index}-1", "jit_restored-1"} if index == 0 else {f"jit_{index}-1"}), file
+
+
 def test_a_bundle_the_cap_cut_short_is_sent_once(cache_worker, tmp_path, monkeypatch):
     """Two programs that together pass `MAX_BYTES`: the bundle carries the first, is sent once, and is
     not sent again by a later close or the drain while its tests compile nothing new."""

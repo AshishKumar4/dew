@@ -168,8 +168,32 @@ def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_
         {"tests/test_site.py::test_light": 1.0, "tests/test_site.py::test_site": 2.0}))
     spans = [(0, 4), (4, 12), (12, 20)]
     names = [ci.site_task("3.12", "tests/test_site.py", "test_site", span) for span in spans]
-    weighed = {entry["name"]: entry["weight"] for entry in ci.plan(30.0, {"rows": {names[0]: 40.0}})}
+    weighed = {entry["name"]: entry["weight"] for entry in ci.plan(100.0, {"rows": {names[0]: 40.0}})}
     assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
+
+
+def test_a_sites_map_tasks_its_measured_rate_puts_past_the_target_are_cut_finer_never_coarser(ci, tmp_path):
+    """A site whose measured rate puts a map task of its declared cut past the target is cut finer: as many
+    units a task as the target holds at that rate, each weighed at it, its later stage later still; one
+    whose rate fits the target keeps its declared cut, and none is cut coarser than declared (row 4376: a
+    64-seed shard of test_recurrence_template_stability ran 966 s, the train's critical path, where every
+    other group took 256 s or less)."""
+    site_checkout(tmp_path)
+    first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
+
+    def maps(target: float, seconds: float) -> list[tuple[str, float, bool]]:
+        return [(entry["split"], entry["weight"], entry.get("later", False))
+                for entry in ci.plan(target, {"rows": {first: seconds}})
+                if entry["python"] == "3.12" and ".draws-" in entry["split"]]
+
+    # 4 seeds in 40 s: 10 s a seed, 3 a task within 30 s.
+    assert maps(30.0, 40.0) == [
+        ("test_site.draws-0-3", 30.0, False), ("test_site.draws-3-4", 10.0, False),
+        *((f"test_site.draws-{start}-{min(start + 3, 20)}", 10.0 * (min(start + 3, 20) - start), True)
+          for start in range(4, 20, 3))]
+    # 4 seeds in 4 s fit a task of the declared 8 within the target, and of no more.
+    assert [split for split, _, _ in maps(30.0, 4.0)] == [
+        "test_site.draws-0-4", "test_site.draws-4-12", "test_site.draws-12-20"]
 
 
 def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
