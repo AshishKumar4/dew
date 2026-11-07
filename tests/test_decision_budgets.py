@@ -273,6 +273,37 @@ def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
     assert offers(0) == {"two": True, "three": True}
 
 
+def test_a_yes_or_no_draws_no_none_of_the_above_by_default_and_a_recorded_run_keeps_its_floor():
+    """An objective left at its defaults draws no "none of the above" on a choice of two options, a yes
+    or a no, which it would turn into another question, and draws it on one of three (row 2938); a run
+    recorded when the floor defaulted to none builds with that floor, as it trained."""
+    from dew.config import ObjectiveConfig
+    from dew.decision.objective import DecisionObjective
+    from dew.decision.rows import NONE_OF_THE_ABOVE, QuestionRows
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    two = Choice("Is it on?", ["yes", "no"])
+    three = Choice("Which colour?", ["red", "green", "blue"])
+    example = Example("the lamp", {"two": two, "three": three}, {"two": "yes", "three": "red"})
+    backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=256, attention_impl="xla")
+    objective = DecisionObjective(backbone, tokenizer=BYTES, specials=BYTE_SPECIALS,
+                                  layout=MarkerLayout(max_len=256), none_of_the_above=1.0)
+    fit, expand, configured = objective.data().train
+    assert isinstance(expand, QuestionRows)
+    read = configured.factory({"slots": {"options": 3, "questions": 1}})
+    rows = {row["decision"].names[0]: row for row in expand.flat_map(fit.map({"example": example}))}
+    rng = np.random.default_rng(0)
+    assert {name: any(NONE_OF_THE_ABOVE in bytes(option).decode()
+                      for _ in range(16) for option in _options(read.random_map(row, rng)))
+            for name, row in rows.items()} == {"two": False, "three": True}
+    defaulted = ObjectiveConfig("decision", fields={"none_of_the_above": 1.0})
+    recorded = ObjectiveConfig("decision", fields={"none_of_the_above": 1.0},
+                               defaults={**defaulted.defaults, "none_of_the_above_options": 0})
+    assert defaulted.defaults["none_of_the_above_options"] == 3
+    assert recorded.arguments["none_of_the_above_options"] == 0
+
+
 def test_a_none_of_the_above_draw_never_leaves_a_row_unfit():
     """A "none of the above" that would leave its question alone past the window lays the question out as
     Fit admitted it, where the encoding refused the row before; a draw whose row fits (one replacing the
