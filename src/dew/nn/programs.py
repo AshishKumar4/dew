@@ -216,7 +216,7 @@ def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
 def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | None:
     """`primitive`'s outputs over concrete `operands`, computed as this host computes a constant: at compile
     time, on its CPU, outside any mesh a program traces under and without the outputs' stated shardings
-    (`_on_host`); None where an operand is an array this process cannot read whole (one laid across another
+    (`on_host`); None where an operand is an array this process cannot read whole (one laid across another
     process's devices), or an operand or output is of an extended dtype (a PRNG key, which no host array
     holds), or the primitive runs per device of a mesh it names (a shard_map's body sees one shard, and the
     host holds no mesh to run it over), none a constant of this host. A call with a derivative rule of its own
@@ -228,7 +228,7 @@ def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | Non
         return None
     params = {name: None if name in ("sharding", "out_sharding") else value for name, value in params.items()}
     body = params.get("call_jaxpr")
-    with _on_host():
+    with on_host():
         if isinstance(body, jcore.ClosedJaxpr):
             made = jax.core.eval_jaxpr(body.jaxpr, body.consts, *operands)
         else:
@@ -243,7 +243,7 @@ def _extended(value) -> bool:
 
 
 @contextlib.contextmanager
-def _on_host() -> Iterator[None]:
+def on_host() -> Iterator[None]:
     """Compile-time evaluation on this host's CPU, no mesh in context, abstract or concrete: a step traced
     under its devices' mesh (`jax.set_mesh`, a compile-only TPU topology's, a multi-process one's) would
     place an eager primitive's operands on devices that run nothing here. `jax.set_mesh(None)` does the
