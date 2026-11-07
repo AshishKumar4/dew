@@ -2402,3 +2402,18 @@ def test_a_replaced_constructor_leaves_device_contexts_their_own_in_a_fresh_proc
                           text=True, check=False)
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.split() == ["meta", "torch.float64", "meta", "torch.int64"]
+
+
+def test_a_float64_truth_takes_a_tensors_float32_softmax_in_float64():
+    """A reference's float64 truth (`tools.torch_precision.float64`) widens a softmax pinned to float32,
+    the tensor method's as the function's: the softmax it computes is float64's own."""
+    import torch
+
+    from tools.torch_precision import float64
+
+    logits = torch.tensor([[0.17, -1.32, 0.91, 2.14]], dtype=torch.float64)
+    with float64():
+        widened = {"method": logits.softmax(dim=-1, dtype=torch.float32),
+                   "function": torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)}
+    for name, softmax in widened.items():
+        np.testing.assert_array_equal(softmax.numpy(), logits.softmax(dim=-1).numpy(), err_msg=name)
