@@ -163,7 +163,8 @@ def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_inter
     whose states merge by their masses (`algebra.merged_slices`): the first row reads every key, whole key
     tiles and whole slices, the second none. On par with the reference path (check 1), the empty row zero;
     with values near bf16's largest over equal keys, each slice's weighted sum near fp32's largest and
-    their sum past it, which the merge's masses keep finite."""
+    their sum past it, which the merge's masses keep finite. The reference's sums pass it too, so it runs on
+    the values taken down by a power of two and gives its output back up by it, exactly."""
     keys = 4096
     spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, 0], jnp.int32))
 
@@ -179,8 +180,11 @@ def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_inter
         with generation.assumed("sm90"):
             return attention_decode.attend(query, key, value, spans, interpret=True)
 
-    assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
-                    f"template decode split at aligned keys, {values}", seeds=SEEDS)
+    def reference(query, key, value):
+        return template.reference(query, key, value * 2.0 ** -8, spans) * 2.0 ** 8
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template decode split at aligned keys, {values}",
+                    seeds=SEEDS)
 
 
 @INTERPRETS
