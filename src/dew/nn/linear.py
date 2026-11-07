@@ -40,7 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-from dew.batch import Coordinates, document_ranks, prefix_sum, valid_order
+from dew.batch import Coordinates, prefix_sum, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
@@ -241,67 +241,6 @@ def _stream_order(valid):
     order, counts = valid_order(valid)
     rank = prefix_sum(jnp.asarray(valid, bool), dtype=jnp.int32) - 1
     return rank, jnp.where(jnp.arange(length)[None, :] < counts[:, None], order, length).astype(jnp.int32)
-
-
-def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, parts=None, dtype=None,
-                   activation: bool = True):
-    """`causal_conv1d` of packed documents of which each convolves after a history of its own: a tap that
-    reaches before its document's first real token reads `held` `[B, D, K - 1, C]` at the document the
-    document enters (`entered` `[B, D]`, numbered from 1 as `dew.batch.Entered` numbers them, 0 for none,
-    which reads the zeros `causal_conv1d` reads), where
-    `documents` `[B, S]` numbers each token's document from 1 (0 on padding) and `valid` marks the real
-    tokens, each document's a run of them: the questions of a row over one state, each convolving after
-    its state's last `K - 1` tokens (`document_tails`; row 1506). XLA's arithmetic, `xla_conv1d`'s."""
-    dtype = x.dtype if dtype is None else jnp.dtype(dtype)
-    batch, length, _ = x.shape
-    taps_count = kernel.shape[1]
-    wide = jnp.promote_types(at_least_fp32(x.dtype), dtype)
-    padded = jnp.pad(x, ((0, 0), (taps_count - 1, 0), (0, 0))).astype(wide)
-    real = jnp.asarray(valid, bool)
-    documents = jnp.asarray(documents, jnp.int32)
-    # Each real token's count of the real tokens before it in its document, and the history slot it enters.
-    begins = real & (jnp.pad(documents, ((0, 0), (1, 0)), constant_values=-1)[:, :-1] != documents)
-    rank = document_ranks(real, begins)
-    slot = jnp.take_along_axis(jnp.asarray(entered, jnp.int32), jnp.maximum(documents - 1, 0), axis=1) - 1
-    slot = jnp.where(documents > 0, slot, -1)
-    rows = jnp.arange(batch)[:, None]
-    history = jnp.asarray(held).astype(wide)
-
-    def read(tap):
-        """The token `K - 1 - tap` before each, of its own document, else of the history it enters."""
-        inside = padded[:, tap:tap + length]
-        if tap == taps_count - 1:
-            return inside
-        behind = history[rows, jnp.maximum(slot, 0), jnp.clip(tap + rank, 0, taps_count - 2)]
-        behind = jnp.where((slot >= 0)[..., None], behind, 0)
-        return jnp.where((rank >= taps_count - 1 - tap)[..., None], inside, behind)
-
-    taps = kernel.astype(wide)
-    windows = short_conv.preactivation([read(tap) for tap in range(taps_count)],
-                                       [taps[:, tap] for tap in range(taps_count)],
-                                       None if bias is None else bias.astype(wide))
-    if activation:
-        windows = nn.silu(windows)
-    windows = jnp.where(real[:, :, None], windows, 0)
-    return conv_pieces(windows, parts, dtype)
-
-
-def document_tails(x, valid, documents, width: int, count: int):
-    """Each document's last `width` real tokens `[B, count, width, C]`, zeros in front where it holds
-    fewer and for a document the row holds none of, `documents` `[B, S]` numbering each token's document
-    from 1 (0 on padding) and `valid` marking the real ones: the history a document that continues it
-    convolves after (`entered_conv1d`)."""
-    batch, length, _ = x.shape
-    real = jnp.asarray(valid, bool) & (documents > 0)
-    slots = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-    rows = jnp.arange(batch)[:, None]
-    ends = jnp.full((batch, count), -1, jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].max(
-        jnp.where(real, slots, -1))
-    places = ends[:, :, None] - width + 1 + jnp.arange(width)[None, None, :]
-    inside = jnp.clip(places, 0, length - 1)
-    owner = documents[rows[:, :, None], inside]
-    kept = (places >= 0) & (owner == jnp.arange(1, count + 1)[None, :, None]) & real[rows[:, :, None], inside]
-    return jnp.where(kept[..., None], x[rows[:, :, None], inside], 0)
 
 
 def real_tail(x, valid, segments, width: int):
