@@ -1,4 +1,5 @@
-"""Wan 2.1's video transformer, as Diffusers 0.34.0's `WanTransformer3DModel` runs it for text-to-video.
+"""Wan 2.1's video transformer, as Diffusers' `WanTransformer3DModel` runs it for text-to-video
+from 0.35.0 on.
 
 A strided 3-D convolution cuts the clip's latent into 1x2x2 patches, one
 token each, in frame, row, column order. Every block normalizes its residual
@@ -74,7 +75,6 @@ class WanBlock(nn.Module):
     features: int
     heads: int
     ffn_dim: int
-    qk_norm: bool = True
     cross_attn_norm: bool = True
     epsilon: float = 1e-6
     dtype: Dtype | None = None
@@ -83,15 +83,14 @@ class WanBlock(nn.Module):
 
     @nn.nowrap
     def _attention(self, name=None):
-        """The source's `Attention` under `WanAttnProcessor2_0`: flat projections, Wan's
-        `rms_norm_across_heads` over each token's whole query and key, rounded to the weight's dtype
-        before they scale, and adjacent rotary pairs. Its cross-attention reads keys and values from
-        the text alone, where the MM-DiTs' join the two streams (`JointAttention`)."""
+        """The source's `WanAttention` under `WanAttnProcessor`: flat projections, an RMS norm over each
+        token's whole query and key (Wan's `rms_norm_across_heads`), rounded to the weight's dtype before
+        they scale, and adjacent rotary pairs. Its cross-attention reads keys and values from the text
+        alone, where the MM-DiTs' join the two streams (`JointAttention`)."""
         return NormalAttention(
             self.features, self.heads, self.features // self.heads, dtype=self.dtype,
             precision=self.precision,
-            qk_norm=QKNorm(("norm_q", "norm_k"), self.epsilon, across_heads=True, scale_after_cast=True)
-            if self.qk_norm else None,
+            qk_norm=QKNorm(("norm_q", "norm_k"), self.epsilon, across_heads=True, scale_after_cast=True),
             attention_impl=self.attention_impl, flat=True, rotary_pairs="adjacent", name=name)
 
     @nn.nowrap
@@ -133,7 +132,8 @@ class WanBlock(nn.Module):
 
 
 class WanTransformer(nn.Module):
-    """Runs Diffusers 0.34.0's `WanTransformer3DModel` for text-to-video, behind Dew's model interface.
+    """Runs Diffusers' `WanTransformer3DModel` for text-to-video, behind Dew's model interface, as 0.35.0
+    and later compute it.
 
     `__call__` takes a clip's latent `[B, F, H, W, C]`, the model time the
     schedule supplies, and a `DenoisingCondition`, and returns the flow
@@ -141,8 +141,12 @@ class WanTransformer(nn.Module):
     training count, which is the timestep the source's pipeline passes. The
     condition's `context` is the UMT5 states `[B, L, text_dim]`, and the
     cross-attention reads every one of them, as the source's does. The
-    fields are the config's; `qk_norm` takes the value the source names,
-    `rms_norm_across_heads`, or None.
+    fields are the config's. Its attention norms each token's query and key
+    across heads whatever `qk_norm` names, as Diffusers' `WanAttention` does
+    from 0.35.0 on (transformer_wan.py:208-209 at 0.39.0), which reads no
+    `qk_norm`; 0.34.0 left them unnormed under None. `qk_norm` keeps the
+    config's value, `rms_norm_across_heads` or None, so the config round-trips;
+    every published Wan config names `rms_norm_across_heads`.
     """
 
     patch_size: Sequence[int] = (1, 2, 2)
@@ -180,7 +184,7 @@ class WanTransformer(nn.Module):
         """A block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP count
         reads it): one factory, so the count and the execution build the same block."""
         return WanBlock(self.features, self.num_attention_heads, self.ffn_dim,
-                        qk_norm=self.qk_norm is not None, cross_attn_norm=self.cross_attn_norm,
+                        cross_attn_norm=self.cross_attn_norm,
                         epsilon=self.eps, attention_impl=self.attention_impl, dtype=self.dtype,
                         precision=self.precision, **where)
 

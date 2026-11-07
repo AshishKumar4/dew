@@ -74,7 +74,7 @@ seams: numerics: {
 	purpose: "Numerics owns the matmul precision a program runs at"
 	paths:   _src
 	type:    "jax.default_matmul_precision"
-	onlyIn:  ["Numerics.*", "configured_precision", "at_default_precision", "at_default_precision.*"]
+	onlyIn:  ["Numerics.*", "configured_precision", "at_precision", "at_precision.*"]
 }
 
 seams: tokenizers: {
