@@ -312,6 +312,37 @@ def _decode_drawn(rows: int, capacity: int, kv_heads: int, width: int):
 
     return draw
 
+
+@pytest.mark.parametrize("starts", [None, (3, 17)], ids=["whole", "window"])
+def test_a_paged_templates_gradient_lowers_in_forward_mode_for_h100(monkeypatch, starts):
+    """The compiled paged decode's forward-over-reverse derivative lowers with traced row lengths."""
+    from jax.sharding import Mesh
+
+    from dew.nn.kernels import generation
+    from dew.nn.kv_cache import template_paged
+
+    monkeypatch.setattr(generation, "placed_platform", lambda: "gpu")
+    table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
+    lengths = jnp.asarray([69, 128], jnp.int32)
+    starts = None if starts is None else jnp.asarray(starts, jnp.int32)
+    shapes = ((2, 4, 64), (2, 4, 64, 64), (2, 4, 64, 64), (4,))
+    operands = tuple(jax.ShapeDtypeStruct(shape, jnp.bfloat16 if index < 3 else jnp.float32)
+                     for index, shape in enumerate(shapes))
+
+    def loss(*arrays):
+        output = template_paged(None)(*arrays[:3], table, lengths, starts, arrays[3])
+        return jnp.sum(output.astype(jnp.float32) ** 2)
+
+    gradient = jax.grad(loss, argnums=(0, 1, 2, 3))
+
+    def differentiated(*arrays):
+        return jax.jvp(gradient, arrays, jax.tree.map(jnp.ones_like, arrays))
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices("cpu")[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(differentiated).trace(*operands).lower(lowering_platforms=("cuda",))
+
+
 @INTERPRETS
 def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_interpreted():
     """A bf16 pool split between two groups of rows (`KVCache.groups`), which the GPU's Pallas paged kernel
