@@ -2082,14 +2082,21 @@ def _derived_softmax(spec: Forward, state: Partial, keys: Keys):
     derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
                          stepped=own)
     m = dict(zip(fields, derived, strict=True))["m"]
-    accumulated, added = taken[0]["acc"], taken[0]["total"]
+    factor, p, value, held = _derived_parts(state, keys, taken[0]["acc"], taken[0]["total"])
+    return m, factor, p, value, held
+
+
+def _derived_parts(state: Partial, keys: Keys, accumulated, added):
+    """The forms' step's parts as the template's step takes them: the factor the state's sums take, the
+    tile's weights (the denominator's terms; the guarded walk's at the row's shift, `room`), its values and
+    the guarded `Room`."""
     assert isinstance(accumulated, Accumulated) and isinstance(added, Added)
     value, p, factor = accumulated.values, added.terms, added.factor
     held = None
     if state.guard is not None:
         largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
         held = room(state.guard, state.total, factor, p, largest())
-    return m, factor, p if held is None else held.weights, value, held
+    return factor, p if held is None else held.weights, value, held
 
 
 def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
@@ -2122,15 +2129,9 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
 
             acc = held_by(states[fields.index("acc")], scale, (accumulated.weights,), accumulated.values)
             return tuple(acc if field == "acc" else total if field == "total" else None for field in fields)
-        assert isinstance(added, Added)
         # The template's step over the forms' weights (the denominator's terms, before their narrowing for
         # the product) and rescale.
-        value, p, factor = accumulated.values, added.terms, added.factor
-        held = None
-        if state.guard is not None:
-            largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
-            held = room(state.guard, state.total, factor, p, largest())
-        weights = p if held is None else held.weights
+        factor, weights, value, held = _derived_parts(state, keys, accumulated, added)
         times = functools.partial(_times, keys.dot, value, multiplier=None, chunk=chunk_of(spec))
         after.append(stepped(state, state.m, factor, weights, times(weights), held, times))
         return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
