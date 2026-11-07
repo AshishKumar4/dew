@@ -155,7 +155,7 @@ RECURRENCE_CASES = [pytest.param(name, regime, id=f"{name}-{regime}")
 
 @pytest.mark.parametrize(("name", "regime"), RECURRENCE_CASES)
 def test_the_derived_chunk_stays_finite_and_exact_on_every_regime(name, regime):
-    """The portable math's derived chunk forms (`recurrence_chunk.derived_rule`) under the template suite's
+    """The portable math's derived chunk forms (`recurrence_chunk.xla_mainloop`) under the template suite's
     regime: output and final memory finite wherever float64's are, and on par with the token-by-token
     recurrence's (check 1)."""
     hooks = recurrence_suite.SITES[name]

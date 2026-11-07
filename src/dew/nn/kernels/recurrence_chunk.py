@@ -564,7 +564,10 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
     if hooks.l2norm:
-        query, key = (l2norm(x.astype(work)) for x in (query, key))
+        # Normalized in fp32 and rounded once to their own dtype, as fla's in-kernel norm and the layers'
+        # conv hand them to a kernel: kept fp32, a bf16 call reached the template as an fp32 one, its final
+        # memory 30 to 41 times fla's distance from float64 in two parts (row 184's GDN cell, acb1301632c).
+        query, key = (l2norm(x.astype(work)).astype(x.dtype) for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
     g, beta = recurrence.log_gates(hooks, given, work)
     g = jnp.zeros(value.shape[:3], work) if g is None else g
@@ -602,8 +605,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                 scale=scale, wide=epilogue, firsts=firsts)
             if kernel == 'derived':
                 # The portable math's forms derived from the token update, where a call names them.
-                return derived_rule(query, key, value, g, beta, state, starts, scale=scale, delta=hooks.delta,
-                                    chunk_size=chunk_size, dtype=work, bound=hooks.inverse_bound)
+                return xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, scale=scale,
+                                    delta=hooks.delta, dtype=work, bound=hooks.inverse_bound)
             group = value.shape[2] // key.shape[2]
             if group > 1:
                 query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -852,7 +855,7 @@ GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
 recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
 portable math (`chunk_delta_rule`). The portable math's forms derived from the token update
-(`derived_rule`) run where a call names them (`generation.chosen(gated_delta_rule='derived')`), until they
+(`xla_mainloop`) run where a call names them (`generation.chosen(gated_delta_rule='derived')`), until they
 match the hand forms in check 1 at the edges, in every derivative order and in time."""
 
 
@@ -860,9 +863,17 @@ RESET = "first"
 """The derived rule's reset operand (`scan.Scan.reset`): a packed document's first tokens."""
 
 
-def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: float, delta: bool,
-                 chunk_size: int, dtype, bound: float | None = None):
-    """The recurrence over chunks by the forms derived from its token update (`dew.algebra.scan`, the compact
+@dataclasses.dataclass(frozen=True)
+class Tiles:
+    """The plain-JAX mainloop's config (`xla_mainloop`): its walk's chunk of `chunk` tokens."""
+
+    chunk: int
+
+
+def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, *, scale: float,
+                 delta: bool, dtype, bound: float | None = None):
+    """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
+    forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
     carry alone in sequence): each value head's update `h = D h - beta k (k^T D h) + beta
     k v^T` with the delta rule (`recurrence.update`'s), `h = D h + beta k v^T` without it, `D = exp(g)` a
@@ -901,6 +912,7 @@ def derived_rule(query, key, value, g, beta, state=None, starts=None, *, scale: 
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
                                        state=((width, columns), dtype), reset=reset, ranges=ranges),
                              saturation=SATURATION)
+    chunk_size = config.chunk
     chunks = -(-length // chunk_size)
     padded = chunks * chunk_size - length
 
@@ -1443,12 +1455,16 @@ def fast_rounding() -> bool:
 
 def chunk_rounding(delta: bool, dtype) -> bool:
     """Whether a call of `dtype` on the delta rule's route (`chunk`, `port_kernel`) takes the run's fast
-    forms' numbers (`fast_rounding`): the delta rule's and an fp32 call's, never a 16-bit call's without the
-    delta rule, whose rounded numbers are mamba_ssm's, the SSD's, which its scan's route alone asks
+    forms' numbers (`fast_rounding`): the delta rule's alone, whose bar is fla's (TF32 products in an fp32
+    call). A form without the delta rule has no port, its bar the portable math at full fp32: an fp32 call's
+    two bf16 parts put its training step 30 to 69 times the portable math's distance from float64 on every
+    leaf, interpreted and on a GH200 alike (row 184's write gate cell, jsf-cellcpu, M-JS-9), so it takes
+    three; a 16-bit call's rounded numbers are mamba_ssm's, the SSD's, which its scan's route alone asks
     (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between launches
     in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned keys
     (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9)."""
-    return fast_rounding() and (delta or jnp.dtype(dtype) == jnp.float32)
+    del dtype  # The run's declaration rounds a call by its dtype (`fast_rounding`, row 4673).
+    return fast_rounding() and delta
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,

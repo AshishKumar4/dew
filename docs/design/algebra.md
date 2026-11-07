@@ -798,7 +798,7 @@ derived one replaced is deleted with it, check 1 holding the derived forms to XL
   tile declaration (`softmax_cotangents`) over its own products. Both cover hooks' slopes, dropout, the
   first pass's D and initial states.
 - The recurrence. The plain-JAX path runs `derive_scan`'s chunk forms with their carry split
-  (`derived_rule`), differentiated at every order (the decays' and the solve's rules through
+  (`recurrence_chunk.xla_mainloop`), differentiated at every order (the decays' and the solve's rules through
   `generation.linear_tangent`: reverse mode their protected rules, forward mode their own tangent), its
   carries typed as every operand varies, its decays' prefix restarting at a token whose decay vanishes in
   its dtype (`dew.nn.precision.vanishing`, a segmented compensated scan: a span through it is zero, and no later span's sum

@@ -305,7 +305,7 @@ scan without the delta rule (Mamba2's SSD, the scan's own op)."""
 @pytest.mark.parametrize('packed', [False, True], ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', DERIVED, ids=str)
 def test_the_derived_forms_are_as_exact_as_the_recurrence_token_by_token(hooks, packed):
-    """The forms derived from the token update (`recurrence_chunk.derived_rule`, `dew.algebra.scan`), the
+    """The forms derived from the token update (`recurrence_chunk.xla_mainloop`, `dew.algebra.scan`), the
     delta rule's kernel a call names 'derived', against the same recurrence a token at a time, output and
     final memory, on the portable math's draws of one sequence or of packed documents, each document's first
     token its forms' reset (check 1): the accuracy check the derived forms are taken behind."""
@@ -836,7 +836,7 @@ def test_a_rated_scan_traced_for_a_jvp_on_a_tpu_gives_its_tangent():
 @pytest.mark.parametrize("replicated", [(), (2, 5)], ids=["every operand split", "values and memory whole"])
 @pytest.mark.parametrize("entering", [False, True], ids=["zero memory", "a memory entering"])
 def test_the_derived_rule_runs_in_a_shard_map_that_checks_varying_axes(entering, replicated):
-    """The portable math's forms derived from the token update, named (`recurrence_chunk.derived_rule`,
+    """The portable math's forms derived from the token update, named (`recurrence_chunk.xla_mainloop`,
     `generation.chosen(gated_delta_rule='derived')`) inside a `shard_map` that checks varying axes over
     operands that vary by row, or with the values and the entering memory whole beside split keys
     and gates, from a zero memory and from one that enters: its carries vary as its operands do, and its
