@@ -247,7 +247,7 @@ class OuterProgram:
         @functools.wraps(self.function)
         def traced(*args, **kwargs):
             return algebra.rewritten(self.function, static_argnums=self.numbers,
-                                     static_argnames=tuple(self.names))(*args, **kwargs)
+                                     static_argnames=tuple(self.names), kernels=True)(*args, **kwargs)
         return traced
 
     @functools.cached_property
