@@ -1,0 +1,2 @@
+gdnbase|0
+gdnbarrierbetween|0

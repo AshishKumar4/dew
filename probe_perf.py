@@ -4,6 +4,10 @@ import struct
 import platform
 
 variant, packed = sys.argv[1], sys.argv[2] == "1"
+per_key = not variant.startswith("gdn")
+variant = variant.removeprefix("gdn")
+if not per_key:
+    print("K hooks gdn",variant,flush=True)
 if variant == "ftz":
     libm = ctypes.CDLL("libm.so.6")
     env = ctypes.create_string_buffer(32)
@@ -86,7 +90,7 @@ def unit(x):
     return x / np.sqrt(np.sum(x*x, axis=-1, keepdims=True))
 q, k = (jnp.asarray(unit(rng.standard_normal((rows,length,heads,width))), jnp.float32) for _ in range(2))
 v = jnp.asarray(rng.standard_normal((rows,length,heads,width)), jnp.float32)
-g = jnp.asarray(-np.logaddexp(0,rng.standard_normal((rows,length,heads,width))+1)*0.1,jnp.float32)
+g = jnp.asarray(-np.logaddexp(0,rng.standard_normal((rows,length,heads)+((width,) if per_key else ()))+1)*0.1,jnp.float32)
 if variant == "mild":
     g = g * 0.1
 if variant == "strong":
@@ -97,7 +101,7 @@ if packed:
     starts=np.zeros((rows,length),bool)
     starts[:,[0,300,700]]=True
     starts=jnp.asarray(starts)
-hooks=recurrence.Hooks(decay="vector",scale=width**-0.5,write_bound=1.)
+hooks=recurrence.Hooks(decay="vector" if per_key else "scalar",scale=width**-0.5,write_bound=1.)
 def forward(q,k,v,g,beta):
     with generation.chosen(gated_delta_rule="derived"):
         return chunk(hooks,Chunk(q,k,v,log_decay=g,beta=beta,starts=starts))
