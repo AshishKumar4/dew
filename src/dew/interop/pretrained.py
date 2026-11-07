@@ -606,9 +606,9 @@ class Pretrained:
         """`load` of a source a family's loader reads, its every option as `load` states it."""
         if packed_experts and scan_layers:
             # A scan stacks a period's layers along a leading axis of each leaf, which a bank's three would
-            # take as its experts' (row 4881).
+            # take as its experts' (row 4861).
             raise ValueError("packed_experts serves each layer's banks apart; scan_layers stacks them, which "
-                             "no bank takes yet (row 4881)")
+                             "no bank takes yet (row 4861)")
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
