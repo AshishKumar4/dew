@@ -126,8 +126,7 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     assert key(read) != key(compile_only_gpus("sm90", 2))
 
 
-def test_a_step_compiled_ahead_over_a_hosts_gpus_plans_within_the_memory_it_is_told_on_those_gpus(tmp_path,
-                                                                                                  monkeypatch):
+def test_a_step_compiled_ahead_over_a_hosts_gpus_plans_within_the_memory_it_is_told(tmp_path, monkeypatch):
     """Over a host's own GPUs (`host_gpus`), a stated capacity reaches the planner alone: the step is
     planned within it and compiled over the host's GPUs as serialized, not over a canonical target restated
     with it."""
@@ -137,7 +136,8 @@ def test_a_step_compiled_ahead_over_a_hosts_gpus_plans_within_the_memory_it_is_t
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     serialized = tmp_path / "topology.bin"
-    serialized.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm90", 1, 2**30))).serialize())
+    stated = compile_only_gpus("sm90", 1, 2**30)
+    serialized.write_bytes(topologies.TopologyDescription(list(stated)).serialize())
     host = host_gpus("sm90", serialized, 1)
     trainer = fine_tune(MeshSpec().build(host))
     ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30, host=True)
