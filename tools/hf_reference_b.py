@@ -5,7 +5,9 @@ Runs in the same venv as tools/hf_reference.py and reuses its writers:
 `write_tiny` for a random-weight checkpoint with the reference's fp32
 logits, `write_released_config` for a released config.json alone.
 
-    PYTHONPATH=src .venv/bin/python tools/hf_reference_b.py
+    PYTHONPATH=src .venv/bin/python tools/hf_reference_b.py [FIXTURE ...]
+
+writes every fixture, or the ones named (`WRITERS`).
 
 What lands in tests/fixtures/hf:
 
@@ -44,7 +46,10 @@ What lands in tests/fixtures/hf:
   ones with the balancing bias and a shared expert, IndexShare's
   full/shared schedule (index_topk_freq 4 off index_skip_topk_offset 3)
   over eight layers, and one MTP depth (model.layers.8.*) with its own
-  indexer, composed as glm4-moe-tiny's is (mtp_logits.npy).
+  indexer, composed as glm4-moe-tiny's is (mtp_logits.npy). Its indexer has
+  eight heads: a key every head's relu zeroes scores exactly 0, at 2^-heads
+  a key, and four heads put such ties at the top-k cut of most prompts,
+  where torch's topk (no tie order) and Dew's lowest index first part.
 - deepseek-v4-tiny/: DeepSeek V4-Flash at toy width under the release's own
   legacy spelling: the compressed-attention schedule as compress_ratios
   with a trailing entry for the prediction depth, the compression rates as
@@ -631,11 +636,11 @@ def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
 #
 # The release's indexer has half as many heads as the attention, which
 # would be two here; the relu zeroes a key's score whenever every head's
-# agreement is negative, and at two heads no seed in 400 kept the fourth
-# and fifth scores apart on every row of the five indexer layers (the
-# trunk's four full layers and the depth). Four heads with seed 3850 keep
-# them at least 0.0149 apart everywhere, so the fixture's top-k is one
-# selection and not a tie torch and jax break differently.
+# agreement is negative, at 2^-heads a key, and a top-k cut among such
+# ties is torch's tie order, not the indexer's function. Eight heads keep
+# the cut untied on the fixture's ids and on prompts drawn from its tokens
+# (tests/test_hf_decoder_moe.py asserts it), where four left 41 tied cuts
+# over 17 prompts (row 4703).
 GLM_MOE_DSA_SEED = 3850
 GLM_MOE_DSA_TINY = dict(
     vocab_size=256, hidden_size=32, intermediate_size=64, moe_intermediate_size=12,
@@ -647,7 +652,7 @@ GLM_MOE_DSA_TINY = dict(
     rms_norm_eps=1e-5, tie_word_embeddings=False,
     rope_parameters={"rope_theta": 8000000.0, "rope_type": "default"},
     attention_bias=False, attention_dropout=0.0, index_topk=4, index_head_dim=8,
-    index_n_heads=4, head_dim=12, first_k_dense_replace=3,
+    index_n_heads=8, head_dim=12, first_k_dense_replace=3,
     num_nextn_predict_layers=1, indexer_rope_interleave=True, rope_interleave=True,
     index_topk_freq=4, index_skip_topk_offset=3, index_topk_pattern=None,
     index_share_for_mtp_iteration=True, moe_router_dtype="float32",
@@ -1132,43 +1137,69 @@ def write_mirrored_config(name: str, repo: str) -> None:
     (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
 
 
-def main() -> None:
-    write_tiny("gpt-oss-tiny", tiny_gpt_oss())
-    write_tiny("deepseek-v2-tiny", tiny_deepseek_v2())
-    write_tiny("kimi-k2-tiny", tiny_kimi_k2())
-    write_kimi_k2_config("kimi-k2-tiny", "moonshotai/Kimi-K2-Instruct")
-    write_kimi_k25("kimi-k25-tiny", "moonshotai/Kimi-K2.5", tiny_kimi_k25())
+def write_glm4_moe() -> None:
     glm = tiny_glm4_moe()
     write_tiny("glm4-moe-tiny", glm)
     write_glm_mtp("glm4-moe-tiny", glm, glm4_moe_mtp(glm.config))
+
+
+def write_qwen3_next() -> None:
     qwen3_next = tiny_qwen3_next()
     write_tiny("qwen3-next-tiny", qwen3_next)
     write_qwen3_next_mtp("qwen3-next-tiny", qwen3_next, "Qwen/Qwen3-Next-80B-A3B-Instruct")
     write_released_config("qwen3-next-80b-a3b", "Qwen/Qwen3-Next-80B-A3B-Instruct")
+
+
+def write_glm5_next() -> None:
     glm5_next = tiny_glm5_next()
     write_tiny("glm5-next-tiny", glm5_next, seed=GLM5_NEXT_SEED)
     write_glm5_next_mtp("glm5-next-tiny", glm5_next, glm5_next_mtp(glm5_next_tiny_config()))
     write_glm5_next_config("glm5-next-tiny", "zai-org/GLM-5.3-Flash")
     write_released_config("glm-5.3-flash", "zai-org/GLM-5.3-Flash")
+
+
+def write_glm_moe_dsa() -> None:
     dsa = tiny_glm_moe_dsa()
     write_tiny("glm-moe-dsa-tiny", dsa, seed=GLM_MOE_DSA_SEED)
     write_glm_mtp("glm-moe-dsa-tiny", dsa, glm_moe_dsa_mtp(dsa.config))
     write_glm_moe_dsa_head_dim("glm-moe-dsa-tiny")
+
+
+def write_deepseek_v4() -> None:
     write_tiny("deepseek-v4-tiny", tiny_deepseek_v4(), seed=DEEPSEEK_V4_SEED)
     write_deepseek_v4_source("deepseek-v4-tiny")
     write_deepseek_v4_config("deepseek-v4-tiny", "deepseek-ai/DeepSeek-V4-Flash")
     write_deepseek_v4_mtp_reference("deepseek-v4-tiny")
+
+
+def write_llama4() -> None:
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
     write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")
     write_mirrored_config("gemma4-26b-a4b", "unsloth/gemma-4-26B-A4B-it")
 
+
+def write_gemma4_moe() -> None:
     write_tiny("gemma4-moe-tiny", tiny_gemma4_moe())
     write_gemma4_moe_block(FIXTURES.parent / "gemma4")
+
+
+def write_gemma3n() -> None:
     write_tiny("gemma3n-tiny", tiny_gemma3n())
     write_gemma3n_blocks(FIXTURES.parent / "gemma3n")
+
+
+def write_kimi_k2() -> None:
+    write_tiny("kimi-k2-tiny", tiny_kimi_k2())
+    write_kimi_k2_config("kimi-k2-tiny", "moonshotai/Kimi-K2-Instruct")
+
+
+def write_layer_scalars() -> None:
     for name in ("gemma4-ple", "gemma4-kvshare", "gemma4-e2b"):
         add_layer_scalars(name)
+
+
+def write_released_configs() -> None:
     write_released_config("gpt-oss-20b", "openai/gpt-oss-20b")
     write_released_config("deepseek-v2-lite", "deepseek-ai/DeepSeek-V2-Lite")
     write_released_config("kimi-k2", "moonshotai/Kimi-K2-Instruct")
@@ -1178,6 +1209,35 @@ def main() -> None:
     write_released_config("glm-5.3", "zai-org/GLM-5.3")
     write_released_config("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash")
     write_mirrored_config("gemma-3n-e2b", "unsloth/gemma-3n-E2B")
+
+
+WRITERS = {
+    "gpt-oss-tiny": lambda: write_tiny("gpt-oss-tiny", tiny_gpt_oss()),
+    "deepseek-v2-tiny": lambda: write_tiny("deepseek-v2-tiny", tiny_deepseek_v2()),
+    "kimi-k2-tiny": write_kimi_k2,
+    "kimi-k25-tiny": lambda: write_kimi_k25("kimi-k25-tiny", "moonshotai/Kimi-K2.5", tiny_kimi_k25()),
+    "glm4-moe-tiny": write_glm4_moe,
+    "qwen3-next-tiny": write_qwen3_next,
+    "glm5-next-tiny": write_glm5_next,
+    "glm-moe-dsa-tiny": write_glm_moe_dsa,
+    "deepseek-v4-tiny": write_deepseek_v4,
+    "llama4-tiny": write_llama4,
+    "gemma4-moe-tiny": write_gemma4_moe,
+    "gemma3n-tiny": write_gemma3n,
+    "layer-scalars": write_layer_scalars,
+    "released-configs": write_released_configs,
+}
+"""Each fixture's writer, by the fixture it writes, in the order `main` runs them."""
+
+
+def main() -> None:
+    """Write every fixture, or those named on the command line (`WRITERS`)."""
+    named = sys.argv[1:] or list(WRITERS)
+    unknown = sorted(set(named) - set(WRITERS))
+    if unknown:
+        raise SystemExit(f"no fixture named {unknown}; the fixtures are {list(WRITERS)}")
+    for name in named:
+        WRITERS[name]()
 
 
 if __name__ == "__main__":
