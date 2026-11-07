@@ -223,7 +223,8 @@ class Graph:
         # The body's constants (jax.nn's mask positions, an iota it closed over) by their values.
         self._constants: dict[jcore.Var, object] = {
             var: np.asarray(value) for var, value in index.consts.items()
-            if math.prod(getattr(var.aval, "shape", ())) <= MASK_ENTRIES}
+            if not isinstance(value, jax.core.Tracer)
+            and math.prod(getattr(var.aval, "shape", ())) <= MASK_ENTRIES}
 
     def made(self, atom, *names: str):
         """The place of the equation making `atom`, where its primitive is one of `names`; None else."""

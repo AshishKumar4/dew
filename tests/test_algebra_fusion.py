@@ -381,6 +381,23 @@ def swiglu(a, b):
     return jax.nn.silu(a) * b
 
 
+def _norms_written(fn, *shapes):
+    """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
+    (`norm_regions`), decided under the H100 and written on this host, whose norms run their portable
+    arithmetic: what the compile point's rewrite computes, run here."""
+    from jax.extend.core import jaxpr_as_fun
+
+    from dew.algebra import fusion, norm_regions
+
+    closed = jax.make_jaxpr(fn)(*shapes)
+    with generation.assumed("sm90"):
+        found = [region for region in norm_regions.regions(fusion.Index(closed.jaxpr))
+                 if norm_regions.taken(region)]
+    written = [fusion.Written(region.places, region.operands, (region.output,), region.places[-1],
+                              norm_regions.written(region)) for region in found]
+    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(found)
+
+
 NORM_FORMS = {
     "flax RMSNorm": (flax_rms, {"scale_offset": False, "scale_after_cast": False}),
     "plain RMSNorm": (plain_rms, {"scale_offset": False, "scale_after_cast": False}),
@@ -424,11 +441,11 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
         assert set(fused(lambda: dew.jit(program).trace(*shapes))) == expected
     sizes = [shape.shape for shape in shapes]
     draw = normal_drawn(43, *sizes, sizes[0], dtype=jnp.bfloat16)
-    # Under the H100's decisions, so the compile point writes the norm; on this host its portable arithmetic.
-    with generation.assumed("sm90"):
-        assert_as_exact(jax.jit(with_gradients(dew.jit(program))), jax.jit(with_gradients(program)), draw,
-                        f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
-                            lambda *x: program(*(a.astype(jnp.float64) for a in x))))
+    written, found = _norms_written(program, *shapes)
+    assert found == 1
+    assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(program)),
+                    draw, f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
+                        lambda *x: program(*(a.astype(jnp.float64) for a in x))))
 
 
 def _rows_inverse(x):
@@ -470,13 +487,11 @@ def test_a_plain_program_near_a_norm_computes_as_written(program):
     from contract_support import normal_drawn
     from reference_error import assert_as_exact, with_gradients
 
-    import dew
 
     fn = NEAR_NORMS[program]
     draw = normal_drawn(47, (256, 256), (256,), (256, 256), dtype=jnp.bfloat16)
-    # Under an H100's decisions, so the compile point writes what it matches; on this host Dew's norms run
-    # their portable arithmetic.
-    with generation.assumed("sm90"):
-        assert_as_exact(jax.jit(with_gradients(dew.jit(fn))), jax.jit(with_gradients(fn)), draw,
-                        f"dew.jit {program}", seeds=8,
-                        truth_fn=with_gradients(lambda *x: fn(*(a.astype(jnp.float64) for a in x))))
+    written, _ = _norms_written(fn, jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(fn)), draw,
+                    f"dew.jit {program}", seeds=8,
+                    truth_fn=with_gradients(lambda *x: fn(*(a.astype(jnp.float64) for a in x))))
