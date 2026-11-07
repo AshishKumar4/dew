@@ -134,6 +134,54 @@ router, its attention and its sparse indexer sow, which a looped pass keeps
 apart per pass (`PassView`)."""
 
 
+LAYER_ROWS = 'layer_rows'
+"""The collection, and the key within it, under which a one-stage scan's run holds the layers a stage-local
+state keeps on their stored layers, a row each (`StackView.stack`): a frozen base the objective joins into the
+parameters, which each iteration reads where it lies (`_rows_at`), where a stacked copy would hold it twice.
+The collection holds each run's rows by the collection they join."""
+
+
+def _rowed(trees: Sequence) -> dict:
+    """A run's layers of a collection it reads a row an iteration (`LAYER_ROWS`), in run order."""
+    return {LAYER_ROWS: {str(offset): tree for offset, tree in enumerate(trees)}}
+
+
+def _row_containers(tree, path: tuple[str, ...] = ()) -> list[tuple[tuple[str, ...], list]]:
+    """Every run's rows `tree` holds (`_rowed`), by its path, each run's rows in order."""
+    if not isinstance(tree, Mapping):
+        return []
+    if set(tree) == {LAYER_ROWS}:
+        rows = tree[LAYER_ROWS]
+        return [(path, [rows[str(offset)] for offset in range(len(rows))])]
+    return [found for name, value in tree.items() for found in _row_containers(value, (*path, name))]
+
+
+def _rows_read(tree, index: jax.Array):
+    """`tree` with every run's rows read at the iteration's `index`: one switch, each branch returning its
+    row of every run as it lies, so no copy of the run is stacked and the step reads one layer's."""
+    found = _row_containers(tree)
+    branches = [functools.partial(lambda held, offset: [rows[offset] for rows in held], offset=offset)
+                for offset in range(len(found[0][1]))]
+    read = jax.lax.switch(index, branches, [rows for _, rows in found])
+    flat = flatten_dict(tree)
+    for (path, _), row in zip(found, read, strict=True):
+        flat = {key: value for key, value in flat.items() if key[:len(path) + 1] != (*path, LAYER_ROWS)}
+        flat.update({(*path, *key): value for key, value in flatten_dict(row).items()})
+    return unflatten_dict(flat)
+
+
+_rows_at = jax.checkpoint(_rows_read, policy=jax.checkpoint_policies.nothing_saveable)
+"""`_rows_read` recomputed in the backward, so a scan keeps the iteration's index of it, not its rows."""
+
+
+def _rows_joined(variables: Mapping[str, Mapping], index: jax.Array) -> dict:
+    """A run's variables at an iteration: its rows (`LAYER_ROWS`) read at `index` (`_rows_at`) and joined
+    into the collections they belong to, beside those collections' own slices."""
+    read = _rows_at(variables[LAYER_ROWS], index)
+    return {name: merge(dict(tree), read[name]) if name in read else tree
+            for name, tree in variables.items() if name != LAYER_ROWS}
+
+
 @dataclasses.dataclass(frozen=True)
 class Loop:
     """A block of a layer stack that runs `steps` times over its own output,
@@ -344,11 +392,23 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                 return step(layer, carry, per_layer_input, store)[0], None
 
             repeats = count // len(run.specs) if periodic else count
+            # The layers the run holds a row each (`LAYER_ROWS`) are closed over whole, each iteration
+            # reading its row in place into the collections they join (`_rows_joined`); every other
+            # collection scans its stacked layers.
+            rows = tuple(run.variables.get(LAYER_ROWS, {}))
+            if rows:
+                def scanned(layer, carry, per_layer_input, index, *, scanned=scanned, rows=rows):
+                    read = nn.map_variables(scanned, (LAYER_ROWS, *rows),
+                                            trans_in_fn=functools.partial(_rows_joined, index=index),
+                                            init=False, mutable=False)
+                    return read(layer, carry, per_layer_input)
             # A parameter its module boxed (`nn.with_logical_partitioning`) stacks with an unnamed layer
             # axis, which the run's view cuts off again per layer (`_rows`).
-            x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
-                           in_axes=2, length=repeats,
-                           metadata_params={nn.PARTITION_NAME: None})(run, x, inputs)
+            x, _ = nn.scan(scanned, variable_axes={nn.DenyList(LAYER_ROWS) if rows else True: 0},
+                           variable_broadcast=LAYER_ROWS if rows else False, split_rngs={True: True},
+                           in_axes=(2, 0) if rows else 2, length=repeats,
+                           metadata_params={nn.PARTITION_NAME: None})(
+                run, x, inputs, *((jnp.arange(repeats),) if rows else ()))
     return x
 
 
@@ -913,8 +973,13 @@ class StackView:
                 # place, the index a reshape.
                 runs = {name: with_unstacked_axes(jax.tree.map(_one_stage, run), 1)
                         for name, run in tree['stages'].items()}
-                outside = {name: value for name, value in tree.items() if name != 'stages'}
+                # The layers it keeps on their stored layers beside its runs (a frozen base the objective
+                # joins into its parameters) are read a row an iteration where they lie (`_rows_at`).
+                outside, rows = self._rowed_runs(collection, {name: value for name, value in tree.items()
+                                                              if name != 'stages'})
                 inside[collection] = {**outside, **runs}
+                for name, run in rows.items():
+                    inside.setdefault(LAYER_ROWS, {}).setdefault(name, {})[collection] = run
                 continue
             # A periodic run's positions stack on their own (`_stacked_periods`), whatever the stages.
             self._stacked_periods(collection, tree)
@@ -944,6 +1009,8 @@ class StackView:
                         for name, value in tree.items() if name in runs}
                 outside[collection] = {**{name: value for name, value in tree.items() if name not in runs},
                                        'stages': held}
+                continue
+            if collection == LAYER_ROWS:
                 continue
             if collection in self.banked or collection in self.staged:
                 outside[collection] = dict(tree)
@@ -1059,6 +1126,21 @@ class StackView:
             if stacked:
                 runs[name] = stacked
         return runs
+
+    def _rowed_runs(self, collection: str, tree: Mapping) -> tuple[dict, dict]:
+        """`tree` without the stored layers of its runs, and those layers held as rows by run name (`_rowed`),
+        a periodic run's by position of its period, as the scan reads them a row an iteration."""
+        tree, runs = dict(tree), {}
+        for name, layers, _ in self._named_runs():
+            held = self._stacked(collection, tree, [[layer] for layer in layers])
+            if held is not None:
+                runs[name] = _rowed(held)
+        for name, prefix, positions in self._periodic_runs():
+            rows = {f'{prefix}{offset}': _rowed(held) for offset, layers in enumerate(positions)
+                    if (held := self._stacked(collection, tree, [[layer] for layer in layers])) is not None}
+            if rows:
+                runs[name] = rows
+        return tree, runs
 
     def _stacked_periods(self, collection: str, tree: dict) -> None:
         """Each periodic run `tree` holds stacked in it by position of its period: a position's repeats
