@@ -5,7 +5,7 @@ tools/reference_worker.py), each a case of tools/flaxdiff_family_cases.py's CASE
 environment (its JAX), on the CPU.
 
     python tools/flaxdiff_family_worker.py flaxdiff-MODEL-CONFIG    `IN OUT` lines on stdin, each `done`
-    python tools/flaxdiff_family_worker.py --layout OUT.json        every case's parameters' shapes
+    python tools/flaxdiff_family_worker.py --layout OUT.json        every case's shapes and Fourier table
 
 IN holds each draw's `<draw>.param.<path>` by its '/'-joined path in FlaxDiff's parameter tree, its `image`
 (or clip), `times` and `text` states, and `probe`, a cotangent of the output. OUT gets
@@ -115,16 +115,22 @@ def applying(case: str, dtype: str) -> Iterator[Applied]:
     yield apply
 
 
-def layout() -> dict[str, dict[str, list[int]]]:
-    """Every case's parameters' shapes by '/'-joined path, from its model's own initialization."""
-    shapes = {}
+def layout() -> dict[str, dict]:
+    """Every case's parameters' shapes by '/'-joined path, from its model's own initialization, and the
+    Fourier table its FourierEmbedding draws (`fourier`), the model's constant."""
+    modules = flaxdiff(wide=False)
+    found = {}
     for case, (module, cls, config, image, text) in CASES.items():
-        model = getattr(flaxdiff(wide=False)[module], cls)(**config)
+        model = getattr(modules[module], cls)(**config)
         # Eagerly: FlaxDiff's scan orders read their permutations as NumPy.
         variables = model.init(jax.random.key(0), jnp.zeros((2, *image)), jnp.zeros(2), jnp.zeros((2, *text)))
-        shapes[case] = {"/".join(path): list(leaf.shape)
-                        for path, leaf in sorted(flatten_dict(variables["params"]).items())}
-    return shapes
+        width = config["emb_features"]
+        table = modules["common"].FourierEmbedding(
+            features=width[0] if isinstance(width, tuple) else width).bind({}).freqs
+        found[case] = {"params": {"/".join(path): list(leaf.shape)
+                                  for path, leaf in sorted(flatten_dict(variables["params"]).items())},
+                       "fourier": [float(value) for value in table]}
+    return found
 
 
 if __name__ == "__main__":

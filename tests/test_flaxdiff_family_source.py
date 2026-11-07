@@ -6,7 +6,7 @@ CASES). Over drawn weights, images (or clips), times, text states and cotangents
 the gradients of the cotangent's product with respect to the image, the text and every parameter are as
 exact as FlaxDiff's float32 run against its float64 run (check 1), each case its own recording
 (tools/venv_reference.py's `flaxdiff-<model>-<config>` sites), Dew's float64 run held to the recorded sketch,
-with the Fourier table FlaxDiff draws (`dew.interop.flaxdiff.fourier_table`) as Dew's constant.
+with the Fourier table FlaxDiff draws as Dew's constant.
 
 The DiTs average the text over every position, as FlaxDiff's do: Dew builds them with
 `text_pooling="all"`, and is handed a padded mask the pooling must ignore. The MM-DiTs and the VideoDiT,
@@ -23,7 +23,7 @@ import pytest
 from reference_runs import assert_as_exact_as_recorded
 from torch_layout import node
 
-from dew.interop.flaxdiff import SCAN_PROJECTION, fourier_table, scan_projection
+from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection
 from dew.nn.attention_blocks import Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
@@ -36,7 +36,8 @@ from tools.flaxdiff_family_cases import CASES
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_family"
 LAYOUT = json.loads((FIXTURES / "layout.json").read_text())
-"""Each case's FlaxDiff parameters' shapes by '/'-joined path (tools/flaxdiff_family_worker.py --layout)."""
+"""Each case's FlaxDiff parameters' shapes by '/'-joined path, and the Fourier table its FourierEmbedding
+draws, the model's constant (tools/flaxdiff_family_worker.py --layout)."""
 FAMILY_SEEDS = dict.fromkeys(CASES, 8)
 """Each case's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 OUTPUTS = ("output", "gradients")
@@ -176,7 +177,7 @@ def drawing(case: str):
     def draw(seed: int) -> dict[str, np.ndarray]:
         rng = np.random.default_rng([269, seed])
         drawn = {}
-        for path, shape in LAYOUT[case].items():
+        for path, shape in LAYOUT[case]["params"].items():
             leaf = path.split("/")[-1]
             if leaf == "scale":
                 value = rng.normal(1.0, 0.3, shape)
@@ -197,10 +198,9 @@ def computing(case: str):
     """`dew(dtype, inputs)` of `case`: Dew's model's output at `dtype` under a draw's weights, and the
     gradients tools/flaxdiff_family_worker.py gives, in its order."""
     _, cls, config, _, _ = CASES[case]
-    names = sorted(LAYOUT[case])
+    names = sorted(LAYOUT[case]["params"])
     model = dew_model(cls, config)
-    widths = config["emb_features"]
-    table = fourier_table(widths[0] if isinstance(widths, tuple) else widths, jax.__version__)
+    table = np.asarray(LAYOUT[case]["fourier"], np.float32)
 
     def dew(dtype, inputs) -> dict:
         params = nest({dew_path(cls, name): to_dew(cls, name, jnp.asarray(inputs[f"param.{name}"], dtype),
@@ -218,7 +218,7 @@ def computing(case: str):
         output, pullback = jax.vjp(forward, params, image, text)
         grad_params, grad_image, grad_text = pullback(jnp.asarray(inputs["probe"], dtype))
         native = [grad_image, grad_text, *(from_dew(cls, name, node(grad_params, dew_path(cls, name)),
-                                                    LAYOUT[case][name]) for name in names)]
+                                                    LAYOUT[case]["params"][name]) for name in names)]
         return {"output": output, "gradients": jnp.concatenate([jnp.ravel(value) for value in native])}
     return dew
 
