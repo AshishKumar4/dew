@@ -368,8 +368,21 @@ def _forward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jc
     return found
 
 
+_HELD_WALKS: weakref.WeakKeyDictionary[fusion.Index, dict] = weakref.WeakKeyDictionary()
+"""Each body's walks from its values (`_backward`), held while its index lives: every candidate of an anchor
+reads its results' ancestry again."""
+
+
 def _backward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jcore.Var, int]:
-    """The values `var` is made from within `reach` equations, with their distance."""
+    """The values `var` is made from within `reach` equations, with their distance, walked once a body."""
+    held = _HELD_WALKS.setdefault(index, {})
+    if (var, reach) not in held:
+        held[var, reach] = _walked_back(index, var, reach)
+    return held[var, reach]
+
+
+def _walked_back(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
+    """`_backward`'s walk."""
     found, frontier = {var: 0}, collections.deque([var])
     while frontier:
         value = frontier.popleft()
@@ -469,7 +482,8 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
     region's scalar constants each an epsilon, and the call's choices (the weight's offset, its side of the
     cast, the gate's activation) each tried; the earliest row and the latest result first, so the largest
     region the e-graph proves is the one written. A row made by a sum the body reads on is tried as a
-    stream's too, the sum among the results."""
+    stream's too, the sum among the results. The weight's side of the cast and its association (folded
+    into the inverse first, Flax's `x (r w)`, `weight_first`) are each the call's own choices."""
     anchor = index.jaxpr.eqns[place].outvars[0]
     rows = sorted(((distance, var) for var, distance in _backward(index, anchor).items()
                    if var is not anchor and var.aval.ndim >= 1), key=lambda pair: -pair[0])
@@ -516,15 +530,16 @@ def _norm_candidates(index: fusion.Index, row, output, weight, gate, epsilons) -
             and all(isinstance(atom, jcore.Var) and atom.aval.shape == row.aval.shape
                     for atom in index.jaxpr.eqns[added].invars)):
         streams.insert(0, tuple(index.jaxpr.eqns[added].invars))
-    choices = [(False, False)] if weight is None else [(False, False), (False, True), (True, False),
-                                                       (True, True)]
-    for stream, epsilon, (offset, after_cast) in itertools.product(streams, epsilons, choices):
+    # (offset, after_cast, weight_first): the weight folded into the inverse first (Flax's) takes no cast.
+    choices = [(False, False, False)] if weight is None else [
+        choice for choice in itertools.product((False, True), repeat=3) if not (choice[1] and choice[2])]
+    for stream, epsilon, (offset, after_cast, first) in itertools.product(streams, epsilons, choices):
         def normed(x, *rest, stream=stream, epsilon=epsilon, offset=offset, after_cast=after_cast,
-                   implementation='auto'):
+                   first=first, implementation='auto'):
             branch, rest = (rest[0], rest[1:]) if stream is not None else (None, rest)
             summed, result = stream_rms_normalized(x, branch, rest[0] if rest else None, epsilon, dtype,
                                                    offset, after_cast, fp32_statistics=True,
-                                                   implementation=implementation)
+                                                   weight_first=first, implementation=implementation)
             return (summed, result) if stream is not None else result
 
         operands = (*(stream if stream is not None else (row,)), *([weight] if weight is not None else []))
