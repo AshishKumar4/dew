@@ -12,6 +12,7 @@ landed 22,000 times torch's distance from float64, without the clip 4,000 times.
 """
 
 import dataclasses
+import functools
 import os
 import subprocess
 import sys
@@ -60,15 +61,26 @@ def _first_gradient_margin(tokens: np.ndarray) -> float:
     (in magnitude), Dew's model in float64 on the rows' mean shifted cross entropy: how far the draw's first
     AdamW update is from flipping an element's sign by rounding."""
     with jax.enable_x64(new_val=True):
-        model = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float64", attention_impl="xla")
-        rows = jnp.asarray(tokens[0])
+        return float(_first_gradients()(jnp.asarray(tokens[0])))
 
-        def loss(params):
+
+@functools.cache
+def _first_gradients():
+    """`_first_gradient_margin`'s program over a batch of rows, qwen3-tiny loaded and compiled once."""
+    with jax.enable_x64(new_val=True):
+        model = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float64", attention_impl="xla")
+
+        def loss(params, rows):
             logits = model.model.apply({**model.variables, "params": params}, rows[:, :-1])
             return optax.softmax_cross_entropy_with_integer_labels(logits, rows[:, 1:]).mean()
 
-        grads = jax.grad(loss)(model.variables["params"])
-        return min(float(jnp.min(jnp.abs(g)) / jnp.max(jnp.abs(g))) for g in jax.tree.leaves(grads))
+        @jax.jit
+        def margin(rows):
+            grads = jax.grad(loss)(model.variables["params"], rows)
+            return jnp.min(jnp.stack([jnp.min(jnp.abs(g)) / jnp.max(jnp.abs(g))
+                                      for g in jax.tree.leaves(grads)]))
+
+        return margin
 
 
 def steps_draw(seed: int) -> dict[str, np.ndarray]:
