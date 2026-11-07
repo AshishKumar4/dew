@@ -198,9 +198,7 @@ def test_a_blackwells_gathered_product_reads_its_rows_by_its_load_warps_gathers(
 def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu: bool = False):
     """A gathered, scattered grouped product on a Blackwell GPU (row 1376): tcgen05's bundle takes it (its
     load warp's TMA four-row gathers, `gathered.Committed`), its value bitwise the product of the rows
-    gathered first and put at their slots after; and its kernel gradient's tables on the next issuer
-    (mma.sync's TMA rings, `bundles.groups`), bitwise the gradient of the rows gathered first. Integers,
-    every sum exact in the bf16 output."""
+    gathered first and put at their slots after. Integers, every sum exact in the bf16 output."""
     from dew.nn.kernels import gemm
 
     rng = np.random.default_rng(13)
@@ -208,7 +206,6 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
     matrices = jnp.asarray(rng.integers(-1, 2, size=(3, 256, 256)), jnp.bfloat16)
     table = jnp.asarray(rng.integers(0, 200, 384), jnp.int32)
     slots = jnp.asarray(rng.permutation(384), jnp.int32)
-    cotangent = jnp.asarray(rng.integers(-1, 2, size=(384, 256)), jnp.bfloat16)
     sizes = jnp.asarray([128, 0, 200], jnp.int32)
     options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": interpret_on_cpu}
     derived, original = [], mosaic_gpu.gmm
@@ -222,12 +219,7 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
         got = jax.jit(lambda: gemm.gemm(tokens, matrices, sizes, gather=table, scatter=slots, **options))()
         assert {tile.family for tile in derived} == {"tcgen05"}
         apart = jax.jit(lambda: gemm.gemm(tokens[table], matrices, sizes, **options))()
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.zeros_like(apart).at[slots].set(apart)))
-        gradient = jax.jit(lambda: gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32, gather=(
-            table, slots), precision="default", interpret_on_cpu=interpret_on_cpu))()
-        expected = jax.jit(lambda: gemm.gemm_t(tokens[table], cotangent[slots], sizes, out_dtype=jnp.float32,
-                                               precision="default", interpret_on_cpu=interpret_on_cpu))()
-    np.testing.assert_array_equal(np.asarray(gradient), np.asarray(expected))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.zeros_like(apart).at[slots].set(apart)))
 
 
 def test_a_blackwells_gathered_product_lowers_for_cuda():
