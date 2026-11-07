@@ -354,7 +354,15 @@ def _equation_key(equation: jcore.JaxprEqn) -> Hashable | None:
 
 
 def _forward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jcore.Var, int]:
-    """The values `var` reaches within `reach` equations, with their distance."""
+    """The values `var` reaches within `reach` equations, with their distance, walked once a body."""
+    held = _HELD_WALKS.setdefault(index, {})
+    if ("forward", var, reach) not in held:
+        held["forward", var, reach] = _walked_forward(index, var, reach)
+    return held["forward", var, reach]
+
+
+def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
+    """`_forward`'s walk."""
     found, frontier = {var: 0}, collections.deque([var])
     while frontier:
         value = frontier.popleft()
@@ -369,8 +377,8 @@ def _forward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jc
 
 
 _HELD_WALKS: weakref.WeakKeyDictionary[fusion.Index, dict] = weakref.WeakKeyDictionary()
-"""Each body's walks from its values (`_backward`), held while its index lives: every candidate of an anchor
-reads its results' ancestry again."""
+"""Each body's walks from its values (`_backward`, `_forward`), held while its index lives: every candidate
+of an anchor walks from the same rows and results again."""
 
 
 def _backward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jcore.Var, int]:
@@ -401,13 +409,12 @@ def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
     """The values beside `row` (one value, or several: attention's query, keys and values) the equations
     from it to `output` read: each a value of the body made from neither it nor constants alone (a weight,
     a gate, a branch, a bias), in the order first read; None where `output` is not made from every one.
-    Made from a row is read within `output`'s own ancestry (`_backward`, as far as a candidate's operands lie
-    from its results: twice `REACH`), never past it."""
+    Made from a row is read as far as a candidate's operands lie from its results (twice `REACH`)."""
     rows = (row,) if isinstance(row, jcore.Var) else tuple(row)
-    ancestry = _backward(index, output, 2 * REACH)
-    if not all(source in ancestry for source in rows):
+    reached = [_forward(index, source, 2 * REACH) for source in rows]
+    if not all(output in found for found in reached):
         return None
-    descendants = _within(index, rows, ancestry)
+    descendants = set().union(*reached)
     extras: dict[jcore.Var, None] = {}
     seen, frontier = set(), [output]
     while frontier:
@@ -422,18 +429,6 @@ def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
         if place is not None:
             frontier += [atom for atom in index.jaxpr.eqns[place].invars if isinstance(atom, jcore.Var)]
     return list(extras)
-
-
-def _within(index: fusion.Index, rows: Sequence[jcore.Var], ancestry: dict[jcore.Var, int]) -> set[jcore.Var]:
-    """The values of `ancestry` made from any of `rows`: `rows` carried forward through the equations whose
-    outputs `ancestry` holds, nearest the rows first."""
-    made: set[jcore.Var] = set(rows)
-    for var in sorted(ancestry, key=lambda value: -ancestry[value]):
-        place = index.producer.get(var)
-        if place is not None and any(isinstance(atom, jcore.Var) and atom in made
-                                     for atom in index.jaxpr.eqns[place].invars):
-            made.add(var)
-    return made
 
 
 def _constant(index: fusion.Index, var: jcore.Var) -> bool:
