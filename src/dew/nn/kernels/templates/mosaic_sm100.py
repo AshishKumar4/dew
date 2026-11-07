@@ -546,6 +546,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     (JAX's `blackwell_ragged_dot_mgpu.py`'s schedule, CUTLASS's sm100 persistent GEMM)."""
 
     consumers = 1
+    gathers_rows = False  # its rings and roles are its own (`streams`, `persist`), a load warp's, no gather
 
     turns = 2
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
