@@ -419,25 +419,23 @@ def offset_rms(x, w):
 
 
 def gated_product_of(a, b):
-    """A gated MLP's product as a plain program writes it."""
-    return jax.nn.silu(a) * b
+    """A gated MLP's product as a plain program writes Dew's (torch's) math: the activation in float32,
+    rounded once to the gate's dtype, then times the up projection."""
+    return jax.nn.silu(a.astype(jnp.float32)).astype(a.dtype) * b
 
 
 def _norms_written(fn, *shapes):
     """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
-    (`norm_regions`), decided under the H100 and written on this host, whose norms run their portable
+    (`recognize.recognized`), decided under the H100 and written on this host, whose norms run their portable
     arithmetic: what the compile point's rewrite computes, run here."""
     from jax.extend.core import jaxpr_as_fun
 
-    from dew.algebra import fusion, norm_regions
+    from dew.algebra import fusion, recognize
 
     closed = jax.make_jaxpr(fn)(*shapes)
     with generation.assumed("sm90"):
-        found = [region for region in norm_regions.regions(fusion.Index(closed.jaxpr))
-                 if norm_regions.taken(region)]
-    written = [fusion.Written(region.places, region.operands, region.outputs, region.places[-1],
-                              norm_regions.written(region)) for region in found]
-    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(found)
+        written = recognize.recognized(closed.jaxpr, fusion.Index(closed.jaxpr))
+    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(written)
 
 
 def residual_rms(x, branch, w):
@@ -456,8 +454,10 @@ def gated_rms(x, gate, w):
 
 
 def packed_swiglu(gate_up):
-    """A packed gate|up projection's SwiGLU as a plain program writes it: its two halves sliced out."""
-    return jax.nn.silu(gate_up[..., 0, :]) * gate_up[..., 1, :]
+    """A packed gate|up projection's SwiGLU as a plain program writes Dew's math (`gated_product_of`): its
+    two halves sliced out."""
+    gate = gate_up[..., 0, :]
+    return jax.nn.silu(gate.astype(jnp.float32)).astype(gate.dtype) * gate_up[..., 1, :]
 
 
 def _own_norm(*, offset: bool, after_cast: bool):
@@ -554,6 +554,11 @@ _named_silu.__name__ = "silu"
 
 
 NEAR_NORMS = {
+    "statistics in bfloat16, the widening dropped": lambda x, w: (
+        x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6) * w.astype(x.dtype)),
+    "the weight applied before the statistic": lambda x, w: (
+        _rows_inverse(x * w.astype(x.dtype))[:, None] * x.astype(jnp.float32)).astype(x.dtype),
+    "a SwiGLU whose sigmoid rounds to bfloat16": lambda x, w: jax.nn.silu(x) * (x * w.astype(x.dtype)),
     "columns scaled by the rows' statistics":
         lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[None, :]).astype(x.dtype),
     "a weight along the rows":
@@ -591,10 +596,12 @@ def test_a_norm_is_its_mean_over_the_rows_width_alone(width):
 def test_a_plain_program_near_a_norm_computes_as_written(program):
     """A program whose arithmetic resembles an RMSNorm or SwiGLU without being one (the statistics or the
     weight laid along another axis, a nested program only named silu, a mean scaled by zero, the region's own
-    sum read as its weight, a weight rounded by a cast the
-    norm would drop), compiled through `dew.jit` on an H100, computes what it does as written: its
-    output and gradients on par with the program's (check 1), whatever of it the compile point writes as
-    Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as written)."""
+    sum read as its weight, a weight rounded by a cast the norm would drop, its statistics left in bfloat16,
+    the weight applied to the row before its statistic, a SwiGLU rounding its sigmoid and each product to
+    bfloat16 where Dew's rounds once after a float32 activation), compiled through `dew.jit` on an H100,
+    computes what it does as written: its output and gradients on par with the program's (check 1),
+    whatever of it the compile point writes as Dew's norm (an unweighted RMSNorm inside it, its product with
+    another axis's weight left as written)."""
     from contract_support import normal_drawn
     from reference_error import assert_as_exact, with_gradients
 
