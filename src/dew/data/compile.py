@@ -1272,9 +1272,9 @@ def _compile_phases(
         phase = staged_at(index, {} if tokens else consumed_by([phase for phase, _ in staged], ends))
         # A phase on the step clock ends at its step's record: the records of the phases before it, and its
         # own steps in its own rows (row 4812).
-        before = ends[-1] if ends else 0
-        steps = None if tokens or until is None else until - (source.ends[index - 1] if index else 0)
-        staged.append((phase, None if steps is None else before + steps * phase.build.batch))
+        before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
+        staged.append((phase, None if tokens or until is None
+                       else before + (until - started) * phase.build.batch))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
