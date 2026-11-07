@@ -328,15 +328,30 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
     along `axis`, each tile's `schedule(index)`, `(active, steps, views, tile)`, visited as `visit(counter,
     active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
     of the active tiles before it) and its turn round accumulators a tile takes whole (`done`: the active
-    tiles before it). Returns both past the last tile."""
-    @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=(jnp.int32(0), jnp.int32(0)))
-    def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
-        counter, done = carry
-        active, steps, views, tile = schedule(loop.index)
-        visit(counter, active, steps, views, tile, done)
-        return counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
+    tiles before it). Returns both past the last tile. The loop's one induction variable is the tile's flat
+    index (from the program's, by the programs' count, while below the grid's size, a constant): Pallas's
+    `nd_loop` kept the program's index and its own trip count live beside its step, two uniform integers
+    ptxas spilled at a 256-column exact tile's register pressure (16 bytes, NSDBG3620-F5, row 3620)."""
+    total, programs = math.prod(tiles), lax.axis_size(axis)
 
-    return ended
+    def walked(carry):
+        flat, counter, done = carry
+        active, steps, views, tile = schedule(_unraveled(flat, tiles))
+        visit(counter, active, steps, views, tile, done)
+        return flat + programs, counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
+
+    start = (lax.axis_index(axis).astype(jnp.int32), jnp.int32(0), jnp.int32(0))
+    _, counter, done = lax.while_loop(lambda carry: carry[0] < total, walked, start)
+    return counter, done
+
+
+def _unraveled(flat, shape: tuple[int, ...]) -> tuple:
+    """The index of `flat` in a grid of `shape`, row-major (`jnp.unravel_index` in `lax`'s primitives)."""
+    index = []
+    for size in reversed(shape):
+        index.append(lax.rem(flat, jnp.int32(size)))
+        flat = lax.div(flat, jnp.int32(size))
+    return tuple(reversed(index))
 
 
 def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
