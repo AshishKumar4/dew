@@ -25,6 +25,7 @@ the largest difference over the largest value, 1e-5. Observed: prompt states
 """
 
 import contextlib
+import functools
 import json
 from pathlib import Path
 
@@ -41,7 +42,8 @@ from interop_support import (
     fixture_arrays,
     source_transformer,
 )
-from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
+from reference_error import as_given, assert_as_exact
+from reference_runs import assert_arms_as_recorded
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, read_transformer, wan_fields, wan_path
@@ -90,113 +92,77 @@ def transformer_draw(arrays, name):
     return draw
 
 
-def source_model(source, name):
-    """Diffusers' `WanTransformer3DModel` of case `name`, in float32 and its float64 twin."""
-    from diffusers import WanTransformer3DModel
-    from safetensors.torch import load_file
+WAN_SEEDS = {"published": 8, "variant": 8, "bf16/published": 8, "bf16/variant": 8}
+"""Each recorded site's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 
-    from tools.torch_precision import float64_twin
 
-    # Built from its config, then its file loaded: the variant's checkpoint, saved by Diffusers 0.34, stores
-    # no affine weight for its query and key norms, which this Diffusers holds as weights at their init,
-    # ones, the same function; every other tensor loads.
-    directory = source / name / "transformer"
-    narrow = WanTransformer3DModel.from_config(WanTransformer3DModel.load_config(directory)).eval()
-    loaded = narrow.load_state_dict(load_file(directory / "diffusion_pytorch_model.safetensors"),
-                                    strict=False)
-    assert not loaded.unexpected_keys
-    assert all(key.endswith(("norm_q.weight", "norm_k.weight")) for key in loaded.missing_keys), loaded
-    return narrow, float64_twin(narrow)
+@functools.cache
+def extracted() -> Path:
+    """The transformer fixture's archive extracted once, for the recorded sites' arms."""
+    import tempfile
+
+    return extract_fixture(ROOT / "tests/fixtures/wan_transformer.tar.xz", Path(tempfile.mkdtemp()))
+
+
+def flowing(name: str, *, gradients: bool):
+    """`dew(dtype, inputs)` of case `name`: Dew's flow at `dtype`, channels first, and with `gradients` those
+    of `sum(flow * probe)` with respect to the latents, the prompt states and every parameter by its
+    published name, sorted, concatenated, as tools/wan_worker.py gives them."""
+    source = extracted()
+    config = json.loads((source / name / "transformer" / "config.json").read_text())
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), wan_path)
+    tensors = sorted((layout.name.removeprefix("transformer/"), layout) for layout in layouts)
+
+    def dew(dtype, inputs) -> dict:
+        model = WanTransformer(**wan_fields(config, dtype=jnp.dtype(dtype).name, attention_impl="xla"))
+        held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype if dtype == jnp.float64 else leaf.dtype),
+                            params)
+        times = jnp.asarray(inputs["times"], jnp.float64 if dtype == jnp.float64 else jnp.float32)
+
+        def flow(held, latents, context):
+            output = model.apply({"params": held}, jnp.moveaxis(latents, 1, -1), times,
+                                 DenoisingCondition(context))
+            return jnp.moveaxis(output, -1, 1)
+
+        latents, context = (jnp.asarray(inputs[key], dtype) for key in ("latents", "context"))
+        output = flow(held, latents, context)
+        if not gradients:
+            return {"output": output.astype(jnp.float32 if dtype != jnp.float64 else dtype)}
+        probe = jnp.asarray(inputs["probe"], dtype)
+        grads = jax.grad(lambda *args: jnp.sum(flow(*args) * probe), argnums=(0, 1, 2))(
+            held, latents, context)
+        native = [grads[1], grads[2], *(layout.export({"params": grads[0]}) for _, layout in tensors)]
+        flat = jnp.concatenate([jnp.ravel(jnp.asarray(leaf)) for leaf in native])
+        return {"output": output, "gradients": flat}
+    return dew
+
+
+def pipeline_arms(arms: str):
+    """tools/venv_reference.py's `wan-<case>` or `wan-bf16-<case>` site (`arms` the case, or `bf16/<case>`):
+    its recording, draw, Dew run and leaves."""
+    half = arms.startswith("bf16/")
+    name = arms.removeprefix("bf16/")
+    stem = f"{name}-bf16" if half else name
+    arrays = fixture_arrays(extracted() / "wan_transformer.npz")
+    return (ROOT / "tests/fixtures/wan" / f"{stem}.npz", lambda seed: transformer_draw(arrays, name)(seed)[0],
+            flowing(name, gradients=not half), ("output",) if half else ("output", "gradients"))
 
 
 @pytest.mark.parametrize("name", CASES)
-def test_the_flow_and_its_gradients_are_as_exact_as_the_source(source, arrays, name):
+def test_the_flow_and_its_gradients_are_as_exact_as_the_source(name):
     """The flow, and the gradients of `sum(flow * probe)` with respect to the latents, the prompt states and
     every parameter (by its published name), each on par with Diffusers' float32 walk over drawn inputs
     (check 1), its float64 twin the truth."""
-    import torch
-
-    from tools.torch_precision import float64
-
-    model, params, layouts = load(source, name)
-    tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
-
-    @jax.jit
-    def walked(latents, context, times, params, probe):
-        def flow(latents, context, params):
-            output = model.apply({"params": params}, jnp.moveaxis(latents, 1, -1), times,
-                                 DenoisingCondition(context))
-            return jnp.moveaxis(output, -1, 1)
-        return with_gradients(flow)(latents, context, params, probe)
-
-    @as_given
-    def native(inputs):
-        out, grad_latents, grad_context, grad_params = walked(inputs["latents"], inputs["context"],
-                                                              inputs["times"], params, inputs["probe"])
-        return out, grad_latents, grad_context, {
-            tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()}
-
-    narrow, wide = source_model(source, name)
-    weights = {id(module): {key: value.detach().numpy() for key, value in module.named_parameters()}
-               for module in (narrow, wide)}
-
-    def source_walk(module, drawn):
-        dtype = torch.from_numpy(np.asarray(drawn["latents"])).dtype
-        times = torch.from_numpy(np.asarray(drawn["times"])).to(dtype)
-
-        def flow(latents, context, params):
-            return torch.func.functional_call(module, params, (latents, times, context),
-                                              {"return_dict": False})[0]
-
-        out, grad_latents, grad_context, grad_params = torch_with_gradients(flow)(
-            drawn["latents"], drawn["context"], weights[id(module)], drawn["probe"])
-        return out, grad_latents, grad_context, {tensor: grad_params[tensor] for tensor in tensors}
-
-    @as_given
-    def truth(inputs):
-        with float64():
-            return source_walk(wide, widened(inputs))
-
-    assert_as_exact(native, as_given(lambda inputs: source_walk(narrow, inputs)),
-                    transformer_draw(arrays, name), f"{name} flow and gradients", seeds=SEEDS, truth_fn=truth)
+    assert_arms_as_recorded(pipeline_arms(name), f"wan-{name}", WAN_SEEDS[name], f"{name} flow and gradients")
 
 
 @pytest.mark.parametrize("name", CASES)
-def test_a_bfloat16_flow_is_as_exact_as_the_bfloat16_source(source, arrays, name):
+def test_a_bfloat16_flow_is_as_exact_as_the_bfloat16_source(name):
     """In bfloat16, Dew's flow on par with the source's own bfloat16 run, whose time embedder stays in
     float32, over drawn inputs (check 1), its float64 twin the truth: sinusoids taken in bfloat16 land ten to
     twenty times further."""
-    import torch
-
-    from tools.torch_precision import float64
-
-    config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = WanTransformer(**wan_fields(config, dtype="bfloat16", attention_impl="xla"))
-    params, _ = read_transformer(component_tensors(source / name, "transformer"), wan_path)
-
-    @jax.jit
-    def flow(latents, context, times):
-        output = model.apply({"params": params}, jnp.moveaxis(latents, 1, -1).astype(jnp.bfloat16), times,
-                             DenoisingCondition(context.astype(jnp.bfloat16)))
-        return jnp.moveaxis(output, -1, 1).astype(jnp.float32)
-
-    narrow, wide = source_model(source, name)
-    half = narrow.to(torch.bfloat16)
-
-    def source_flow(module, dtype, inputs):
-        latents, context, times = (torch.from_numpy(np.asarray(inputs[key])).to(dtype)
-                                   for key in ("latents", "context", "times"))
-        with torch.no_grad():
-            return module(latents, times, context, return_dict=False)[0].to(torch.float64).numpy()
-
-    @as_given
-    def truth(inputs):
-        with float64():
-            return source_flow(wide, torch.float64, inputs)
-
-    assert_as_exact(lambda inputs: flow(inputs["latents"], inputs["context"], inputs["times"]),
-                    as_given(lambda inputs: source_flow(half, torch.bfloat16, inputs)),
-                    transformer_draw(arrays, name), f"{name} bfloat16 flow", seeds=SEEDS, truth_fn=truth)
+    assert_arms_as_recorded(pipeline_arms(f"bf16/{name}"), f"wan-bf16-{name}", WAN_SEEDS[f"bf16/{name}"],
+                            f"{name} bfloat16 flow", narrow=jnp.bfloat16)
 
 
 @pytest.fixture(scope="module")
