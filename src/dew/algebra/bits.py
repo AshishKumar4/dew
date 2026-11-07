@@ -830,10 +830,14 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     above its largest magnitude over 6 times the tensor scale, so no code saturates; each value over its
     block's scale and the tensor scale rounded to e2m1 (`encoded`), a block of zeros codes of zero. Its
     decode (`nvfp4_decoded`) times `NVFP4_OWED` times the tensor scale is each value's rounding, as the GEMM
-    epilogue's NVFP4 output stores it (row 4050)."""
+    epilogue's NVFP4 output stores it (row 4050). A tile whose largest over 6 * 448 is no normal fp32 (a
+    flushing device's zero) takes its largest over 6 instead, every block's scale then at most 1, so a
+    nonzero tile keeps its codes (row A24)."""
     magnitude = jnp.abs(x)
     largest = jnp.max(magnitude)
-    tensor = jnp.where(largest > 0, largest / np.float32(6 * 448), np.float32(1))
+    spread = largest / np.float32(6 * 448)
+    tensor = jnp.where(largest > 0, jnp.where(spread >= np.finfo(np.float32).tiny, spread, largest / 6),
+                       np.float32(1))
     blocks = jnp.max(magnitude.reshape(-1, 16, x.shape[-1]), axis=1)
     ratio = blocks / (np.float32(6) * tensor)
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
