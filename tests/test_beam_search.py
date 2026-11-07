@@ -108,14 +108,17 @@ def beam_draw(name: str):
     vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
     eos, pad = _special(name)
     tokens = np.asarray([token for token in range(vocabulary) if token not in (eos, pad)])
-    truth = Pretrained.load(str(FIXTURES / name), dtype="float64", attention_impl="reference")
+    with jax.enable_x64(new_val=True):
+        truth = Pretrained.load(str(FIXTURES / name), dtype="float64", attention_impl="reference")
 
     def clears(drawn: dict) -> bool:
-        for penalty, early in SETTINGS:
-            found = _searched(truth, drawn["ids"], eos, pad, penalty, early, margins=True)
-            margins = np.asarray(found.margins)
-            if np.any(margins[np.isfinite(margins)] <= MARGIN):
-                return False
+        # In float64 in any process: a recorder's draws run where JAX's float64 is off.
+        with jax.enable_x64(new_val=True):
+            for penalty, early in SETTINGS:
+                found = _searched(truth, drawn["ids"], eos, pad, penalty, early, margins=True)
+                margins = np.asarray(found.margins)
+                if np.any(margins[np.isfinite(margins)] <= MARGIN):
+                    return False
         return True
 
     def draw(seed: int) -> dict:
