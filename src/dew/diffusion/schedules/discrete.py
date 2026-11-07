@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.programs import on_host
 from dew.nn.sharding import rows_taken
 
 from .common import NoiseScheduler
@@ -33,16 +34,19 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         # The table is fixed at construction. Device float32 prefix products
         # and roots introduce backend-dependent error into every later step.
         alpha_cumprod = np.cumprod(1 - np.asarray(betas, np.float64), axis=0)
-        self.alpha_cumprod = jnp.asarray(alpha_cumprod, jnp.float32)
-        self.one_minus_alpha_cumprod = jnp.asarray(1 - alpha_cumprod, jnp.float32)
-        self.sqrt_alpha_cumprod = jnp.asarray(np.sqrt(alpha_cumprod), jnp.float32)
-        self.sqrt_one_minus_alpha_cumprod = jnp.asarray(np.sqrt(1 - alpha_cumprod), jnp.float32)
         noise_variance = 1 - alpha_cumprod
         # This form of (k + SNR)^-gamma also preserves the zero-noise limit.
         weights = (
             noise_variance / (p2_loss_weight_k * noise_variance + alpha_cumprod)
         ) ** p2_loss_weight_gamma
-        self.p2_loss_weights = jnp.asarray(weights, jnp.float32)
+        # Placed as a constant is, on this host's CPU (`on_host`): a schedule built while a program traces
+        # under a mesh of devices that run nothing here (a compile-only GPU's) holds them all the same.
+        with on_host():
+            self.alpha_cumprod = jnp.asarray(alpha_cumprod, jnp.float32)
+            self.one_minus_alpha_cumprod = jnp.asarray(1 - alpha_cumprod, jnp.float32)
+            self.sqrt_alpha_cumprod = jnp.asarray(np.sqrt(alpha_cumprod), jnp.float32)
+            self.sqrt_one_minus_alpha_cumprod = jnp.asarray(np.sqrt(1 - alpha_cumprod), jnp.float32)
+            self.p2_loss_weights = jnp.asarray(weights, jnp.float32)
 
     def index(self, t) -> jax.Array:
         """Return `t` as a table index.
