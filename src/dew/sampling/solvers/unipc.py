@@ -9,6 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
+from dew.nn.programs import on_host
+
 from .common import _check_endpoint_domain, _push
 
 
@@ -181,7 +183,7 @@ class UniPC:
             source=corrects_source and (not self.predict_x0 or self.solver_type == "bh1"),
             target=not self.lower_order_final and self.order > 1 and times.shape[0] > 2,
             reason="UniPC corrector/predictor requires finite log-SNR at this endpoint")
-        with jax.ensure_compile_time_eval():
+        with on_host():
             alpha, sigma = process.sampler_schedule.rates(jnp.asarray(times))
         # The tables hold every division a walk takes: one over an interval of no length is not finite.
         with np.errstate(divide="ignore", invalid="ignore"):

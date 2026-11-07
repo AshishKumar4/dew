@@ -43,6 +43,7 @@ from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.options import Held
 from dew.nn.mp import Uncertainty
+from dew.nn.programs import on_host
 from dew.nn.protocols import (
     CountedCondition,
     CountedConditionedSpatial,
@@ -149,7 +150,7 @@ def model_part(tree: Variables) -> Variables:
 def sampling_grid(process: Process, steps: int, grid: SourceGrid | None = None) -> tuple[Process, jax.Array]:
     """The process and the concrete descending times `steps` steps sample on: a loaded pipeline's
     own (`grid`, `SourceTask.grid`), else `process`'s grid."""
-    with jax.ensure_compile_time_eval():
+    with on_host():
         return (process, process.times(steps)) if grid is None else grid(steps)
 
 
