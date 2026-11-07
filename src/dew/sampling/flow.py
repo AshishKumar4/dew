@@ -79,7 +79,7 @@ class GaussianTransition:
         # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
         # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
         # times it. Each row has its own variance, which that function would take one row at a time.
-        log_prob = -(_gaussian_kl(value, mean, safe_variance)
+        log_prob = -(_half_mahalanobis(value, mean, safe_variance)
                      + 0.5 * dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
@@ -181,7 +181,7 @@ def _summed_products(left: jax.Array, left_shift: jax.Array, right: jax.Array,
     top = jnp.max(jnp.where(products != 0, powers, FLOOR), axis=tuple(range(1, left.ndim)))
     excess = _unshifted_at_zero(top, _shift(top, 2 + math.ceil(math.log2(max(count, 1)))))
     # Each product restored by its own powers, a zero's included, so a derivative of a zero product (a
-    # residual of zero, `_gaussian_kl`'s second order) is restored as its value would be.
+    # residual of zero, `_half_mahalanobis`'s second order) is restored as its value would be.
     return _scaled(products, powers - expand(excess, powers)).sum(axis=tuple(range(1, left.ndim))), excess
 
 
@@ -225,15 +225,81 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
     end (`_scaled`): a squared difference past float32's largest over a variance as wide, or a
     variance whose double overflows; and taken up where every value lies below 2**-63, so it keeps
     what the plain formula would flush (`_shift`). It keeps every term the plain formula keeps. Its
-    derivatives are `_gaussian_kl`'s."""
+    derivatives are `_gaussian_kl`'s and `_half_mahalanobis`'s."""
     *_, (quotient, power) = _divergence_parts(mean, reference, variance)
     return _scaled(quotient, power)
 
 
+def _half_mahalanobis_value(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
+    """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term, as the KL forms it
+    (`_divergence`): the plain float32 formula bit for bit wherever it stays in range, and finite
+    wherever the term is (a residual of 2**64 under a variance of 2**126; a value of 2**127 beside a
+    mean of -2**127). Its derivatives are the plain formula's at every order (`_half_mahalanobis_jvp`)."""
+    return _divergence(value, mean, variance)
+
+
+def _half_mahalanobis_jvp(primals, tangents):
+    """The plain formula's tangent, `sum((value - mean) * (t_value - t_mean)) / variance - term * t_variance
+    / variance`, linear in the tangents, so reverse mode transposes it, and its coefficients functions of the
+    primals, so it differentiates again: each coefficient, `(value - mean) / variance` a coordinate and
+    `-term / variance`, restored into float32's normal range before the tangent's product (`_restored`),
+    each product exact where it is a normal number, and the rest of its power, the primals' alone, after
+    the sum. So a tangent far from its operands' scale moves nothing the derivative keeps finite (ledger
+    3331: a value and mean of 2**-120 under a tangent of 2**10, a residual of 2**100 under a variance of
+    2**100 under 2**100), the plain formula's in range, bit for bit, the powers of two exact."""
+    value, mean, variance = primals
+    along_value, along_mean, along_variance = tangents
+    difference, shift, (quotient, power) = _divergence_parts(value, mean, variance)
+    level, spread = _split(variance)
+    axes = tuple(range(1, value.ndim))
+    widest = jnp.max(shift, axis=axes)
+    # The residual's coefficient restored up to its largest coordinate's room, by the primals alone.
+    largest = jnp.max(jnp.where(difference != 0, _exponent(difference) + shift, widest), axis=axes)
+    before = _restored(widest - spread, largest - widest)
+    products = _residual(value, mean, expand(before - widest, shift)) * (along_value - along_mean)
+    moved = _scaled(products.sum(axis=axes) / level, widest - spread - before)
+    stretch_power = power - spread
+    stretch_before = _restored(stretch_power, jnp.where(quotient != 0, _exponent(quotient), 0))
+    stretched = _scaled(-quotient, stretch_before) * along_variance / level
+    return (_half_mahalanobis(value, mean, variance),
+            moved + _scaled(stretched, stretch_power - stretch_before))
+
+
+def _restored(power: jax.Array, exponent: jax.Array) -> jax.Array:
+    """As much of `power` as a coefficient whose largest exponent is `exponent` takes while it stays in
+    float32's normal range, each product with a tangent then exact where it is a normal number."""
+    return jnp.clip(power, -126 - exponent, 126 - exponent)
+
+
+def _residual_value(value: jax.Array, mean: jax.Array, power: jax.Array) -> jax.Array:
+    """`(value - mean) * 2**power` a coordinate, its difference formed shifted to range (`_differences`) and
+    restored once (`_scaled`)."""
+    difference, shift = _differences(value, mean)
+    return _scaled(difference, shift + power)
+
+
+def _residual_jvp(primals, tangents):
+    """The scaled residual's tangent, `(t_value - t_mean) * 2**power` in one restoration: the difference's
+    own shift never reaches a tangent, where a tangent of 2**10 taken up by 2**120 overflowed."""
+    value, mean, power = primals
+    along_value, along_mean, _ = tangents
+    return _residual(value, mean, power), _scaled(along_value - along_mean, power)
+
+
+_residual = contracted("test_a_transitions_quadratic_term_holds_every_order")(
+    declared_tangent(Protected(), _residual_value, _residual_jvp))
+"""A residual scaled by a power of two (`_residual_value`), differentiated in one restoration
+(`_residual_jvp`): the quadratic term's coefficient, whose derivative is its second order."""
+
+
+_half_mahalanobis = contracted("test_a_transitions_quadratic_term_holds_every_order")(
+    declared_tangent(Protected(), _half_mahalanobis_value, _half_mahalanobis_jvp))
+"""The density's quadratic term (`_half_mahalanobis_value`), differentiated by its range-safe rule
+(`_half_mahalanobis_jvp`): numerics the algebra pass keeps as written."""
+
+
 def _gaussian_kl_value(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
-    """`_divergence`, the KL of two transitions of one variance, and a transition's quadratic term
-    `|value - mean|**2 / (2 variance)` (`GaussianTransition.log_prob`), one function differentiated as one
-    linear map: its
+    """`_divergence`, the KL of two transitions of one variance, differentiated as one linear map: its
     forward mode `_kl_tangent`'s, its reverse mode `_kl_pullback`'s, each forming every difference,
     product and quotient from operands scaled to range, so each is finite wherever its derivative is,
     whatever the tangents' or the cotangent's scale; a higher order differentiates either's arithmetic
@@ -245,10 +311,10 @@ def _gaussian_kl_jvp(primals, tangents):
     return _gaussian_kl(*primals), linear_map(_kl_tangent, _kl_pullback, primals, tangents)
 
 
-_gaussian_kl = contracted("test_a_transitions_quadratic_term_and_kl_hold_every_order")(
+_gaussian_kl = contracted("test_a_transitions_kl_holds_every_order")(
     declared_tangent(Protected(), _gaussian_kl_value, _gaussian_kl_jvp))
-"""The KL of two transitions and a transition's quadratic term (`_gaussian_kl_value`), differentiated as
-one range-safe linear map (`_gaussian_kl_jvp`): numerics the algebra pass keeps as written."""
+"""The KL of two transitions (`_gaussian_kl_value`), differentiated as one range-safe linear map
+(`_gaussian_kl_jvp`): numerics the algebra pass keeps as written."""
 
 
 def _kl_tangent(primals: tuple[jax.Array, jax.Array, jax.Array],
