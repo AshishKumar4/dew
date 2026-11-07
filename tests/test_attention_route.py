@@ -377,6 +377,32 @@ def test_an_fp32_call_on_an_h100_infers_on_the_template_and_trains_on_xla(width,
     assert not launches(trained, 4)
 
 
+@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+def test_a_dense_bias_infers_on_the_template_and_trains_on_it_where_it_measured_faster(generation_name,
+                                                                                      causal):
+    """A bf16 call whose bias varies by query, lowered for an H100 and an A100: one no derivative is taken of
+    runs the template's launch on both; a differentiated one runs it causal on the H100 alone, xla's
+    attention elsewhere (`attention_kernels._attention_preferred`, M-DD-8)."""
+    from kernel_compile import lowered_for
+    shape = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16)
+    bias = jax.ShapeDtypeStruct((1, 2, 512, 512), jnp.float32)
+
+    def attend(query, key, value, bias):
+        return scaled_dot_product_attention(query, key, value, bias=bias, causal=causal)
+
+    def trained(query, key, value, bias, dout):
+        out, pull = jax.vjp(attend, query, key, value, bias)
+        return out, pull(dout)
+
+    def launches(fn, args):
+        text = lowered_for(fn, args, generation_name).as_text()
+        return "mosaic_gpu" in text or "xla.gpu.triton" in text
+
+    assert launches(attend, (shape, shape, shape, bias))
+    assert launches(trained, (shape, shape, shape, bias, shape)) == (causal and generation_name == "sm90")
+
+
 @pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
