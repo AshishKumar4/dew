@@ -1521,16 +1521,16 @@ DUMP_SECONDS = 10.0
 thread's frames out of its memory, in under a second for a test's threads (0.14 s on armada, 2026-11-07)."""
 
 
-def dumped(pid: Path, reader: Path) -> str:
+def dumped(pid: Path, spy: Path) -> str:
     """Every thread's stack of a task's pytest past its deadline, its Python frames and the native ones under
-    them, read from outside it by `reader` (py-spy, the task environment's) while it is stopped: nothing runs
+    them, read from outside it by `spy` (py-spy, the task environment's) while it is stopped: nothing runs
     in the stalled process, so one stalled in the interpreter, or in native code holding the GIL or not (an
     XLA compile, a wait on a device, a collective), says where it stood alike (row 4828). pytest's id is the
     one executed.py wrote to `pid` as it loaded; none where it never loaded."""
     if not pid.is_file():
         return ""
     try:
-        read = subprocess.run([str(reader), "dump", "--native", "--pid", pid.read_text()],
+        read = subprocess.run([str(spy), "dump", "--native", "--pid", pid.read_text()],
                               capture_output=True, text=True, timeout=DUMP_SECONDS)
     except subprocess.TimeoutExpired:
         return f"py-spy read no stacks of pytest in {DUMP_SECONDS:.0f} s"
@@ -1538,7 +1538,7 @@ def dumped(pid: Path, reader: Path) -> str:
 
 
 def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
-               pid: Path, reader: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
+               pid: Path, spy: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
     """A task's pytest `command` run to its `deadline`: its exit code, output, whether it passed the deadline,
     its threads' stacks then (`dumped`), the data files it opened (`watched`), none where its group
     outlived the kill, and the checkout's files it wrote (`watched.changed`). pytest leads its own process
@@ -1566,7 +1566,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
         done.wait(deadline)
     except subprocess.TimeoutExpired:
         # Every thread's stack as pytest stands at its deadline, before the interrupt below.
-        expired, dump = True, dumped(pid, reader)
+        expired, dump = True, dumped(pid, spy)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
