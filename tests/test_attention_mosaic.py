@@ -476,6 +476,35 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
     _check_forward(call, dtype, SHAPES["interpreted"], natural=False, interpret=True)
 
 
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call):
+    """An fp16 call's backward in the fast form's one launch (row 3886): its weights and score cotangents as
+    two fp16 parts at each walk's running scale (`algebra.running_parts`), dV's and dK's accumulators taken
+    to the new scale as it grows and back at the end, each tile's dQ by its own; every gradient the
+    reference's (check 1), under the interpreter, heads 64 wide, where one launch's registers hold fp16's
+    parts (at 128 the derivation takes the two launches). (A dropping fp16 call takes no Mosaic walk at
+    all: its dropping walk takes bf16 operands.)"""
+    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, dtype=jnp.float16, width=64)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("width", [64, 128])
+def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
+    """An fp16 call's backward at its derived tiles of a causal call `width` wide (the one launch's two parts
+    at running scales, `attention_mosaic_fused._sixteen_step`, where its registers hold it), lowered and
+    compiled by ptxas for an H100 on this CPU: within its shared memory, spilling nothing, its register
+    model's decision ptxas's."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    op, ba, config = _gated_backward("sm90", width, accurate=False, dtype=jnp.float16)
+    with generation.assumed("sm90"):
+        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config),
+                                                   _backward_models(op, ba, config))], "sm90")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
 TPU_PASSES = {"fold": {"natural": False}, "natural": {"natural": True},
               "sinks": {"natural": False, "sinks": True},
               "training": {"natural": False, "training": template.Kept.SPLIT}}
@@ -1744,11 +1773,13 @@ Blackwell's mma.sync fed by TMA (`bundles.MmaFed`) runs the mainloop too, but de
 
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
-BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
+BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in GATED
+                  for width in (64, 128) for accurate in (False, True)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
 """The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
 call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
-whole (row 2281: its live set beside the step's)."""
+whole, in each form (row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a
+row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
@@ -1763,14 +1794,15 @@ def _gated_hooks(hooks: str, queries: int, width: int):
                           initial)
 
 
-def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str = "none"):
+def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str = "none",
+                    dtype=jnp.bfloat16):
     """The resource gate's backward op, bound arguments and derived config: a causal call of 512 queries,
-    four query heads over two key heads `width` wide, bf16, in the form `accurate` names, under the score
-    hook `hooks` names (`_gated_hooks`), for `generation_name`."""
+    four query heads over two key heads `width` wide, in `dtype` (bf16 by default), in the form `accurate`
+    names, under the score hook `hooks` names (`_gated_hooks`), for `generation_name`."""
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
-    query = jnp.zeros((1, queries, 4, width), jnp.bfloat16)
-    key = jnp.zeros((1, queries, 2, width), jnp.bfloat16)
+    query = jnp.zeros((1, queries, 4, width), dtype)
+    key = jnp.zeros((1, queries, 2, width), dtype)
     hooked = _gated_hooks(hooks, queries, width)
     with generation.assumed(generation_name):
         op, args = attention_mosaic._backward_call(query, key, key, spans, hooked, query,
@@ -1787,10 +1819,14 @@ FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name i
                  for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
+FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
+FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
+                 for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
-beside the walk's), and a softcap's inference forward 256 wide (Gemma's)."""
+beside the walk's), a softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and
+training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes)."""
 
 
 @COMPILES_ON_CPU
@@ -1972,19 +2008,20 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("generation_name", "width", "training", "hooks"), FORWARD_GATE)
-def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks):
+@pytest.mark.parametrize(("generation_name", "width", "training", "hooks", "dtype"), FORWARD_GATE)
+def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks,
+                                                              dtype):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
-    wide under the score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
-    (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
-    model's decision ptxas's (`mosaic_failures`)."""
+    wide under the score hook `hooks` names, in `dtype`, lowered and compiled by ptxas for `generation_name`
+    on this CPU (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its
+    register model's decision ptxas's (`mosaic_failures`)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     queries = 512
     spans = template.spans(queries, queries, 1, causal=True)
-    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), dtype)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), dtype)
     hooked = _gated_hooks(hooks, queries, width)
 
     def forward(query, key, value):
@@ -2079,6 +2116,9 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
         return grads.query, grads.key, grads.value
 
     op, ba, config = _gated_backward(generation_name, width, accurate, hooks)
+    if config is None and accurate and hooks != "none":
+        pytest.skip(f"the accurate form under {hooks} derives no tile {width} wide on {generation_name}: "
+                    "its registers hold none, and the Pallas-Triton mainloop takes the call")
     assert config is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
     with generation.assumed(generation_name):
         models = _backward_models(op, ba, config)
