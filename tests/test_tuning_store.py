@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import tokamax
 from reference_error import assert_computes_the_oracle
+from tuned import recorded
 
 from dew import _cache
 from dew.nn.kernels import generation, norm_swiglu, tuning
@@ -30,10 +31,8 @@ def test_a_steps_launches_and_their_timings_round_trip_through_dews_json():
     does."""
     from test_tuning import operands, step
 
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-    assert found
-    keyed = [ba.op.keyed(ba) for ba in found]
+    keyed = recorded(step(), *operands(15))
+    assert keyed
     again = tuning.loads_launches(tuning.dumps_launches(keyed))
     assert [(ba.op, ba.autotuning_cache_key) for ba in again] == [
         (tuning._identity(ba.op), ba.autotuning_cache_key) for ba in keyed]
@@ -56,9 +55,7 @@ def _norm_launch_and_two_configs():
     """A norm launch of `test_tuning`'s step, its derived config and another of its space."""
     from test_tuning import operands, step
 
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
-    ba = next(ba.op.keyed(ba) for ba in found if len(ba.autotuning_configs) > 1)
+    ba = next(ba for ba in recorded(step(), *operands(15)) if len(ba.autotuning_configs) > 1)
     other = next(config for config in ba.autotuning_configs if config != ba.heuristics_config)
     return ba, ba.heuristics_config, other
 

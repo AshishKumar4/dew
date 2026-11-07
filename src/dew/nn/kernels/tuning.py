@@ -20,8 +20,8 @@ pick stored for its own key on its target GPU model (Dew's picks,
 other key. Dew resolves the config itself, so no tokamax policy measures or
 refuses inside a trace.
 
-In a tuning run, `tune` reads a program's launches from a lowering that
-describes them (`launches`), and the pool's process 0 decides every distinct
+In a tuning run, `tune` reads a program's launches as its lowering traces
+them (`seen`), and the pool's process 0 decides every distinct
 launch's config, which the others take exactly, so every process compiles the
 same program: its pick, or the heuristic. With `measure`, on a GPU the
 process has to itself (`dew._cache.measures_picks`), every variant of a launch
@@ -412,11 +412,6 @@ class _Picks(dict):
         return None
 
 
-# tokamax's `get_bound_args` for a lowered program: its annotation's ParamSpec,
-# for a callable's arguments, is one pyright cannot solve without any.
-_bound_args: Callable[[jax.stages.Lowered], tuple[tokamax.BoundArguments, ...]] = (
-    tokamax.autotuning.get_bound_args)
-
 _PICKS: dict[tuple[tokamax.Op, str], _Picks] = {}
 _LOADED: set[str] = set()
 _LOADING = threading.Lock()
@@ -501,8 +496,6 @@ class KernelOp(tokamax.Op):
 
     ROWS: ClassVar[tuple[str, ...]] = ()
     HOOKS: ClassVar[tuple[str, ...]] = ()
-    supports_batched_args_capture: ClassVar[bool] = False
-    supports_symbolic_shapes: ClassVar[bool] = False
     revision: int = 1
 
     def __call__(self, *args, **kwargs):
@@ -525,11 +518,6 @@ class KernelOp(tokamax.Op):
         # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
         with report.launching(self, ba, config):
-            if _cache.KERNEL_LAUNCHES.value:
-                # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
-                # each traced array for its devices (`keyed`).
-                return tokamax.Op.__call__(self.replace(config=config, bypass_device_check=True), *ba.args,
-                                           **ba.kwargs)
             return self._fwd(*ba.args, config=config, **ba.kwargs)[0]
 
     def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
@@ -813,16 +801,16 @@ def _host(value) -> np.ndarray:
 
 
 def _identity(op: tokamax.Op, *, traced: bool = True) -> tokamax.Op:
-    """`op` as its picks name it: without the config, the vjp and the device check a call sets, its hook
+    """`op` as its picks name it: without the config and the vjp a call sets, its hook
     fields by what they compute (`KernelOp.traced`, a tuning run's alone: `reading`, `seen`, `tune`, whose
     picks persist under it across checkouts), or, not `traced`, as every launch's identity reads them
     (`KernelOp.identified`, `report._identity`), tracing nothing."""
     if not isinstance(op, KernelOp):
-        return op.replace(config=None, vjp=None, bypass_device_check=False)
+        return op.replace(config=None, vjp=None)
     fields = {field.name for field in dataclasses.fields(op)}
     read = op.traced if traced else op.identified
     hooks = {name: read(name, getattr(op, name)) for name in op.HOOKS if name in fields}
-    return op.replace(config=None, vjp=None, bypass_device_check=False, **hooks)
+    return op.replace(config=None, vjp=None, **hooks)
 
 
 def _kind(ba: tokamax.BoundArguments) -> str:
@@ -1037,15 +1025,6 @@ def _store(device_kind: str, picks) -> None:
         write_atomically(path, json.dumps({**written, "data": [*written["data"], *foreign]}))
 
 
-@contextlib.contextmanager
-def launches() -> Iterator[None]:
-    """Each kernel launch traced within carries tokamax's description of
-    itself, which `tokamax.autotuning.get_bound_args` reads out of the
-    lowered program (`dew._cache.KERNEL_LAUNCHES`)."""
-    with _cache.KERNEL_LAUNCHES(new_value=True):
-        yield
-
-
 class Seen(list[Launch]):
     """The launches traced under `seen`, each its op and keyed arguments, in the order they traced, and
     `taken`, the config each took as it traced (`KernelOp._chosen`: a pin, a pick, the nearest pick or
@@ -1085,11 +1064,8 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     its stored pick for each, with `measure` measuring and storing one for a
     launch without where it has its GPU to itself, and every process takes
     exactly process 0's configs (`_settle`). Where that changes a config the
-    lowering traced, it lowers again: a launch's description in the program,
-    which tokamax reads its launches out of (`launches`), keeps it from the
-    persistent cache, so reading them so took a lowering of its own, about
-    62 s of each cold plan candidate's compile of the packed Qwen3.5-0.8B step
-    on an A100 (ledger 561). A launch without a pick takes its heuristic."""
+    lowering traced, it lowers again. A launch without a pick takes its
+    heuristic."""
     if not generation.triton_runs():
         return lower(), "[]"
     with reading():
