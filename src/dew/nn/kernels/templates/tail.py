@@ -1,8 +1,8 @@
 """A persistent launch's walk over its output tiles: the planar snake that orders them (`planar_snake`);
 its tail, the output tiles past its whole waves, their steps balanced over the programs (`balanced`,
-`Tail`), each tile fixed up by the program that walks its first step from the partials the others leave it
-(`mosaic.Family.fixes_up`, `mosaic.RingFamily.fixed_up`); and the order an interpreter, with no
-semaphores, walks them in (`ordered`)."""
+`Tail`), each tile fixed up from the partials its programs leave by the last of them to arrive
+(`mosaic.Family.fixes_up`, `mosaic.Family.fixed_up`); and the order an interpreter, with no semaphores,
+walks them in (`ordered`)."""
 
 import dataclasses
 import functools
@@ -17,9 +17,9 @@ from jax import lax
 class Tail:
     """A dense kernel gradient's output tiles beyond its whole waves, balanced over the programs
     (`balanced`): the whole waves each program walks first, a tile a wave, as the snake orders them; then
-    the remaining tiles' steps, `iterations` of them, shared out as `partitions` contiguous ranges, a
-    program's range crossing a tile's boundary leaving its partial tile to the program that walks the tile's
-    first step, which adds it (CUTLASS's data-parallel and stream-K hybrid)."""
+    the remaining tiles' steps, `iterations` of them, shared out as `partitions` contiguous ranges, each
+    program whose range crosses into a tile leaving its partial, the last of them to arrive adding them
+    (CUTLASS's data-parallel and stream-K hybrid)."""
     waves: int
     iterations: int
     partitions: int
@@ -32,9 +32,9 @@ class Tail:
 
     def segment(self, index, programs: int, tiles: int) -> tuple:
         """A program's `index`-th segment (`(segment, program)`): its tile's place in the snake, the first
-        of the tile's steps it walks and how many, and the exclusive end of the programs whose ranges
-        start inside the tile (which leave it their partials); a segment past the program's range walks
-        none, at a tile its descriptors can take."""
+        of the tile's steps it walks and how many, and the programs that walk a part of the tile, the first
+        (which walks its first step) and the exclusive end (`mosaic.Family.fixed_up`'s); a segment past the
+        program's range walks none, at a tile its descriptors can take."""
         segment, program = index
         whole = segment < self.waves
         lo = jnp.minimum(program, self.partitions) * self.iterations // self.partitions
@@ -43,11 +43,16 @@ class Tail:
         start = jnp.where(whole, 0, jnp.maximum(lo, tail_tile * self.steps) - tail_tile * self.steps)
         end = jnp.where(whole, self.steps,
                         jnp.minimum(hi, (tail_tile + 1) * self.steps) - tail_tile * self.steps)
+        # The programs whose ranges reach into the tile: those whose first step `p * iterations //
+        # partitions` lies before its end, the first the last of them whose first step is at or before its
+        # start.
+        first = jnp.where(whole, program,
+                          -(-((tail_tile * self.steps + 1) * self.partitions) // self.iterations) - 1)
         gathered = jnp.where(whole, program + 1,
                              -(-((tail_tile + 1) * self.steps * self.partitions) // self.iterations))
         tile = jnp.where(whole, segment * programs + program, self.waves * programs + tail_tile)
         return (jnp.minimum(tile, tiles - 1), start, jnp.maximum(end - start, 0),
-                jnp.minimum(gathered, self.partitions))
+                (first, jnp.minimum(gathered, self.partitions)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,9 +141,9 @@ def ordered(tail: Tail | None, index: tuple, programs: int, interpreted: bool) -
     """A persistent walk's index as its program walks it: interpreted, a balanced tail's programs counted
     from the last. The interpreter has no semaphores, and its one program walks the segments in turn, each
     segment's programs from the first (`gemm.mosaic_gpu`'s kernel gradient); a program leaving a tile its
-    partial (`mosaic.RingFamily.fixed_up`) walks it in its first tail segment, no later than the tile's
-    first program, so with the programs reversed each tile's partials are there before that program adds
-    them."""
+    partial (`mosaic.Family.fixed_up`) walks it in its first tail segment, no later than the tile's first
+    program, so with the programs reversed each tile's partials are there before that program, which
+    interpreted adds them, reads them."""
     if tail is None or not interpreted:
         return index
     return (*index[:-1], programs - 1 - index[-1])
