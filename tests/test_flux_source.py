@@ -377,8 +377,8 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
     carrying neither is refused rather than initialized.
     """
     from dew.interop.diffusion import component_tensors
+    from dew.interop.text_encoders import _t5_path, translate_t5_weights
     from dew.interop.weights import record_layouts
-    from dew.nn.text_encoders import _t5_path, translate_t5_weights
 
     tensors = dict(component_tensors(source / "pipeline", "text_encoder_2"))
     embedding = next(tensors[name] for name in
