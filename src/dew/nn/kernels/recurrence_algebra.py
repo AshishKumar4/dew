@@ -901,10 +901,8 @@ def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue:
 
 
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
-    """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
-    memory's decay `exp2(g_last)`."""
-    gated = corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
-    return gated, raised(last, last_lo)
+    """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves."""
+    return corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
@@ -1108,24 +1106,26 @@ def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, o
 
 
 def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, queries: TileLoad, out_grad, local,
-                    gate, low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
+                    gate, low, last, last_low, kept: list, scale: float, dtype, issue: Issue
+                    ) -> tuple[list, jax.Array]:
     """One chunk of the memory's reverse recurrence (fla's dhu) under a decay a head: from the gradient of
     the memory leaving the chunk `grad`, its key slices `[K_i, BV]` fp32, the corrected values' gradient
     `dv = (k grad) exp2(g_last - g) + local` ('values_dv', the gradient cast to `dtype`) and the gradient of
     the memory the chunk entered, `grad exp2(g_last) + scale q^T (do exp2(g)) - w^T dv` ('reads', the
     decayed `do` fp32; 'weights_dv', `dv` cast to `dtype`). `last` and `last_low` are the chunk's last prefix
-    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles. Without the delta rule
+    halves as a row's vectors, `kept[i]` the memory's decay across the chunk as key slice `i`'s rows'
+    (`exp2(g_last)` `[K_i, 1]`), `queries(i)` and `weights(i)` key slice `i`'s tiles. Without the delta rule
     (`weights` None) nothing was corrected, and the memory entered takes no `w^T dv`."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
     dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
-    kept = raised(last, last_low)[:, None]
+
     def slice_entered(i, part):
         # A slice's terms in one expression, so each slice's products are live alone (formed slice by slice
         # into a list first, every slice's partial sum stayed live past the products: 128 bytes spilled in
         # an H100's reverse walk of Qwen3.5-27B's gated delta net).
-        entered = part * kept + issue("reads", queries(i).T, read) * scale
+        entered = part * kept[i] + issue("reads", queries(i).T, read) * scale
         return entered if weights is None else entered - issue("weights_dv", weights(i).T, dv.astype(dtype))
 
     return [slice_entered(i, part) for i, part in enumerate(grad)], dv
