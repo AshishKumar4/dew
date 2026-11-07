@@ -178,7 +178,7 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
     (`AttentionMetadata.key_runs`), a windowed layer windowing each run over the key positions the call
     gives, its queries read at them too where they are its own tokens, or a cached call's at its rotary
     positions through a mask. `key_places` are where the keys are read otherwise."""
-    if metadata.pairwise_mask is None and metadata.key_runs is None and metadata.entered is None:
+    if metadata.pairwise_mask is None and metadata.key_runs is None:
         return None
     key_positions, valid = metadata.key_positions, metadata.key_valid
     if key_positions is not None and key_positions.shape != (batch, keys):
@@ -1388,7 +1388,6 @@ class CausalSelfAttention(nn.Module):
         position bias is refused by name rather than run without them."""
         carried = [name for name, given in (("a pairwise mask", metadata.pairwise_mask),
                                             ("key runs", metadata.key_runs),
-                                            ("entered documents", metadata.entered),
                                             ("key positions", metadata.key_positions),
                                             ("a position bias", metadata.position_bias)) if given is not None]
         if carried:
@@ -1631,7 +1630,6 @@ class CausalSelfAttention(nn.Module):
             return False
         return metadata is None or (
             metadata.pairwise_mask is None and metadata.key_runs is None and metadata.position_bias is None
-            and metadata.entered is None
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
     def _output(self, attention, gate, batch: int, length: int, own_value, progress):
