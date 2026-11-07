@@ -197,15 +197,14 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
     second, weights_read = product
     places.append(second)
     logits_places: list[int] = []
-    scaled, causal = _unmasked(graph, logits, logits_places)
-    if causal is None:
+    scaled, mask, perm = _unmasked(graph, logits, logits_places)
+    if perm is None:
         return None
     places += logits_places
     first, query, key, query_width, key_width, layout = _scaled_product(graph, scaled, places)
     if first is None:
         return None
-    region = _laid_out(graph, first, second, weights_read, query, key, layout, query_width, key_width, axis,
-                       causal)
+    region = _laid_out(graph, second, weights_read, query, key, layout, query_width, key_width, axis, mask, perm)
     if region is None:
         return None
     places = sorted(set(places))
@@ -218,23 +217,22 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
 
 
 def _rows_maximum(graph: _Graph, centre, logits, places: list[int]) -> int | None:
-    """The keys axis where `centre` is `logits`' largest over it, broadcast back (and through stop_gradient
-    and a maximum with a constant, jax.nn's `initial`); None where it is not."""
-    eqns = graph.jaxpr.eqns
-    broadcast = graph.made(centre, "broadcast_in_dim")
-    if broadcast is None:
-        return None
-    places.append(broadcast)
-    atom = eqns[broadcast].invars[0]
-    if (held := graph.made(atom, "stop_gradient")) is not None:
-        places.append(held)
-        atom = eqns[held].invars[0]
-    if (initial := graph.made(atom, "max")) is not None:
-        a, b = eqns[initial].invars
-        constant, atom = (a, b) if graph.constant(a) is not None else (b, a)
-        if graph.constant(constant) is None:
-            return None
-        places.append(initial)
+    """The keys axis where `centre` is `logits`' largest over it, broadcast back, held from its gradient and
+    raised to a constant (jax.nn's `initial`) in any order, through casts; None where it is not."""
+    eqns, atom = graph.jaxpr.eqns, centre
+    while True:
+        place = graph.made(atom, "broadcast_in_dim", "stop_gradient", "max", *CASTS)
+        if place is None:
+            break
+        eqn = eqns[place]
+        if jax_name(eqn.primitive) == "max":
+            a, b = eqn.invars
+            constant, atom = (a, b) if graph.constant(a) is not None else (b, a)
+            if graph.constant(constant) is None or np.ndim(graph.constant(constant)) != 0:
+                return None
+        else:
+            atom = eqn.invars[0]
+        places.append(place)
     reduced = graph.made(atom, "reduce_max")
     if reduced is None or eqns[reduced].invars[0] is not logits or len(eqns[reduced].params["axes"]) != 1:
         return None
@@ -268,53 +266,61 @@ def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int
 
 
 def _unmasked(graph: _Graph, logits, places: list[int]):
-    """`logits` past a constant mask (`jnp.where(mask, s, fill)`: a nested `_where`, or a `select_n`), and the
-    mask's array with the logits' rank (`_aligned`), True where there is none; (None, None) where a mask is
-    made from the program's inputs, holds more than MASK_ENTRIES entries, or lies otherwise than broadcast."""
-    eqns = graph.jaxpr.eqns
+    """`logits` past a constant mask (`jnp.where(mask, s, fill)`: a nested `_where`, or a `select_n`): the
+    scaled logits `s`, the mask's array at the logits' rank (True where there is none), and the logits' axes as
+    `s` lays them (`perm`: the logits' axis i is `s`'s `perm[i]`, a batched `_where` moving its batch axis
+    first); (None, None, None) where a mask is made from the program's inputs, holds more than MASK_ENTRIES
+    entries, or is laid out otherwise than broadcast."""
+    eqns, rank, nothing = graph.jaxpr.eqns, logits.aval.ndim, (None, None, None)
+    identity = tuple(range(rank))
     place = graph.made(logits, "jit", "pjit", "select_n")
     if place is None:
-        return logits, True
+        return logits, True, identity
     eqn = eqns[place]
     if jax_name(eqn.primitive) in ("jit", "pjit"):
         if eqn.params.get("name") != "_where":
-            return logits, True
+            return logits, True, identity
         mask, kept, fill = eqn.invars
-        axes = _broadcast_axes(eqn.params["jaxpr"].jaxpr, 0, logits.aval.ndim)
+        inner = eqn.params["jaxpr"].jaxpr
+        axes, perm = _laid(inner, 0, rank), _laid(inner, 1, rank)
+        if perm is None or sorted(perm) != list(identity):
+            return nothing
     else:
         if len(eqn.invars) != 3:
-            return None, None
+            return nothing
         mask, fill, kept = eqn.invars  # select_n(predicate, on_false, on_true)
-        axes = tuple(range(logits.aval.ndim))
+        axes, perm = identity, identity
     mask_value = graph.constant(mask)
     if mask_value is None or axes is None or graph.constant(fill) is None:
-        return None, None
+        return nothing
     places.append(place)
     aligned = np.reshape(mask_value.astype(bool), [mask_value.shape[axes.index(a)] if a in axes else 1
-                                                   for a in range(logits.aval.ndim)])
-    return kept, aligned
+                                                   for a in range(rank)])
+    return kept, aligned, perm
 
 
-def _broadcast_axes(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
-    """The output axes `inner`'s input `index` lies along where it is broadcast to the output's `rank`
-    (`broadcast_in_dim`'s dimensions, through casts), every axis where it is read at the output's rank;
-    None where it is laid out otherwise."""
-    atom, axes = inner.invars[index], None
+def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
+    """Where `inner`'s input `index` lies in its select's output (rank `rank`): for each of the input's axes,
+    the output axis it is laid along (`broadcast_in_dim`'s dimensions), and through a transpose, for each
+    output axis the input axis it reads (an input of the output's rank: its permutation); None where it
+    reaches the select otherwise."""
+    atom, axes = inner.invars[index], tuple(range(inner.invars[index].aval.ndim))
     for eqn in inner.eqns:
         if atom not in eqn.invars:
             continue
         name = jax_name(eqn.primitive)
-        if name == "broadcast_in_dim" and eqn.invars[0] is atom:
-            dims = tuple(eqn.params["broadcast_dimensions"])
-            axes = dims if axes is None else tuple(dims[a] for a in axes)
-            atom = eqn.outvars[0]
-        elif name in CASTS:
-            atom = eqn.outvars[0]
+        if name == "broadcast_in_dim" and eqn.invars[0] is atom and index == 0:
+            dims = tuple(int(d) for d in eqn.params["broadcast_dimensions"])
+            axes = tuple(dims[a] for a in axes)
+        elif name == "transpose" and eqn.invars[0] is atom and index == 1:
+            permutation = tuple(int(d) for d in eqn.params["permutation"])
+            axes = tuple(axes[d] for d in permutation)
         elif name == "select_n":
-            break
-    if atom.aval.ndim != rank:
-        return None
-    return tuple(range(rank)) if axes is None else axes
+            return axes if atom.aval.ndim == rank or index == 0 else None
+        elif name not in CASTS:
+            return None
+        atom = eqn.outvars[0]
+    return None
 
 
 def _scaled_product(graph: _Graph, scaled, places: list[int]):
@@ -359,19 +365,20 @@ def _scaled_product(graph: _Graph, scaled, places: list[int]):
     return first, query, key, contracted_q[0], contracted_k[0], eqn.params["dimension_numbers"]
 
 
-def _laid_out(graph: _Graph, first: int, second: int, weights, query, key, layout, query_width: int,
-              key_width: int, axis: int, mask) -> Attention | None:
-    """The written call's folds (the module's account) from the two products' layouts and the mask; None
-    where they do not hold one: the keys not a free axis of k, the values' product contracting another axis
-    than the keys or sharing other axes than q and k do, the values more than one free axis, or a mask
-    neither causal over the query rows and the keys nor keeping every key."""
+def _laid_out(graph: _Graph, second: int, weights, query, key, layout, query_width: int, key_width: int,
+              axis: int, mask, perm: tuple[int, ...]) -> Attention | None:
+    """The written call's folds (the module's account) from the two products' layouts and the mask, the
+    softmax's axes as the logits product lays them through `perm` (`_unmasked`'s); None where they do not
+    hold one: the keys not k's one free axis, the values' product contracting another axis than the keys or
+    sharing other axes than q and k do, the values more than one free axis, or a mask neither causal over the
+    query rows and the keys nor keeping every key."""
     eqns = graph.jaxpr.eqns
-    (_, _), (shared_q, shared_k) = layout
+    _, (shared_q, shared_k) = layout
     q_free = [a for a in range(query.aval.ndim) if a != query_width and a not in shared_q]
     k_free = [a for a in range(key.aval.ndim) if a != key_width and a not in shared_k]
-    # The logits' axes: the shared, then q's free, then k's free (dot_general's order).
-    logits_rank = len(shared_q) + len(q_free) + len(k_free)
-    if len(k_free) != 1 or axis != logits_rank - 1:
+    # The product's logits: the shared axes, then q's free, then k's free (dot_general's order).
+    shared_n, rank = len(shared_q), len(shared_q) + len(q_free) + len(k_free)
+    if len(k_free) != 1 or len(perm) != rank or perm[axis] != rank - 1:
         return None
     (left_c, right_c), (left_b, right_b) = eqns[second].params["dimension_numbers"]
     left, right = eqns[second].invars
@@ -381,39 +388,40 @@ def _laid_out(graph: _Graph, first: int, second: int, weights, query, key, layou
         weights_c, value_c, weights_b, value_b, value = right_c, left_c, right_b, left_b, left
     else:
         return None
-    if tuple(weights_c) != (axis,) or sorted(weights_b) != list(range(len(shared_q))) or len(value_c) != 1:
+    shared_b = [perm[w] for w in weights_b]
+    if tuple(weights_c) != (axis,) or sorted(shared_b) != list(range(shared_n)) or len(value_c) != 1:
         return None
     value_free = [a for a in range(value.aval.ndim) if a not in value_c and a not in value_b]
     if len(value_free) != 1:
         return None
-    value_shared = {w: v for w, v in zip(weights_b, value_b, strict=True)}
+    value_shared = dict(zip(shared_b, value_b, strict=True))
     shared = tuple((q, k, value_shared[i]) for i, (q, k) in enumerate(zip(shared_q, shared_k, strict=True)))
-    causal = _causal(mask, len(shared_q), len(q_free), logits_rank)
+    mask = mask if mask is True else np.transpose(mask, [perm.index(a) for a in range(rank)])
+    causal = _causal(mask, shared_n, len(q_free))
     if causal is None:
         return None
     is_causal, row = causal
     rows = (q_free[row],) if is_causal else tuple(q_free)
     heads = tuple(a for a in q_free if a not in rows)
-    # The call's output axes: shared (their logits order), rows, heads, the value width; the second
-    # product's: its batch (the weights' order), then the first operand's free axes, then the second's.
-    ours = ([("shared", i) for i in range(len(shared_q))] + [("free", q_free.index(a)) for a in rows]
+    # The call's output axes: shared (the product's order), rows, heads, the value width; the second
+    # product's: its batch (as the weights pair them), then its first operand's free axes, then its second's.
+    ours = ([("shared", i) for i in range(shared_n)] + [("free", q_free.index(a)) for a in rows]
             + [("free", q_free.index(a)) for a in heads] + [("width", 0)])
-    weights_free = [("free", a - len(shared_q)) for a in range(logits_rank) if a >= len(shared_q) and a != axis]
-    theirs = [("shared", w) for w in weights_b]
-    theirs += (weights_free + [("width", 0)]) if left is weights else ([("width", 0)] + weights_free)
+    weights_free = [("free", perm[i] - shared_n) for i in range(rank) if i not in weights_b and i != axis]
+    theirs = [("shared", s) for s in shared_b]
+    theirs += [*weights_free, ("width", 0)] if left is weights else [("width", 0), *weights_free]
     out_order = tuple(ours.index(label) for label in theirs)
     return Attention((), query, key, value, eqns[second].outvars[0], is_causal, shared, rows, heads,
                      query_width, k_free[0], key_width, value_c[0], value_free[0], out_order,
                      np.dtype(eqns[second].outvars[0].aval.dtype))
 
 
-def _causal(mask, shared: int, free: int, rank: int) -> tuple[bool, int] | None:
+def _causal(mask, shared: int, free: int) -> tuple[bool, int] | None:
     """(True, the q-free axis it reads as query rows) where `mask` (the logits' rank, `_unmasked`) keeps each
     query row's keys up to its own index (jax's `is_causal`, top left aligned) and is the same along every
     other axis; (False, 0) where it keeps every key (True for none); None else."""
     if mask is True or bool(np.all(mask)):
         return False, 0
-    del rank
 
     def varies(a: int) -> bool:
         return mask.shape[a] > 1 and not np.all(mask == np.take(mask, [0], axis=a))
