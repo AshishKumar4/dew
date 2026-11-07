@@ -29,10 +29,11 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.averaging import ema_update
-from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, leaves_by_path, merge
+from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
 from dew.gauss_newton import solves_equations
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
+from dew.nn import in_backward
 from dew.nn.inspection import (
     PROBES,
     Watched,
@@ -310,6 +311,88 @@ def consumed_where_made(optimizer: optax.GradientTransformation, state: TrainSta
     return leaf_local(optimizer, params, opt_state, progressed=progressed)
 
 
+def _param_copies(opt_state, params) -> list[Variables]:
+    """The copies of `params`' tree an optimizer's state holds (Adam's moments), in the state's order."""
+    shape = jax.tree.structure(params)
+    copies = jax.tree.leaves(opt_state, is_leaf=lambda node: jax.tree.structure(node) == shape)
+    return [node for node in copies if jax.tree.structure(node) == shape]
+
+
+def _with_copies(opt_state, params, replaced: Callable[[int, Variables], Variables]):
+    """`opt_state` with its `k`th copy of `params`' tree (`_param_copies`) `replaced(k, copy)`."""
+    shape = jax.tree.structure(params)
+    counted = iter(range(len(_param_copies(opt_state, params))))
+
+    def each(node):
+        return replaced(next(counted), node) if jax.tree.structure(node) == shape else node
+    return jax.tree.map(each, opt_state, is_leaf=lambda node: jax.tree.structure(node) == shape)
+
+
+def _nested(path: tuple[str, ...], subtree) -> Variables:
+    """`subtree` under `path`."""
+    for name in reversed(path):
+        subtree = {name: subtree}
+    return subtree
+
+
+def _at(tree, path: tuple[str, ...]):
+    """`tree`'s subtree at `path`."""
+    for name in path:
+        tree = tree[name]
+    return tree
+
+
+def _stage_runs(params: Variables, path: tuple[str, ...] = ()) -> list[tuple[str, ...]]:
+    """The paths of the runs a one-stage scanned state holds stacked (`dew.training.stages`), whether
+    whole or by position of a repeated period: each under a `stages` subtree whose leaves lead with a stage
+    axis of one."""
+    found = []
+    for name, child in params.items():
+        if not isinstance(child, Mapping):
+            continue
+        if name == "stages" and all(np.shape(leaf)[:1] == (1,) for leaf in jax.tree.leaves(child)):
+            found += [(*path, name, run) for run in child]
+        else:
+            found += _stage_runs(child, (*path, name))
+    return found
+
+
+def _state_path(path: tuple[str, ...]) -> tuple[str, ...]:
+    """A scanned run's path in a one-stage state (`_stage_runs`) from its module's path in the model."""
+    return (*path[:-1], "stages", path[-1])
+
+
+@struct.dataclass
+class Applied:
+    """What the runs that updated in their backward (`dew.nn.in_backward`) leave for a step's commit:
+    their new parameters (the masters where the step keeps narrow copies) and the new copies of them in
+    the optimizer's state (`_param_copies`), each a tree of the runs alone under their paths, and their
+    gradients' sum of squares and non-finite count, which the step's norm and finiteness read."""
+
+    params: Variables
+    moments: tuple[Variables, ...]
+    sumsq: jax.Array
+    nonfinite: jax.Array
+
+    def onto(self, state: TrainState) -> TrainState:
+        """`state` with the runs' new parameters and moments in place of theirs."""
+        params = state.variables["params"]
+        opt_state = _with_copies(state.opt_state, params,
+                                 lambda index, copy: merge(copy, self.moments[index]))
+        return dataclasses.replace(state, variables={**state.variables, "params": merge(params, self.params)},
+                                   opt_state=opt_state)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Planned:
+    """A step's plan for the runs that update in their backward (`Transaction.planned`) and the collections
+    it adds to what the forward reads: the optimizer's copies of the parameters, the masters where the step
+    keeps narrow copies, and each run's norms (`dew.nn.in_backward`)."""
+
+    plan: in_backward.InBackward
+    read: dict[str, Variables]
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
@@ -441,6 +524,8 @@ class PendingAttempt(Generic[Loss]):
     qk: Variables | None
     candidate: Accumulation | None
     gradient: Variables
+    applied: Applied | None = None
+    """What the runs that updated in their backward leave for the commit (`Transaction.planned`)."""
 
 
 _GROUPS: contextvars.ContextVar[tuple[int, int | jax.Array] | None] = contextvars.ContextVar(
@@ -783,7 +868,7 @@ class Transaction:
                              "a run bounded in examples that no plan counts ahead keeps")
         return jnp.asarray(current.consumed, jnp.float32) / self.bound
 
-    def commit(self, current, gradient, effects, qk, statistics):
+    def commit(self, current, gradient, effects, qk, statistics, applied: Applied | None = None):
         """Apply the pooled native gradient and return its finiteness and global norm. An optimizer that
         reads more than the gradient is handed the update's pooled loss `statistics` (a Gauss-Newton
         update's system, `dew.gauss_newton`) and attention logit maxima (`qk`).
@@ -814,6 +899,11 @@ class Transaction:
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)
         norm = norm.astype(at_least_fp32(norm.dtype))
+        if applied is not None:
+            # The runs that updated in their backward hold no gradient here (zeros where theirs would be):
+            # their norm and finiteness come from the backward that read them (`Applied`).
+            native_finite = native_finite & (applied.nonfinite == 0)
+            norm = jnp.sqrt(jnp.square(norm) + applied.sumsq.astype(norm.dtype))
 
         def apply(current):
             # The update applies to the parameters the model's constraint projects
@@ -826,6 +916,11 @@ class Transaction:
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
                 stepped(stored, update, current.opt_state, opt_state), updated=True)}
+            if applied is not None:
+                # The runs that updated in their backward take what their backward wrote, and the update's
+                # own of them, read by nothing, is never computed.
+                moved = applied.onto(dataclasses.replace(current, variables=params, opt_state=opt_state))
+                params, opt_state = moved.variables, moved.opt_state
             done = update_applied(current.opt_state, opt_state)
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
@@ -895,9 +990,11 @@ class Transaction:
         accepted = jnp.asarray(a=True) if scale is None else finite
         numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
+        # Runs that updated in their backward wrote it only where the step commits (`in_backward.gated`).
+        numerical = numerical if pending.applied is None else pending.applied.onto(numerical)
 
         def commit(current):
-            return self.commit(current, gradient, effects, qk, pending.pooled)
+            return self.commit(current, gradient, effects, qk, pending.pooled, pending.applied)
 
         def recopied(current):
             # A window of several microbatches reads one set of copies
@@ -984,6 +1081,122 @@ class Transaction:
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted))
 
+    def planned(self, state: TrainState) -> _Planned | None:
+        """The plan by which the runs a one-stage scanned state holds stacked update in their backward
+        (`dew.nn.in_backward`), where the step reads each gradient where it is made into the update
+        (`consumed_where_made`), a window of one microbatch read whole, with no post-step effect, sampled
+        summary, QK-Clip, held update, adapter (a frozen base) or projection of its parameters; None
+        elsewhere. A run the model cannot update so (a routed or adapted one) runs as before."""
+        if self.size != 1 or self.split != 1 or self.inspection is not None:
+            return None
+        if self.aux_shape.effects is not None or FROZEN in state.variables:
+            return None
+        if holds_back(state.opt_state) or clips_qk(state.opt_state):
+            return None
+        if not consumed_where_made(self.optimizer, state, 1, shared=self.shared,
+                                   progressed=self.bound is not None):
+            return None
+        params = state.variables["params"]
+        runs = _stage_runs(params)
+        if not runs or self.objective.projected(params, updated=True) is not params:
+            return None
+        copies = _param_copies(state.opt_state, params)
+        names = tuple(f"{in_backward.MOMENTS}_{index}" for index in range(len(copies)))
+        progress = None if self.bound is None else self.progress(state)
+
+        def update(path, index, gradient, weights, moments):
+            # One layer of the run as the step's update reads it: its tree under the run's path with the
+            # stage and layer axes of one, so every rule of the update by path reads it as its whole.
+            where = _state_path(path)
+
+            def layer(tree):
+                return _nested(where, jax.tree.map(lambda leaf: leaf[None, None], tree))
+
+            def unlayer(tree):
+                return jax.tree.map(lambda leaf: leaf[0, 0], _at(tree, where))
+
+            held = layer(weights)
+            before = _with_copies(state.opt_state, params, lambda index, _: layer(moments[names[index]]))
+            descent = layer(jax.tree.map(_descending, gradient, weights))
+            moved, after = optimizer_update(self.optimizer, descent, before, held, progress=progress)
+            copied = zip(names, _param_copies(after, held), strict=True)
+            return (unlayer(stepped(held, moved, before, after)),
+                    {name: unlayer(copy) for name, copy in copied})
+
+        norms = {}
+        for path in runs:
+            run = _at(params, path)
+            count = jax.tree.leaves(run)[0].shape[1]
+            zeros = jnp.zeros((1, count), jnp.float32)
+            held = {"sumsq": zeros, "nonfinite": zeros}
+            periodic = all(str(key).startswith("layers_") for key in run)
+            norms = merge(norms, _nested(path, {in_backward.PERIOD_NORMS: held} if periodic else held))
+        read = {**dict(zip(names, copies, strict=True)), in_backward.NORMS: norms}
+        if state.compute is not None:
+            read[in_backward.MASTERS] = params
+        return _Planned(in_backward.InBackward(update=update, moments=names), read)
+
+    def realize_planned(self, planned: _Planned) -> Callable[[Variables, Batch, Step], Realization]:
+        """`realize`, differentiating the collections `planned` adds beside the parameters, whose
+        cotangents are what the runs that update in their backward leave (`split_planned`)."""
+        def realize(variables, batch, step_info):
+            def loss(trainable):
+                return self.objective._loss({**variables, **trainable}, batch, step_info)
+            stats, back, aux = jax.vjp(loss, {"params": variables["params"], **planned.read}, has_aux=True)
+            return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
+        return realize
+
+    @staticmethod
+    def split_planned(planned: _Planned, cotangents, masters: bool) -> tuple[Variables, Applied | None]:
+        """The step's gradient and what the runs that updated in their backward left (`Applied`), from the
+        cotangents of `realize_planned`: those runs' gradient zeros, their new state read off the
+        cotangents of the parameters (or their `masters`) and moments."""
+        gradient = cotangents["params"]
+        handled = [_state_path(path) for path in planned.plan.handled]
+        if not handled:
+            return gradient, None
+        source = cotangents[in_backward.MASTERS] if masters else gradient
+        norms = cotangents[in_backward.NORMS]
+        applied = Applied(
+            params=functools.reduce(merge, [_nested(path, _at(source, path)) for path in handled], {}),
+            moments=tuple(functools.reduce(merge, [_nested(path, _at(cotangents[name], path))
+                                                   for path in handled], {})
+                          for name in planned.plan.moments),
+            sumsq=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["sumsq"]) for path in handled),
+                      jnp.zeros((), jnp.float32)),
+            nonfinite=sum((jnp.sum(in_backward.norms_of(_at(norms, path))["nonfinite"]) for path in handled),
+                          jnp.zeros((), jnp.float32)))
+        zeros = functools.reduce(merge, [_nested(path, jax.tree.map(jnp.zeros_like, _at(gradient, path)))
+                                         for path in handled], {})
+        return merge(gradient, zeros), applied
+
+    def _realized_in(self, state: TrainState, realize, read, batch, step_info, factor, *,
+                     host: bool) -> tuple[Realization, _Planned | None]:
+        """The microbatch realized, inside the plan by which its runs update in their backward where the
+        step has one (`planned`; not a host step's, one that summarizes its cotangents, nor one realized
+        otherwise), and that plan."""
+        watching = step_info.watched is not None and bool(step_info.watched.cotangents)
+        planned = None if host or watching or realize != self.realize else self.planned(state)
+        if planned is None:
+            return self._realized(realize, read, batch, step_info, factor), None
+        with in_backward.planned(planned.plan):
+            return self._realized(self.realize_planned(planned), read, batch, step_info, factor), planned
+
+    def _pulled(self, realized: Realization, cotangent, planned: _Planned | None, *, whole: bool,
+                masters: bool) -> tuple[Variables, Variables | None, Applied | None]:
+        """The microbatch's gradient, its probes' where it summarizes them from the same backward (`whole`),
+        and what its runs that updated in their backward left (`split_planned`), whose backward reads
+        whether the step commits (`dew.nn.in_backward.gated`), known once its forward is."""
+        if planned is not None:
+            _, active = self.objective.reduce_loss(realized.stats)
+            with in_backward.gated(active):
+                gradient, applied = self.split_planned(planned, realized.pullback(cotangent), masters)
+            return gradient, None, applied
+        if realized.probed is None or not whole:
+            return realized.pullback(cotangent), None, None
+        gradient, probed = realized.probed(cotangent)
+        return gradient, probed, None
+
     def _realized(self, realize, read, batch, step_info, factor):
         """The attempt `realize`d unscaled by `factor`, refused where its loss weighs a router it trains by a
         fixed weight that no term of it reaches (`refuse_fixed_routers`)."""
@@ -1025,14 +1238,16 @@ class Transaction:
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             # A watched cotangent is read unscaled by the factor its backward is seeded with.
             read = self.read(state.variables, state.compute)
-            realized = self._realized(realize, read, batch, step_info, factor)
+            # The runs a one-stage scanned state holds update in their backward where the step's update
+            # reads each gradient alone (`planned`); a host step, or one realized otherwise, as before.
+            realized, planned = self._realized_in(state, realize, read, batch, step_info, factor, host=host)
             loss, cotangent = reduce(realized.stats, factor)
             # A step that summarizes its cotangents takes its probes' gradient from the same backward where
             # the microbatch is its update's whole window; otherwise from the pooled loss's, below.
             probing = realized.probed
             whole = probing is not None and self.size == 1
-            gradient, probed = (realized.pullback(cotangent), None) if probing is None or not whole else (
-                probing(cotangent))
+            gradient, probed, applied = self._pulled(realized, cotangent, planned, whole=whole,
+                                                     masters=state.compute is not None)
             if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
             # Otherwise no loss scale divides it (`Trainer._narrow_copies`),
@@ -1042,6 +1257,7 @@ class Transaction:
             # A run whose stream ends inside the window closes it at the step's last part (`closes`).
             closing = None if closes is None else jnp.logical_and(closes, part == self.split - 1)
             pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing)
+            pending = pending.replace(applied=applied)
             if probing is not None and not whole:
                 # The probes summarize the cotangent of the update's loss, the window's pooled one, as replay
                 # differentiates it (`pooled_cotangent`), whatever microbatches the plan splits it into.
