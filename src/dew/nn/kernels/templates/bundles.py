@@ -42,20 +42,24 @@ def of(generation_name: str, dtype, *, stated: bool = False, tpu: bool = False) 
     device whose blocks move by TMA (`generation.Architecture.tma`, consumer Blackwell's) through TMA rings
     (`MmaFed`). tcgen05's (`mosaic_sm100.RINGS`) is a launch's where it states its tiles' accumulators
     (`stated`, `Transport.persist`'s `accumulators`), which that bundle allocates in tensor memory: the GEMM
-    template's; a launch that does not runs none there. A TPU core's (`mosaic_tpu.MXU`) is a launch's
-    written wholly against the family's seams (`tpu`, the module's account); a launch that is not runs none
-    there."""
+    template's; a launch that does not takes the next family the device issues (`generation.issuers`):
+    mma.sync on TMA rings, a datacenter Blackwell's recurrence and attention until tcgen05's bundle is given.
+    A TPU core's (`mosaic_tpu.MXU`) is a launch's written wholly against the family's seams (`tpu`, the
+    module's account); a launch that is not runs none there."""
     architecture = generation.architecture(generation_name)
     if architecture is not None and architecture.family == "tpu":
         return mosaic_tpu.MXU if tpu else None
     if architecture is None or generation.capability(generation_name) is None:
         return None
-    if architecture.family == mosaic_sm90.WGMMA.name:
-        return mosaic_sm90.WGMMA
-    if architecture.family == mosaic_sm80.Mma.name:
-        return _mma(architecture, dtype)
     if architecture.family == mosaic_sm100.RINGS.name and stated:
         return mosaic_sm100.RINGS
+    # The first family the device issues that has a bundle here: its own, or mma.sync beside it (a datacenter
+    # Blackwell's launch that states no accumulators, on mma.sync's TMA rings until tcgen05's is given).
+    for family in generation.issuers(generation_name):
+        if family == mosaic_sm90.WGMMA.name:
+            return mosaic_sm90.WGMMA
+        if family == mosaic_sm80.Mma.name:
+            return _mma(architecture, dtype)
     return None
 
 
