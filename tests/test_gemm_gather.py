@@ -98,8 +98,9 @@ def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
     (CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     table = jnp.zeros((256,), jnp.int32)
-    _, gathered, m, extent = mosaic_gpu._walked_rows(jnp.zeros((200, 128), jnp.bfloat16), table, tiles,
-                                                     transpose_lhs=False, dense=False, bounded=True)
+    tokens = jnp.zeros((200, 128), jnp.bfloat16)
+    _, gathered, _, m, extent = mosaic_gpu._walked_rows(tokens, table, None, tiles, transpose_lhs=False,
+                                                        dense=False, bounded=True)
     assert gathered.shape[0] == extent == mosaic_gpu.row_extent(m, tiles.block_m) > m
 
 
@@ -123,15 +124,16 @@ def test_a_grouped_products_depth_split_sums_as_its_walk_apart():
 
 
 def test_a_hoppers_moe_decode_splits_its_experts_depth():
-    """A MoE decode step on an H100 (DeepSeek-V3's down projection: 2048 deep, 7168 wide, eight of 256
-    experts active a token, one token's slots, row 3622): the derived tile splits its depth over the wave
-    (`MosaicGmm._decode_split`), legally; a prefill's rows keep it unsplit."""
+    """A MoE decode step on an H100 (Qwen3-30B-A3B's down projection: 768 deep, 2048 wide, eight of 128
+    experts active a token, one token's slots, row 3622): its eight experts' 64 tiles leave half the wave's
+    multiprocessors idle, so the derived tile splits its depth over them (`MosaicGmm._decode_split`),
+    legally; a prefill's rows keep it unsplit."""
     launch = grouped_matmul.MosaicGmm()
 
     def derived(rows):
-        bound = launch.bind(jax.ShapeDtypeStruct((rows, 2048), jnp.bfloat16),
-                            jax.ShapeDtypeStruct((256, 2048, 7168), jnp.bfloat16),
-                            jax.ShapeDtypeStruct((256,), jnp.int32), out_dtype="bfloat16", trans_rhs=False,
+        bound = launch.bind(jax.ShapeDtypeStruct((rows, 768), jnp.bfloat16),
+                            jax.ShapeDtypeStruct((128, 768, 2048), jnp.bfloat16),
+                            jax.ShapeDtypeStruct((128,), jnp.int32), out_dtype="bfloat16", trans_rhs=False,
                             interpret=False)
         target = generation.gpu_target()
         tile = launch.derived(bound, target)

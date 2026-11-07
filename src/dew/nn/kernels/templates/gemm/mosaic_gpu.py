@@ -1907,7 +1907,7 @@ def handoff_steps(tiles: Tiles, target) -> float:
 
 def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
                 multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
-                launch_seconds: float | None) -> int:
+                launch_seconds: float | None, partial_rows: int | None = None) -> int:
     """Dew: the slices a contraction of `rows` splits into at `tiles` (`Tiles.splits`: a kernel gradient's,
     `tgmm`, and a swapped decode product's, `gmm`), from the call's extents and the device's facts. Over a
     wave (`multiprocessors` x `tiles.programs`) and `rows` in steps a group (on average), the busiest program
@@ -1915,8 +1915,10 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
     shares of the operands (`rows` of `depth` and of `width` at `itemsizes` bytes, each read once) at its
     share of `bandwidth` (that of the multiprocessors the programs keep busy, over the programs in flight);
     the walk takes the longer of the two. A split adds the time its fp32 partials take written and read back
-    (2s + 1 passes over the output at `bandwidth`, in steps of `step_seconds`) and the launch their sum adds
-    (`launch_seconds`, the part's measured launch in a program, row 3613; none where unmeasured). The split
+    (2s + 1 passes over the output, `partial_rows` of it where they hold fewer than its `groups` x
+    `depth`: a decode step's experts' few rows, at `bandwidth`, in steps of `step_seconds`) and the launch
+    their sum adds (`launch_seconds`, the part's measured launch in a program, row 3613; none where
+    unmeasured). The split
     is the s of the shortest walk, the least of equal ones, each slice keeping at least the ring's stages and
     one more on average and some steps (`split_runs`, as `gmm`'s runs share them); one where the device
     states no rate or the call no whole tile. A bounded comparison over the facts, no table, no timing:
@@ -1939,7 +1941,8 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
         rate = bandwidth * min(programs, multiprocessors) / multiprocessors / min(programs, wave)
         streamed = waves * operand_bytes / programs / rate / step_seconds
         passes = 0 if splits == 1 else 2 * splits + 1
-        partials = passes * groups * depth * width * 4 / bandwidth / step_seconds
+        held = groups * depth if partial_rows is None else partial_rows
+        partials = passes * held * width * 4 / bandwidth / step_seconds
         # A split runs its partials' launch and XLA's sum of them where the unsplit call runs one launch.
         launches = 0 if splits == 1 or launch_seconds is None else launch_seconds / step_seconds
         return max(busiest, streamed) + partials + launches

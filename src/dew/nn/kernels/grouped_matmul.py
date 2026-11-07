@@ -1052,8 +1052,11 @@ class MosaicGmm(_Mosaic):
             return tile
         _, depth, width = self._generated_extents(ba)
         assert depth is not None, "a product's steps run over its depth"
+        # A decode step's rows bound its active experts, each one row tile, and its partials hold its rows.
+        active = min(groups, tokens.shape[0])
         splits = mosaic_gpu.split_count(
-            tile, groups=groups, rows=depth, depth=tile.block_m, width=width,
+            tile, groups=active, rows=depth * active, depth=tile.block_m, width=width,
+            partial_rows=-(-tokens.shape[0] // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
             itemsizes=(tokens.dtype.itemsize, kernel.dtype.itemsize),
             multiprocessors=_multiprocessors(target), step_seconds=mosaic_gpu.step_seconds(tile, target),
             bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)

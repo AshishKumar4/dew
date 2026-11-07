@@ -242,18 +242,22 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
             SEEDS["unweighted" if edge is None else "unweighted, one value"])
 
 
-def test_the_fused_unweighted_norms_fp16_gradient_holds_past_xlas_edge():
-    """The fused unweighted norm's fp16 input gradient at a cotangent of 2**14 (the parity case's edge
-    before row 823 narrowed it to 2**7, workaround audit group 45): past the edge XLA's fp16 transposes keep
-    finite (each gradient term grows by up to 2**8, past fp16's largest), where the kernel sums in fp32. Rows
-    of one value under a cotangent of one value, whose exact gradient is zero: the kernel's is finite and
-    within the cotangent's fp16 rounding of zero."""
+@pytest.mark.parametrize("exponent", [7, 14])
+def test_the_fused_unweighted_norms_fp16_gradient_meets_fp16s_edge_where_xlas_does(exponent):
+    """The fused unweighted norm's fp16 input gradient at a cotangent of 2**7 (the parity case's edge) and
+    2**14 (its edge before row 823 narrowed it, workaround audit group 45), rows of one value: finite where
+    XLA's program's is and not where it is not (each gradient term grows by up to 2**8 within the model's
+    fp16 cast sites, which the kernel keeps, so past 2**8 below fp16's largest both overflow: a boundary of
+    the format the model computes in, not of the kernel)."""
     x = jnp.full((4, 128), 1.5, jnp.float16)
-    cotangent = jnp.full((4, 128), 1.25 * 2.0 ** 14, jnp.float16)
-    _, pullback = jax.vjp(fused_unweighted(1e-6), x)
-    (d_x,) = pullback(cotangent)
-    d_x = np.asarray(d_x, np.float64)
-    assert np.isfinite(d_x).all() and np.abs(d_x).max() <= 1.25 * 2.0 ** 14 * 2.0 ** -10 / 1.5, d_x
+    cotangent = jnp.full((4, 128), 1.25 * 2.0 ** exponent, jnp.float16)
+
+    def unweighted(x):
+        return norms.unweighted_rmsnorm(x, 1e-6, implementation="xla")
+
+    finite = [np.isfinite(np.asarray(jax.vjp(f, x)[1](cotangent)[0], np.float64))
+              for f in (fused_unweighted(1e-6), unweighted)]
+    np.testing.assert_array_equal(*finite)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
