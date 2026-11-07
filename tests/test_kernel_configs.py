@@ -995,6 +995,40 @@ def test_a_hoppers_gathered_projection_runs_the_template_producers_gather():
     _assert_launches("sm90", "gathered projection", _gathered_projection, 4, "dew_gmm")
 
 
+def test_a_b200s_gathered_projection_runs_the_template_load_warps_gathers():
+    """A paired expert projection of gathered rows on a compile-only B200 (row 1376): its program launches the
+    template's grouped product on tcgen05's bundle, whose load warp gathers each step's rows by TMA's
+    four-row gathers (`gathered.Committed`), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm100", "gathered projection", _gathered_projection, 4, "dew_gmm")
+
+
+def _gathered_projection_gradient():
+    """The reverse pass of an expert projection of gathered rows whose rows land at their slots (`gemm.gemm`'s
+    `gather` and `scatter`: Qwen3-30B-A3B's 2048-deep, 768-wide experts, eight, 1024 tokens of top-2 slots),
+    its kernel gradient reading the tokens and the cotangent where they lie (`gemm_t`'s `gather`)."""
+    from dew.nn.kernels import gemm
+
+    sizes = jnp.full((8,), 256, jnp.int32)
+
+    def gradient(tokens, table, slots, matrices, cotangent):
+        def product(tokens, matrices):
+            return gemm.gemm(tokens, matrices, sizes, out_dtype=jnp.bfloat16, gather=table, scatter=slots)
+
+        return jax.vjp(product, tokens, matrices)[1](cotangent)
+
+    return gradient, (jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
+                      *(jax.ShapeDtypeStruct((2048,), jnp.int32),) * 2,
+                      jax.ShapeDtypeStruct((8, 2048, 768), jnp.bfloat16),
+                      jax.ShapeDtypeStruct((2048, 768), jnp.bfloat16))
+
+
+def test_a_hoppers_gathered_projections_reverse_pass_reads_its_rows_where_they_lie():
+    """The reverse pass of a gathered, scattered expert projection on a compile-only H100 (row 1376): its
+    program launches the template's kernel gradient, whose producer gathers each step's token rows and
+    cotangent rows by cp.async (`gathered.Ring`), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm90", "gathered projection gradient", _gathered_projection_gradient, 5, "dew_tgmm")
+
+
 def _blockwise_gradient():
     """A blockwise-scaled FP8 MoE projection's kernel gradient (`gemm.blockwise_fp8_kernel_gradient`: 2048
     deep, 768 wide, eight experts of 4 to 12 whole 128-row blocks) through the template named."""
@@ -1313,7 +1347,9 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     compute what their own programs do, as those compiled one after another do, on inputs that tell the
     programs apart: those lowered in distinct MLIR contexts (here, each on a thread of its own, as JAX lowers
     a thread's programs in one) and those sharing one alike, whose compiles JAX's cache key reads without
-    writing their context from 0.12.0.1.post54; each program compiled once (`Compiles`' events)."""
+    writing their context from 0.12.0.1.post54; each program compiled once (`Compiles`' events). Each
+    executable's output is bitwise its own program's compiled by JAX (`Lowered.compile`): one module, one
+    compiler, one executable's arithmetic."""
     import threading
 
     from dew.nn.kernels.templates import report
@@ -1333,13 +1369,18 @@ def test_programs_compiled_at_once_are_the_ones_compiled_in_turn():
     shared = [jax.jit(function).lower(square, square) for function in functions]
     keys = jax.random.split(jax.random.key(11))
     x, y = (jax.random.normal(key, (256, 256), jnp.float32) for key in keys)
-    expected = [np.asarray(function(x, y)) for function in functions]
+    ran = []
     for lowerings in (apart, shared):
         with Compiles(None) as compiles:
             together = report.compiled_at_once([(lowered, None, lambda lowered=lowered: lowered)
                                                 for lowered in lowerings])
         assert len([program for program in compiles.programs if program.kind == "compiled"]) == len(functions)
         alone = [report.compiled(lowered, relower=lambda lowered=lowered: lowered) for lowered in lowerings]
-        for executables in (together, alone):
-            for executable, want in zip(executables, expected, strict=True):
-                np.testing.assert_allclose(np.asarray(executable(x, y)), want, rtol=1e-6, atol=1e-6)
+        ran.append((lowerings, [[np.asarray(executable(x, y)) for executable in executables]
+                                for executables in (together, alone)]))
+    # JAX's own compiles after every counted one, none of them a cache entry those read.
+    for lowerings, outputs in ran:
+        expected = [np.asarray(lowered.compile()(x, y)) for lowered in lowerings]
+        for got in outputs:
+            for value, want in zip(got, expected, strict=True):
+                np.testing.assert_array_equal(value, want)
