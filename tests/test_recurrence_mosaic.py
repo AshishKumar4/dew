@@ -184,8 +184,8 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
     (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
     hooks', its numbers the run's fast forms' where they are its forms (`rounded`, as its route resolves
-    it: a rated scan's mamba_ssm's, `recurrence_chunk.fast_rounding`, else the delta rule's and an fp32
-    call's two parts, `recurrence_chunk.chunk_rounding`)."""
+    it: a rated scan's mamba_ssm's, `recurrence_chunk.fast_rounding`, else the delta rule's alone,
+    `recurrence_chunk.chunk_rounding`)."""
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
@@ -711,20 +711,24 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
     final memory on par with the recurrence a token at a time's from float64 over the site's declared draws
     (check 1), as test_recurrence_chunk holds the portable math; a call the template refuses (a launch's
     registers past a thread's) is checked refused, its arithmetic the forward check's (`on_the_mainloop`).
-    The draws are fp32, whose products the accurate forms take in three bf16 parts, an fp32 product's
-    accuracy, as the fp32 recurrence's; under the fast forms an fp32 call's are two (`mainloop.FAST_PARTS`),
-    held to recorded fla-core instead (`the_mosaic_forward_is_as_exact_as_its_reference`): run under the
-    fast forms, the run's default since 82e5eabd30, this check put the template 42 to 83 times the fp32
-    recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
+    The draws are fp32: a form whose bar is the portable math (no delta rule, no rated decay) runs under the
+    run's own forms, its products in three bf16 parts under the fast forms too
+    (`recurrence_chunk.chunk_rounding`; in two, row 184's write gate cell was 30 to 69 times the portable
+    math's distance on every leaf, the forward of hooks7, hooks12 and hooks26 57 to 77 times); a form with
+    a port (the delta rule's fla, the rated scan's mamba_ssm) under the accurate forms, its fast forms' two
+    parts (`mainloop.FAST_PARTS`) held to the recorded port instead
+    (`the_mosaic_forward_is_as_exact_as_its_reference`): there they put the template 42 to 83 times the
+    fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
+    forms = 'accurate' if hooks.delta or hooks.rated else generation.numerics().forms
     (sample,) = hooked_draw(hooks, packed, 0)
-    if not formed('accurate', taken)(sample, hooks):
+    if not formed(forms, taken)(sample, hooks):
         with pytest.raises(REFUSED):
-            formed('accurate', jax.eval_shape)(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
+            formed(forms, jax.eval_shape)(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
         return
-    dew = jax.jit(formed('accurate', functools.partial(chunk_on, 'mosaic_gpu', hooks)))
+    dew = jax.jit(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
-                    f'the mosaic forward, {hooks} packed={packed} under the accurate forms',
+                    f'the mosaic forward, {hooks} packed={packed} under the {forms} forms',
                     seeds=HOOK_SEEDS[hooks, packed])
 
 
