@@ -158,9 +158,12 @@ def scattered_rows(smem, out: mosaic.Scattered, row_start, first, stored, column
                 dest[pl.ds(token, 1), :] = smem[pl.ds(row, 1), :]
         return
     scalar = plgpu.Layout.WG_SPLAT(())
-    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), plgpu.RefType(), scalar, scalar))(
-        lambda ctx, *refs: _scattered_pieces(*refs[:3], splat_value(refs[3]), splat_value(refs[4])))(
-            smem, table, dest, jnp.asarray(first, jnp.int32), jnp.asarray(stored, jnp.int32))
+    def pieces(ctx, smem_ref, table_ref, dest_ref, first_value, stored_value):
+        del ctx
+        _scattered_pieces(smem_ref, table_ref, dest_ref, splat_value(first_value), splat_value(stored_value))
+
+    plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.RefType(), plgpu.RefType(), scalar, scalar))(pieces)(
+        smem, table, dest, jnp.asarray(first, jnp.int32), jnp.asarray(stored, jnp.int32))
 
 
 def _scattered_pieces(smem, table, dest, first, stored) -> None:
