@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import across, mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -146,7 +146,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
     contraction, its blocks staged at `mosaic.swizzle_for`'s 64 bytes), and their sums meet before one
-    store each, twice in one scope reused (`mosaic.summed_across`), in a scope after the rings'
+    store each, twice in one scope reused (`across.summed_across`), in a scope after the rings'
     (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`)."""
     from dew.nn.kernels.templates import mosaic_sm90
     family, share = mosaic_sm90.FED, FED_ROWS // consumers
@@ -179,10 +179,10 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
 
         def total(**scratch):
             for value, out in ((summed, out_gmem), (summed * 2, doubled_gmem)):
-                mosaic.summed_across(value, scratch, wg, consumers,
+                across.summed_across(value, scratch, wg, consumers,
                                      lambda value, out=out: out.__setitem__(slice(None), value))
 
-        pl.run_scoped(total, **mosaic.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
+        pl.run_scoped(total, **across.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32)
     return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=consumers,
