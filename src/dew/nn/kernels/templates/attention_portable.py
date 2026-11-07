@@ -11,7 +11,12 @@ from typing import Literal, overload
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, axes
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_gradient as gradient,
+    attention_program,
+    axes,
+)
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -35,9 +40,6 @@ from dew.nn.kernels.templates.attention import (
     shared_place,
     within,
 )
-from dew.nn.kernels.templates.attention_program import dkv_sums, dq_sums, off_anchor_pass
-from dew.nn.kernels.templates.attention_program import finished as program_finished
-from dew.nn.kernels.templates.attention_program import walk as program_walk
 
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
@@ -143,14 +145,15 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows
             # shifting (`algebra.walked`).
             tiles_of = _composed(functools.partial(keys_at, form), tile_of)
-            return program_walk(form, lo, hi, tiles_of, anchor_rows, resumed, block_q, value_width, live=live,
-                                training=residuals, dropping=drop is not None)
+            return attention_program.walk(form, lo, hi, tiles_of, anchor_rows, resumed, block_q, value_width,
+                                          live=live, training=residuals, dropping=drop is not None)
 
         def finished(form: algebra.Forward, carry):
             # A walk's outputs in `form` (`attention_program.finished`), as the Triton mainloop's.
-            out, *kept = program_finished(form, carry, _composed(functools.partial(keys_at, form), tile_of),
-                                          anchor_rows, (lo, hi), resumed, training=residuals,
-                                          output_mod=output_mod, output_params=out_params)
+            tiles_of = _composed(functools.partial(keys_at, form), tile_of)
+            out, *kept = attention_program.finished(form, carry, tiles_of, anchor_rows, (lo, hi), resumed,
+                                                    training=residuals, output_mod=output_mod,
+                                                    output_params=out_params)
             return (out.astype(query.dtype), *kept) if residuals else out.astype(query.dtype)
 
         # A training walk's weighted values are its split sums joined, where they overflow.
@@ -354,8 +357,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                     columns, _, _, v_tile, logits, _ = formed(j)
                     return columns[None, :], logits, v_tile
 
-                walked = off_anchor_pass(lo, hi, weighed, before, maxima, chosen, shifts, how,
-                                         interpreted_dot)
+                walked = attention_program.off_anchor_pass(lo, hi, weighed, before, maxima, chosen, shifts,
+                                                           how, interpreted_dot)
                 first = gradient.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
                                                  key_index[row, head, rows], shifts)
                 kept = shifts < 0
@@ -368,11 +371,11 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             columns, seen, k_tile, v_tile, logits, slopes = formed(j, slopes=True)
             return columns[None, :], seen, k_tile, v_tile, logits, slopes
 
-        found = dq_sums(weighed, q, do, m, anchor, delta, prior, lo, hi, chosen,
-                        None if draw is None else functools.partial(draw, q_pos),
-                        hooked=score_mod is not None, score_kinds=score_kinds, summed=summed,
-                        prescale=prescale, grad_scale=grad_scale, how=how, accurate=accurate,
-                        dot=interpreted_dot)
+        found = attention_program.dq_sums(
+            weighed, q, do, m, anchor, delta, prior, lo, hi, chosen,
+            None if draw is None else functools.partial(draw, q_pos), hooked=score_mod is not None,
+            score_kinds=score_kinds, summed=summed, prescale=prescale, grad_scale=grad_scale, how=how,
+            accurate=accurate, dot=interpreted_dot)
         dq, delta, denominator, mass, grads = gradient.dq_finish(found, prior, state_total, peak0,
                                                                 (total0, mean0), m, anchor, delta,
                                                                 accurate=accurate)
@@ -468,11 +471,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         tiled = tuple(jnp.zeros((queries, block_k), jnp.float32) for kind in score_kinds if kind == Kind.TILE)
         hooks = (tiled, *(jnp.zeros((block_k,) if kind == Kind.KEY else (), jnp.float32)
                           for kind in score_kinds))
-        dk, dv, (tiled, *grads) = dkv_sums(formed, k_tile, v_tile, ranges.q_lo[row, j], ranges.q_hi[row, j],
-                                           pulled, hooks, hooked=score_mod is not None,
-                                           dropped=draw is not None, grad_scale=grad_scale, how=how,
-                                           accurate=accurate, score_kinds=score_kinds,
-                                           dot=interpreted_dot)
+        dk, dv, (tiled, *grads) = attention_program.dkv_sums(
+            formed, k_tile, v_tile, ranges.q_lo[row, j], ranges.q_hi[row, j], pulled, hooks,
+            hooked=score_mod is not None, dropped=draw is not None, grad_scale=grad_scale, how=how,
+            accurate=accurate, score_kinds=score_kinds, dot=interpreted_dot)
         keyed = iter(grad for grad, kind in zip(grads, score_kinds, strict=True) if kind == Kind.KEY)
         columns_of = iter(tiled)
         return dk, dv, tuple(next(keyed) if kind == Kind.KEY else next(columns_of)
