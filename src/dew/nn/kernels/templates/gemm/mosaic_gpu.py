@@ -449,10 +449,9 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     blocks = {'rows': (lhs_block, dtype), **matrix,
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **(_scale_blocks(block_m, block_n) if step_scaled else {}),
-              # An MX product's rows' and matrix's E8M0 scales, a step's tiles of each (`gmm`'s `mx_scales`).
-              **({'a_scales': ((block_m // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu),
-                  'b_scales': ((block_n // 128, block_k // 128, 32, 16), jnp.float8_e8m0fnu)}
-                 if block_scaled else {}),
+              # A block-scaled product's rows' and matrix's scales, a step's tiles of each (`gmm`'s
+              # `mx_scales`), four scales a tile's row (`block_format`).
+              **(_scale_tiles(block_m, block_n, block_k, dtype) if block_scaled else {}),
               **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
     sides = family.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
@@ -466,6 +465,26 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers'], decoded),
                        tuple((part, jnp.dtype(out)) for out in dtypes))
+
+
+def block_format(dtype) -> tuple[jnp.dtype, int]:
+    """Dew: a block-scaled product's scale dtype and the depths one scale covers, by its operands' `dtype`
+    (`gmm`'s `mx_scales`): NVFP4's (E2M1 operands) an E4M3 scale every 16 (tcgen05's `scale_vec::4X`,
+    `kind::mxf4nvf4`); MXFP8's (FP8 operands) an E8M0 scale every 32 (OCP MX, `scale_vec::1X`)."""
+    if jnp.dtype(dtype) == jnp.dtype(jnp.float4_e2m1fn):
+        return jnp.dtype(jnp.float8_e4m3fn), 16
+    return jnp.dtype(jnp.float8_e8m0fnu), 32
+
+
+def _scale_tiles(block_m: int, block_n: int, block_k: int, dtype) -> dict:
+    """Dew: a block-scaled step's scale streams (`gmm_allocations`'): its rows' and its matrix's columns'
+    scales in `tcgen05.scales_layout`'s tiles, `[128-row tiles, scale tiles, 32, 16]`, a tile four scales of
+    each of 128 rows, so a step of `block_k` depths takes `block_k` over four blocks' depths of them
+    (`block_format`)."""
+    scale, per = block_format(dtype)
+    depth_tiles = block_k // (4 * per)
+    return {'a_scales': ((block_m // 128, depth_tiles, 32, 16), scale),
+            'b_scales': ((block_n // 128, depth_tiles, 32, 16), scale)}
 
 
 def _scale_blocks(block_m: int, block_n: int) -> dict:
@@ -973,10 +992,11 @@ def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: 
 
 
 def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs: bool, plain: bool) -> None:
-    """Dew: `gmm`'s refusal of an MX product (`mx_scales`: the rows' and the matrices' E8M0 scales, one every
-    32 depths, tiled as `tcgen05.scales_layout` lays them out, `[rows / 128, depth / 128, 32, 16]` and
-    `[groups, width / 128, depth / 128, 32, 16]`; FP8 rows times a K-major FP8 matrix, each 32 depths of each
-    scaled in the products, `mosaic.Issuer.scaled_products`) it does not take: but on a family whose
+    """Dew: `gmm`'s refusal of a block-scaled product (`mx_scales`: the rows' and the matrices' scales, one
+    every block of depths, `block_format`'s, tiled as `tcgen05.scales_layout` lays them out, `[rows / 128,
+    scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`; FP8 or E2M1 rows times a K-major
+    matrix of theirs, each block of each scaled in the products, `mosaic.Issuer.scaled_products`) it does
+    not take: but on a family whose
     products take block scales, its matrix K-major, with no hook, pair, packed matrix, step scales,
     transposed rows, exact sums or split, its tile whole 128s of rows, columns and depth (the scales'
     tiles), each group's rows whole 128-row tiles (the caller's)."""
@@ -984,8 +1004,8 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
         return
     if not (family.takes_block_scales and transpose_rhs and plain and tiles.splits == 1
             and tiles.block_m % 128 == 0 and tiles.block_n % 128 == 0 and tiles.block_k % 128 == 0):
-        raise ValueError(f"an MX product runs on a family whose products take block scales ({family.name}'s "
-                         f"do not, or its call or {tiles} is not one it takes)")
+        raise ValueError(f"a block-scaled product runs on a family whose products take block scales "
+                         f"({family.name}'s do not, or its call or {tiles} is not one it takes)")
 
 
 def _outputs(o_gmems: tuple, tail, scatter_gmem, interpret: bool) -> tuple:
