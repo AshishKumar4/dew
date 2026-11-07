@@ -353,11 +353,11 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                                         anchor_rows, do, chosen, shifts)
             if not split:
                 # D without the forward's split sums: the dQ launch's own pass over the keys.
-                def weighed(j):
+                def logits_of(j):
                     columns, _, _, v_tile, logits, _ = formed(j)
                     return columns[None, :], logits, v_tile
 
-                walked = attention_program.off_anchor_pass(lo, hi, weighed, before, maxima, chosen, shifts,
+                walked = attention_program.off_anchor_pass(lo, hi, logits_of, before, maxima, chosen, shifts,
                                                            how, interpreted_dot)
                 first = gradient.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
                                                  key_index[row, head, rows], shifts)

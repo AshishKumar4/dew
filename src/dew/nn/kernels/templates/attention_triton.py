@@ -505,12 +505,12 @@ def _issued(a: jax.Array, b: jax.Array, *, interpret: bool) -> jax.Array:
     one narrowed by its parts, each scaled into the other's range and taken back after its product
     (`algebra.cotangent_product`: a cotangent past a 16-bit dtype's largest stays finite), as the hand steps
     narrowed theirs; the accurate form issues its parts, each of the other's dtype already."""
-    dot = functools.partial(kernel_dot, interpret=interpret)
-    if interpret:
+    def dot(x: jax.Array, y: jax.Array) -> jax.Array:
+        if not interpret:
+            return kernel_dot(x, y, interpret=False)
         # The CPU runs no 16-bit product into fp32 of a transposed tile (XLA's DotThunk, as the forms' rows
         # walk forms them): its operands taken to fp32, where 16-bit products are exact, summed in fp32.
-        def dot(x, y):
-            return interpreted_dot(x.astype(jnp.float32), y.astype(jnp.float32))
+        return interpreted_dot(x.astype(jnp.float32), y.astype(jnp.float32))
     if jnp.dtype(a.dtype).itemsize > jnp.dtype(b.dtype).itemsize:
         return algebra.cotangent_product(a, b, dot, accurate=False)
     return dot(a, b.astype(a.dtype))
