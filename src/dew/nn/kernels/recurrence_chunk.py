@@ -225,7 +225,9 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     scale = Dk ** -0.5 if scale is None else scale
     if query.shape[1] == 0:
         return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
-    rule = _portable_rule(chunk_size, delta, scale, jnp.dtype(dtype))
+    # The block's rung read as the call is traced: a scan differentiates its body's custom rules after
+    # the block's trace has left it (`recomputing`).
+    rule = _portable_rule(chunk_size, delta, scale, jnp.dtype(dtype), recomputed_memory())
     return rule(query, key, value, g, beta, state, starts)
 
 
@@ -310,11 +312,12 @@ def _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size):
     return grown, last, kept, (key, value, g, beta, reset)
 
 
-def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
-    """`_kept_residual`'s, or where the block's remat rung recomputes the delta rule's memory (`RECOMPUTED`,
-    'delta_memory') the operands alone, the backward computing the memory and what it derives again, as the
-    port and the template drop theirs: `(out, (kept, operands))`, one of them None."""
-    if recomputed_memory():
+def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype,
+                          recomputed: bool):
+    """`_kept_residual`'s, or where the block's remat rung recomputes the delta rule's memory (`recomputed`,
+    `recomputed_memory`) the operands alone, the backward computing the memory and what it derives again,
+    as the port and the template drop theirs: `(out, (kept, operands))`, one of them None."""
+    if recomputed:
         out = _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
         return out, (None, (query, key, value, g, beta, state, starts))
     out, kept = _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
@@ -439,15 +442,16 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
 
 
 @functools.cache
-def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype) -> Callable:
+def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype,
+                   recomputed: bool) -> Callable:
     """The portable rule over `(query, key, value, g, beta, state, starts)` differentiated at every order
     (`generation.linear_tangent`): reverse mode runs its reverse rule (`_chunk_delta_residual`,
-    `_chunk_delta_backward`), forward mode (`jax.jvp`, `jax.linearize`) the chunked math's own tangent,
-    in any context: a custom VJP alone refused a plain `jax.jvp` outside the attention's forward-mode
-    context (row 1834)."""
+    `_chunk_delta_backward`), keeping its memory or, `recomputed`, its operands alone; forward mode
+    (`jax.jvp`, `jax.linearize`) the chunked math's own tangent, in any context: a custom VJP alone
+    refused a plain `jax.jvp` outside the attention's forward-mode context (row 1834)."""
     def forward(query, key, value, g, beta, state, starts):
         return _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale,
-                                     dtype)
+                                     dtype, recomputed)
 
     def backward(saved, operands, cotangent):
         # Every operand's cotangent, as the portable rule's pullback gives them (`linear_tangent` checks the

@@ -848,6 +848,23 @@ class StackView:
         layers of it each stage runs; None where no run has that name."""
         return next(((layers, count) for run, layers, count in self._named_runs() if run == name), None)
 
+    def staged_layers(self, keys: Sequence[str]) -> tuple[list[str], int, int] | None:
+        """The stored layers a stage-local leaf stacks, in its rows' order, where `keys` are the names
+        below `stages` on its path: a run's inside name, and on one stage a periodic run's position after
+        it (`_stacked_positions`); how many of its leading dimensions stack them (`staged_shape`), and how
+        many of `keys` name the run. None where they name no run."""
+        if not keys:
+            return None
+        held = self.run_layers(keys[0])
+        if held is not None:
+            layers, count = held
+            return layers, len(self.staged_shape(count)), 1
+        for name, prefix, positions in self._periodic_runs():
+            offset = keys[1].removeprefix(prefix) if name == keys[0] and len(keys) > 1 else ''
+            if offset.isdigit() and int(offset) < len(positions):
+                return positions[int(offset)], 2, 2
+        return None
+
     @staticmethod
     def layer_structures(variables: Mapping[str, Mapping], layers: int) -> tuple[tuple, ...]:
         """What one scanned body has to share beyond its spec, for each of `layers`
