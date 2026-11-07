@@ -423,10 +423,12 @@ def _chunk(form: linear_scan.Form, held: tuple, h, entering, to_last, whole, bet
 
 
 def _plain(name: str, left, right):
-    """A chunk's products as the language's plain ones (`float32_matmul`), as the trace `carry.split`
-    derives from takes them (`_chunk`)."""
+    """A chunk's products as the language's plain ones, `dot_general`s, as the trace `carry.split` derives
+    from takes them (`_chunk`): the split's forms issue every product themselves (its roles), so this trace
+    states only which. `float32_matmul` here traced a float64 run's product inside a protected span the
+    language cannot read, and the split refused the state it read (Kimi Linear's float64 truth)."""
     del name
-    return float32_matmul(left, right)
+    return jnp.matmul(left, right)
 
 
 def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable,
