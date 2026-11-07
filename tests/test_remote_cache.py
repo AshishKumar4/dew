@@ -389,7 +389,6 @@ def test_a_bundle_holds_every_program_its_files_tests_compiled_however_they_ran(
                        ("escape", remote_cache.packed([("../jit_escape-1", b"x")]))):
         stored[f"/jax/cpu/bundles/tests/{name}.py"] = body
         fresh = remote_cache.RemoteCache(tmp_path / name, url, "token", "jax/cpu")
-        (tmp_path / name).mkdir()
         fresh.opened(f"tests/{name}.py")
         assert programs(tmp_path / name) == {} and fresh.programs_fetched == 0 and fresh.failures == 1
     assert not (tmp_path / "jit_escape-1-cache").exists()
