@@ -530,7 +530,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
                             else state.astype(work), *varying)
 
-    def walking(operands, h):
+    def walking_one(operands, h):
         # Each chunk's values that read no memory at once; the memory alone in sequence; then each chunk's
         # outputs from the memory entering it, at once. Each chunk's entering memory kept, the adjoint's one
         # checkpoint a chunk.
@@ -545,7 +545,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         carried, entering = jax.lax.scan(one, (decayed, h), prepared)
         return (jax.vmap(forms.mapped)(prepared, entering), carried[1]), entering[1]
 
-    def replayed(operands, h):
+    def replayed_one(operands, h):
         # The walk token by token (`Derived.replay`), the derivative's arithmetic at every order.
         def one(h, chunk):
             outputs, h = forms.replay(chunk, h)
@@ -554,28 +554,34 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         h, outputs = jax.lax.scan(one, h, operands)
         return outputs, h
 
-    def adjoint(entering, primals, cotangent, live):
+    def adjoint_one(operands, h, entering, d_outputs, d_final):
         # Each chunk's adjoint (`Derived.backward`) from the memory entering it, the chunks in reverse.
-        operands, _ = primals
-        d_outputs, d_final = cotangent
+        del h
 
         def one(d_h, chunk):
             chunk, h, d_out = chunk
             return forms.backward(chunk, (None, h), d_h, d_out)
 
         d_h, d_operands = jax.lax.scan(one, d_final, (operands, entering, d_outputs), reverse=True)
+        return d_operands, d_h
+
+    def each(function):
+        # Over every row and head at once: the derivative's rule outside the batch, which a second order
+        # transposes as one map.
+        return jax.vmap(jax.vmap(function))
+
+    def adjoint(entering, primals, cotangent, live):
+        operands, h = primals
+        d_operands, d_h = each(adjoint_one)(operands, h, entering, *cotangent)
         # A reset's booleans take no cotangent (never `live`), held in their place.
         whole = jax.tree.leaves(({**operands, **d_operands}, d_h))
         return tuple(whole[index] for index in live)
 
     # The forms' walk for the value, its derivative the token update's replayed per chunk (algebra.md §6.9).
-    walk = generation.linear_tangent(walking, adjoint, replayed, kind=Protected(), live_cotangents=True)
-
-    def walked(operands, h):
-        outputs, final = walk(operands, h)
-        return outputs.reshape(-1, columns), final
-
-    out, final = jax.vmap(jax.vmap(walked))(operands, entering)
+    walk = generation.linear_tangent(each(walking_one), adjoint, each(replayed_one), kind=Protected(),
+                                     live_cotangents=True)
+    outputs, final = walk(operands, entering)
+    out = outputs.reshape(*outputs.shape[:2], -1, columns)
     return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
 
 
