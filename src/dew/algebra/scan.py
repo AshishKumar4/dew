@@ -601,8 +601,14 @@ def _halved(issue: Callable, role: str, left, right):
     """`left @ right` the product `role` makes, summed over its depth as its two halves' products added, as
     the hand math paired its keys: over the whole depth in one product, a packed walk's final memory landed
     4.1 times the token scan's distance from float64 where the halves' land 2.4 times (row 1966)."""
-    half = left.shape[-1] // 2
-    return issue(role, left[..., :half], right[:half]) + issue(role, left[..., half:], right[half:])
+    # One product of the halves stacked (`issue` multiplies over the last two axes), an odd depth's second
+    # half a zero key longer, which adds nothing.
+    half = -(-left.shape[-1] // 2)
+    odd = 2 * half - left.shape[-1]
+    lefts = jnp.stack([left[..., :half], jnp.pad(left[..., half:], ((0, 0), (0, odd)))])
+    rights = jnp.stack([right[:half], jnp.pad(right[half:], ((0, odd), (0, 0)))])
+    halves = issue(role, lefts, rights)
+    return halves[0] + halves[1]
 
 
 def _factored(left, right, between, joined, issue: Callable, role: str):
