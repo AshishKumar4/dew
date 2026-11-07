@@ -503,9 +503,14 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
     scalars = {"train/loss": float(read.loss), **{f"train/{k}": float(v) for k, v in read.aux.items()},
                **throughput(elapsed, counts.since_log, counts.samples, counts.flops, devices,
                             waited=counts.waited, compiling=counts.compiling, training_flops=work,
-                            tokens=None if read.tokens is None else _TokenCount.host(read.tokens)),
+                            tokens=None if read.scored is None else _TokenCount.host(read.scored)),
                **real_token_share(None if read.scored is None else _TokenCount.host(read.scored),
                                   counts.computed)}
+    if read.tokens is not None:
+        # The tokens the interval's committed updates trained on, a token budget's count: an interval that
+        # cuts an accumulation window holds a share of its commits' tokens that its steps did not read
+        # alone, so the steps' rates read the tokens they scored (`throughput`).
+        scalars["train/committed_tokens"] = float(_TokenCount.host(read.tokens))
     scalars["train/accepted"] = float(read.accepted)
     if read.committed is not None:
         norms, commits = read.committed
