@@ -285,7 +285,8 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
                        txt_ids=tensor(np.zeros((condition.context.shape[1], 3)))).sample
         return unpacked(output.numpy(), grid, grid)
 
-    assert_export_recomputes(export, forward, call, draw, "trained Flux")
+    assert_export_recomputes(forward, lambda wide: consumer.denoiser(export, call, wide=wide), draw,
+                             "trained Flux")
 
 
 def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(

@@ -179,20 +179,14 @@ def unet_predictor(export: Path, *, wide: bool = False):
                                         for value in given(sample, timestep, context, pooled, time_ids))))
 
         return predict
-    with precision(wide):
-        unet = load(export, "unet", torch.float64 if wide else torch.float32)
-
-    def predict(sample, timestep, context, pooled=None, time_ids=None):
+    def call(unet, tensor, sample, timestep, context, pooled=None, time_ids=None):
         sample, times, context, pooled, time_ids = given(sample, timestep, context, pooled, time_ids)
-        added = None if pooled is None else {"text_embeds": torch.from_numpy(pooled),
-                                             "time_ids": torch.from_numpy(time_ids)}
-        with precision(wide), torch.no_grad():
-            output = unet(torch.from_numpy(np.ascontiguousarray(np.moveaxis(sample, -1, 1))),
-                          torch.from_numpy(times), encoder_hidden_states=torch.from_numpy(context),
-                          added_cond_kwargs=added).sample
+        added = None if pooled is None else {"text_embeds": tensor(pooled), "time_ids": tensor(time_ids)}
+        output = unet(tensor(np.ascontiguousarray(np.moveaxis(sample, -1, 1))), tensor(times),
+                      encoder_hidden_states=tensor(context), added_cond_kwargs=added).sample
         return np.moveaxis(output.numpy(), 1, -1)
 
-    return predict
+    return denoiser(export, call, wide=wide)
 
 
 def denoiser(export: Path, call, *, wide: bool = False):
