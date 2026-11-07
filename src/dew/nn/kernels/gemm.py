@@ -253,7 +253,9 @@ class NvFp4:
     scale (`scales`, `[width, depth / 16]`, in the depths' own order), and the tensor's fp32 scale
     (`scale`, a scalar): each value its code times its block's scale times the tensor's. Its depth is whole
     stages (`NVFP4_STAGE`): the mainloop's stage decode reads each column's words and scales as rows a TMA
-    copy takes, at least 16 bytes."""
+    copy takes, at least 16 bytes. A bank of experts' matrices (`[groups, depth, width]`, row 4516) leads
+    each field with its group axis: `words` `[groups, width, depth / 8]`, `scales` `[groups, width,
+    depth / 16]`, `scale` `[groups]`, each expert's matrix its own tensor scale."""
 
     words: jax.Array
     scales: jax.Array
@@ -261,34 +263,45 @@ class NvFp4:
 
     @classmethod
     def quantized(cls, x: jax.Array) -> "NvFp4":
-        """`x` (`[depth, width]`) quantized to NVFP4 (`bits.nvfp4_quantized`: its block scales and tensor
-        scale, each value rounded to E2M1), its codes packed in the staged order."""
-        words, scales, scale = bits.nvfp4_quantized(jnp.asarray(x, jnp.float32))
-        return cls.of(_codes(words), scales, scale)
+        """`x` (`[depth, width]`, or a bank's `[groups, depth, width]`) quantized to NVFP4
+        (`bits.nvfp4_quantized`, each matrix: its block scales and tensor scale, each value rounded to E2M1),
+        its codes packed in the staged order."""
+        def one(x):
+            words, scales, scale = bits.nvfp4_quantized(jnp.asarray(x, jnp.float32))
+            return _codes(words), scales, scale
+
+        return cls.of(*(jax.vmap(one) if x.ndim == 3 else one)(x))
 
     @classmethod
     def of(cls, codes: jax.Array, scales: jax.Array, scale) -> "NvFp4":
-        """The matrix of `codes` (`[depth, width]`, each an E2M1 value, in the depths' own order), its block
-        scales `scales` (`[depth / 16, width]` float8_e4m3fn) and its tensor scale `scale`: a checkpoint's
-        NVFP4 weight, its codes packed in the staged order, K-major."""
-        if codes.shape[0] % NVFP4_STAGE:
-            raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_STAGE}s, not {codes.shape[0]}")
-        return cls(_staged_words(codes).T, scales.T, jnp.asarray(scale, jnp.float32))
+        """The matrix of `codes` (`[depth, width]`, each an E2M1 value, in the depths' own order, or a bank's
+        `[groups, depth, width]`), its block scales `scales` (`[..., depth / 16, width]` float8_e4m3fn) and
+        its tensor scale `scale` (one a matrix): a checkpoint's NVFP4 weight, its codes packed in the staged
+        order, K-major."""
+        depth = codes.shape[-2]
+        if depth % NVFP4_STAGE:
+            raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_STAGE}s, not {depth}")
+        words = jax.vmap(_staged_words)(codes) if codes.ndim == 3 else _staged_words(codes)
+        return cls(jnp.swapaxes(words, -1, -2), jnp.swapaxes(scales, -1, -2), jnp.asarray(scale, jnp.float32))
 
     def codes(self) -> jax.Array:
-        """Its codes' values (`[depth, width]` float32, each code's E2M1 value) in the depths' own order."""
-        return _codes(self.words.T, staged=True)
+        """Its codes' values (`[..., depth, width]` float32, each code's E2M1 value) in the depths' own
+        order."""
+        words = jnp.swapaxes(self.words, -1, -2)
+        staged = functools.partial(_codes, staged=True)
+        return jax.vmap(staged)(words) if words.ndim == 3 else staged(words)
 
     def decoded(self) -> jax.Array:
-        """Its values over `bits.NVFP4_OWED` and the tensor scale, exactly, in bfloat16 (`[depth, width]`):
-        each code times its block's scale over 2^8, as the mainloop's stage decode forms it."""
-        owed = self.scales.T.astype(jnp.float32) * jnp.float32(1 / bits.NVFP4_OWED)
-        return (self.codes() * jnp.repeat(owed, 16, axis=0)).astype(jnp.bfloat16)
+        """Its values over `bits.NVFP4_OWED` and the tensor scale, exactly, in bfloat16 (`[..., depth,
+        width]`): each code times its block's scale over 2^8, as the mainloop's stage decode forms it."""
+        owed = jnp.swapaxes(self.scales, -1, -2).astype(jnp.float32) * jnp.float32(1 / bits.NVFP4_OWED)
+        return (self.codes() * jnp.repeat(owed, 16, axis=-2)).astype(jnp.bfloat16)
 
     @property
     def factor(self) -> jax.Array:
         """The factor its decode defers to the product's accumulator (`bits.NVFP4_OWED` times the tensor's
-        scale): `bits.nvfp4_decoded` keeps each value within bfloat16's normal range by owing 2^8."""
+        scale, a bank's one a matrix): `bits.nvfp4_decoded` keeps each value within bfloat16's normal range
+        by owing 2^8."""
         return jnp.float32(bits.NVFP4_OWED) * jax.lax.stop_gradient(jnp.asarray(self.scale, jnp.float32))
 
 
@@ -385,67 +398,80 @@ where a receipt measured it faster (a decode-sized call on an A100 or an H100: `
 named (`generation.chosen(nvfp4='packed')`), and it plans a tile."""
 
 
-def nvfp4_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:
+def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None = None, *, out_dtype,
+                  interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · W` of an NVFP4 matrix `W` (`NvFp4`), its weights frozen (a quantized checkpoint's): `lhs`
     rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`NvFp4.decoded`, its block's
     scale applied, 2^8 owed), the products summed in fp32, each step's apart (`templates.product.promoted`,
     row 4331), and the accumulator times the deferred factor
     (`NvFp4.factor`) before the one rounding to `out_dtype`: the deferred factor is the epilogue's first
     operation, ahead of any output hook (PLAN piece 10). Its selector (`NVFP4`) runs the template's mainloop
-    decoding each stage in place (`_packed`) where named, else decodes the matrix once a call (`gemm`)."""
+    decoding each stage in place (`_packed`) where named, else decodes the matrix once a call (`gemm`).
+    With `group_sizes`, `matrix` is a bank of experts' matrices (`NvFp4`'s group axis, row 4516) and `lhs`
+    their sorted rows: each group's rows times its expert's matrix, each times its expert's factor, frozen
+    (no gradient reaches the bank)."""
     rows = lhs.astype(jnp.bfloat16)
     launch = grouped_matmul.MosaicPackedGmm()
-    width, depth = matrix.words.shape[0], 8 * matrix.words.shape[1]
+    words = matrix.words if group_sizes is not None else matrix.words[None]
+    groups, width, depth = words.shape[0], words.shape[1], 8 * words.shape[2]
+    sizes = jnp.asarray([rows.shape[0]], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
     bound = launch.bind(jax.ShapeDtypeStruct(rows.shape, rows.dtype),
-                        jax.ShapeDtypeStruct((1, width, depth), jnp.bfloat16),
-                        jax.ShapeDtypeStruct((1,), jnp.int32), out_dtype='float32', trans_rhs=True,
-                        interpret=interpret_on_cpu, dense=True, exact_sums=True)
+                        jax.ShapeDtypeStruct((groups, width, depth), jnp.bfloat16),
+                        jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype='float32', trans_rhs=True,
+                        interpret=interpret_on_cpu, dense=group_sizes is None, exact_sums=True)
     target = generation.gpu_target()
     tile = launch.derived(bound, target) if launch.eligible(bound, target) else None
+    scales = matrix.scales if group_sizes is not None else matrix.scales[None]
     if selection.select(NVFP4, PackedCase(tile, math.prod(rows.shape[:-1]))).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
-        summed = _packed(rows, matrix.words, matrix.scales, tile, interpret_on_cpu)
+        summed = _packed(rows, words, scales, sizes, tile, interpret_on_cpu, dense=group_sizes is None)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
         # product's, whatever precision the program defaults to.
-        summed = gemm(rows, matrix.decoded(), None, out_dtype=jnp.float32,
+        summed = gemm(rows, matrix.decoded(), group_sizes, out_dtype=jnp.float32,
                       precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
-    return (summed * matrix.factor).astype(out_dtype)
+    factor = matrix.factor if group_sizes is None else jnp.repeat(
+        matrix.factor, sizes, total_repeat_length=rows.shape[0])[:, None]
+    return (summed * factor).astype(out_dtype)
 
 
-def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, tile: mosaic_gpu.Tiles,
-            interpret: bool) -> jax.Array:
-    """The packed matrix's product in fp32 (`nvfp4_product`'s packed kernel): the template's mainloop, each
-    stage of `words` and `scales` decoded in place (`mosaic_gpu.gmm`'s `scales`), differentiable at every
-    order as `gemm` is (`generation.linear_tangent`): its tangent the decoded product's in XLA, its reverse
-    mode the rows' gradient through the decoded values (the frozen words and scales taking none)."""
+def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, tile: mosaic_gpu.Tiles,
+            interpret: bool, *, dense: bool) -> jax.Array:
+    """The packed matrices' product in fp32 (`nvfp4_product`'s packed kernel, `words` and `scales` led by
+    their group axis, `sizes` each group's rows): the template's mainloop, each stage of `words` and
+    `scales` decoded in place (`mosaic_gpu.gmm`'s `scales`), differentiable at every order as `gemm` is
+    (`generation.linear_tangent`): its tangent the decoded product's in XLA, its reverse mode the rows'
+    gradient through the decoded values (the frozen words, scales and sizes taking none)."""
     launch = grouped_matmul.MosaicPackedGmm()
 
-    def forward(rows, words, scales):
-        out = mosaic_gpu.gmm(rows, words[None], jnp.asarray([rows.shape[0]], jnp.int32), tiles=tile,
-                             transpose_rhs=True, out_dtype=jnp.float32,
+    def decoded(words, scales):
+        return NvFp4(words, scales, jnp.ones((words.shape[0],), jnp.float32)).decoded()
+
+    def forward(rows, words, scales, sizes):
+        out = mosaic_gpu.gmm(rows, words, sizes, tiles=tile, transpose_rhs=True, out_dtype=jnp.float32,
                              multiprocessors=launch._launched(tile, interpret),
-                             interpret=grouped_matmul.INTERPRETED if interpret else False, dense=True,
-                             exact_sums=True, scales=scales[None])
+                             interpret=grouped_matmul.INTERPRETED if interpret else False, dense=dense,
+                             exact_sums=True, scales=scales)
         return out, ()
 
     def backward(saved, operands, cotangent, live):
         # The cotangent times the decoded values' transpose, summed in fp32, rounded once to the rows'.
         del saved
-        rows, words, scales = operands
-        leaves = (gemm(cotangent.astype(jnp.bfloat16), NvFp4(words, scales, jnp.float32(1)).decoded(), None,
+        rows, words, scales, sizes = operands
+        leaves = (gemm(cotangent.astype(jnp.bfloat16), decoded(words, scales), None if dense else sizes,
                        transpose_rhs=True, out_dtype=rows.dtype, precision=jax.lax.Precision.DEFAULT,
                        interpret_on_cpu=interpret),
-                  zero_from_primal(words), zero_from_primal(scales))
+                  zero_from_primal(words), zero_from_primal(scales), zero_from_primal(sizes))
         return tuple(leaves[index] for index in live)
 
-    def portable(rows, words, scales):
-        decoded = NvFp4(words, scales, jnp.float32(1)).decoded()
-        return jnp.dot(rows, decoded, preferred_element_type=jnp.float32)
+    def portable(rows, words, scales, sizes):
+        return grouped_matmul.xla_ragged_dot(rows, decoded(words, scales), sizes,
+                                             precision=jax.lax.Precision.DEFAULT,
+                                             preferred_element_type=jnp.float32)
 
     differentiable = contracted("test_an_nvfp4_products_kernels_hold_every_order")(
         generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
-    return differentiable(rows, words, scales)
+    return differentiable(rows, words, scales, sizes)
 
 
 BLOCKWISE_ROW = 'ledger 4518'
