@@ -13,7 +13,7 @@ from typing import ClassVar, Protocol
 import grain.python as grain
 import numpy as np
 
-from dew._records import integer, integers, json_value, record
+from dew._records import boolean, finite, integer, json_value, listed, record, text
 from dew.batch import Batch
 from dew.data.pipeline import ACCOUNTS, CONSUMED, DOCUMENT, Documents, Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
@@ -106,6 +106,21 @@ class WindowSource(View[TokenFiles]):
         return _indexed_manifest(self, self.describe(), 1024)
 
 
+_READ_AS = {"b": boolean, "i": integer, "u": integer, "f": finite}
+"""How a saved carry's tokens read, by their dtype's kind: an aligned field holds a stream's per-token
+values of any of these, a mask, ids, a weight (`Windows.fields`)."""
+
+
+def _carried(saved: Mapping[str, object], name: str) -> np.ndarray:
+    """A field's carry as `_WindowIterator.get_state` saved it, its tokens read as its dtype holds them
+    (A22: a floating weight's carry was read as integers and refused)."""
+    dtype = np.dtype(text(saved["dtype"], name))
+    read = _READ_AS.get(dtype.kind)
+    if read is None:
+        raise ValueError(f"saved causal window carry {name!r} holds {dtype}, which no aligned field holds")
+    return np.asarray(listed(saved["tokens"], name, read=read, what=f"a list of {dtype}"), dtype=dtype)
+
+
 class _WindowIterator(grain.DatasetIterator[Batch]):
     def __init__(self, parent: grain.DatasetIterator[Batch], windows: Windows, documents: Documents | None):
         super().__init__(parent)
@@ -181,12 +196,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "window parent"))
         held = record(state["held"], "window carry")
-        self._held = {
-            name: np.asarray(
-                integers(record(tokens, name)["tokens"], name), dtype=str(record(tokens, name)["dtype"])
-            )
-            for name, tokens in held.items()
-        }
+        self._held = {name: _carried(record(tokens, name), name) for name, tokens in held.items()}
         if self._documents is not None:
             self._documents.restore(json_value(state["documents"], "held documents"))
         skip = state["skip"]
