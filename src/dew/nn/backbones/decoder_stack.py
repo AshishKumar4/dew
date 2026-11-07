@@ -473,8 +473,10 @@ of a layer at a time do, so its stacked residuals hold no more than that loop's 
 
 def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematPolicy | None):
     """A scanned run as `dew.nn.in_backward.scanned_run` computes it: each layer the run's own module
-    applied on its row of the run's weights, its dropout drawn from a key of its own, under the layer's
-    rung, or where it names none what a layer at a time keeps (`_KEPT_WITHOUT_A_RUNG`)."""
+    applied on its row of the run's weights, its dropout drawn from a key of its own split from the run's,
+    under the layer's rung, or where it names none what a layer at a time keeps (`_KEPT_WITHOUT_A_RUNG`).
+    Its masks are this program's own, as a stack's a layer at a time and its scan's each are: Linen's scan
+    splits the run's key below the scope's own fold, which no public form reads."""
     held = run.variables
     current = in_backward.plan()
     assert current is not None

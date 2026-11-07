@@ -311,21 +311,73 @@ def consumed_where_made(optimizer: optax.GradientTransformation, state: TrainSta
     return leaf_local(optimizer, params, opt_state, progressed=progressed)
 
 
+def _placeholder(node) -> bool:
+    """Whether `node` is the place an optimizer's per-parameter tree holds for a parameter it keeps no value
+    of: a partitioned optimizer's group's for one another group steps (`optax.multi_transform`'s masks), or
+    an 8-bit moment's scales' for a parameter it keeps unquantized (None, `dew._moments.int8_moments`)."""
+    return node is None or isinstance(node, optax.MaskedNode)
+
+
+def _laid_as(params) -> Callable[[optax.OptState], bool]:
+    """Whether a node of an optimizer's state lays its leaves out as `params`' tree, a placeholder
+    (`_placeholder`) a leaf."""
+    shape = jax.tree.structure(params)
+    return lambda node: jax.tree.structure(node, is_leaf=_placeholder) == shape
+
+
+def _copy_of(params) -> Callable[[optax.OptState], bool]:
+    """Whether a node of an optimizer's state is a copy of `params`' tree (Adam's moments): laid out as it
+    (`_laid_as`), at each parameter a float leaf of its shape or a placeholder, one at least a value."""
+    laid, shapes = _laid_as(params), [np.shape(leaf) for leaf in jax.tree.leaves(params)]
+
+    def copy(node) -> bool:
+        if not laid(node):
+            return False
+        held = jax.tree.leaves(node, is_leaf=_placeholder)
+        valued = [(leaf, want) for leaf, want in zip(held, shapes, strict=True) if not _placeholder(leaf)]
+        return bool(valued) and all(np.shape(leaf) == want and jnp.issubdtype(leaf.dtype, jnp.floating)
+                                    for leaf, want in valued)
+    return copy
+
+
+def _placeholders_of(params) -> Callable[[optax.OptState], bool]:
+    """Whether a node of an optimizer's state is laid out as `params`' tree (`_laid_as`), holding no value."""
+    laid = _laid_as(params)
+    return lambda node: laid(node) and not jax.tree.leaves(node)
+
+
 def _param_copies(opt_state, params) -> list[Variables]:
     """The copies of `params`' tree an optimizer's state holds (Adam's moments), in the state's order."""
-    shape = jax.tree.structure(params)
-    copies = jax.tree.leaves(opt_state, is_leaf=lambda node: jax.tree.structure(node) == shape)
-    return [node for node in copies if jax.tree.structure(node) == shape]
+    copy = _copy_of(params)
+    return [node for node in jax.tree.leaves(opt_state, is_leaf=copy) if copy(node)]
 
 
 def _with_copies(opt_state, params, replaced: Callable[[int, Variables], Variables]):
     """`opt_state` with its `k`th copy of `params`' tree (`_param_copies`) `replaced(k, copy)`."""
-    shape = jax.tree.structure(params)
+    copy = _copy_of(params)
     counted = iter(range(len(_param_copies(opt_state, params))))
 
     def each(node):
-        return replaced(next(counted), node) if jax.tree.structure(node) == shape else node
-    return jax.tree.map(each, opt_state, is_leaf=lambda node: jax.tree.structure(node) == shape)
+        return replaced(next(counted), node) if copy(node) else node
+    return jax.tree.map(each, opt_state, is_leaf=copy)
+
+
+def _placeholders_at(opt_state, params, path: tuple[str, ...]):
+    """`opt_state` with each of its trees laid out as `params` that holds no value (`_placeholders_of`) cut to
+    its subtree at `path`, as a layer's update reads them."""
+    empty = _placeholders_of(params)
+    return jax.tree.map(lambda node: _nested(path, _at(node, path)) if empty(node) else node, opt_state,
+                        is_leaf=empty)
+
+
+def _held_in_copies(opt_state, params) -> bool:
+    """Whether every leaf of `opt_state` a parameter owns lies in one of its copies of `params`' tree
+    (`_param_copies`), the rest scalars (a count): a factored optimizer's state holds its parameters' rows
+    and columns (Adafactor's), and an 8-bit one's its moments' codes and their blocks' scales
+    (`dew._moments.int8_moments`), none of which a layer's slice reads as the layer's own, nor a backward
+    writes as a float cotangent."""
+    rest = _with_copies(opt_state, params, lambda index, copy: {})
+    return all(np.ndim(leaf) == 0 for leaf in jax.tree.leaves(rest))
 
 
 def _nested(path: tuple[str, ...], subtree) -> Variables:
@@ -914,13 +966,13 @@ class Transaction:
                 progress=None if self.bound is None else self.progress(current))
             # The update moves the weights, and each post-step effect of this update (QK-Clip's
             # rescale, a bounded group's clamp) acts on them (`stepped`).
-            params = {**current.variables, "params": self.objective.projected(
-                stepped(stored, update, current.opt_state, opt_state), updated=True)}
+            params = {**current.variables, "params": stepped(stored, update, current.opt_state, opt_state)}
             if applied is not None:
                 # The runs that updated in their backward take what their backward wrote, and the update's
                 # own of them, read by nothing, is never computed.
                 moved = applied.onto(dataclasses.replace(current, variables=params, opt_state=opt_state))
                 params, opt_state = moved.variables, moved.opt_state
+            params = {**params, "params": self.objective.projected(params["params"], updated=True)}
             done = update_applied(current.opt_state, opt_state)
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
@@ -1085,8 +1137,14 @@ class Transaction:
         """The plan by which the runs a one-stage scanned state holds stacked update in their backward
         (`dew.nn.in_backward`), where the step reads each gradient where it is made into the update
         (`consumed_where_made`), a window of one microbatch read whole, with no post-step effect, sampled
-        summary, QK-Clip, held update, adapter (a frozen base) or projection of its parameters; None
-        elsewhere. A run the model cannot update so (a routed or adapted one) runs as before."""
+        summary, QK-Clip, held update or adapter (a frozen base), and its optimizer holds what each
+        parameter owns in copies of their tree (`_held_in_copies`); None elsewhere. A run the model cannot
+        update so (a routed or adapted one) runs as before.
+
+        The backward writes where the step commits (`dew.nn.in_backward.gated`, its loss's `active`): a
+        window of one under no loss scale (`consumed_where_made` refuses `TrainState.scale`) commits every
+        attempt it takes, so what the backward wrote is what the commit keeps (`Applied.onto`), on the
+        state the window leaves as on the one it commits."""
         if self.size != 1 or self.split != 1 or self.inspection is not None:
             return None
         if self.aux_shape.effects is not None or FROZEN in state.variables:
@@ -1098,7 +1156,7 @@ class Transaction:
             return None
         params = state.variables["params"]
         runs = _stage_runs(params)
-        if not runs or self.objective.projected(params, updated=True) is not params:
+        if not runs or not _held_in_copies(state.opt_state, params):
             return None
         copies = _param_copies(state.opt_state, params)
         names = tuple(f"{in_backward.MOMENTS}_{index}" for index in range(len(copies)))
@@ -1116,7 +1174,9 @@ class Transaction:
                 return jax.tree.map(lambda leaf: leaf[0, 0], _at(tree, where))
 
             held = layer(weights)
-            before = _with_copies(state.opt_state, params, lambda index, _: layer(moments[names[index]]))
+            before = _placeholders_at(
+                _with_copies(state.opt_state, params, lambda index, _: layer(moments[names[index]])), params,
+                where)
             descent = layer(jax.tree.map(_descending, gradient, weights))
             moved, after = optimizer_update(self.optimizer, descent, before, held, progress=progress)
             copied = zip(names, _param_copies(after, held), strict=True)
@@ -1133,7 +1193,8 @@ class Transaction:
             norms = merge(norms, _nested(path, {in_backward.PERIOD_NORMS: held} if periodic else held))
         read = {**dict(zip(names, copies, strict=True)), in_backward.NORMS: norms}
         if state.compute is not None:
-            read[in_backward.MASTERS] = params
+            # The masters the step's update applies to, as its constraint projects them (`Transaction.read`).
+            read[in_backward.MASTERS] = self.objective.projected(params, updated=False)
         return _Planned(in_backward.InBackward(update=update, moments=names), read)
 
     def realize_planned(self, planned: _Planned) -> Callable[[Variables, Batch, Step], Realization]:
