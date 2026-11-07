@@ -647,6 +647,21 @@ def test_a_gpu_memory_read_where_no_device_states_its_peak_says_so_never_a_peak_
     assert isinstance(followed.gpu_memory("cpu"), str)
 
 
+def test_a_reference_run_whose_devices_state_no_peak_records_and_compares_its_peak_as_unknown():
+    """A reference run on devices that state no allocator peak (a CPU, row 4597) records None per device, and
+    its comparison reads the largest stated peak, unknown where none is stated, never raising on the run's
+    record nor taking a peak it did not measure (train 679's review: compare.py and the runs' summaries
+    raised TypeError on max over None)."""
+    common, compare = load("reference_runs/common"), load("reference_runs/compare")
+    stated = common.device_memory([{"peak_bytes_in_use": 3 << 30, "bytes_limit": 8 << 30}, {}])
+    assert stated == {"peak_allocated_bytes": [3 << 30, None], "bytes_limit": [8 << 30, None]}
+    record = {"framework": "dew", "precision": "bf16", "parallel": "data", "world": 1,
+              "throughput": {"tokens_per_s": 10.0, "step_ms_mean": 5.0}, "mfu": None}
+    rows = compare.performance({"stated": {**record, "memory": stated},
+                                "unstated": {**record, "memory": common.device_memory([{}, {}])}})
+    assert (rows["stated"]["peak_gib"], rows["unstated"]["peak_gib"]) == (3.0, None)
+
+
 def test_the_layout_parity_command_runs_its_main(tmp_path):
     """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
     directory to write, where a script whose entry point is gone exits 0 having checked nothing."""

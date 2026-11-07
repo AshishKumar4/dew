@@ -184,15 +184,22 @@ def test_groups_started_and_stopped_from_many_threads_at_once_each_end_as_their_
 
 
 def test_raised_names_each_error_a_process_ended_with_whatever_its_names_capitals():
-    """`raised` names every error class a traceback closes with, those whose second letter is a capital
-    among them (OSError, json.decoder.JSONDecodeError), as its docstring promises."""
+    """`raised` names every error class a traceback closes with, whatever its name's case (OSError,
+    json.decoder.JSONDecodeError, socket.gaierror, a private class's), as its docstring promises, and no
+    indented line's `word: text` that closes no traceback (train 679's review)."""
     from process_support import raised
 
-    program = ("import json, sys\n"
+    program = ("import json, socket, sys\n"
+               "class _Private(Exception): pass\n"
+               "print('  note: an indented line')\n"
+               "print('note: no traceback closes here')\n"
                "try:\n"
-               "    json.loads('{')\n"
+               "    try:\n"
+               "        json.loads('{')\n"
+               "    finally:\n"
+               "        raise socket.gaierror('gone')\n"
                "finally:\n"
-               "    raise OSError('gone')\n")
+               "    raise _Private('held')\n")
     done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=60,
                           check=False)
-    assert {"json.decoder.JSONDecodeError", "OSError"} <= raised(done).keys(), done.stderr
+    assert set(raised(done)) == {"json.decoder.JSONDecodeError", "socket.gaierror", "_Private"}, done.stderr
