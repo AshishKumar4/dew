@@ -72,7 +72,7 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
 
     index = Index(jaxpr)
     attention = [region for region in attention_regions.regions(index)
-                 if _decided(jaxpr, region.places, _read(jaxpr, region.places), region.outputs,
+                 if _decided(jaxpr, region.places, region_inputs(jaxpr, region.places), region.outputs,
                              lambda region=region: attention_regions.taken(region))]
     held = {place for region in attention for place in region.places}
     products = [region for region in _regions(index) if not held & set(region.places)
@@ -89,7 +89,7 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     return _spliced(jaxpr, written)
 
 
-def _read(jaxpr: jcore.Jaxpr, places: Sequence[int]) -> tuple[jcore.Var, ...]:
+def region_inputs(jaxpr: jcore.Jaxpr, places: Sequence[int]) -> tuple[jcore.Var, ...]:
     """The values the equations at `places` read that none of them makes, in the order they are read."""
     made = {var for place in places for var in jaxpr.eqns[place].outvars}
     return tuple(dict.fromkeys(var for place in places for var in jaxpr.eqns[place].invars
@@ -107,9 +107,9 @@ class Index:
     it holds them (`consts`): what the region finders read (`_regions`, `attention_regions.regions`,
     `recognize.recognized`)."""
 
-    def __init__(self, jaxpr: jcore.Jaxpr):
+    def __init__(self, jaxpr: jcore.Jaxpr | jcore.ClosedJaxpr):
         self.jaxpr = jaxpr
-        values = getattr(jaxpr, "consts", ())
+        values = jaxpr.consts if isinstance(jaxpr, jcore.ClosedJaxpr) else ()
         held = len(values) == len(jaxpr.constvars)
         self.consts = dict(zip(jaxpr.constvars, values, strict=True)) if held else {}
         self.producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}

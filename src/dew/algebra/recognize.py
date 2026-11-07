@@ -178,7 +178,7 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
     """What a region's choice reads: its structure (`program.structure`, every value it reads an input), the
     values of the constants among them (`_digest`: a statistic's divisor, an epsilon held as an array), the
     numerics' forms and the context its kernels are chosen in."""
-    inputs = fusion._read(jaxpr, places)
+    inputs = fusion.region_inputs(jaxpr, places)
     window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     held = tuple(_digest(index.consts[var]) if var in index.consts else None for var in inputs)
     return program.structure(window), held, accurate, derive.context(), _cache.KERNEL_CHOICES.value
@@ -241,17 +241,17 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
             return None
         frontier += [atom for atom in index.jaxpr.eqns[place].invars
                      if isinstance(atom, jcore.Var) and atom not in bound]
-    results, last = set(outputs), max(places, default=-1)
+    made, last = set(outputs), max(places, default=-1)
     for place in places:
         if jax_name(index.jaxpr.eqns[place].primitive) in BARRIERS:
             return None
         for var in index.jaxpr.eqns[place].outvars:
             outside = index.readers[var] - places
-            if var not in results and (var in index.escaping or outside):
+            if var not in made and (var in index.escaping or outside):
                 return None
             # A result is written where the region's last equation stood (`fusion._spliced`): a reader
             # outside the region before it would read it before it is made.
-            if var in results and any(reader < last for reader in outside):
+            if var in made and any(reader < last for reader in outside):
                 return None
     return tuple(sorted(places))
 
@@ -285,10 +285,10 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
 
     def joint(*values):
         held = dict(zip(wanted, run(*consts, *values), strict=True))
-        results = [held[var] for candidate, _ in spans for var in candidate.outputs]
+        computed = [held[var] for candidate, _ in spans for var in candidate.outputs]
         for candidate, _ in spans:
-            results += _declaration(candidate)(*(held[var] for var in candidate.operands))
-        return results
+            computed += _declaration(candidate)(*(held[var] for var in candidate.operands))
+        return computed
 
     closed = _canonical(jax.make_jaxpr(joint)(*(jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype)
                                                  for var in inputs)))
@@ -309,11 +309,12 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
     graph, _, _ = program.graphed(region)
     program.saturate(graph, region, rules.admitted(accurate), SATURATION)
     # Each output's term, the program's results first, then each declaration's in the same order.
-    results = region.outputs
+    terms_made = region.outputs
     equal, program_at = [], 0
     declared_at = sum(len(candidate.outputs) for candidate, _ in spans)
     for candidate, _ in spans:
-        pairs = [(results[program_at + n], results[declared_at + n]) for n in range(len(candidate.outputs))]
+        pairs = [(terms_made[program_at + n], terms_made[declared_at + n])
+                 for n in range(len(candidate.outputs))]
         equal.append(all(ours is not None and theirs is not None and graph.check_bool(eq(ours).to(theirs))
                          for ours, theirs in pairs))
         program_at += len(candidate.outputs)
@@ -355,7 +356,7 @@ def _typed(value) -> Hashable:
     if isinstance(value, jcore.Var):
         return value.aval
     if isinstance(value, (tuple, list)):
-        return tuple(_typed(item) for item in value)
+        return tuple(_typed(entry) for entry in value)
     return value
 
 
@@ -421,9 +422,9 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values) -> list:
     alone computed where it is made."""
     env: dict[jcore.Var, object] = dict(zip(jaxpr.constvars, consts, strict=True))
     env.update(zip(jaxpr.invars, values, strict=True))
-    widened: dict[int, object] = {}
+    widened: dict[int, jax.Array] = {}
     laid: dict[int, tuple] = {}
-    squeezed: dict[int, object] = {}
+    squeezed: dict[int, jax.Array] = {}
 
     def read(atom):
         return atom.val if isinstance(atom, jcore.Literal) else env[atom]
@@ -463,7 +464,7 @@ more for, so a float32 result rounded again rounds as the narrow operation does.
 backend computes a narrow one its own way (XLA:GPU's logistic in the operand's dtype)."""
 
 
-def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object],
+def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, jax.Array],
             laid: dict[int, tuple]) -> list:
     """`equation` bound over `operands` in the form recognition compares (`_canonical`): a square a value
     times itself, bit for bit; a narrow float's elementwise equation (`ROUNDED_ONCE`) its float32 one
@@ -497,6 +498,14 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
         narrow = next((dtype for dtype, held in NARROW.items() if held == bits and dtype in FULL_RANGE), None)
         if narrow is not None:
             return [_converted(_converted(operands[0], narrow, widened), operands[0].dtype, widened)]
+    if name in ROUNDED_ONCE and len(equation.outvars) == 1 and any(map(_uniform, operands)):
+        shape = equation.outvars[0].aval.shape
+        if all(_uniform(value) or jnp.shape(value) == shape for value in operands):
+            # A constant of one value throughout reads, element by element, as that value: the equation over
+            # the scalar computes the same elements, so a mean's divisor held as an array is its scalar's.
+            scalars = [_scalar(value) if _uniform(value) else value for value in operands]
+            if any(jnp.shape(value) == shape for value in scalars):
+                return _normal(equation, scalars, widened, laid)
     out = equation.outvars[0].aval.dtype if len(equation.outvars) == 1 else None
     if name in ROUNDED_ONCE and out in NARROW and all(jnp.result_type(value) == out for value in operands):
         wide = [_converted(value, jnp.float32, widened) for value in operands]
@@ -510,8 +519,8 @@ UNIT_ERASED = frozenset({"dot_general", "transpose", "reduce_sum", "reduce_max",
 """The layout-reading equations `_erased` computes over their operands' axes of more than one element."""
 
 
-def _erased(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object], laid: dict[int, tuple],
-            squeezed: dict[int, object]) -> list | None:
+def _erased(equation: jcore.JaxprEqn, operands: list, widened: dict[int, jax.Array], laid: dict[int, tuple],
+            squeezed: dict[int, jax.Array]) -> list | None:
     """An equation over values with axes of one element computed over those values with every such axis
     erased (`_squeeze`), then laid back out to its shape: a size-1 axis holds the same elements wherever
     a layout puts it, so a statistic kept `[N, 1]` and one held `[N]` are one computation. The equation's
@@ -568,7 +577,7 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
     return [_unsqueezed(core, out.shape, squeezed)]
 
 
-def _squeeze(value, squeezed: dict[int, object]):
+def _squeeze(value, squeezed: dict[int, jax.Array]):
     """`value` with its axes of one element erased: the erased value it was laid out from where it was
     (`squeezed`), else its reshape, once a value."""
     shape = jnp.shape(value)
@@ -583,7 +592,7 @@ def _squeeze(value, squeezed: dict[int, object]):
     return made
 
 
-def _unsqueezed(core, shape: tuple[int, ...], squeezed: dict[int, object]):
+def _unsqueezed(core, shape: tuple[int, ...], squeezed: dict[int, jax.Array]):
     """`core` laid out to `shape`, its axes of one element restored, recorded as `core`'s (`squeezed`)."""
     if jnp.shape(core) == tuple(shape):
         return core
@@ -595,6 +604,23 @@ def _unsqueezed(core, shape: tuple[int, ...], squeezed: dict[int, object]):
 ELEMENTWISE = ROUNDED_ONCE | {"convert_element_type", "select_n", "integer_pow", "square", "sign", "floor",
                              "ceil", "round", "pow", "atan2", "rem"}
 """The equations computed element by element, which a layout of their operands commutes with exactly."""
+
+
+def _uniform(value) -> bool:
+    """Whether `value` is a constant (computed, `_evaluated`) of more than one element, all one value bit for
+    bit (a zero's sign among its bits)."""
+    if isinstance(value, jax.core.Tracer) or jnp.ndim(value) == 0:
+        return False
+    held = np.ascontiguousarray(value)
+    if not held.size:
+        return False
+    bits = held.view(f"V{held.dtype.itemsize}")
+    return bool(np.all(bits == bits.flat[0]))
+
+
+def _scalar(value) -> np.ndarray:
+    """A uniform constant (`_uniform`) as its one value, in its dtype."""
+    return np.asarray(value).flat[0].astype(np.asarray(value).dtype)
 
 
 def _one(value) -> bool:
@@ -641,7 +667,7 @@ def _unit_axes(before: tuple[int, ...], after: tuple[int, ...]) -> tuple[int, ..
     return tuple(dimensions) if at == len(before) else None
 
 
-def _lifted(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object], laid: dict[int, tuple]):
+def _lifted(equation: jcore.JaxprEqn, operands: list, widened: dict[int, jax.Array], laid: dict[int, tuple]):
     """An elementwise equation whose every operand but scalars one layout made, from sources of one shape:
     the equation over the sources, then the layout; None where its operands are laid otherwise."""
     layouts = {laid[id(value)][1] for value in operands if id(value) in laid}
@@ -656,12 +682,12 @@ def _lifted(equation: jcore.JaxprEqn, operands: list, widened: dict[int, object]
         shape=jnp.shape(next(source for source, value in zip(sources, operands, strict=True)
                              if id(value) in laid))))])
     made = _normal(inner, sources, widened, laid)[0]
-    result = jax.lax.broadcast_in_dim(made, shape, dimensions)
-    laid[id(result)] = (made, (shape, dimensions))
-    return result
+    spread = jax.lax.broadcast_in_dim(made, shape, dimensions)
+    laid[id(spread)] = (made, (shape, dimensions))
+    return spread
 
 
-def _converted(value, dtype, widened: dict[int, object]):
+def _converted(value, dtype, widened: dict[int, jax.Array]):
     """`value` cast to `dtype`: the value it was widened from where it is an exact widening of a value of
     `dtype` (`widened`), else the cast, recorded in `widened` where it widens exactly (a narrow float to
     float32, a float to float64)."""
@@ -867,10 +893,10 @@ def _norm_candidates(index: fusion.Index, row, output, weight, gate, epsilons) -
         def normed(x, *rest, stream=stream, epsilon=epsilon, offset=offset, after_cast=after_cast,
                    first=first, implementation='auto'):
             branch, rest = (rest[0], rest[1:]) if stream is not None else (None, rest)
-            summed, result = stream_rms_normalized(x, branch, rest[0] if rest else None, epsilon, dtype,
-                                                   offset, after_cast, fp32_statistics=True,
-                                                   weight_first=first, implementation=implementation)
-            return (summed, result) if stream is not None else result
+            summed, normalized = stream_rms_normalized(x, branch, rest[0] if rest else None, epsilon, dtype,
+                                                       offset, after_cast, fp32_statistics=True,
+                                                       weight_first=first, implementation=implementation)
+            return (summed, normalized) if stream is not None else normalized
 
         operands = (*(stream if stream is not None else (row,)), *([weight] if weight is not None else []))
         outputs = (row, output) if stream is not None else (output,)
