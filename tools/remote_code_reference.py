@@ -79,7 +79,7 @@ from transformers import AutoConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 # NumPy alone, as the release's environment holds no JAX.
-from remote_code_draws import CHUNKS, PADDED, RATE, SITES, draw, positions, vocabulary
+from remote_code_draws import SITE_FORMS, SITES, draw, vocabulary
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 _PINNED = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
@@ -411,74 +411,6 @@ def opens(name: str, export: Path, scratch: Path) -> dict[str, bool]:
     return json.loads(run.stdout.strip().splitlines()[-1])
 
 
-SPELLED = {"mimo-v2-vl-tiny": {"pixel_values_videos": "video_pixel_values"}}
-"""Each release's names for the media fields its forward spells otherwise than its processor's: MiMo-V2.6's
-video patches (`MiMoV2ForCausalLM.forward`)."""
-
-
-def released_outputs(model, site: str, inputs: dict, name: str = "") -> dict[str, np.ndarray]:
-    """The release's outputs at a recorded `site` (tests/remote_code_draws.py), as Dew's forward
-    gives them (tests/model_support.py's `remote_code_site`), the gradients by the release's own tensor
-    names, the media under `name`'s own spellings (`SPELLED`). An update steps `model` and restores its
-    weights after."""
-    ids = torch.from_numpy(inputs["ids"].astype(np.int64))
-    if site == "update":
-        weights = {name: tensor.clone() for name, tensor in model.state_dict().items()}
-        model.zero_grad()
-        with torch.enable_grad():
-            logits = model(input_ids=ids).logits
-            torch.nn.functional.cross_entropy(logits[:, :-1].flatten(0, 1), ids[:, 1:].flatten()).backward()
-        torch.optim.SGD(model.parameters(), lr=RATE).step()
-        with torch.no_grad():
-            stepped = model(input_ids=ids).logits.numpy()
-            model.load_state_dict(weights)
-        model.zero_grad()
-        return {"logits": stepped}
-    if site == "gradients":
-        model.zero_grad()
-        with torch.enable_grad():
-            logits = model(input_ids=ids).logits
-            (logits * torch.from_numpy(inputs["cotangent"]).to(logits.dtype)).sum().backward()
-        return {name: parameter.grad.detach().numpy() for name, parameter in model.named_parameters()}
-    with torch.no_grad():
-        if site == "packed":
-            return {"logits": model(input_ids=ids, position_ids=torch.from_numpy(
-                positions().astype(np.int64))).logits.numpy()}
-        if site == "decode":
-            cache, steps, start = None, [], 0
-            for chunk in CHUNKS:
-                out = model(input_ids=ids[:, start:start + chunk], past_key_values=cache, use_cache=True)
-                cache, start = out.past_key_values, start + chunk
-                steps.append(out.logits)
-            return {"logits": torch.cat(steps, dim=1).numpy()}
-        if site == "biased":
-            logits = model(input_ids=ids, attention_mask=torch.from_numpy(inputs["attention_mask"])).logits
-            return {"row0": logits[0].numpy(), "row1": logits[1, PADDED:].numpy()}
-        if site in ("image", "video", "frames"):
-            # The patch vectors in the model's dtype, as its processor's float32 ones are cast to it.
-            dtype = next(model.parameters()).dtype
-            spelled = SPELLED.get(name, {})
-            media = {spelled.get(field, field): torch.from_numpy(value).to(
-                dtype if field.startswith("pixel") else torch.int64)
-                for field, value in inputs.items() if field != "ids"}
-            return {"logits": model(input_ids=ids, **media).logits.numpy()}
-        if site == "mtp":
-            # The prediction layer's logits: each position's final state beside the next token's embedding.
-            hidden = model.model(input_ids=ids).last_hidden_state
-            embeds = model.model.embed_tokens(ids[:, 1:])
-            return {"logits": model.lm_head(model.prediction_layer(embeds, hidden[:, :-1])).numpy()}
-        if site == "audio":
-            # Each clip's valid mel frames through the release's own pipeline (`get_audio_feature`: its
-            # tokenizer's codes, then its encoder), in the model's dtype, filling the placeholders.
-            dtype = next(model.parameters()).dtype
-            clips = zip(inputs["input_features"], inputs["input_features_mask"], strict=True)
-            mels = [torch.from_numpy(clip[valid]).to(dtype) for clip, valid in clips]
-            embeds = model.audio_encoder.get_audio_feature(mels, model.speech_embeddings,
-                                                           model.audio_tokenizer.encoder)
-            return {"logits": model(input_ids=ids, audio_embeds=embeds).logits.numpy()}
-        return {"logits": model(input_ids=ids).logits.numpy()}
-
-
 def serve(name: str) -> None:
     """The release's side of a recording (`--record`, over tools/reference_worker.py's frames): its fp32
     outputs and their float64 truth at each site and draw the recorder sends."""
@@ -489,9 +421,9 @@ def serve(name: str) -> None:
 
         def run(request: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
             site = str(request.pop("site"))
-            reference = released_outputs(native, site, request, name)
+            reference = SITE_FORMS[site].released(native, request, name)
             with float64():
-                truth = released_outputs(wide, site, request, name)
+                truth = SITE_FORMS[site].released(wide, request, name)
             return reference_worker.paired(reference, truth)
 
         reference_worker.serve(run, frames=True)
