@@ -157,6 +157,33 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
 
 
 @INTERPRETS
+@pytest.mark.parametrize("values", ["drawn", "near bf16's largest over equal keys"])
+def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_interpreted(values):
+    """A decode step on an H100 of two rows over 4096 keys, its four programs' keys cut into slices (`plan`)
+    whose states merge by their masses (`algebra.merged_slices`): the first row reads every key, whole key
+    tiles and whole slices, the second none. On par with the reference path (check 1), the empty row zero;
+    with values near bf16's largest over equal keys, each slice's weighted sum near fp32's largest and
+    their sum past it, which the merge's masses keep finite."""
+    keys = 4096
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, 0], jnp.int32))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (2, 1, 8, 64), jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.bfloat16) for stream in streams[1:])
+        if values != "drawn":
+            key, value = jnp.zeros_like(key), jnp.where(value > 0, 3.0e38, 2.9e38).astype(jnp.bfloat16)
+        return query, key, value
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
+                    f"template decode split at aligned keys, {values}", seeds=SEEDS)
+
+
+@INTERPRETS
 def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
     """A serving step's work list over a cache of two rows: three batch rows, a decode row's one query and
     two pieces of four prompt queries each, reading cache rows 1, 0 and 1 where they lie (`attend`'s
