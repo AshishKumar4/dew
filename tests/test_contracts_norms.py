@@ -226,7 +226,7 @@ def test_ngpts_join_and_normed_hidden_hold_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_default_precision_call_holds_every_order_it_takes(edge):
-    """A function traced at the default matmul precision (`precision.at_default_precision`, a custom VJP):
+    """A function traced at the default matmul precision (`precision.at_precision('default')`, a custom VJP):
     every order it takes finite wherever float64 is a normal float32 and the product as written is; it takes
     no forward derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient
     running."""
@@ -236,6 +236,6 @@ def test_a_default_precision_call_holds_every_order_it_takes(edge):
     primals = normal_draw(1208, (5, 16), (16, 3), scale=EDGES[edge])
     direction = normal_draw(1209, (5, 16), (16, 3), scale=EDGES[edge])
     (cotangent,) = normal_draw(1210, (5, 3))
-    assert_contract(precision.at_default_precision(product), primals, direction, cotangent,
+    assert_contract(precision.at_precision('default')(product), primals, direction, cotangent,
                     f"a default-precision call {edge}", truth_fn=product, plain_fn=product,
                     without=OWN_FORWARD_ORDERS)

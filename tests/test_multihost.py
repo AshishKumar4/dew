@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 import test_multiprocess as single
-from process_support import report_of, spawn, terminate, worker_env
+from process_support import relayed, report_of, spawn, terminate, worker_env
 
 test_a_real_token_budget_agrees_across_processes_after_logging_ticks = (
     single.test_a_real_token_budget_agrees_across_processes_after_logging_ticks)
@@ -221,33 +221,35 @@ def lost_host(sequence: int, tmp_path: Path) -> list:
     return [alive, outcome, time.monotonic() - killed]
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
 def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
     """`command` as this rank's process of a pool of one process per rank, joined at rank0 as `dew launch`
     leaves a pool (DEW_PROCESS_COUNT, DEW_PROCESS_ID, JAX_COORDINATOR_ADDRESS) on `devices` CPU devices each:
-    its output, once it exited 0."""
+    its output, once it exited 0, relayed to the rank's log as it comes (`relayed`)."""
     sequence = next(POOLS)
     env = {**worker_env(devices), "DEW_PROCESS_COUNT": str(WORLD), "DEW_PROCESS_ID": str(RANK),
            "JAX_COORDINATOR_ADDRESS": f"rank0:{COORDINATOR + sequence}"}
     together(sequence)
-    ran = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
+    ran = relayed(command, env, timeout=timeout)
     exits = exchange(sequence, ran.returncode)
-    assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.stdout[-6000:]}\n{ran.stderr[-6000:]}"
-    return ran.stdout
+    assert exits == [0] * WORLD, f"rank exits {exits}\n{ran.output[-12000:]}"
+    return ran.output
 
 @pytest.mark.distributed
 @pytest.mark.parametrize("model", MODELS)
-def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device(model):
+def test_layouts_across_hosts_split_only_data_and_fsdp_and_run_as_one_device_does(model):
     """The parity tool's dense decoder or mixture of experts over one device on each of four hosts:
-    the data, fsdp and replica layouts, whose sums cross the relay between containers, match one
-    device, and an axis inside a model replica (tensor, stage) is refused across hosts, since each
-    container is its own slice and only fsdp may cross slices. One model a test, so CI's gangs run
-    them side by side."""
+    the data, fsdp and replica layouts, whose sums cross the relay between containers, each take their
+    first step there, its sample one device's and every value finite where one device's is (the tool's
+    `--seeds 0`), and an axis inside a model replica (tensor, stage) is refused across hosts, since each
+    container is its own slice and only fsdp may cross slices. Their accuracy over many draws is judged
+    on a pool of four processes of one host (test_multiprocess.py,
+    `test_the_layouts_a_gang_crosses_hosts_with_match_one_device_across_four_processes`), where a draw
+    takes a fraction of its time here. One model a test, so CI's gangs run them side by side."""
     if WORLD != 4:
         pytest.skip("one device on each of four hosts")
-    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", model, "--layouts",
-                       "data4", "fsdp4", "replicas4", "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
+    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", model,
+                       "--seeds", "0", "--layouts", "data4", "fsdp4", "replicas4",
+                       "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
     if RANK == 0:
         summary = next(line for line in output.splitlines() if re.fullmatch(r"\w+ \d+(, \w+ \d+)*", line))
         counts = {status: int(count) for status, count in re.findall(r"(\w+) (\d+)", summary)}

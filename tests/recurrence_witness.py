@@ -800,7 +800,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     dtype = jnp.result_type(q, k, v)
     scale = k.shape[-1] ** -0.5 if delta else 1.0
     if rounded is None:
-        rounded = recurrence_chunk.chunk_rounding(delta, dtype) if delta else recurrence_chunk.fast_rounding()
+        rounded = (recurrence_chunk.chunk_rounding(delta, dtype) if delta
+                   else recurrence_chunk.fast_rounding(dtype))
     family = mainloop.family_of(dtype) or bundles.INTERPRETED
     # The parts its operands and passed values take (`chunk_forward.prepared`'s `given` and `held`): one of a
     # 16-bit value; an fp32 one's three, or under the fast forms its family's (`mainloop._fast_parts`).
@@ -1409,7 +1410,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
     scale = run.scale
     rounded = (recurrence_chunk.chunk_rounding(delta=True, dtype=dtype) if delta
-               else recurrence_chunk.fast_rounding())
+               else recurrence_chunk.fast_rounding(dtype))
     family = mainloop.family_of(dtype) or bundles.INTERPRETED
     interpret = generation.backend() != "gpu"
 

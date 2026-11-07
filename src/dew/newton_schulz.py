@@ -15,7 +15,7 @@ import numpy as np
 import optax
 
 from dew.mesh import STAGE_AXIS
-from dew.nn.precision import configured_precision
+from dew.nn.precision import configured_precision, iteration_dtype
 
 Preconditioning = Literal["frobenius", "spectral", "aol", "schatten"]
 """How optax's Newton-Schulz scales a matrix before it iterates (`optax.contrib.muon`'s `preconditioning`)."""
@@ -169,11 +169,13 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     iteration's products (`BF16_BF16_F32`'s bfloat16, `TF32_TF32_F32`'s and `F32_F32_F32`'s float32, which a
     platform that has not the algorithm refuses in JAX's own words, and a complex update, whose products no
     real algorithm holds, refuses by name); else the run's numerics' (`dew.nn.kernels.generation.numerics`),
-    each product at its precision (`Numerics.matmul`): bfloat16 in its fast forms, as Jordan's Muon
-    (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate; float32 in its accurate ones, TF32 products on
-    a GPU at the default precision and IEEE float32 under the accurate preset (`precision="accurate"`);
-    complex64 for a complex update; and float32 for a spectral preconditioning, whose norm is an SVD of
-    float32 operands.
+    each product at its precision (`Numerics.matmul`), as `dew.nn.precision.iteration_dtype` declares it:
+    in its fast forms bfloat16 for a 16-bit compute dtype (16-mixed's float16 among them), as Jordan's Muon
+    (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate, and the compute dtype otherwise; at least
+    float32 of it in its accurate ones, TF32 products on a GPU
+    at the default precision and IEEE float32 under the accurate preset (`precision="accurate"`);
+    complex64 for a complex update; and at least float32 of the iteration's dtype for a spectral
+    preconditioning, whose norm is an SVD of at least float32 operands (a float64 run's in float64).
 
     The fast forms' bfloat16, where optax iterates in its momentum's own float32: the quintic brings the
     singular values only near one, roughly within 0.7 to 1.2 (optax `orthogonalize_via_newton_schulz`), far
@@ -183,15 +185,13 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     at each of 30 steps within 0.07 of the float32 iteration's (0.02 on average). Accumulated, its update's
     microbatch takes 860 ms against 516 and the others about AdamW's: an update of 65,536 tokens 9.4% over
     AdamW's and one of 262,144 2.5% (`dew.optim.muon`; ledger 2685, 2752)."""
-    from dew.nn.kernels.generation import numerics
-
     if jnp.issubdtype(dtype, jnp.complexfloating):
         return jnp.dtype(jnp.complex64)
     if preconditioning == "spectral":
-        return jnp.dtype(jnp.float32)
+        return jnp.promote_types(iteration_dtype(), jnp.float32)
     if algorithm is not None and algorithm.supported_lhs_types:
         return jnp.dtype(algorithm.supported_lhs_types[0])
-    return jnp.dtype(jnp.bfloat16 if numerics().forms == "fast" else jnp.float32)
+    return iteration_dtype()
 
 
 def orthogonalized_leaf(update: jax.Array, steps: int,

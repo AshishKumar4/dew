@@ -98,6 +98,9 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
     report = run.validate(step_batch())
     state = run.fit(Loader(train=lambda partition: repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1),
                            val=None, records=None, batch=BATCH), steps=2 * accumulation)
+    # The state as the step holds it (`Trainer.staged`): a one-stage scan's runs stacked, which fit returns
+    # on their stored layers.
+    state = run.staged(state)
 
     leaves = jax.tree_util.tree_flatten_with_path(state)[0]
     held = dict.fromkeys(run.device_mesh.device_ids.ravel().tolist(), 0)

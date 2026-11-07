@@ -253,3 +253,41 @@ def test_the_release_version_is_read_from_a_module_import_dew_does_not_run():
     metadata = tomllib.loads((SOURCE.parent / "pyproject.toml").read_text())
     assert metadata["tool"]["setuptools"]["dynamic"]["version"] == {"attr": "dew._version.__version__"}
     assert re.fullmatch(r"\d+\.\d+\.\d+", run.stdout.strip())
+
+
+def test_a_process_that_never_loads_the_algebra_pass_never_loads_egglog():
+    """egglog loads with the algebra pass, not with `import dew`: a process that
+    imports Dew and its data layer, and never a kernel, holds no egglog."""
+    script = "import json, sys\nimport dew, dew.data\nprint(json.dumps('egglog' in sys.modules))\n"
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) is False
+
+
+def test_egglogs_declarations_hold_no_frame_of_the_call_that_first_loads_the_pass():
+    """The first import of the algebra pass from inside a call (a training step's first trace, a kernel's
+    options) leaves egglog's builtin declarations holding none of that call's frame: a value only the call's
+    locals held is freed once it returns. A bare `import egglog` in a call keeps it (each builtin class's
+    declarations hold the importing frame until first used); the pass's own import, with egglog 14.0.0,
+    keeps none."""
+    script = r'''
+import gc, json, weakref
+import dew
+
+class Held:
+    pass
+
+def compiling():
+    held = Held()
+    import dew.algebra  # noqa: F401
+    return weakref.ref(held)
+
+ref = compiling()
+gc.collect()
+print(json.dumps(ref() is None))
+'''
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=240)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) is True

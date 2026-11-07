@@ -2,6 +2,7 @@
 load a torch reference's weights and compare gradients in its own names: kernels as [in, out], a fused
 qkv projection split per head into Dew's to_q, to_k and to_v, the output projection read per head."""
 
+import jax.numpy as jnp
 import numpy as np
 
 QKV = ("to_q", "to_k", "to_v")
@@ -18,8 +19,8 @@ def split_qkv(value: np.ndarray, heads: int) -> np.ndarray:
 def join_qkv(parts: list[np.ndarray]) -> np.ndarray:
     """`split_qkv`'s inverse: three Dew kernels or biases back as the fused torch weight or bias."""
     if parts[0].ndim == 3:
-        return np.stack(parts).transpose(0, 2, 3, 1).reshape(-1, parts[0].shape[0])
-    return np.concatenate([part.ravel() for part in parts])
+        return jnp.stack(parts).transpose(0, 2, 3, 1).reshape(-1, parts[0].shape[0])
+    return jnp.concatenate([part.ravel() for part in parts])
 
 
 def output_heads(value: np.ndarray, heads: int) -> np.ndarray:
@@ -57,21 +58,8 @@ def torch_leaf(path: tuple[str, ...], value: np.ndarray) -> np.ndarray:
     return torch_kernel(value) if path[-1] == "kernel" else value
 
 
-def case_arrays(arrays, case: str):
-    """A reference fixture's arrays of one case, written as `<case>/<name>`: a reader of them by
-    `name`, and the case's parameter names (`<case>/param.<name>`) in the file's order."""
-    prefix = f"{case}/param."
-    return (lambda name: arrays[f"{case}/{name}"]), [name.removeprefix(prefix) for name in arrays
-                                                     if name.startswith(prefix)]
-
-
 def node(tree, path: tuple[str, ...]):
     """The node at `path` in a nested tree."""
     for key in path:
         tree = tree[key]
     return tree
-
-
-def leaf(tree, path: tuple[str, ...]) -> np.ndarray:
-    """The array at `path` in a nested tree (`node`)."""
-    return np.asarray(node(tree, path))

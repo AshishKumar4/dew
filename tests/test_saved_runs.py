@@ -65,6 +65,25 @@ def archived(recorded: str, kind: str) -> tarfile.TarFile:
     return tarfile.open(fileobj=io.BytesIO(stored.tobytes()), mode="r:xz")
 
 
+def test_every_task_a_registered_objective_saves_its_runs_as_is_a_recorded_kinds(tmp_path):
+    """Every kind the corpus's writer saves (`SAVED_KINDS`) has a run a main recorded (`SAVED`), and every
+    task a registered objective saves its runs as (`dew.registry.objectives`' `saved_task`) is the task of
+    one of them, so a run of it a main saved loads back and answers
+    (`test_a_run_an_earlier_main_saved_loads_and_answers`); a masked-diffusion run's task had no kind, and
+    a kind the writer saves with no recording would pass a gate that read the writer's list (train 669's
+    review, row 4674)."""
+    def built(kind: str):
+        # Each kind's run built in a directory of its own, as the corpus's writer builds it.
+        (tmp_path / kind).mkdir()
+        return SAVED_KINDS[kind](tmp_path / kind, drawn=False)
+
+    recorded = {kind for _, kind in SAVED}
+    assert set(SAVED_KINDS) <= recorded, sorted(set(SAVED_KINDS) - recorded)
+    declared = {objectives[name].saved_task for name in objectives} - {None}
+    saved = {objectives[built(kind).objective.name].saved_task for kind in SAVED_KINDS}
+    assert declared <= saved, sorted(task.__name__ for task in declared - saved)
+
+
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_saved_run_names_no_owner_time_or_place_of_the_machine_that_wrote_it(recorded, kind):
     """Each archive of the corpus names nothing of its writer's machine, which the fetched store
@@ -90,29 +109,60 @@ def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind):
     """A kind's run saved at an earlier main rebuilds from its record, in the compute it recorded, and,
-    where its objective declares a saved task, pins its last checkpoint and loads as that task, which
-    answers a request; an objective that declares none (a JEPA encoder's) records no inference
-    declaration."""
+    where its objective declared a saved task then and the run recorded that declaration, pins its last
+    checkpoint and loads as that task, which answers a request. A run whose objective declared none at its
+    main recorded none (the corpus's JEPA runs, saved before a JEPA encoder had a release: row 4313,
+    `dew.inference.models.SavedModel`), so pinning it is refused; resuming it saves a step that declares
+    one (`test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint`)."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
     task = objectives[recorded_run.objective.name].saved_task
+    with Checkpoints(str(run)) as checkpoints:
+        last = checkpoints.latest
+        declared = checkpoints.artifact(last) is not None
     if seen is not None:
         assert recorded_run.compute_dtype() == seen["compute"]
-        if task is not None and seen["version"] >= PRODUCTS:
+        if seen["version"] >= PRODUCTS:
+            # A run that declared its task recorded what one request multiplied, and one that declared
+            # none recorded nothing.
+            assert (seen["products"] is not None) == declared
+        if declared and seen["version"] >= PRODUCTS:
             # The task loaded multiplies as the one the run saved did: one request's products, module by
             # module, in the dtypes they multiplied in then.
             found = computed(run)
             assert found["products"] == unpacked(seen["products"], found["packs"])
-    with Checkpoints(str(run)) as checkpoints:
-        last = checkpoints.latest
-        declared = checkpoints.artifact(last) is not None
-    assert declared == (task is not None)
-    if task is not None:
+    if declared:
         saved = SavedRun.pinned(str(run))
         assert saved.step == last
         answered(task.from_run(str(run)))
+    else:
+        with pytest.raises(ValueError):
+            SavedRun.pinned(str(run))
 
+
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run(tmp_path, recorded, kind):
+    """A kind's run saved at an earlier main, exported by `dew export` where its checkpoint declared its task,
+    loads back through `dew.pipeline` as the task its run loads (`from_run`) and answers one request as that
+    task does, leaf for leaf (MF01). A run that declared none (the corpus's JEPA runs, saved before a JEPA
+    encoder had a release) is refused by the export, as `SavedRun.pinned` refuses it."""
+    from option_witness import answered_alike, answers
+
+    from dew._cli.main import main
+    from dew.inference.loading import pipeline
+
+    run = extracted(tmp_path, recorded, kind)
+    task = objectives[RunConfig.load(str(run)).objective.name].saved_task
+    with Checkpoints(str(run)) as checkpoints:
+        declared = checkpoints.artifact(checkpoints.latest) is not None
+    release = tmp_path / "release"
+    if not declared:
+        with pytest.raises(ValueError):
+            main(["export", str(run), str(release)])
+        return
+    assert main(["export", str(run), str(release)]) == 0
+    assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
@@ -162,8 +212,9 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         assert consumed is None or consumed > seen["consumed"]
         assert not clocked or consumed == recorded_run.trainer.examples
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
+        # Where its main recorded them: a run whose objective declared no task then recorded none.
         task = objectives[recorded_run.objective.name].saved_task
-        if task is not None and seen["version"] >= PRODUCTS:
+        if task is not None and seen["version"] >= PRODUCTS and seen["products"] is not None:
             found = computed(run, int(state.step))
             assert found["products"] == unpacked(seen["products"], found["packs"])
         # The step the resumed fit compiled, at the rung it was admitted at.
@@ -464,3 +515,22 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
     # A branch read from two collections, its trunk held frozen, is the branch its root reads.
     assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}, frozen=True) == read(
         {"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)})
+
+
+
+@pytest.mark.parametrize(("recorded", "kind"),
+                         [(recorded, kind) for recorded, kind in SAVED if kind == "diffusion"],
+                         ids=lambda part: str(part))
+def test_a_diffusion_runs_release_stores_its_encoders_parameters_in_the_dtype_a_load_asks(tmp_path, recorded,
+                                                                                            kind):
+    """A diffusion run's native release loaded with a storage dtype stores every parameter its run's load does
+    in it, its condition encoders' among them, and the rest as written: leaf for leaf the dtypes of the run
+    loaded so (review of the run release)."""
+    from dew._cli.main import main
+    from dew.inference.loading import pipeline
+
+    run = extracted(tmp_path, recorded, kind)
+    assert main(["export", str(run), str(tmp_path / "release")]) == 0
+    loaded, released = (pipeline(str(path), param_dtype="bfloat16") for path in (run, tmp_path / "release"))
+    assert (jax.tree.map(lambda leaf: leaf.dtype, released.variables)
+            == jax.tree.map(lambda leaf: leaf.dtype, loaded.variables))

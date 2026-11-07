@@ -9,6 +9,24 @@ LAYOUT_SEEDS = 8
 """Check 1's declared seeds for a run under one layout against the same run under another."""
 
 
+def x64() -> bool:
+    """Whether the calling context computes in float64: a check-1 truth runs under `jax.enable_x64`,
+    a thread's own setting, which `jax.config.read` does not see."""
+    return jnp.zeros(()).dtype == jnp.float64
+
+
+def widened_start(trainer) -> object:
+    """`trainer`'s start placed, and in float64 (`x64`) the float32 run's own start, every floating leaf
+    widened: a float64 truth steps the arms' start, where the objective's float literals would be drawn
+    anew in float64."""
+    if not x64():
+        return trainer.place()[0]
+    with jax.enable_x64(new_val=False):
+        start = trainer.place()[0]
+    return jax.tree.map(lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating)
+                        else leaf, start)
+
+
 def floats(state) -> dict[str, np.ndarray]:
     """A state's floating leaves by path, as check 1 holds them."""
     return {jax.tree_util.keystr(path): np.asarray(leaf)
