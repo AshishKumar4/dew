@@ -463,20 +463,24 @@ class Tiles:
 
 
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, *, scale: float,
-                 delta: bool, dtype, bound: float | None = None):
+                 delta: bool, dtype=None, bound: float | None = None):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
     carry alone in sequence): each value head's update `h = D h - beta k (k^T D h) + beta
     k v^T` with the delta rule (`recurrence.update`'s), `h = D h + beta k v^T` without it, `D = exp(g)` a
-    head's or each key's own, read `scale q^T h`; `(output, final memory)` in `dtype`, the memory entering
-    `state` (zero where None). A length off the chunk grid is padded with tokens that leave the memory as it
+    head's or each key's own, read `scale q^T h`; `(output, final memory)`, computed in at least fp32
+    (`work`), the output in `dtype` (the queries', keys' and values' common dtype where None, as the port
+    returns it; a caller's epilogue passes its working dtype, unrounded) and the memory in `work`, the memory
+    entering `state` (zero where None). A length off the chunk grid is padded with tokens that leave the memory as it
     was (zero keys and write gates, a unit decay). `starts` `[B, S]`, where given, marks packed documents'
     first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`). `bound`, the layer's
     write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is the
     declaration's range facts (`scan.Scan.ranges`)."""
     from dew.algebra import SATURATION, scan
 
+    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
+    work = at_least_fp32(jnp.result_type(query, key, value))
     group = value.shape[2] // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
@@ -502,7 +506,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
     ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound, "overlap": bound})}
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
-                                       state=((width, columns), dtype), reset=reset, ranges=ranges),
+                                       state=((width, columns), work), reset=reset, ranges=ranges),
                              saturation=SATURATION)
     chunk_size = config.chunk
     chunks = -(-length // chunk_size)
@@ -514,7 +518,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         x = jnp.moveaxis(x, 2, 1)
         return x.reshape(rows, heads, chunks, chunk_size, *x.shape[3:])
 
-    operands = {name: laid(x.astype(dtype))
+    operands = {name: laid(x.astype(work))
                 for name, x in zip(axes, (query, key, value, g, beta), strict=True)}
     if starts is not None:
         # Each head's tokens reset where their row's document starts; a padded token starts none.
@@ -523,8 +527,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
     varying = (query, key, value, g, beta, starts)
-    entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), dtype), value) if state is None
-                            else state.astype(dtype), *varying)
+    entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
+                            else state.astype(work), *varying)
 
     def walked(operands, h):
         # Each chunk's values that read no memory at once; the memory alone in sequence; then each chunk's
@@ -542,7 +546,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         return outputs.reshape(-1, columns), carried[1]
 
     out, final = jax.vmap(jax.vmap(walked))(operands, entering)
-    return jnp.moveaxis(out[:, :, :length], 1, 2), final
+    return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
 
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
