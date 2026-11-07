@@ -2,6 +2,7 @@
 tests/test_bf16_reference.py's bfloat16): the workflow fixture's prefill, transformers' model and canvas
 logits, a seed's drawn prompt, canvas, previous logits and pixels, and Dew's canvas logits."""
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -89,22 +90,21 @@ def transformers_canvas(network, prompt, canvas, *rest):
     return {"logits": network(input_ids=prompt, decoder_input_ids=canvas, **fields).logits}
 
 
-def dew_canvas(model, variables):
-    """Dew's canvas logits after a drawn prompt, as `transformers_canvas` takes them."""
+def dew_canvas(model, variables, intercepted=contextlib.nullcontext):
+    """Dew's canvas logits after a drawn prompt, as `transformers_canvas` takes them: its prompt's prefill
+    and its canvas each run within `intercepted()` (a `flax.linen.intercept_methods` of a caller's), its
+    cache's initialization outside it."""
     def canvas_of(prompt, canvas, *rest):
-        if rest and rest[0].ndim == 3:
-            cache = prefill(model, variables, prompt)
-            return model.apply({**variables, "cache": cache}, canvas, self_conditioning_logits=rest[0])
-        if rest:
-            inputs = ModelInputs(prompt, {"image_indices": jnp.where(prompt == 60, 0, -1)},
-                                 {"pixel_values": rest[0]})
-            cache = model.apply(variables, prompt.shape[0], method=model.init_cache,
-                                mutable=["cache"])[1]["cache"]
-            cache = model.apply({**variables, "cache": cache}, inputs,
+        cache = model.apply(variables, prompt.shape[0], method=model.init_cache,
+                            mutable=["cache"])[1]["cache"]
+        media = ({"image_indices": jnp.where(prompt == 60, 0, -1)}, {"pixel_values": rest[0]}) \
+            if rest and rest[0].ndim != 3 else ()
+        conditioning = {"self_conditioning_logits": rest[0]} if rest and rest[0].ndim == 3 else {}
+        with intercepted():
+            cache = model.apply({**variables, "cache": cache}, ModelInputs(prompt, *media),
                                 method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
                                 mutable=["cache"])[1]["cache"]
-            return model.apply({**variables, "cache": cache}, canvas)
-        return model.apply({**variables, "cache": prefill(model, variables, prompt)}, canvas)
+            return model.apply({**variables, "cache": cache}, canvas, **conditioning)
 
     # Eager: the cache's prefill reads its prompt on the host (`TokenEmbedding`'s padding).
     return as_given(lambda *inputs: {"logits": canvas_of(*map(jnp.asarray, inputs))})

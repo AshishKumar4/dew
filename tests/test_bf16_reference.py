@@ -40,20 +40,20 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from canvas_support import (
-    CANVAS_SEEDS,
     WORKFLOW,
     canvas_draw,
     dew_canvas,
     transformers_canvas,
     transformers_model as canvas_model,
 )
+from flax import linen as nn
 from interop_support import clearing_selections, fixture_ids, transformers_arms, transformers_model
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 from selection_margins import NARROW_MARGIN
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
-from dew.nn.inputs import ModelInputs
+from dew.nn.gemma4_moe import Gemma4TextRouter
 from dew.nn.kernels import generation
 from dew.nn.precision import ACCURATE
 
@@ -173,36 +173,71 @@ def assert_biases_sum_as_torch(name):
                     seeds=BIAS_SEEDS[name], truth_fn=torch_gradients(wide, float64))
 
 
-def routed_canvas_draw(config, draw):
-    """`draw`, redrawn until Dew's float64 run of the denoiser routes every token it reads, the prompt's
-    prefill and the canvas's, by bfloat16's margin (`selection_margins.NARROW_MARGIN`, testing.md's
-    selection rule): its routed experts' bfloat16 choices flip apart from the truth's otherwise, each
-    flip a heavy tail of both arms' errors (a draw's log ratios spread 1.0 unconditioned)."""
-    from selection_margins import NARROW_MARGIN, capturing, clearing, margin
+class PinnedRoutes:
+    """Each draw's expert choices as Dew's float64 run of the denoiser makes them, the prompt's prefill's and
+    the canvas's, router by router in the order they run (`chosen`); and the context that replays them in
+    Dew's run (`replayed`: through the router's own `routes`, by `flax.linen.intercept_methods`) and the
+    hooks that replay them in transformers' (`hooked`: each router's selection replaced, its weights the
+    run's own probabilities of the chosen experts, renormalized and scaled as the router scales them). The
+    gates' probabilities and every other value stay each arm's own arithmetic; routing itself is held by
+    tests/test_block_diffusion.py's float32 sites and the router tests (row 4739)."""
 
-    fields = adapter.translate_config(adapter.text_config(config))
-    with jax.enable_x64(new_val=True):
-        model = adapter.build(config, dtype="float64", attention_impl="xla")
-        variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
-
-    def routed(prompt, canvas, *rest):
-        conditioning = {"self_conditioning_logits": rest[0]} if rest and rest[0].ndim == 3 else {}
-        media = ({"image_indices": jnp.where(prompt == 60, 0, -1)}, {"pixel_values": rest[0]}) \
-            if rest and rest[0].ndim != 3 else ()
-        inputs = ModelInputs(jnp.asarray(prompt), *media)
-        empty = model.apply(variables, prompt.shape[0], method=model.init_cache,
-                            mutable=["cache"])[1]["cache"]
-        _, prefilled = capturing(model, {**variables, "cache": empty}, inputs, mutable=["cache"],
-                                 method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()))
-        cache = prefilled.pop("cache")
-        _, canvased = capturing(model, {**variables, "cache": cache}, jnp.asarray(canvas), **conditioning)
-        return min(margin(fields, prefilled, "prefill"), margin(fields, canvased, "canvas"))
-
-    def clears(drawn) -> bool:
+    def __init__(self, config):
         with jax.enable_x64(new_val=True):
-            return routed(*drawn) > NARROW_MARGIN
+            model = adapter.build(config, dtype="float64", attention_impl="xla")
+            variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+        self.truth = dew_canvas(model, variables, self._recording)
+        self.held: dict = {}
+        self.routes: list = []
 
-    return lambda seed: clearing(draw, clears, tries=256)(seed)
+    def chosen(self, inputs) -> list:
+        """The float64 run's choices for `inputs`, computed once a draw."""
+        key = tuple(np.asarray(value).tobytes() for value in inputs)
+        if key not in self.held:
+            self.routes = []
+            with jax.enable_x64(new_val=True):
+                self.truth(*inputs)
+            self.held[key] = self.routes
+        return self.held[key]
+
+    def _recording(self):
+        def record(next_fun, args, kwargs, context):
+            made = next_fun(*args, **kwargs)
+            if isinstance(context.module, Gemma4TextRouter) and context.method_name == "__call__":
+                self.routes.append(np.asarray(made[-1]))
+            return made
+        return nn.intercept_methods(record)
+
+    def replayed(self, inputs):
+        """A context replaying `inputs`' choices into Dew's routers, in order."""
+        routes = iter(self.chosen(inputs))
+
+        def replay(next_fun, args, kwargs, context):
+            if isinstance(context.module, Gemma4TextRouter) and context.method_name == "__call__":
+                kwargs = {**kwargs, "routes": (jnp.asarray(next(routes)), None)}
+            return next_fun(*args, **kwargs)
+        return nn.intercept_methods(replay)
+
+    @contextlib.contextmanager
+    def hooked(self, network, inputs):
+        """transformers' routers of `network` replaying `inputs`' choices, in order, within the block."""
+        import torch
+
+        routes = iter(self.chosen(inputs))
+
+        def replay(module, _, output):
+            selected = torch.from_numpy(next(routes)).long().reshape_as(output[2])
+            weights = output[0].gather(-1, selected)
+            weights = weights / weights.sum(-1, keepdim=True) * module.per_expert_scale[selected]
+            return output[0], weights, selected
+
+        hooks = [module.register_forward_hook(replay) for name, module in network.named_modules()
+                 if name.endswith(".router")]
+        try:
+            yield
+        finally:
+            for hook in hooks:
+                hook.remove()
 
 
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
@@ -210,8 +245,11 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
     and the vision conditioner in bfloat16: each canvas forward tests/test_block_diffusion.py holds in
     float32 (bare, self-conditioned, image-conditioned), Dew's bfloat16 canvas logits on par with
     transformers' own bfloat16 forward over drawn prompts, canvases, previous logits and pixels
-    (`canvas_draw`) whose routing the float64 run decides by bfloat16's margin (`routed_canvas_draw`), both
-    measured from the float64 twin of the stored float32 weights (check 1)."""
+    (`canvas_draw`), both measured from the float64 twin of the stored float32 weights (check 1), each
+    bfloat16 arm's experts pinned to Dew's float64 run's choices (`PinnedRoutes`): bfloat16 moves the
+    routers' scores past every draw's least margin (over 512 draws a form, the pair movement 1.7 to 4.6
+    of the scores' scale against least margins of at most 0.15), so no margin precondition admits a draw,
+    and an unpinned draw's flips spread both arms' errors past check 1's resolution (row 4739)."""
     import torch
 
     config = json.loads((WORKFLOW / "config.json").read_text())
@@ -222,19 +260,29 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
     stored = canvas_model(WORKFLOW)
     narrow = copy.deepcopy(stored).to(torch.bfloat16)
     reference_arm, truth = transformers_arms(narrow, transformers_canvas, source=stored)
-    canvas = dew_canvas(model, variables)
+    pinned = PinnedRoutes(config)
 
     @as_given
     def dew(*inputs):
+        canvas = dew_canvas(model, variables, lambda: pinned.replayed(inputs))
         return {"logits": jnp.asarray(canvas(*inputs)["logits"], jnp.float32)}
+
+    @as_given
+    def reference_pinned(*inputs):
+        with pinned.hooked(narrow, inputs):
+            return reference_arm(*inputs)
 
     draws = {"bare": canvas_draw(reference["prompt"], reference["canvas"], 64),
              "conditioned": canvas_draw(reference["prompt"], reference["canvas"], 64, previous=True),
              "image_logits": canvas_draw(reference["image_prompt"], reference["canvas"], 64,
                                          pixels=reference["pixels"])}
     for name, draw in draws.items():
-        assert_as_exact(dew, reference_arm, routed_canvas_draw(config, draw), f"workflow {name} bfloat16",
-                        seeds=CANVAS_SEEDS, truth_fn=truth)
+        assert_as_exact(dew, reference_pinned, draw, f"workflow {name} bfloat16 pinned routing",
+                        seeds=PINNED_SEEDS, truth_fn=truth)
+
+
+PINNED_SEEDS = 32
+"""The pinned site's declared seeds, sized by `seeds_for` paired: 32 for each form (row 4739)."""
 
 
 def bfloat16(bits: np.ndarray) -> jax.Array:
