@@ -360,7 +360,7 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     def logits(loaded):
         return jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens))
 
-    assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=4)
+    assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=8)
 
 
 def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
