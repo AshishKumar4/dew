@@ -181,3 +181,18 @@ def test_groups_started_and_stopped_from_many_threads_at_once_each_end_as_their_
 
     with ThreadPoolExecutor(16) as pool:
         assert list(pool.map(ran, range(400))) == [0] * 400
+
+
+def test_raised_names_each_error_a_process_ended_with_whatever_its_names_capitals():
+    """`raised` names every error class a traceback closes with, those whose second letter is a capital
+    among them (OSError, json.decoder.JSONDecodeError), as its docstring promises."""
+    from process_support import raised
+
+    program = ("import json, sys\n"
+               "try:\n"
+               "    json.loads('{')\n"
+               "finally:\n"
+               "    raise OSError('gone')\n")
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=60,
+                          check=False)
+    assert {"json.decoder.JSONDecodeError", "OSError"} <= raised(done).keys(), done.stderr

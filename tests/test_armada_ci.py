@@ -893,7 +893,9 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     """A census task, run as armada starts it from `plan --census`'s entry, runs its tests with CENSUS set,
     where the accuracy gate compiles check 1's arms with YNNPACK's fusions on (tests/reference_error.py), and
     writes nothing to the test cache: its green row, run in another numerical mode than its inputs say, is
-    reused by no later run, and a red one replaces no green. An ordinary task sees no CENSUS."""
+    reused by no later run, and a red one replaces no green. An ordinary task sees no CENSUS, whatever this
+    test's own process runs under (the census's whole suite sets it here too: row 4660)."""
+    monkeypatch.delenv(ci.check1_wire().CENSUS, raising=False)
     (tmp_path / "tests/test_seen.py").write_text(
         "import os\n"
         "from pathlib import Path\n"
