@@ -40,7 +40,6 @@ parses its flags itself, through `absl.app` or `FLAGS(argv)`, still does.
 from importlib import import_module as _import_module
 from typing import TYPE_CHECKING
 
-import egglog as _egglog
 from absl import flags as _flags
 
 from dew._devices import (
@@ -51,10 +50,6 @@ from dew._devices import (
 )
 from dew._exports import lookup as _lookup
 
-# egglog's builtin declarations keep the frame of the module that first imports egglog, and through it every
-# caller's, until each is first used: imported here, it holds `import dew`'s importer alone, never the locals
-# of a call that compiles a process's first program through the algebra pass (dew.algebra).
-del _egglog
 _keep_roundings()
 _divide_exactly()
 _unpartition_gpu_pool()

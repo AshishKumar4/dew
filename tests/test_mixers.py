@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
+from port_support import row_names_port
 from reference_error import assert_as_exact, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
 
@@ -33,7 +34,6 @@ from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.cross_attention import CrossAttention
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall
-from dew.nn.kernels.generation import chosen
 from dew.nn.memory import Gate, InContextMemory, MLPMemory
 from dew.nn.mixer_base import MLP_RESIDUALS, MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
@@ -599,7 +599,6 @@ def test_a_cross_attention_feed_forward_keeps_its_rungs_where_the_trunk_has_none
 
 
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
-@chosen(gated_delta_rule="fla")
 def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.marks`), so
     a kind may name only what its layer marks: under `jax.checkpoint` a policy saving each one alone
@@ -607,8 +606,7 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     both its 'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are
     its port's (`row_names_port`, interpreted off a GPU), named within its rule's declared span
     (`derivatives.declared_derivative`), whose saved residuals JAX reports as the span's outputs; the
-    port runs at the default product precision its fp32 products are declared at
-    (`recurrence_chunk._port_precision`; the suite's lanes configure 'highest')."""
+    port runs at the default product precision its fp32 products are declared at."""
     from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -620,7 +618,8 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     variables = model.init(jax.random.key(4), tokens)
 
     def loss(variables):
-        return jnp.sum(model.apply(variables, tokens) ** 2)
+        with row_names_port("gated_delta_rule", "fla"):
+            return jnp.sum(model.apply(variables, tokens) ** 2)
 
     def saved(names):
         capsys.readouterr()
@@ -628,9 +627,8 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
         print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
         return capsys.readouterr().out
 
-    with jax.default_matmul_precision("default"):
-        nothing = saved(())
-        assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
+    nothing = saved(())
+    assert [name for name in value.marks() or () if saved((name,)) == nothing] == []
 
 
 def one_tap(kind):

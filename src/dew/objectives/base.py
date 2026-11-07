@@ -1162,8 +1162,11 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @property
     def _validation_loss(self):
-        return self.program(
-            'loss', lambda variables, batch, step: self._loss(variables, batch, step, validation=True)[0])
+        def validated_loss(variables, batch, step):
+            # Named, as JAX's compile events name its program (`dew.telemetry.compiles.Compiles`).
+            return self._loss(variables, batch, step, validation=True)[0]
+
+        return self.program('loss', validated_loss)
 
     @property
     def _validation_reduction(self):

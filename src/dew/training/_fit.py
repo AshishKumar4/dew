@@ -52,7 +52,7 @@ from dew.training.cooldown import Branch
 from dew.training.diloco import regrouped
 from dew.training.evaluation import EvalSuite, Evaluation, Split, Summary, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
-from dew.training.model_flops import TOKENS
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture, stop_capture
 from dew.training.rollout import Rollout, rolled_out
@@ -343,6 +343,8 @@ class FitRun:
     window_paused: bool = False
     """Whether the open window's capture is stopped for work beside the steps (`outside_window`), to start
     again before the next step's read."""
+    window_waits: bool = False
+    """Whether the open window's stops convert its reports as they stop (`ProfileWindow.wait`)."""
     other: float = 0.0
     first_step: float | None = None
     preempted: int | None = None
@@ -396,7 +398,7 @@ class FitRun:
         elif (profiler is not None and profile is not None and not self.tracing and self.traced == 0
                 and seen >= profile.warmup and compiled):
             start_capture(profiler)
-            self.tracing, self.window = True, profiler
+            self.tracing, self.window, self.window_waits = True, profiler, profile.wait
 
     @contextlib.contextmanager
     def outside_window(self) -> Iterator[None]:
@@ -407,7 +409,7 @@ class FitRun:
         the loop's own cadenced reads of its steps, which a profile of the loop shows; work inside a step's
         iteration (a rollout, a new shape's compile) stays too, as the step it serves."""
         if self.window is not None and not self.window_paused:
-            stop_capture(self.window, self.loss)
+            stop_capture(self.window, self.loss, wait=self.window_waits)
             self.window_paused = True
         yield
 
@@ -416,7 +418,7 @@ class FitRun:
         it until the run's cleanup waits for them and its outcome reports the window
         (`Trainer._reported_outcome`); a capture stopped for work beside the steps has stopped already."""
         if not self.window_paused:
-            stop_capture(profiler, self.loss)
+            stop_capture(profiler, self.loss, wait=self.window_waits)
         self.window, self.window_paused = None, False
         self.profiled = (self.traced, self.current, str(profiler.directory))
 
@@ -760,16 +762,17 @@ def resized(batch: Batch, rows: int) -> Batch:
     return jax.tree.map(cut, batch)
 
 
-EMPTIED = (VALID_ROWS, EXAMPLES_CONSUMED, TOKENS)
+EMPTIED = (VALID_ROWS, EXAMPLES_CONSUMED, TOKENS, TRAINING_FLOPS)
 """The fields a batch a share steps with once its stream has run out holds zero (`emptied`): no row real,
-none consuming an example, none counting a token."""
+none consuming an example, none counting a token, none counting work (train/flops and train/mfu count the
+rows that train, row 4403)."""
 
 
 def emptied(batch: Batch) -> Batch:
     """A share's prepared `batch` of the pool's tree on the host, with no row real, none consuming an
-    example and none counting a token (`EMPTIED`): what the share steps with once its stream has run out
-    and another share's reads on, so it trains nothing and its pool's programs and collectives stay one.
-    Its rows' other fields stand as they were, masked."""
+    example, none counting a token and none its work (`EMPTIED`): what the share steps with once its
+    stream has run out and another share's reads on, so it trains nothing and its pool's programs and
+    collectives stay one. Its rows' other fields stand as they were, masked."""
     return {**batch, **{name: jax.tree.map(np.zeros_like, batch[name]) for name in EMPTIED if name in batch},
             CONSUMED_COUNT: ConsumedCount(0)}
 
