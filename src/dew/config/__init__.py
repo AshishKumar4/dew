@@ -1067,14 +1067,15 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
-    decision run's option text as its rows wrote it (`earlier_option_text`); its data plan version as the
-    one it read by (`earlier_data_plan`); a chain's store under the
-    fields its class renamed since, by today's names (`dew.data.records.earlier_chains`).
+    decision run's option text as its rows wrote it (`earlier_option_text`), and the fewest options its
+    rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); its data plan version
+    as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
+    by today's names (`dew.data.records.earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return records.earlier_chains(earlier_data_plan(earlier_option_text(earlier_profile(
-        earlier_newton_schulz(earlier_trainer(record))))), _CHAINS)
+    return records.earlier_chains(earlier_data_plan(earlier_option_text(earlier_none_of_the_above(
+        earlier_profile(earlier_newton_schulz(earlier_trainer(record)))))), _CHAINS)
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -1104,6 +1105,30 @@ def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
             field.name for field in dataclasses.fields(run_class)}:
         return record
     return {**record, "fields": {**named[1], "option_text": "named"}}
+
+
+DECISION_OBJECTIVE = "dew.decision.objective:DecisionObjective"
+"""The decision objective's import path, as a saved run's record names its objective
+(`ObjectiveConfig.name`)."""
+
+
+def earlier_none_of_the_above(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved decision run's record whose objective states the fewest options its rows draw "none of the
+    above" on (`none_of_the_above_options`) neither in its fields nor in the defaults it recorded: saved
+    before the argument, its rows drew it on every choice, a yes or a no among them, so it reads 0, as
+    they drew; a run saved since records its own (row 2938: the default became 3). Carried to 1.0 (ledger
+    1552)."""
+    named = registry.class_record(record)
+    objective = None if named is None else named[1].get("objective")
+    if not isinstance(objective, Mapping) or not isinstance(objective.get("name"), str):
+        return record
+    stated, defaulted = objective.get("fields", {}), objective.get("defaults", {})
+    if (registry.import_path(objectives[objective["name"]]) != DECISION_OBJECTIVE
+            or not isinstance(stated, Mapping)
+            or not isinstance(defaulted, Mapping) or "none_of_the_above_options" in {*stated, *defaulted}):
+        return record
+    earlier = {**objective, "defaults": {**defaulted, "none_of_the_above_options": 0}}
+    return {**record, "fields": {**named[1], "objective": earlier}}
 
 
 def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:

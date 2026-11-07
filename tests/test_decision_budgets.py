@@ -276,7 +276,8 @@ def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
 def test_a_yes_or_no_draws_no_none_of_the_above_by_default_and_a_recorded_run_keeps_its_floor():
     """An objective left at its defaults draws no "none of the above" on a choice of two options, a yes
     or a no, which it would turn into another question, and draws it on one of three (row 2938); a run
-    recorded when the floor defaulted to none builds with that floor, as it trained."""
+    recorded when the floor defaulted to none builds with that floor, as it trained, and one saved before
+    the floor existed reads it as none (`earlier_run`), as its rows drew."""
     from dew.config import ObjectiveConfig
     from dew.decision.objective import DecisionObjective
     from dew.decision.rows import NONE_OF_THE_ABOVE, QuestionRows
@@ -302,6 +303,19 @@ def test_a_yes_or_no_draws_no_none_of_the_above_by_default_and_a_recorded_run_ke
                                defaults={**defaulted.defaults, "none_of_the_above_options": 0})
     assert defaulted.defaults["none_of_the_above_options"] == 3
     assert recorded.arguments["none_of_the_above_options"] == 0
+    # A run saved before the argument records none of it, and reads as its rows drew: on every choice.
+    from dew.config import earlier_run
+
+    def saved(defaults):
+        objective = {"name": "dew.decision.objective:DecisionObjective",
+                     "fields": {"none_of_the_above": 1.0}, "defaults": defaults}
+        return {"class": "dew.decision.config:DecisionRunConfig", "fields": {"objective": objective}}
+
+    before = {name: value for name, value in defaulted.defaults.items()
+              if name != "none_of_the_above_options"}
+    read = earlier_run(saved(before))["fields"]["objective"]["defaults"]
+    assert read["none_of_the_above_options"] == 0
+    assert earlier_run(saved(defaulted.defaults))["fields"]["objective"]["defaults"] == defaulted.defaults
 
 
 def test_a_none_of_the_above_draw_never_leaves_a_row_unfit():
