@@ -1,14 +1,16 @@
-"""The weight-only compressed-tensors checkpoints under tests/fixtures/codecs/storage (FP8 and NVFP4,
-tools/nvfp4_storage_reference.py's files), each run by the format author's own CPU reader
+"""The compressed-tensors checkpoints under tests/fixtures/codecs: weight-only storage (FP8 and NVFP4,
+tools/nvfp4_storage_reference.py's files) and NVFP4 with input QDQ under either local-scale rounding
+(tools/nvfp4_qdq_reference.py's), each run by the format author's own CPU reader
 (compressed-tensors 0.17.1 under transformers 5.16.1) on drawn ids, in float32 and float64: the reference
-arm of tools/venv_reference.py's `codec-storage-<kind>` sites (its protocol tools/reference_worker.py), on
+arm of tools/venv_reference.py's `codec-<family>-<kind>` sites (its protocol tools/reference_worker.py), on
 the CPU.
 
-    python tools/codec_worker.py codec-storage-KIND    `IN OUT` lines on stdin, each `done`
+    python tools/codec_worker.py codec-FAMILY-KIND    `IN OUT` lines on stdin, each `done`
 
-The decoded weights run in float32 with weight QDQ off, and in float64 (`float64_twin`, its rotary table
-float64's, the float32 read's values in it). IN holds each draw's `<draw>.ids` `[B, T]`; OUT gets
-`<draw>.reference.logits` and `<draw>.truth.logits`.
+The decoded weights run in float32 with weight QDQ off and the input QDQ on where the checkpoint declares
+it, and in float64 (`float64_twin`, its rotary table float64's, the float32 read's values in it), the
+input QDQ there as published (`nvfp4_qdq_reference.quantized_as_published`). IN holds each draw's
+`<draw>.ids` `[B, T]`; OUT gets `<draw>.reference.logits` and `<draw>.truth.logits`.
 """
 
 import sys
@@ -18,16 +20,19 @@ import numpy as np
 import torch
 from reference_worker import serve
 
-STORAGE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "storage"
+CODECS = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs"
+FAMILIES = ("storage", "nvfp4_qdq")
+"""The checkpoint families the worker runs: weight-only storage, and NVFP4 with input QDQ."""
 
 
-def run(kind: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def run(family: str, kind: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's logits, in float32 and float64."""
+    from compressed_tensors.quantization import QuantizationStatus
+    from nvfp4_qdq_reference import quantized_as_published
+    from torch_precision import float64, float64_twin
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64, float64_twin
-
-    directory = STORAGE / kind
+    directory = CODECS / family / kind
     model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32, attn_implementation="eager")
     # PreTrainedModel.float refuses quantized models even after their weights are decoded; Module.float
     # promotes that decoded tree.
@@ -35,20 +40,25 @@ def run(kind: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     exact = float64_twin(model, lambda: AutoModelForCausalLM.from_pretrained(
         directory, dtype=torch.float64, attn_implementation="eager"))
     for module in (*model.modules(), *exact.modules()):
-        module.quantization_enabled = False
+        if family == "storage":
+            module.quantization_enabled = False
+        elif hasattr(module, "quantization_status"):
+            # The decoded weights' QDQ again is redundant; the input QDQ stays (tools/nvfp4_qdq_reference.py).
+            module.quantization_status = QuantizationStatus.COMPRESSED
     out = {}
     for name in sorted({key.split(".", 1)[0] for key in cases}):
         ids = torch.from_numpy(np.asarray(cases[f"{name}.ids"])).long()
         with torch.no_grad():
             out[f"{name}.reference.logits"] = model(ids, use_cache=False).logits.numpy()
-        with float64(), torch.no_grad():
+        with float64(), torch.no_grad(), quantized_as_published():
             out[f"{name}.truth.logits"] = exact(ids, use_cache=False).logits.numpy()
     return out
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or not sys.argv[1].startswith("codec-storage-"):
+    family, _, kind = sys.argv[1].removeprefix("codec-").rpartition("-") if len(sys.argv) == 2 else ("",) * 3
+    if family not in FAMILIES:
         raise SystemExit(__doc__)
-    sys.path.insert(0, str(STORAGE.parents[3]))
+    sys.path.insert(0, str(CODECS.parents[2] / "tools"))
     torch.set_num_threads(1)
-    serve(lambda cases: run(sys.argv[1].removeprefix("codec-storage-"), cases))
+    serve(lambda cases: run(family, kind, cases))

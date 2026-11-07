@@ -29,11 +29,10 @@ from dew.registry import ModelConfig
 CODECS = Path(__file__).parent / "fixtures" / "codecs"
 CHECKPOINTS = ("modelopt/tiny", "modelopt/mixed", *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES),
                "storage/fp8", "storage/nvfp4")
-RECORDED = ("storage/fp8", "storage/nvfp4")
-"""The weight-only checkpoints, recorded over drawn ids (tools/codec_worker.py). Those with input QDQ stay
-on one draw (row 4741): ModelOpt's reference runs its author's CUDA kernels, and compressed-tensors' float64
-truth is not Dew's float64 run's (1.6e-07 RMS apart)."""
-ONE_DRAW = ("modelopt/tiny", "modelopt/mixed", *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES))
+RECORDED = ("storage/fp8", "storage/nvfp4", *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES))
+"""The compressed-tensors checkpoints, recorded over drawn ids (tools/codec_worker.py). ModelOpt's stay on
+one draw (row 4741): its reference runs its author's CUDA kernels."""
+ONE_DRAW = ("modelopt/tiny", "modelopt/mixed")
 CODEC_SEEDS = dict.fromkeys(RECORDED, 8)
 """Each checkpoint's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 
@@ -84,10 +83,9 @@ def test_a_quantized_checkpoint_computes_its_reference(name):
 
 
 @pytest.mark.parametrize("name", ONE_DRAW)
-def test_an_input_qdq_checkpoint_computes_its_reference(name):
-    """ModelOpt's NVFP4 and its per-layer FP8 and NVFP4 table, and compressed-tensors' NVFP4 with input QDQ
-    under either local-scale rounding: the author's forward of the same files on its recorded ids, held by
-    the one-draw rule (row 4741)."""
+def test_a_modelopt_checkpoint_computes_its_reference(name):
+    """ModelOpt's NVFP4 and its per-layer FP8 and NVFP4 table: the author's forward of the same files on its
+    recorded ids, held by the one-draw rule (row 4741)."""
     directory = CODECS / name
     with np.load(directory / "reference.npz") as reference:
         ids, expected, truth = reference["ids"].astype(np.int32), reference["logits"], reference["logits_f64"]
