@@ -255,12 +255,13 @@ fitted to them, and a rule set ships only with measured receipts.
   point where its selector gives the template the launch, its consumers into the epilogue where fused prices
   less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450).
 - **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
-  RMSNorm, stream and gated norms, SwiGLU; its attention next, once its call takes a program's mask fill)
-  only where the e-graph proves the region computes that call (`dew.algebra.recognize`). Each call's math is
-  declared once, as the call itself on its portable path (`implementation='xla'`), the arithmetic its
-  kernels are held to; no account of a spelling is written anywhere. Around an equation of the primitive
-  every declaration of a family holds (`rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
-  its static arguments read from the region's own constants, each choice the call takes tried. The region's
+  attention, RMSNorm, stream and gated norms, SwiGLU) only where the e-graph proves the region computes that
+  call (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
+  (`implementation='xla'`, attention's `'reference'`), the arithmetic its kernels are held to; no account of
+  a spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
+  (`exp`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
+  its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill, which
+  the kernels take as the program holds it), each choice the call takes tried. The region's
   equations and each candidate's declaration over the same operands enter one term region in a normal form
   (nested programs inlined, constants folded, a square a product, a narrow float's arithmetic its float32
   arithmetic rounded once, axes of one element erased, equal equations once), saturate under exactly the rule sets the call's numerics
