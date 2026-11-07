@@ -117,8 +117,8 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
         lowered = jax.jit(lambda x: x * 2 + 1).trace(jax.ShapeDtypeStruct(
             (8, 128), jnp.float32, sharding=jax.sharding.SingleDeviceSharding(devices[0]))).lower()
         backend = devices[0].client
-        options = compiler.get_compile_options(num_replicas=1, num_partitions=1, device_assignment=[[devices[0]]],
-                                               backend=backend)
+        options = compiler.get_compile_options(num_replicas=1, num_partitions=1,
+                                               device_assignment=[[devices[0]]], backend=backend)
         return cache_key.get(lowered.compiler_ir("stablehlo"), np.array(devices[:1]), options, backend)
 
     read = host_gpus("sm90", serialized, 2)
