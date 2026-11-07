@@ -863,6 +863,12 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
     entering = cotangents.entering * decays.entering
     to_last = cotangents.to_last * decays.to_last
     between = cotangents.between * decays.between
+    if between.shape[-1] > 1:
+        # A decay a key's pairs' terms `[C, C, K]` formed once, ahead of their scans: fused into the first,
+        # XLA:CPU formed them again in its every step, Kimi delta attention's derived forward and backward
+        # 14.7 s against 1.24 at 2 x 1024 tokens, 4 heads of 128 (row 1966's probe at ea6a839c5ba, a CPU
+        # host); a decay a head's, its pairs a key's alone, ran 147 ms fused against 161 so.
+        between = lax.optimization_barrier(between)
     from_on = _scanned(entering, reverse=True)
     before = _earlier(_scanned(to_last))
     # Rectangle sums: each row's terms left of a column, then the rows from a column's own row down.
