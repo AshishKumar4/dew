@@ -1351,17 +1351,11 @@ def test_a_pytest_option_the_supervisor_inherits_selects_nothing_a_row_is_kept_o
     test is red, and no later run reuses a green row its tests would not give (row 2558)."""
     written(tmp_path, {"test_a.py": "def test_passes():\n    assert True\n\n\n"
                                     "def test_fails():\n    assert False\n"})
-    interpreter(tmp_path, "3.12")
-    url, _, _ = cache_worker
-    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
-    cached(monkeypatch, url)
-    out = tmp_path / "verdict.json"
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     monkeypatch.setenv("PYTEST_ADDOPTS", "-k 'not test_fails'")
-    ci.task("3.12", ["tests/test_a.py"], "", out, 600.0)
-    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [1]
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [1]
     monkeypatch.delenv("PYTEST_ADDOPTS")
-    ci.task("3.12", ["tests/test_a.py"], "", out, 600.0)
-    assert [row["exitCode"] for row in json.loads(out.read_text())["rows"]] == [1]
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [1]
 
 
 def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkeypatch, cache_worker):
