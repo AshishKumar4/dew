@@ -17,10 +17,10 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import jax
 from etils import epath
@@ -31,9 +31,11 @@ from dew._coordination import agreed_same, from_every_process, reading_home, see
 from dew._files import staged
 from dew._records import JSON, json_value
 from dew.checkpoints import RUN_FILE
+from dew.registry import trust_sources, trusts_source
 
 if TYPE_CHECKING:
     from flax import linen as nn
+    from jax.typing import DTypeLike
 
     from dew.batch import Variables
     from dew.diffusion.process import Process
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.inputs import InputSpec
+    from dew.interop.pretrained import Pretrained
     from dew.interop.releases import ReleasePlan
     from dew.lora import LoRA
     from dew.nn.attention import AttentionImpl
@@ -307,3 +310,66 @@ def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
     else:
         export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
     from_every_process(None)  # every process reads the release once it is published
+
+
+def native_release(source: str | Path) -> bool:
+    """Whether `source` is a local directory holding a run's native release (`dew.inference.loading.
+    released_model`), whose files no family's loader reads: a saved run's export where no family's layout
+    states its model (`run_plan`) among them."""
+    from dew.inference.loading import released_model
+
+    return Path(source).is_dir() and released_model(epath.Path(source))
+
+
+def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *, mesh: MeshSpec | Mesh | None,
+                                      layout: Layout | None, dtype: DTypeLike | None,
+                                      param_dtype: DTypeLike | Literal["auto"] | None, on_host: bool,
+                                      building: Mapping[str, object]) -> Loaded:
+    """The native release in `source` as the `kind` of source a run starts from: its run's step
+    (`dew.inference.models.ReleasedRun`) as its task's bundle (`ReleasedTask.source_of`; row 4776: such a
+    release's record states no dtypes a family's load reads, and a run started from it raised KeyError),
+    placed on `mesh` under `layout`, or on the host (`on_host`), every tree of it, computing in `dtype`
+    and stored in `param_dtype` ("auto": as the release stores it). A load option that builds a
+    family's model another way (`building`, set where neither None nor False, a 0 among them) is
+    refused, as the release builds the model its run recorded, and so is a bundle of another kind than
+    `kind`."""
+    from dew.inference.models import ReleasedRun
+    from dew.objectives.base import ReleasedTask
+
+    built = [name for name, value in building.items() if value is not None and value is not False]
+    if built:
+        raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
+                         f"load it without {', '.join(built)}")
+    run = ReleasedRun.of(str(source))
+    task = run.objective.saved_task
+    if task is None or not issubclass(task, ReleasedTask):
+        raise ValueError(f"{source} is the native release of a {run.objective.__name__} run, which declares "
+                         "no task a run starts from")
+    bundle = task.source_of(run, mesh=mesh, layout=layout, dtype=dtype,
+                            param_dtype=None if param_dtype == "auto" else param_dtype)
+    if not isinstance(bundle, kind):
+        raise TypeError(f"{source} is a {type(bundle).__name__} source, not a {kind.__name__}; load it with "
+                        f"{type(bundle).__name__}.load or Pretrained.load")
+    return bundle.map_variables(jax.device_get) if on_host else bundle
+
+
+def released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:
+    """The source a load reads, itself or a saved run's release (`released_run`), and whether the load
+    runs its own code (`_runs_code`): a trusted run's release is trusted with it, as the processor's
+    record names the release."""
+    runs = _runs_code(str(name_or_dir), asked)
+    released = released_run(name_or_dir, **release)
+    if runs and released != name_or_dir:
+        trust_sources((str(released),))
+    return released, runs
+
+
+def _runs_code(name: str, asked: bool | None) -> bool:
+    """Whether a load of `name` runs the source's own code: as `asked`, or, where None, as the process
+    trusts the source (`dew.registry.trusts_source`). A load asked to run it trusts the source for the
+    process, so a processor reloaded from its record runs that code too (`load_processor`)."""
+    if asked is None:
+        return trusts_source(name)
+    if asked:
+        trust_sources((name,))
+    return asked
