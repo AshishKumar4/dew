@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A profile window may convert its reports as it stops, in the run's own process (`ProfileWindow(wait=True)`),
+  as `Profiler.stop(wait=True)` does: a short interactive run's, or one whose sandbox forbids it to create a
+  process. By default a window's reports still convert in a process of their own while the run trains on.
 - A streamed Parquet store reads file by file: its shards are its files, each read row group by row group,
   its footer read as its reader reaches it, so a stream's first record waits for one file's footer, where it
   waited for every one's (FineWeb-Edu's default configuration, 2410 files on the Hub: 196 s). This is data
