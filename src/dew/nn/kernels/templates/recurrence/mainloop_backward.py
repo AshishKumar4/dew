@@ -571,8 +571,9 @@ def _reverse_carried(call: Call, slots, grad: list, out: Parts, columns, issue: 
         return algebra.key_reverse_carried(grad, keys, weights, queries, out, local, kept, held.dtype, issue)
     gate, low = (family.rows_of(ref.at[h, span]) for ref in prefix)
     ending, ending_low = (jnp.full((chunk,), ref[h, last]) for ref in prefix)
+    kept = [algebra.raised(*(jnp.full((call.block,), ref[h, last]) for ref in prefix))[:, None]] * len(grad)
     return algebra.reverse_carried(grad, keys, weights, queries, out.value(), local, gate, low, ending,
-                                   ending_low, scale, held.dtype, issue)
+                                   ending_low, kept, scale, held.dtype, issue)
 
 
 def _values_gated_back(call: Call, slots, columns, out: Parts, dv, betas, skip) -> tuple:
