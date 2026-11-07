@@ -151,14 +151,13 @@ def _held(kind: Kind) -> tuple[str, ...]:
 
 def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                     output_kinds: tuple[Kind, ...], initial: bool, residuals: Kept, output_mod, block_k: int,
-                    interpret: bool, guard: str):
+                    interpret: bool):
     """The forward's Triton mainloop: one program a query block and head walks the key tiles its form
     gives it (every tile, the causal diagonal's, or the spans' block map), issuing the tile's two
-    products and calling the algebra between them (`attention_algebra`). Under headroom
-    (`algebra.Forward.headroom`) the plain launch (`guard` 'flag') also writes which of its rows'
-    weighted values overflowed, and a second launch (`guard` 'rewalk', the plain launch's outputs its
-    own) walks again, each row shifting as it needs, only the programs one of whose rows did; the plain
-    walk itself is unchanged (`guard` 'none' where no row can overflow)."""
+    products and calling the algebra between them (`attention_algebra`), under the default's guards as
+    the plain-JAX mainloop's program takes them (`algebra.walked`): its sums' headroom, a row whose
+    weighted values overflowed walking again shifting, and the fold's reach, a program one of whose rows'
+    maximum passes it walking again natural. Ordinary inputs take the plain walk alone."""
     refs = list(refs)
     spans = bounds = ids = None
     if spec.form == "spans":
@@ -173,14 +172,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     score_refs = [refs.pop(0) for _ in score_kinds]
     output_refs = [refs.pop(0) for _ in output_kinds]
     initial_refs = [refs.pop(0) for _ in range(3 if initial else 0)]
-    flags_ref = refs.pop(0) if guard == "rewalk" else None
-    if guard == "rewalk":
-        # The plain launch's outputs enter as inputs aliased to this launch's outputs, which follow them
-        # one for one (`input_output_aliases`); the program writes the outputs and reads no input of them.
-        aliased = len(refs) // 2
-        refs = refs[aliased:]
     out_ref, *residual_refs = refs
-    flag_ref = residual_refs.pop() if guard == "flag" else None
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
     first_query = pl.program_id(0) * block_q
@@ -188,16 +180,16 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     query = query_ref[...]
     q_pos = first_query + jnp.arange(block_q)[:, None]
 
-    def keys_at(index) -> algebra.Keys:
-        # A key tile's logits; its values load where the step calls for them, after the softmax, where
-        # jax's mha loads them.
+    def keys_at(form: algebra.Forward, index) -> algebra.Keys:
+        # A key tile's logits in `form` (the call's, or the fold's rewalk's); its values load where the step
+        # calls for them, after the softmax, where jax's mha loads them.
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :],
                                 None if spans is None else (spans,),
                                 None if ids is None else (ids[0], ids[1][tile]))
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
-        logits = algebra.modify(spec, kernel_dot(query, key_ref[tile, :].T, interpret), coords, params)
+        logits = algebra.modify(form, kernel_dot(query, key_ref[tile, :].T, interpret), coords, params)
         values = algebra.Operand((block_k, value_ref.shape[-1]), value_ref.dtype, lambda: value_ref[tile, :])
         return algebra.Keys(coords, logits, values, functools.partial(kernel_dot, interpret=interpret))
 
@@ -208,40 +200,24 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     resumed = (initial_refs[0][...], initial_refs[1][...], initial_refs[2][...]) if initial else None
     training = residuals is Kept.SPLIT
 
-    def walk(live=None):
-        # The plain walk where `live` is None, else the guarded one, those rows shifting.
-        return program.walk(spec, lo, hi, keys_at, rows, resumed, block_q, value_ref.shape[-1], live=live,
-                            training=training)
+    def walk(form: algebra.Forward, live):
+        # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows shifting.
+        return program.walk(form, lo, hi, functools.partial(keys_at, form), rows, resumed, block_q,
+                            value_ref.shape[-1], live=live, training=training)
 
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
-    finished = functools.partial(program.finished, spec, keys_at=keys_at, rows=rows, bounds=(lo, hi),
-                                 resumed=resumed, training=training, output_mod=output_mod,
-                                 output_params=output_params)
-    written = functools.partial(_written, rows=rows, out_ref=out_ref, residual_refs=residual_refs,
-                                flag_ref=flag_ref, residuals=residuals, finished=finished)
 
-    if flags_ref is None:
-        written(walk())
-        return
-    live = flags_ref[...] > 0
+    def finished(form: algebra.Forward, carry):
+        # A walk's outputs in `form` (`program.finished`): the normalized output, its maximum and
+        # denominator, and a training walk's (`Kept.SPLIT`) anchors and split sums.
+        return program.finished(form, carry, keys_at=functools.partial(keys_at, form), rows=rows,
+                                bounds=(lo, hi), resumed=resumed, training=training, output_mod=output_mod,
+                                output_params=output_params)
 
-    @pl.when(jnp.max(live.astype(jnp.int32)) > 0)
-    def _():
-        # Only a program one of whose rows overflowed walks again: each of those rows shifts as it needs,
-        # every other row's bits the plain walk's (`algebra.room`).
-        written(walk(live))
-
-
-def _written(walked, *, rows, out_ref, residual_refs, flag_ref, residuals: Kept, finished: Callable):
-    """A forward walk's output and residuals written: which rows overflowed where the launch flags them, its
-    outputs (`program.finished`: the normalized output, its maximum and denominator, and a training walk's,
-    `Kept.SPLIT`, anchors and split sums), `Kept.OUTPUT` the first three alone, the plain walk's."""
-    split = residuals is Kept.SPLIT
-    if flag_ref is not None:
-        weighted = algebra.joined(walked, rows).acc if split else walked.acc
-        flag_ref[...] = algebra.overflowed(weighted).astype(jnp.float32)
-    out, m, denominator, *kept = finished(walked)
+    # A training walk's weighted values are its split sums joined, where they overflow.
+    weighted = (lambda carry: algebra.joined(carry, rows).acc) if training else None
+    out, m, denominator, *kept = algebra.walked(spec, walk, finished, weighted)
     out_ref[...] = out.astype(out_ref.dtype)
     if residuals is not Kept.NONE:
         residual_refs[0][...] = m
@@ -337,30 +313,11 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
             interpret=interpret)
-        launch = functools.partial(
-            launches.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
-        if not spec.headroom:
-            out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
-                         out_shape=out_shape, name=report.named("attention_forward"))(*arrays)
-            return (tuple(out) if residuals is not Kept.NONE else out[0]), None
-        # The plain launch writes which rows overflowed; the second, issued only where one did, walks again
-        # only the programs with one, its outputs the plain launch's (`_forward_kernel`): ordinary inputs
-        # take the one launch and a check.
-        flagged = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
-        *out, flags = launch(functools.partial(kernel, guard="flag"), in_specs=in_specs,
-                             out_specs=[*out_specs, per_row], out_shape=[*out_shape, flagged],
-                             name=report.named("attention_forward"))(*arrays)
-        first = len(arrays) + 1
-
-        def rewalked(out):
-            return tuple(launch(functools.partial(kernel, guard="rewalk"),
-                                in_specs=[*in_specs, per_row, *out_specs], out_specs=out_specs,
-                                out_shape=out_shape, name=report.named("attention_forward_headroom"),
-                                input_output_aliases={first + index: index for index in range(len(out))},
-                                )(*arrays, flags, *out))
-
-        out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: out, tuple(out))
+        out = launches.pallas_call(
+            kernel, grid=(queries // block_q, batch, heads), interpret=interpret,
+            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
+            in_specs=in_specs, out_specs=out_specs, out_shape=out_shape,
+            name=report.named("attention_forward"))(*arrays)
         return (tuple(out) if residuals is not Kept.NONE else out[0]), None
 
     GENERATES = True
@@ -377,12 +334,12 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         128 wide. Fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: equal on all 48
         configs it refused on either GPU, and every config it compiled within the budget).
 
-        A training forward whose sums can overflow (`algebra.headroom`) launches again where a row did
-        (`_forward_kernel`'s guard 'rewalk'), and its live rows take their split sums from a second walk of
-        the keys (`algebra.normalized_pass`), whose key and value tiles Triton stages beside the query and
-        weights tiles and the first walk's key stages (its IR at 32 x 64, width 256: Q, the first walk's
-        K stage, the second's K and V, 114688 bytes, past a 99 KB block, where the plain launch asks 90112):
-        the larger of the two launches. Exact at 32 x 32 and 64 x 32, width 256; the A100's compile-only
+        A training forward whose sums can overflow (`algebra.headroom`) walks again where a row did
+        (`algebra.walked`), and its live rows take their split sums from a second walk of the keys
+        (`algebra.normalized_pass`), whose key and value tiles Triton stages beside the query and weights
+        tiles and the first walk's key stages (its IR at 32 x 64, width 256: Q, the first walk's K stage,
+        the second's K and V, 114688 bytes, past a 99 KB block, where the plain walk asks 90112): the larger
+        of the two walks'. Exact at 32 x 32 and 64 x 32, width 256; the A100's compile-only
         device asked up to 512 bytes more at width 128 and 8192 at 128 x 64, width 64, each within every
         GPU's block (et-fsmem-cpu); a compile's refusal steps the launch down (`report.kept`)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
