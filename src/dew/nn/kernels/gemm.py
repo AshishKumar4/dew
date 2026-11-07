@@ -57,11 +57,11 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 reads at its tile's group (`axes.GROUPS`) and XLA's program at each row (`axes.at_rows`)."""
 
 
-def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
-         prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
-         out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
-         interpret_on_cpu: bool = False, prologue_jvp=None, compute=None, layer: jax.Array | None = None,
-         paired: jax.Array | None = None, gather: jax.Array | None = None,
+def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None = None, *,
+         transpose_rhs: bool = False, prologue=None, prologue_operands: tuple = (), epilogue=None,
+         epilogue_operands: tuple = (), out_dtype, out_dtypes: tuple | None = None,
+         precision: PrecisionLike = None, interpret_on_cpu: bool = False, prologue_jvp=None, compute=None,
+         layer: jax.Array | None = None, paired: jax.Array | None = None, gather: jax.Array | None = None,
          scatter: jax.Array | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
@@ -89,15 +89,14 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     slot reads). `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at
     each output's row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`mosaic.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
-    gather."""
-    if paired is not None and layer is not None:
-        raise ValueError("a paired product takes no stacked layer")
-    if gather is not None and (group_sizes is None or prologue is not None or layer is not None):
-        raise ValueError("gathered rows are a grouped call's, with no prologue or stacked layer")
-    if scatter is not None and group_sizes is None:
-        raise ValueError("scattered rows are a grouped call's")
-    if compute is not None and prologue is not None:
-        raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
+    gather. An NVFP4 `rhs` (`NvFp4`, row 4516) is `_nvfp4_gemm`'s, frozen."""
+    if isinstance(rhs, NvFp4):
+        return _nvfp4_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
+                           out_dtype=out_dtype, out_dtypes=out_dtypes, gather=gather, scatter=scatter,
+                           interpret_on_cpu=interpret_on_cpu,
+                           refused=(transpose_rhs, prologue, prologue_operands, layer, paired, prologue_jvp))
+    _gemm_refused(group_sizes, prologue=prologue, layer=layer, paired=paired, gather=gather, scatter=scatter,
+                  compute=compute)
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None and layer is None
@@ -177,6 +176,44 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                                    live_cotangents=True, kind=KernelGlue()))
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                           scatter)
+
+
+def _gemm_refused(group_sizes, *, prologue, layer, paired, gather, scatter, compute) -> None:
+    """`gemm`'s refusal of a call it does not take: a pair beside a stacked layer, gathered rows but a
+    grouped call's with no prologue or stacked layer, scattered rows but a grouped call's, a prologue beside
+    a named `compute`."""
+    if paired is not None and layer is not None:
+        raise ValueError("a paired product takes no stacked layer")
+    if gather is not None and (group_sizes is None or prologue is not None or layer is not None):
+        raise ValueError("gathered rows are a grouped call's, with no prologue or stacked layer")
+    if scatter is not None and group_sizes is None:
+        raise ValueError("scattered rows are a grouped call's")
+    if compute is not None and prologue is not None:
+        raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
+
+
+def _nvfp4_gemm(lhs, matrix: "NvFp4", group_sizes, *, epilogue, epilogue_operands: tuple, out_dtype,
+                out_dtypes, gather, scatter, interpret_on_cpu: bool, refused: tuple):
+    """`gemm` of an NVFP4 `matrix` (a matrix, or a bank of experts' with `group_sizes`: `nvfp4_product`'s
+    fp32 sums times the deferred factor, frozen), its epilogue on them in XLA before the one rounding, its
+    rows gathered and scattered as any; none of `refused` (a transposed matrix, a prologue, its side
+    operands, a stacked layer, a pair, a prologue's JVP) given."""
+    transpose_rhs, prologue, prologue_operands, layer, paired, prologue_jvp = refused
+    if transpose_rhs or prologue is not None or prologue_operands or layer is not None or paired is not None \
+            or prologue_jvp is not None:
+        raise ValueError("an NVFP4 matrix's product takes no prologue, pair, stacked layer or transposed "
+                         "matrix")
+    summed = nvfp4_product(lhs, matrix, group_sizes, gather=gather, out_dtype=jnp.float32,
+                           interpret_on_cpu=interpret_on_cpu)
+    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
+    if epilogue is None:
+        outs = (summed,)
+    else:
+        arrays, axes = _split(epilogue_operands, 'epilogue', group_sizes)
+        sizes = jnp.asarray([summed.shape[0]], jnp.int32) if group_sizes is None else group_sizes
+        outs = _tupled(epilogue, summed, *_rows(arrays, axes, sizes, summed.shape[0]))
+    outs = scattered(tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True)), scatter)
+    return outs if out_dtypes else outs[0]
 
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
@@ -302,6 +339,17 @@ class NvFp4:
         return (self.codes() * jnp.repeat(owed, 16, axis=-2)).astype(jnp.bfloat16)
 
     @property
+    def dtype(self) -> jnp.dtype:
+        """The dtype its decode yields (`decoded`), which it is multiplied as: bfloat16."""
+        return jnp.dtype(jnp.bfloat16)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """The shape of the matrix it stands for: `[depth, width]`, a bank's `[groups, depth, width]`."""
+        *groups, width, words = self.words.shape
+        return (*groups, 8 * words, width)
+
+    @property
     def factor(self) -> jax.Array:
         """The factor its decode defers to the product's accumulator (`bits.NVFP4_OWED` times the tensor's
         scale, a bank's one a matrix): `bits.nvfp4_decoded` keeps each value within bfloat16's normal range
@@ -409,8 +457,8 @@ where a receipt measured it faster (a decode-sized call on an A100 or an H100: `
 named (`generation.chosen(nvfp4='packed')`), and it plans a tile."""
 
 
-def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None = None, *, out_dtype,
-                  interpret_on_cpu: bool = False) -> jax.Array:
+def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None = None,
+                  gather: jax.Array | None = None, *, out_dtype, interpret_on_cpu: bool = False) -> jax.Array:
     """`lhs · W` of an NVFP4 matrix `W` (`NvFp4`), its weights frozen (a quantized checkpoint's): `lhs`
     rounded to bfloat16, each value of `W` decoded exactly to bfloat16 (`NvFp4.decoded`, its block's
     scale applied, 2^8 owed), the products summed in fp32, each step's apart (`templates.product.promoted`,
@@ -420,39 +468,45 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     decoding each stage in place (`_packed`) where named, else decodes the matrix once a call (`gemm`).
     With `group_sizes`, `matrix` is a bank of experts' matrices (`NvFp4`'s group axis, row 4516) and `lhs`
     their sorted rows: each group's rows times its expert's matrix, each times its expert's factor, frozen
-    (no gradient reaches the bank)."""
+    (no gradient reaches the bank); with `gather` besides, the rows `lhs[gather]`, read where they lie as
+    `gemm`'s are (the packed kernel's producer gathering them where it does, the template's mainloop)."""
     rows = lhs.astype(jnp.bfloat16)
     launch = grouped_matmul.MosaicPackedGmm()
     words = matrix.words if group_sizes is not None else matrix.words[None]
     groups, width, depth = words.shape[0], words.shape[1], 8 * words.shape[2]
-    sizes = jnp.asarray([rows.shape[0]], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
-    bound = launch.bind(jax.ShapeDtypeStruct(rows.shape, rows.dtype),
-                        jax.ShapeDtypeStruct((groups, width, depth), jnp.bfloat16),
-                        jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype='float32', trans_rhs=True,
-                        interpret=interpret_on_cpu, dense=group_sizes is None, exact_sums=True)
+    count = rows.shape[0] if gather is None else gather.shape[0]
+    sizes = jnp.asarray([count], jnp.int32) if group_sizes is None else group_sizes.astype(jnp.int32)
+    spec = jax.ShapeDtypeStruct
+    bound = launch.bind(spec(rows.shape, rows.dtype), spec((groups, width, depth), jnp.bfloat16),
+                        spec((groups,), jnp.int32), (), (), None, None,
+                        None if gather is None else spec(gather.shape, jnp.int32), out_dtype='float32',
+                        trans_rhs=True, interpret=interpret_on_cpu, dense=group_sizes is None,
+                        exact_sums=True)
     target = generation.gpu_target()
     tile = launch.derived(bound, target) if launch.eligible(bound, target) else None
     scales = matrix.scales if group_sizes is not None else matrix.scales[None]
     if selection.select(NVFP4, PackedCase(tile, math.prod(rows.shape[:-1]))).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
-        summed = _packed(rows, words, scales, sizes, tile, interpret_on_cpu, dense=group_sizes is None)
+        summed = _packed(rows, words, scales, sizes, gather, tile, interpret_on_cpu,
+                         dense=group_sizes is None)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
         # product's, whatever precision the program defaults to.
         summed = gemm(rows, matrix.decoded(), group_sizes, out_dtype=jnp.float32,
-                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu)
+                      precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret_on_cpu, gather=gather)
     factor = matrix.factor if group_sizes is None else jnp.repeat(
-        matrix.factor, sizes, total_repeat_length=rows.shape[0])[:, None]
+        matrix.factor, sizes, total_repeat_length=count)[:, None]
     return (summed * factor).astype(out_dtype)
 
 
-def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, tile: mosaic_gpu.Tiles,
-            interpret: bool, *, dense: bool) -> jax.Array:
+def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, gather,
+            tile: mosaic_gpu.Tiles, interpret: bool, *, dense: bool) -> jax.Array:
     """The packed matrices' product in fp32 (`nvfp4_product`'s packed kernel, `words` and `scales` led by
-    their group axis, `sizes` each group's rows): the template's mainloop, each stage of `words` and
-    `scales` decoded in place (`mosaic_gpu.gmm`'s `scales`), differentiable at every order as `gemm` is
-    (`generation.linear_tangent`): its tangent the decoded product's in XLA, its reverse mode the rows'
-    gradient through the decoded values (the frozen words, scales and sizes taking none)."""
+    their group axis, `sizes` each group's rows, `gather` the rows of `rows` they are where given): the
+    template's mainloop, each stage of `words` and `scales` decoded in place (`mosaic_gpu.gmm`'s `scales`),
+    differentiable at every order as `gemm` is (`generation.linear_tangent`): its tangent the decoded
+    product's in XLA, its reverse mode the rows' gradient through the decoded values, summed back into the
+    rows a gather read (the frozen words, scales, sizes and table taking none)."""
     launch = grouped_matmul.MosaicPackedGmm()
 
     def decoded(words, scales):
@@ -460,32 +514,37 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         matrices = NvFp4(words, scales, jnp.ones((words.shape[0],), jnp.float32)).decoded()
         return matrices[0] if dense else matrices
 
-    def forward(rows, words, scales, sizes):
+    def forward(rows, words, scales, sizes, gather):
         out = mosaic_gpu.gmm(rows, words, sizes, tiles=tile, transpose_rhs=True, out_dtype=jnp.float32,
                              multiprocessors=launch._launched(tile, interpret),
                              interpret=grouped_matmul.INTERPRETED if interpret else False, dense=dense,
-                             exact_sums=True, scales=scales)
+                             exact_sums=True, scales=scales, gather=gather)
         return out, ()
 
     def backward(saved, operands, cotangent, live):
-        # The cotangent times the decoded values' transpose, summed in fp32, rounded once to the rows'.
+        # The cotangent times the decoded values' transpose, summed in fp32, rounded once to the rows', each
+        # gathered row's summed back into the row it read.
         del saved
-        rows, words, scales, sizes = operands
-        leaves = (gemm(cotangent.astype(jnp.bfloat16), decoded(words, scales), None if dense else sizes,
-                       transpose_rhs=True, out_dtype=rows.dtype, precision=jax.lax.Precision.DEFAULT,
-                       interpret_on_cpu=interpret),
-                  zero_from_primal(words), zero_from_primal(scales), zero_from_primal(sizes))
+        rows, words, scales, sizes, gather = operands
+        d_rows = gemm(cotangent.astype(jnp.bfloat16), decoded(words, scales), None if dense else sizes,
+                      transpose_rhs=True, out_dtype=rows.dtype, precision=jax.lax.Precision.DEFAULT,
+                      interpret_on_cpu=interpret)
+        if gather is not None:
+            d_rows = jnp.zeros(rows.shape, d_rows.dtype).at[gather].add(d_rows)
+        leaves = (d_rows, zero_from_primal(words), zero_from_primal(scales), zero_from_primal(sizes),
+                  *(() if gather is None else (zero_from_primal(gather),)))
         return tuple(leaves[index] for index in live)
 
-    def portable(rows, words, scales, sizes):
+    def portable(rows, words, scales, sizes, gather):
         matrices = decoded(words, scales)
-        return grouped_matmul.xla_ragged_dot(rows, matrices if not dense else matrices[None], sizes,
+        return grouped_matmul.xla_ragged_dot(rows if gather is None else rows[gather],
+                                             matrices if not dense else matrices[None], sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
 
     differentiable = contracted("test_an_nvfp4_products_kernels_hold_every_order")(
         generation.linear_tangent(forward, backward, portable, live_cotangents=True, kind=KernelGlue()))
-    return differentiable(rows, words, scales, sizes)
+    return differentiable(rows, words, scales, sizes, gather)
 
 
 BLOCKWISE_ROW = 'ledger 4518'
