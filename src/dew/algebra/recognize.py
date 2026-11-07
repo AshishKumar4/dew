@@ -173,6 +173,10 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
     """The first of one region's candidates whose call takes a kernel and which the e-graph proves equal to
     the region (`_equalities`, of the taken ones alone), its place among `members`; None where none is."""
     taken = [number for number, candidate in enumerate(members) if candidate.taken()]
+    # Each alone first, where its results are its declaration's own values; the e-graph only where none is.
+    for number in taken:
+        if _equalities(index, [(members[number], places)], accurate, saturating=False)[0]:
+            return number
     if not taken:
         return None
     equal = _equalities(index, [(members[number], places) for number in taken], accurate)
@@ -223,12 +227,12 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
 
 
 def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int, ...]]],
-                accurate: bool) -> list[bool]:
+                accurate: bool, *, saturating: bool = True) -> list[bool]:
     """Whether each candidate's results are its declaration's, in one e-graph of every span's equations and
     every declaration, saturated under the rule sets the numerics admit (the module's account). Where a
     candidate's results are already its declaration's own values in the normal form (`_canonical`: one
     term, which every rule set admits), that candidate is equal and the rest are not weighed: no e-graph
-    is built."""
+    is built; nor where not `saturating`, which weighs that alone."""
     if not spans:
         return []
     places = sorted(set().union(*(set(span) for _, span in spans)))
@@ -265,6 +269,8 @@ def _equalities(index: fusion.Index, spans: Sequence[tuple[Candidate, tuple[int,
     if any(shared):
         first = shared.index(True)
         return [number == first for number in range(len(spans))]
+    if not saturating:
+        return shared
     region = terms.region(closed)
     graph, _, _ = program.graphed(region)
     program.saturate(graph, region, rules.admitted(accurate), SATURATION)
