@@ -1737,7 +1737,7 @@ def wrote_inputs(depends: list[str], changed: Container[str]) -> bool:
     """Whether a run's inputs `depends` (followed.py's records) hold a file `changed` (`watched.changed`:
     written, removed or made) names: a file read, probed or run as a module, or the entries an import's lookup
     finds of its name (`followed.LOOKUP`, `digests.looked_up`). A directory's listing is weighed by none: a
-    file made in it is a new file, which a checkout the plan reads lacks, so no plan finds the key it leaves."""
+    file made in it is new to every checkout a plan reads, so no plan finds the key it leaves."""
     for item in depends:
         if item.startswith(followed.LOOKUP):
             looked = item[len(followed.LOOKUP):]

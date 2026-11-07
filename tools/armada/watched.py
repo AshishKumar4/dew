@@ -173,4 +173,5 @@ def stamps(root: str, hidden_inputs: tuple[str, ...]) -> dict[str, tuple[int, in
 def changed(before: dict[str, tuple[int, int, int, int]],
             after: dict[str, tuple[int, int, int, int]]) -> set[str]:
     """The files of a checkout written, removed or made between two `stamps` of it."""
-    return {path for path, stamp in before.items() if after.get(path) != stamp} | (after.keys() - before.keys())
+    made = after.keys() - before.keys()
+    return {path for path, stamp in before.items() if after.get(path) != stamp} | made
