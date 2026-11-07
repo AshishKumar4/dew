@@ -216,13 +216,30 @@ def _refuse_lossy(wrapper: MultimodalTransformer, config: Mapping[str, object]) 
         raise ExportRefused(f"the {wrapper.family} config written for this model does not read back: "
                             f"{error}") from error
     hf_decoders.refuse_rebuilt(wrapper.language_model, language, wrapper.family)
-    ours, theirs = ({name: value for name, value in record_fields(held, MultimodalTransformer).items()
-                     if name not in ("language_model", "precision", "dtype")}
+    ours, theirs = ({name: _computed(value)
+                     for name, value in record_fields(held, MultimodalTransformer).items()
+                     if name != "language_model" and name not in hf_decoders.NUMERICS_FIELDS}
                     for held in (wrapper, rebuilt))
     lost = sorted(name for name in ours.keys() | theirs.keys() if ours.get(name) != theirs.get(name))
     if lost:
         raise ExportRefused(f"{lost} would not survive an export as {wrapper.family}: its config reads back "
                             f"{', '.join(f'{name}={theirs.get(name)!r}' for name in lost)}")
+
+
+def _computed(record: object) -> object:
+    """A part's `record` as what it computes: every class record in it without its numerics fields
+    (`hf_decoders.NUMERICS_FIELDS`), which a decoder's comparison skips too (`refuse_rebuilt`), so a
+    projection built in a run's dtype exports as its family writes it (row 4776's review)."""
+    from dew.interop.hf_decoders import NUMERICS_FIELDS
+
+    if isinstance(record, Mapping):
+        if isinstance(record.get("class"), str) and isinstance(record.get("fields"), Mapping):
+            return {**record, "fields": {name: _computed(value) for name, value in record["fields"].items()
+                                         if name not in NUMERICS_FIELDS}}
+        return {key: _computed(value) for key, value in record.items()}
+    if isinstance(record, list | tuple):
+        return [_computed(value) for value in record]
+    return record
 
 
 def _tree(tree: Mapping[str, object], name: str) -> Mapping[str, object]:
