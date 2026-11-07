@@ -40,6 +40,7 @@ does not take the remote back, and the uploads still queued are dropped unsent. 
 background thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 """
 
+import contextlib
 import importlib.util
 import itertools
 import logging
@@ -103,6 +104,10 @@ class RemoteCache:
         self.seen: set[str] | None = None
         """The programs in the directory when the current bundle's run began or last moved on: listed once,
         then kept by what arrives in it (`writes`)."""
+        # JAX makes its cache directory at its first write, after this: made here, so the watch has it. One
+        # that cannot be made (a file in its place) is one the watch cannot watch: the remote is left alone.
+        with contextlib.suppress(OSError):
+            self.directory.mkdir(parents=True, exist_ok=True)
         self.writes = WATCHED.Writes(str(self.directory))
         """What arrives in the directory, JAX's programs and the bundles' own (watched.py's `Writes`): a
         bundle's switch lists no directory of hundreds of thousands of programs (row 3496)."""
