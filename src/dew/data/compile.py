@@ -136,7 +136,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, unplaced
+from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import (
     Read,
@@ -727,7 +727,9 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
            lowering: _Lowering | None = None, version: int = PLAN_VERSIONS[-1]) -> _Build:
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise, and
-    the data plan `version` it reads by, and the branch's own key where it is named (`_own_key`)."""
+    the data plan `version` it reads by (one each entry, `compile`, `iterate` and `publish`, refused where
+    this Dew reads by none of it, before anything is prepared), and the branch's own key where it is named
+    (`_own_key`)."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
     return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic,
                   version=version, named=_own_key(branch))
@@ -761,10 +763,9 @@ def compile(
     read has no record count, bounds it to that many passes over the source examples it states a pass
     holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
     it reads by (`dew.data.plan.PLAN_VERSIONS`): this Dew's, or the one a resumed run saved under, which
-    reads its order as it did (`dew.config.RunConfig.data_plan_version`)."""
-    if plan_version not in PLAN_VERSIONS:
-        raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
-                         f"{plan_version}: resume a run saved under another with the Dew that wrote it")
+    reads its order as it did (`dew.config.RunConfig.data_plan_version`), refused before anything is
+    provisioned where this Dew reads by none of it (`dew.data.plan.read_by`)."""
+    read_by(plan_version)
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
@@ -1597,6 +1598,7 @@ def iterate(
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, read by data plan
     `plan_version` (`compile`'s)."""
+    read_by(plan_version)
     if any(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
@@ -1904,6 +1906,7 @@ def validation(
     stream. With no `read`, the sources choose it (`_preferred_read`); `widths` are the run's static
     widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched; it
     reads by data plan version `plan_version`, its run's (`compile`)."""
+    read_by(plan_version)
     read = read or _preferred_read((pipeline,), provision=provision)
 
     # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).
@@ -1941,6 +1944,7 @@ def publish(
     from dew.data.generation import Generation
     from dew.data.packing import PackingPlan, plan_name
 
+    read_by(plan_version)
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, (Mixture, Phases)):

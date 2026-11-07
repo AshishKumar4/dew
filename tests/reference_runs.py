@@ -11,8 +11,9 @@ def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label
     """`dew(dtype, inputs)`, Dew's outputs at `dtype` on a seed's inputs `draw(seed)`, as exact as the
     reference's float32 run against its float64 run over `site`'s recording in `fixture` (check 1), Dew's
     float64 run its truth, held to the recorded truth's sketch (`indexed_recording`)."""
+    # Dew's float64 run compiled once for every seed, where run op by op it dispatched each seed's every op.
     drawn, reference, truth = indexed_recording(recording(fixture), site, seeds, inputs_of=draw,
-                                                truth_fn=lambda inputs: dew(jnp.float64, inputs))
+                                                truth_fn=jax.jit(lambda inputs: dew(jnp.float64, inputs)))
     compiled = jax.jit(lambda inputs: dew(jnp.float32, inputs))
     # Compiled here, so the gate runs it as given: compiling it again would compile the program twice
     # (ledger 3900).

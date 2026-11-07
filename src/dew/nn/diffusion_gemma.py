@@ -240,8 +240,8 @@ class DiffusionGemma(DecoderWrapper):
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False, positions=None,
                  coordinates: Coordinates | None = None,
-                 attention_pairwise_mask=None, attention_key_positions=None,
-                 states: bool = False, progress: Progress | None = None):
+                 attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
+                 attention_key_valid=None, states: bool = False, progress: Progress | None = None):
         """Return the canvas logits, or with `states` the final normalized states before the head.
 
         `encode` explains why a loss reads the states. Self-conditioning reads
@@ -249,7 +249,9 @@ class DiffusionGemma(DecoderWrapper):
         false get a zero signal, as they do when no logits are given. The
         canvas's `positions` are converted once to its `coordinates`
         (`token_coordinates`), the layout the decoder reads, at a training
-        step's `progress` as `encode` reads it."""
+        step's `progress` as `encode` reads it. The canvas's keys, the cache's and its own, are read
+        under a pairwise mask, or under key runs beside the keys' validity, where a call gives them
+        (`CausalTransformer`'s `attention_pairwise_mask`, `attention_key_runs`, `attention_key_valid`)."""
         tokens = jnp.asarray(tokens, jnp.int32)
         coordinates = token_coordinates(tokens.shape[:2], coordinates, positions=positions)
         if self.is_initializing() and self.conditioner is not None:
@@ -269,7 +271,8 @@ class DiffusionGemma(DecoderWrapper):
         return read(tokens, train=train, decode=not self.is_initializing(),
                     input_embeddings=conditioned, coordinates=coordinates,
                     attention_pairwise_mask=attention_pairwise_mask,
-                    attention_key_positions=attention_key_positions, progress=progress)
+                    attention_key_positions=attention_key_positions, attention_key_runs=attention_key_runs,
+                    attention_key_valid=attention_key_valid, progress=progress)
 
 
 def translate_weights(

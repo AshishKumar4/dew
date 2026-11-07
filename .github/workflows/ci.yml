@@ -48,8 +48,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/base/kernels' && !(github.event_name == 'schedule' || inputs.whole) }}
 
 env:
-  # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#636be1efc249d2dcb3d3518dee7343ed19a19c94
+  # The armada runner every armada job uses: one that waits out a redeploy's refusal of a new job (armada 1626e08),
+  # so a deploy's drain delays a run and never fails it (Main, 2026-11-06).
+  ARMADA: github:AshishKumar4/armada#1626e0880d02f04fd720e4c0ca452104047dbdd5
 
 jobs:
   # A commit this workflow passed on another push, as one proved on

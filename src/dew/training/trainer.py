@@ -1386,16 +1386,16 @@ class Trainer(Generic[Loss, Effects]):
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
-                stopped, state = self._between_steps(plan, run, interval, state, shardings, position,
-                                                     loss, aux, accepted)
-            # The step row is complete once its scope exits; closing the window here keeps the last
-            # iteration inside the capture, and counts the run's last step where the window outlives it.
+            # The step row is complete once its scope exits; the window's last step closes it before the work
+            # after it, whose evaluations, saves and cooldowns run outside it (`FitRun.outside_window`).
             if run.tracing and profile is not None:
                 run.traced += 1
                 if run.traced == profile.steps:
                     run.tracing = False
                     assert profiler is not None
                     run.close_window(profiler)
+            stopped, state = self._between_steps(plan, run, interval, state, shardings, position, loss, aux,
+                                                 accepted)
             if stopped:
                 break
         return self._wind_down(plan, run, interval, state, shardings, position, profiler)
@@ -1690,7 +1690,7 @@ class Trainer(Generic[Loss, Effects]):
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
             self._read_taken(run)
-            with region("evaluate"), run.held():
+            with run.outside_window(), run.held(), region("evaluate"):
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, names,
@@ -1712,8 +1712,9 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.cooling(branch)
         if ending:
             run.cooling, branch = branch, None
-        state, cut = (state, False) if branch is None else self._cooled(plan, run, interval, state, shardings,
-                                                                         position, branch)
+        with contextlib.nullcontext() if branch is None else run.outside_window():
+            state, cut = (state, False) if branch is None else self._cooled(plan, run, interval, state,
+                                                                             shardings, position, branch)
         # Asked at every step on every process, as JAX's agreement needs, before the step's save, so a
         # stop's save is its one save, whole; the last step ends the run. A pause falls on the same step
         # on every process, so where it is reached none asks.
@@ -2137,7 +2138,7 @@ class Trainer(Generic[Loss, Effects]):
         envelope = self._checkpoint_envelope(state, position, interval, run, weights_only=weights_only)
         write = functools.partial(checkpoints.save, step, metrics=metadata, ranking=ranking,
                                   weights_only=weights_only, **envelope)
-        with run.held():
+        with run.outside_window(), run.held():
             self._report(CheckpointRequested(checkpoints.directory), step, write)
         interval.saved(step, resumable=not weights_only)
         self._display.status("")
@@ -2163,7 +2164,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("writing a local checkpoint")
         write = functools.partial(checkpoints.save_local, step,
                                   **self._checkpoint_envelope(state, position, interval, run))
-        with run.held():
+        with run.outside_window(), run.held():
             self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
         return time.perf_counter() - paused

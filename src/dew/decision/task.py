@@ -631,8 +631,14 @@ class Decide(SavedRunTask, InItsForm):
             if request is not None:
                 raise ValueError("each of a batch's requests is its own whole request; ask a part of one "
                                  "with questions= and request=")
+            if images or context is not None:
+                raise ValueError("a batch of requests reads no one request's images or context: give each "
+                                 "request's context in contexts=, and ask a request with images alone")
             return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
                                                              [asked for _, asked in state])]
+        if contexts is not None:
+            raise ValueError("one request reads its context in context=; contexts= is a batch's, each "
+                             "request's own")
         if images:
             return self._seen(state, questions, images, context, request=request)[0]
         return self._answered([self._encoded(state, questions, context=context, request=request)],

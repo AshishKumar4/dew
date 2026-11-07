@@ -544,13 +544,15 @@ STARTS_SEEDS = 8
 
 
 @pytest.mark.parametrize("options", [{"force_fp32_for_softmax": False},
-                                     {"precision": jax.lax.Precision.HIGHEST}], ids=["softmax", "precision"])
+                                     {"precision": (jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT)}],
+                         ids=["softmax", "precision"])
 def test_key_starts_keep_the_arithmetic_auto_is_asked_for_where_the_decode_kernel_would_run(options):
     """A lone grouped query of decode-kernel widths over key starts and lengths alone, traced as on
-    an A100, asking for arithmetic only the reference path performs: 'auto' takes the reference
-    path, not the decode kernel (which refused the options by name), and is on par with the one-mask
-    form over drawn inputs (check 1, the truth the reference path's float64 run); the grouped query
-    sums in another order."""
+    an A100, asking for arithmetic only the reference path performs (an fp32 softmax's absence, or a
+    precision a pair of levels states, which no fused kernel's configuration names:
+    `attention.reference_only`): 'auto' takes the reference path, not the decode kernel (which
+    refused the options by name), and is on par with the one-mask form over drawn inputs (check 1,
+    the truth the reference path's float64 run); the grouped query sums in another order."""
     from dew.nn.kernels.generation import assumed
 
     lengths, starts = jnp.asarray([2, 40, 64], jnp.int32), jnp.asarray([1, 8, 0], jnp.int32)

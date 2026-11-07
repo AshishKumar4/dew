@@ -1669,9 +1669,9 @@ class _Build:
         shards = dataclasses.replace(shards, reader=steps)
         consumed = start if interleave is None else interleave + 1
         # A shard's stated rows are the examples it holds where the bound is only where nothing before
-        # the bound drops any.
-        ran = (*stages[:cache], *local) if transparent else local
-        dropping = (cache is not None and not transparent) or any(_drops(stage) for stage in ran)
+        # the bound drops any: a cache's own steps, which its shards' readers run, among them.
+        ran = (*stages[:cache], *local) if cache is not None else local
+        dropping = any(_drops(stage) for stage in ran)
         examples = None if dropping else self.dealt_examples(pipeline, partition, consumed)
         places, held = None, None
         if examples is not None:

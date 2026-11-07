@@ -26,6 +26,7 @@ from run_kinds import (
     merged,
     prefixed,
     requested,
+    shared,
     trained_by_cli,
 )
 
@@ -338,11 +339,12 @@ TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
              "MaskedSettings": ((masked, "masked_diffusion"), (dreamed, "masked_diffusion")),
              "ImageSettings": ((diffusion, "diffusion"),), "BlockSettings": ((blockwise, "block_diffusion"),),
              "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"),
-                                (merged, "decision"))}
+                                (merged, "decision"), (shared, "decision"))}
 """The runs here of an objective that records each saved task's settings, and the objective's name: a
 decision release's, which exports, a fresh head's over a backbone that reads blocks, a fresh letter
-readout's, whose labels its layout takes, and a fresh head's over a tokenizer that merges, whose unit a row
-shows; a masked run over a release, whose walk it takes."""
+readout's, whose labels its layout takes, a fresh head's over a tokenizer that merges, whose unit a row
+shows, and a letter readout's whose rows ask a request's questions over one state, whose siblings it reads;
+a masked run over a release, whose walk it takes."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:

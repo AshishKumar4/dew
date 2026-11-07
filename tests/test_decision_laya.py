@@ -145,7 +145,7 @@ def test_the_rule_catches_a_head_that_ignores_the_question_type():
     the head; dropping it moves the logits past the rule: check 1 decides
     against it, the truth the typed head's own float64 run."""
     drawn, reference, truth = indexed_recording(recording(FIXTURE), "laya", LAYA_SEEDS, inputs_of=draw,
-                                                truth_fn=lambda inputs: dew(jnp.float64, inputs))
+                                                truth_fn=jax.jit(lambda inputs: dew(jnp.float64, inputs)))
     untyped = jax.jit(lambda inputs: dew(jnp.float32, inputs, typed=False))
     with pytest.raises(GateFailure) as failed:
         assert_as_exact(as_given(lambda index, inputs: untyped(inputs)), reference, drawn,

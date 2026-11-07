@@ -766,7 +766,9 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
             climbed.append(stronger)
         return marked, [rung.recompute_record() for rung in climbed]
 
-    with chosen(gated_delta_rule="fla"):
+    # The port at the default product precision its fp32 products are declared at
+    # (`recurrence_chunk._port_precision`; the suite's lanes configure 'highest').
+    with chosen(gated_delta_rule="fla"), jax.default_matmul_precision("default"):
         delta, delta_rungs = kept(layer("delta_rule"))
         quantized, _ = kept(layer("delta_rule"), quantized=True)
     titans, titans_rungs = kept(layer("titans"))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import bisect
+import itertools
 import json
 import logging
 import os
@@ -346,6 +348,30 @@ class _Published:
                 raise
             outputs = _transformed(ordinal, value, transform)
             return outputs if transform is not None else outputs[0]
+
+    def finish(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def metrics(self) -> CacheStats:
+        return _READING
+
+
+@dataclass(frozen=True)
+class _Parted:
+    """A shard's records read from a generation a read of its parts filled (`_CachedIter._parted`): each
+    record its part's (`ids`, which start at `starts` among the shard's records), at its place there."""
+
+    published: _Published
+    starts: tuple[int, ...]
+    ids: tuple[str, ...]
+
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+        part = bisect.bisect_right(self.starts, ordinal) - 1
+        place = ordinal - self.starts[part]
+        return self.published.process((self.ids[part], place), place, value, transform)
 
     def finish(self) -> None:
         pass
@@ -909,7 +935,19 @@ class _CachedReader:
 
     def __call__(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
         return _CachedIter(self.reader(shard, options), self.cache, self.key, shard, self.transform,
-                           self.published, self.source, self.transparent, self.shards, self.halted)
+                           self.published, self.source, self.transparent, self.shards, self.halted,
+                           self.held_parts)
+
+    def held_parts(self) -> Mapping[str, tuple[Shard, ...]]:
+        """Each of its store's shards' finer shards a read by them fills (`ShardManifest.parted`), by the
+        shard's id, derived once for every shard this reader opens."""
+        return self._parts
+
+    @cached_property
+    def _parts(self) -> Mapping[str, tuple[Shard, ...]]:
+        if self.source is None:
+            return {}
+        return self.source.manifest(filled_version(self.key.fill)).parted(1)
 
 
 class _CachedIter(grain.IterDataset):
@@ -925,35 +963,49 @@ class _CachedIter(grain.IterDataset):
         transparent: bool,
         shards: int | None,
         halted: set[str],
+        parts: Callable[[], Mapping[str, tuple[Shard, ...]]],
     ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
         self.published, self.input_parent, self.source = published, parent, source
-        self.transparent, self.shards, self.halted = transparent, shards, halted
+        self.transparent, self.shards, self.halted, self.parts = transparent, shards, halted, parts
 
     def __iter__(self) -> grain.DatasetIterator:
         return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform,
                                self.transparent)
 
-    def writer(self) -> _Writer | _Published | _Computed:
+    def writer(self) -> _Writer | _Published | _Parted | _Computed:
         """Where its shard's records are written or read. A shard keeps its iterator's state either
-        way, so a fill resumes onto its published generation. A shard the generation holds under
-        another ID (another mount, a stream cut into more shards than it has) runs its steps and
-        writes nothing, so the key holds no rows under its IDs."""
+        way, so a fill resumes onto its published generation. A shard the generation holds as its store's
+        finer shards (a Parquet file a read by its row groups filled, `ShardManifest.parts`) reads each
+        record at its place in its part. A shard the generation holds under another ID (another mount, a
+        stream cut into more shards than it has) runs its steps and writes nothing, so the key holds no
+        rows under its IDs."""
         published = self.published
         if published is None:
             return _opened_writer(self.cache, self.key, source=self.source, shards=self.shards,
                                   halted=self.halted)
         if isinstance(published, _Computed) or published.generation.holds((self.shard.id, 0)):
             return published
-        return _Computed()
+        parted = self._parted(published)
+        return _Computed() if parted is None else parted
+
+    def _parted(self, published: _Published) -> _Parted | None:
+        """Its shard's records as the generation holds them in its store's finer shards, every one of
+        its parts held (`ShardManifest.parts`, each stating its rows); None where they are not."""
+        parts = self.parts().get(self.shard.id, ())
+        if not parts or any(part.rows is None or (part.rows and not published.generation.holds((part.id, 0)))
+                            for part in parts):
+            return None
+        starts = tuple(itertools.accumulate((part.rows or 0 for part in parts), initial=0))[:-1]
+        return _Parted(published, starts, tuple(part.id for part in parts))
 
 
 class _CachedIterator(grain.DatasetIterator):
     def __init__(
         self,
         parent: grain.DatasetIterator,
-        opens: Callable[[], _Writer | _Published | _Computed],
+        opens: Callable[[], _Writer | _Published | _Parted | _Computed],
         shard: Shard,
         transform: Transform | None,
         transparent: bool = False,
@@ -961,7 +1013,7 @@ class _CachedIterator(grain.DatasetIterator):
         super().__init__(parent)
         self.parent, self.opens, self.shard, self.transform = parent, opens, shard, transform
         self.transparent = transparent
-        self.writer: _Writer | _Published | _Computed | None = None
+        self.writer: _Writer | _Published | _Parted | _Computed | None = None
         self.ordinal: int | None = 0
         """Its records' place in the shard, the key of each; None once a transparent read resumed, whose
         saved position holds no place, so the rest of its shard is computed and kept nowhere."""
@@ -1003,5 +1055,11 @@ class _CachedIterator(grain.DatasetIterator):
 
     def close(self) -> None:
         self.parent.close()
-        if self.writer is not None:
+        if self.writer is None:
+            return
+        if self.shard.rows is not None and self.ordinal == self.shard.rows:
+            # Read to its stated last record, by a stream that stopped before asking past it (a bound
+            # that ends with it): whole, its fill seals as one read to its end does.
+            self.writer.finish()
+        else:
             self.writer.close()

@@ -35,7 +35,7 @@ from dew.mesh import BATCH_AXES
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.inputs import MixerCall
-from dew.nn.kv_cache import KVCache
+from dew.nn.kv_cache import POOLED, KVCache, leaf_name, row_axis
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.protocols import held_groups
@@ -736,16 +736,25 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
-def hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
-    """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
-    tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
+DELTA_NET = {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
+             "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}
+"""`hybrid_model`'s gated delta net's fields."""
+
+THIN_DELTA_NET = {"linear_num_key_heads": 1, "linear_num_value_heads": 1, "linear_key_head_dim": 4,
+                  "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2}
+"""A delta net of one 4-by-4 value head and a two-tap convolution: a row state of 224 bytes, under half
+a page of four tokens' keys (512 bytes), so a host tier holds more states than pages."""
+
+
+def hybrid_model(vocab_size: int = VOCAB, width: int = 16, delta_net: dict = DELTA_NET) -> CausalTransformer:
+    """Qwen3.5's stack at toy size: two gated-delta-net layers (`delta_net`'s fields), whose recurrent
+    memory and conv tail are each row's own state, and one full-attention layer, whose keys a paged server
+    pages."""
     return CausalTransformer(
         vocab_size=vocab_size, emb_features=width, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
         mlp_features=2 * width, max_seq_len=128, dtype="float32",
         layer_types=("linear_attention",) * 2 + ("full_attention",),
-        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
-            "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
-            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": delta_net}}})
 
 
 def parallel_hybrid_model(vocab_size: int = VOCAB, width: int = 16) -> CausalTransformer:
@@ -845,7 +854,7 @@ the later ones wait for the first to write it."""
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
       "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
     ((Served(9), Served(9, flipped=(0,)), Served(9)),
-     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 2,
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
       "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID),
     (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
     (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
@@ -899,7 +908,8 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
     alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
     a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
-    and its repeat reads it back with its pages (`dew.inference.pages.States`). A segment three prompts
+    and its repeat reads it back with its pages (`dew.inference.pages.States`; a tier holds as many states
+    as its host pages' bytes, one in six pages' here). A segment three prompts
     declare shared, ending inside a page (`SEGMENT`), is read by each later one from the state kept at
     its end, its last page copied into the prompt's own, one a round or all asked at once. With a host
     tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page named by the segment
@@ -915,6 +925,65 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
                            serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=site.budget,
                            seeds=(site.seeds, site.seeds))
+
+
+@pytest.mark.parametrize("host_pages", [1, 5, 6, 40])
+def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages):
+    """A hybrid server keeps as many row states on the host as the bytes of its `host_pages` pages hold
+    (ledger 4602): a state is a whole recurrent memory and conv tail, here several pages' bytes, so
+    `host_pages` states would take several times the host memory it names. Each group's state slots,
+    times one entry's bytes in the server's own store, are within its host pages' bytes in the server's
+    own pool, and one more would not be."""
+    server = Server.from_task(hybrid_task(), **{**HYBRID_SHARED, "host_pages": host_pages,
+                                                 "prefix_states": 2})
+    part = server.rows.pages[0]
+    assert part.states is not None
+    leaves = jax.tree_util.tree_leaves_with_path(server._states)
+    entry = sum(leaf.nbytes // leaf.shape[row_axis(path)] for path, leaf in leaves)
+    # The pool's leaves hold their pages on their second axis, heads first (`_pages_axis`).
+    pool = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(server.cache)
+            if leaf_name(path) in POOLED]
+    page = sum(leaf.nbytes // leaf.shape[row_axis(path) + 1] for path, leaf in pool)
+    budget = part.host * page
+    assert part.states.host.slots * entry <= budget < (part.states.host.slots + 1) * entry
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=64)
+def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
+    """A hybrid stack whose row state is smaller than a page keeps more states on the host than pages
+    (`THIN_DELTA_NET`: four states in two pages' bytes), each in its own slot: three prompts send
+    their states there as a store of one entry gives way, the third to the slot past the pages' count,
+    and their repeats read each back with its own prefix (ledger 4602's review), each request drawing
+    what it draws alone and scoring it as a full forward does (check 1)."""
+    model = hybrid_model(256, delta_net=THIN_DELTA_NET)
+    # It draws greedily to its budget alone, no end token, as the check scores every draw.
+    task = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
+                          sampling=Sampling(temperature=0, pad_token_id=0))
+    requests = (Served(9), Served(9, flipped=(0,)), Served(9, flipped=(0, 1)), Served(9, flipped=(0, 2)),
+                Served(9, flipped=(0, 1)), Served(9, flipped=(0,)))
+    serving = {**HYBRID_SHARED, "slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8),
+               "host_pages": 2, "prefix_states": 1}
+    server = Server.from_task(task, **serving)
+    assert server.rows.pages[0].states.host.slots == 4
+    assert_served_as_exact(task, requests, "thin hybrid host states", serving=serving,
+                           rounds=(1,) * len(requests), budget=8, seeds=(256, 256))
+
+
+def test_a_one_tap_convolutions_empty_state_fits_any_host_tier():
+    """A one-tap short convolution keeps an empty conv tail beside paged attention, a row state of no
+    bytes: a server of it builds, its state host tier as many slots as the pages' (ledger 4602's review),
+    with no host tier and with one."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=128, dtype="float32", layer_types=("conv", "full_attention"),
+        kinds={"conv": {"mixer": {"class": "short_conv", "fields": {"conv_L_cache": 1}}}})
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    task = TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+    for host_pages in (0, 3):
+        server = Server.from_task(task, **{**HYBRID_SHARED, "host_pages": host_pages})
+        part = server.rows.pages[0]
+        assert part.states is not None and part.states.host.slots == part.host == host_pages
 
 
 def test_a_shared_segment_is_refused_where_no_server_keeps_it_or_it_splits_its_prompt():

@@ -212,19 +212,21 @@ def test_a_step_reports_its_mfu_from_the_same_invocation_and_a_lower_one_regress
 
 
 def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmeasured_off_it(gate):
-    """The fine-tune rows time a 4B decoder's full AdamW step on an H100 and a 1.7B one's on an A100:
-    each case is one benchmark_step reads, on a declared field of the decoder, stepping the optimizer
-    it names, and off its device its four rows are not measured, never compared against another's, nor
-    failing a claim, which requires the references alone."""
+    """The fine-tune rows time a 4B decoder's full AdamW step on Hopper, an H100 or the GH200 dew-ops
+    measures Hopper on, and a 1.7B one's on an A100: each case is one benchmark_step reads, on a declared
+    field of the decoder, stepping the optimizer it names, and off its devices its four rows are not
+    measured, never compared against another's, nor failing a claim, which requires the references alone."""
     import dataclasses
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     step = load("benchmark_step")
     declared = {field.name for field in dataclasses.fields(CausalTransformer)}
-    h100, a100 = "NVIDIA H100 80GB HBM3", "NVIDIA A100-SXM4-40GB"
+    h100, gh200, a100 = "NVIDIA H100 80GB HBM3", "NVIDIA GH200 480GB", "NVIDIA A100-SXM4-40GB"
     for name, device, other in (("step finetune-4b 1x2048", h100, a100),
-                                ("step finetune-1.7b 1x2048", a100, h100)):
+                                ("step finetune-4b 1x2048", gh200, a100),
+                                ("step finetune-1.7b 1x2048", a100, h100),
+                                ("step finetune-1.7b 1x2048", a100, gh200)):
         [case] = step.cases_from_json(json.dumps([gate.STEP_CASES[name]]))
         assert case.optimizer == "adamw" and set(case.config) <= declared
         rows = [row for row in gate.BATTERY if row.name.endswith(name.removeprefix("step "))]
@@ -517,13 +519,14 @@ def test_the_servers_compiles_are_measured_cold_in_every_arm_and_round(gate, tmp
     assert not gated["compile serve dory-1.0-4b warm 16 slots"].gated
 
 
+@pytest.mark.parametrize(("kind", "gib"), [("h100", 80), ("gh200", 96)])
 def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_substituted_program(
-        gate, tmp_path, monkeypatch):
+        gate, tmp_path, monkeypatch, kind, gib):
     """`compile` plans and compiles each of a kind's steps ahead of its run for one compile-only GPU of the
-    kind's generation and memory, its attention XLA's in every arm and named so in the row (ledger 4616:
-    the GPU's attention route lowers on no compile-only GPU), in each tree's environment of the lock the GPU
-    run used, three arms a
-    round in an order kept, every sample a process of its own with an empty compile cache: a head whose
+    kind's generation and memory (Hopper's as an H100 or the GH200 dew-ops measures Hopper on), its
+    attention XLA's in every arm and named so in the row (ledger 4616: the GPU's attention route lowers on
+    no compile-only GPU), in each tree's environment of the lock the GPU run used, three arms a round in an
+    order kept, every sample a process of its own with an empty compile cache: a head whose
     planning takes half as long again regresses past COMPILE_FLOOR, and a step whose program substituted a
     kernel is unsupported, failing the gate as the gate's own; each sample's selected plan is kept. A step
     sized for another device is not compiled for this kind."""
@@ -551,17 +554,17 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
     monkeypatch.setattr(gate.subprocess, "run", child)
     trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
     out = tmp_path / "compile.json"
-    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="h100",
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind=kind,
                            lock="cuda12", rounds=6, only=["lm-dense", "lm-moe"], out=str(out),
                            environments=str(tmp_path / "environments"))
     assert gate.compile_battery(args) == 0
     results = json.loads(out.read_text())
-    assert results["target"] == {"kind": "h100", "generation": "sm90", "capacity_gib": 80, "lock": "cuda12"}
+    assert results["target"] == {"kind": kind, "generation": "sm90", "capacity_gib": gib, "lock": "cuda12"}
     dense, moe = "compile lm-dense 4x1024 (xla attention)", "compile lm-moe 4x1024 (xla attention)"
     assert [row["name"] for row in results["rows"]] == [dense, moe]
     assert len(compiled) == 2 * 3 * 6
     selected = ",".join(gate.SELECTED)
-    assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(80 << 30), "xla", selected)}
+    assert {tuple(argv) for _, argv, _, _ in compiled} == {("sm90", str(gib << 30), "xla", selected)}
     assert len({cache for _, _, cache, _ in compiled}) == len(compiled)
     assert not any(made for *_, made in compiled)
     assert {tree for tree, *_ in compiled} == {"main", "head"}
