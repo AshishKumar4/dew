@@ -877,6 +877,11 @@ class Mixture:
 
 @dataclasses.dataclass(frozen=True)
 class Phases:
+    """Pipelines a run reads one after another, each to its end (`ends`). Every phase batches alike: a
+    run's steps are one program of one batch, and a phase's end is its steps in those rows, so a phase
+    that batched otherwise would move its boundary (row 3940); a batch that grows over a run is a ramp of
+    one order (`dew.data.dataset.ramped`)."""
+
     pipelines: tuple[Pipeline, ...]
     ends: tuple[int | None, ...]
     """Where each phase ends, as `clock` counts them: at the training step it names (`phases`), or at
