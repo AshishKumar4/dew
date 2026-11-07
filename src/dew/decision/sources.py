@@ -107,8 +107,9 @@ class PretrainedDecision(Pretrained):
         inverse of `Decide.released`, which a run's task and a loaded release are both written through.
         A head no format holds (`dew.decision.formats`), a tokenizer with no files to write, a backbone
         no decoder family states and one carrying LoRA factors its model binds to no adapter are
-        refused."""
+        refused; a backbone with cross-attention is its source's family's, carrying it."""
         from dew.interop.pretrained import PretrainedDecoder
+        from dew.nn.protocols import CrossAttending
 
         if not isinstance(task.tokenizer, HFTokenizer):
             raise ValueError("a released checkpoint holds the files of a Hugging Face tokenizer, and this "
@@ -116,7 +117,13 @@ class PretrainedDecision(Pretrained):
         head = task.model.head
         decision_format(head.release_format)
         encoder, backbone = task.model.backbone, thaw(part(task.variables, "backbone"))
-        decoder = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+        # A backbone a decision context reads through cross-attention is its source's extension, which no
+        # family writes: the bundle is its source's carrying the task's model, as `Pretrained.from_saved`
+        # holds a run's, and its export refuses it (`Pretrained.export`), a run starting from it reading it.
+        crossing = isinstance(encoder, CrossAttending) and encoder.cross_attention is not None
+        source = PretrainedDecoder.from_model(encoder.with_cross_attention(None) if crossing else encoder,
+                                              backbone)
+        decoder = dataclasses.replace(source, model=encoder).bound(encoder, backbone)
         if decoder.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
                                            for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
                                            for key in path):

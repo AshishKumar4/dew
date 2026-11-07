@@ -65,7 +65,14 @@ from dew.interop.pipeline_assembly import (
 from dew.interop.processors import Processor, hosts
 from dew.interop.release import load_settings, with_rounding
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
-from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
+from dew.interop.saved_sources import (
+    RunPipeline,
+    native_release,
+    native_source,
+    pinned_run,
+    pipeline_of_run,
+    released_source,
+)
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.interop.wrappers import corrected
@@ -87,7 +94,6 @@ from dew.registry import (
     record_fields,
     resolve_dtype,
     towers,
-    trust_sources,
     trusts_source,
 )
 from dew.sampling.text import Sampling, with_ids_of
@@ -555,19 +561,37 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
-        name_or_dir, trust_remote_code = _released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
-                                                          mesh=mesh, layout=layout)
-        if _native(name_or_dir):
-            # A run's native release builds the model its run recorded (`ReleasedTask.source_of`).
-            built = {"attention_impl": attention_impl != "auto", "max_seq_len": max_seq_len is not None,
-                     "revision": revision is not None, "subfolder": subfolder is not None,
-                     "gguf_file": gguf_file is not None, "single_file": single_file is not None,
-                     "dduf_file": dduf_file is not None, "fallback": fallback is not None,
-                     "modeling_overrides": bool(modeling_overrides), "text_only": text_only,
-                     "prediction_depths": prediction_depths is not None, "dex": dex is not None,
-                     "precision": precision is not None, "scan_layers": scan_layers}
-            return _native_source(name_or_dir, [name for name, set_ in built.items() if set_], mesh=mesh,
-                                  layout=layout, dtype=dtype, param_dtype=param_dtype, on_host=on_host)
+        name_or_dir, trust_remote_code = released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
+                                                         mesh=mesh, layout=layout)
+        if native_release(name_or_dir):
+            # A run's native release builds the model its run recorded (`saved_sources.native_source`).
+            return native_source(cls, name_or_dir, mesh=mesh, layout=layout, dtype=dtype,
+                                 param_dtype=param_dtype, on_host=on_host, building={
+                "attention_impl": attention_impl != "auto", "max_seq_len": max_seq_len, "revision": revision,
+                "subfolder": subfolder, "gguf_file": gguf_file, "single_file": single_file,
+                "dduf_file": dduf_file, "fallback": fallback, "modeling_overrides": modeling_overrides,
+                "text_only": text_only, "prediction_depths": prediction_depths, "dex": dex,
+                "precision": precision, "scan_layers": scan_layers})
+        return cls._from_family(
+            name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
+            attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
+            gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file, fallback=fallback, mesh=mesh,
+            layout=layout, on_host=on_host, weights=weights, modeling_overrides=modeling_overrides,
+            text_only=text_only, prediction_depths=prediction_depths, dex=dex, precision=precision,
+            scan_layers=scan_layers)
+
+
+    @classmethod
+    def _from_family(cls, name_or_dir: str | Path, trust_remote_code: bool | None, *,
+                     dtype: DTypeLike | None, param_dtype: DTypeLike | Literal["auto"] | None,
+                     attention_impl: AttentionImpl, max_seq_len: int | None, revision: str | None,
+                     subfolder: str | None, gguf_file: str | None, single_file: str | None,
+                     dduf_file: str | None, fallback: str | None, mesh: MeshSpec | Mesh | None,
+                     layout: Layout | None, on_host: bool, weights: bool,
+                     modeling_overrides: Mapping[str, object] | None, text_only: bool,
+                     prediction_depths: int | None, dex: DifferentialExtension | None,
+                     precision: Numerics | str | None, scan_layers: bool) -> Self:
+        """`load` of a source a family's loader reads, its every option as `load` states it."""
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -1351,65 +1375,6 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
                          source=source if media or gguf_path is None else None,
                          directory=directory if media else None)
     return None
-
-
-def _native(source: str | Path) -> bool:
-    """Whether `source` is a local directory holding a run's native release (`dew.inference.loading.
-    released_model`), whose files no family's loader reads: a saved run's export where no family's layout
-    states its model (`dew.interop.saved_sources.run_plan`) among them."""
-    from etils import epath
-
-    from dew.inference.loading import released_model
-
-    return os.path.isdir(source) and released_model(epath.Path(source))
-
-
-def _native_source(source: str | Path, built: Sequence[str], *, mesh: MeshSpec | Mesh | None,
-                   layout: Layout | None, dtype: DTypeLike | None,
-                   param_dtype: DTypeLike | Literal["auto"] | None, on_host: bool) -> Pretrained:
-    """The native release in `source` as the source a run starts from: its run's step
-    (`dew.inference.models.ReleasedRun`) as its task's bundle (`ReleasedTask.source_of`; row 4776: such a
-    release's record states no dtypes a family's load reads, and a run started from it raised KeyError),
-    placed on `mesh` under `layout`, or on the host (`on_host`), computing in `dtype` and stored in
-    `param_dtype` ("auto": as the release stores it). A load option that builds a family's model
-    another way (`built`) is refused: the release builds the model its run recorded. A load without
-    weights reads them whole, as a native release states no shapes apart from its tensors."""
-    from dew.inference.models import ReleasedRun
-    from dew.objectives.base import ReleasedTask
-
-    if built:
-        raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
-                         f"load it without {', '.join(built)}")
-    run = ReleasedRun.of(str(source))
-    task = run.objective.saved_task
-    if task is None or not issubclass(task, ReleasedTask):
-        raise ValueError(f"{source} is the native release of a {run.objective.__name__} run, which declares "
-                         "no task a run starts from")
-    bundle = task.source_of(run, mesh=mesh, layout=layout, dtype=dtype,
-                            param_dtype=None if param_dtype == AUTO else param_dtype)
-    return replace(bundle, variables=jax.device_get(bundle.variables)) if on_host else bundle
-
-
-def _released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:
-    """The source a load reads, itself or a saved run's release (`released_run`), and whether the load
-    runs its own code (`_runs_code`): a trusted run's release is trusted with it, as the processor's
-    record names the release."""
-    runs = _runs_code(str(name_or_dir), asked)
-    released = released_run(name_or_dir, **release)
-    if runs and released != name_or_dir:
-        trust_sources((str(released),))
-    return released, runs
-
-
-def _runs_code(name: str, asked: bool | None) -> bool:
-    """Whether a load of `name` runs the source's own code: as `asked`, or, where None, as the process
-    trusts the source (`dew.registry.trusts_source`). A load asked to run it trusts the source for the
-    process, so a processor reloaded from its record runs that code too (`load_processor`)."""
-    if asked is None:
-        return trusts_source(name)
-    if asked:
-        trust_sources((name,))
-    return asked
 
 
 def load_processor(source: sources.SourceReference, model: nn.Module) -> Processor | None:
