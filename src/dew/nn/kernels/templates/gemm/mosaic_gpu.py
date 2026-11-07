@@ -794,9 +794,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     # A depth split's outputs: each run's partial, a `[m, n]` slice of its own.
     out_type = tuple(jax.ShapeDtypeStruct((m, n) if tiles.splits == 1 else (tiles.splits, m, n), dtype)
                      for dtype in dtypes)
-    # A balanced tail's partials: each program's, a consumer's share of a tile each.
+    # A balanced tail's partials: each program's, a consumer's share of a tile each, of the tile its range
+    # starts inside and of the one it walks the first step of (`Family.fixed_up`'s `firsts`).
     workspace = () if tail is None else (
-        jax.ShapeDtypeStruct((multiprocessors, consumers, *part), jnp.float32),)
+        jax.ShapeDtypeStruct((multiprocessors, 2, consumers, *part), jnp.float32),)
     operands = (lhs, rhs, *(() if paired is None else (paired,)), *(() if scales is None else (scales,)),
                 *(step_scales or ()), *(mx_scales or ()))
     kernel = family.kernel(body, out_type=(*out_type, *workspace),
@@ -814,7 +815,7 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
     """Dew: a consumer's share of a `gmm` tile stored (`_finished`) from its accumulators: at once, or,
     a balanced tail's tile (`partials`: its workspace and readiness flags), once its program's partial and
     the other programs' are added (`mosaic.Family.fixed_up`)."""
-    group, row_start, ni, start, gathered, program, split, _ = tile
+    group, row_start, ni, _, gathered, program, split, _ = tile
     # A depth split's run stores its partial in its own slice of each output.
     o_gmems = o_gmems if split is None else tuple(o_gmem.at[split] for o_gmem in o_gmems)
     # This consumer's share of the tile: its first row, and its group's rows there.
@@ -829,8 +830,9 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
         finished(*accs)
         return
     workspace, ready = partials
-    family.fixed_up(accs[0], workspace.at[:, wg], None if ready is None else ready.at[:, wg], program, start,
-                    gathered, finished)
+    first, gathered = gathered
+    family.fixed_up(accs[0], workspace.at[:, 0, wg], None if ready is None else ready.at[:, wg], program,
+                    first, gathered, finished, firsts=workspace.at[:, 1, wg])
 
 
 def _stored_rows(group, part_row, rows: int, m: int, *, dense: bool, row_tile: int) -> tuple:
@@ -1511,16 +1513,18 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                         family.summed_window(tiles.block_k))
 
             def finish(wg, tile, summed, store, *, active):
-                g_i, depth, columns, _, start, gathered, program = tile
+                g_i, depth, columns, _, _, gathered, program = tile
                 if tail is not None and not active:
                     return
                 place = (depth.start + wg * depth_half, 0, depth_half, columns.start, depth_half)
                 if tail is None:
                     store(0, summed, o_gmem.at[g_i], place)
                     return
-                family.fixed_up(summed, refs[-1].at[:, wg], None if ready is None else ready.at[:, wg],
-                                program, start, gathered,
-                          lambda value: store(0, value, o_gmem.at[g_i], place))
+                first, gathered = gathered
+                family.fixed_up(summed, refs[-1].at[:, 0, wg], None if ready is None else ready.at[:, wg],
+                                program, first, gathered,
+                                lambda value: store(0, value, o_gmem.at[g_i], place),
+                                firsts=refs[-1].at[:, 1, wg])
 
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
@@ -1532,9 +1536,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                              swizzles=SCALE_SWIZZLES if step_scales is not None else None))
 
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
-    # A balanced tail's partials: each program's, a consumer's share of a tile each.
+    # A balanced tail's partials: each program's, a consumer's share of a tile each, of the tile its range
+    # starts inside and of the one it walks the first step of (`Family.fixed_up`'s `firsts`).
     workspace = () if tail is None else (
-        jax.ShapeDtypeStruct((multiprocessors, consumers, *part), jnp.float32),)
+        jax.ShapeDtypeStruct((multiprocessors, 2, consumers, *part), jnp.float32),)
     kernel = family.kernel(body, out_type=(out_type, *workspace),
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
                            consumers=consumers,

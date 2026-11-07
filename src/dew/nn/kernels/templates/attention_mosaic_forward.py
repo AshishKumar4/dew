@@ -1374,8 +1374,8 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
             return
         # A slice's state finished (a short row's slice may see no key) and folded (`algebra.slice_state`),
         # in the units its finished rows are in (`algebra.finished_form`: a fold's natural ones); each slot a
-        # slice from the last, which merges the others' in turn, then the initial state's, and finishes
-        # once: no row's output multiplied back by its denominator.
+        # slice from the last, the last to arrive merging every slot's in their order, then the initial
+        # state's, and finishing once: no row's output multiplied back by its denominator.
         form = algebra.finished_form(spec)
         own = algebra.slice_state(form, *algebra.finish(spec, state, initial=True))
         slot = merge.splits - 1 - merge.split
@@ -1385,7 +1385,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                 running = algebra.finished_merge(form, running, algebra.initial_state(form, merge.initial()))
             store(running, form, initial=True, normalized=True)
 
-        family.fixed_up(own, merge.slots, merge.ready, slot, slot, merge.splits, merged,
+        family.fixed_up(own, merge.slots, merge.ready, slot, 0, merge.splits, merged,
                         combine=functools.partial(algebra.finished_merge, form))
         return
     maximum, denominator = algebra.finished_rows(spec, state, initial=hooked.initial is not None)

@@ -448,8 +448,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
 
-    # Its programs wait across programs through global-memory semaphores (`Family.fixed_up`), which sm_70 on
-    # issues: a balanced tail's and a decode's split partials merge in the launch.
+    # Its programs fix a tile up across programs through global-memory atomics (`Family.fixed_up`), which
+    # sm_70 on issues: a balanced tail's and a decode's split partials merge in the launch.
     fixes_up = True
 
     bounded_loads = False

@@ -128,9 +128,10 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     registers', its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter
     slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
     (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
-    whole step took 13). Where the family waits across programs (`Family.fixes_up`), the launch merges the
-    slices in the last one's program, the initial state with them (`MosaicForward.merges`); elsewhere each
-    slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config derived for them."""
+    whole step took 13). Where the family fixes a tile up across programs (`Family.fixes_up`), the launch
+    merges the slices in the last to arrive, the initial state with them (`MosaicForward.merges`);
+    elsewhere each slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config
+    derived for them."""
     found = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
                       sources=sources, out_dtype=None, scales=scales)
     if found is None:
@@ -193,9 +194,9 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     row's keys where it maps them), the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
     sliced over the derived work list (`plan`) on the template's forward (`attention_mosaic.forward`'s
-    `splits`), the slices merged with the initial state in the launch where its family waits across programs
-    (`merges`), else in XLA from their fp32 states (`algebra.merged_slices`), and unpacked. Its logits folded
-    where the algebra folds them, the rows the fold's reach or the headroom guard rewalks walked again
+    `splits`), the slices merged with the initial state in the launch where its family fixes a tile up
+    across programs (`merges`), else in XLA from their fp32 states (`algebra.merged_slices`), and unpacked.
+    Its logits folded where the algebra folds them, the rows the fold's reach or the headroom guard rewalks walked again
     natural over those rows alone, with no branch read on the host (`MosaicForward.masked`, row 1978). A
     quantized cache's keys and values are its codes (int8 or an FP8) and `scales` their keys' and values'
     `[B, KV, K]` fp32 in each row's key order (a dense cache's head-major scales, a paged pool's gathered by

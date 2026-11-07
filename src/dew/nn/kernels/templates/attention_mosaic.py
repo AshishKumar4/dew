@@ -281,10 +281,10 @@ class MosaicForward(_Mainloop[Tiles]):
     """The slices each query tile's keys are cut into, each a program of its own (`_Program.splits`): a
     split-KV inference launch's, its outputs each slice's (`attention_decode` merges them)."""
     merges: bool = False
-    """Whether a split launch merges its slices itself, the last slice's program each query block's, the
-    initial state's among them (`attention_mosaic_forward._Merge`): its outputs the rows' whole, no merge in
-    XLA after it. Legal on a family that waits across programs (`Family.fixes_up`) where every program of
-    its grid is resident at once (`resident`), as its waits on the other slices need."""
+    """Whether a split launch merges its slices itself, the last slice's program to arrive each query
+    block's, the initial state's among them (`attention_mosaic_forward._Merge`, `Family.fixed_up`): its
+    outputs the rows' whole, no merge in XLA after it. Legal on a family whose programs fix a tile up across
+    programs (`Family.fixes_up`), none waiting on another."""
     parts: int = 1
     """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
@@ -361,15 +361,10 @@ class MosaicForward(_Mainloop[Tiles]):
                 and family.shares_rows(config.relaunch_k or config.block_k,
                                        config.relaunch_consumers or config.consumers)):
             return False
-        if self.merges and self.splits > 1:
-            # On a family that waits across programs (`Family.fixes_up`), every program of the grid resident
-            # at once: the last slice's waits on the others' states. Its kernel holds that residency
-            # (`_launched`'s `resident`); a guarded rewalk merges nothing (`_inference_walk`).
-            programs = (query.shape[0] * query.shape[2] * self.splits
-                        * -(-query.shape[1] // (config.consumers * config.block_q)))
-            if (not family.fixes_up or not target.multiprocessors
-                    or programs > target.multiprocessors * self.resident(ba, config, target)):
-                return False
+        if self.merges and self.splits > 1 and not family.fixes_up:
+            # A family whose programs merge their slices (`Family.fixes_up`); a guarded rewalk merges nothing
+            # (`_inference_walk`).
+            return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
         tiles = (config.block_k, config.relaunch_k or config.block_k)

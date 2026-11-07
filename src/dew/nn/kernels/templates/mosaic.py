@@ -34,6 +34,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
+from jax.extend.mlir import ir
+from jax.extend.mlir.dialects import arith
 
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import product, report, resources
@@ -1577,9 +1579,9 @@ class Transport[Allocated, Opened](abc.ABC):
     them between their own products (`Mma`'s cp.async)."""
 
     fixes_up: bool = False
-    """Whether a tile's steps may be walked by several programs in turn (`tail.Tail`), each but the first
-    leaving its fp32 partial in global memory behind a GPU-scope semaphore the first waits on (`fixed_up`,
-    `partials_ready`)."""
+    """Whether a tile's steps may be walked by several programs in turn (`tail.Tail`), each leaving its fp32
+    partial in global memory and the last to arrive at the tile's GPU-scope counter merging them
+    (`fixed_up`, `partials_ready`)."""
 
     stores_through_registers: bool
     """Whether a program copies its stored output tiles out through its registers (no TMA store before
@@ -1946,37 +1948,47 @@ class Transport[Allocated, Opened](abc.ABC):
         """A program's adds into global memory complete (`added`), past any copy of its still in flight (a
         TMA reduction's); a family that adds from its registers has none in flight."""
 
-    def fixed_up(self, summed, partials, ready, program, start, gathered, store,
-                 combine=operator.add) -> None:
-        """A balanced tail's consumer's share of a tile (`tail.Tail`), `summed` from its program's steps:
-        left in `partials` (each program's, this consumer's) behind `ready` (`partials_ready`) where its
-        range starts inside the tile; otherwise combined with every partial the programs after it up to
-        `gathered` left, each awaited, in their order, and stored (`store`). `combine(running, partial)` is
-        the algebra's merge of two partials of one tile (a sum's addition by default; a split walk's
-        softmax merge, a scan's composition), which the work's declaration supplies. `summed` may be a
-        pytree (a merge's partial of several leaves): `partials` is then a ref a leaf, in its structure,
-        and a program's one signal releases them all. GPU-scope signals and waits: TGHYBRID1-h100's SASS
-        releases each partial with MEMBAR.GPU and a strong global add, and acquires it with a strong CAS,
-        which sm_70 on issues. Interpreted, the partials are left before they are read (`tail.ordered`)."""
-        @pl.when(start > 0)
-        def _():
+    def fixed_up(self, summed, partials, ready, program, first, gathered, store,
+                 combine=operator.add, firsts=None) -> None:
+        """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
+        (a balanced tail's, `tail.Tail`; a split walk's), `summed` from this program's steps: left in
+        `partials` (each program's, this consumer's; the tile's first program's in `firsts` where given, a
+        balanced tail's program first in one tile having left its partial of the tile before in its own
+        slot), and the program that arrives last at the tile's counter (`arrived`, on `ready`'s semaphore
+        of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
+        whichever arrives last, and stores it (`store`). No program waits on another, which the GPU may
+        never have scheduled (row 4732). `combine(running, partial)` is the algebra's merge of two partials
+        of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
+        the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
+        `partials` is then a ref a leaf, in its structure. Interpreted (`ready` None), the tile's first
+        program combines, which the interpreter walks after every other (`tail.ordered`)."""
+        opening = partials if firsts is None else firsts
+
+        def left(refs) -> None:
             # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
             # 64 bytes), which an optimized global transfer refuses.
-            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed,
-                         partials)
-            if ready is not None:
-                plgpu.semaphore_signal(ready.at[program], memory_scope="gpu")
+            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
 
-        @pl.when(start == 0)
+        def read(refs, other):
+            # The partials' structure read off the running value's: a ref may itself be a tree.
+            return jax.tree.map(lambda _, ref: plgpu.load(ref.at[other], optimized=False), summed, refs)
+
+        def combined(running) -> None:
+            store(lax.fori_loop(first + 1, gathered,
+                                lambda other, running: combine(running, read(partials, other)), running))
+
+        if ready is None:
+            pl.when(program != first)(lambda: left(partials))
+            pl.when(program == first)(lambda: combined(summed))
+            return
+        pl.when(gathered - first == 1)(lambda: store(summed))
+
+        @pl.when(gathered - first > 1)
         def _():
-            def added(other, running):
-                if ready is not None:
-                    plgpu.semaphore_wait(ready.at[other], memory_scope="gpu")
-                # The partials' structure read off the running value's: a ref may itself be a tree.
-                return combine(running, jax.tree.map(
-                    lambda _, ref: plgpu.load(ref.at[other], optimized=False), running, partials))
-
-            store(lax.fori_loop(program + 1, gathered, added, summed))
+            pl.when(program != first)(lambda: left(partials))
+            pl.when(program == first)(lambda: left(opening))
+            last = arrived(ready.at[gathered - 1], gathered - first)
+            pl.when(last == 1)(lambda: combined(read(opening, first)))
 
 
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):
@@ -2322,6 +2334,44 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def added_settled(self) -> None:
         # Its adds are TMA reductions (`added`), each in flight past its issue until waited.
         plgpu.wait_smem_to_gmem(0)
+
+
+def arrived(counter, contributors) -> jax.Array:
+    """1 where this consumer warpgroup is the last of `contributors` to arrive at `counter` (a GPU-scope
+    semaphore each arrives at once, `Transport.fixed_up`'s), else 0, an int32 scalar: one of its threads adds
+    one to the count by an atomic that releases the warpgroup's writes before it (a barrier first, so every
+    thread's are) and acquires every earlier arrival's; the last, which reads `contributors - 1` before its
+    add, sets the count back to zero for the next launch, and a barrier's reduction tells every thread of
+    the warpgroup which it is. One atomic and no wait: a program spinning on a peer the GPU never scheduled
+    hangs (row 4732), where an atomic ticket's last arriver merges (CUTLASS's and Triton's split-K
+    semaphores alike)."""
+    scalar = plgpu.Layout.WG_SPLAT(())
+
+    @plgpu.inline_mgpu(arg_types=(plgpu.RefType(), scalar),
+                       return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.int32), layout=scalar))
+    def ticket(ctx, ref, count):
+        del ctx
+        i32 = ir.IntegerType.get_signless(32)
+        mgpu_utils.warpgroup_barrier()
+        thread = arith.remui(mgpu_utils.thread_idx(), mgpu_utils.c(resources.THREADS, i32))
+        before_last = arith.subi(count.registers.item(), mgpu_utils.c(1, i32))
+        last = mgpu_utils.inline_ptx(
+            f"""{{
+            .reg .pred elected, last;
+            .reg .b32 before;
+            setp.eq.u32 elected, $1, 0;
+            mov.b32 before, 0;
+            @elected atom.acq_rel.gpu.global.add.u32 before, [$2], 1;
+            setp.eq.and.u32 last, before, $3, elected;
+            @last st.relaxed.gpu.global.u32 [$2], 0;
+            bar.red.or.pred last, $4, {resources.THREADS}, last;
+            selp.u32 $0, 1, 0, last;
+            }}""",
+            thread, mgpu_utils.memref_ptr(ref), before_last, mgpu_utils.warpgroup_barrier_idx(sync=False),
+            result_types=i32, has_side_effects=True, convergent=True)
+        return mgpu_fragments.FragmentedArray.splat(last, (), is_signed=True)
+
+    return ticket(counter, jnp.asarray(contributors, jnp.int32))
 
 
 def summing(shape: tuple[int, ...], consumers: int) -> dict:
