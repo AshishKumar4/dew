@@ -228,7 +228,7 @@ def _canonical(closed: jcore.ClosedJaxpr) -> jcore.ClosedJaxpr:
                                            outvars=[read(atom) for atom in jaxpr.outvars]), [])
 
 
-BODY_PARAMS = {"pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
+BODY_PARAMS = {"jit": "jaxpr", "pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
                "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
                "custom_vjp_call_jaxpr": "fun_jaxpr", "remat2": "jaxpr", "checkpoint": "jaxpr"}
 """The nested programs `_evaluated` runs in place, by the parameter holding each one's body: what its call
