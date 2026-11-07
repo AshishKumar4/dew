@@ -6,8 +6,10 @@ fit check holds beside it (`candidate_for`), and the same step lowered for a GPU
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import jax
@@ -31,14 +33,40 @@ from dew.training.memory import local_devices
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import narrow_copies, narrowed
 from dew.training.planning import Candidate, splits
+from dew.training.stages import StageLocal
 from dew.training.transaction import COMMIT_FIELDS, consumed_where_made, outcome, pooled_by_mean
 
 if TYPE_CHECKING:
     from dew.training.trainer import Trainer
 
 
-def candidate_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                   schedule: Schedule, placement, replicated, split: int, narrow: bool | None,
+@dataclasses.dataclass(frozen=True)
+class Stepping[LossT, EffectsT]:
+    """What a fit search's candidates read of the run beside its trainer's public fields, as the trainer
+    stands as it plans (`Trainer._stepping`): its loss's traced shapes (`loss_shape`), where its step keeps
+    a pipelined run (`staging`), its window's accumulation (`initialize_accumulation`), its model's batch
+    and its shapes (`model_batch`, `model_shapes`), its step's body (`step_body`) and the fields it fetches
+    (`fetched`), the batches it prefetches (`prefetch`), the examples clock it runs on (`examples`), the
+    mesh it traces on (`traced_on`), and the rows and split its batches are cut in (`rows`, `split`): read
+    here, none off the trainer's private members (row 4555)."""
+
+    trainer: Trainer[LossT, EffectsT]
+    loss_shape: Callable[..., tuple]
+    staging: StageLocal
+    initialize_accumulation: Callable[..., TrainState]
+    model_batch: Callable[[Batch], Batch]
+    model_shapes: Callable[[Batch], Batch]
+    step_body: Callable[..., Callable]
+    fetched: Callable[..., TrainState]
+    prefetch: int
+    examples: int | None
+    traced_on: Callable[[Mesh | AbstractMesh], contextlib.AbstractContextManager[Schedule]]
+    rows: tuple[int, ...] | None
+    split: int | None
+
+
+def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
+                                   schedule: Schedule, placement, replicated, split: int, narrow: bool,
                                    launches: str | None, lowering: bool = True, *,
                                    mesh: Mesh | AbstractMesh | None = None,
                                    platforms: tuple[str, ...] | None = None, capacity: int | None = None,
@@ -50,8 +78,9 @@ def candidate_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Tra
     (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`lowered_for`). `capacity` is
     the bytes a device that states none holds (`FitSearch.capacity`), at which its footprint is judged;
     `footprint`, the one its derivation traced, which it keeps (`FitSearch.footprints`)."""
+    trainer = stepping.trainer
     micro = microbatch_shapes(batch, split)
-    shapes, copies, prepared = prepared_for(trainer, state, micro, schedule, split, narrow)
+    shapes, copies, prepared = prepared_for(stepping, state, micro, schedule, split, narrow)
     shardings = trainer.shardings(prepared)
     if mesh is not None:
         shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -66,8 +95,8 @@ def candidate_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Tra
     built = 0 if mesh is not None else placed_bytes([field for field, kept in (
         (prepared.compute, state.compute), (prepared.window, None if rebuilt else last))
         if kept is None and field is not None])
-    held = 0 if mesh is not None else prefetched_bytes(batch, placement, trainer._prefetch) + built
-    jitted = step_program(trainer, shapes, copies, shardings, placement, replicated, split)
+    held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.prefetch) + built
+    jitted = step_program(stepping, shapes, copies, shardings, placement, replicated, split)
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
     # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
     # arrays a step compiled ahead reads (`first_step_batch`) and one over the placed arrays a run steps
@@ -93,13 +122,13 @@ def candidate_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Tra
     window = split * trainer.accumulation
     if footprint is None and shapes is not None and mesh is None:
         footprint = candidate_footprint(
-            trainer.objective, trainer._model_shapes(micro), window, prepared, held,
+            trainer.objective, stepping.model_shapes(micro), window, prepared, held,
             (local_devices(trainer.device_mesh) or [*trainer.device_mesh.devices.flat])[0], split,
-            functools.partial(consumes_where_made, trainer, prepared, micro, window, shapes),
+            functools.partial(consumes_where_made, stepping, prepared, micro, window, shapes),
             max(cuts, default=0), capacity)
     # The sampled step lowers as the step does, over the same arguments, for the same platforms.
     watched = None if trainer.inspection is None else step_program(
-        trainer, shapes, copies, shardings, placement, replicated, split, sampled=True)
+        stepping, shapes, copies, shardings, placement, replicated, split, sampled=True)
     sampled = None if watched is None else functools.partial(
         lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
         *apart(prepared), given, part)
@@ -107,40 +136,42 @@ def candidate_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: Tra
                      lower.report() if lowering else KernelReport((), ()), footprint, sampled)
 
 
-def consumes_where_made[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], prepared: TrainState,
+def consumes_where_made[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], prepared: TrainState,
                                          micro: Batch, window: int, shapes) -> bool:
     """Whether the step over `prepared` consumes each gradient where it is made
     (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
     (`group_of`), not the outer optimizer's."""
+    trainer = stepping.trainer
     with group_of(prepared, micro) as (view, _):
         return consumed_where_made(trainer.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
-                                   progressed=trainer._examples is not None)
+                                   progressed=stepping.examples is not None)
 
 
-def prepared_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                  schedule: Schedule, split: int, narrow: bool | None = None):
+def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
+                                  schedule: Schedule, split: int, narrow: bool):
     """The loss's shapes (None under a custom step), the narrow copies and the state's shapes with the
     accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
     the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
     `narrow` is off."""
+    trainer = stepping.trainer
     window = split * trainer.accumulation
     with group_of(state, batch) as (view, rows):
-        traced, shapes = (None, None) if trainer.step is not None else trainer._loss_shape(
+        traced, shapes = (None, None) if trainer.step is not None else stepping.loss_shape(
             view, rows, window, split)
     if shapes is not None:
-        trainer._staging.refuse_unpipelined(schedule, trainer.objective)
-    prepared = windowed(lambda state, rows, *, shape_only: trainer._initialize_accumulation(
+        stepping.staging.refuse_unpipelined(schedule, trainer.objective)
+    prepared = windowed(lambda state, rows, *, shape_only: stepping.initialize_accumulation(
         state, rows, shapes, window=window, shape_only=shape_only), state, batch)
     # DiLoCo's groups read their own parameters, which no narrow copy shadows.
-    copies = (narrow_copies(trainer.objective, state, batch, trainer._model_batch, window=window, split=split,
+    copies = (narrow_copies(trainer.objective, state, batch, stepping.model_batch, window=window, split=split,
                             composed=trainer.step is None and not trainer.dynamic_scale, traced=traced)
-              if (trainer._narrow if narrow is None else narrow) and trainer.diloco is None else {})
+              if narrow and trainer.diloco is None else {})
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
     return shapes, copies, prepared
 
 
-def step_program[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], shapes, copies: dict,
+def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, copies: dict,
                                   shardings: Placement[TrainState], placement, replicated: NamedSharding,
                                   split: int, sampled: bool = False):
     """The step over one of the `split` microbatches of a batch
@@ -148,12 +179,13 @@ def step_program[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], shapes, cop
     (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
     it reads and neither donates nor returns, so the frozen arrays stay the ones the run (and the
     objective's held tree) holds, and no output copies them."""
+    trainer = stepping.trainer
     # The transaction brings the optimizer state and the EMA the layout keeps on the host to the device
     # once its gradient is ready (`Transaction.past`); a custom step, and every other field, reads them
     # from its start.
     late = () if trainer.step is not None else tuple(set(COMMIT_FIELDS) & set(trainer.layout.host))
-    body = trainer._step_body(shapes, copies, split, {field: getattr(shardings, field) for field in late},
-                           sampled, shardings.variables["params"])
+    body = stepping.step_body(shapes, copies, split, {field: getattr(shardings, field) for field in late},
+                              sampled, shardings.variables["params"])
     body = body if trainer.diloco is None else trainer.diloco.step(body, trainer.device_mesh, split)
     moving, frozen = apart(shardings)
 
@@ -163,8 +195,8 @@ def step_program[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], shapes, cop
         current = together(current, held)
         micro = microbatch(batch, part, split)
         early = [field for field in trainer.layout.host if field not in late]
-        advanced, loss, aux, committed = body(trainer._fetched(current, shardings, early),
-                                              trainer._model_batch(micro), part, batch_tokens(micro),
+        advanced, loss, aux, committed = body(stepping.fetched(current, shardings, early),
+                                              stepping.model_batch(micro), part, batch_tokens(micro),
                                               micro.get(CLOSES_WINDOW))
         stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
                                  batch_consumed(micro))
@@ -175,21 +207,22 @@ def step_program[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], shapes, cop
                          out_shardings=returned, donate_argnums=0)
 
 
-def lowered_for[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], state: TrainState, batch: Batch,
-                                 generation: str) -> jax.stages.Lowered:
+def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
+                                 generation: str, narrow: bool) -> jax.stages.Lowered:
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
     (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
-    devices, from which JAX's Pallas lowering reads the GPU, at the base rung and the plan's first split:
-    a run that does not fit splits its batch or recomputes more, no other kernel. A CPU-owned state's step
-    realizes its parameters on the host as it runs, and is not lowered."""
+    devices, from which JAX's Pallas lowering reads the GPU, at the base rung its trainer put the
+    objective at (`Trainer._at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
+    the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
+    A CPU-owned state's step realizes its parameters on the host as it runs, and is not lowered."""
+    trainer = stepping.trainer
     if trainer.host_master:
         raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                          "the variables on the host")
     mesh = gpu_mesh(trainer.device_mesh, generation)
-    trainer._at_base_rung(batch)
-    with assumed(generation), trainer._traced_on(mesh) as schedule:
+    with assumed(generation), stepping.traced_on(mesh) as schedule:
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
-        split = splits(trainer._rows, batch, mesh, trainer.microbatches, trainer._split)[0]
+        split = splits(stepping.rows, batch, mesh, trainer.microbatches, stepping.split)[0]
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
-        return candidate_for(trainer, state, batch, schedule, placement, replicated, split, None, None,
+        return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow, None,
                                mesh=mesh, platforms=('cuda',)).lowered

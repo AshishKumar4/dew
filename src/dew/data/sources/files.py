@@ -950,7 +950,7 @@ class Files(Dataset):
         shards = tuple(Shard(name, name, number) for number, name in enumerate(
             self._shard_name(fragment.path) for fragment in self._listed_files))
         return ShardManifest(shards, self._read_shard, self._row_groups,
-                             counted=None if self.where is not None else self._file_rows)
+                             counted=None if self.where is not None else self._file_rows, fixed_parts=True)
 
     def _row_groups(self, count: int) -> tuple[Shard, ...]:
         """A Parquet store's row groups as its shards, read by more readers and workers (`count`) than its
@@ -963,15 +963,23 @@ class Files(Dataset):
                      for number in range(len(pieces.rows)))
 
     def _file_rows(self, reads: int) -> tuple[int, ...]:
-        """The rows of each of a Parquet store's files, from their footers, `reads` read at once (a read's
-        `Loading.threads`), or from its row groups' counts where a read counted them (`_pieces`)."""
+        """The rows of each of a Parquet store's files, read once for the store: from its row groups' counts
+        where a read counted them (`_pieces`), else from its footers, `reads` read at once (a read's
+        `Loading.threads`), kept for every read after (`sized`'s callers: a bound, a placed read, a pass's
+        count, a publication)."""
+        held = self.__dict__.get("_file_counts")
+        if held is not None:
+            return held
         listed = self._listed_files
         if "_pieces" in self.__dict__:
             counts = np.bincount(self._pieces.files, weights=self._pieces.rows, minlength=len(listed))
-            return tuple(int(count) for count in counts)
-        with self._versions_held(self.paths), ThreadPoolExecutor(
-                min(max(reads, 1), max(1, len(listed)))) as pool:
-            return tuple(int(groups.sum()) for groups in pool.map(_group_rows, listed))
+            held = tuple(int(count) for count in counts)
+        else:
+            with self._versions_held(self.paths), ThreadPoolExecutor(
+                    min(max(reads, 1), max(1, len(listed)))) as pool:
+                held = tuple(int(groups.sum()) for groups in pool.map(_group_rows, listed))
+        self.__dict__["_file_counts"] = held
+        return held
 
     def _subdivided(self, count: int) -> tuple[Shard, ...]:
         """The JSON-lines or text files cut into `count` parts, for a streamed read with more

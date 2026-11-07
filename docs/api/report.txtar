@@ -201,7 +201,7 @@ class Process(schedule: NoiseScheduler, prediction: PredictionTransform, weighti
   .times(self, steps: int) -> jax.Array
   .variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
   .weight(self, t) -> jax.Array
-class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>, reports: bool = True) -> None  [dew.training.profiling]
+class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>, reports: bool = True, wait: bool = False) -> None  [dew.training.profiling]
 class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None  [dew.telemetry.profile]
   .captures: property -> tuple[Path, ...]
   .directory: property -> Path | None
@@ -588,6 +588,11 @@ dew.config.lm.ServedRollout
   max_lag: int = 1
   sync_every: int = 1
   page_size: int | None = None
+dew.config.release.Release
+  task: Mapping[str, object] | None = None
+  layout: Mapping[str, object] | None = None
+  max_length: int | None = None
+  calibration: Mapping[str, object] | None = None
 dew.config.sweep.GridSearch
 dew.config.sweep.OptunaSearch
   seed: int = 0
@@ -649,6 +654,8 @@ dew.decision.config.DecisionRunConfig
   segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
   reads: Annotated[Reads, record_argument(Reads)] | None = None
   parallel: bool | None = None
+  shared_state: int | None = None
+  siblings: bool | None = None
   unit: Unit | None = None
   order: RowOrder | None = None
   split: Literal['part', 'question', 'whole'] | None = None
@@ -1011,6 +1018,7 @@ dew.training.profiling.ProfileWindow
   warmup: int = 2
   capture: dew.telemetry.profile.CaptureOptions = dew.telemetry.profile.CaptureOptions()
   reports: bool = True
+  wait: bool = False
 dew.training.profiling.RunProfile
   steps: int = 2
   warmup: int = 10

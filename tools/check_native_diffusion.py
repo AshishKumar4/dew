@@ -187,9 +187,6 @@ def public_start(task, source, start, meta, key, given, null, process, times, by
     return task.prepare(**shared, initial=prior)
 
 
-TRAINED_SEEDS = 8
-"""Every task's declared seeds for check 1 of its trained UNet against Diffusers' (`diffusers_reads`),
-sized by `seeds_for` paired with Dew's on armada (11-06): 8 at each of the eight tasks."""
 TRAINED_TIME = 10.0
 """The timestep the trained UNet is read at."""
 
@@ -201,8 +198,8 @@ def diffusers_reads(task, source, export, model, variables, noise, given):
     writes back untrained), and its declared UNet holds Dew's trained one
     on par (check 1) over drawn noise, prompt states, pooled embedding and
     inpaint channels, of `noise`'s and `given`'s shapes, at `given`'s time
-    ids, both measured from Diffusers' own UNet run in float64."""
-    from reference_error import as_given, assert_as_exact
+    ids, both measured from Diffusers' own UNet run in float64 (`assert_export_recomputes`)."""
+    from diffusion_support import assert_export_recomputes
     from safetensors.numpy import load_file
 
     from dew.diffusion.process import DenoisingCondition
@@ -241,10 +238,9 @@ def diffusers_reads(task, source, export, model, variables, noise, given):
             sample = np.concatenate([drawn["noise"], *(drawn[name] for name in spatial)], -1)
             return predict(sample, TRAINED_TIME, drawn["context"], drawn.get("pooled"),
                            None if condition.time_ids is None else np.asarray(condition.time_ids))
-        return as_given(run)
+        return run
 
-    assert_as_exact(dew, diffusers(False), draw, f"{task} trained UNet", seeds=TRAINED_SEEDS,
-                    truth_fn=diffusers(True))
+    assert_export_recomputes(jax.jit(dew), diffusers, draw, f"{task} trained UNet")
 
 
 def train_and_reload(task, source, reference, key, given, noise):

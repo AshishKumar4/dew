@@ -52,6 +52,7 @@ from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically
 from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
+from dew.config.release import Release
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -479,7 +480,8 @@ class TrainerConfig:
     """Stop after the loss has scored this many targets across all microbatches, including before a
     resume.
 
-    Uses the counter reported as `train/tokens`, without padding. The final
+    Counts the tokens committed updates trained on, reported as `train/committed_tokens`, without
+    padding. The final
     microbatch may cross the budget. With `steps`, `epochs` or `examples`, the
     first cap reached ends the run. A token-only run needs a constant learning
     rate or a schedule with its own explicit step horizon.
@@ -2433,6 +2435,6 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     return dataclasses.replace(start, model=looped)
 
 
-__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "SourceOptions",
-           "TrainerConfig",
+__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "Release", "RunConfig",
+           "SourceOptions", "TrainerConfig",
            "flag_selected", "looping"]

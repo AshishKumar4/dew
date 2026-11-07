@@ -41,12 +41,6 @@ class ValueExperts:
     scaling: float = 1.0
     bias: bool = False
 
-    @property
-    def fixed_weights(self) -> bool:
-        """Whether a token's expert weight is fixed whatever its router scores: one expert's softmax score
-        renormalized over itself, which is 1 (`Mixture.fixed_weights`)."""
-        return self.top_k == 1 and self.norm_topk_prob and self.score_function == 'softmax'
-
     def __post_init__(self):
         if not 0 < self.top_k <= self.experts:
             raise ValueError(f"value experts choose top_k of their experts, got {self.top_k} of "

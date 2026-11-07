@@ -60,7 +60,7 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
-    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
@@ -170,7 +170,7 @@ def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recor
     payload.unlink()
     (built / "PKG-INFO").unlink()
     built.rmdir()
-    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
@@ -218,7 +218,7 @@ def test_a_plan_reuses_nothing_for_tasks_pinned_to_another_class(ci, tmp_path, m
     recorded on another class plan every file a task of its own, as before."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17")
     armada_task(ci, monkeypatch, verdict)
-    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
 
 
@@ -231,7 +231,7 @@ def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
                                         "GenuineIntel-6-143")
     armada_task(ci, monkeypatch, verdict)
-    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
@@ -246,7 +246,7 @@ def test_a_row_run_green_on_these_inputs_is_reused_though_another_commits_run_of
     test_c = tmp_path / "tests/test_c.py"
     first = test_c.read_text()
     # Another commit's run of test_c, on other inputs, after this one's.
-    test_c.write_text(first + "\n# another commit\n")
+    test_c.write_text(first + "\nANOTHER_COMMIT = 1\n")
     armada_task(ci, monkeypatch, verdict)
     test_c.write_text(first)
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
@@ -283,7 +283,7 @@ def test_a_plan_keeps_each_green_group_of_a_heavy_file_and_a_task_runs_a_group_w
     # A kept group whose green run its task cannot read, its file changed since the plan: the task runs that
     # group alone.
     test_c = tmp_path / "tests/test_c.py"
-    test_c.write_text(test_c.read_text() + "\n# changed after the plan\n")
+    test_c.write_text(test_c.read_text() + "\nCHANGED_AFTER_THE_PLAN = 1\n")
     monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", "--tests=tests/test_c.py#2/2@"
                                       "GenuineIntel-6-143:0000", f"--out={verdict}", "--cache=on"])
     assert ci.main() == 0
@@ -335,31 +335,35 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
 
 
-def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_runs_none_past_it(
+def test_a_kept_task_runs_a_stale_row_only_within_its_deadline_and_says_the_rest_stale_not_run(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A kept task that must run a kept group whose green run it cannot read, past its deadline, reads and
-    runs no group after it: each is a red row its task's deadline cut off, and the task writes every row
-    (review: each later group was still read and run, a fresh grace and settle each, past the deadline)."""
+    """A kept task whose kept groups' green runs it cannot read runs each only where its recorded seconds fit
+    what is left of its deadline: every other is said stale, not run (ci.py's `STALE`), its own outcome the
+    queue runs again, never a deadline red, and none runs past the deadline (row 4468: a kept task's 163 of
+    165 stale rows ran out its 1680 s one after another, each a deadline red); groups that fit run and
+    pass."""
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     _, _, seen = cache_worker
     names = "cde"
-    written(tmp_path, {"test_c.py": "import time\nfrom pathlib import Path\n" + "".join(
-        f"def test_{name}():\n    Path('runs-{name}').write_text('x')\n    time.sleep(3)\n"
-        for name in names)})
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_c.py::test_{name}": 250.0 for name in names}))
+    written(tmp_path, {"test_c.py": "from pathlib import Path\n" + "".join(
+        f"def test_{name}():\n    Path('runs-{name}').write_text('x')\n" for name in names)})
     groups = " ".join(f"tests/test_c.py#{index}/3@GenuineIntel-6-143:0000" for index in (1, 2, 3))
-    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
-                                      f"--out={verdict}", "--cache=on", "--deadline=1"])
-    seen.clear()
-    assert ci.main() == 0
-    rows = json.loads(verdict.read_text())["rows"]
-    assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
-        (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
-    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False]
-    # The groups past the deadline were never looked up.
-    assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
-        True, False, False]
+
+    def kept_task(seconds: float, deadline: int) -> list[tuple[str, int, str | None]]:
+        (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+            {f"tests/test_c.py::test_{name}": seconds for name in names}))
+        monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
+                                          f"--out={verdict}", "--cache=on", f"--deadline={deadline}"])
+        seen.clear()
+        assert ci.main() == 0
+        return [(row["name"], row["exitCode"], row.get("kind"))
+                for row in json.loads(verdict.read_text())["rows"]]
+
+    assert kept_task(250.0, 60) == [(f"3.12:tests/test_c.py#{index}/3", 1, ci.STALE) for index in (1, 2, 3)]
+    assert not any((tmp_path / f"runs-{name}").exists() for name in names)
+    assert any("tests/test_c.py/1-of-3" in path for path in seen)
+    assert kept_task(0.5, 600) == [(f"3.12:tests/test_c.py#{index}/3", 0, None) for index in (1, 2, 3)]
+    assert all((tmp_path / f"runs-{name}").exists() for name in names)
 
 
 def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(
@@ -452,7 +456,7 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
                                         "GenuineIntel-6-143")
     armada_task(ci, monkeypatch, verdict)
-    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\n# changed\n")
+    (tmp_path / "tests/test_c.py").write_text((tmp_path / "tests/test_c.py").read_text() + "\nCHANGED = 1\n")
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
     monkeypatch.setattr(ci, "cpu_class", lambda: "AuthenticAMD-25-17")
     rows = armada_task(ci, monkeypatch, verdict)

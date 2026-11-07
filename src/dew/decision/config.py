@@ -165,6 +165,12 @@ class DecisionRunConfig(DecoderRunConfig):
     """Whether a question row reads its options in parallel, each at positions of its own after the
     question (`QuestionLayout.parallel`), which a head that reads option slots needs. None keeps the
     layout's own."""
+    shared_state: int | None = None
+    """The most questions a row asks over one copy of their request's state, each read as its own row reads
+    it (`QuestionLayout.shared_state`). None keeps a row a question, each with its state."""
+    siblings: bool | None = None
+    """Whether a question of a row over one state also reads the questions before it in the row
+    (`QuestionLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
     unit: Unit | None = None
     """How a question row's `segments` encode their text, piece by piece or whole
     (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""
