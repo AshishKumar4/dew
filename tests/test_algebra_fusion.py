@@ -191,13 +191,15 @@ def jax_attention(*, causal: bool):
     return attend
 
 
-def flax_attention(*, causal: bool):
-    """Flax's attention as a Flax model writes it, its causal mask built from the rows."""
+def flax_attention(*, causal: bool, wide: bool = True):
+    """Flax's attention as a Flax model writes it, its causal mask built from the rows, its softmax in
+    float32 where `wide` (`force_fp32_for_softmax`, the kernels' arithmetic) and Flax's default, the
+    operands' dtype, else."""
     from flax import linen as nn
 
     def attend(q, k, v):
         mask = nn.make_causal_mask(jnp.ones(q.shape[:2])) if causal else None
-        return nn.dot_product_attention(q, k, v, mask=mask)
+        return nn.dot_product_attention(q, k, v, mask=mask, force_fp32_for_softmax=wide)
     return attend
 
 
@@ -206,6 +208,17 @@ SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2, True),
              "flax causal": (flax_attention(causal=True), 4, True),
              "flax": (flax_attention(causal=False), 4, False)}
 """Each plain program's attention, its key heads over 4 query heads, and whether it is causal."""
+
+
+def test_flaxs_default_attention_softmax_in_bfloat16_is_kept_as_written():
+    """Flax's attention at its default, its softmax in the operands' bfloat16, compiled through `dew.jit` on
+    an H100, runs as written: Dew's call computes it only with its softmax in bfloat16, which no kernel of
+    Dew's takes, so no region is written as a kernel's (row 4783)."""
+    import dew
+
+    shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: dew.jit(flax_attention(causal=True, wide=False)).trace(*shapes))
 
 
 def _attention_routes(trace) -> list[str]:
@@ -217,7 +230,7 @@ def _attention_routes(trace) -> list[str]:
 
 @pytest.mark.parametrize("spelling", list(SPELLINGS))
 def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
-    """A plain JAX or Flax program's softmax attention (`dew.algebra.attention_regions`) compiled through
+    """A plain JAX or Flax program's softmax attention (`dew.algebra.recognize`) compiled through
     `dew.jit` on an H100 runs the kernel Dew's selector gives the call (FlashAttention, or the template a call
     names), where the program as written runs XLA's; on this host, its output and gradients under the
     template (its portable mainloop) on par with the program as written (check 1)."""
@@ -263,51 +276,69 @@ def softcapped_attention(q, k, v):
     return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
 
 
+JAX_FILL = -0.7 * float(jnp.finfo(jnp.float32).max)
+"""jax.nn's fill for masked logits (its `_get_large_negative` at float32)."""
+
+
+def masked_attention(q, k, v):
+    """Attention written out over a mask drawn from its inputs, its masked logits -inf: a row the mask leaves
+    no key is NaN."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+    weights = jax.nn.softmax(jnp.where(input_mask(q, k), logits, -jnp.inf), axis=-1).astype(v.dtype)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
+
+
 FORMS = {
     "a mask of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, mask=input_mask(q, k), implementation="xla"),
-        lambda q, k, v: {"mask": input_mask(q, k)}),
+        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}),
+    "a mask of its inputs filled with -inf": (
+        masked_attention, lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": -jnp.inf}),
     "a bias of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, bias=input_bias(q, k), implementation="xla"),
         lambda q, k, v: {"bias": input_bias(q, k)}),
     "twice the default scale": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
                                                      implementation="xla"),
-        lambda q, k, v: {}),
+        None),
     "a causal window": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
                                                      implementation="xla"),
-        lambda q, k, v: {"causal": True, "sliding_window": 16}),
-    "a softcap": (softcapped_attention, lambda q, k, v: {"causal": True, "softcap": 50.0}),
+        lambda q, k, v: {"causal": True, "sliding_window": 16, "mask_fill": JAX_FILL}),
+    "a softcap": (softcapped_attention,
+                  lambda q, k, v: {"causal": True, "softcap": 50.0, "mask_fill": -jnp.inf}),
 }
 """Each plain program's attention under a form beside the default scale and a causal mask, and the arguments
-Dew's own attention takes for it."""
+Dew's own attention takes for it, its fill the program's; None where no call of Dew's computes it (a scale
+other than the default: another constant), which the compile point keeps as written. The masks leave rows
+partly masked (a window, causality) and wholly masked (a mask of the inputs: NaN rows under -inf, uniform
+ones under jax.nn's finite fill)."""
 
 
 @pytest.mark.parametrize("form", list(FORMS))
 def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes(form):
-    """A plain program's attention under a mask or bias it draws from its inputs, a scale a power of two past
-    the default, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel Dew's
-    own attention call under those arguments routes to (none where that is XLA's), where the program as
-    written runs XLA's; on this host, under the template, its output and gradients on par with the program
-    as written (check 1)."""
+    """A plain program's attention under a mask (filled as jax.nn fills it, or with -inf) or a bias it draws
+    from its inputs, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel
+    Dew's own attention call under those arguments routes to (none where that is XLA's), and under a scale
+    no call of Dew's takes runs as written, XLA's; on this host, under the template, its output and
+    gradients on par with the program as written (check 1)."""
     from attention_oracle import attention_on_par
     from contract_support import normal_drawn
 
     import dew
-    from dew.algebra.attention_regions import KEPT
+    from dew.algebra.recognize import KEPT
     from dew.nn.attention import scaled_dot_product_attention
 
     attend, arguments = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
 
     def own(q, k, v):
-        return scaled_dot_product_attention(q, k, v, **arguments(q, k, v))
+        return scaled_dot_product_attention(q, k, v, scale_logits=True, **arguments(q, k, v))
 
     with generation.assumed("sm90"):
         assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
-        expected = [kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
-                    if kernel not in KEPT]
+        expected = [] if arguments is None else [
+            kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes)) if kernel not in KEPT]
         assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
     draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):
@@ -357,17 +388,18 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
                                                                            "dtype": jnp.float32})])
 def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100, scaled after its
-    product or its queries divided by sqrt(D) before it (Flax's); written out with
-    any step computing otherwise (a finite fill, truncated or narrowed logits, an initial maximum above the
-    logits, a row normalized by another's sum, a sum narrowed past its range, a divisor near sqrt(D) but not
-    it, in float32, where bfloat16 holds no value that near), it stays as written, XLA's."""
+    product or its queries divided by sqrt(D) before it (Flax's), its masked logits filled with -inf or a
+    finite constant (Dew's call's `mask_fill`, the future keys weighed as that fill weighs them); written out
+    with any step computing otherwise (truncated or narrowed logits, an initial maximum above the logits, a
+    row normalized by another's sum, a sum narrowed past its range, a divisor near sqrt(D) but not it, in
+    float32, where bfloat16 holds no value that near), it stays as written, XLA's."""
     import dew
 
     options = dict(options)
     shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), options.pop("dtype", jnp.bfloat16)),) * 3
     with generation.assumed("sm90"):
         routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
-    assert bool(routes) == (variant in ("attention", "attention by a root")), routes
+    assert bool(routes) == (variant in ("attention", "finite fill", "attention by a root")), routes
 
 
 @pytest.mark.parametrize("order", [("xla", "template"), ("template", "xla")],
@@ -434,7 +466,7 @@ def _norms_written(fn, *shapes):
 
     closed = jax.make_jaxpr(fn)(*shapes)
     with generation.assumed("sm90"):
-        written = recognize.recognized(closed.jaxpr, fusion.Index(closed.jaxpr))
+        written = recognize.recognized(closed.jaxpr, fusion.Index(closed.jaxpr), recognize.NORMS)
     return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(written)
 
 
