@@ -117,7 +117,16 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     (a backward's `fewer_rows`). None where no tile fits."""
     rows = query_rows(family, dtype, held) if rows is None else rows
     most = most_consumers(family, tiles(rows, family.rows, 1)) if overlapped else 1
+
+    def padded(consumers: int) -> int:
+        return -(-held // (rows * consumers)) * rows * consumers
+
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
+        if consumers > 1 and padded(consumers) - padded(consumers - 1) > held // 8:
+            # A count whose tile pads the held rows by more than an eighth of them beyond the next count's
+            # (a 192-row tile of three consumers over a 256-row shard pads it by half, where two consumers'
+            # 128 pad none): the call's padding is a copy and its last tile's work wasted.
+            continue
         for extent in walks(family, dtype, walked):
             for narrow in stagings(family):
                 config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
