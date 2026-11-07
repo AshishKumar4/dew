@@ -642,13 +642,17 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
 def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
-    """Every GEMM Mosaic GPU launch form a generation's family emits (`_emitted_forms`) derives a tile at
-    every real projection (`_gemm_mainloop_cases`): an eligibility regression fails here rather than leaving
-    the compile gate fewer cases. Its launches state their tiles' accumulators, so a B200's tcgen05 bundle is
-    theirs (`bundles.of`'s `stated`); a GPU whose family has no bundle (consumer Blackwell's TMA-fed mma.sync)
-    emits none."""
+    """Every GEMM Mosaic GPU launch form a generation emits derives a tile at every real projection
+    (`_gemm_mainloop_cases`), each on the most capable issuer whose bundle takes it (`bundles.groups`, its
+    launches stating their tiles' accumulators): a B200's kernel gradients and exact sums, which tcgen05's
+    bundle refuses, on mma.sync's (row 4727). An eligibility regression fails here rather than leaving the
+    compile gate fewer cases."""
     cases = _gemm_mainloop_cases(generation_name, shape)
-    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16, stated=True), shape)
+    forms, taken = set(), set()
+    for group in bundles.groups(generation_name, jnp.bfloat16, stated=True):
+        own = _emitted_forms(group[0]) - taken
+        taken |= own
+        forms |= own & _emitted_forms(group[0], shape)
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
