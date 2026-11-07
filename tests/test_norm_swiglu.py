@@ -242,6 +242,24 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
             SEEDS["unweighted" if edge is None else "unweighted, one value"])
 
 
+@pytest.mark.parametrize("exponent", [7, 14])
+def test_the_fused_unweighted_norms_fp16_gradient_meets_fp16s_edge_where_xlas_does(exponent):
+    """The fused unweighted norm's fp16 input gradient at a cotangent of 2**7 (the parity case's edge) and
+    2**14 (its edge before row 823 narrowed it, workaround audit group 45), rows of one value: finite where
+    XLA's program's is and not where it is not (each gradient term grows by up to 2**8 within the model's
+    fp16 cast sites, which the kernel keeps, so past 2**8 below fp16's largest both overflow: a boundary of
+    the format the model computes in, not of the kernel)."""
+    x = jnp.full((4, 128), 1.5, jnp.float16)
+    cotangent = jnp.full((4, 128), 1.25 * 2.0 ** exponent, jnp.float16)
+
+    def unweighted(x):
+        return norms.unweighted_rmsnorm(x, 1e-6, implementation="xla")
+
+    finite = [np.isfinite(np.asarray(jax.vjp(f, x)[1](cotangent)[0], np.float64))
+              for f in (fused_unweighted(1e-6), unweighted)]
+    np.testing.assert_array_equal(*finite)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):

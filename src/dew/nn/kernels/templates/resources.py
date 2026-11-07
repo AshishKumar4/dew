@@ -280,6 +280,22 @@ def _semaphore(leaf) -> bool:
     return jnp.issubdtype(leaf.dtype, jax.dtypes.extended)
 
 
+PACKED_BITS = {jnp.dtype(jnp.float4_e2m1fn): 4, jnp.dtype(jnp.int4): 4, jnp.dtype(jnp.uint4): 4}
+"""The dtypes Mosaic GPU stores two to a byte (their `itemsize` reads 1), by their bits: an E2M1 operand of
+Blackwell's block-scaled products' (row 4519's NVFP4 arm)."""
+
+
+def element_bits(dtype) -> int:
+    """The bits an element of `dtype` takes in memory: its itemsize's, but a packed dtype's
+    (`PACKED_BITS`)."""
+    return PACKED_BITS.get(jnp.dtype(dtype), jnp.dtype(dtype).itemsize * 8)
+
+
+def stored_bytes(shape: tuple, dtype) -> int:
+    """The bytes an array of `shape` and `dtype` takes in memory, a packed dtype's two elements a byte."""
+    return math.prod(shape) * element_bits(dtype) // 8
+
+
 def scratch_bytes(family: "Family", scope: Scope) -> int:
     """The shared memory a program of `scope` asks for besides its barriers and semaphores (`_semaphore`),
     as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every array rounded up to
@@ -289,12 +305,12 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
     (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
     (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
-        return [math.prod(leaf.shape) * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(tree)
+        return [stored_bytes(leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(tree)
                 if not _barrier(leaf) and not _semaphore(leaf)]
 
     sizes = arrays(scope.program)
     walks = [allocated(*arrays(walk)) for walk in scope.walks]
-    after = [math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in scope.after]
+    after = [stored_bytes(shape, dtype) for shape, dtype in scope.after]
     if family.walks_scoped:
         walks += [allocated(size) for size in after]
     else:
@@ -545,7 +561,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
 def widest_swizzle(dtype, columns: int) -> int:
     """The widest swizzle, in bytes, a row of `columns` elements of `dtype` fills (`plgpu.find_swizzle`): the
     one a block staged at its rows' width takes, as layout inference and jax's Ampere examples stage it."""
-    return plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
+    return plgpu.find_swizzle(columns * element_bits(dtype))
 
 
 def addresses(tiles) -> int:
