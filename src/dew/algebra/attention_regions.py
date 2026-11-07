@@ -54,7 +54,7 @@ WIDENINGS = frozenset({("bfloat16", "float32"), ("float16", "float32"), ("bfloat
 float16 keeps neither: its range past 65504 is lost)."""
 
 
-def _widening(source: np.dtype, target: np.dtype) -> bool:
+def widening(source: np.dtype, target: np.dtype) -> bool:
     """A float cast that keeps every value (`WIDENINGS`), or none."""
     return source == target or (np.dtype(source).name, np.dtype(target).name) in WIDENINGS
 
@@ -121,7 +121,7 @@ class Attention(NamedTuple):
 def regions(index) -> list[Attention]:
     """Every attention region of the body `index` reads (`fusion.Index`; the module's account), the first
     found where two would share an equation."""
-    graph, jaxpr = _Graph(index), index.jaxpr
+    graph, jaxpr = Graph(index), index.jaxpr
     found, claimed = [], set()
     for place, equation in enumerate(jaxpr.eqns):
         if jax_name(equation.primitive) != "exp":
@@ -207,7 +207,7 @@ def taken(region: Attention) -> bool:
     return any(route.choice == "attention" and route.kernel not in KEPT for route in found)
 
 
-class _Graph:
+class Graph:
     """A body's index (`fusion.Index`: its producers, readers and returned values) with the reads this
     module's matcher takes: an equation by its primitive, a value past the casts a rule admits, and a value
     the program makes from no input."""
@@ -277,7 +277,7 @@ def _evaluated(eqn: jcore.JaxprEqn, inputs: list, index: int):
         return None
 
 
-def _matched(graph: _Graph, exp_place: int) -> Attention | None:
+def _matched(graph: Graph, exp_place: int) -> Attention | None:
     """The attention region around the softmax exponential at `exp_place`, None where the body holds no
     region there (the module's account)."""
     eqns, places = graph.jaxpr.eqns, [exp_place]
@@ -341,7 +341,7 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
     return region._replace(places=tuple(places))
 
 
-def _rows_maximum(graph: _Graph, centre, logits, scaled, perm: tuple[int, ...],
+def _rows_maximum(graph: Graph, centre, logits, scaled, perm: tuple[int, ...],
                   places: list[int]) -> int | None:
     """The keys axis (the softmax's layout, `logits`') where `centre` is the logits' largest over it, each
     row's own (`_back_to_rows`): broadcast back, held from its gradient, raised to an excluding initial
@@ -361,7 +361,7 @@ def _rows_maximum(graph: _Graph, centre, logits, scaled, perm: tuple[int, ...],
             if not graph.excluding(constant, logits.aval.dtype):
                 return None
         else:
-            if name in CASTS and not _widening(np.dtype(eqn.invars[0].aval.dtype), np.dtype(atom.aval.dtype)):
+            if name in CASTS and not widening(np.dtype(eqn.invars[0].aval.dtype), np.dtype(atom.aval.dtype)):
                 return None
             atom = eqn.invars[0]
         chain.append(place)
@@ -403,7 +403,7 @@ def _back_to_rows(eqns, chain: list[int], labels: list[int], value, axis: int) -
     return len(labels) == rank and all(labels[a] == (None if a == axis else a) for a in range(rank))
 
 
-def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int | None:
+def _normalized(graph: Graph, exponential, axis: int, places: list[int]) -> int | None:
     """The place of the division of the exponential (no cast between) by its sum over `axis` (the sum read
     from the exponential widened, `WIDENINGS`, and narrowed back to exactly its dtype, as Flax's, nothing
     below it), broadcast back to its own rows (`_back_to_rows`)."""
@@ -419,7 +419,7 @@ def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int
 
         def back(source: np.dtype, target: np.dtype, held=held) -> bool:
             # The sum narrowed back to exactly the exponential's dtype from a widening of it, or kept.
-            return target == held and _widening(held, source)
+            return target == held and widening(held, source)
 
         atom = graph.uncast(denominator, chain, back)
         broadcast = graph.made(atom, "broadcast_in_dim")
@@ -430,7 +430,7 @@ def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int
         if summed is None or tuple(eqns[summed].params["axes"]) != (axis,):
             continue
         widened: list[int] = []
-        if graph.uncast(eqns[summed].invars[0], widened, _widening) is not exponential:
+        if graph.uncast(eqns[summed].invars[0], widened, widening) is not exponential:
             continue
         labels = [a for a in range(exponential.aval.ndim) if a != axis]
         if not _back_to_rows(eqns, chain[::-1], labels, denominator, axis):
@@ -440,7 +440,7 @@ def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int
     return None
 
 
-def _unmasked(graph: _Graph, logits, places: list[int]):
+def _unmasked(graph: Graph, logits, places: list[int]):
     """`logits` past a mask (`jnp.where(mask, s, fill)`: a nested `_where`, or a `select_n`) whose fill
     excludes: the scaled logits `s`, the mask (its array at the logits' rank where the program makes it from
     no input, True where there is none, a `Masked` else) and the logits' axes as `s` lays them (`perm`: the
@@ -508,27 +508,27 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
     return None
 
 
-def _scaled_product(graph: _Graph, scaled, places: list[int]):
+def _scaled_product(graph: Graph, scaled, places: list[int]):
     """The logits product making `scaled` (the module's account): (its place, the query and key operands it
     reads (a query divided by sqrt(D) read before its division), their contracted axes, its layout, its
     softcap, the power of two its scale is past the default's, its bias); Nones where the product is scaled
     otherwise or is no `dot_general`."""
     eqns, nothing = graph.jaxpr.eqns, (None,) * 9
-    atom = graph.uncast(scaled, places, _widening)
+    atom = graph.uncast(scaled, places, widening)
     bias = None
     if (added := graph.made(atom, "add")) is not None:
         # The bias the operand of the logits' shape not made by the logits' own chain: the other one's.
         for kept, other in itertools.permutations(eqns[added].invars):
-            inner = _capped(graph, graph.uncast(kept, [], _widening), [])[1]
+            inner = _capped(graph, graph.uncast(kept, [], widening), [])[1]
             if (isinstance(other, jcore.Var) and other.aval.shape == atom.aval.shape
                     and _product_of(graph, inner)):
-                bias, atom = other, graph.uncast(kept, places, _widening)
+                bias, atom = other, graph.uncast(kept, places, widening)
                 places.append(added)
                 break
         else:
             return nothing
     softcap, atom = _capped(graph, atom, places)
-    atom = graph.uncast(atom, places, _widening)
+    atom = graph.uncast(atom, places, widening)
     scale = None
     if (multiplied := graph.made(atom, "mul")) is not None:
         a, b = eqns[multiplied].invars
@@ -539,7 +539,7 @@ def _scaled_product(graph: _Graph, scaled, places: list[int]):
         else:
             return nothing
         places.append(multiplied)
-        atom = graph.uncast(atom, places, _widening)
+        atom = graph.uncast(atom, places, widening)
     first = graph.made(atom, "dot_general")
     if first is None:
         return nothing
@@ -572,7 +572,7 @@ def _scaled_product(graph: _Graph, scaled, places: list[int]):
             factor, bias)
 
 
-def _capped(graph: _Graph, atom, places: list[int]) -> tuple[float | None, object]:
+def _capped(graph: Graph, atom, places: list[int]) -> tuple[float | None, object]:
     """`(h, s)` where `atom` is Gemma 2's softcap of `s`, `h * tanh(s / h)` (a multiply by `1 / h` alike,
     casts between), its equations' places added to `places`; `(None, atom)` where it is none."""
     eqns = graph.jaxpr.eqns
@@ -581,10 +581,10 @@ def _capped(graph: _Graph, atom, places: list[int]) -> tuple[float | None, objec
         return None, atom
     for cap, inner in itertools.permutations(eqns[place].invars):
         h = graph.constant(cap)
-        tanh = graph.made(graph.uncast(inner, [], _widening), "tanh")
+        tanh = graph.made(graph.uncast(inner, [], widening), "tanh")
         if h is None or np.ndim(h) != 0 or tanh is None or float(h) <= 0:
             continue
-        argument = graph.uncast(eqns[tanh].invars[0], [], _widening)
+        argument = graph.uncast(eqns[tanh].invars[0], [], widening)
         divided, scaled = graph.made(argument, "div"), graph.made(argument, "mul")
         if divided is not None and _equals(graph.constant(eqns[divided].invars[1]), float(h)):
             capped = eqns[divided].invars[0]
@@ -596,8 +596,8 @@ def _capped(graph: _Graph, atom, places: list[int]) -> tuple[float | None, objec
         else:
             continue
         uncast: list[int] = []
-        graph.uncast(inner, uncast, _widening)
-        graph.uncast(eqns[tanh].invars[0], uncast, _widening)
+        graph.uncast(inner, uncast, widening)
+        graph.uncast(eqns[tanh].invars[0], uncast, widening)
         places += [place, tanh, *found, *uncast]
         return float(h), capped
     return None, atom
@@ -608,18 +608,18 @@ def _equals(value, expected: float) -> bool:
     return value is not None and np.ndim(value) == 0 and math.isclose(float(value), expected, rel_tol=1e-6)
 
 
-def _product_of(graph: _Graph, atom) -> bool:
+def _product_of(graph: Graph, atom) -> bool:
     """Whether `atom` is a logits product, scaled or not (a multiply by a constant of a `dot_general`, or the
     product itself), casts between."""
-    atom = graph.uncast(atom, [], _widening)
+    atom = graph.uncast(atom, [], widening)
     if (multiplied := graph.made(atom, "mul")) is not None:
         operands = graph.jaxpr.eqns[multiplied].invars
         atom = next((var for var in operands if graph.constant(var) is None), None)
-        atom = None if atom is None else graph.uncast(atom, [], _widening)
+        atom = None if atom is None else graph.uncast(atom, [], widening)
     return atom is not None and graph.made(atom, "dot_general") is not None
 
 
-def _laid_out(graph: _Graph, second: int, weights, query, key, layout, query_width: int, key_width: int,
+def _laid_out(graph: Graph, second: int, weights, query, key, layout, query_width: int, key_width: int,
               axis: int, mask, perm: tuple[int, ...]) -> Attention | None:
     """The written call's folds (the module's account) from the two products' layouts and the mask, the
     softmax's axes as the logits product lays them through `perm` (`_unmasked`'s); None where they do not
