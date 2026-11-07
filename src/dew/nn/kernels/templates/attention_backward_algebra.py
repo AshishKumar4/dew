@@ -20,9 +20,9 @@ def softmax_cotangents(logits, products, peak, total, anchor, delta, keep=None, 
     unnormalized weights `e = exp(s - m)` from its `logits` (the hooked, scaled logits the template forms,
     natural, -inf where unseen) at its maximum `peak` (at least the least finite where it saw nothing), those
     weights over its denominator `total` (`T`, 1 where it saw nothing), and its score cotangents
-    `e ((dP - c) - (D - c)) / T` about its anchor `c` (`anchor`, `D - c` its `delta`, `grad_scores`' order)
+    `e ((dP - c) - (D - c)) / T` about its anchor `c` (`anchor`, `D - c` its `delta`, the reference's order)
     with its products `dP = dO Vᵀ` times the dropout multipliers `keep` where the call drops, zero where the
-    tile's mask `seen` says its query sees no key (`where_seen`, as `grad_scores`: an empty query's weight is
+    tile's mask `seen` says its query sees no key (`where_seen`: an empty query's weight is
     0 while its product may overflow, `0 * inf`); the tile's queries its rows, or its columns where it holds
     its keys first (`Coords.keys_first`). Its weights recomputed in the forward's units (`how`, the
     template's own `gradient.below`: raw products' difference scaled after it, an exact largest weight of 1),

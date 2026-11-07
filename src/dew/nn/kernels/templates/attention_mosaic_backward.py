@@ -41,7 +41,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     dK/dV program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small weight
     on a large value, bf16: dK's worst row 2.5e1 at the first pass's D, where check 1 allows 1.55e-2), the
     accurate form's always, and a score hook's parameters', whose gradients need the refined D
-    (`gradient.dq_step`). The fast form's one launch (`tiles.fused`, a call whose score hook, if any, takes
+    (`gradient.dq_issued`). The fast form's one launch (`tiles.fused`, a call whose score hook, if any, takes
     no parameters, an initial state's gradient from the first pass's D): the dK/dV program adding each tile's
     dQ atomically, under the first pass's D and the forward's denominator, the derived default of such a call
     (`MosaicBackward.derived`; in deterministic mode a full or causal one's, its adds in turn: 1.05 to 1.4

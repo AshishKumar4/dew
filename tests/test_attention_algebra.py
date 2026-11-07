@@ -803,7 +803,7 @@ def test_a_querys_gradient_at_a_subnormal_scale_is_finite():
 def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_is_finite():
     """One key resumed from a state of denominator 2^-40 at maximum 40, at a scale of 2^100: the key's
     probability is about 4.7e-6 and dQ about 5.9e24, finite, though the scale over the denominator, 2^140,
-    is not (`attention_gradient.dq_step`: each factor's mantissa and exponent apart). The accurate form's dQ
+    is not (`attention_gradient.dq_issued`: each factor's mantissa and exponent apart). The accurate form's dQ
     agrees to the bit in both mainloops and is on par with the reference's against float64's."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
