@@ -177,6 +177,10 @@ else:
   print('K SIZED',threshold,seeds,'attempts',attempts[0],flush=True)
   assert_as_exact(candidate,ref,draw,'dsv3 margin '+str(threshold),seeds=seeds,truth_fn=truth)
   print('K GREEN',threshold,seeds,'attempts',attempts[0],flush=True)
+  verdict=[evaluate(draw(seed)[0]) for seed in range(seeds)]
+  mine=sum(np.mean((v['d'].astype(float)-v['w'])**2) for v in verdict)/seeds
+  theirs=sum(np.mean((v['n'].astype(float)-v['w'])**2) for v in verdict)/seeds
+  print('K VERDICT_RMS',np.sqrt(mine),np.sqrt(theirs),'ratio',np.sqrt(mine/theirs),flush=True)
  except Exception as e:print('K FAIL',type(e).__name__,str(e),flush=True)
  vals=[evaluate(np.frombuffer(key,np.int32).reshape(2,12)) for key in set(accepted)]
  print('K ACCEPTED',len(vals),'attempts',attempts[0],'flips',sum(np.any(np.sort(v['di'],-1)!=np.sort(v['wi'],-1)) for v in vals),sum(np.any(np.sort(v['ni'],-1)!=np.sort(v['wi'],-1)) for v in vals),flush=True)
