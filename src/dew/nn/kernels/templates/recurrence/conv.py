@@ -63,6 +63,13 @@ def _owner(documents_ref, row, token, length: int):
     return jnp.where(inside, documents_ref[row, jnp.clip(token, 0, length - 1)], -1)
 
 
+def _stored(ref, at: tuple, value, when) -> None:
+    """`value` stored at `ref[at]` in its dtype where `when` holds (a token inside the row, or its own)."""
+    @pl.when(when)
+    def _():
+        plgpu.store(ref.at[at], value.astype(ref.dtype), optimized=False)
+
+
 def _activated(pre, activation: bool):
     """The SiLU of the conv's sums, its sigmoid one quotient, and the sigmoid (None without one)."""
     if not activation:
@@ -155,12 +162,7 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
             out = _activated(piece.preactivation(piece.window(read)), activation)[0]
             if head is not None:
                 out = out * scan.inverse_norm(out, eps, exchanged, interpret=interpret)
-            out = _kept(piece.kept(t), out)
-
-            @pl.when(t < length)
-            def _():
-                plgpu.store(out_ref.at[piece.row, t, piece.local], out.astype(out_ref.dtype),
-                            optimized=False)
+            _stored(out_ref, (piece.row, t, piece.local), _kept(piece.kept(t), out), t < length)
             return read[1:]
 
         lax.fori_loop(0, tokens, token, [piece.read(piece.start - count + 1 + j) for j in range(count - 1)])
@@ -257,10 +259,7 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
         dx = zero
         for shift, (value, theirs) in enumerate(zip(reads, [document, *owners], strict=True)):
             dx = dx + _kept(theirs == document, value) * piece.taps[count - 1 - shift]
-
-        @pl.when(owned)
-        def _():
-            plgpu.store(dx_ref.at[piece.row, t, piece.columns], dx.astype(dx_ref.dtype), optimized=False)
+        _stored(dx_ref, (piece.row, t, piece.columns), dx, owned)
         return read[:-1], [grad, *later[:-1]], [document, *owners[:-1]], sums
 
     last = piece.start + tokens + count - 2
