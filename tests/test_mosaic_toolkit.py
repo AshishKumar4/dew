@@ -43,7 +43,6 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                            collective_axes="wg")
         def _(smem, full, consumed, out_smem):
             ring = mosaic.Ring(smem, full, consumed)
-            wg = jax.lax.axis_index("wg")
 
             def producer():
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
@@ -80,7 +79,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     plgpu.copy_smem_to_gmem(out_smem.at[wg], mine)
                 plgpu.wait_smem_to_gmem(0)
 
-            mosaic.roles(wg, consumers, consumer, producer)
+            mosaic.Schedule((mosaic.Role("consumer", consumers), mosaic.Role("producer", weight=0))).run(
+                consumer=consumer, producer=producer)
 
     return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, *BLOCK), jnp.float32), grid=(1,),
                         grid_names=("sm",), num_threads=consumers + 1, thread_name="wg",
@@ -273,6 +273,50 @@ def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, u
                     assert singly <= 2 * (stages - 1), (first, lo, hi)
                 else:
                     assert singly == hi - lo
+
+
+@pytest.mark.parametrize("weights", [(2, 1, 0), (1, 1, 0), (3, 1, 1, 0), (1, 0)])
+@pytest.mark.parametrize("programs", [1, 2])
+def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
+    """Each raised role's registers (`resources.role_registers`, a `Schedule`'s): none past the launch's pool
+    or setmaxnreg's ceiling, a heavier role never below a lighter one, and the pool spent to within a step
+    a role unless every role is at the ceiling (a capped role's share goes to the rest)."""
+    from dew.nn.kernels.templates import resources
+
+    with generation.assumed("sm90"):
+        held = resources.role_registers(weights, programs)
+        pool = resources.entry_registers(len(weights), programs) * len(weights)
+        step, ceiling = resources.facts().raises().step, resources.raise_ceiling()
+        floor = resources.producer_floor()
+    assert sum(held) <= pool
+    raised = [(weight, budget) for weight, budget in zip(weights, held, strict=True) if weight]
+    assert all(budget == floor for weight, budget in zip(weights, held, strict=True) if not weight)
+    assert all(budget <= ceiling and budget % step == 0 for _, budget in raised)
+    assert all(lighter <= heavier for (w1, heavier) in raised for (w2, lighter) in raised if w1 >= w2)
+    assert (all(budget == ceiling for _, budget in raised)
+            or pool - sum(held) < step * sum(weight for weight, _ in raised))
+
+
+def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
+    """A hand-off's barriers (`Schedule.scratch`): a signal two softmax warpgroups fill counts two arrivals,
+    an accumulator ring the product warp fills and the correction gives back counts one each, and one a
+    product's commit gives back (`release_by`) counts that commit alone."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    schedule = mosaic.Schedule(
+        (mosaic.Role("softmax", count=2), mosaic.Role("correction"), *mosaic_sm100.ISSUING),
+        (mosaic.HandOff("scales", mosaic_sm100.Signals(count=2, tensor_core=False), "softmax"),
+         mosaic.HandOff("output", mosaic_sm100.Accumulators(1, 128, 64), "mma", ("correction",)),
+         mosaic.HandOff("scores", mosaic_sm100.Accumulators(2, 128, 64, narrowed=jnp.bfloat16), "mma",
+                        ("mma",))))
+    scales, (_, output_done, output_read), (_, scores_done, scores_read) = schedule.scratch(
+        generation.gpu_target("sm100"))
+    assert scales.num_arrivals == 2
+    assert (output_done.num_arrivals, output_read.num_arrivals) == (1, 1)
+    assert (scores_done.num_arrivals, scores_read.num_arrivals) == (1, 1)
+    assert schedule.warpgroups() == 4
+    with pytest.raises(ValueError, match="last warpgroup"):
+        mosaic.Schedule((mosaic.Role("consumer"), mosaic.Role("producer", weight=0), *mosaic_sm100.ISSUING))
 
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
@@ -669,7 +713,8 @@ def _relayed_products(q, k, v, *, interpret):
                 family.products(o, p, v_smem)
                 summed.committed(first)
 
-            family.roles_of(((1, relay),), load=load, products=products)
+            mosaic.Schedule((mosaic.Role("relay"), *mosaic_sm100.ISSUING)).run(relay=relay, load=load,
+                                                                                mma=products)
 
         smem = [plgpu.SMEM(each.shape, each.dtype, transforms=mosaic.swizzle_transforms(each.dtype, 128))
                 for each in (q, k, v)]

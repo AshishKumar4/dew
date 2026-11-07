@@ -4,7 +4,7 @@ mainloop on tcgen05 beside it): tcgen05's products with their accumulators in te
 FlashAttention-4 and Tokamax's sm100 kernel hold them, and the template's algebra (`attention_algebra`)
 between the products.
 
-A program is a head's query block of `TCGEN05.rows` rows, in three warpgroups (`mosaic.tabled`). The
+A program is a head's query block of `TCGEN05.rows` rows, in three warpgroups (`SCHEDULE`). The
 issuing one's load warp fills a ring of key stages and one of value stages (the bundle's streams,
 `mosaic_sm100.RINGS`: their slots released by the products' commit), and its
 product warp issues each step's `S = Q Kᵀ` into tensor memory and, a step behind, `P V` into the output's
@@ -44,13 +44,13 @@ from dew.nn.kernels.templates import (
     resources,
 )
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
-from dew.nn.kernels.templates.mosaic_sm100 import STORED, TCGEN05, TMEM
+from dew.nn.kernels.templates.mosaic_sm100 import ISSUING, RINGS, STORED, TCGEN05, TMEM, Accumulator
 
 CHUNK = 32
 """The output accumulator's columns the correction rescales at a time."""
-WARPGROUPS = 3
-"""A program's warpgroups: the softmax's and the correction's (`mosaic.tabled`'s rows), then the issuing
-one."""
+SCHEDULE = mosaic.Schedule((mosaic.Role("softmax"), mosaic.Role("correction"), *ISSUING))
+"""A program's roles: the softmax's warpgroup and the correction's, then the issuing one's load and product
+warps."""
 PART = 16
 """A step's tile's columns the softmax reads and weighs at a time: its chains over a row's whole tile spill
 (the natural relaunch's, 7.9 KB a thread at 128 columns), 80 bytes at 32 columns, none at 16 (ptxas for a
@@ -205,7 +205,7 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
     `P V` into the output's accumulator once its weights are there and the correction has taken the
     accumulator to their maximum."""
     queries = q_ref.at[block.row, pl.ds(block.first, TCGEN05.rows), block.head]
-    mosaic_sm100.RINGS.loaded(((queries, scratch.q_smem, scratch.q_loaded.at[0]),))
+    RINGS.loaded(((queries, scratch.q_smem, scratch.q_loaded.at[0]),))
 
     def values(index):
         turn = scratch.values.turn(index)
@@ -259,7 +259,9 @@ def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: 
 
     def step(index, carry: tuple[jax.Array, jax.Array], *, masked):
         m, total = carry
-        read = scratch.scores.read(scratch.scores.turn(index), PART, layout=TMEM)
+        scores = scratch.scores.turn(index)
+        scratch.scores.ready(scores)
+        read = functools.partial(_part, scratch.scores.slot(scores))
         # The row's new maximum over the tile's parts, and the factor the state before takes to it.
         new = m
         for part in range(parts):
@@ -289,8 +291,9 @@ def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: 
                      else total + weights.sum(axis=-1))
             narrowed = algebra.narrow(weights, dtype)
             for slot, p_tmem in enumerate(scratch.p_tmems):
+                weighed = Accumulator(p_tmem, (rows, block_k), dtype=dtype)
                 pl.when(lax.rem(index, 2) == slot)(functools.partial(
-                    TCGEN05.store_columns, p_tmem, part * PART, narrowed))
+                    RINGS.write, weighed, narrowed, first=part * PART))
         # The next S may overwrite this one once it is read out (`Tensor.release`).
         scratch.scores.release(scratch.scores.turn(index))
         scratch.p_full.published(scratch.p_full.turn(index))
@@ -315,6 +318,11 @@ def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: 
     scratch.finished.published(scratch.finished.turn(0))
 
 
+def _part(scores: Accumulator, part: int) -> jax.Array:
+    """A step's `S` tile's columns `PART` at a time, from tensor memory in its own layout."""
+    return RINGS.read(scores, first=part * PART, columns=PART, layout=TMEM)
+
+
 def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, blocks: int) -> None:
     """The correction warpgroup: each step's rescale of the output's accumulator in tensor memory, once the
     last `P V` is in it, by the factor the softmax hands it (`CHUNK` columns at a time), published for the
@@ -323,6 +331,7 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
     out_ref, maxima_ref, over_ref = outs
     rows = TCGEN05.rows
     value_width = int(scratch.acc_tmem.shape[1])
+    output = Accumulator(scratch.acc_tmem, (rows, value_width))
 
     @pl.loop(1, blocks)
     def _(index):
@@ -333,13 +342,13 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
             alpha = plgpu.load(scratch.scales.at[turn.slot], layout=TMEM.reduce(1))
             scratch.o_done.wait(scratch.o_done.turn(index - 1))
             for start in range(0, value_width, CHUNK):
-                acc = TCGEN05.load_columns(scratch.acc_tmem, start, CHUNK, layout=TMEM)
-                TCGEN05.store_columns(scratch.acc_tmem, start, algebra.rescale(acc, alpha))
+                RINGS.update(output, functools.partial(algebra.rescale, alpha=alpha), first=start,
+                             columns=CHUNK)
             scratch.corrected.published(scratch.corrected.turn(index - 1))
 
     scratch.o_done.wait(scratch.o_done.turn(block.steps - 1))
     scratch.finished.wait(scratch.finished.turn(0))
-    acc = TCGEN05.load_columns(scratch.acc_tmem, 0, value_width)
+    acc = RINGS.read(output)
     TCGEN05.loaded()
     m, total = (plgpu.load(scratch.rows_smem.at[place], layout=STORED.reduce(1)) for place in (0, 1))
     out = algebra.finish(spec, algebra.Partial(acc, m, total), initial=False)[0]
@@ -368,7 +377,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     target = generation.gpu_target()
     # The keys' and values' rings, the bundle's streams (`mosaic_sm100.RINGS`), each block's rows at the
     # widest swizzle its contraction fills (`mosaic_sm100.swizzled`'s).
-    rings = mosaic_sm100.RINGS.streams(
+    rings = RINGS.streams(
         {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}, tiles.stages, 1,
         swizzles={"keys": resources.widest_swizzle(dtype, width),
                   "values": resources.widest_swizzle(dtype, value_width)})
@@ -377,7 +386,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     def kernel(q_ref, k_ref, v_ref, out_ref, maxima_ref, over_ref, *refs):
         (q_smem, q_loaded, key_refs, value_refs, score_refs, p_even, p_odd, p_full, acc_tmem, o_done, scales,
          scaled, corrected, rows_smem, finished, o_smem, l_smem) = refs
-        opened = mosaic_sm100.RINGS.opened({name: dict(zip(rings[name], refs, strict=True))
+        opened = RINGS.opened({name: dict(zip(rings[name], refs, strict=True))
                                             for name, refs in (("keys", key_refs), ("values", value_refs))})
         scratch = _Scratch(q_smem, q_loaded, opened["keys"], opened["values"],
                            scores.opened(*score_refs), (p_even, p_odd),
@@ -385,13 +394,12 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                            handed.opened(scaled), signals.opened(corrected), rows_smem,
                            loads.opened(finished), o_smem, l_smem)
         block = _Block(spec.form == "causal", blocks, block_k)
-        # The softmax and the correction, then the issuing warpgroup's load and product warps.
-        roles = ((1, lambda _: _softmax(block, scratch, spec=spec, tiles=tiles, blocks=blocks, dtype=dtype)),
-                 (1, lambda _: _correction(block, scratch, (out_ref, maxima_ref, over_ref), spec=spec,
-                                           blocks=blocks)))
-        mosaic.tabled(lax.axis_index("wg"), roles, functools.partial(
-            TCGEN05.issuing, functools.partial(_load, block, scratch, k_ref, v_ref, group=group, tiles=tiles),
-            functools.partial(_products, block, scratch, q_ref)))
+        SCHEDULE.run(
+            softmax=lambda _: _softmax(block, scratch, spec=spec, tiles=tiles, blocks=blocks, dtype=dtype),
+            correction=lambda _: _correction(block, scratch, (out_ref, maxima_ref, over_ref), spec=spec,
+                                             blocks=blocks),
+            load=functools.partial(_load, block, scratch, k_ref, v_ref, group=group, tiles=tiles),
+            mma=functools.partial(_products, block, scratch, q_ref))
 
     # The softmax's final rows a role's signal; the weights', each `P V`'s and each rescale's the tensor
     # core's; each step's factor a role's in two slots, the correction reading one while the softmax writes
@@ -400,7 +408,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     handed = mosaic_sm100.Signals(count=2, tensor_core=False)
     # The weights' two buffers' signals and each `P V`'s, a slot a buffer.
     paired = mosaic_sm100.Signals(count=2)
-    scratch = (mosaic_sm100.operand((rows, width), dtype, width), mosaic_sm100.RINGS.load_barriers(1),
+    scratch = (mosaic_sm100.operand((rows, width), dtype, width), RINGS.load_barriers(1),
                tuple(rings["keys"].values()), tuple(rings["values"].values()), scores.scratch(target),
                *(mosaic_sm100.operand_columns(rows, block_k, dtype) for _ in range(2)), paired.scratch(),
                mosaic_sm100.accumulator_columns(rows, value_width), paired.scratch(),
@@ -412,7 +420,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
         kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type,
                           rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
-        interpret=bodies.interpreted(interpret), warpgroups=WARPGROUPS,
+        interpret=bodies.interpreted(interpret), warpgroups=SCHEDULE.warpgroups(),
         # A name a form (the default's fold and its natural rewalk compile apart).
         name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)
