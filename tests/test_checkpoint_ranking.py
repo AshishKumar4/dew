@@ -874,49 +874,53 @@ def test_a_runs_persistent_and_local_checkpoints_hold_one_envelope(tmp_path):
                                             persistent["state"], saved["state"])))
 
 
-def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
-    from dew.training import Evaluation
-
-    class TracedLM(LMObjective):
-        traces = 0
-        def loss(self, variables, batch, step):
-            self.traces += 1
-            return super().loss(variables, batch, step)
-    model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
-                              mlp_features=32, max_seq_len=16, dtype='float32', attention_impl='xla')
-    objective = TracedLM(model, seq_len=8, ema_decay=None)
-    variables = objective.init(jax.random.key(0))
-    batch = {'text': np.tile(np.arange(9, dtype=np.int32), (8, 1))}
-    def reader(partition):
-        return iter([batch])
-    first = Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
-    old_program = objective._validation_loss
-    assert objective.traces == 1
-    assert objective.tile_head((4, 4)) is not None
-    second = Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
-    assert objective.traces == 2
-    assert objective._validation_loss is not old_program
-    assert np.isfinite(first.scores['val/loss']) and np.isfinite(second.scores['val/loss'])
-    # Replacing the immutable model (as the fit ladder does) also invalidates
-    # the program, even when every variable and input shape stays the same.
-    objective.model = objective.model.clone(remat=None)
-    Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
-    assert objective.traces == 3
-    # So does the context the model reads as it traces (`trace_context`): the
-    # layout's rules and the pipeline's microbatch count, and returning to one
-    # finds its program again.
+def test_a_validation_pass_scores_the_head_model_and_context_it_runs_under():
+    """A validation pass's loss is the one a fresh objective of the same head, model and context scores, bit
+    for bit: after its objective tiles its head, after a model that predicts otherwise replaces its own at
+    the same variables and input shapes (as the fit ladder replaces it), and under each context the model
+    traces in (`trace_context`: the layout's rules, the pipeline's microbatch count). Each change traces
+    its program afresh and a return to one traces none, as the public seam counts (`Compiles`, whose
+    traces no persistent cache answers; row 4406). The tiled head's loss on par with the whole head's is
+    test_lm_head's."""
     from flax import linen as nn
 
     from dew.mesh import DEFAULT_RULES
+    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.sharding import pipeline_microbatches
-    with nn.logical_axis_rules((("vocab", None), *DEFAULT_RULES)):
-        Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
-    with pipeline_microbatches(2):
-        Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
-    Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
-    assert objective.traces == 5
+    from dew.objectives.lm import LMObjective
+    from dew.telemetry.compiles import Compiles
+    from dew.training import Evaluation
+
+    def model(**fields):
+        return CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                                 max_seq_len=16, dtype='float32', attention_impl='xla', **fields)
+
+    batch = {'text': np.tile(np.arange(9, dtype=np.int32), (8, 1))}
+    objective = LMObjective(model(), seq_len=8, ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+
+    def scored(scorer):
+        with Compiles(None) as compiles:
+            loss = Evaluation.run(scorer, variables, lambda partition: iter([batch]), key=jax.random.key(0),
+                                  loss=True).scores['val/loss']
+        return loss, [program.kind for program in compiles.programs].count("traced")
+
+    def fresh(head_tile=None, **fields):
+        return scored(LMObjective(model(**fields), seq_len=8, ema_decay=None, head_tile=head_tile))[0]
+
+    whole, _ = scored(objective)
+    assert np.isfinite(whole) and whole == fresh()
+    assert objective.tile_head((4, 4)) is not None
+    tiled, traced = scored(objective)
+    assert traced and tiled == fresh((4, 4))
+    objective.model = objective.model.clone(rope_theta=500.0)
+    rotated, traced = scored(objective)
+    assert traced and rotated == fresh((4, 4), rope_theta=500.0) and rotated != tiled
+    for context in (nn.logical_axis_rules((("vocab", None), *DEFAULT_RULES)), pipeline_microbatches(2)):
+        with context:
+            loss, traced = scored(objective)
+            assert traced and loss == fresh((4, 4), rope_theta=500.0)
+    assert scored(objective) == (rotated, 0)
 
 
 def test_a_refused_save_leaves_the_step_the_retention_policy_reads(tmp_path):
