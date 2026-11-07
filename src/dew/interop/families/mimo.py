@@ -71,12 +71,12 @@ from dew.interop.layouts import (
     When,
     unread,
 )
+from dew.interop.towers.mimo import translate_mimo_projector_config, translate_mimo_vision_config
+from dew.interop.towers.mimo_audio import AUDIO_TOKENIZER, translate_mimo_audio_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.mimo_audio import AUDIO_TOKENIZER, translate_mimo_audio_config
 from dew.nn.mixers.mlp import MLPMixer
-from dew.nn.vision.mimo import translate_mimo_projector_config, translate_mimo_vision_config
 
 _KINDS = ('full_attention', 'sliding_attention')
 

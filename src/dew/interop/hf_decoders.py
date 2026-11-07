@@ -67,6 +67,24 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.layouts import ConfigField, ConfigLayout
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.towers import (
+    TOWER_LAYOUTS,
+    projector_layout,
+    projector_variables,
+    tower_layout,
+    tower_variables,
+)
+from dew.interop.towers.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
+from dew.interop.towers.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
+from dew.interop.towers.gemma4_unified import translate_gemma4_unified_vision_config
+from dew.interop.towers.lfm3 import translate_lfm3_vl_projector_config, translate_lfm3_vl_vision_config
+from dew.interop.towers.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
+from dew.interop.towers.muse_glimmer import (
+    translate_muse_glimmer_projector_config,
+    translate_muse_glimmer_vision_config,
+)
+from dew.interop.towers.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
+from dew.interop.towers.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.interop.wrappers import TextCorrection, WrapperLayout
@@ -74,17 +92,6 @@ from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.gemma3n import AltUp
-from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
-from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
-from dew.nn.vision.gemma4_unified import translate_gemma4_unified_vision_config
-from dew.nn.vision.lfm3 import translate_lfm3_vl_projector_config, translate_lfm3_vl_vision_config
-from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
-from dew.nn.vision.muse_glimmer import (
-    translate_muse_glimmer_projector_config,
-    translate_muse_glimmer_vision_config,
-)
-from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
-from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.registry import from_record, towers
 
 if TYPE_CHECKING:
@@ -691,12 +698,12 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         component, owner = wrapper_route(name[:-len(sidecar)] + ".weight", record)
         return component, owner.removesuffix(".weight") + sidecar
     tower_prefix = (None if record["tower"] is None else
-                    vision_nn.tower_layout(_kind_name(record, "tower")).prefix)
+                    tower_layout(_kind_name(record, "tower")).prefix)
     projector_prefix = (None if record["projector"] is None else
-                        vision_nn.projector_layout(_kind_name(record, "projector")).prefix)
+                        projector_layout(_kind_name(record, "projector")).prefix)
     audio = record.get("audio_projector") is not None
     audio_layout = (None if record.get("audio") is None
-                    else towers[_kind_name(record, "audio")].checkpoint)
+                    else TOWER_LAYOUTS.get(towers[_kind_name(record, "audio")]))
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")
     for prefix in record.get("unported", {}):
@@ -1113,23 +1120,23 @@ def read_wrapper(
     variables = {"language_model": language}
     placed = {}
     if record["tower"] is not None:
-        tower, tower_layouts = vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"],
+        tower, tower_layouts = tower_variables(_kind_name(record, "tower"), tables["tower"],
                                                          param_dtype)
-        projector, projector_layouts = vision_nn.projector_variables(
+        projector, projector_layouts = projector_variables(
             _kind_name(record, "projector"), tables["projector"], param_dtype)
         variables.update(tower=tower, projector={"params": projector})
         placed.update(tower=tower_layouts, projector=nested(projector_layouts, 0, "params"))
     audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
-        # A Gemma tower's tensors are named under its own map; any other's sit where its class says
-        # (`TowerBase.checkpoint`).
+        # A Gemma tower's tensors are named under its own map; any other's sit where its family declares
+        # (`dew.interop.towers`).
         variables["audio_tower"], placed["audio_tower"] = (
             audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
             if isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio))
-            else vision_nn.tower_variables(_kind_name(record, "audio"), tables["audio_tower"], param_dtype))
+            else tower_variables(_kind_name(record, "audio"), tables["audio_tower"], param_dtype))
     if record.get("audio_projector") is not None:
-        audio_projector, audio_layouts = vision_nn.projector_variables(
+        audio_projector, audio_layouts = projector_variables(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)
         variables["audio_projector"] = {"params": audio_projector}
         placed["audio_projector"] = nested(audio_layouts, 0, "params")
