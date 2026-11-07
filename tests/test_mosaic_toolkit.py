@@ -609,11 +609,13 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
 
 
 @pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
 def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, rows):
-    """A launch of a decode step's few rows lowers on each bundle its device issues for them
+    """A launch of a decode step's few rows lowers on each bundle its device composes for them
     (`bundles.layouts`' `rows`: mma.sync's on cp.async on an A100; on an H100 wgmma's two layouts and
-    mma.sync's on TMA rings), its tile padded to the bundle's least rows and storing only its own."""
+    mma.sync's on TMA rings; on a B200, for a launch stating no accumulators, and on an RTX PRO 6000,
+    mma.sync's on TMA rings, so neither leaves Mosaic, row 4727), its tile padded to the bundle's least rows
+    and storing only its own."""
     from dew.nn.kernels.templates import bundles
     x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(64))
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)

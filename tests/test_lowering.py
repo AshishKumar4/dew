@@ -1021,12 +1021,13 @@ def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores
 @pytest.mark.parametrize("generation, claimed", [
     ("sm75", None), ("sm80", "mma.sync"), ("sm86", "mma.sync"), ("sm87", "mma.sync"),
     ("sm89", "mma.sync"), ("sm90", "wgmma"), ("sm100", "tcgen05"), ("sm103", "tcgen05"),
-    ("sm110", "tcgen05"), ("sm120", "mma.sync"), ("sm121", "mma.sync"), ("sm70", None), ("sm60", None),
-    ("v5e", "tpu"), ("cpu", None)])
+    ("sm110", "tcgen05"), ("sm120", "mma.sync"), ("sm121", "mma.sync"), ("sm130", "mma.sync"),
+    ("sm91", "mma.sync"), ("sm70", None), ("sm60", None), ("v5e", "tpu"), ("cpu", None)])
 def test_a_generations_instruction_family_is_its_compute_capabilitys(generation, claimed):
     """The family a template's mainloop claims comes from the compute capability alone, a GPU the table
-    names or not (sm87, sm110 and sm121 it does not); a Turing GPU (no bf16 MMA), one before it or a CPU
-    is in none."""
+    names or not (sm87, sm110 and sm121 it does not; an NVIDIA GPU past every rule, sm130 or sm91, mma.sync,
+    which every NVIDIA GPU from Ampere issues); a Turing GPU (no bf16 MMA), one before it or a CPU is in
+    none."""
     assert family(generation) == claimed
 
 

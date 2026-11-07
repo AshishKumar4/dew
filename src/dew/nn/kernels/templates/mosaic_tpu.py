@@ -342,13 +342,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         # Each step's blocks awaited before it and the next step's copied while it multiplies; a segment
         # of no steps copies nothing. Its products are synchronous: no stage outlives its step.
         del first, in_flight, unrolled, interpret
-        if held_past or finish is not None:
-            raise NotImplementedError(f"{self.name}'s steps give their stages back as each ends")
         names = tuple(streams.views)
         carry = (start, self.started(shapes, initial))
         for step, lo, hi in segments:
@@ -401,6 +398,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         # out, no swizzle.
         del swizzle
         return pltpu.VMEM(shape, dtype)
+
+    def added_settled(self) -> None:
+        # Its adds are synchronous copies (`added`), done when they return.
+        pass
 
     def schedule(self, consumers: int):
         # One role a core takes no turns (`turn` passes for one consumer): a semaphore it never signals, no

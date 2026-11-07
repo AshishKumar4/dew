@@ -265,12 +265,13 @@ def _lowering(forward, shapes, traced: list):
 
 @lowers("sm90")
 @pytest.mark.parametrize("exhausted", [False, True])
-def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhausted):
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fits(exhausted):
     """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
-    launch's config and lowers once more, where the derivation takes its next tile by its own rule; a
-    kernel spilling again is recorded and not stepped again. A paired SwiGLU forward whose model counts no
-    registers, compiled for a compile-only H100 on this CPU through ptxas. A derivation with no replacement
-    keeps its first program; the refusals saved with that program must derive it again."""
+    launch's config and lowers again, where the derivation takes its next tile by its own rule, for as long
+    as a config not refused before spills; the kept program's own spills are recorded and not stepped. A
+    paired SwiGLU forward whose model counts no registers, compiled for a compile-only H100 on this CPU
+    through ptxas. A derivation with no replacement keeps its first program; the refusals saved with that
+    program must derive it again."""
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
@@ -290,11 +291,11 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert not refused
         kept = first
     else:
-        first, kept = traced
-        assert kept != first
-        assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
-        assert all(miss.config == kept and not miss.stepped for miss in misses[1:])
-        assert [config for _, config, _ in refused] == [first]
+        *stepped, kept = traced
+        assert stepped and kept not in stepped
+        assert [miss.config for miss in misses if miss.stepped] == stepped
+        assert all(miss.config == kept for miss in misses if not miss.stepped)
+        assert {config for _, config, _ in refused} == set(stepped)
     # Another process seeded with the run's refusals (its plan's) derives the tile this compile kept.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -384,9 +385,9 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
         finally:
             stop.set()
         other.result()
-    first, kept = traced
-    assert kept != first
-    assert [config for _, config, _ in refused] == [first]
+    *stepped, kept = traced
+    assert stepped and kept not in stepped
+    assert {config for _, config, _ in refused} == set(stepped)
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
@@ -642,13 +643,17 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
 def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
-    """Every GEMM Mosaic GPU launch form a generation's family emits (`_emitted_forms`) derives a tile at
-    every real projection (`_gemm_mainloop_cases`): an eligibility regression fails here rather than leaving
-    the compile gate fewer cases. Its launches state their tiles' accumulators, so a B200's tcgen05 bundle is
-    theirs (`bundles.of`'s `stated`); a GPU whose family has no bundle (consumer Blackwell's TMA-fed mma.sync)
-    emits none."""
+    """Every GEMM Mosaic GPU launch form a generation emits derives a tile at every real projection
+    (`_gemm_mainloop_cases`), each on the most capable issuer whose bundle takes it (`bundles.groups`, its
+    launches stating their tiles' accumulators): a B200's kernel gradients and exact sums, which tcgen05's
+    bundle refuses, on mma.sync's (row 4727). An eligibility regression fails here rather than leaving the
+    compile gate fewer cases."""
     cases = _gemm_mainloop_cases(generation_name, shape)
-    forms = _emitted_forms(bundles.of(generation_name, jnp.bfloat16, stated=True), shape)
+    forms, taken = set(), set()
+    for group in bundles.groups(generation_name, jnp.bfloat16, stated=True):
+        own = _emitted_forms(group[0]) - taken
+        taken |= own
+        forms |= own & _emitted_forms(group[0], shape)
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
@@ -955,6 +960,39 @@ def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
     call): its program launches the template's packed product (`kernel_compile.Expected`, its route
     evidence)."""
     _assert_launches("sm90", "nvfp4 16 rows", functools.partial(_nvfp4_projected, 16, None), 1, "dew_gmm")
+
+
+def test_a_hoppers_nvfp4_prefill_shares_its_stage_decode():
+    """An NVFP4 projection at a prefill's 4096 rows on a compile-only H100, its packed kernel named: its
+    consumers share each stage's decode, each its share of the columns, meeting at a named barrier
+    (`mosaic_gpu._shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm90", "nvfp4 4096 rows", functools.partial(_nvfp4_projected, 4096, "packed"), 1,
+                     "dew_gmm")
+
+
+def _gathered_projection():
+    """An expert projection of gathered rows (`gemm.gemm`'s `gather`: Qwen3-30B-A3B's gate|up, 2048 deep and
+    768 wide, eight experts, 1024 tokens of top-2 slots), its tokens read where they lie."""
+    from dew.nn.kernels import gemm
+
+    sizes = jnp.full((8,), 256, jnp.int32)
+
+    def product(tokens, table, first, second):
+        # Both projections, stacked: the gate's and the up's.
+        return jnp.stack(gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16,
+                                   out_dtypes=(jnp.bfloat16,) * 2, paired=second, gather=table))
+
+    return product, (jax.ShapeDtypeStruct((1024, 2048), jnp.bfloat16),
+                     jax.ShapeDtypeStruct((2048,), jnp.int32),
+                     *(jax.ShapeDtypeStruct((8, 2048, 768), jnp.bfloat16),) * 2)
+
+
+def test_a_hoppers_gathered_projection_runs_the_template_producers_gather():
+    """A paired expert projection of gathered rows on a compile-only H100 (row 1376): its own cell
+    ('grouped forward gathered', which no old route reads), its program launching the template's grouped
+    product, whose producer warpgroup gathers each step's rows by cp.async into the swizzled ring
+    (`gathered.Ring`), which ptxas compiles (`kernel_compile.Expected`, its route evidence)."""
+    _assert_launches("sm90", "gathered projection", _gathered_projection, 4, "dew_gmm")
 
 
 def _blockwise_gradient():

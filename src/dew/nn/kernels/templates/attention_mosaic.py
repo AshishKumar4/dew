@@ -8,6 +8,7 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable, Hashable, Sequence
 from typing import ClassVar, Literal, overload
 
@@ -205,10 +206,11 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         # and the fused one, each consumer its own keys over the stream they walk whole. The forward on it
         # has no use the producer's layout does not serve, and deadlocked (row 2599): it is no config.
         walks_whole = not isinstance(config, Tiles) and config.queries_first
-        # A decode step's 16-row tile on mma.sync's fed layout (an H100's, `few_rows`): one consumer feeding
-        # its own rings, no turns between consumers, whose dropped turns hung the two-consumer fed forward.
-        alone = (family is not None and isinstance(config, Tiles) and config.consumers == 1
-                 and config.block_q < family.role_rows)
+        # One consumer feeding its own rings: no turns between consumers, whose dropped turns hung the
+        # two-consumer fed forward; a decode step's 16-row tile on mma.sync's fed layout (an H100's,
+        # `few_rows`), and every forward on a device whose bundle has no producer's layout (consumer
+        # Blackwell's, an unseen NVIDIA GPU's: `bundles.of`, row 4727).
+        alone = family is not None and isinstance(config, Tiles) and config.consumers == 1
         return (family is not None and (walks_whole or alone or not split_queries(family))
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
@@ -282,10 +284,10 @@ class MosaicForward(_Mainloop[Tiles]):
     """The slices each query tile's keys are cut into, each a program of its own (`_Program.splits`): a
     split-KV inference launch's, its outputs each slice's (`attention_decode` merges them)."""
     merges: bool = False
-    """Whether a split launch merges its slices itself, the last slice's program each query block's, the
-    initial state's among them (`attention_mosaic_forward._Merge`): its outputs the rows' whole, no merge in
-    XLA after it. Legal on a family that waits across programs (`Family.fixes_up`) where every program of
-    its grid is resident at once (`resident`), as its waits on the other slices need."""
+    """Whether a split launch merges its slices itself, the last slice's program to arrive each query
+    block's, the initial state's among them (`attention_mosaic_forward._Merge`, `Family.fixed_up`): its
+    outputs the rows' whole, no merge in XLA after it. Legal on a family whose programs fix a tile up across
+    programs (`Family.fixes_up`), none waiting on another."""
     parts: int = 1
     """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
@@ -362,15 +364,10 @@ class MosaicForward(_Mainloop[Tiles]):
                 and family.shares_rows(config.relaunch_k or config.block_k,
                                        config.relaunch_consumers or config.consumers)):
             return False
-        if self.merges and self.splits > 1:
-            # On a family that waits across programs (`Family.fixes_up`), every program of the grid resident
-            # at once: the last slice's waits on the others' states. Its kernel holds that residency
-            # (`_launched`'s `resident`); a guarded rewalk merges nothing (`_inference_walk`).
-            programs = (query.shape[0] * query.shape[2] * self.splits
-                        * -(-query.shape[1] // (config.consumers * config.block_q)))
-            if (not family.fixes_up or not target.multiprocessors
-                    or programs > target.multiprocessors * self.resident(ba, config, target)):
-                return False
+        if self.merges and self.splits > 1 and not family.fixes_up:
+            # A family whose programs merge their slices (`Family.fixes_up`); a guarded rewalk merges nothing
+            # (`_inference_walk`).
+            return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
         tiles = (config.block_k, config.relaunch_k or config.block_k)
@@ -435,14 +432,11 @@ class MosaicForward(_Mainloop[Tiles]):
         the 45 KB a program keeps in flight (ET-STAGES2-h100).
         Its natural rewalk's tiles derived again (`_relaunched`); `config` itself where no smaller tile
         dividing the call's keys holds, or the part's stream is unmeasured."""
-        query, value = ba.arguments["query"], ba.arguments["value"]
-        rate, fixed = target.memory_rate, target.fixed_seconds
-        if not (streams(query, target) and rate and fixed and target.multiprocessors):
+        in_flight = self._in_flight(ba, config, target)
+        if in_flight is None:
             return config
+        query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
-        itemsize = jnp.dtype(query.dtype).itemsize
-        per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
-        in_flight = rate / target.multiprocessors * fixed
         # Its key tiles dividing the call's keys alone: a tile past them pads the whole cache, its keys and
         # values copied a step (`padded_call`; a 96-key tile over 32768, 383 us a step on an A100,
         # M-DD-5 W16, as long as its launch). A multiprocessor's bytes in flight are its resident programs'
@@ -454,9 +448,42 @@ class MosaicForward(_Mainloop[Tiles]):
             if not (self.keys % extent == 0 and self._launch_legal(ba, candidate, target)):
                 continue
             held = self.resident(ba, candidate, target)
-            if held * config.stages * extent * per_key >= in_flight:
+            if held * self._staged_keys(ba, candidate) >= in_flight:
                 return self._relaunched(ba, candidate, target) or config
         return config
+
+    def streamed(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
+        """The programs a multiprocessor runs at once to keep its share of the device's stream in flight at
+        `config` (`streaming`'s bytes in flight over a program's staged keys and values), at most those it
+        holds (`resident`); those it holds where the stream is unmeasured. A memory-bound launch of more
+        programs a multiprocessor streams no faster: a split decode's slices past them only lengthen its
+        merge (an H100's B1 x 32768 decode at width 64 cut into 82 slices, five programs a multiprocessor
+        where one keeps its stream, took 90.7 us against the hand kernel's 28.7, M-DD-4 W56)."""
+        resident = self.resident(ba, config, target)
+        in_flight = self._in_flight(ba, config, target)
+        if in_flight is None:
+            return resident
+        return max(1, min(resident, math.ceil(in_flight / self._staged_keys(ba, config))))
+
+    def _in_flight(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
+                   ) -> float | None:
+        """The bytes a multiprocessor keeps in flight to stream its share of the device's memory rate for a
+        call its memory bounds (`streams`: `GpuTarget.memory_rate` over its multiprocessors, for the part's
+        measured `Measured.fixed`); None where the call is not so bound or the part's stream is
+        unmeasured."""
+        rate, fixed = target.memory_rate, target.fixed_seconds
+        if not (streams(ba.arguments["query"], target) and rate and fixed and target.multiprocessors):
+            return None
+        return rate / target.multiprocessors * fixed
+
+    def _staged_keys(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
+        """The bytes of keys and values a program's ring stages at `config`: its `stages` key tiles' rows of
+        both, at the widths its family stages them (`_width`)."""
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        family = bundle_of(config, query.dtype)
+        itemsize = jnp.dtype(query.dtype).itemsize
+        per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
+        return config.stages * config.block_k * per_key
 
     def _relaunched(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
                     ) -> Tiles | None:
@@ -811,6 +838,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     the keys' and the values' `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads
     the keys and values they dequantize to, each converted to the query's dtype in its program (`_Codes`).
     """
+    if residuals is Kept.SPLIT:
+        # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
+        spans = spans.per_query()
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
                              subtracted=subtracted, merges=merges, scales=scales)
@@ -822,6 +852,7 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                      residuals: Kept = Kept.NONE) -> Refusal | None:
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
+    spans = spans.per_query() if residuals is Kept.SPLIT else spans
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
 
@@ -1395,8 +1426,9 @@ def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans:
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                    dout: jax.Array, residuals: tuple, *, scale: float | None, natural: bool,
                    accurate: bool, rounded: bool = True) -> tuple[MosaicBackward, tuple]:
-    """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`)."""
-    hooks = Hooks() if hooks is None else hooks
+    """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`), its spans an
+    interval a query (`KeySpans.per_query`)."""
+    hooks, spans = Hooks() if hooks is None else hooks, spans.per_query()
     op = MosaicBackward(score_mod=hooks.score_mod,
                         score_kinds=tuple(param.kind for param in hooks.score_params),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),

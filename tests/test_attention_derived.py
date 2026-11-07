@@ -333,7 +333,7 @@ def fast(forms: str = "fast"):
 
 CALLS = {"plain": {}, "residuals": {"residuals": True}, "dropped": {"drop": 0.25}}
 """The forward calls the derived walk serves: a call's output, a training call's with its residuals (the
-forward's step, merge and finish whatever walk the training step takes), and a dropping call's."""
+training walk's step, `training_step`, taking the derived softmax), and a dropping call's."""
 
 
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
@@ -532,13 +532,14 @@ with generation.run_precision(fast):
                                           template.spans(16, 16, 1), residuals=True)
 print(bool(jnp.all(jnp.isfinite(out[0]))))
 """
-"""A fresh process's first derived walk: a training call's forward, its step the training walk's own."""
+"""A fresh process's first derived walk: a training call's forward, its step the training walk's, by the
+derived forms' softmax."""
 
 
 def test_a_fresh_processs_training_forward_finishes_by_the_derived_forms():
-    """A training call's forward (`residuals=True`, its walk the training step's) as a fresh
-    process's first call under the derived forms: its finish takes the derived forms of the state it holds,
-    whatever walk came before it in the process (none here), and its output is finite."""
+    """A training call's forward (`residuals=True`, its walk the training step's, by the derived forms) as a
+    fresh process's first call under the derived forms: its finish takes the derived forms of the state it
+    holds, whatever walk came before it in the process (none here), and its output is finite."""
     done = subprocess.run([sys.executable, "-c", FRESH], capture_output=True, text=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
     assert done.returncode == 0, done.stderr[-3000:]

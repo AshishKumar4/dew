@@ -361,9 +361,6 @@ class ScaleRing(CommittedRing):
     def acquire(self, turn: mosaic.Turn):
         return super().acquire(turn), self._scales(turn)
 
-    def slot(self, turn: mosaic.Turn):
-        return super().slot(turn), self._scales(turn)
-
     def _scales(self, turn: mosaic.Turn):
         """`turn`'s slot's tensor memory: its columns of `tmem`."""
         columns = self.tmem.shape[1] // self.smem.shape[0]
@@ -468,8 +465,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
             return tuple(initial)
         return tuple(Accumulator(None, shape) for shape in shapes)
 
-    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None,
-                       finish=None) -> tuple[C, tuple]:
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
+                       ) -> tuple[C, tuple]:
         # The accumulators stay in tensor memory, out of the loops' carries: a step's products add onto them
         # but at the walk's first step.
         del interpret
@@ -486,7 +483,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
             carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
             if loop.then is not None:
                 loop.then()
-        return (carry, accumulators) if finish is None else finish(carry, accumulators)
+        return carry, accumulators
 
     def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
                  ) -> Accumulator:
@@ -546,6 +543,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     (JAX's `blackwell_ragged_dot_mgpu.py`'s schedule, CUTLASS's sm100 persistent GEMM)."""
 
     consumers = 1
+    gathers_rows = False  # its rings and roles are its own (`streams`, `persist`), a load warp's, no gather
 
     turns = 2
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill
@@ -556,7 +554,10 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         return self.turns * columns * accumulators
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None) -> dict:
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()) -> dict:
+        if gathered:
+            raise NotImplementedError("tcgen05's load warp gathers no rows (`gathers_rows`)")
         if multicast:
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
                                       "(`Topology`; not yet a stream of this bundle's)")

@@ -60,8 +60,9 @@ class KeySpans:
     form: str = dataclasses.field(default="spans", metadata={"static": True})
     per_span: int = dataclasses.field(default=1, metadata={"static": True})
     """The consecutive queries each interval of a call of one run and no documents holds, `start` and `end`
-    then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), which a
-    program reads by position (`per_query` repeats them)."""
+    then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), or a
+    call's every query where lengths and starts alone bound its keys (`spans`), which a program reads by
+    position (`per_query` repeats them)."""
 
     def per_query(self) -> "KeySpans":
         """These spans an interval a query (`per_span` 1)."""
@@ -278,7 +279,19 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     if valid is not None:
         query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
-    return KeySpans(start, end, query_ids, key_ids, keys, form)
+    return _by_row(KeySpans(start, end, query_ids, key_ids, keys, form), causal, sliding_window, chunk,
+                   segment_ids, valid, runs, slots)
+
+
+def _by_row(spans: KeySpans, causal: bool, *narrowings) -> KeySpans:
+    """`spans` one interval a row (`KeySpans.per_span` its queries) where lengths and starts alone bound a
+    call's keys, every query's alike, which a program reads by position, so no block map is formed over its
+    queries (a grouped decode step's packed heads, `dew.nn.decode_geometry.grouped_query`); else as they
+    are. `narrowings` are the call's others: a window, a chunk, documents, validity, runs and slots."""
+    queries = spans.start.shape[1]
+    if spans.form != "spans" or queries <= 1 or causal or any(x is not None for x in narrowings):
+        return spans
+    return KeySpans(spans.start[:, :1], spans.end[:, :1], None, None, spans.keys, spans.form, queries)
 
 
 def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,

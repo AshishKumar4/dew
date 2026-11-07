@@ -1382,7 +1382,9 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
     row's shift past its weights' (`beyond_weights`). Where the mainloop holds the sums (`Keys.accumulate`,
     the plain walk's), they take the tile there. Returns the carry and `rows`."""
     state, arg, own, others_total = carry
-    m, factor, p, value, held = _softmax(spec, state, keys)
+    # The derived forms' softmax (`_derived_softmax`), but for a dropping call's, as `plain_step` takes them.
+    softmax = _derived_softmax if keys.coords.drop is None else _softmax
+    m, factor, p, value, held = softmax(spec, state, keys)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     parts, others, own_tile, anchor = _split_tile(keys, p, value.dtype, anchor, multiplier)
@@ -1431,8 +1433,11 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
     apart, as the gathering walk keeps them. No reduction finds a maximum or an anchor, and the sums the
     mainloop holds take the product in place, unscaled (`Keys.accumulate`'s `scale` None)."""
     state, arg, own, others_total = carry
-    p = weights(spec, keys.logits, state.m)
-    value = keys.values.load()
+    if keys.coords.drop is None:
+        # The derived forms' weights at the known maximum, which no tile moves.
+        _, _, p, value, _ = _derived_softmax(spec, state, keys)
+    else:
+        p, value = weights(spec, keys.logits, state.m), keys.values.load()
     parts, others, own_tile, arg = _split_tile(keys, p, value.dtype, arg,
                                                drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos))
     if keys.accumulate is None:
@@ -2083,6 +2088,51 @@ def _stated(spec: Forward, state: Partial) -> tuple[tuple, dict]:
     return (spec.base2, False, None, *_form_key(spec)), tiles
 
 
+def _step_forms(spec: Forward, keys: Keys):
+    """The derived forms of a walk's step over the tile `keys` (`derived_forms`), its tiles by name and its
+    states' slots: over the raw products where the mainloop gives them (`logits_of`), their factor the
+    declaration's own."""
+    raw = keys.products is not None
+    key = (spec.base2, bool(keys.coords.keys_first), spec.factor if raw else None, *_form_key(spec))
+    tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
+    return derived_forms(*key), tiles, _slotted(key, {name: (value.shape, value.dtype)
+                                                      for name, value in tiles.items()})
+
+
+def _derived_softmax(spec: Forward, state: Partial, keys: Keys):
+    """`_softmax` by the derived forms: the running maximum the forms' step reaches, the factor the state's
+    sums take, the tile's weights (the denominator's terms, before their narrowing for the product; the
+    guarded walk's at the row's shift, `room`) and values, and the guarded `Room`."""
+    forms, tiles, fields = _step_forms(spec, keys)
+    taken: list = []
+
+    def own(states, parts):
+        # The sums kept as they were: the walk takes the tile's weights and values itself, so the forms
+        # evaluate no product here.
+        taken.append(dict(zip(fields, parts, strict=True)))
+        return tuple(held if field in ("acc", "total") else None
+                     for field, held in zip(fields, states, strict=True))
+
+    derived = forms.step(tuple(getattr(state, field) for field in fields), tiles, product=keys.dot,
+                         stepped=own)
+    m = dict(zip(fields, derived, strict=True))["m"]
+    factor, p, value, held = _derived_parts(state, keys, taken[0]["acc"], taken[0]["total"])
+    return m, factor, p, value, held
+
+
+def _derived_parts(state: Partial, keys: Keys, accumulated, added):
+    """The forms' step's parts as the template's step takes them: the factor the state's sums take, the
+    tile's weights (the denominator's terms; the guarded walk's at the row's shift, `room`), its values and
+    the guarded `Room`."""
+    assert isinstance(accumulated, Accumulated) and isinstance(added, Added)
+    value, p, factor = accumulated.values, added.terms, added.factor
+    held = None
+    if state.guard is not None:
+        largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
+        held = room(state.guard, state.total, factor, p, largest())
+    return factor, p if held is None else held.weights, value, held
+
+
 def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """`plain_step` by the derived forms: the tile's logits (-inf where a query does not see a key, as
     `modify` writes them) and values, its maximum, rescale and weights the forms'; the weighted values' sums
@@ -2091,12 +2141,7 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     step takes them (`stepped`, the one owner of both): the tile's products a chunk of keys each, each
     addition's rounding kept, and on the guarded walk each live row's shift (`room`, from the forms' weights
     and the tile's values) with the unshifted sums beside them."""
-    # Over the raw products where the mainloop gives them (`logits_of`), their factor the declaration's own.
-    raw = keys.products is not None
-    key = (spec.base2, bool(keys.coords.keys_first), spec.factor if raw else None, *_form_key(spec))
-    forms = derived_forms(*key)
-    tiles = {"logits": keys.products if raw else keys.logits, "values": keys.values}
-    fields = _slotted(key, {name: (value.shape, value.dtype) for name, value in tiles.items()})
+    forms, tiles, fields = _step_forms(spec, keys)
     held_by, plain = keys.accumulate, state.low is None and state.guard is None
     after: list[Partial] = []
 
@@ -2118,15 +2163,9 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
 
             acc = held_by(states[fields.index("acc")], scale, (accumulated.weights,), accumulated.values)
             return tuple(acc if field == "acc" else total if field == "total" else None for field in fields)
-        assert isinstance(added, Added)
         # The template's step over the forms' weights (the denominator's terms, before their narrowing for
         # the product) and rescale.
-        value, p, factor = accumulated.values, added.terms, added.factor
-        held = None
-        if state.guard is not None:
-            largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
-            held = room(state.guard, state.total, factor, p, largest())
-        weights = p if held is None else held.weights
+        factor, weights, value, held = _derived_parts(state, keys, accumulated, added)
         times = functools.partial(_times, keys.dot, value, multiplier=None, chunk=chunk_of(spec))
         after.append(stepped(state, state.m, factor, weights, times(weights), held, times))
         return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)

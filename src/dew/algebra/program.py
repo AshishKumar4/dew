@@ -114,11 +114,10 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
     @functools.wraps(fn)
     def run(*args, **kwargs):
         # Under `jax.disable_jit` a program runs as Python, its values concrete, so nothing is traced to
-        # rewrite; where the run's numerics admit saturation aids alone (`Rules.aid`: the accurate forms'
-        # commutativity), the pass would leave the program as it is.
-        accurate = generation.numerics().forms == "accurate"
-        if not _rewriting(accurate) or jax_config.disable_jit.value:
+        # rewrite.
+        if not ALGEBRA.value.on or jax_config.disable_jit.value:
             return fn(*args, **kwargs)
+        accurate = generation.numerics().forms == "accurate"
         statics = _statics(args, numbers)
         fixed = {name: value for name, value in kwargs.items() if name in names}
         dynamic, named = _dynamic(args, kwargs, numbers, names)
@@ -139,9 +138,9 @@ def rewritten_program(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.J
     (`passes`, `rewrite`'s walks): `closed` itself where no rule changes it, so the trace jit made lowers as
     it is, never staged again (a Dory-4B training step's replay of its unchanged program, 1.8 seconds of
     its compile). The pass's whole seconds, its walks among them, recorded (`report.record_pass`)."""
-    accurate = generation.numerics().forms == "accurate"
-    if not _rewriting(accurate):
+    if not ALGEBRA.value.on:
         return closed
+    accurate = generation.numerics().forms == "accurate"
     began = time.perf_counter()
     made = _rewritten(closed, accurate, saturation)
     kernel_report.record_pass(time.perf_counter() - began)
@@ -162,10 +161,10 @@ def replaying(closed: jcore.Jaxpr, structure, numbers: Iterable[int],
     return run
 
 
-def _rewriting(accurate: bool) -> bool:
-    """Whether the pass rewrites here: the switch on, and the run's numerics admitting a set past saturation
-    aids (`Rules.aid`: the accurate forms' commutativity), where the pass would leave a program as it is."""
-    return ALGEBRA.value.on and not all(sets.aid for sets in rules.admitted(accurate))
+def _saturating(accurate: bool) -> bool:
+    """Whether the pass saturates a program's math: the run's numerics admitting a set past saturation aids
+    (`Rules.aid`: the accurate forms' commutativity), where saturation would leave its math as it is."""
+    return not all(sets.aid for sets in rules.admitted(accurate))
 
 
 def _statics(args: tuple, numbers: Iterable[int]) -> set[int]:
@@ -643,15 +642,17 @@ def _opens(equation: jcore.JaxprEqn) -> bool:
 
 def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jcore.Jaxpr:
     """`closed`'s bodies rewritten in place (`_within`), then its own math (`_windowed`) with each Algebra
-    span's body opened into it (`_opened`), so a window reaches across the span's boundary, then its
-    products fused with their consumers where the GEMM template takes them (`fusion.fused_program`); the
-    program with its spans kept as traced where no window's form lands (`closed` itself where nothing
-    changed)."""
-    within = _within(closed, accurate, saturation)
-    opened = _opened(within)
-    made = _windowed(opened, accurate, saturation)
-    made = within if made is opened else made
-    # Each product and its consumers fused into the GEMM template's epilogue where it takes them.
+    span's body opened into it (`_opened`), so a window reaches across the span's boundary, where the run's
+    numerics admit a rewrite of it (`_saturating`), then its products fused with their consumers where the
+    GEMM template takes them and its attention written as Dew's where a kernel of Dew's takes it
+    (`fusion.fused_program`), whatever the numerics admit: accurate forms limit reassociation alone (row
+    4730). The program with its spans kept as traced where no window's form lands (`closed` itself where
+    nothing changed)."""
+    made = _within(closed, accurate, saturation)
+    if _saturating(accurate):
+        opened = _opened(made)
+        windowed = _windowed(opened, accurate, saturation)
+        made = made if windowed is opened else windowed
     return fusion.fused_program(made)
 
 
