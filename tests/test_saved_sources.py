@@ -170,6 +170,33 @@ def test_a_run_whose_mixture_no_family_writes_exports_and_loads_back_answering_a
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_lettered_run_over_a_qwen35_backbone_exports_a_release_a_run_starts_from(tmp_path, monkeypatch):
+    """`dew export` of a lettered decision run over a Qwen3.5 text backbone (qwen3_5_text, its delta
+    nets' geometry and its rotary's fraction the generic export writes none of) writes a release that
+    loads: a run started from it lands every leaf as a run started from the saved run does, one step from
+    each, bit for bit (ledger 4533's repro through its public path, row 4563)."""
+    from saved_run_kinds import lettered
+
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    first = lettered(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    exported = tmp_path / "exported"
+    export_run(SavedRun.pinned(str(source)), exported)
+    assert json.loads((exported / "config.json").read_text())["model_type"] == "qwen3_5_text"
+
+    def started(pretrained, name: str, *flags: str):
+        run = DecisionRunConfig.cli(["--pretrained", str(pretrained), *flags], default=first)
+        # The saved run and its release are each the run's decision task whole, its head among it and its
+        # backbone no wrapper's: a run from either reads it as it is (no fresh head, no text_only).
+        run = dataclasses.replace(run, head=None, source=dataclasses.replace(run.source, text_only=False))
+        return trained(run, tmp_path, name, trainer={"checkpoint_final": True})[0]
+
+    leaves_alike(started(source, "from_run", "--source.step", "latest").variables,
+                 started(exported, "from_export").variables)
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_on(tmp_path):
     """A named run started from a saved Dew run (`--pretrained <run>`) at the step its selection names by
     default (a diffusion run's, its latest) records that step; when the saved run has trained on, so that
@@ -202,6 +229,23 @@ def test_a_run_started_from_a_saved_run_resumes_its_step_after_that_run_trains_o
         dataclasses.replace(recorded, source=SourceOptions(step=later)).check_resume(saved)
     trained(command, tmp_path, "after", trainer={"name": "after", "steps": 2, "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "after").iterdir()}
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
+    """How a decoder executes its layers (`scan_layers`, `RunConfig.EXECUTED`) is no part of what a run
+    computes or stores, its checkpoint holding every layer `layers_N` either way: a run saved running a
+    layer at a time resumes scanning them, and back, where its resume refused it as another model (row
+    4104)."""
+    first = lm(tmp_path, drawn=False)
+    deeper = dataclasses.replace(first, model=ModelConfig("causal_transformer",
+                                                          {**first.model.fields, "num_layers": 2}))
+    trained(deeper, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
+    for scanned, steps in ((True, 2), (False, 3)):
+        run = dataclasses.replace(deeper, model=ModelConfig("causal_transformer", {
+            **deeper.model.fields, "scan_layers": scanned}))
+        trained(run, tmp_path, "run", trainer={"name": "run", "steps": steps, "checkpoint_final": True})
+        assert str(steps) in {path.name for path in (tmp_path / "runs" / "run").iterdir()}
 
 
 @pytest.mark.mesh(devices=8)

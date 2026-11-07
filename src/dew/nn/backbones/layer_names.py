@@ -150,9 +150,10 @@ def stored_layers(model, variables: Variables, *, banks: bool = False) -> Variab
     stacked under (`StackView.layer_form`): a stage-local one's into arrays, a bank's into rows read as
     they are read (`StoredRow`), beside what the store holds of each layer apart (a DEX layer's own
     parameters); variables that hold no such run are returned as they are. A model run reads the store
-    as it is (`off_stages`)."""
+    as it is (`off_stages`). A store on one stage holds its runs stacked so too where its decoder scans
+    them (`StagedStacks.stage_sites` at one stage)."""
     stages = stage_count(variables)
-    if stages > 1 and isinstance(model, StagedStacks):
+    if isinstance(model, StagedStacks) and stacked_by_stage(variables):
         sites, cut = model.stage_sites(variables, stages), array_rows
 
         def held(node) -> bool:
@@ -165,12 +166,20 @@ def stored_layers(model, variables: Variables, *, banks: bool = False) -> Variab
             return isinstance(node, Mapping) and any(len(group_layers(name) or ()) > 1 for name in node)
     else:
         return variables
+    stages = stage_count(variables)
     stored = dict(variables)
     for site in sites:
         def layered(node, view=site.view):
             return _with_apart(node, view.layer_form(node, cut)) if held(node) else node
         stored = {name: _at(tree, site.namespace, layered) for name, tree in stored.items()}
     return stored
+
+
+def stacked_by_stage(tree: Mapping) -> bool:
+    """Whether `tree`, variables or one of their collections, holds a run stacked by stage anywhere in it
+    (`StackView.stage_form`), a pipeline's or one stage's scan's, a wrapped decoder's under its name."""
+    return 'stages' in tree or any(isinstance(child, Mapping) and stacked_by_stage(child)
+                                   for child in tree.values())
 
 
 def _with_apart(node: Mapping, layers: dict) -> dict:
