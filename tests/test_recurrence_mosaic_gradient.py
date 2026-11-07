@@ -215,6 +215,33 @@ def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.parametrize('family', ['wgmma', 'tcgen05'])
+@pytest.mark.parametrize('case', ['one sequence', 'a decay a key dimension'])
+def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
+    """The template's training step at 128 tokens a chunk (`Tiles.chunk`) on wgmma's and tcgen05's bundles,
+    interpreted, on par from float64 with the same tiles at 64 (check 1, the truth the recurrence a token at
+    a time in float64): its output, final memory and every operand's gradient in bf16 (row 4770)."""
+    hooks, dtype = case_hooks(case), jnp.bfloat16
+    (sample, _) = drawn(dtype, 0, **geometry(case))
+    bundle = {'wgmma': bundles.INTERPRETED, 'tcgen05': mosaic_sm100.CHUNKS}[family]
+    target = generation.gpu_target({'wgmma': 'sm90', 'tcgen05': 'sm100'}[family])
+    tiles = template.MOSAIC.derived(template_call(sample, hooks), target)
+    assert tiles is not None
+
+    def at(chunk):
+        def rule(given):
+            return template.mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta,
+                                        given.state, tiles=dataclasses.replace(tiles, chunk=chunk),
+                                        family=bundle, delta=hooks.delta, scale=given.key.shape[-1] ** -0.5,
+                                        floor=hooks.floor, bound=hooks.inverse_bound, rounded=True)
+        return jax.jit(with_gradients(rule))
+
+    assert_as_exact(at(128), at(64), functools.partial(drawn, dtype, **geometry(case)),
+                    f'128-token chunks training on {family}, {case}', seeds=8,
+                    truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
+
+
 def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
     """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
     recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
