@@ -6,6 +6,7 @@ routed size, each against transformers' logits (see test_hf_decoders).
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -241,6 +242,77 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
+
+
+PACKED_CONFIG = {**fixture_config("gpt-oss-tiny"), "hidden_size": 256, "intermediate_size": 256,
+                 "num_attention_heads": 4, "head_dim": 64, "quantization_config": {"quant_method": "mxfp4"}}
+"""A GPT-OSS whose experts are whole NVFP4 stages deep (256, `gemm.NVFP4_STAGE`): the tiny fixture's 32
+wide is not, so its banks would stay dense."""
+
+
+def _mxfp4_gpt_oss(directory: Path) -> Path:
+    """A GPT-OSS checkpoint in the released MXFP4 layout under `directory`, `PACKED_CONFIG`'s geometry,
+    its weights a draw of the model exported (`PretrainedDecoder.save`) and its experts packed by the
+    released encoder (`quantize_mxfp4`)."""
+    from safetensors.numpy import load_file, save_file
+
+    dense = {key: value for key, value in PACKED_CONFIG.items() if key != "quantization_config"}
+    model = translate_config(dense)
+    variables = nn.unbox(model.init(jax.random.key(0), np.zeros((1, 4), np.int32)))
+    PretrainedDecoder.from_model(model, variables).save(directory / "dense")
+    packed = {}
+    for name, tensor in load_file(str(directory / "dense" / "model.safetensors")).items():
+        if name.endswith(("gate_up_proj", "down_proj")):
+            blocks, scales = (np.asarray(part) for part in quantize_mxfp4(jnp.asarray(tensor)))
+            packed[name + "_blocks"], packed[name + "_scales"] = blocks, scales
+        else:
+            packed[name] = tensor
+    (directory / "mxfp4").mkdir()
+    save_file(packed, str(directory / "mxfp4" / "model.safetensors"))
+    (directory / "mxfp4" / "config.json").write_text(json.dumps(PACKED_CONFIG))
+    return directory / "mxfp4"
+
+
+def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
+    """An MXFP4 GPT-OSS loaded with its experts packed (`Pretrained.load`'s `packed_experts`, row 4516):
+    each expert matrix an NVFP4 bank in the `QUANTIZATION` collection, no parameter beside it, holding
+    exactly the values the dequantizing load decodes; its logits on par with that load's, both bf16 with
+    the stored weights' own dtype (check 1, truth the decoded load in fp32); and its export the source's
+    MXFP4 tensors bit for bit."""
+    from dew.nn.kernels.gemm import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    source = _mxfp4_gpt_oss(tmp_path)
+    packed, decoded = (Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
+                                       attention_impl="xla", packed_experts=served)
+                       for served in (True, False))
+    banks = flat_tree(packed.variables[QUANTIZATION])
+    assert sorted(banks) == sorted(path for path in flat_tree(decoded.variables["params"])
+                                   if path.endswith(("gate_up_proj", "down_proj")))
+    params = flat_tree(packed.variables["params"])
+    for path, bank in banks.items():
+        assert isinstance(bank, NvFp4) and path not in params
+        values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
+        held = flat_tree(decoded.variables["params"])[path]
+        np.testing.assert_array_equal(values, np.asarray(held, np.float32))
+
+    wide = Pretrained.load(str(source), dtype="float32", attention_impl="xla")
+
+    def draw(seed: int):
+        return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
+
+    def logits(loaded):
+        return jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens))
+
+    assert_as_exact(logits(packed), logits(decoded), draw, "packed GPT-OSS experts", seeds=8,
+                    truth_fn=logits(wide))
+    from safetensors.numpy import load_file
+
+    stored = load_file(str(source / "model.safetensors"))
+    exported = packed.export()
+    for name in stored:
+        if name.endswith(("_blocks", "_scales")):
+            np.testing.assert_array_equal(np.asarray(exported[name]), stored[name])
 
 
 @pytest.mark.network
