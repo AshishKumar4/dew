@@ -50,6 +50,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _plain_forward,
     _trained_forward,
     certified_walk,
+    forward_products,
     guarded_columns,
     guarded_tiles,
 )
@@ -74,6 +75,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     query_swizzle,
     reducing,
     refused,
+    scopes_products,
     split_queries,
     stagings,
     varying_slopes,
@@ -598,7 +600,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
         guarded = algebra.headroom(_computed(ba)) and ba.arguments.get("residuals") is not Kept.SPLIT
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
-            family, config.consumers, self.score_reduces or self.output_mod is not None, guarded=guarded)))
+            family, config.consumers, self.score_reduces or self.output_mod is not None, guarded=guarded),
+            products=forward_products(config, value_width, query.dtype, parts=self.parts)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
                   columns: int | None = None) -> int | None:
@@ -1171,6 +1174,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                              ) and not config.queries_first:
             return False
         if config.fused and dropped and config.shared_keys:
+            return False
+        if any(scopes_products(bundle_of(tiles, ba.arguments["query"].dtype))
+               for tiles in (config, config.dkv)):
+            # The backward's launches scope no issuer's product scratch (tcgen05's chunks'); row 4839's
+            # tensor-memory backward is their tcgen05 form.
             return False
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
