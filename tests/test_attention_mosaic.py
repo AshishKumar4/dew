@@ -622,10 +622,18 @@ def test_the_backward_is_on_par_at_head_widths_interpreted(width, value_width):
                     value_width=value_width)
 
 
+DROPPING_FORWARDS = [(call, training, jnp.bfloat16) for call in CALLS
+                     for training in (template.Kept.NONE, template.Kept.SPLIT)]
+DROPPING_FORWARDS += [("causal", training, jnp.float16)
+                      for training in (template.Kept.NONE, template.Kept.SPLIT)]
+"""The dropping forward's cases: each call form, plain and training, over bf16; over fp16 a causal call's,
+whose dropped weights narrow as they are (`algebra.dropped_parts`), the walk bf16's otherwise."""
+
+
 @INTERPRETS
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
-@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
-@pytest.mark.parametrize("call", CALLS)
+@pytest.mark.parametrize(("call", "training", "dtype"), DROPPING_FORWARDS,
+                         ids=[f"{call}-{training.name}-{jnp.dtype(dtype).name}"
+                              for call, training, dtype in DROPPING_FORWARDS])
 def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
     """The forward and the training forward under probability dropout, its draw the reference's bit for bit
     (`template.Draw`), over bf16 or fp16 operands, fp16's dropped weights narrowed as they are and summed in
