@@ -177,6 +177,58 @@ def test_a_gathered_kernel_gradient_lowers_for_cuda():
                                     lowering_platforms=("cuda",))
 
 
+def test_a_blackwells_gathered_product_reads_its_rows_by_its_load_warps_gathers():
+    """A gathered, scattered grouped product on an sm100, interpreted (row 1376): tcgen05's bundle takes it
+    (on the GPU its load warp's TMA four-row gathers, `gathered.Committed`; interpreted each row a copy), its
+    value bitwise the product of the rows gathered first and put at their slots after; and its kernel
+    gradient's tables on the next issuer (mma.sync's TMA rings, `bundles.groups`), bitwise the gradient of
+    the rows gathered first. Integers, every sum exact in the bf16 output."""
+    from dew.nn.kernels import gemm
+
+    rng = np.random.default_rng(13)
+    tokens = jnp.asarray(rng.integers(-1, 2, size=(200, 256)), jnp.bfloat16)
+    matrices = jnp.asarray(rng.integers(-1, 2, size=(3, 256, 256)), jnp.bfloat16)
+    table = jnp.asarray(rng.integers(0, 200, 384), jnp.int32)
+    slots = jnp.asarray(rng.permutation(384), jnp.int32)
+    cotangent = jnp.asarray(rng.integers(-1, 2, size=(384, 256)), jnp.bfloat16)
+    sizes = jnp.asarray([128, 0, 200], jnp.int32)
+    options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": True}
+    derived, original = [], mosaic_gpu.gmm
+
+    def recorded(*args, tiles, **kwargs):
+        derived.append(tiles)
+        return original(*args, tiles=tiles, **kwargs)
+
+    with generation.assumed("sm100"), pytest.MonkeyPatch.context() as patched:
+        patched.setattr(mosaic_gpu, "gmm", recorded)
+        got = jax.jit(lambda: gemm.gemm(tokens, matrices, sizes, gather=table, scatter=slots, **options))()
+        assert {tile.family for tile in derived} == {"tcgen05"}
+        apart = jax.jit(lambda: gemm.gemm(tokens[table], matrices, sizes, **options))()
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.zeros_like(apart).at[slots].set(apart)))
+        gradient = jax.jit(lambda: gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32, gather=(
+            table, slots), precision="default", interpret_on_cpu=True))()
+        expected = jax.jit(lambda: gemm.gemm_t(tokens[table], cotangent[slots], sizes, out_dtype=jnp.float32,
+                                               precision="default", interpret_on_cpu=True))()
+    np.testing.assert_array_equal(np.asarray(gradient), np.asarray(expected))
+
+
+def test_a_blackwells_gathered_product_lowers_for_cuda():
+    """A gathered grouped product on a compile-only B200 lowers through Mosaic GPU on tcgen05's bundle: its
+    load warp's TMA four-row gathers into the swizzled ring (`gathered.tma_rows`), each slot released by its
+    products' commit."""
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
+
+    def gathered(tokens, matrices, table):
+        return mosaic_gpu.gmm(tokens, matrices, sizes, tiles=tiles, transpose_rhs=False,
+                              out_dtype=jnp.bfloat16, multiprocessors=148, interpret=False, gather=table)
+
+    with generation.assumed("sm100"):
+        jax.jit(gathered).trace(jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((4, 512, 256), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((2048,), jnp.int32)).lower(lowering_platforms=("cuda",))
+
+
 def test_a_gathered_products_table_covers_every_tile_its_schedule_walks():
     """A gathered product's table, on a family whose loads past the rows are bounded (wgmma's TMA, compiled),
     still extends to every row its schedule's tiles walk (`mosaic_gpu.row_extent`): the producer's threads
