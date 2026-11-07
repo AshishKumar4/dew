@@ -765,7 +765,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
-    return max(resources.live_registers(family, carried, *phases, *products), scored) + rows
+    return max(resources.live_registers(family, carried, *phases, *products), scored) + rows + (
+        family.product_control)
 
 
 def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tuple, width: int) -> int:

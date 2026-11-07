@@ -730,6 +730,9 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
     # jsf-gate100b): an fp32 product takes bf16 parts.
     takes_fp8 = True
     takes_register_left = False
+    # A B200's training forward on three consumers at 64 x 64, width 64, priced 158 of 160 registers with
+    # its products read back twice and spilled 20 bytes (et-h1gate3): its products' addresses and phase.
+    product_control = 8
     rows = 64
     role_rows = 64
     widest_product = 256
