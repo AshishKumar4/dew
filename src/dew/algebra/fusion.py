@@ -107,11 +107,15 @@ def _fusing(replay: Callable, fused_gemm) -> Callable:
 
 class Index:
     """A body's equations by the values they make (`producer`), each value's readers (`readers`: the places
-    of the equations that read it) and the values the body returns (`escaping`): what both region finders
-    read (`_regions`, `attention_regions.regions`)."""
+    of the equations that read it), the values the body returns (`escaping`) and its constants' values where
+    it holds them (`consts`): what the region finders read (`_regions`, `attention_regions.regions`,
+    `norm_regions.regions`)."""
 
     def __init__(self, jaxpr: jcore.Jaxpr):
         self.jaxpr = jaxpr
+        values = getattr(jaxpr, "consts", ())
+        held = len(values) == len(jaxpr.constvars)
+        self.consts = dict(zip(jaxpr.constvars, values, strict=True)) if held else {}
         self.producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
         self.readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
         for place, equation in enumerate(jaxpr.eqns):

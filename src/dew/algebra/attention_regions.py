@@ -108,7 +108,9 @@ class Attention(NamedTuple):
     mask_axes: tuple[int, ...] = ()
     """The logits' axis each of `mask`'s lies along."""
     bias: jcore.Var | None = None
-    """An additive bias of the product's logits' shape and layout, the call's `bias`."""
+    """An additive bias of the logits' shape, the call's `bias`, laid as the product's logits once transposed
+    by `bias_perm` (the logits moved before the bias was added: jax.nn's)."""
+    bias_perm: tuple[int, ...] = ()
     perm: tuple[int, ...] = ()
     """The logits' axes as the product lays them (`_unmasked`'s)."""
 
@@ -152,7 +154,9 @@ def written(region: Attention) -> Callable:
         v = v.reshape(math.prod(batch), v.shape[-2], 1, v.shape[-1])
         extra = iter(extras)
         mask = None if region.mask is None else _folded(region, _laid_mask(region, next(extra)), q.shape)
-        bias = None if region.bias is None else _folded(region, next(extra), q.shape)
+        bias = None if region.bias is None else next(extra)
+        if bias is not None:
+            bias = _folded(region, jnp.transpose(bias, region.bias_perm) if region.bias_perm else bias, q.shape)
         out = scaled_dot_product_attention(q, k, v, causal=region.causal, sliding_window=region.window,
                                            softcap=region.softcap, mask=mask, bias=bias)
         out = out.reshape(*batch, *row_sizes, *heads, out.shape[-1])
@@ -215,7 +219,10 @@ class Graph:
     def __init__(self, index):
         self.jaxpr, self.producer, self.readers, self.escaping = (index.jaxpr, index.producer, index.readers,
                                                                   index.escaping)
-        self._constants: dict[jcore.Var, object] = {}
+        # The body's constants (jax.nn's mask positions, an iota it closed over) by their values.
+        self._constants: dict[jcore.Var, object] = {
+            var: np.asarray(value) for var, value in index.consts.items()
+            if math.prod(getattr(var.aval, "shape", ())) <= MASK_ENTRIES}
 
     def made(self, atom, *names: str):
         """The place of the equation making `atom`, where its primitive is one of `names`; None else."""
@@ -247,8 +254,9 @@ class Graph:
         return value == -math.inf or value <= 0.5 * float(jnp.finfo(dtype).min)
 
     def constant(self, atom):
-        """`atom`'s value where no input of the program makes it (literals and iotas through any equation
-        without effects), None else, nor where it holds more than MASK_ENTRIES entries."""
+        """`atom`'s value where no input of the program makes it (literals, the body's constants, iotas,
+        through any equation without effects), None else, nor where it holds more than MASK_ENTRIES
+        entries."""
         if isinstance(atom, jcore.Literal):
             return np.asarray(atom.val)
         if atom in self._constants:
@@ -319,15 +327,19 @@ def _matched(graph: Graph, exp_place: int) -> Attention | None:
     second, weights_read = product
     places.append(second)
     places += logits_places
-    first, query, key, query_width, key_width, layout, softcap, factor, bias = _scaled_product(graph, scaled,
-                                                                                               places)
+    first, query, key, query_width, key_width, layout, softcap, factor, bias, moved = _scaled_product(
+        graph, scaled, places)
     if first is None:
         return None
+    # The logits' axes as the product lays them: through the layout before the bias (`moved`), then the
+    # one before the softmax (`perm`).
+    perm = tuple(moved[axis] for axis in perm) if moved else perm
     region = _laid_out(graph, second, weights_read, query, key, layout, query_width, key_width, axis, mask,
                        perm)
     if region is None:
         return None
-    region = region._replace(softcap=softcap, factor=factor, bias=bias)
+    bias_perm = tuple(moved.index(axis) for axis in range(len(moved))) if moved else ()
+    region = region._replace(softcap=softcap, factor=factor, bias=bias, bias_perm=bias_perm)
     places = sorted(set(places))
     # A mask or bias made outside the region and before the place its call is written (its last).
     made_at = [graph.producer.get(var) for var in region.operands[3:]]
@@ -511,19 +523,28 @@ def _laid(inner: jcore.Jaxpr, index: int, rank: int) -> tuple[int, ...] | None:
 def _scaled_product(graph: Graph, scaled, places: list[int]):
     """The logits product making `scaled` (the module's account): (its place, the query and key operands it
     reads (a query divided by sqrt(D) read before its division), their contracted axes, its layout, its
-    softcap, the power of two its scale is past the default's, its bias); Nones where the product is scaled
-    otherwise or is no `dot_general`."""
-    eqns, nothing = graph.jaxpr.eqns, (None,) * 9
+    softcap, the power of two its scale is past the default's, its bias, and the permutation a transpose of
+    the scaled product before the bias's add took (`()` for none: the logits' axis i is the product's
+    `moved[i]`)); Nones where the product is scaled otherwise or is no `dot_general`."""
+    eqns, nothing = graph.jaxpr.eqns, (None,) * 10
+    moved: tuple[int, ...] = ()
     atom = graph.uncast(scaled, places, widening)
     bias = None
     if (added := graph.made(atom, "add")) is not None:
         # The bias the operand of the logits' shape not made by the logits' own chain: the other one's.
         for kept, other in itertools.permutations(eqns[added].invars):
-            inner = _capped(graph, graph.uncast(kept, [], widening), [])[1]
+            inner = graph.uncast(kept, [], widening)
+            transposed = graph.made(inner, "transpose")
+            inner = _capped(graph, inner if transposed is None else eqns[transposed].invars[0], [])[1]
             if (isinstance(other, jcore.Var) and other.aval.shape == atom.aval.shape
                     and _product_of(graph, inner)):
-                # The bias as the program holds it, its widening for the add the region's (jax.nn's).
+                # The bias as the program holds it, its widening for the add the region's (jax.nn's), and
+                # the logits laid out again before it, the transpose the region's.
                 bias, atom = graph.uncast(other, places, widening), graph.uncast(kept, places, widening)
+                if transposed is not None:
+                    moved = tuple(int(d) for d in eqns[transposed].params["permutation"])
+                    places.append(transposed)
+                    atom = eqns[transposed].invars[0]
                 places.append(added)
                 break
         else:
@@ -570,7 +591,7 @@ def _scaled_product(graph: Graph, scaled, places: list[int]):
             return nothing
     places.append(first)
     return (first, query, key, contracted_q[0], contracted_k[0], eqn.params["dimension_numbers"], softcap,
-            factor, bias)
+            factor, bias, moved)
 
 
 def _capped(graph: Graph, atom, places: list[int]) -> tuple[float | None, object]:
