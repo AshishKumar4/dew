@@ -1,11 +1,12 @@
 """The diagnostic must exercise the real Trainer's unchanged profiler window."""
+import jax
 import numpy as np
 import optax
 
 from affine_run import Regression, batches, dataset
 from profiler_sequence_support import ReplayTracker, TrainerProbe
 
-from dew.training import Trainer
+from dew.training import MeshSpec, Trainer
 from dew.training.profiling import ProfileWindow
 
 
@@ -20,6 +21,7 @@ def test_the_real_loop_captures_steps_41_to_48_and_all_suites_at_43(tmp_path):
 
     trainer = ProbedTrainer(
         Regression(), optax.sgd(1e-3), key=57831, accumulation=2, split=2,
+        mesh=MeshSpec().build([jax.devices("cpu")[0]]),
         profile=ProfileWindow(str(tmp_path / "trace"), 8, warmup=40, reports=False),
         tracker=ReplayTracker(event))
     trainer.replay_event = event
