@@ -995,6 +995,13 @@ def test_a_hoppers_gathered_projection_runs_the_template_producers_gather():
     _assert_launches("sm90", "gathered projection", _gathered_projection, 4, "dew_gmm")
 
 
+def test_a_b200s_gathered_projection_runs_the_template_load_warps_gathers():
+    """A paired expert projection of gathered rows on a compile-only B200 (row 1376): its program launches the
+    template's grouped product on tcgen05's bundle, whose load warp gathers each step's rows by TMA's
+    four-row gathers (`gathered.Committed`), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm100", "gathered projection", _gathered_projection, 4, "dew_gmm")
+
+
 def _gathered_projection_gradient():
     """The reverse pass of an expert projection of gathered rows whose rows land at their slots (`gemm.gemm`'s
     `gather` and `scatter`: Qwen3-30B-A3B's 2048-deep, 768-wide experts, eight, 1024 tokens of top-2 slots),
