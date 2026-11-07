@@ -60,7 +60,8 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
     delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
-    (the accurate forms) take none. A decay a key dimension's form takes either pair factoring its layer's
+    (the accurate forms, or a form without the delta rule on its route, `recurrence_chunk.chunk_rounding`)
+    take none. A decay a key dimension's form takes either pair factoring its layer's
     floor gives (`algebra.factored_range`, `algebra.key_diagonal_pairs_back`)."""
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
@@ -482,8 +483,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
 
         def step(role):
             (*staged, (second,)), lands = roled(role)
-            # A key slice's memory operand and, where a chunk is wider than a key slice, the chunk's apart.
-            sliced, chunked = staged[0], staged[-1]
+            sliced, chunked = staged[0], staged[-1]  # a key slice's operand, a chunk's where wider
             # The decayed output gradient fp32 as two parts against the queries (fla's split product, 16 of
             # its significand's bits): one part put the initial memory's gradient 5 to 7 times the port's
             # distance from float64. Its first part reuses the memory products' tile, each consumed before
@@ -530,9 +530,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     final_landing, after = final_memory_landing(call, bv)
     return launch_kernel(program, call, out_type=out_type,
                          grid=(value_width // walked_width, sequences.shape[0], call.heads),
-                         # Two deep where the block holds both stages, else one: an fp32 call's two parts and
-                         # keys 256 wide took 237920 and 282848 bytes two deep, past an H100's 232448
-                         # (fp32-plan-sm90 at cdcd620ef, wide-backward).
+                         # Two deep where the block holds both, else one: fp32's two parts and 256-wide keys
+                         # took 237920 and 282848 bytes, past an H100's 232448 (fp32-plan-sm90, cdcd620ef).
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2), work=work,
                          held=_reverse_held(call, bv, gates=gates, skips=skips), consumers=walkers,
                          live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
