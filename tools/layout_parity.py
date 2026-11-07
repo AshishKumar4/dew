@@ -1040,9 +1040,10 @@ class Judge:
     """How many draws past the one read the reference and the anchor run ahead (`ahead`)."""
 
     def ahead(self, seed: int) -> None:
-        """Draw `seed`'s reference and float64 anchor, and the `AHEAD` draws' after it, on two threads
-        beside the caller, which runs a layout's draw meanwhile: each of a draw's three programs keeps
-        about half of a CI task's four cores busy, so the three together run in about half the time.
+        """Draw `seed`'s reference and float64 anchor, and the `AHEAD` draws' after it, on two threads,
+        finishing before the caller runs a layout's draw. XLA:CPU's collective needs its device gang
+        together on the client's bounded pool; a reference holding one of those threads can leave the
+        collective waiting for a participant whose launch is queued on that same pool.
         The pairs are held in the order they were last asked for, the least recently asked dropped past
         twice `AHEAD` once it has finished, so a pending draw is never dropped and recomputed; each
         layout of a model restarts its draws at 0 and finds the earlier layout's pairs still held, or
@@ -1064,6 +1065,8 @@ class Judge:
                 self._ahead.move_to_end(at)
             else:
                 self._ahead[at] = self._pool.submit(both, at)
+        for pair in self._ahead.values():
+            pair.result()
         finished = [at for at, pair in self._ahead.items() if pair.done()]
         for at in finished[:max(0, len(self._ahead) - 2 * self.AHEAD)]:
             del self._ahead[at]
