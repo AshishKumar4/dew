@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax.typing import DTypeLike
 
 from dew.nn.derivatives import Algebra, contracted
-from dew.nn.kernels.generation import linear_tangent
+from dew.nn.kernels.generation import linear_tangent, unbroadcast
 from dew.nn.precision import L2NORM_EPS, at_least_fp32
 
 __all__ = ["NGPT"]
@@ -151,15 +151,8 @@ def _stepped_backward(scale: float, saved, operands, cotangent) -> tuple[jax.Arr
     # pulls them back: its derivative at zero and its sums over each broadcast axis.
     _, rated = jax.vjp(lambda alpha: jnp.broadcast_to(jnp.abs(alpha.astype(wide) * scale), step.shape), alpha)
     (d_alpha,) = rated(d_joined * (end - start))
-    return (_unbroadcast(d_residual, residual).astype(residual.dtype),
-            _unbroadcast(d_branch, branch).astype(branch.dtype), d_alpha.astype(alpha.dtype))
-
-
-def _unbroadcast(cotangent: jax.Array, operand: jax.Array) -> jax.Array:
-    """`cotangent`, of the shape `operand` broadcast to, summed back to `operand`'s shape, as JAX pulls a
-    broadcast back."""
-    _, pulled = jax.vjp(lambda wide: jnp.broadcast_to(wide, cotangent.shape), operand.astype(cotangent.dtype))
-    return pulled(cotangent)[0]
+    return (unbroadcast(d_residual, residual.shape).astype(residual.dtype),
+            unbroadcast(d_branch, branch.shape).astype(branch.dtype), d_alpha.astype(alpha.dtype))
 
 
 def normed_hidden(gate: jax.Array, up: jax.Array, gate_gain: jax.Array, up_gain: jax.Array, factor: float,
