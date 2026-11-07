@@ -1,11 +1,12 @@
 """What Mosaic GPU's compiles say of each kernel, what the templates' resource models are checked against.
 A run's compile (`compiled`, owner 10-29, bible §6) reads each kernel's registers a thread and its stack
 frame from the binary its executable carries (`binaries`): a launch whose kernel spills is refused
-(`refused`) and its program lowered once more, where the launch's derivation takes the next config by its
-own rule, each such refusal a model miss (`misses`). The CPU suite's compile gate reads the binaries too,
-beside the resource estimate Pallas prints as it lowers a kernel and the PTX Mosaic prints as it compiles
-one, whose registers and spills ptxas states at the GPU's own compile (tests/kernel_compile.py). Each
-kernel's name carries the launch that traced it (`named`), so a binary names its launch and its config."""
+(`refused`) and its program lowered again, where the launch's derivation takes the next config by its own
+rule, until none spills or the launch has none left (`settled`), each such refusal a model miss (`misses`).
+The CPU suite's compile gate reads the binaries too, beside the resource estimate Pallas prints as it lowers
+a kernel and the PTX Mosaic prints as it compiles one, whose registers and spills ptxas states at the GPU's
+own compile (tests/kernel_compile.py). Each kernel's name carries the launch that traced it (`named`), so a
+binary names its launch and its config."""
 
 import contextlib
 import contextvars
@@ -281,6 +282,13 @@ def spilled(op, arguments: tokamax.BoundArguments, config: Hashable) -> frozense
         return registry.refused.get(identity, frozenset())
 
 
+def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kernels) -> None:
+    """`op`'s launch of `arguments` at `config` refused in this context as a compile that found `kernels`
+    spilling refuses it (`settled`), so its derivation takes the next config: a compile gate's, which
+    compiles a launch apart from `compiled`, stepping as a run's compile steps (row 4727)."""
+    _record((_identity(op, arguments), config), None, frozenset(kernels))
+
+
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
     """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
     the process's), ordered. A validated plan can hand them to another process explicitly (`refuse` within
@@ -471,15 +479,18 @@ def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
 def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
             relower: Callable[[], jax.stages.Lowered], first: Attempt) -> jax.stages.Compiled:
     """The program kept of `lowered`'s first compile (`first`), read through its kernels' binaries
-    (`binaries`): where a kernel of a template's
-    launch spills, that launch's config is refused (`refused`), the miss recorded (`misses`, logged), and the
-    program `relower`ed once and compiled; `relower` traces afresh, so each refused launch's derivation
-    takes the next config by its own rule. A kernel spilling again is recorded, neither refused nor stepped
-    again, so every process derives the program this compile keeps; a relowering whose derivations find no
-    config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
-    only when a replacement compiles, so a later process derives the program kept here. A program loaded
-    from the persistent compilation cache carries its kernels' binaries as one compiled here does. A
-    program whose block XLA refuses steps its asking Triton launches down (`_unblocked`)."""
+    (`binaries`): where a kernel of a template's launch spills, that launch's config is refused (`refused`),
+    the miss recorded (`misses`, logged), and the program `relower`ed and compiled, again for as long as a
+    launch spills at a config not yet refused; `relower` traces afresh, so each refused launch's derivation
+    takes the next config by its own rule, through every composition its device has (`bundles.groups`), and
+    a launch whose every legal config spilled derives none, its call taking the next route (it leaves the
+    template only so). The last compile's own spills are recorded,
+    neither refused nor stepped, so every process derives the program this compile keeps; a relowering whose
+    derivations find no config left (`Exhausted`: a launch a call pins) keeps the program before it, its
+    misses recorded as not stepped. Refusals commit only as a replacement compiles, so a later process
+    derives the program kept here. A program loaded from the persistent compilation cache carries its
+    kernels' binaries as one compiled here does. A program whose block XLA refuses steps its asking Triton
+    launches down (`_unblocked`)."""
     if first.error is not None:
         asked = shared_asked(first.error)
         if asked is None:
@@ -488,26 +499,28 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     executable = first.executable
     assert executable is not None
     found = _misses_of(_spilling(lowered, executable))
-    refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
-    if not refusals:
-        _recorded(found, stepped=False)
-        return executable
-    try:
-        with _proposing(refusals) as proposal:
-            relowered = relower()
-            replacement, spilling = _compiled_reported(relowered, options)
-    except Exhausted as failed:
-        _log.warning("relowering after a spill found no config: %s; the first program runs", failed)
-        _recorded(found, stepped=False)
-        return executable
-    _commit(proposal)
-    for refusal, kernel in refusals:
-        _record(refusal, None, frozenset({kernel}))
-    _recorded(found, stepped=True)
+    while True:
+        # Each step refuses a config no step refused before, of the finitely many its launches derive.
+        held = _registry().refused
+        refusals = [(refusal, report.kernel) for refusal, report, _ in found
+                    if refusal is not None and report.kernel not in held.get(refusal, frozenset())]
+        if not refusals:
+            break
+        try:
+            with _proposing(refusals) as proposal:
+                replacement, spilling = _compiled_reported(relower(), options)
+        except Exhausted as failed:
+            _log.warning("relowering after a spill found no config: %s; the program before it runs", failed)
+            break
+        _commit(proposal)
+        for refusal, kernel in refusals:
+            _record(refusal, None, frozenset({kernel}))
+        _recorded(found, stepped=True)
+        executable, found = replacement, _misses_of(spilling)
     # The kept program's own spills are misses alone: refused, they would have every process seeded with
-    # them derive a third program, not the one this compile keeps and runs.
-    _recorded(_misses_of(spilling), stepped=False)
-    return replacement
+    # them derive another program, not the one this compile keeps and runs.
+    _recorded(found, stepped=False)
+    return executable
 
 
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,

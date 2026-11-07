@@ -36,7 +36,7 @@ from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 from sharded import collective_axes
 
 from dew.nn.kernels import grouped_matmul
-from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
+from dew.nn.kernels.generation import assumed, capability, gpu_target
 from dew.nn.kernels.lowered import kernel_calls, triton_kernels
 from dew.nn.kernels.templates import report, resources
 from dew.training.ahead import compile_only_gpus
@@ -212,7 +212,8 @@ def _device(generation: str, axes: tuple[tuple[str, int], ...] = (("data", 1),))
 def lowered_for(fn, args, generation: str, expected: Expected | None = None):
     """`fn` traced on `args`, its abstract leaves placed on compile-only devices of the CUDA `generation`
     (`_device`: one, replicated, or `expected`'s mesh, each argument by its spec), and lowered as on that GPU
-    (`assumed`, `gpu_mesh`) within its block's shared memory: what XLA compiles for it, never run."""
+    (`assumed`, the mesh's abstract devices) within its block's shared memory: what XLA compiles for it,
+    never run."""
     mesh = _device(generation) if expected is None else _device(generation, expected.axes)
     specs = (None,) * len(args) if expected is None else expected.specs
     def placed_on(arg, sharding: NamedSharding):
@@ -223,7 +224,7 @@ def lowered_for(fn, args, generation: str, expected: Expected | None = None):
                    for arg, spec in zip(args, specs, strict=True))
     # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
     # Its bound checks the total allocation, including barriers outside the scratch estimate.
-    with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+    with (assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
           mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit)):
         return jax.jit(fn).trace(*placed).lower()
 
@@ -243,7 +244,7 @@ def failures(found: list[dict]) -> list[str]:
 
 def compile_kernels(cases, generation: str) -> list[dict]:
     """Each case (`name`, `call()` giving the kernel and abstract operands) on the CUDA `generation`,
-    lowered as on that GPU on this host (`assumed`, `gpu_mesh`) and compiled by XLA for a compile-only
+    lowered as on that GPU on this host (`assumed`, `lowered_for`) and compiled by XLA for a compile-only
     device of it, never run: its name, the generation's block limit, and the shared bytes its Triton
     kernels launch with (the most of any; those XLA refused, where it refused one), or the error.
 
@@ -286,7 +287,7 @@ def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
 
 def _compiled(case, generation: str, record: dict,
               directory: str | None = None) -> tuple[list[str], dict[str, int]] | None:
-    """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
+    """`case` lowered as on the CUDA `generation` (`lowered_for`) and compiled by XLA for a
     compile-only device of it: XLA's thunk sequences and the lowered program's Triton calls by name
     (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
     refused. Given a `directory`, its Mosaic GPU kernels' evidence too (`_printed`): `record['estimates']`

@@ -197,27 +197,41 @@ class Multiprocessor:
 @dataclasses.dataclass(frozen=True)
 class Architecture:
     """The facts every device of one instruction family shares, from its compute capability (a TPU's
-    generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per clock per
+    generation), each component a template's bundle composes from stated per device, never implied by a
+    generation's number (`templates.bundles.groups`): the matrix instruction families it issues, most capable
+    first (`issuers`; the first the family a template's mainloop claims, `family`, and Hopper's warpgroup MMA,
+    `wgmma`, one of them), the multiprocessors a cluster's TMA multicast reaches (`cluster`), whether its
+    tensor instructions read block-scaled operands (`block_scales`), its dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; '8bit': FP8
     operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively; 'fp32': IEEE fp32
-    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup MMA, Blackwell's
-    tensor memory columns (PTX ISA, tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and
-    the VMEM a kernel may raise its limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block
-    into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline` and
-    `copy_gmem_to_smem`), where below it they copy by cp.async. `dependent_launch`: PTX's grid dependency
-    control (`griddepcontrol`, programmatic dependent launch), sm_90 on. A family of None is no template's:
-    its devices' facts serve the rest of Dew (MFU's peaks). Its CUDA multiprocessor's resources
-    (`multiprocessor`), None on a TPU."""
+    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Blackwell's tensor memory columns (PTX ISA,
+    tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and the VMEM a kernel may raise its
+    limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block into shared memory by TMA, which
+    it picks from compute capability 9.0 on (its `emit_pipeline` and `copy_gmem_to_smem`), where below it they
+    copy by cp.async. `dependent_launch`: PTX's grid dependency control (`griddepcontrol`, programmatic
+    dependent launch), sm_90 on. No issuer is no template's: its devices' facts serve the rest of Dew (MFU's
+    peaks). Its CUDA multiprocessor's resources (`multiprocessor`), None on a TPU."""
 
-    family: str | None
+    issuers: tuple[str, ...]
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     multiprocessor: Multiprocessor | None = Multiprocessor()
-    wgmma: bool = False
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
     scoped_vmem: int | None = None
     vmem_bytes: int | None = None
+    cluster: int = 1
+    block_scales: bool = False
+
+    @property
+    def family(self) -> str | None:
+        """The instruction family a template's mainloop claims the device by: the most capable it issues."""
+        return self.issuers[0] if self.issuers else None
+
+    @property
+    def wgmma(self) -> bool:
+        """Whether the device issues Hopper's warpgroup MMA."""
+        return 'wgmma' in self.issuers
 
 
 # Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x boost clock: A100 312 TF
@@ -236,24 +250,30 @@ class Architecture:
 # Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
 # 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
 # 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
+_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
                        Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None))
-_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256},
+_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, 'fp32': 256},
                                 Multiprocessor(register_raises=None))
-_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
+_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
                     Multiprocessor(resident_blocks=24, register_raises=None))
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128},
+_TURING = Architecture((), {'16bit': 1024, 'fp32': 128},
                        Multiprocessor(resident_threads=1024, register_raises=None))
-_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32), wgmma=True, tma=True,
-                       dependent_launch=True)
-# Blackwell's tcgen05 family.
-_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
+# Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
+# pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
+_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32), tma=True,
+                       dependent_launch=True, cluster=2)
+# Blackwell's tcgen05 family: tcgen05 (sm_100a) and mma.sync, no wgmma; tensor memory, a pair's 2-CTA
+# products and multicast, block-scaled operands (PTX ISA, tcgen05.mma's kind::mxf8f6f4 and mxf4nvf4).
+_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
                           Multiprocessor(resident_threads=2048, resident_blocks=32), tmem_columns=512,
-                          tma=True, dependent_launch=True)
+                          tma=True, dependent_launch=True, cluster=2, block_scales=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
-_BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
+# Its components are those PTX's forward compatibility gives every NVIDIA GPU after it too: mma.sync and
+# cp.async from sm_80, TMA and grid dependency control from sm_90, no arch-specific instruction (wgmma's
+# sm_90a, tcgen05's sm_100a), which no capability implies.
+_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
                                    Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
@@ -261,15 +281,18 @@ _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bi
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
+_TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20),
-         'v6e': Architecture('tpu', {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
+         'v6e': Architecture(('tpu',), {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
 
 
 def architecture(generation: str) -> Architecture | None:
     """The instruction family `generation` belongs to, from its compute capability alone, one rule a
-    capability (a TPU's generation), so a device no row names (B300, sm103) takes its family's facts;
-    None outside every family Dew knows (a GPU before Turing, a TPU no rule states, a CPU)."""
+    capability (a TPU's generation), so a device no row names (B300, sm103) takes its family's facts, and
+    an NVIDIA GPU past every rule (a capability Dew states none for yet) takes consumer Blackwell's, whose
+    components PTX's forward compatibility gives it (mma.sync, cp.async and TMA): the Mosaic templates run
+    wherever CUDA does (row 4727). None outside every family Dew knows (a GPU before Ampere, a TPU no rule
+    states, a CPU)."""
     found = capability(generation)
     if found is None:
         return _TPUS.get(generation)
@@ -282,27 +305,15 @@ def architecture(generation: str) -> Architecture | None:
         return _HOPPER
     if major in (10, 11):
         return _BLACKWELL
-    if major == 12:
-        return _BLACKWELL_CONSUMER
-    return None
+    return _BLACKWELL_CONSUMER if major >= 9 else None
 
 
 def family(generation: str) -> str | None:
     """The instruction family a template's mainloop claims `generation` by ('mma.sync', 'wgmma',
-    'tcgen05', 'tpu'), seen or unseen: a claim is a family, never a list of devices; None outside every
-    family (a Turing GPU, a CPU)."""
+    'tcgen05', 'tpu'), seen or unseen (an NVIDIA GPU past every rule claimed by mma.sync, `architecture`):
+    a claim is a family, never a list of devices; None outside every family (a Turing GPU, a CPU)."""
     found = architecture(generation)
     return None if found is None else found.family
-
-
-def issuers(generation: str) -> tuple[str, ...]:
-    """The matrix instruction families a device of `generation` issues, its own first (`family`): a GPU of
-    a family after Ampere issues mma.sync too, beside Hopper's wgmma or Blackwell's tcgen05; none outside
-    every family."""
-    own = family(generation)
-    if own is None:
-        return ()
-    return (own,) if own in ('mma.sync', 'tpu') else (own, 'mma.sync')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -392,7 +403,7 @@ class GpuTarget:
     @property
     def architecture(self) -> Architecture:
         """The target's instruction family's facts (`architecture`), none where it belongs to none."""
-        return architecture(self.generation) or Architecture('')
+        return architecture(self.generation) or Architecture(())
 
     @property
     def tensor_rates(self) -> Mapping[str, int]:
@@ -712,20 +723,18 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
-    the kernel benchmark's oracle; tests/kernel_compile.py). Its devices state their compute capability, which
-    Mosaic GPU lowers for (its `utils._infer_arch`; a device that states none it takes for sm90's, and an
-    sm80 kernel's cp.async waits do not lower), but an sm90's, which Mosaic's default already is: stated,
-    its `9.0` sends a warpgroup-MMA kernel's ptxas a lower default SM than the sm_90a its PTX targets
-    ('SM version specified by .target is higher than default SM version assumed', FAM-contract3). JAX
-    0.12's abstract device states it (`AbstractDevice.compute_capability`)."""
+    the kernel benchmark's oracle). Its devices state their compute capability, which Mosaic GPU lowers for
+    (its `utils._infer_arch`; a device that states none it takes for sm90's, and an sm80 kernel's cp.async
+    waits do not lower), as a mesh of compile-only devices of the generation does (`compile_only_gpus`, whose
+    `abstract_mesh` a caller holding one takes), so one GPU's programs trace on one abstract mesh (row
+    3915). JAX 0.12's abstract device states it (`AbstractDevice.compute_capability`)."""
     from jax.sharding import AbstractDevice, AbstractMesh
     target = gpu_target(generation)
     version = capability(generation)
     if not target.generation.startswith('sm') or target.shared_limit is None or version is None:
         raise ValueError(f"no CUDA target for {generation!r}")
-    stated = None if version == (9, 0) else '.'.join(map(str, version))
     device = AbstractDevice(device_kind=target.device_kind, num_cores=None, platform='cuda',
-                            compute_capability=stated)
+                            compute_capability='.'.join(map(str, version)))
     return AbstractMesh(mesh.axis_sizes, mesh.axis_names, axis_types=mesh.axis_types, abstract_device=device)
 
 
@@ -921,7 +930,7 @@ def gpu_facts(part: str | None = None) -> GpuFacts:
         resident_threads=resources and resources.resident_threads,
         resident_blocks=resources and resources.resident_blocks,
         dense_peaks=MappingProxyType(dict(target._part(target.dense_peaks) or {})),
-        instruction_families=issuers(target.generation),
+        instruction_families=target.architecture.issuers,
         bundles=tuple(bundle.name for bundle in bundles.layouts(target.generation, 'bfloat16')))
 
 
@@ -981,15 +990,17 @@ class _Routes:
 
 
 @contextlib.contextmanager
-def routes() -> Iterator[list[Route]]:
+def routes(*, alone: bool = False) -> Iterator[list[Route]]:
     """Collect every `Route` a dispatch reports while code runs or traces in the block, in order: what
     a step's trace within `assumed(target)` on a CPU shows of that target's kernels. Each block is a
     fresh collection JAX keys its traces on (`dew._cache.KERNEL_ROUTES`), so a function traced before
-    traces, and reports, again; a block nested in another reports to both."""
+    traces, and reports, again; a block nested in another reports to both, unless `alone` (a decision
+    that traces a call it may not take, the compile point's, whose routes no program runs)."""
     from dew import _cache
 
     collected = _Routes()
-    with _cache.KERNEL_ROUTES((*_cache.KERNEL_ROUTES.value, collected)):
+    enclosing = () if alone else _cache.KERNEL_ROUTES.value
+    with _cache.KERNEL_ROUTES((*enclosing, collected)):
         yield collected.found
 
 

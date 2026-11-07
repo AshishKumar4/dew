@@ -157,6 +157,30 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
 
 
 @INTERPRETS
+def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_interpreted():
+    """A decode step on an H100 of two rows over 4096 keys, its four programs' keys cut into slices (`plan`)
+    whose states merge by their masses (`algebra.merged_slices`): the first row reads every key, whole key
+    tiles and whole slices, the second none. On par with the reference path (check 1), the empty row zero.
+    The merge at fp32's edges is the stability suite's (tests/test_attention_stability.py's template
+    decode at fp32's edges)."""
+    keys = 4096
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, 0], jnp.int32))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (2, 1, 8, 64), jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.bfloat16) for stream in streams[1:])
+        return query, key, value
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
+                    "template decode split at aligned keys", seeds=SEEDS)
+
+
+@INTERPRETS
 def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
     """A serving step's work list over a cache of two rows: three batch rows, a decode row's one query and
     two pieces of four prompt queries each, reading cache rows 1, 0 and 1 where they lie (`attend`'s
@@ -333,7 +357,8 @@ def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
     spans = _spans(3)
     rows, row_spans, _ = attention_decode.packed(query, spans, 2)
     np.testing.assert_array_equal(template.ungrouped_rows(rows, 8), query)
-    np.testing.assert_array_equal(row_spans.per_query().start, np.repeat(np.asarray(spans.start), 4, axis=1))
+    np.testing.assert_array_equal(row_spans.per_query().start,
+                                  np.repeat(np.asarray(spans.per_query().start), 4, axis=1))
 
 
 

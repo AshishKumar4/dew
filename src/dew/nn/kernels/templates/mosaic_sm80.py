@@ -168,6 +168,14 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     operands_in_registers = True
 
+    def column_unit(self, dtype) -> int:
+        # A warp's lanes, whatever loader stages its tiles: the guarded attention walk's 32-column key
+        # blocks held where its 64 held no tile's registers at width 128 (its fragments are registers), a
+        # TMA ring staging such a block at a 64-byte swizzle (`mosaic.staged`); cp.async's stores move rows
+        # through registers, a row's columns over a warp's lanes at least (`mosaic.copied`).
+        del dtype
+        return resources.THREADS // 4
+
     products_overlap = False
 
     takes_tf32 = True
@@ -440,6 +448,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
 
+    # Its programs fix a tile up across programs through global-memory atomics (`Family.fixed_up`), which
+    # sm_70 on issues: a balanced tail's and a decode's split partials merge in the launch.
+    fixes_up = True
+
     bounded_loads = False
 
     # A step loading ahead of the one consumed leaves cp.async's latency unhidden: two steps 64 deep stalled
@@ -558,13 +570,10 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
-                unrolled: bool = False, held_past: tuple[str, ...] = (), finish: Callable | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                unrolled: bool = False) -> tuple[C, tuple[jax.Array, ...]]:
         # Its products are synchronous: none stays in flight past its step, and `emit_pipeline` gives
         # each stage back as its step ends, so no step holds one past it.
         del first, in_flight, unrolled
-        if held_past or finish is not None:
-            raise NotImplementedError(f"{self.name}'s pipeline gives each stage back as its step ends")
         blocks, copies = streams.pipeline.blocks, streams.pipeline.copies
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))
@@ -660,6 +669,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         # automatic barriers order.
         pass
 
+    def added_settled(self) -> None:
+        # Its adds go from registers (`added`'s `red.global`), none in flight past its issue; the ticket's
+        # GPU-scope release orders them before the next turn.
+        pass
+
 
 @dataclasses.dataclass(frozen=True)
 class Mma(MmaIssuer, CpAsync):
@@ -673,13 +687,6 @@ class Mma(MmaIssuer, CpAsync):
     # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
-
-    def column_unit(self, dtype) -> int:
-        # Its stores move rows through registers, a row's columns over a warp's lanes at least
-        # (`mosaic.copied`), each lane holding an element (the guarded attention walk's 32-column blocks,
-        # whose 64 held no tile's registers at width 128).
-        del dtype
-        return resources.THREADS // 4
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).

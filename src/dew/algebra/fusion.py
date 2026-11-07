@@ -19,6 +19,8 @@ identity (`program._within`'s). A region's decision is held by its structure
 and the context it was weighed in (`_decided`), so every layer of a stack, and every retrace, weighs it once.
 A softmax attention (`attention_regions`) is found first and written as Dew's attention where a kernel of
 Dew's takes it, through the same splice (`_spliced`); a product inside it is none of the products' regions.
+An RMSNorm or SwiGLU no product's epilogue took (`norm_regions`) is written as Dew's where its fused kernel
+takes it, through the same splice.
 """
 
 from __future__ import annotations
@@ -62,9 +64,10 @@ class Region(NamedTuple):
 
 def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     """`jaxpr` with each attention region a kernel of Dew's takes written as Dew's attention
-    (`attention_regions`) and each product region the template takes fused (the module's account); `jaxpr`
-    itself where none is."""
-    from dew.algebra import attention_regions
+    (`attention_regions`), each product region the template takes fused (the module's account), and each
+    RMSNorm and SwiGLU region the fused norms take written as Dew's (`norm_regions`); `jaxpr` itself where
+    none is."""
+    from dew.algebra import attention_regions, norm_regions
     from dew.nn.kernels import fused_gemm
 
     index = Index(jaxpr)
@@ -75,10 +78,16 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     products = [region for region in _regions(index) if not held & set(region.places)
                 and _decided(jaxpr, region.places, region.inputs, region.outputs,
                              lambda region=region: _takes(fused_gemm, jaxpr, region))]
-    if not attention and not products:
+    held |= {place for region in products for place in region.places}
+    norms = [region for region in norm_regions.regions(index) if not held & set(region.places)
+             and _decided(jaxpr, region.places, _read(jaxpr, region.places), (region.output,),
+                          lambda region=region: norm_regions.taken(region))]
+    if not attention and not products and not norms:
         return jaxpr
-    written = [Written(region.places, (region.query, region.key, region.value), (region.output,),
-                       region.places[-1], attention_regions.written(region)) for region in attention]
+    written = [Written(region.places, region.operands, (region.output,), region.places[-1],
+                       module.written(region))
+               for module, found in ((attention_regions, attention), (norm_regions, norms))
+               for region in found]
     written += [Written(region.places, region.inputs, region.outputs, region.at,
                         _fusing(_replayed(jaxpr, region, fused_gemm), fused_gemm)) for region in products]
     return _spliced(jaxpr, written)
@@ -98,11 +107,15 @@ def _fusing(replay: Callable, fused_gemm) -> Callable:
 
 class Index:
     """A body's equations by the values they make (`producer`), each value's readers (`readers`: the places
-    of the equations that read it) and the values the body returns (`escaping`): what both region finders
-    read (`_regions`, `attention_regions.regions`)."""
+    of the equations that read it), the values the body returns (`escaping`) and its constants' values where
+    it holds them (`consts`): what the region finders read (`_regions`, `attention_regions.regions`,
+    `norm_regions.regions`)."""
 
     def __init__(self, jaxpr: jcore.Jaxpr):
         self.jaxpr = jaxpr
+        values = getattr(jaxpr, "consts", ())
+        held = len(values) == len(jaxpr.constvars)
+        self.consts = dict(zip(jaxpr.constvars, values, strict=True)) if held else {}
         self.producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
         self.readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
         for place, equation in enumerate(jaxpr.eqns):
@@ -214,7 +227,9 @@ def _regions(index: Index) -> list[Region]:
         members = set(places)
         for place in list(places[1:]):
             for var in jaxpr.eqns[place].invars:
-                source = producer.get(var) if isinstance(var, jcore.Var) else None
+                if not isinstance(var, jcore.Var):
+                    continue
+                source = producer.get(var)
                 if (source is not None and source not in members and source not in claimed
                         and jax_name(jaxpr.eqns[source].primitive) in CAPTURED
                         and readers[var] <= members and var not in escaping):
@@ -295,7 +310,9 @@ def _decided(jaxpr: jcore.Jaxpr, places: Sequence[int], inputs: Sequence[jcore.V
     window = jcore.Jaxpr([], list(inputs), list(outputs), [jaxpr.eqns[place] for place in places])
     key = (program.structure(window), derive.context(), _cache.KERNEL_CHOICES.value)
     if key not in _held:
-        _held[key] = decide()
+        # Its probes' routes are no program's: the routes a block collects are the kernels it runs.
+        with generation.routes(alone=True):
+            _held[key] = decide()
         if len(_held) > DECISIONS_HELD:
             _held.popitem(last=False)
     _held.move_to_end(key)

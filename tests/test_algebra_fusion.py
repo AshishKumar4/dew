@@ -10,6 +10,7 @@ import pytest
 
 from dew import algebra
 from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
 
 
 def draw(seed: int = 7):
@@ -128,15 +129,18 @@ def test_a_layers_gradient_under_the_pass_is_its_gradient_as_written(layer):
         assert_equal(jax.jit(algebra.rewritten(grad))(*operands), jax.jit(grad)(*operands))
 
 
+@pytest.mark.parametrize("forms", ["fast", "accurate"])
 @pytest.mark.parametrize("layer", [bare, kernel_gradient, grouped, grouped_kernel_gradient],
                          ids=lambda layer: layer.__name__)
-def test_a_plain_programs_product_runs_the_template_its_call_names(layer):
+def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms):
     """A plain JAX program's product of each form the template takes (`fusion.Form`: alone, a kernel
     gradient's, each group's rows times its matrix, a grouped kernel gradient's), under the pass on an H100
     whose template a call names, runs the template's launch (its route reported as the selector's), where
-    the program as written runs XLA's dot."""
+    the program as written runs XLA's dot; under the accurate forms too, which limit the pass's
+    reassociation alone (row 4730)."""
     operands = draw()
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
+          generation.run_precision(Numerics(forms=forms))):
         with generation.routes() as written:
             jax.jit(layer).trace(*operands)
         with generation.routes() as passed:
@@ -197,13 +201,6 @@ def flax_attention(*, causal: bool):
     return attend
 
 
-def input_masked(q, k, v):
-    """jax.nn's attention under a mask drawn from the queries, which the compile point leaves as written."""
-    rows = (q[..., :1] > 0).transpose(0, 2, 1, 3)
-    mask = jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]))
-    return jax.nn.dot_product_attention(q, k, v, mask=mask, implementation="xla")
-
-
 SPELLINGS = {"jax.nn causal, grouped": (jax_attention(causal=True), 2, True),
              "jax.nn, grouped": (jax_attention(causal=False), 2, False),
              "flax causal": (flax_attention(causal=True), 4, True),
@@ -244,15 +241,78 @@ def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
                          keep=kept(64, 64, causal=causal))
 
 
-def test_a_plain_programs_attention_under_a_mask_of_its_inputs_stays_as_written():
-    """Attention under a mask the program draws from its inputs is no region of Dew's (its mask read at no
-    compile): `dew.jit` runs it as written, its attention XLA's own on an H100."""
+def input_mask(q, k):
+    """A mask drawn from the queries, `[B, H, Q, K]`: each query row keeps every key where its first entry is
+    positive, none else."""
+    rows = (q[..., :1] > 0).transpose(0, 2, 1, 3)
+    return jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1]))
+
+
+def input_bias(q, k):
+    """A bias drawn from the queries, `[B, H, Q, K]`: a query row's first entry over every key."""
+    rows = (q[..., 0] * 0.25).transpose(0, 2, 1)[..., None]
+    return jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1])).astype(q.dtype)
+
+
+def softcapped_attention(q, k, v):
+    """Gemma 2's attention as a plain program writes it: scaled logits softcapped at 50, causal."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+    logits = 50.0 * jnp.tanh(logits / 50.0)
+    causal = jnp.tril(jnp.ones((q.shape[1], k.shape[1]), bool))
+    weights = jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), axis=-1).astype(v.dtype)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
+
+
+FORMS = {
+    "a mask of its inputs": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, mask=input_mask(q, k), implementation="xla"),
+        lambda q, k, v: {"mask": input_mask(q, k)}),
+    "a bias of its inputs": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, bias=input_bias(q, k), implementation="xla"),
+        lambda q, k, v: {"bias": input_bias(q, k)}),
+    "twice the default scale": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
+                                                     implementation="xla"),
+        lambda q, k, v: {}),
+    "a causal window": (
+        lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
+                                                     implementation="xla"),
+        lambda q, k, v: {"causal": True, "sliding_window": 16}),
+    "a softcap": (softcapped_attention, lambda q, k, v: {"causal": True, "softcap": 50.0}),
+}
+"""Each plain program's attention under a form beside the default scale and a causal mask, and the arguments
+Dew's own attention takes for it."""
+
+
+@pytest.mark.parametrize("form", list(FORMS))
+def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_call_takes(form):
+    """A plain program's attention under a mask or bias it draws from its inputs, a scale a power of two past
+    the default, a causal window or a softcap, compiled through `dew.jit` on an H100, runs the kernel Dew's
+    own attention call under those arguments routes to (none where that is XLA's), where the program as
+    written runs XLA's; on this host, under the template, its output and gradients on par with the program
+    as written (check 1)."""
+    from attention_oracle import attention_on_par
+    from contract_support import normal_drawn
+
     import dew
+    from dew.algebra.attention_regions import KEPT
+    from dew.nn.attention import scaled_dot_product_attention
 
+    attend, arguments = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
-    with generation.assumed("sm90"):
-        assert not _attention_routes(lambda: dew.jit(input_masked).trace(*shapes))
 
+    def own(q, k, v):
+        return scaled_dot_product_attention(q, k, v, **arguments(q, k, v))
+
+    with generation.assumed("sm90"):
+        assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
+        expected = [kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
+                    if kernel not in KEPT]
+        assert set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == set(expected)
+    draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
+    with generation.chosen(attention="template"):
+        attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
+                         truth=lambda *x: attend(*(a.astype(jnp.float64) for a in x)))
 
 def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None):
     """Causal softmax attention as a program writes it out (its products as einsums, a causal where, the
@@ -293,3 +353,145 @@ def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
     with generation.assumed("sm90"):
         routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
     assert bool(routes) == (variant == "attention"), routes
+
+
+def flax_rms(x, w):
+    """Flax's RMSNorm as a Flax model applies it."""
+    from flax import linen as nn
+
+    return nn.RMSNorm(epsilon=1e-6, dtype=x.dtype).apply({"params": {"scale": w}}, x)
+
+
+def widened_rms(x, w):
+    """An RMSNorm as a plain program writes it: float32 statistics, the weight before the cast."""
+    widened = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
+    return (widened * inverse * w).astype(x.dtype)
+
+
+def offset_rms(x, w):
+    """Gemma's RMSNorm: the normalized row cast first, then times one more than its weight."""
+    widened = x.astype(jnp.float32)
+    normed = widened * jax.lax.rsqrt(jnp.mean(jnp.square(widened), axis=-1, keepdims=True) + 1e-6)
+    return normed.astype(x.dtype) * (1 + w.astype(x.dtype))
+
+
+def gated_product_of(a, b):
+    """A gated MLP's product as a plain program writes it."""
+    return jax.nn.silu(a) * b
+
+
+def _norms_written(fn, *shapes):
+    """`fn` with each RMSNorm and SwiGLU the compile point takes on an H100 written as Dew's norm
+    (`norm_regions`), decided under the H100 and written on this host, whose norms run their portable
+    arithmetic: what the compile point's rewrite computes, run here."""
+    from jax.extend.core import jaxpr_as_fun
+
+    from dew.algebra import fusion, norm_regions
+
+    closed = jax.make_jaxpr(fn)(*shapes)
+    with generation.assumed("sm90"):
+        found = [region for region in norm_regions.regions(fusion.Index(closed.jaxpr))
+                 if norm_regions.taken(region)]
+    written = [fusion.Written(region.places, region.operands, (region.output,), region.places[-1],
+                              norm_regions.written(region)) for region in found]
+    return jaxpr_as_fun(closed.replace(jaxpr=fusion._spliced(closed.jaxpr, written))), len(found)
+
+
+NORM_FORMS = {
+    "flax RMSNorm": (flax_rms, {"scale_offset": False, "scale_after_cast": False}),
+    "plain RMSNorm": (widened_rms, {"scale_offset": False, "scale_after_cast": False}),
+    "Gemma RMSNorm": (offset_rms, {"scale_offset": True, "scale_after_cast": True}),
+    "SwiGLU": (gated_product_of, None),
+}
+"""Each plain program's fused norm, and how Dew's own RMSNorm weighs it (None: Dew's SwiGLU)."""
+
+
+@pytest.mark.parametrize("form", list(NORM_FORMS))
+def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
+    """A plain program's RMSNorm (Flax's, a plain one, Gemma's offset weight after the cast) or SwiGLU,
+    compiled through `dew.jit` on an H100, runs the kernel Dew's own norm routes the call to (none where that
+    is XLA's arithmetic), where the program as written runs XLA's; on this host, its output and gradients on
+    par with the program as written (check 1)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+    import dew
+    from dew.nn.activations import gated_product
+    from dew.nn.norms import rms_normalized
+
+    program, weighed = NORM_FORMS[form]
+    rows = jax.ShapeDtypeStruct((256, 1024), jnp.bfloat16)
+    shapes = (rows, rows) if weighed is None else (rows, jax.ShapeDtypeStruct((1024,), jnp.bfloat16))
+
+    def own(x, w):
+        if weighed is None:
+            return gated_product("swiglu")(x, w)
+        return rms_normalized(x, w, 1e-6, x.dtype, fp32_statistics=True, **weighed)
+
+    def fused(trace) -> list[str]:
+        with generation.routes() as found:
+            trace()
+        return [route.kernel for route in found if route.choice in ("rms_norm", "swiglu")
+                and route.kernel != "xla"]
+
+    with generation.assumed("sm90"):
+        assert not fused(lambda: jax.jit(program).trace(*shapes))
+        expected = set(fused(lambda: jax.jit(own).trace(*shapes)))
+        assert set(fused(lambda: dew.jit(program).trace(*shapes))) == expected
+    sizes = [shape.shape for shape in shapes]
+    draw = normal_drawn(43, *sizes, sizes[0], dtype=jnp.bfloat16)
+    written, found = _norms_written(program, *shapes)
+    assert found == 1
+    assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(program)),
+                    draw, f"dew.jit {form}", seeds=8, truth_fn=with_gradients(
+                        lambda *x: program(*(a.astype(jnp.float64) for a in x))))
+
+
+def _rows_inverse(x):
+    """Each row's inverse root mean square, fp32 `[rows]`, the feature axis reduced."""
+    widened = x.astype(jnp.float32)
+    return jax.lax.rsqrt(jnp.sum(widened * widened, axis=-1) / x.shape[-1] + 1e-6)
+
+
+def _named_silu(x):
+    return jnp.tanh(x)
+
+
+_named_silu.__name__ = "silu"
+
+
+NEAR_NORMS = {
+    "columns scaled by the rows' statistics":
+        lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[None, :]).astype(x.dtype),
+    "a weight along the rows":
+        lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[:, None] * w[:, None]).astype(x.dtype),
+    "a jit named silu that is tanh": lambda x, w: jax.jit(_named_silu)(x) * w.astype(x.dtype),
+    "a zero mean multiplier": lambda x, w: (x.astype(jnp.float32) * jax.lax.rsqrt(
+        jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) * 0.0 + 1e-6)).astype(x.dtype),
+    "its own sum as the weight": lambda x, w: (
+        x.astype(jnp.float32) * _rows_inverse(x)[:, None]
+        * jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1)[None, :]).astype(x.dtype),
+}
+"""Programs a norm's recogniser reads almost as an RMSNorm or SwiGLU and computes otherwise (a square row,
+so every axis has the feature axis's extent)."""
+
+
+@pytest.mark.parametrize("program", list(NEAR_NORMS))
+def test_a_plain_program_near_a_norm_computes_as_written(program):
+    """A program whose arithmetic resembles an RMSNorm or SwiGLU without being one (the statistics or the
+    weight laid along another axis, a nested program only named silu, a mean scaled by zero, the region's own
+    sum read as its weight), compiled through `dew.jit` on an H100, computes what it does as written: its
+    output and gradients on par with the program's (check 1), whatever of it the compile point writes as
+    Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as written)."""
+    from contract_support import normal_drawn
+    from reference_error import assert_as_exact, with_gradients
+
+
+    fn = NEAR_NORMS[program]
+    draw = normal_drawn(47, (256, 256), (256,), (256, 256), dtype=jnp.bfloat16)
+    written, _ = _norms_written(fn, jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
+                                jax.ShapeDtypeStruct((256,), jnp.bfloat16))
+    assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(fn)), draw,
+                    f"dew.jit {program}", seeds=8,
+                    truth_fn=with_gradients(lambda *x: fn(*(a.astype(jnp.float64) for a in x))))

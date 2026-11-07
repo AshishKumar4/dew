@@ -90,7 +90,8 @@ def packed(query: jax.Array, spans: KeySpans, kv_heads: int, initial: Initial | 
     group = heads // kv_heads
     rows = grouped_rows(query, kv_heads)
     if spans.query_ids is None and spans.start.ndim == 2:
-        spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans", group)
+        spans = KeySpans(spans.start, spans.end, None, spans.key_ids, spans.keys, "spans",
+                         spans.per_span * group)
     else:
         start, end = (jnp.repeat(x, group, axis=1) for x in (spans.start, spans.end))
         query_ids = None if spans.query_ids is None else jnp.repeat(spans.query_ids, group, axis=1)
@@ -124,13 +125,14 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     the forward's derived config at the key tile its memory-bound walk streams at least
     (`MosaicForward.streaming`) and its slices; None where no launch of it derives.
     One where the programs already fill the multiprocessors (a slice's merge would cost and its keys gain
-    nothing). Else as many as its programs' residency holds at once (`MosaicForward.resident`: its
-    registers', its shared memory's), but each slice at least twice its ring's stages of key tiles: a shorter
-    slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to hide them
-    (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where cuDNN's
-    whole step took 13). Where the family waits across programs (`Family.fixes_up`), the launch merges the
-    slices in the last one's program, the initial state with them (`MosaicForward.merges`); elsewhere each
-    slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config derived for them."""
+    nothing). Else as many as keep the device's stream in flight (`MosaicForward.streamed`, at most those its
+    residency holds, `MosaicForward.resident`), but each slice at least twice its ring's stages of key tiles:
+    a shorter slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to
+    hide them (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where
+    cuDNN's whole step took 13). Where the family fixes a tile up across programs (`Family.fixes_up`), the
+    launch merges the slices in the last to arrive, the initial state with them (`MosaicForward.merges`);
+    elsewhere each slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config
+    derived for them."""
     found = _streamed(query, key, value, spans, hooks, scale=scale, target=target, table=table,
                       sources=sources, out_dtype=None, scales=scales)
     if found is None:
@@ -151,10 +153,11 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
             return Plan(config, 1, merges=False)
         config, op, ba = found
     longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
-    # The most slices whose programs the device holds at once, none past it: one program past them waits a
-    # whole walk for a slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a
-    # second wave as long as the first), and a merging launch's every program resident.
-    slices = max(1, min(processors * op.resident(ba, config, target) // programs, longest))
+    # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`, at
+    # most those it holds), none past them: one program past those it holds waits a whole walk for a slot
+    # (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a second wave as long as
+    # the first), and one past those that stream it only lengthens the merge.
+    slices = max(1, min(processors * op.streamed(ba, config, target) // programs, longest))
     return Plan(config, slices, merges=slices > 1 and bundle_of(config, query.dtype).fixes_up)
 
 
@@ -193,13 +196,13 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     row's keys where it maps them), the keys `spans` `[B, T]` leaves each query under `hooks` (`packable`), as
     `attention.reference` computes it, `[B, T, H, Dv]` in the query's dtype: packed (`packed`), its keys
     sliced over the derived work list (`plan`) on the template's forward (`attention_mosaic.forward`'s
-    `splits`), the slices merged with the initial state in the launch where its family waits across programs
-    (`merges`), else in XLA from their fp32 states (`algebra.merged_slices`), and unpacked. Its logits folded
-    where the algebra folds them, the rows the fold's reach or the headroom guard rewalks walked again
-    natural over those rows alone, with no branch read on the host (`MosaicForward.masked`, row 1978). A
-    quantized cache's keys and values are its codes (int8 or an FP8) and `scales` their keys' and values'
-    `[B, KV, K]` fp32 in each row's key order (a dense cache's head-major scales, a paged pool's gathered by
-    its table), dequantized in the walk (`attention_mosaic.forward`'s `scales`, ledger 3624)."""
+    `splits`), the slices merged with the initial state in the launch where its family fixes a tile up
+    across programs (`merges`), else in XLA from their fp32 states (`algebra.merged_slices`), and unpacked.
+    Its logits folded where the algebra folds them, the rows the fold's reach or the headroom guard rewalks
+    walked again natural over those rows alone, with no branch read on the host (`MosaicForward.masked`, row
+    1978). A quantized cache's keys and values are its codes (int8 or an FP8) and `scales` their keys' and
+    values' `[B, KV, K]` fp32 in each row's key order (a dense cache's head-major scales, a paged pool's
+    gathered by its table), dequantized in the walk (`attention_mosaic.forward`'s `scales`, ledger 3624)."""
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "

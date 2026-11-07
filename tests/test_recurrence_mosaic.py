@@ -1059,7 +1059,8 @@ def _two_roles(name: str, bound, derived, family, facts, *, packed: bool) -> lis
     return [] if two is None else [(two, 'two roles ')]
 
 
-def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None) -> list:
+def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None,
+                   launched: dict | None = None) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
     1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
     documents, and the gated delta rule's 16-bit training pass, at the template's derived tiles and, one row's
@@ -1067,7 +1068,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
     (`Template._held`) and refused for registers alone, and the fast backward its launches' registers refuse,
     so a model over ptxas's need fails as one under it does. Each case's plan by its label into `plans`
     (`template.planned`), each call the template refuses into `refused`, and the launches a case's
-    model refuses by its label into `apart` where they are held apart (`apart_failures`)."""
+    model refuses by its label into `apart` where they are held apart (`apart_failures`), and each case's
+    bound call and tiles by its label into `launched` where given (`stepped_down`)."""
     from fla_gdn_support import KernelCase
 
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
@@ -1137,6 +1139,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         label = (f"{name} {jnp.dtype(dtype).name} {'training' if training else 'forward'}"
                  f"{' packed' if packed else ''} {kind}{tiles}")
         plans[label] = template.MOSAIC._launches(bound, tiles, facts, backward=training)
+        if launched is not None:
+            launched[label] = (bound, tiles)
         unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
         with generation.assumed(facts):
             held = not training or kind != 'two roles ' or template.backward_holds(
@@ -1236,8 +1240,9 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
     227 KB) and tensor memory and at most its plan's shared memory (`template.planned`, from which
-    the tiles are derived, `planned_failures`), no launch the template's legality holds spills a register (a
-    refused tile's compiled as the model's evidence, `KernelCase.required`), and each launch's register model
+    the tiles are derived, `planned_failures`), no launch the template's legality holds spills a register
+    once a spilling launch steps down as a run's compile steps it (`stepped_down`; a refused tile's
+    compiled as the model's evidence, `KernelCase.required`), and each launch's register model
     decides as ptxas's need does, admitting a tile or refusing it (row 1971,
     `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
     memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
@@ -1248,11 +1253,11 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
             pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
-    from kernel_compile import compile_mosaic_kernels, failures, mosaic_failures
+    from kernel_compile import failures, mosaic_failures
 
     plans, refused, apart = {}, [], {}
-    cases = compiled_cases(target, plans, refused, apart, only=group)
-    found = compile_mosaic_kernels(cases, target)
+    with report.refusals():
+        cases, found = stepped_down(target, group, plans, refused, apart)
     # Every case compiles and reports; a refused tile's spill is the model's refusal, a required one's fails,
     # and a case whose launches are held apart fails as either does, launch by launch.
     failed = failures(found) + planned_failures(found, plans)
@@ -1262,6 +1267,42 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     assert not failed, "\n".join(failed)
+
+
+def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
+    """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
+    long as a required launch spills at a config not refused before, its launch refused
+    (`report.refuse_launch`) and the group derived and compiled again, as a run's compile steps a spilling
+    launch down through its derivation's configs (`report.settled`): a launch whose every config spills
+    derives none and leaves the template. `refused` holds the calls the template's own model refuses (its
+    first derivation, before any compile); the plans and launches held apart are those of the cases
+    returned."""
+    from kernel_compile import compile_mosaic_kernels
+
+    launched: dict = {}
+    cases = compiled_cases(target, plans, refused, apart, only=group, launched=launched)
+    found = compile_mosaic_kernels(cases, target)
+    stepped: set = set()
+    while True:
+        spilling = {case.name: {kernel["kernel"] for kernel in record.get("kernels", ())
+                                if kernel.get("spilled")}
+                    for case, record in zip(cases, found, strict=True) if case.required}
+        spilling = {name: kernels for name, kernels in spilling.items() if kernels and name not in stepped}
+        if not spilling:
+            break
+        stepped |= set(spilling)
+        # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
+        # reads.
+        with generation.assumed(generation.gpu_target(target)):
+            for name, kernels in spilling.items():
+                bound, tiles = launched[name]
+                report.refuse_launch(template.MOSAIC, bound, tiles, kernels)
+        plans.clear()
+        apart.clear()
+        launched.clear()
+        cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
+        found = compile_mosaic_kernels(cases, target)
+    return cases, found
 
 
 def test_a_gated_delta_nets_ring_and_residency_are_one_choice():
