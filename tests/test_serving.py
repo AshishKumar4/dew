@@ -11,6 +11,7 @@ import dataclasses
 import functools
 import itertools
 import threading
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -20,7 +21,7 @@ from arm_arithmetic import float64_held
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, assert_within_derived_bound
 from serving_support import Served, assert_served_as_exact
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
@@ -888,6 +889,103 @@ def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry(requests
     """`assert_reads_a_shared_prefix`'s sites of 512 seeds, a store of one entry's, which CI draws in map
     tasks of 128."""
     assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
+
+
+QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny"
+"""A Qwen3.5 checkpoint (its byte-vocabulary text decoder): three gated delta net layers, each a recurrent
+memory and a four-tap conv tail a row keeps, and one of gated full attention, whose keys a server pages."""
+
+
+QWEN35_BUDGET = 16
+"""The tokens each question draws."""
+
+
+def float32_score_bound(logits: np.ndarray, tokens: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """How far a drawn token's log probability may lie from its float64 value, `scores`, where a server
+    computes `logits` (`[steps, V]`, the float64 full forward's) in float64 and scores them in float32,
+    as every draw scores its model's logits (`dew.sampling.strategies.draw`: the logits cast to float32,
+    then `log_softmax` at the token). With u = 2^-24, float32's unit roundoff, gamma_n = n u / (1 - n u),
+    and e and l the float32 exp's and log's ulps on this lane (`certified.lane`'s measured reach), element
+    by element, the score z_t - m - log S (m = max z, d_j = z_j - m, S = sum_j exp(d_j)) moves by at most:
+
+    - u (|z_t| + sum_j p_j |z_j|) <= 2 u max |z| from the cast, each logit moved by u |z_j|;
+    - u |d_t| from rounding z_t - m (m is a logit, exact);
+    - log S by the relative error of S, at most gamma_{V-1} from summing V positive terms in any order
+      (Higham, 3.5) plus each term's own, u max |d_j| from rounding its exponent's argument and 2 e u from
+      its exp, then 2 l u |log S| from the log itself and u |log S| from rounding it;
+    - u |score| from the last subtraction;
+    - the float64 logits the server computes part from the full forward's by float64 rounding, held as an
+      oracle is (`reference_error.FACTOR` times `RESOLUTION`'s 1024 roundings of max |z|).
+
+    A state the segment left copied wrong moves a score by the model's own sensitivity, 1e-2 and more."""
+    from certified import lane
+    from reference_error import FACTOR, RESOLUTION
+
+    u, reach = 2.0 ** -24, lane().reach
+    exp_ulps, log_ulps = reach[("exp", "float32")], reach[("log", "float32")]
+    steps, vocab = np.arange(len(tokens)), logits.shape[-1]
+    gamma = (vocab - 1) * u / (1 - (vocab - 1) * u)
+    largest, peak = np.max(np.abs(logits), axis=-1), np.max(logits, axis=-1)
+    apart = logits - peak[:, None]
+    log_total = np.log(np.sum(np.exp(apart), axis=-1))
+    summed = gamma + u * np.max(np.abs(apart), axis=-1) + 2 * exp_ulps * u
+    return (2 * u * largest + u * np.abs(apart[steps, tokens]) + summed / (1 - summed)
+            + (2 * log_ulps + 1) * u * np.abs(log_total) + u * np.abs(scores) + FACTOR * RESOLUTION * largest)
+
+
+@pytest.mark.parametrize("hits, rounds", [((0, 6, 12), None), ((12,), (3,))], ids=["one-a-round", "at-once"])
+def test_a_qwen35_checkpoint_serves_each_question_from_its_shared_turn_encoded_once(hits, rounds):
+    """Shared-prefix serving end to end on a Qwen3.5 checkpoint as `Pretrained.load` reads it: a request's
+    chat turn and state, a segment each question past it declares shared (`SEGMENT`), is encoded once (the
+    server's prefix hits), and each question is served from what the segment left, its attention pages,
+    each gated delta net's recurrent memory and conv tail, kept at the segment's end and copied into its
+    row, asked one a round or all at once. Served in float64, each question draws what the lone task
+    draws, token for token, and scores each draw within `float32_score_bound` of the float64 full forward
+    over the prompt and the tokens drawn before it: the server's float32 scoring alone rounds, so a state
+    copied wrong is orders past it. A check-1 ratio of the float32 server does not resolve on this
+    checkpoint's 64 wide layers within 512 seeds (heavy-tailed draws); the NARROW and WIDE hybrid sites
+    hold the same path's float32 parity (check 1)."""
+    from serving_support import served_inputs
+
+    from dew.interop import Pretrained
+    from dew.nn.visibility import with_served_blocks
+
+    source = Pretrained.load(str(QWEN35), dtype="float32")
+    with jax.enable_x64(new_val=True):
+        model, variables = source.model.clone(dtype=jnp.float64), float64_held(source.variables)
+        served = TextGeneration(model, variables, sampling=Sampling(temperature=0, pad_token_id=0))
+        server = Server.from_task(served, **HYBRID_SHARED)
+        full = model.clone(attention_impl="reference")
+        forward = jax.jit(lambda weights, tokens, groups: full.apply(weights, tokens, **groups))
+        vocab = model.vocab_size
+        for seed in range(4):
+            row = np.random.default_rng([0x1536, seed]).integers(1, vocab, SEGMENT[0].length).astype(np.int32)
+            tickets, shared, before = [], [], server.prefix_hits
+            for end in itertools.accumulate((1,) * len(SEGMENT) if rounds is None else rounds):
+                tickets.extend(server.submit(served_inputs(row, SEGMENT[index], vocab), QWEN35_BUDGET,
+                                             key=index, shared=SEGMENT[index].shared)
+                               for index in range(len(tickets), end))
+                server.run()
+                shared.append(server.prefix_hits - before)
+            assert shared == list(hits), shared
+            for index, (request, ticket) in enumerate(zip(SEGMENT, tickets, strict=True)):
+                inputs = served_inputs(row, request, vocab)
+                generation = ticket.result().host()
+                tokens = np.asarray(generation.tokens)[0, -QWEN35_BUDGET:]
+                alone = np.asarray(served(inputs, QWEN35_BUDGET, key=index).host().tokens)[0, -QWEN35_BUDGET:]
+                np.testing.assert_array_equal(tokens, alone)
+                prompt = np.asarray(inputs.tokens)
+                held = with_served_blocks({}, np.ones(prompt.shape, bool), served.prefix)
+                # One forward over the prompt and the draws, whose logits at the prompt's last position on
+                # score each draw.
+                whole = jnp.asarray(np.concatenate([prompt, tokens[None, :-1]], 1))
+                logits = np.asarray(forward(variables, whole, {name: jnp.asarray(value)
+                                                               for name, value in held.items()}),
+                                    np.float64)[0, prompt.shape[1] - 1:]
+                truth = np.asarray(jax.nn.log_softmax(logits, axis=-1))[np.arange(QWEN35_BUDGET), tokens]
+                scored = np.asarray(generation.raw_log_probs[0], np.float64)
+                assert_within_derived_bound(scored, truth, float32_score_bound(logits, tokens, truth),
+                                            f"Qwen3.5 shared turn {hits}, seed {seed}, question {index}")
 
 
 def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
