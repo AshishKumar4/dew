@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests"))
-sys.path.insert(0, str(ROOT / "tools"))
+# The tests' own path (pyproject's `pythonpath`: the repository root), their directory and this one.
+sys.path[:0] = [str(ROOT / "tools"), str(ROOT / "tests"), str(ROOT)]
 
 _WORKER = importlib.import_module("native_diffusion_worker")
 NATIVE = {**{f"{task}-{group}": (task, group) for task in _WORKER.TASKS for group in _WORKER.groups(task)},
@@ -57,6 +57,24 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                          "reference": "moonshotai/Kimi-Linear-48B-A3B-Instruct "
                                       "e1df551a447157d4658b573f9a695d57658590e9",
                          "license": "MIT", "distribution": ("fla-core", "0.4.0")},
+         **{f"uvit-{case}": {"test": "test_uvit_source", "arms": case, "worker": "uvit_worker.py",
+                             "reference": "baofff/U-ViT ce551708dc9cde9818d2af7d84dfadfeb7bd9034",
+                             "license": "MIT"} for case in ("published", "variant")},
+         **{f"jepa-{case}": {"test": "test_jepa_source", "arms": case, "worker": "vjepa_worker.py",
+                             "reference": "facebookresearch/jepa 51c59d518fc63c08464af6de585f78ac0c7ed4d5",
+                             "license": "CC-BY-NC-4.0"} for case in ("published", "variant")},
+         **{f"router-{case}": {"test": "test_router_source", "arms": case, "worker": "vllm_router_worker.py",
+                               "reference": "vllm-project/vllm ced6857afa0ea7b2e3f0846a62e1394e90f15607",
+                               "license": "Apache-2.0"}
+            for case in ("kimi", "grouped", "softmax", "unbiased")},
+         "repa-preprocessing": {"test": "test_alignment", "worker": "repa_worker.py",
+                                "reference": "sihyun-yu/REPA 67f714503e3892f993844aab088ffc5791c92613 with "
+                                             "End2End-Diffusion/iREPA "
+                                             "99ad4ac234efe8de52ce157120f72856e836d09f",
+                                "license": "MIT"},
+         "mimo-mel": {"test": "test_mimo_audio", "arms": "mel", "worker": "torchaudio_mel_worker.py",
+                      "reference": "pytorch/audio 2.11.0 MelSpectrogram", "license": "BSD-2-Clause",
+                      "distribution": ("torchaudio", "2.11.0+cpu"), "host": True, "outputs": True},
          **{f"native-{name}": {"test": "check_native_diffusion", "arms": arms,
                                "worker": "native_diffusion_worker.py", "reference": NATIVE_PIPELINES,
                                "license": "Apache-2.0",

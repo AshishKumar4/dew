@@ -38,7 +38,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_alignment.py": {
-   "comparisons": 5,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_attention_masked_rows.py": {
@@ -337,10 +337,6 @@
    "comparisons": 8,
    "lane": "Training"
   },
-  "tests/test_jepa_source.py": {
-   "comparisons": 3,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_jit.py": {
    "comparisons": 2,
    "lane": "Training"
@@ -418,7 +414,7 @@
    "lane": "Training"
   },
   "tests/test_mimo_audio.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_mimo_v2.py": {
@@ -573,10 +569,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_router_source.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_router_statistics.py": {
    "comparisons": 4,
    "lane": "Training"
@@ -668,10 +660,6 @@
   "tests/test_training_transactions.py": {
    "comparisons": 6,
    "lane": "Training"
-  },
-  "tests/test_uvit_source.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_vae.py": {
    "comparisons": 1,
