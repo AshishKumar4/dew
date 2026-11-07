@@ -1348,8 +1348,11 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     # fragment store's rows off one another's banks.
     padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),)
     scanned = mosaic.plain((2, 2 * CHUNK, keys), jnp.float32)
-    # A merged walk's sums in shared memory; a lone output's in registers (`_intra_held`).
-    sums = (mosaic.plain((len(products), CHUNK, CHUNK), jnp.float32),) if len(products) > 1 else ()
+    # A merged walk's sums in shared memory, each read and written whole, so in swizzled 8-row tiles: plain,
+    # rows a multiple of 32 words apart put a fragment's 8 rows in the same banks (41.3M bank conflicts in a
+    # GH200's Kimi Linear intra launch at ceb64ccc5d, M-JS-17); a lone output's in registers (`_intra_held`).
+    sums = ((mosaic.staged((len(products), CHUNK, CHUNK), jnp.float32, 128),) if len(products) > 1
+            else ())
     return (_pairing(call, keys), scanned, *sums, *padded), landing
 
 
