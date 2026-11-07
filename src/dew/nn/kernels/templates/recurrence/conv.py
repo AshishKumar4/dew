@@ -34,6 +34,39 @@ def _tokens(length: int) -> int:
     return min(TOKENS, length)
 
 
+UNROLLED = 8
+"""The most tokens a turn of a walk reads at once, their inputs (and in the backward their output gradients)
+loaded before the first is used, so the loads overlap: a token a turn, each load's latency was the walk's
+(an A100's conv training step 2.11 ms against the Triton conv's 1.81, M-JS-20)."""
+
+
+def _unrolled(steps: int) -> int:
+    """The tokens a turn of a walk of `steps` reads at once: `UNROLLED`'s widest power of two dividing it."""
+    return next(unrolled for unrolled in (UNROLLED, 4, 2, 1) if steps % unrolled == 0)
+
+
+def lanes(parts) -> int:
+    """The channels a program of a conv of `parts` (`(width, head)` each) takes, a vector of `lanes //
+    THREADS` a thread: the widest of 8, 4, 2 and 1 channels a thread (a 128-bit transfer of 16-bit
+    channels at 8) every piece's width holds whole, a normalised piece's head summed in at most a warp's
+    threads (`scan.grouped_summed`) or across the warpgroup at one a thread (`scan.summed`). A channel a
+    thread, each transfer a warp's 64 bytes, a GH200's conv training step took 1.07 ms against the Triton
+    conv's 0.77 (M-JS-20)."""
+    for vector in (8, 4, 2, 1):
+        span = scan.THREADS * vector
+        if all(width % span == 0 and (head is None or vector == 1 or head // vector <= scan.WARP)
+               for width, head in parts):
+            return span
+    raise ValueError(f"no program's channels divide the conv's pieces {parts}")
+
+
+def _group(head: int | None, lanes_: int) -> int | None:
+    """The threads a normalised head's channels take at `lanes_` a program (None: the warpgroup's, one a
+    thread)."""
+    vector = lanes_ // scan.THREADS
+    return None if head is None or vector == 1 else head // vector
+
+
 def fits(width: int, head: int | None) -> bool:
     """Whether a piece of `width` channels steps here: whole warpgroups of them, a normalised piece's head
     one (its row sum the warpgroup's)."""
@@ -47,11 +80,11 @@ def _kept(kept, value: jax.Array) -> jax.Array:
 
 
 def _loaded(ref, row, token, columns, length: int):
-    """`ref`'s `[THREADS]` channels at `token` of `row`, fp32, zero before the row's first and past its
-    last."""
+    """`ref`'s program's channels (`columns`) at `token` of `row`, fp32, zero before the row's first and
+    past its last."""
     inside = (token >= 0) & (token < length)
     at = ref.at[row, jnp.clip(token, 0, length - 1), columns]
-    value = plgpu.load(at, layout=scan.blocked(scan.THREADS), optimized=False).astype(jnp.float32)
+    value = plgpu.load(at, layout=scan.blocked(columns.size), optimized=False).astype(jnp.float32)
     return _kept(inside, value)
 
 
@@ -82,12 +115,12 @@ class _Piece:
     """A program's view of its piece: its row, its tokens' first, its channels in the operand and the
     piece, the taps and bias it reads, and the masks."""
 
-    def __init__(self, refs, *, first: int, local, length: int, count: int, tokens: int):
+    def __init__(self, refs, *, first: int, local, length: int, count: int, tokens: int, lanes_: int):
         self.x_ref, self.w_ref, self.b_ref, self.valid_ref, self.documents_ref = refs
         self.row, self.length, self.count = lax.axis_index("rows"), length, count
         self.start = lax.axis_index("tokens") * tokens
-        self.local, self.columns = pl.ds(local, scan.THREADS), pl.ds(first + local, scan.THREADS)
-        layout = scan.blocked(scan.THREADS)
+        self.local, self.columns = pl.ds(local, lanes_), pl.ds(first + local, lanes_)
+        layout = scan.blocked(lanes_)
         self.taps = [plgpu.load(self.w_ref.at[tap, self.columns], layout=layout, optimized=False)
                      .astype(jnp.float32) for tap in range(count)]
         self.bias = (None if self.b_ref is None else plgpu.load(
@@ -133,7 +166,7 @@ def _named(kernel: str, first: int, width: int) -> str:
     return f"{kernel}_{first}_{width}"
 
 
-STATIC = ("first", "width", "head", "activation", "eps", "dtype", "family", "interpret")
+STATIC = ("first", "width", "head", "lanes_", "activation", "eps", "dtype", "family", "interpret")
 """A piece's launch's static arguments (`tuning.lowered_once`): its channels, its norm and activation, its
 output's dtype, its bundle; every other argument an array or None. Lowered once a configuration: a model's
 layers' identical convs were each lowered again (two Mamba layers six Mosaic calls to one's four,
@@ -141,35 +174,42 @@ jsf-r06p)."""
 
 
 @tuning.lowered_once(STATIC)
-def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: int | None, activation: bool,
-            eps: float, dtype, family: mosaic.Family, interpret: bool = False):
+def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: int | None, lanes_: int,
+            activation: bool, eps: float, dtype, family: mosaic.Family, interpret: bool = False):
     """A piece's output `[B, T, width]` of `x`'s channels `first` to `first + width`, convolved by `taps`
-    `[C, K]` plus `bias`, activated and, with a `head`, l2-normalised over each head."""
+    `[C, K]` plus `bias`, activated and, with a `head`, l2-normalised over each head; `lanes_` channels a
+    program (`lanes`)."""
     rows, length, _ = x.shape
     count, tokens = taps.shape[1], _tokens(length)
+    unrolled, group = _unrolled(tokens), _group(head, lanes_)
     operands = [x, taps.T, bias, valid, documents]
 
     def entry(*refs):
         *given, out_ref, exchanged = refs
         given = iter(given)
         piece = _Piece([next(given) if operand is not None else None for operand in operands], first=first,
-                       local=lax.axis_index("channels") * scan.THREADS, length=length, count=count,
-                       tokens=tokens)
+                       local=lax.axis_index("channels") * lanes_, length=length, count=count,
+                       tokens=tokens, lanes_=lanes_)
 
-        def token(i, held):
-            t = piece.start + i
-            read = [*held, piece.read(t)]
-            out = _activated(piece.preactivation(piece.window(read)), activation)[0]
-            if head is not None:
-                out = out * scan.inverse_norm(out, eps, exchanged, interpret=interpret)
-            _stored(out_ref, (piece.row, t, piece.local), _kept(piece.kept(t), out), t < length)
-            return read[1:]
+        def turn(i, held):
+            first_token = piece.start + i * unrolled
+            reads = [piece.read(first_token + u) for u in range(unrolled)]
+            for u, latest in enumerate(reads):
+                t = first_token + u
+                read = [*held, latest]
+                out = _activated(piece.preactivation(piece.window(read)), activation)[0]
+                if head is not None:
+                    out = out * scan.inverse_norm(out, eps, exchanged, group=group, interpret=interpret)
+                _stored(out_ref, (piece.row, t, piece.local), _kept(piece.kept(t), out), t < length)
+                held = read[1:]
+            return held
 
-        lax.fori_loop(0, tokens, token, [piece.read(piece.start - count + 1 + j) for j in range(count - 1)])
+        lax.fori_loop(0, tokens // unrolled, turn,
+                      [piece.read(piece.start - count + 1 + j) for j in range(count - 1)])
 
     name = _named("short_conv", first, width)
     launched = mosaic.kernel(entry, out_type=jax.ShapeDtypeStruct((rows, length, width), dtype),
-                             grid=(rows, pl.cdiv(length, tokens), width // scan.THREADS),
+                             grid=(rows, pl.cdiv(length, tokens), width // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
                              family=family.name, name=name, scratch=(scan.scratch(),))
     return launched(*(operand for operand in operands if operand is not None))
@@ -184,10 +224,10 @@ def backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: 
     its piece's input gradient apart, which XLA joined: 0.66 of an A100's 2.65 ms conv training step at
     Qwen3.5-0.8B's widths (M-JS-18)."""
     rows, length, channels = x.shape
-    count, tokens = taps.shape[1], _tokens(length)
+    count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts)
     blocks = pl.cdiv(length, tokens)
     operands = [x, taps.T, bias, valid, documents]
-    bounds = [(first // scan.THREADS, (first + width) // scan.THREADS, first, head)
+    bounds = [(first // lanes_, (first + width) // lanes_, first, head)
               for first, width, head in pieces(parts)]
 
     def entry(*refs):
@@ -199,8 +239,8 @@ def backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: 
         for (lo, hi, first, head), dy_ref in zip(bounds, dy_refs, strict=True):
             @pl.when((program >= lo) & (program < hi))
             def _(lo=lo, first=first, head=head, dy_ref=dy_ref):
-                piece = _Piece(found, first=first, local=(program - lo) * scan.THREADS, length=length,
-                               count=count, tokens=tokens)
+                piece = _Piece(found, first=first, local=(program - lo) * lanes_, length=length,
+                               count=count, tokens=tokens, lanes_=lanes_)
                 _backward_walk(piece, dy_ref, (dx_ref, dw_ref, db_ref), exchanged, head=head,
                                activation=activation, eps=eps, tokens=tokens, interpret=interpret)
 
@@ -208,7 +248,7 @@ def backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: 
     out_type = (jax.ShapeDtypeStruct((rows, length, channels), x.dtype), f32((rows, blocks, count, channels)),
                 f32((rows, blocks, channels)))
     name = "short_conv_backward_" + "_".join(f"{width}{'n' if head else ''}" for width, head in parts)
-    launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // scan.THREADS),
+    launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
                              family=family.name, name=name, scratch=(scan.scratch(),))
     dx, dw, db = launched(*(operand for operand in operands if operand is not None), *dys)
@@ -231,41 +271,54 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
     dx_ref, dw_ref, db_ref = outs
     count, length = piece.count, piece.length
     block = lax.axis_index("tokens")
-    zero = jnp.zeros((scan.THREADS,), jnp.float32)
+    zero = jnp.zeros((piece.columns.size,), jnp.float32)
+    group = _group(head, piece.columns.size)
+    # The walk's tokens a whole number of turns: those past the block's last K-1 add only to tokens no
+    # program here owns.
+    unrolled = _unrolled(UNROLLED)
+    steps = -(-(tokens + count - 1) // unrolled) * unrolled
+    last = piece.start + steps - 1
 
-    def gradient(t, window):
-        """`t`'s pre-activation gradient from its output's, through the norm and the SiLU."""
+    def gradient(t, window, dy):
+        """`t`'s pre-activation gradient from its output's `dy`, through the norm and the SiLU."""
         pre = piece.preactivation(window)
         out, gate = _activated(pre, activation)
-        grad = _kept(piece.kept(t), _loaded(dy_ref, piece.row, t, piece.local, length))
+        grad = _kept(piece.kept(t), dy)
         if head is not None:
-            scale = scan.inverse_norm(out, eps, exchanged, interpret=interpret)
+            scale = scan.inverse_norm(out, eps, exchanged, group=group, interpret=interpret)
             unit = out * scale
-            grad = scale * (grad - scan.summed(unit * grad, exchanged, interpret=interpret) * unit)
+            projected = (scan.grouped_summed(unit * grad, group, interpret=interpret) if group is not None
+                         else scan.summed(unit * grad, exchanged, interpret=interpret))
+            grad = scale * (grad - projected * unit)
         if gate is not None:
             grad = grad * gate + (grad * pre) * (gate * (1.0 - gate))
         return grad
 
-    def token(i, carry):
+    def turn(i, carry):
         held, later, owners, sums = carry
-        t = piece.start + tokens + count - 2 - i
-        read = [piece.read(t - count + 1), *held]
-        window = piece.window(read)
-        grad, document = gradient(t, window), read[-1][1]
-        owned = (t < piece.start + tokens) & (t < length)
-        sums = [*(total + _kept(owned, grad * inputs)
-                  for total, inputs in zip(sums[:-1], window, strict=True)), sums[-1] + _kept(owned, grad)]
-        reads = [grad, *later]
-        dx = zero
-        for shift, (value, theirs) in enumerate(zip(reads, [document, *owners], strict=True)):
-            dx = dx + _kept(theirs == document, value) * piece.taps[count - 1 - shift]
-        _stored(dx_ref, (piece.row, t, piece.columns), dx, owned)
-        return read[:-1], [grad, *later[:-1]], [document, *owners[:-1]], sums
+        newest = last - i * unrolled
+        tokens_ = [newest - u for u in range(unrolled)]
+        reads = [piece.read(t - count + 1) for t in tokens_]
+        dys = [_loaded(dy_ref, piece.row, t, piece.local, length) for t in tokens_]
+        for t, oldest, dy in zip(tokens_, reads, dys, strict=True):
+            read = [oldest, *held]
+            window = piece.window(read)
+            grad, document = gradient(t, window, dy), read[-1][1]
+            owned = (t < piece.start + tokens) & (t < length)
+            sums = [*(total + _kept(owned, grad * inputs)
+                      for total, inputs in zip(sums[:-1], window, strict=True)),
+                    sums[-1] + _kept(owned, grad)]
+            dx = zero
+            reads = zip([grad, *later], [document, *owners], strict=True)
+            for shift, (value, theirs) in enumerate(reads):
+                dx = dx + _kept(theirs == document, value) * piece.taps[count - 1 - shift]
+            _stored(dx_ref, (piece.row, t, piece.columns), dx, owned)
+            held, later, owners = read[:-1], [grad, *later[:-1]], [document, *owners[:-1]]
+        return held, later, owners, sums
 
-    last = piece.start + tokens + count - 2
     held = [piece.read(last - count + 2 + j) for j in range(count - 1)]
     carry = (held, [zero] * (count - 1), [jnp.int32(-2)] * (count - 1), [zero] * (count + 1))
-    *_, sums = lax.fori_loop(0, tokens + count - 1, token, carry)
+    *_, sums = lax.fori_loop(0, steps // unrolled, turn, carry)
     for tap in range(count):
         plgpu.store(dw_ref.at[piece.row, block, tap, piece.columns], sums[tap], optimized=False)
     plgpu.store(db_ref.at[piece.row, block, piece.columns], sums[count], optimized=False)
