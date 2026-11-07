@@ -119,6 +119,11 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
+CONSUMERS = 2
+"""The most consumer warpgroups a GEMM tile takes: CUTLASS's sm90 cooperative kernel's two; a family's third
+(wgmma's, FlashAttention 3's d64 forward's) unmeasured on a product."""
+
+
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its
@@ -214,12 +219,13 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # further consumers would compute padding alone; where groups average a role's rows, a routing's groups
     # past it keep the further consumers' rows real. Row 3622, H100 (FS-3622-AB1/AB2-h100): one consumer ran
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
-    whole = rows >= family.role_rows if grouped else rows % (family.role_rows * family.consumers) == 0
+    most = min(family.consumers, CONSUMERS)
+    whole = rows >= family.role_rows if grouped else rows % (family.role_rows * most) == 0
     # Each consumer count's tile at the most programs that hold one, the count the objective prices least
     # (`_reads`), the most consumers on a tie.
     counted = [next((tile for programs in range(family.programs(consumers), 0, -1)
                      if (tile := tiled(consumers, programs)) is not None), None)
-               for consumers in range(family.consumers if whole else 1, 0, -1)]
+               for consumers in range(most if whole else 1, 0, -1)]
     return min((tile for tile in counted if tile is not None), key=functools.partial(_reads, family),
                default=None)
 
