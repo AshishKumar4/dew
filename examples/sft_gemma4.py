@@ -36,7 +36,7 @@ from dew.interop import PretrainedDecoder
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.optim import OptimConfig
 from dew.sampling import Sampling
-from dew.training import Checkpoints, MeshSpec, Trainer, prepare_process
+from dew.training import Checkpoints, LocalTracker, MeshSpec, Trainer, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"
@@ -138,7 +138,8 @@ def main(config: Config) -> Path:
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
                                              clip_grads=1.0).build(config.steps),
                       key=jax.random.key(0), mesh=MeshSpec(fsdp=jax.device_count()),
-                      accumulation=config.accumulation, checkpoints=Checkpoints(str(run_dir)))
+                      accumulation=config.accumulation, checkpoints=Checkpoints(str(run_dir)),
+                      tracker=LocalTracker(run_dir / "tracking"))
     state = trainer.fit(data, validation=validation, steps=config.steps, log_every=1 if config.smoke else 20,
                         eval_every=config.steps, checkpoint_every=config.steps, metrics=[Perplexity()])
 

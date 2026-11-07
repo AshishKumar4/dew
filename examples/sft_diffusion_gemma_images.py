@@ -43,7 +43,7 @@ from dew.nn.inputs import ModelInputs
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.objectives.lm import Perplexity
 from dew.optim import Cosine, OptimConfig
-from dew.training import Checkpoints, MeshSpec, Trainer, prepare_process
+from dew.training import Checkpoints, LocalTracker, MeshSpec, Trainer, prepare_process
 
 EOS, PAD, IMAGE = 256, 257, 258
 """The ids past the 256 bytes: end of caption, padding and the image placeholder."""
@@ -257,7 +257,8 @@ def main(config: Config) -> Path:
     prepare_process(multi_host=False)
     # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
     trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
-                      checkpoints=Checkpoints(str(run_dir), keep=2 if config.smoke else 1))
+                      checkpoints=Checkpoints(str(run_dir), keep=2 if config.smoke else 1),
+                      tracker=LocalTracker(run_dir / "tracking"))
     data = caption_data(config, parts, labels)
     started = time.perf_counter()
     state = trainer.fit(data, steps=config.steps, log_every=1 if config.smoke else 100,

@@ -41,7 +41,7 @@ from dew.nn.backbones import CausalTransformer
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import Perplexity
 from dew.optim import Cosine, OptimConfig
-from dew.training import Checkpoints, Evaluation, MeshSpec, Trainer
+from dew.training import Checkpoints, Evaluation, LocalTracker, MeshSpec, Trainer
 
 SMOKE_TEXT = (
     "The cat sat on the warm mat and watched the rain.\n",
@@ -132,7 +132,7 @@ def main(config: Config) -> Path:
         peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
         end_value=config.learning_rate / 10)).build(config.steps)
     trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
-                      checkpoints=Checkpoints(str(run_dir), keep=1))
+                      checkpoints=Checkpoints(str(run_dir), keep=1), tracker=LocalTracker(run_dir / "tracking"))
     started = time.perf_counter()
     trainer.fit(data, steps=config.steps, log_every=1 if config.smoke else 100, eval_every=config.eval_every,
                 checkpoint_every=config.eval_every, validation=validation)
