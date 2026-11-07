@@ -21,7 +21,7 @@ def _worker(hold: float = 8):
     import numpy as np
     from tool_support import load
 
-    jax.config.update("jax_enable_x64", True)
+    jax.config.update("jax_enable_x64", val=True)
     tool = load("layout_parity")
     _, case = tool.model_case("jepa", "float32", {}, {})
     armed, released = threading.Event(), threading.Event()
