@@ -1024,13 +1024,16 @@ def _walked_rows(lhs, gather, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
     """Dew: `gmm`'s rows as its schedule walks them: `lhs`, or a gathered product's table (`gather`, a pad
     reading row 0 of the tokens, which stay as they are), padded to whole TMA rows (`m` of them) and
     extended to the schedule's extent where the family's loads past the rows are not zeros (`bounded`):
-    `(lhs, gather, m, extent)`."""
+    `(lhs, gather, m, extent)`. A table is always extended: its threads read a tile's entries by plain
+    loads, which no TMA bounds (a gathered product's last tile read past an unextended table on a GH200,
+    CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
     row_axis = 1 if transpose_lhs else 0
     walked, axis = (lhs, row_axis) if gather is None else (gather, 0)
     walked = rows_padded(walked, axis, TMA_ROWS)
     m = walked.shape[axis]
     row_tile = tiles.block_m * tiles.cluster
-    extent = m if bounded else -(-m // row_tile) * row_tile if dense else row_extent(m, row_tile)
+    extent = (m if bounded and gather is None else -(-m // row_tile) * row_tile if dense
+              else row_extent(m, row_tile))
     walked = rows_extended(walked, axis, extent)
     return (walked, None, m, extent) if gather is None else (lhs, walked, m, extent)
 
