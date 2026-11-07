@@ -683,9 +683,13 @@ class CausalTransformer(LinearProducts):
     def stored_view(self, store: Variables) -> StackView:
         """How `store` holds this decoder's layer stack (`bank_sites`), as a decoder bound to its shapes
         plans its runs (`SteppedFeedForward`)."""
-        bound = self if self.scope is not None else self.bind(jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
-        return StackView(bound.groups)
+        if self.scope is not None:
+            return StackView(self.groups)
+        # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
+        # split where its adapter's targets do (`scanned_like`).
+        return StackView(self.apply(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
+            method=lambda module: module.groups))
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
         """Resolve every kind the pattern names, plus the kinds of the prediction depths and the drafter.
@@ -848,7 +852,8 @@ class CausalTransformer(LinearProducts):
         self.scan_keys = tuple(zip(specs, structures, strict=True))
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(self.scan_keys, self.bank_layers) if self.scan_layers else tuple(
+        self.groups = scan_groups(tuple(self.scanned_like(index) for index in range(self.num_layers)),
+                                  self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
         self.mtp = self._prediction_depths(types, kinds, mixer_spec, gated_mlp, routed, wiring)
         if self.dspark is not None:
@@ -1014,11 +1019,17 @@ class CausalTransformer(LinearProducts):
                                      self._dex_start(index), spec.routed)
         return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
 
+    def scanned_like(self, index: int) -> Hashable:
+        """What layer `index` runs as under a scan: its scan key (`scan_keys`), so like layers run as one
+        scanned run (`groups`). A method interceptor that gives a layer parameters of its own (an adapter's
+        factors and scales, `dew.lora`) keys it apart where they differ, so a run of layers adapted alike
+        stacks one factor pair, and a layer adapted otherwise runs a run of its own."""
+        return self.scan_keys[index]
+
     def drawn_like(self, index: int) -> Hashable:
-        """What layer `index` draws as: its scan key and what its extension starts from (`_dex_start`), so
-        like layers draw under one scan. A method interceptor that gives a layer parameters of its own (an
-        adapter's factors, `dew.lora`) keys it apart where they differ."""
-        return (self.scan_keys[index], self._dex_start(index))
+        """What layer `index` draws as: what it runs as (`scanned_like`) and what its extension starts from
+        (`_dex_start`), so like layers draw under one scan."""
+        return (self.scanned_like(index), self._dex_start(index))
 
     @nn.nowrap
     def _dex_start(self, index: int) -> DexStart | None:

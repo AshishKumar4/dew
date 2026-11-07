@@ -752,8 +752,8 @@ def _targets_under(targets: Mapping[Path, Target], path: Path) -> bool:
 def _target_at[T](targets: Mapping[Path, T], path: Path) -> T | None:
     """Return the target a module path names, seen through the stack that runs
     it: a scanned run's module `layers_3_7` stands for layers 3 through 7,
-    whose targets must agree, since the run's kernels share one stacked
-    factor pair."""
+    whose targets agree, since a decoder runs layers adapted otherwise as runs
+    of their own (`CausalTransformer.scanned_like`)."""
     if path in targets:
         return targets[path]
     for depth, name in enumerate(path):
@@ -763,9 +763,7 @@ def _target_at[T](targets: Mapping[Path, T], path: Path) -> T | None:
         found = {targets.get((*path[:depth], f"layers_{index}", *path[depth + 1:])) for index in layers}
         if found == {None}:
             return None
-        if len(found) != 1:
-            raise ValueError(f"{'/'.join(path)} runs layers whose adapter targets differ: "
-                             f"a scanned run stacks one factor pair over all of them")
+        assert len(found) == 1, f"{'/'.join(path)} runs layers adapted otherwise as one scanned run"
         return found.pop()
     return None
 
@@ -844,13 +842,13 @@ class _Branch:
     def __call__(self, next_fun, args, kwargs, context):
         module = context.module
         root = self.root
-        if context.method_name == "drawn_like":
-            # A layer draws as its stack says, and apart from layers whose factors differ from its own
-            # (`CausalTransformer.drawn_like`): a scanned run stacks one factor pair over its layers.
+        if context.method_name == "scanned_like":
+            # A layer runs as its stack says, and apart from layers whose factors or scales differ from its
+            # own (`CausalTransformer.scanned_like`): a scanned run stacks one factor pair over its layers.
             index = args[0] if args else kwargs["index"]
             layer = (*root, *module.path, f"layers_{index}")
-            own = tuple(sorted((path[len(layer):], target) for path, target in self.targets.items()
-                               if path[:len(layer)] == layer))
+            own = tuple(sorted((path[len(layer):], target, self.bound.scales.get(path))
+                               for path, target in self.targets.items() if path[:len(layer)] == layer))
             return next_fun(*args, **kwargs), own
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on

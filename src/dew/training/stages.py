@@ -175,6 +175,11 @@ class StageLocal:
         staged = cls(tuple(site for site in declared if not any(
             site.view.splits(tree) for tree in in_namespace(shapes, site.namespace).values())), mesh)
         whole = whole_reading(optimizer, shapes, staged)
+        if whole and stages == 1:
+            # One stage's scan stacks its runs within each step instead, as a state on its layers holds them.
+            _log.info("the optimizer given built may read a stacked leaf otherwise than layer by layer (%s), "
+                      "so the scan stacks its runs within each step", "; ".join(whole))
+            return cls((), mesh)
         if whole:
             _log.warning("the optimizer given built may read a stacked leaf otherwise than layer by layer "
                          "(%s), so each pipelined run keeps every layer whole on every stage, without "
@@ -188,16 +193,29 @@ class StageLocal:
     def stages(self) -> int:
         return self.mesh.shape.get(STAGE_AXIS, 1)
 
+    def _stacks(self, site: DecoderBank, where: str) -> bool:
+        """Whether the run's subtree at `where` is one this state stacks: every collection's over a
+        pipeline's stages; on one stage the parameters' alone, and every mirror of them (an optimizer's
+        moment, an accumulated gradient, whose root is the site's namespace). There the step reads its other
+        collections as its model does: the frozen one banked by run once, as it is placed
+        (`dew.training.execution.banked_frozen`), the small ones stacked in the step."""
+        if self.stages > 1:
+            return True
+        keys = tuple(where.split("/")) if where else ()
+        return keys == site.namespace or keys[:1] == ("params",)
+
     def staged[Leaf](self, tree, stack: RowStack[Leaf] = _stacked_rows):
-        """`tree`, any tree that holds or mirrors variables, with each run stacked by stage, its rows
-        made one leaf by `stack(rows, shape)` (`StackView.stage_form`): arrays, shapes or shardings. A
-        run already stacked stays as it is."""
-        return _walked(tree, self.sites, lambda site, where, node: site.view.stage_form(where, node, stack))
+        """`tree`, any tree that holds or mirrors variables, with each run it stacks (`_stacks`) stacked by
+        stage, its rows made one leaf by `stack(rows, shape)` (`StackView.stage_form`): arrays, shapes or
+        shardings. A run already stacked stays as it is."""
+        return _walked(tree, self.sites, lambda site, where, node: site.view.stage_form(where, node, stack)
+                       if self._stacks(site, where) else node)
 
     def layered[Leaf](self, tree, cut: RowCut[Leaf] = _layer_rows):
         """`staged`'s inverse, `cut(path, leaf, shape)` giving a stacked leaf's rows
         (`StackView.layer_form`)."""
-        return _walked(tree, self.sites, lambda site, where, node: site.view.layer_form(node, cut))
+        return _walked(tree, self.sites, lambda site, where, node: site.view.layer_form(node, cut)
+                       if self._stacks(site, where) else node)
 
     def received(self, objective, state: TrainState) -> TrainState:
         """`state`, one a run handed on (`fit`'s), read as this run's step starts from it: a run stacked

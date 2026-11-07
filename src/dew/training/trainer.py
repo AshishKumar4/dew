@@ -616,7 +616,9 @@ class Trainer(Generic[Loss, Effects]):
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
 
-        It returns the state with its shardings and the data position a resume continues from.
+        It returns the state with its shardings and the data position a resume continues from, the state as
+        the step holds it, which `compile` takes: a pipelined run's layers stacked by stage, and a one-stage
+        scan's runs of parameters stacked as the scan reads them; `stored` reads it on its stored layers.
         """
         return self._placed(self._started(), positioned=True)
 
@@ -1172,7 +1174,8 @@ class Trainer(Generic[Loss, Effects]):
         cooldowns: Cooldowns | None = None,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says;
-        return the state as the run holds it, which its model reads off the mesh (`off_stages`).
+        return the state as the run holds it, which over a pipeline's stages its model reads off the mesh
+        (`off_stages`), and on one stage with every layer on its stored layers (`stored`).
 
         `resume="auto"` continues the checkpointer's latest checkpoint where it holds one and otherwise
         starts afresh; "require" refuses to start afresh, for a job that must continue, and "never" refuses
@@ -1251,7 +1254,9 @@ class Trainer(Generic[Loss, Effects]):
                 raise error
         if run.preempted is not None:
             raise Preempted(run.preempted)
-        return trained
+        # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on
+        # their stored layers, as every reader by layer name reads them, at no device's cost but the copy.
+        return trained if self._staging.stages > 1 else self.stored(trained)
 
     def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
               dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,

@@ -352,7 +352,8 @@ def test_the_state_a_stage_local_fit_returns_is_the_one_it_holds_and_reads_off_t
     stored = run.stored(trained)
     alone = trainer(model, optimizer, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path)))
     held = on_host((stored.variables, stored.opt_state, stored.ema))
-    placed, _, _ = alone.place()
+    # Placed as its step holds it, a one-stage scan's runs stacked, read on their stored layers.
+    placed = alone.stored(alone.place()[0])
     restored = on_host((placed.variables, placed.opt_state, placed.ema))
     assert jax.tree.structure(restored) == jax.tree.structure(held)
     for mine, theirs in zip(jax.tree.leaves(restored), jax.tree.leaves(held), strict=True):
@@ -445,7 +446,8 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     written = jax.device_get(whole.stored(trained))
     alone = trainer(model, optimizer, MeshSpec(fsdp=2), 2, checkpoints=Checkpoints(str(tmp_path / "whole")))
     alone.validate(steps=3)
-    placed, _, _ = alone.place()
+    # Placed as its step holds it, a one-stage scan's runs stacked, read on their stored layers.
+    placed = alone.stored(alone.place()[0])
     for name in ("variables", "opt_state", "ema"):
         restored, held = jax.device_get(getattr(placed, name)), getattr(written, name)
         assert jax.tree.structure(restored) == jax.tree.structure(held), name
