@@ -1430,6 +1430,13 @@ class Issuer[Accumulator](abc.ABC):
         allocates."""
         return () if products is None else self.product_shared(self.product_scratch(*products))
 
+    def product_addresses(self, products: tuple | None) -> int:
+        """The unaligned shared-memory words `Family.scoped`'s `products` keep beside what they hold
+        (`resources.Scope.addresses`): none, but where the issuer keeps its products in tensor memory, whose
+        allocation keeps its address in one (`resources.TMEM_ADDRESS_BYTES`)."""
+        del products
+        return 0
+
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
         `shape` (zero), its value once they are done: a register accumulator's, which a family whose

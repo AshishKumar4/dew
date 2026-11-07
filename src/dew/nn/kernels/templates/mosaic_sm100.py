@@ -759,6 +759,11 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
                     for _ in range(consumers)) for depth, dtype in dict.fromkeys(lefts)},
                 "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
 
+    def product_addresses(self, products: tuple | None) -> int:
+        # Its accumulators' tensor memory keeps its address in a word: every launch's compile was those 4
+        # bytes past its plan (the sm100 gate, jsf-g100fix).
+        return 0 if products is None else resources.TMEM_ADDRESS_BYTES
+
     def product_shared(self, scratch) -> tuple:
         # Its accumulators are tensor memory: its padded right operands, its staged left operands and its
         # barrier are shared memory, as `product_scratch` allocates them.
