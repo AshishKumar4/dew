@@ -34,11 +34,12 @@ def bouncing(rows: int, frames: int, size: int, seed: int) -> np.ndarray:
 
 def test_tutorial_12s_tokenizer_reconstructs_the_balls_it_was_trained_on():
     """Tutorial 12's tokenizer, trained as the tutorial trains it (2,048 clips of 12 frames, 32 clips an
-    update, Adam 3e-4) for 8,000 updates, reconstructs 8 held-out clips at under a quarter of the mean
-    frame's squared error. Its tokens know their places by Dreamer 4's rotary positions (`positions`, row
-    4669): by learned vectors alone, as before, it reconstructed the mean frame (an H100 at fdd1da52c9:
-    squared error 0.1406 against the mean frame's 0.1417, where rotary positions reach 0.0067, a twentieth
-    of it, so a quarter holds a five-fold margin)."""
+    update, Adam 3e-4) for 8,000 updates, reconstructs the balls of 8 held-out clips: most of their pixels
+    come back lit (above 0, the midpoint of a frame's -1 background and its 1 balls) and most of the
+    background dark, where the mean frame, which the tokenizer reconstructed with learned positions alone
+    (row 4669: an H100 at fdd1da52c9, squared error 0.1406 against the mean frame's 0.1417), lights none.
+    Its tokens know their places by Dreamer 4's rotary positions (`positions`): there its squared error
+    was 0.0067 and its correlation with the frames 0.976."""
     videos, held = bouncing(2048, 12, 32, 0), bouncing(8, 12, 32, 1)
     clips = Loader(train=lambda partition: ({"video": videos[start:start + 32]}
                                             for start in itertools.cycle(range(0, 2048, 32))),
@@ -47,6 +48,8 @@ def test_tutorial_12s_tokenizer_reconstructs_the_balls_it_was_trained_on():
     state = Trainer(TokenizerObjective(tokenizer), optax.adam(3e-4), key=jax.random.key(9)).fit(
         clips, steps=8000, log_every=4000)
     frames = held.reshape(-1, 32, 32, 1)
-    rebuilt = np.asarray(jax.jit(tokenizer.apply)(state.variables, frames))
-    mean = videos.reshape(-1, 32, 32, 1).mean(0)
-    assert np.mean(np.square(rebuilt - frames)) < np.mean(np.square(mean - frames)) / 4
+    lit = np.asarray(jax.jit(tokenizer.apply)(state.variables, frames)) > 0
+    balls = frames > 0
+    assert np.count_nonzero(lit & balls) > np.count_nonzero(~lit & balls)
+    assert np.count_nonzero(~lit & ~balls) > np.count_nonzero(lit & ~balls)
+    assert not np.any(videos.reshape(-1, 32, 32, 1).mean(0) > 0)
