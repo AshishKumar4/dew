@@ -966,6 +966,7 @@ dew.training.ahead.AheadTarget
   capacity_gib: float | None = None
   frontier: bool = False
   multiprocessors: int | None = None
+  topology: str | None = None
 dew.training.budget.Pause
   fraction: float
 dew.training.budget.Plateau

@@ -35,6 +35,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `Decide.save_pretrained` writes the format its head is released in (`Head.release_format`: Laya's, the joint
   head's or the slot readout's), where only Laya's was written, so a task of any layout it trained with
   exports and loads as the task it is.
+- A step compiled ahead may compile over a host's own GPUs as that host serialized their topology
+  (`--trainer.compile-ahead.topology PATH`, `dew.training.ahead.host_gpus`): its programs key the persistent
+  compilation cache as the host's own compiles do, so the host's run reads them. Compiled for a generation alone,
+  they key other entries (the generation's canonical SKU's memory: an A100's 80 GB, where a host's may hold 40 GB).
 - A profile window may convert its reports as it stops, in the run's own process (`ProfileWindow(wait=True)`),
   as `Profiler.stop(wait=True)` does: a short interactive run's, or one whose sandbox forbids it to create a
   process. By default a window's reports still convert in a process of their own while the run trains on.
