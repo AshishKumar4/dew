@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
-    from dew.decision.sources import PretrainedDecision
     from dew.interop.hf_decoders import translate_config, translate_weights
     from dew.interop.pretrained import (
         Pretrained,
@@ -24,7 +23,6 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.interop.sources import SourceReference
 
 _EXPORTS = {
-    "PretrainedDecision": "dew.decision.sources",
     "Pretrained": "dew.interop.pretrained", "PretrainedBlockDecoder": "dew.interop.pretrained",
     "PretrainedDecoder": "dew.interop.pretrained", "PretrainedFallback": "dew.interop.pretrained",
     "PretrainedMaskedDecoder": "dew.interop.pretrained", "PretrainedPipeline": "dew.interop.pretrained",
@@ -41,7 +39,6 @@ __getattr__, __dir__ = _lookup(__name__, _EXPORTS)
 __all__ = [
     "Pretrained",
     "PretrainedBlockDecoder",
-    "PretrainedDecision",
     "PretrainedDecoder",
     "PretrainedFallback",
     "PretrainedMaskedDecoder",
