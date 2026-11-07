@@ -25,6 +25,7 @@ from __future__ import annotations
 import collections
 import functools
 import itertools
+import weakref
 from collections.abc import Callable, Hashable, Iterator, Sequence
 from typing import NamedTuple
 
@@ -387,9 +388,10 @@ def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
     """The values beside `row` (one value, or several: attention's query, keys and values) the equations
     from it to `output` read: each a value of the body made from neither it nor constants alone (a weight,
     a gate, a branch, a bias), in the order first read; None where `output` is not made from every one.
-    Made from a row is read within `output`'s own ancestry (`_backward`), never past it."""
+    Made from a row is read within `output`'s own ancestry (`_backward`, as far as a candidate's operands lie
+    from its results: twice `REACH`), never past it."""
     rows = (row,) if isinstance(row, jcore.Var) else tuple(row)
-    ancestry = _backward(index, output, SPAN)
+    ancestry = _backward(index, output, 2 * REACH)
     if not all(source in ancestry for source in rows):
         return None
     descendants = _within(index, rows, ancestry)
@@ -423,14 +425,24 @@ def _within(index: fusion.Index, rows: Sequence[jcore.Var], ancestry: dict[jcore
 
 def _constant(index: fusion.Index, var: jcore.Var) -> bool:
     """Whether `var` is made from the body's constants and literals alone (a mask of iotas, a table it
-    closed over)."""
-    if var in index.consts:
-        return True
-    place = index.producer.get(var)
-    if place is None:
-        return False
-    return all(isinstance(atom, jcore.Literal) or _constant(index, atom)
-               for atom in index.jaxpr.eqns[place].invars)
+    closed over): read from the body's constant values, found once a body (`_constants`)."""
+    return var in _constants(index)
+
+
+_HELD_CONSTANTS: weakref.WeakKeyDictionary[fusion.Index, frozenset[jcore.Var]] = weakref.WeakKeyDictionary()
+"""Each body's constant values (`_constants`), held while its index lives."""
+
+
+def _constants(index: fusion.Index) -> frozenset[jcore.Var]:
+    """The values of the body `index` reads made from its constants and literals alone, in one pass over its
+    equations in order."""
+    if index not in _HELD_CONSTANTS:
+        found: set[jcore.Var] = set(index.consts)
+        for equation in index.jaxpr.eqns:
+            if all(isinstance(atom, jcore.Literal) or atom in found for atom in equation.invars):
+                found.update(equation.outvars)
+        _HELD_CONSTANTS[index] = frozenset(found)
+    return _HELD_CONSTANTS[index]
 
 
 def _scalars(index: fusion.Index, places: Sequence[int]) -> list[float]:
