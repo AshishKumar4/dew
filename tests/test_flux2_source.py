@@ -15,6 +15,7 @@ The pipeline flattens its latent row-major, one token per position, so these
 tests reshape between that and NHWC with numpy's own reshape.
 """
 
+import contextlib
 import json
 from pathlib import Path
 
@@ -24,7 +25,6 @@ import numpy as np
 import pytest
 import tool_support
 from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
@@ -171,61 +171,148 @@ def nhwc(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
 
 
+PIPELINE_SEEDS = 8
+"""The autoencoder's, encoders' and pipeline's declared seeds for check 1, sized by `seeds_for` paired as
+each check confirmed them."""
+
+
+def torch_arms(run):
+    """`run(dtype, *inputs)` as given in float32, and in float64 inside `float64` (each a reference arm), its
+    tensors as NumPy arrays."""
+    import torch
+
+    from tools.torch_precision import float64
+
+    def arm(dtype):
+        @as_given
+        def given(*inputs):
+            with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+                found = run(dtype, *inputs)
+                return jax.tree.map(
+                    lambda out: out.detach().numpy() if isinstance(out, torch.Tensor) else out, found)
+        return given
+    return arm(torch.float32), arm(torch.float64)
+
+
+def vae_walk(model, dtype, inputs):
+    """`model` walked as `Flux2Pipeline` walks it at `dtype`: `_encode_vae_image` (posterior mode, 2x2 fold,
+    batch-norm normalization) of the draw's image and the call's decode of its code (the inverse, then
+    `vae.decode`), with the gradients of the draw's probes against the pixels and the code."""
+    import torch
+    from diffusers import Flux2Pipeline
+
+    tensors = {key: torch.from_numpy(np.asarray(value)).to(dtype) for key, value in inputs.items()}
+    statistics = (model.bn.running_mean.view(1, -1, 1, 1),
+                  torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps))
+    with torch.enable_grad():
+        pixels_in = tensors["image"].requires_grad_()
+        latent = (Flux2Pipeline._patchify_latents(model.encode(pixels_in).latent_dist.mode())
+                  - statistics[0]) / statistics[1]
+        (grad_image,) = torch.autograd.grad((latent * tensors["probe_latent"]).sum(), [pixels_in])
+        code_in = tensors["code"].requires_grad_()
+        unfolded = Flux2Pipeline._unpatchify_latents(code_in * statistics[1] + statistics[0])
+        pixels = model.decode(unfolded).sample
+        (grad_code,) = torch.autograd.grad((pixels * tensors["probe"]).sum(), [code_in])
+    outputs = {"latent": latent, "pixels": pixels, "grad_image": grad_image, "grad_code": grad_code}
+    return {key: nhwc(value.detach()) for key, value in outputs.items()}
+
+
 @pytest.mark.parametrize("name", ("vae", "small_decoder"))
-def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, arrays, name):
+def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, name):
+    """The pipeline's folded, normalized latent of an image and its decode of a code, and the gradients of
+    probes against both, on par with Diffusers' `AutoencoderKLFlux2` walked as `Flux2Pipeline` walks it, over
+    drawn images, codes and probes (check 1), its float64 twin the truth."""
+    import torch
+    from diffusers import AutoencoderKLFlux2
+
+    from tools.torch_precision import float64_twin
+
     autoencoder, params, layouts, _ = load_flux2_vae(source / name)
     tensors = component_tensors(source / name, "vae")
     assert {layout.name for layout in layouts} == {
         f"vae/{key}" for key in tensors if not key.startswith("bn.")
     }
-    image = nhwc(arrays[f"{name}.image"])
-    latent = autoencoder.encode(params, image)
-    assert latent.shape == (2, *autoencoder.latent_shape(image.shape[1:])) == (2, 4, 6, 16)
-    probe_latent = nhwc(arrays[f"{name}.probe_latent"])
-    grad_image = jax.grad(lambda image: jnp.sum(autoencoder.encode(params, image) * probe_latent))(image)
-    code = nhwc(arrays[f"{name}.code"])
-    pixels = autoencoder.decode(params, code)
-    probe = nhwc(arrays[f"{name}.probe"])
-    grad_code = jax.grad(lambda code: jnp.sum(autoencoder.decode(params, code) * probe))(code)
-    for key, value in (("latent", latent), ("pixels", pixels), ("grad_image", grad_image),
-                       ("grad_code", grad_code)):
-        assert_as_exact_as_the_reference(value, nhwc(arrays[f"{name}.{key}"]),
-                                         nhwc(arrays[f"{name}.fp64.{key}"]), f"{name} {key}")
+    narrow = AutoencoderKLFlux2.from_pretrained(source / name / "vae", local_files_only=True).eval()
+    models = {torch.float32: narrow, torch.float64: float64_twin(narrow)}
+
+    def draw(seed):
+        generator = np.random.default_rng([241, seed])
+        return ({"image": generator.uniform(-1, 1, (2, 3, 16, 24)).astype(np.float32),
+                 "probe_latent": generator.standard_normal((2, 16, 4, 6)).astype(np.float32),
+                 "code": generator.standard_normal((2, 16, 4, 6)).astype(np.float32),
+                 "probe": generator.standard_normal((2, 3, 16, 24)).astype(np.float32)},)
+
+    def walked(inputs):
+        image, probe_latent, code, probe = (nhwc(inputs[key])
+                                            for key in ("image", "probe_latent", "code", "probe"))
+        latent = autoencoder.encode(params, image)
+        grad_image = jax.grad(lambda image: jnp.sum(autoencoder.encode(params, image) * probe_latent))(image)
+        pixels = autoencoder.decode(params, code)
+        grad_code = jax.grad(lambda code: jnp.sum(autoencoder.decode(params, code) * probe))(code)
+        return {"latent": latent, "pixels": pixels, "grad_image": grad_image, "grad_code": grad_code}
+
+    reference, truth = torch_arms(lambda dtype, inputs: vae_walk(models[dtype], dtype, inputs))
+    assert_as_exact(jax.jit(walked), reference, draw, f"{name} walk", seeds=PIPELINE_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.network
 def test_the_published_autoencoder_matches_the_source(monkeypatch):
-    """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
-    ships), downloaded, on a smooth 128x192 image, against the source run in
-    float32 on the device Dew runs on, its matmuls and convolutions in fp32
-    (no TF32), and the float64 truth recorded on the CPU
-    (`flux2_published.npz`): the pipeline's folded, normalized latent and a
-    corner of its decode, each as near float64 as the source's float32 there.
-    On an A100 cuDNN's fp32 convolutions put the source's latent 2.3 times as
-    far from float64 as the CPU's arithmetic does, Dew's alike (ledger 1703),
+    """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev] ships), downloaded, over drawn
+    smooth 128x192 images: the pipeline's folded, normalized latent and a corner of its decode on par with
+    the source run in float32 on the device Dew runs on, its matmuls and convolutions in fp32 (no TF32)
+    (check 1), the truth the source's float64 twin on the CPU. On an A100 cuDNN's fp32 convolutions put the
+    source's latent 2.3 times as far from float64 as the CPU's arithmetic does, Dew's alike (ledger 1703),
     so a GPU run is judged against the source on its GPU."""
     import torch
 
+    from tools.torch_precision import float64, float64_twin
+
     monkeypatch.syspath_prepend(str(ROOT / "tools"))
     tool = tool_support.load("diffusers_flux2_reference")
-    recorded = np.load(ROOT / "tests/fixtures/flux2_published.npz")
     repo, revision = tool.PUBLISHED_VAE
     autoencoder, params, _, _ = load_flux2_vae(repo, revision=revision)
-    latent = autoencoder.encode(params, nhwc(tool.smooth_image()))
-    pixels = autoencoder.decode(params, nhwc(recorded["vae.latent.fp64"]))[:, :tool.CROP, :tool.CROP]
-    assert latent.shape == (1, 8, 12, 128)
     device = {"gpu": "cuda", "cpu": "cpu"}[jax.devices()[0].platform]
     if device == "cuda" and not torch.cuda.is_available():
         pytest.fail("the source runs on the GPU Dew runs on, and this torch has no CUDA")
+    source = tool.published_vae()
+    wide = float64_twin(source)
+    source = source.to(device)
+
+    def draw(seed):
+        smooth = tool.smooth_image()
+        noise = np.random.default_rng([231, seed]).standard_normal(smooth.shape) * 0.05
+        return (np.clip(smooth + noise, -1, 1).astype(np.float32),)
+
+    @as_given
+    def walked(image):
+        latent = autoencoder.encode(params, nhwc(image))
+        pixels = autoencoder.decode(params, latent)[:, :tool.CROP, :tool.CROP]
+        return {"latent": np.asarray(latent), "pixels": np.asarray(pixels)}
+
+    def source_walk(model, dtype, image):
+        with torch.no_grad():
+            mean = model.bn.running_mean.view(1, -1, 1, 1)
+            std = torch.sqrt(model.bn.running_var.view(1, -1, 1, 1) + model.config.batch_norm_eps)
+            folded = Flux2Pipeline._patchify_latents(model.encode(
+                torch.from_numpy(image).to(next(model.parameters()).device, dtype)).latent_dist.mode())
+            pixels = model.decode(Flux2Pipeline._unpatchify_latents(folded)).sample
+            return {"latent": nhwc(((folded - mean) / std).cpu()), "pixels": nhwc(pixels.cpu())[:, :tool.CROP,
+                                                                                                :tool.CROP]}
+
+    from diffusers import Flux2Pipeline
+
     held = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
     try:
-        reference = tool.published_walk(tool.published_vae().to(device), torch.float32)
+        @as_given
+        def truth(image):
+            with float64():
+                return source_walk(wide, torch.float64, image)
+
+        assert_as_exact(walked, as_given(lambda image: source_walk(source, torch.float32, image)), draw,
+                        "published FLUX.2 VAE", seeds=PIPELINE_SEEDS, truth_fn=truth)
     finally:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = held
-    for key, value in (("latent", latent), ("pixels", pixels)):
-        assert_as_exact_as_the_reference(value, nhwc(reference[f"vae.{key}"]),
-                                         nhwc(recorded[f"vae.{key}.fp64"]), f"published {key}")
 
 
 @pytest.fixture(scope="module")
@@ -235,45 +322,158 @@ def klein(source):
     return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
-def test_klein_prompt_encoding_matches_the_source_pipeline(klein, arrays, record):
-    """The conditioner stacks what `encode_prompt` stacks: the chat template
-    with thinking off, every row padded on the right to 512 tokens, and the
-    outputs of layers 9, 18 and 27 side by side, pads included."""
+WORDS = ("a", "red", "green", "blue", "cat", "bird", "on", "mat", "tiny", "photo", "of", "tree")
+"""The words a drawn prompt is made of."""
+
+
+def prompt_draw(seed: int) -> tuple[np.ndarray]:
+    """Two prompts as word indices, the first five words long and the second two."""
+    generator = np.random.default_rng([247, seed])
+    return (generator.integers(0, len(WORDS), 5).astype(np.int32),
+            generator.integers(0, len(WORDS), 2).astype(np.int32))
+
+
+def words(*rows) -> list[str]:
+    return [" ".join(WORDS[index] for index in row) for row in rows]
+
+
+@pytest.fixture(scope="module")
+def klein_pipelines(source):
+    """The saved [klein] pipeline Diffusers loads in float32, and its float64 twin (each module's
+    `float64_twin`) with the run that widens it (the recorder's `widened_walk`)."""
+    import copy
+
+    import torch
+    from diffusers import Flux2KleinPipeline
+
+    from tools.torch_precision import float64_twin
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.syspath_prepend(str(ROOT / "tools"))
+        tool = tool_support.load("diffusers_flux2_reference")
+    narrow = Flux2KleinPipeline.from_pretrained(source / "pipeline", torch_dtype=torch.float32,
+                                                local_files_only=True)
+    narrow.set_progress_bar_config(disable=True)
+    wide = copy.deepcopy(narrow)
+    for name, component in narrow.components.items():
+        if isinstance(component, torch.nn.Module):
+            setattr(wide, name, float64_twin(component))
+    return narrow, wide, tool.widened_walk
+
+
+def klein_arms(pipelines, run):
+    """`run(pipe, dtype, *inputs)` as given over the float32 pipeline, and over its float64 twin widened,
+    its tensors as NumPy arrays."""
+    import torch
+
+    narrow, wide, widened_walk = pipelines
+
+    def numpy(tree):
+        return jax.tree.map(lambda out: out.numpy() if isinstance(out, torch.Tensor) else out, tree)
+
+    @as_given
+    def reference(*inputs):
+        with torch.no_grad():
+            return numpy(run(narrow, torch.float32, *inputs))
+
+    @as_given
+    def truth(*inputs):
+        with torch.no_grad():
+            return numpy(widened_walk(lambda pipe, dtype: run(pipe, dtype, *inputs), wide))
+    return reference, truth
+
+
+def test_klein_prompt_encoding_matches_the_source_pipeline(klein, klein_pipelines, record):
+    """The conditioner stacks what `encode_prompt` stacks: the chat template with thinking off, every row
+    padded on the right to 512 tokens, and the outputs of layers 9, 18 and 27 side by side, pads included;
+    on par with it over drawn prompts and the empty one (check 1), its float64 twin the truth."""
+    import torch
+
     encoder = klein.inputs.conditions["conditioning"].encoder
     params = klein.variables["encoders"]["conditioning"]
-    prompts = [*record["pipeline"]["prompts"], ""]
-    condition = encoder.encode(params, encoder.tokenize(prompts))
-    assert condition.context.shape == (3, 512, record["pipeline"]["config"]["joint_attention_dim"])
+
+    def encoded(*rows):
+        return encoder.encode(params, encoder.tokenize([*words(*rows), ""])).context
+
+    def encode_prompt(pipe, dtype, *rows):
+        return torch.cat([pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))[0]
+                          for prompt in [*words(*rows), ""]])
+
+    condition = encoder.encode(params, encoder.tokenize(["", ""]))
+    assert condition.context.shape == (2, 512, record["pipeline"]["config"]["joint_attention_dim"])
     assert condition.guidance is None
-    for row in range(len(prompts)):
-        assert_as_exact_as_the_reference(condition.context[row], arrays[f"pipeline.context.{row}"][0],
-                                         arrays[f"pipeline.fp64.context.{row}"][0], f"prompt {row}")
+    reference, truth = klein_arms(klein_pipelines, encode_prompt)
+    assert_as_exact(as_given(encoded), reference, prompt_draw, "[klein] prompt encoding",
+                    seeds=PIPELINE_SEEDS, truth_fn=truth)
     with pytest.raises(ValueError):
         encoder.tokenize(["x" * 513])
 
 
-def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
-    """`Pretrained.load().text_to_image()` reproduces the source's own call:
-    its defaults (50 steps, two branches guided at 4.0 against the empty
-    prompt), and at the recorded step count the sigmas it lays out shifted
-    by its empirical mu, the latent it ends on and the image it decodes."""
+def test_klein_pipeline_walk_matches_the_source(klein, klein_pipelines, record):
+    """`Pretrained.load().text_to_image()` reproduces the source's own call: its defaults (50 steps, two
+    branches guided at 4.0 against the empty prompt), and at the recorded step count the sigmas it lays out
+    shifted by its empirical mu, the latent it ends on and the image it decodes, on par with it over drawn
+    prompts and starting latents (check 1), its float64 twin the truth."""
+    import torch
+
     pipeline = record["pipeline"]
     task = klein.text_to_image()
     assert task.steps == 50 and task.guidance is not None and task.guidance.scale == 4.0
-    initial = arrays["pipeline.x_T"].transpose(0, 2, 3, 1)
-    walked = task(task.prepare(pipeline["prompts"], initial=initial, key=0, steps=pipeline["steps"]),
-                  key=jax.random.PRNGKey(0)).host()
-    images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     autoencoder = klein.autoencoder
-    raw = pixel_shuffle(np.asarray(walked.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
-    for row in range(len(pipeline["prompts"])):
-        assert_as_exact_as_the_reference(raw[row], nhwc(arrays[f"pipeline.latents.{row}"])[0],
-                                         nhwc(arrays[f"pipeline.fp64.latents.{row}"])[0], f"latents {row}")
-        assert_as_exact_as_the_reference(images[row], arrays[f"pipeline.images.{row}"][0],
-                                         arrays[f"pipeline.fp64.images.{row}"][0], f"images {row}")
+    height, width, steps = 16, 24, pipeline["steps"]
+
+    def draw(seed):
+        latents = np.random.default_rng([251, seed]).standard_normal((2, 16, height // 4, width // 4))
+        return (*prompt_draw(seed), latents.astype(np.float32))
+
+    @as_given
+    def walked(first, second, latents):
+        initial = latents.transpose(0, 2, 3, 1)
+        walk = task(task.prepare(words(first, second), initial=initial, key=0, steps=steps),
+                    key=jax.random.PRNGKey(0)).host()
+        raw = pixel_shuffle(np.asarray(walk.latents) / autoencoder.latent_scale + autoencoder.latent_shift)
+        return {"latents": raw, "images": np.clip(np.asarray(walk.images) / 2 + 0.5, 0.0, 1.0)}
+
+    def called(pipe, dtype, first, second, latents):
+        rows = {"latents": [], "images": []}
+        for row, prompt in enumerate(words(first, second)):
+            call = {"prompt": prompt, "height": height, "width": width, "num_inference_steps": steps}
+            start = torch.from_numpy(latents[row:row + 1]).to(dtype)
+            rows["latents"].append(nhwc(pipe(**call, latents=start.clone(), output_type="latent").images)[0])
+            rows["images"].append(pipe(**call, latents=start.clone(), output_type="np").images[0])
+        return {key: np.stack(value) for key, value in rows.items()}
+
+    reference, truth = klein_arms(klein_pipelines, called)
+    assert_as_exact(walked, reference, draw, "[klein] pipeline walk", seeds=PIPELINE_SEEDS, truth_fn=truth)
 
 
-def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
+def assert_mistral3_reads_as_flux2_dev(directory, encoder) -> None:
+    """The encoder's prompt states on par with `Flux2Pipeline._get_mistral_3_small_prompt_embeds` over the
+    tiny Mistral-3 and its tokenizer, over drawn prompts (check 1), its float64 twin the truth."""
+    import torch
+    from diffusers import Flux2Pipeline
+    from transformers import AutoModelForImageTextToText, AutoTokenizer
+
+    from tools.torch_precision import float64_twin
+
+    tokenizer = AutoTokenizer.from_pretrained(directory / "tokenizer", local_files_only=True)
+    narrow = AutoModelForImageTextToText.from_pretrained(directory / "text_encoder",
+                                                         local_files_only=True).eval()
+    models = {torch.float32: narrow, torch.float64: float64_twin(narrow)}
+
+    def embeds(dtype, *rows):
+        return Flux2Pipeline._get_mistral_3_small_prompt_embeds(models[dtype], tokenizer, words(*rows),
+                                                                dtype=dtype, device=torch.device("cpu"))
+
+    reference, truth = torch_arms(embeds)
+    def encoded(*rows):
+        return encoder.encode(encoder.params, encoder.tokenize(words(*rows))).context
+
+    assert_as_exact(as_given(encoded), reference, prompt_draw, "mistral3 context", seeds=PIPELINE_SEEDS,
+                    truth_fn=truth)
+
+
+def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source):
     """FLUX.2 [dev]'s conditioning over a tiny Mistral-3 encoder with Mistral
     Small 3.1's chat template: the system and user turns, 512 tokens padded
     on the right, the hidden states after layers 10, 20 and 30 stacked, and
@@ -290,10 +490,9 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
         directory, {}, jnp.float32, pipeline="flux2", tokens=512, guidance=4.0,
         param_dtype="float32", attention_impl="xla")
     assert (encoder.template, encoder.layers) == ("mistral3", (10, 20, 30))
-    condition = encoder.encode(encoder.params, encoder.tokenize(record["pipeline"]["prompts"]))
-    assert_as_exact_as_the_reference(condition.context, arrays["mistral3.context"],
-                                     arrays["mistral3.fp64.context"], "mistral3 context")
+    condition = encoder.encode(encoder.params, encoder.tokenize(words(*prompt_draw(0))))
     np.testing.assert_array_equal(np.asarray(condition.guidance), [4.0, 4.0])
+    assert_mistral3_reads_as_flux2_dev(directory, encoder)
     tensors = component_tensors(directory, "text_encoder")
     assert set(flatten_dict(encoder.params)) == {layout.paths[0][2:] for layout in layouts}
     assert {f"text_encoder/{name}" for name in tensors} == {layout.name for layout in layouts} | set(retained)

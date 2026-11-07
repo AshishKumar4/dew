@@ -283,9 +283,10 @@ def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record
     assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
     size = pipeline_record["size"]
     rows = size // 4
+    channels = json.loads((source / "pipeline" / "transformer" / "config.json").read_text())["in_channels"]
 
     def draw(seed):
-        latents = np.random.default_rng([223, seed]).standard_normal((2, rows * rows, 64))
+        latents = np.random.default_rng([223, seed]).standard_normal((2, rows * rows, channels))
         return (*prompt_draw(seed), latents.astype(np.float32))
 
     @as_given
