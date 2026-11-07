@@ -12,6 +12,7 @@ import grain.experimental as gx
 import grain.python as grain
 import numpy as np
 
+from dew._records import integer, record
 from dew.batch import Batch
 from dew.data.dataset import Ranges
 
@@ -155,9 +156,10 @@ class _WindowShuffled(grain.DatasetIterator[Batch]):
                 "pos_in_window": self._given}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._start = copy.deepcopy(state["parent_window_start_state"])
+        self._start = copy.deepcopy(record(state["parent_window_start_state"], "window start position"))
         self._read.set_state(self._start)
-        self._index, self._given = int(state["window_index"]), int(state["pos_in_window"])
+        self._index = integer(state["window_index"], "window_index")
+        self._given = integer(state["pos_in_window"], "pos_in_window")
         self._ended, self._ahead, self._next = False, [], None
         self._read_ahead(self._size)
         records, self._ahead = self._ahead, []
