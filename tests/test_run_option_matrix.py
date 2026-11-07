@@ -347,6 +347,29 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     assert json.loads(picks.read_text())["data"]
 
 
+def an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune(tmp_path):
+    """An LM run whose attention takes tokamax's Triton kernel (`model.attention_impl="triton"`), no launch
+    of Dew's in its step, that asks to measure its launches (`tune_kernels`) is refused before it trains,
+    naming the kernels it cannot measure (`tuning.Untunable`): the tuner measures Dew's own launches alone
+    (row 2661), and a run that asked for measured configs gets none silently no longer."""
+    import subprocess
+    import sys
+
+    from lane_environment import without_deterministic_ops
+    from process_support import REPO_ROOT, raised
+
+    environment = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"),
+                   "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                   "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}
+    arguments = train_arguments("lm", tmp_path, "untuned", **{
+        "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
+        "model.attention_impl": "triton", "model.head_dim": 16})
+    done = subprocess.run([sys.executable, "-m", "dew._cli.main", "train", *arguments], cwd=tmp_path,
+                          env=environment, capture_output=True, text=True, timeout=900)
+    assert done.returncode != 0
+    assert any(error.endswith("Untunable") for error in raised(done)), done.stderr[-2000:]
+
+
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_spreads_its_split_axis_by_the_link_it_states(kind, tmp_path):
     """A run that states its tensor axis's link (`links`) traces its step with that link as stated, not

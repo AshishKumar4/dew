@@ -81,6 +81,8 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(transactions.an_accumulating_step_updates_the_optimizer_in_its_commit_alone, "commit")),
         Cell("an LM run measures its kernel launches as set",
              in_own(run_option_matrix.an_lm_run_measures_its_kernel_launches_as_set, "launches")),
+        Cell("an LM run whose launches are tokamax's refuses to tune",
+             in_own(run_option_matrix.an_lm_run_whose_launches_are_tokamaxs_refuses_to_tune, "untunable")),
         Cell("a clocked run with a cooldown trains from its step compiled ahead, compiling no other",
              in_own(clocked, "clocked")),
         Cell("a program on this GPU is admitted against the room its pool left",
