@@ -1,4 +1,4 @@
-"""The Gemma 4 vision trunk and its projector, with their checkpoint maps
+"""The Gemma 4 vision trunk and its projector
 (transformers 5.16.1 `models/gemma4/modeling_gemma4.py`).
 """
 
@@ -7,7 +7,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -27,9 +27,6 @@ from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scan_orders import patchify
 
 from .common import ProjectorBase, TowerBase, TowerGeometry, head_width
-
-if TYPE_CHECKING:
-    pass
 
 
 def clipped_linear(module: nn.Module, linear: Callable[[jax.Array], jax.Array], inputs: jax.Array,
@@ -277,32 +274,5 @@ class Gemma4Projector(ProjectorBase):
             raise ValueError(f"media features have width {features.shape[-1]}, "
                              f"expected {self.input_features}")
         return self.projection(self.pre_norm(features))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

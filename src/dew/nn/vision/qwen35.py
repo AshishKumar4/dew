@@ -1,4 +1,4 @@
-"""The Qwen 3.5 vision trunk and its merger, with their checkpoint maps
+"""The Qwen 3.5 vision trunk and its merger
 (transformers 5.16.1 `models/qwen3_5/modeling_qwen3_5.py`).
 """
 
@@ -59,19 +59,5 @@ class Qwen35Projector(MergeProjector, ProjectorBase):
     merged width the text embeddings read directly. The merger
     (modeling_qwen3_5.py, Qwen3_5VisionPatchMerger) is `MergeProjector`: norm,
     each merge block grouped, two maps around an exact GELU."""
-
-
-
-# A block's maps as `clip_layer`'s decoder block names them (`block_routes`).
-
-
-
-
-
-
-
-
-
-
 
 

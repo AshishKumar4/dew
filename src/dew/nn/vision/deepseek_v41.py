@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1's vision trunk and aligner, with their checkpoint maps
+"""DeepSeek-V4.1's vision trunk and aligner
 (the release's `inference/vision.py`).
 """
 
@@ -99,14 +99,3 @@ class DeepseekV41Projector(ProjectorBase):
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
 
 
-# A block's maps as the decoder block names them (`block_routes`).
-
-
-
-
-
-
-
-
-# The aligner's maps under its `aligner.` prefix, and the span's learned vectors, which the release
-# keeps at its top level (model.py:1215-1222).

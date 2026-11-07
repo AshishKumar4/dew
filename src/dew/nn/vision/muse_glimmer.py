@@ -1,4 +1,4 @@
-"""Muse Glimmer's vision trunk and projector, with their checkpoint maps
+"""Muse Glimmer's vision trunk and projector
 (transformers 5.16.1 `models/muse_glimmer/modeling_muse_glimmer.py`).
 """
 
@@ -106,16 +106,3 @@ class MuseGlimmerProjector(ProjectorBase):
         return RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype, name="norm")(projected)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-# The adapter and the projection, each name its prefix off.

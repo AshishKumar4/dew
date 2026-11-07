@@ -1,4 +1,4 @@
-"""Kimi K2.5's and Kimi K3's vision trunk (MoonViT) and projector, with their checkpoint maps
+"""Kimi K2.5's and Kimi K3's vision trunk (MoonViT) and projector
 (moonshotai/Kimi-K2.5@4d01dfe `modeling_kimi_k25.py`: MoonViT3dPretrainedModel, PatchMergerMLP;
 moonshotai/Kimi-K3@f831ab6 `modeling_kimi_k3.py`, its options: RMS norms, bias-free maps, a wider
 attention, PatchMergerMLPV2).

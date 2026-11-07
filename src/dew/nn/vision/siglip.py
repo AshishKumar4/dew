@@ -1,11 +1,10 @@
-"""The SigLIP vision trunk and Gemma 3's projector, with their checkpoint maps
+"""The SigLIP vision trunk and Gemma 3's projector
 (transformers 5.16.1 `models/siglip/modeling_siglip.py`, `models/gemma3/modeling_gemma3.py`).
 """
 
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING
 
 import jax
 from flax import linen as nn
@@ -18,9 +17,6 @@ from dew.nn.text_encoders import tower_activation
 
 from .common import ProjectorBase, TowerBase, TowerGeometry, head_width
 from .vit import LearnedPositions, VisionTransformer, ViTLayout
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,19 +93,5 @@ class GemmaProjector(ProjectorBase):
         pooled = grid.reshape(batch, tokens, kernel, tokens, kernel, width).mean(axis=(2, 4))
         return self.mm_input_projection(
             self.mm_soft_emb_norm(pooled.reshape(batch, tokens * tokens, width)))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

@@ -1,4 +1,4 @@
-"""MiMo-V2.6's vision trunk (MiMo ViT) and its merger, with their checkpoint maps
+"""MiMo-V2.6's vision trunk (MiMo ViT) and its merger
 (XiaomiMiMo/MiMo-V2.6-Pro-MOPD's `modeling_mimo_v2.py`, MiMoVisionTransformer).
 """
 
@@ -76,13 +76,3 @@ class MiMoProjector(MergeProjector, ProjectorBase):
     bias: bool = False
 
 
-
-
-
-
-
-
-
-
-
-# MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).

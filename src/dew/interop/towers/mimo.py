@@ -76,6 +76,7 @@ MIMO_VISION = TowerLayout("visual.", _MIMO_ROUTES, read=translate_vit_weights,
                                     shapes=_patch_convolution)
 
 
+# MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).
 MIMO_PROJECTOR = ProjectorLayout("visual.merger.", {
     "ln_q.weight": ("norm", "scale"), "mlp.0.weight": ("fc1", "kernel"), "mlp.2.weight": ("fc2", "kernel"),
 }, strip="merger.")

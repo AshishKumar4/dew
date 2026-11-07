@@ -1,4 +1,4 @@
-"""Vision towers, projectors and reference checkpoint maps.
+"""Vision towers and projectors.
 
 transformers 5 ships no Flax classes, so the towers are vendored the way
 `dew/nn/text_encoders.py` vendors CLIP, in the reference layout, with each

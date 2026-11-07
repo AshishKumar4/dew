@@ -105,6 +105,7 @@ MUSE_GLIMMER_VISION = TowerLayout("vision_tower.", _MUSE_ROUTES, config=_MUSE_CO
                                            model_type="muse_glimmer_vision")
 
 
+# The adapter and the projection, each name its prefix off.
 MUSE_GLIMMER_PROJECTOR = ProjectorLayout(("vision_adapter.", "vision_projection."), {
     "fc1.weight": ("adapter", "fc1", "kernel"), "fc2.weight": ("adapter", "fc2", "kernel"),
     "weight": ("projection", "kernel"),

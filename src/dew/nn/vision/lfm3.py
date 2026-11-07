@@ -1,4 +1,4 @@
-"""LFM3-VL's vision trunk and projector, with their checkpoint maps (LiquidAI/LFM3-VL-2B@f83d2b0,
+"""LFM3-VL's vision trunk and projector (LiquidAI/LFM3-VL-2B@f83d2b0,
 `modeling_lfm3_vl.py`: Lfm3VlVisionModel and Lfm3VlMultiModalProjector).
 """
 

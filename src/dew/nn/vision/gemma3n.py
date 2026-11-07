@@ -1,12 +1,9 @@
-"""Gemma 3n's MobileNet-v5 vision tower and its hard/soft vision embedder,
-with their checkpoint maps.
-"""
+"""Gemma 3n's MobileNet-v5 vision tower and its hard/soft vision embedder."""
 
 from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
 from flax import linen as nn
@@ -19,9 +16,6 @@ from dew.nn.precision import float32_dot_general
 
 from ..mobilenet import MobileNetV5, MobileNetV5Encoder
 from .common import ProjectorBase, TowerBase, TowerGeometry
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,22 +101,5 @@ class Gemma3nProjector(ProjectorBase):
         chosen = jnp.where(mask, ids, self.vocab_offset + self.vocab_size - 1)
         hard = self.embed_hard(chosen).astype(token_embeddings.dtype)
         return jnp.where(mask[..., None], hard, token_embeddings)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

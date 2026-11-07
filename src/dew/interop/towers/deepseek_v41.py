@@ -11,6 +11,7 @@ from dew.registry import Record
 
 from .common import ProjectorLayout, TowerLayout, _vision_section, block_routes, rope_base, tensor_routes
 
+# A block's maps as the decoder block names them (`block_routes`).
 _BLOCK_MAPS = {("attn", "wqkv"): ("self_attn", "qkv_proj"), ("attn", "wo"): ("self_attn", "o_proj"),
                ("mlp", "w1"): ("mlp", "gate_up_proj"), ("mlp", "w2"): ("mlp", "down_proj")}
 
@@ -69,6 +70,8 @@ def translate_deepseek_v41_projector_config(hf_config: Mapping[str, object],
 DEEPSEEK_V41_VISION = TowerLayout("vision.", _DEEPSEEK_V41_ROUTES)
 
 
+# The aligner's maps under its `aligner.` prefix, and the span's learned vectors, which the release
+# keeps at its top level (model.py:1215-1222).
 DEEPSEEK_V41_PROJECTOR = ProjectorLayout("aligner.", {
     "w1.weight": ("w1", "kernel"), "w1.bias": ("w1", "bias"),
     "w2.weight": ("w2", "kernel"), "w2.bias": ("w2", "bias"),

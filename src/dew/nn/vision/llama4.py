@@ -1,4 +1,4 @@
-"""The Llama 4 vision trunk and its projector, with their checkpoint maps
+"""The Llama 4 vision trunk and its projector
 (transformers 5.16.1 `models/llama4/modeling_llama4.py`).
 """
 
@@ -117,16 +117,5 @@ class Llama4Projector(ProjectorBase):
 
     def __call__(self, image_features) -> jax.Array:
         return self.linear(image_features)
-
-
-# Llama 4 names its layers' norms and maps as the decoder block does.
-
-
-
-
-
-
-
-
 
 

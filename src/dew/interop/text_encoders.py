@@ -94,6 +94,7 @@ def translate_clip_config(hf_config: Mapping[str, object]) -> CLIPFields:
     }
 
 
+# CLIP's layer names, as `clip_layer`'s decoder block names them.
 _NORMS = {"layer_norm1": "input_layernorm", "layer_norm2": "post_attention_layernorm"}
 
 
@@ -103,6 +104,8 @@ _PROJECTIONS = {"q_proj": "q_proj", "k_proj": "k_proj", "v_proj": "v_proj", "out
 _MLP = {"fc1": "up_proj", "fc2": "down_proj"}
 
 
+# A tower's tensors outside its encoder layers. The reference spells the
+# vision tower's first norm `pre_layrnorm`.
 _TEXT_TENSORS = {
     "embeddings.token_embedding.weight": ("token_embedding", "embedding"),
     "embeddings.position_embedding.weight": ("position_embedding", "embedding"),
@@ -131,6 +134,7 @@ _HEADS = {
 }
 
 
+# The tensors of a full checkpoint that are not the text tower's.
 _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projection.",
                           "logit_scale")
 
@@ -146,7 +150,7 @@ def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
 
 def encoder_layer_routes(root: str, norms: Mapping[str, str] = _NORMS,
                          projections: Mapping[str, str] = _PROJECTIONS, *, block: str = "layers"):
-    """A `clip_layer`'s names under `<root>.layers.N` both ways (`dew.nn.vision.common.block_routes`):
+    """A `clip_layer`'s names under `<root>.layers.N` both ways (`dew.interop.towers.common.block_routes`):
     two layer norms, biased attention maps and a biased fc1/fc2 MLP, each source name mapped by `norms`
     or `projections` (CLIP's by default) or onto the MLP's up and down maps."""
     return _encoder_layer_routes(root, tuple(norms.items()), tuple(projections.items()), block)
@@ -321,12 +325,14 @@ def translate_t5_config(hf_config: Mapping[str, object]) -> NativeFields[T5Encod
     )
 
 
+# The names a published T5 stores its one tied token embedding under.
 _T5_EMBEDDING = ("shared.weight", "encoder.embed_tokens.weight")
 
 
 _T5_PROJECTIONS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj"}
 
 
+# T5's feed-forward maps as the decoder block's `GatedMLP` names them.
 _T5_WIDTHS = {"wi": "up_proj", "wi_0": "gate_proj", "wi_1": "up_proj", "wo": "down_proj"}
 
 

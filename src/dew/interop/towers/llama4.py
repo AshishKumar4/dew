@@ -22,6 +22,7 @@ from .common import (
     tensor_routes,
 )
 
+# Llama 4 names its layers' norms and maps as the decoder block does.
 _LAYER_NORMS = {name: name for name in ("input_layernorm", "post_attention_layernorm")}
 
 

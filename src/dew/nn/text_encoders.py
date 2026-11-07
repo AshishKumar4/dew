@@ -314,42 +314,6 @@ class CLIP(nn.Module):
                 self.get_text_features(input_ids, attention_mask))
 
 
-
-
-
-
-
-
-
-
-# CLIP's layer names, as `clip_layer`'s decoder block names them.
-
-# A tower's tensors outside its encoder layers. The reference spells the
-# vision tower's first norm `pre_layrnorm`.
-# The tensors of a full checkpoint that are not the text tower's.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # The T5 encoder.
 
 
@@ -479,15 +443,5 @@ class T5EncoderTransformer(nn.Module):
                 position_bias=tables[index % len(tables)])
             hidden_states = layer(hidden_states, train, attention_metadata=metadata)
         return self.dropout(self.final_norm(hidden_states), deterministic=not train)
-
-
-
-
-# The names a published T5 stores its one tied token embedding under.
-# T5's feed-forward maps as the decoder block's `GatedMLP` names them.
-
-
-
-
 
 

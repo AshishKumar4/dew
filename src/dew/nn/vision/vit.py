@@ -20,7 +20,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -44,9 +44,6 @@ from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import declared
 from dew.nn.text_encoders import clip_layer
-
-if TYPE_CHECKING:
-    pass
 
 Attention = Literal["full", "band", "window", "conv", "item"]
 Order = Literal["patches", "columns", "windows"]
@@ -640,7 +637,5 @@ class MergeProjector(nn.Module):
         if self.post_norm:
             projected = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="post_norm")(projected)
         return projected
-
-
 
 
