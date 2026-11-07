@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.batch import CLOSES_WINDOW, EXAMPLES_CONSUMED, VALID_ROWS, Batch
-from dew.data.dataset import rows_of, take_batch
+from dew.data.dataset import rows_of, take_row_fields
 from dew.objectives.base import Objective
 
 TRAINING_FLOPS = "__dew_training_flops"
@@ -66,7 +66,7 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
     if count_model:
         # Partition the assembled scalar over the batch's real rows. A shared conditioning row is counted
         # once, not once per example.
-        held = batch if real.all() else take_batch(batch, np.flatnonzero(real))
+        held = batch if real.all() else take_row_fields(batch, np.flatnonzero(real))
         training = objective.training_flops(None, held) if real.any() else 0.0
         counted[TRAINING_FLOPS] = np.where(real, training / max(int(real.sum()), 1), 0).astype(np.float32)
     return counted

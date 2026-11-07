@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
-from dew.batch import VALID_ROWS
+from dew.batch import CONSUMED_COUNT, VALID_ROWS, ConsumedCount
 from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import Loader, rows_of, take_batch
 from dew.data.text import ByteTokenizer
@@ -389,7 +389,10 @@ def test_a_batchs_repeats_count_no_tokens_and_no_model_work():
     batch = packed_batch()
     rows = rows_of(batch)
     real = np.arange(rows) < 1
-    counted = prepare_counts(objective, {**batch, VALID_ROWS: real}, count_model=True)
+    # A host count the examples clock adds before the work is counted (`consumption_counted`) stays whole.
+    held = {**batch, VALID_ROWS: real, CONSUMED_COUNT: ConsumedCount(1)}
+    counted = prepare_counts(objective, held, count_model=True)
+    assert counted[CONSUMED_COUNT] == ConsumedCount(1)
     alone = prepare_counts(objective, take_batch(batch, np.flatnonzero(real)), count_model=True)
     assert counted[TRAINING_FLOPS].sum() == alone[TRAINING_FLOPS].sum() > 0
     assert not np.any(counted[TRAINING_FLOPS][~real])

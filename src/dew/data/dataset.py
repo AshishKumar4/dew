@@ -1086,6 +1086,19 @@ def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
     )
 
 
+def take_row_fields(batch: Batch, indices: np.ndarray) -> Batch:
+    """`batch`'s rows at `indices` in the fields that hold one value a row (`rows_of`'s rows: a list or
+    tuple of them, an array along its leading axis), and every other field as it is: a value for the whole
+    step, a shared conditioning row, a host count (`dew.batch.ConsumedCount`)."""
+    rows = rows_of(batch)
+
+    def taken(column):
+        aligned = (len(column) == rows if isinstance(column, list | tuple)
+                   else bool(np.ndim(column)) and np.shape(column)[0] == rows)
+        return take_rows(column, indices) if aligned else column
+    return jax.tree.map(taken, batch, is_leaf=lambda column: isinstance(column, list | tuple))
+
+
 class Unstacked(ValueError):
     """The records of one batch hold a field in different shapes or structures, which no array
     stacks (`record_batch`)."""
