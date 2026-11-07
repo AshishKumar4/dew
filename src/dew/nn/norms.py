@@ -36,7 +36,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
                           static_argnums=static_argnums)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6, 7))
+@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6, 7, 8))
 def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
                         fp32_statistics: bool, activation=None, weight_first: bool = False):
     """Normalize `x` by its root mean square, then apply `scale`.
