@@ -46,9 +46,10 @@ GROUPED = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1,
 steps."""
 
 
-RUN_SEEDS = 16
+RUN_SEEDS = 64
 """Check 1's declared seeds for a run updating in its backward against the whole step's update, sized by
-`seeds_for` on armada."""
+`seeds_for` paired on armada: the two updates share the layers' weights and moments, and the reference
+compared with itself does not resolve within 512 seeds."""
 
 
 def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
