@@ -15,6 +15,7 @@ import collections
 import contextlib
 import dataclasses
 import functools
+import math
 import threading
 from collections.abc import Set
 from typing import ClassVar
@@ -30,29 +31,6 @@ from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resour
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
 
 
-def chunks(family: mosaic.Family, target: generation.GpuTarget) -> tuple[int, ...]:
-    """The tokens a chunk a call's tiles may take on `family`'s bundle on `target`, widest first
-    (`Mosaic.derived`'s first rule): a consumer role's rows (`Family.role_rows`), doubled while a chunk's fp32
-    square, the inverse and the scores every launch holds or stages, fits the device's block
-    (`generation.shared_budget`)."""
-    found, chunk = [], family.role_rows
-    while chunk * chunk * jnp.dtype(jnp.float32).itemsize <= generation.shared_budget(target):
-        found.append(chunk)
-        chunk *= 2
-    return tuple(reversed(found))
-
-
-def launch_seconds(launch: mainloop.Launch, target: generation.GpuTarget) -> float:
-    """A planned launch's seconds by the work-span model (`cost.walked`): a program's tensor FLOPs,
-    exponentials and steps on one multiprocessor, as many waves as the device's multiprocessors hold its
-    programs in (`Launch.resident`), or its device bytes at the memory's rate where longer."""
-    waves = -(-launch.programs // max(1, (target.multiprocessors or 1) * launch.resident))
-    program = cost.walked(cost.Work(flops=launch.flops, exponentials=launch.exponentials, span=launch.steps),
-                          target)
-    memory = launch.device_bytes / target.memory_rate if target.memory_rate else 0.0
-    return max(waves * program, memory)
-
-
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
             ) -> tuple[int, int, jnp.dtype]:
     """The call's keys' and values' widths padded to whole tiles of `family`'s bundle (`mainloop.block_of`),
@@ -64,6 +42,26 @@ def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool
     unit = pad if training else mainloop.value_unit(family)
     return (-(-arguments["key"].shape[-1] // pad) * pad, -(-arguments["value"].shape[-1] // unit) * unit,
             jnp.dtype(dtype))
+
+
+def chunk_of(ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget) -> int:
+    """The tokens a chunk (`Mosaic.derived`'s first rule), the work-span model's optimum solved for it: a
+    token's triangular work grows with its chunk `C`, `C (2 (3 Dk + 2 Dv) + 4 R (log2 R - 1))` tensor FLOPs a
+    head (its pairs against the keys, its system, the inverse applied to its keys and values, its output, and
+    its share of the doubling inverse at a role's rows `R`), where its memory's traffic between launches
+    shrinks with it, `2 Dk Dv` held words a chunk (the states launch's store, the output launch's read): their
+    sum is least at `sqrt((traffic / memory rate) / (work / tensor rate))`, the device's rates
+    (`cost.rates`), rounded to a power of two times the bundle's role rows (`Family.role_rows`), no fewer; the
+    role's rows where the device states neither rate."""
+    rows = family.role_rows
+    key_width, value_width, dtype = _widths(ba, family)
+    tensor, memory = cost.rates(target, device=True)[0], target.memory_rate
+    if not tensor or not memory:
+        return rows
+    work = 2 * (3 * key_width + 2 * value_width) + 4 * rows * (math.log2(rows) - 1)
+    traffic = 2 * key_width * value_width * jnp.dtype(dtype).itemsize
+    best = math.sqrt((traffic / memory) / (work / tensor))
+    return rows * 2 ** max(0, round(math.log2(best / rows)))
 
 
 def _dtype(ba: tokamax.BoundArguments) -> jnp.dtype:
@@ -377,10 +375,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
         (docs/design/kernel-templates.md §7; no candidate space, no ranking: each rule gives way from the
         widest value block to the next narrower where it does not hold), each rule naming the fact it reads:
-        - chunk, of those the bundle offers (`chunks`) at which the rules below find tiles and, where any
-          chunk's do, the fast backward holds, the one whose launches the cost model prices least
-          (`launch_seconds`; `Tiles.chunk`): a wider chunk's quadratic work against a narrower one's
-          walks of more chunks;
+        - chunk, the work-span model's optimum (`chunk_of`), halved while the rules below find no tiles at
+          it or the fast backward does not hold at them, down to a role's rows (`Tiles.chunk`);
         - value block, in steps of the narrowest a staged operand block takes (`Family.narrowest_columns`)
           dividing the padded values: the widest legal (`legal`: every launch's shared memory within a block
           of the device and its registers within a thread's, `registers`), then the widest at which the
@@ -421,18 +417,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(target, _dtype(ba))
         if family is None:
             return None
-        found = [tiles for chunk in chunks(family, target)
-                 if (tiles := self._chunked(ba, target, chunk)) is not None]
-        trained = [tiles for tiles in found if self._backward_holds(ba, tiles, target)] or found
-        return min(trained, key=lambda tiles: self._seconds(ba, tiles, target), default=None)
-
-    def _seconds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
-                 ) -> float:
-        """The call's launches' seconds at `tiles` (`launch_seconds`), its fast backward's with them where it
-        takes one at them."""
-        backward = self._backward_holds(ba, tiles, target)
-        return sum(launch_seconds(launch, target) for launch in self._launches(ba, tiles, target,
-                                                                                 backward=backward))
+        # Each step down a halving of the derived chunk, for legality alone: where no tiles hold, or the fast
+        # backward does not hold at them, down to a role's rows.
+        chunk = chunk_of(ba, family, target)
+        while True:
+            tiles = self._chunked(ba, target, chunk)
+            if chunk == family.role_rows or (tiles is not None and self._backward_holds(ba, tiles, target)):
+                return tiles
+            chunk //= 2
 
     def _chunked(self, ba: tokamax.BoundArguments, target: generation.GpuTarget, chunk: int
                  ) -> mainloop.Tiles | None:
