@@ -377,8 +377,9 @@ def offset_rms(x, w):
 
 
 def gated_product_of(a, b):
-    """A gated MLP's product as a plain program writes it."""
-    return jax.nn.silu(a) * b
+    """A gated MLP's product as a plain program writes Dew's (torch's) math: the activation in float32,
+    rounded once to the gate's dtype, then times the up projection."""
+    return jax.nn.silu(a.astype(jnp.float32)).astype(a.dtype) * b
 
 
 def _norms_written(fn, *shapes):
@@ -411,8 +412,10 @@ def gated_rms(x, gate, w):
 
 
 def packed_swiglu(gate_up):
-    """A packed gate|up projection's SwiGLU as a plain program writes it: its two halves sliced out."""
-    return jax.nn.silu(gate_up[..., 0, :]) * gate_up[..., 1, :]
+    """A packed gate|up projection's SwiGLU as a plain program writes Dew's math (`gated_product_of`): its
+    two halves sliced out."""
+    gate = gate_up[..., 0, :]
+    return jax.nn.silu(gate.astype(jnp.float32)).astype(gate.dtype) * gate_up[..., 1, :]
 
 
 def _own_norm(*, offset: bool, after_cast: bool):
@@ -509,6 +512,7 @@ _named_silu.__name__ = "silu"
 
 
 NEAR_NORMS = {
+    "a SwiGLU whose sigmoid rounds to bfloat16": lambda x, w: jax.nn.silu(x) * (x * w.astype(x.dtype)),
     "columns scaled by the rows' statistics":
         lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[None, :]).astype(x.dtype),
     "a weight along the rows":
@@ -528,9 +532,11 @@ so every axis has the feature axis's extent)."""
 def test_a_plain_program_near_a_norm_computes_as_written(program):
     """A program whose arithmetic resembles an RMSNorm or SwiGLU without being one (the statistics or the
     weight laid along another axis, a nested program only named silu, a mean scaled by zero, the region's own
-    sum read as its weight), compiled through `dew.jit` on an H100, computes what it does as written: its
-    output and gradients on par with the program's (check 1), whatever of it the compile point writes as
-    Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as written)."""
+    sum read as its weight, a SwiGLU rounding its sigmoid and each product to bfloat16 where Dew's rounds
+    once after a float32 activation), compiled through `dew.jit` on an H100, computes what it does as
+    written: its output and gradients on par with the program's (check 1), whatever of it the compile point
+    writes as Dew's norm (an unweighted RMSNorm inside it, its product with another axis's weight left as
+    written)."""
     from contract_support import normal_drawn
     from reference_error import assert_as_exact, with_gradients
 
