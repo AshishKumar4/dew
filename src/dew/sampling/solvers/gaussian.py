@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from typing import Literal
 
-import jax
 import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
 from dew.nn.precision import divided, scaled
+from dew.nn.programs import on_host
 
 from .common import _check_endpoint_domain, _push, _unit_noise
 
@@ -151,7 +151,7 @@ class PNDM:
         # The transfer is DDIM's rationalized for alpha^2 + sigma^2 = 1, Diffusers' beta tables: with
         # alpha 1 (variance exploding) its eps term vanishes and every step returns x unchanged.
         if times.shape[0] >= 2:
-            with jax.ensure_compile_time_eval():
+            with on_host():
                 alpha, sigma = process.sampler_schedule.rates(times)
                 if not bool(jnp.all(jnp.abs(alpha ** 2 + sigma ** 2 - 1) < 1e-4)):
                     raise ValueError("PNDM's transfer is DDIM's for a variance-preserving process, "
