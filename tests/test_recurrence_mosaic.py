@@ -37,7 +37,7 @@ from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
-from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 
 pytestmark = pytest.mark.kernel
@@ -805,7 +805,7 @@ launches the keys-gated ones (`mainloop.Call.gated_keys`)."""
 
 def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.ShapeDtypeStruct]:
     """`(q, k, v, g, beta, h0)` of `RESOURCE_SHAPES[name]`'s geometry over `rows` of `length` tokens, in
-    `dtype` (the decay and the initial memory fp32), as `mainloop.forward` takes them."""
+    `dtype` (the decay and the initial memory fp32), as `chunk_forward.forward` takes them."""
     key_heads, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
 
     def array(*shape, kind=dtype):
@@ -839,8 +839,8 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
             launched = []
             for tiles in (derived, variant):
                 with report.launching(template.MOSAIC, bound, tiles):
-                    launched.append(mainloop.forward(*operands, tiles=tiles, starts=None, max_segments=None,
-                                                     family=family))
+                    launched.append(chunk_forward.forward(*operands, tiles=tiles, starts=None,
+                                                          max_segments=None, family=family))
             return launched
 
         return fn, tuple(args)
@@ -879,8 +879,8 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
         for length in lengths:
             bound, tiles = launches[length]
             with report.launching(template.MOSAIC, bound, tiles):
-                outputs.append(mainloop.forward(*flat[at:at + 6], tiles=tiles, starts=None, max_segments=None,
-                                                family=family))
+                outputs.append(chunk_forward.forward(*flat[at:at + 6], tiles=tiles, starts=None,
+                                                     max_segments=None, family=family))
             at += 6
         return outputs
 
@@ -1141,8 +1141,8 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                           array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
             formed = {key: value for key, value in _form(name, dtype).items()
                       if key != 'wide' or not training}
-            run = functools.partial(mainloop_backward.gradients if training else mainloop.forward, **formed,
-                                    floor=resource_floor(name))
+            run = functools.partial(mainloop_backward.gradients if training else chunk_forward.forward,
+                                    **formed, floor=resource_floor(name))
             skip = list(_skipped(name, dtype).values())
 
             def fn(*operands):

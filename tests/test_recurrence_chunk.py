@@ -391,12 +391,13 @@ def rated_draw(seed: int) -> tuple:
     """A decode token over a memory and a chunked sequence, each with its write gate in [0, 0.5), a rate a
     head in [-2, -0.1) and a skip: `(token, sequence)`, each a dict of the step's or chunk's operands."""
     rng = np.random.default_rng(seed)
-    rows, heads, width = 2, 2, 16
+    # The token's heads a warpgroup's keys, as the launch steps them (`templates.recurrence.step.fits`).
+    rows, heads, width, stepped = 2, 2, 16, 128
     rate = -jnp.asarray(rng.uniform(0.1, 2.0, (heads,)), jnp.float32)
     skip = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
-    token = {name: jnp.asarray(rng.standard_normal((rows, heads, width)), jnp.float32)
+    token = {name: jnp.asarray(rng.standard_normal((rows, heads, stepped)), jnp.float32)
              for name in ('query', 'key', 'value')}
-    token |= {'state': jnp.asarray(rng.standard_normal((rows, heads, width, width)), jnp.float32),
+    token |= {'state': jnp.asarray(rng.standard_normal((rows, heads, stepped, stepped)), jnp.float32),
               'beta': jnp.asarray(rng.uniform(0.0, 0.5, (rows, heads)), jnp.float32), 'rate': rate,
               'skip': skip}
     sequence = {name: jnp.asarray(rng.standard_normal((rows, LENGTH, heads, width)), jnp.float32)

@@ -25,7 +25,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import derivatives
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan
-from dew.nn.kernels.templates.recurrence import mainloop
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop
 
 RESET_WIDTH = 32
 """The columns a row's resets take in their stream, every column the token's flag: the narrowest an int8 tile
@@ -449,7 +449,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     states = A.shape[-1]
     padded = -(-length // chunk) * chunk
 
-    pad = functools.partial(mainloop.zero_padded, axis=1, size=padded)
+    pad = functools.partial(chunk_forward.zero_padded, axis=1, size=padded)
     resets = (jnp.zeros((rows, padded, RESET_WIDTH), jnp.int8) if starts is None else
               jnp.broadcast_to(pad(jnp.asarray(starts, jnp.int8))[..., None], (rows, padded, RESET_WIDTH)))
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
@@ -489,7 +489,7 @@ def _scan_backward(scan: Scan, residuals, grads):
     def leading(t):
         """`t` `[R, T, ...]` with its tokens last, padded to whole blocks: a zero token decays nothing,
         writes nothing and reads nothing."""
-        return mainloop.zero_padded(jnp.moveaxis(t, 1, -1), axis=t.ndim - 1, size=padded)
+        return chunk_forward.zero_padded(jnp.moveaxis(t, 1, -1), axis=t.ndim - 1, size=padded)
 
     # Its kernel named for the launch that traced the forward (`report.relaunched`), as JAX traces it after
     # that launch's scope ended: a spill of it refuses the launch and steps its tokens down (`Selective`).

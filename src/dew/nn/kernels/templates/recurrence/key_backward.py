@@ -475,7 +475,7 @@ class KeyKept(NamedTuple):
     computed again for them: what check 2's witness holds each launch to (tests/recurrence_witness.py)."""
 
     run: object
-    """The prepared call (`mainloop.prepared`): its laid operands, intra scores, inverse, gated keys,
+    """The prepared call (`chunk_forward.prepared`): its laid operands, intra scores, inverse, gated keys,
     corrected values and stored memories."""
     d_scores: jax.Array
     local: jax.Array
@@ -506,8 +506,8 @@ class KeyKept(NamedTuple):
 def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     """`(dq [R, H * Dk], dk [R, H * Dk], dv [R, HV * Dv], dg [R, HV * Dk], dbeta [R, HV], dh0 [B * HV * Dk,
     Dv])` fp32 of the gated delta rule under a decay a key dimension, laid as the prepared run's
-    (`mainloop.prepared`'s, its intra launch's scores and inverse, its gated keys), fla_kda's DAG: the local
-    part, the memory's reverse walk on the queries gated by their decays to the chunk's start and scaled
+    (`chunk_forward.prepared`'s, its intra launch's scores and inverse, its gated keys), fla_kda's DAG: the
+    local part, the memory's reverse walk on the queries gated by their decays to the chunk's start and scaled
     (XLA's, `algebra.key_gated`'s), the memory's and WY part and the pairs' part, summed; the log decay's
     gradient each token's terms, the memory decay's on each chunk's last token (`_reverse`'s fourth),
     cumulated from the chunk's end (its prefix is the chunk's own), a key head's value heads' queries' and

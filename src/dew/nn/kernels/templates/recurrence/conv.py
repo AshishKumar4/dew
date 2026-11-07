@@ -64,11 +64,6 @@ def _activated(pre, activation: bool):
     return pre / (1.0 + jnp.exp(-pre)), gate
 
 
-def _scale(out, eps: float, exchanged, interpret: bool):
-    """`1 / sqrt(sum(out^2) + eps)` over the program's head, its root and quotient each rounded once."""
-    return 1.0 / jnp.sqrt(scan.summed(out * out, exchanged, interpret=interpret) + eps)
-
-
 class _Piece:
     """A program's view of its piece: its row, its tokens' first, its channels in the operand and the
     piece, the taps and bias it reads, and the masks."""
@@ -144,9 +139,9 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
 
         def token(i, carry):
             t = piece.start + i
-            out, _ = _activated(piece.preactivation(piece.window(t)), activation)
+            out = _activated(piece.preactivation(piece.window(t)), activation)[0]
             if head is not None:
-                out = out * _scale(out, eps, exchanged, interpret)
+                out = out * scan.inverse_norm(out, eps, exchanged, interpret=interpret)
             out = _kept(piece.kept(t), out)
 
             @pl.when(t < length)
@@ -189,7 +184,7 @@ def backward(x, taps, bias, valid, documents, dy, *, first: int, width: int, hea
             out, gate = _activated(pre, activation)
             grad = _kept(piece.kept(t), _loaded(dy_ref, piece.row, t, piece.local, length))
             if head is not None:
-                scale = _scale(out, eps, exchanged, interpret)
+                scale = scan.inverse_norm(out, eps, exchanged, interpret=interpret)
                 unit = out * scale
                 grad = scale * (grad - scan.summed(unit * grad, exchanged, interpret=interpret) * unit)
             if gate is not None:
