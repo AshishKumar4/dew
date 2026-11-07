@@ -786,10 +786,10 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     """A training step's backward at width 256 derived for an RTX PRO 6000 (sm120) said to hold an A100's
     block, and compiled for the GPU's own (a compile-only device on this CPU): XLA refuses the program,
     naming no kernel, where its launches ask more shared memory than the GPU's 99 KB block; the run's
-    compile (`report.kept`) refuses the configs of the Triton launches XLA refuses each compiled alone
-    (`report.refused_alone`), each at the bytes it asked, each derivation takes its next config, and the
-    program compiles on its one recompile (row 3584, audit group 71); the program's other Triton launches
-    keep theirs."""
+    compile (`report.kept`) refuses the configs of the traced Triton launches XLA refuses each compiled
+    alone (`report.refused_alone`), each at the bytes it asked, each derivation takes its next config, and
+    the program compiles on its one recompile (row 3584, audit group 71); the program's other Triton
+    launches keep theirs."""
     import dataclasses
 
     import kernel_compile
@@ -826,7 +826,9 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     assert alone and set(alone) < every, (alone, every)
     assert misses and all(miss.stepped for miss in misses), misses
     assert {miss.config for miss in misses} == set(refused), (misses, refused)
-    assert {(miss.kernel, miss.shared) for miss in misses} == {
+    # Each launch refused is one XLA refuses alone, at the bytes it asked alone (a launch the run did not
+    # trace, the backward's here, derives again with the forward it reads).
+    assert {(miss.kernel, miss.shared) for miss in misses} <= {
         (report.kernel_of(name)[0], asked) for name, asked in alone.items()}, (misses, alone)
 
 
