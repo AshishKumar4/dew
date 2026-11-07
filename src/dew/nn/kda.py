@@ -292,6 +292,8 @@ class KimiDeltaAttentionMixer(MixerBase):
     and Kimi K3's `use_full_rank_gate` output gate."""
 
     residuals = DELTA_RULE_RESIDUALS
+    # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
+    packed_cache = True
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128

@@ -407,6 +407,23 @@ def test_fp16_values_at_two_to_the_minus_ten_under_a_near_total_draw_stay_finite
     assert bool(jnp.all(jnp.isfinite(dew)))
 
 
+def test_the_mosaic_dropping_walk_refuses_fp16_weights_past_fp16s_largest():
+    """At the fp16 witness's rate, 1 - 2^-16, a kept weight's multiplier, 2^16, passes fp16's largest, which
+    the Mosaic dropping walk's sums in place take no scaled part of (`algebra.dropped_parts`): its legality
+    rule refuses an fp16 call there, forward and backward, and takes a bf16 one and an fp16 one at an
+    ordinary rate (the plain-JAX mainloop takes the witness, above)."""
+    near_total = hooked(seed_words(0), ROWS, HEADS, 1.0 - 2.0 ** -16)
+
+    def refusal(dtype, hooks, backward):
+        return attention_mosaic.refused(dtype, WIDTH, WIDTH, hooks, backward=backward,
+                                        family=mosaic_sm90.WGMMA)
+
+    for backward in (False, True):
+        assert refusal(jnp.float16, near_total, backward).code == "dropout_rate"
+        assert refusal(jnp.bfloat16, near_total, backward) is None
+        assert refusal(jnp.float16, hooked(seed_words(0), ROWS, HEADS), backward) is None
+
+
 def identical_keys(seed: int, queries: int, keys: int, dtype):
     """A query, a cotangent, and a key and value repeating one row across the keys: every query's keys are
     identical, so its score cotangents must sum to zero over them."""
