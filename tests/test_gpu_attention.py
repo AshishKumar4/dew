@@ -100,8 +100,8 @@ def test_the_attention_kernels_run_on_this_gpu():
     """Every kernel cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together; the Mosaic cells on an H100 alone."""
     run_cells([
-        sweep(triton.every_config_on_a_gpu, triton.attention_triton.FORWARD_TILES),
-        sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_TILES),
+        sweep(triton.every_config_on_a_gpu, triton.FORWARD_TILES),
+        sweep(triton.every_backward_config_on_a_gpu, triton.BACKWARD_TILES),
         # The Pallas-Triton dK/dV launch's prescaled query on an H100: right and repeating (the pipeliner's
         # race, attention_triton_stages).
         *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
