@@ -174,6 +174,13 @@ FOREIGN |= {"dew.lora": ("dew.nn.backbones.layer_plan", "dew.nn.mixer_base", "de
             "dew.sampling.strategies": ("dew.objectives",),
             "dew.inference.tasks": ("dew.objectives",),
             "dew.interop.sequence_causality": ("dew.training",)}
+# A model computes; where a release stores its tensors and config is `dew.interop`'s (row 4264).
+FOREIGN |= {f"dew.nn.{module}": ("dew.interop",)
+            for module in ("audio", "diffusion_gemma", "mimo_audio", "mobilenet", "text_encoders", "vision",
+                           *(f"vision.{family}" for family in ("common", "deepseek_v41", "gemma3n", "gemma4",
+                                                               "gemma4_unified", "lfm3", "llama4", "mimo",
+                                                               "moonvit", "muse_glimmer", "qwen35", "siglip",
+                                                               "vit")))}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))
