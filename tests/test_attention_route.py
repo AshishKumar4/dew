@@ -777,16 +777,22 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
 def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
     """A causal call of block groups (Gemma 4's images, a decision row's blocks), which only spans express
     (`AttentionCase.spans_only`), runs where its visibility stays spans, its forward and its training alike:
-    its compiled program's temporaries hold less than one `[S, S]` mask of bytes, where the reference path's
-    dense mask and logits hold `B H S S` fp32 (rows 1495, 1953)."""
-    tokens, heads, width = 2048, 4, 64
-    query, key, value = (jnp.ones((1, tokens, h, width), jnp.bfloat16) for h in (heads, 2, 2))
-    groups = jnp.repeat(jnp.arange(tokens // 128, dtype=jnp.int32), 128)[None]
+    its compiled program's temporaries grow with its tokens, not their square, twice the tokens taking under
+    three times the bytes, where a dense `[S, S]` mask or the reference path's `B H S S` logits take four
+    times (rows 1495, 1953)."""
+    heads, width = 4, 64
 
-    def attended(query, key, value):
-        return scaled_dot_product_attention(query, key, value, causal=True, block_groups=groups)
+    def temporaries(tokens: int) -> int:
+        query, key, value = (jnp.ones((1, tokens, h, width), jnp.bfloat16) for h in (heads, 2, 2))
+        groups = jnp.repeat(jnp.arange(tokens // 128, dtype=jnp.int32), 128)[None]
 
-    step = jax.grad(lambda *operands: attended(*operands).astype(jnp.float32).sum(),
-                    argnums=(0, 1, 2)) if differentiated else attended
-    compiled = jax.jit(step).lower(query, key, value).compile()
-    assert compiled.memory_analysis().temp_size_in_bytes < tokens * tokens
+        def attended(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, block_groups=groups)
+
+        step = jax.grad(lambda *operands: attended(*operands).astype(jnp.float32).sum(),
+                        argnums=(0, 1, 2)) if differentiated else attended
+        analysis = jax.jit(step).lower(query, key, value).compile().memory_analysis()
+        assert analysis is not None
+        return analysis.temp_size_in_bytes
+
+    assert temporaries(4096) <= 3 * temporaries(2048)
