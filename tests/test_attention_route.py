@@ -354,60 +354,51 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
                     seeds=SEEDS)
 
 
-@pytest.mark.parametrize(("width", "causal"), [(64, False), (128, True), (128, False)])
-def test_an_fp32_call_on_an_h100_infers_on_the_template_and_trains_on_xla(width, causal):
-    """An fp32 attention call lowered for an H100: one no derivative is taken of runs the template's Mosaic
-    launch where its forward measured faster than xla's (width 64, and causal at 128:
-    `attention_kernels.template_infers`) and xla's attention at 128 full; a differentiated one runs xla's
-    alone, forward and backward, whatever its width (the 'float32 attention' cell's 'inference')."""
-    from kernel_compile import lowered_for
-    shape = jax.ShapeDtypeStruct((1, 512, 2, width), jnp.float32)
-
-    def attend(query, key, value):
-        return scaled_dot_product_attention(query, key, value, causal=causal)
-
-    def trained(query, key, value, dout):
-        out, pull = jax.vjp(attend, query, key, value)
-        return out, pull(dout)
-
-    def launches(fn, arity):
-        return "mosaic_gpu" in lowered_for(fn, (shape,) * arity, "sm90").as_text()
-
-    assert launches(attend, 3) == (width == 64 or causal)
-    assert not launches(trained, 4)
+LOWERED = {
+    "fp32-64-full": ("sm90", jnp.float32, 64, False, False),
+    "fp32-128-causal": ("sm90", jnp.float32, 128, True, False),
+    "fp32-128-full": ("sm90", jnp.float32, 128, False, False),
+    **{f"bias-{generation_name}-{'causal' if causal else 'full'}":
+       (generation_name, jnp.bfloat16, 128, causal, True)
+       for generation_name in ("sm90", "sm80") for causal in (True, False)},
+}
+"""Calls lowered for a GPU on the named template: by the GPU, the operands' dtype, the head width, causal or
+full, and a bias that varies by query (`[1, H, Q, K]` fp32) or none."""
 
 
 @pytest.mark.parametrize("form", ["fast", "accurate"])
-@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
-@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
-def test_a_dense_bias_infers_on_the_template_and_trains_on_it_where_it_measured_faster(generation_name,
-                                                                                      causal, form):
-    """A bf16 call whose bias varies by query, lowered for an H100 and an A100: one no derivative is taken of
-    runs the template's launch on both; a differentiated one in the fast form runs it causal on the H100
-    alone, xla's attention elsewhere (`attention_kernels._attention_preferred`, M-DD-8), and in the accurate
-    form everywhere, which xla's attention does not compute."""
+@pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
+@pytest.mark.parametrize("name", LOWERED)
+def test_a_call_named_onto_the_template_lowers_for_a_gpu(name, differentiated, form):
+    """A call named onto the template (`implementation="template"`) lowered for an H100 or an A100, in either
+    form, inferred or differentiated: fp32 operands at widths 64 and 128, and bf16 under a bias that varies by
+    query, each pass on a mainloop that takes it, whichever the route derives (`generation.routes`: one
+    `attention_mainloop` route a pass). Its values are check 1's on the template's mainloops
+    (test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward,
+    test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path)."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.generation import run_precision
     from dew.nn.precision import Numerics
-    shape = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16)
-    bias = jax.ShapeDtypeStruct((1, 2, 512, 512), jnp.float32)
+    generation_name, dtype, width, causal, biased = LOWERED[name]
+    shape = jax.ShapeDtypeStruct((1, 512, 2, width), dtype)
+    bias = (jax.ShapeDtypeStruct((1, 2, 512, 512), jnp.float32),) if biased else ()
 
-    def attend(query, key, value, bias):
-        return scaled_dot_product_attention(query, key, value, bias=bias, causal=causal)
+    def attend(query, key, value, *bias):
+        return scaled_dot_product_attention(query, key, value, bias=bias[0] if bias else None, causal=causal,
+                                            implementation="template")
 
-    def trained(query, key, value, bias, dout):
-        out, pull = jax.vjp(attend, query, key, value, bias)
+    def trained(query, key, value, *rest):
+        *bias, dout = rest
+        out, pull = jax.vjp(attend, query, key, value, *bias)
         return out, pull(dout)
 
-    def launches(fn, args):
-        with run_precision(Numerics(forms=form)):
-            text = lowered_for(fn, args, generation_name).as_text()
-        return "mosaic_gpu" in text or "xla.gpu.triton" in text
-
-    assert launches(attend, (shape, shape, shape, bias))
-    assert launches(trained, (shape, shape, shape, bias, shape)) == (
-        form == "accurate" or (causal and generation_name == "sm90"))
+    with run_precision(Numerics(forms=form)), generation.routes() as found:
+        if differentiated:
+            lowered_for(trained, (shape, shape, shape, *bias, shape), generation_name)
+        else:
+            lowered_for(attend, (shape, shape, shape, *bias), generation_name)
+    assert len([route for route in found if route.choice == "attention_mainloop"]) == 1 + differentiated
 
 
 @pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])
