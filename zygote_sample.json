@@ -1,0 +1,290 @@
+{
+ "files": [
+  "tests/test_aggregation.py",
+  "tests/test_attention_algebra.py",
+  "tests/test_attention_mosaic.py",
+  "tests/test_attention_splash.py",
+  "tests/test_barren_reads.py",
+  "tests/test_behavior_correction.py",
+  "tests/test_benchmark_step.py",
+  "tests/test_capability_matrix.py",
+  "tests/test_compile_ahead.py",
+  "tests/test_contracts_recurrence.py",
+  "tests/test_cross_attention.py",
+  "tests/test_data_mixtures.py",
+  "tests/test_decision_packing.py",
+  "tests/test_decode_attention.py",
+  "tests/test_decoder_export.py",
+  "tests/test_duplicates.py",
+  "tests/test_examples.py",
+  "tests/test_flight.py",
+  "tests/test_gemma4_unified.py",
+  "tests/test_gpu_torchax.py",
+  "tests/test_host_placement.py",
+  "tests/test_layer_stack.py",
+  "tests/test_layers_lint.py",
+  "tests/test_live_gateway.py",
+  "tests/test_liveness_deferred_products.py",
+  "tests/test_lm_recipe.py",
+  "tests/test_mamba_ssd.py",
+  "tests/test_masked_diffusion.py",
+  "tests/test_model_protocols.py",
+  "tests/test_moe_precision.py",
+  "tests/test_multiprocess.py",
+  "tests/test_native_diffusion.py",
+  "tests/test_norm_swiglu.py",
+  "tests/test_parallelism_matrix.py",
+  "tests/test_pytest_selection.py",
+  "tests/test_qwen_qualification.py",
+  "tests/test_recurrence_chunk.py",
+  "tests/test_recurrence_mosaic.py",
+  "tests/test_run_budgets.py",
+  "tests/test_saved_runs.py",
+  "tests/test_slot_sources.py",
+  "tests/test_tolerance_lint.py",
+  "tests/test_tools.py",
+  "tests/test_x64_bits.py"
+ ],
+ "rows": [
+  {
+   "name": "3.12:tests/test_run_budgets.py#4/5",
+   "seconds": 92.57371570500001,
+   "tests": 74.878
+  },
+  {
+   "name": "3.12:tests/test_slot_sources.py#7/9",
+   "seconds": 54.547329262999995,
+   "tests": 37.71
+  },
+  {
+   "name": "3.12:tests/test_attention_mosaic.py#82/110",
+   "seconds": 93.79238081099994,
+   "tests": 80.054
+  },
+  {
+   "name": "3.12:tests/test_mamba_ssd.py#4/6",
+   "seconds": 59.778813550999985,
+   "tests": 44.324
+  },
+  {
+   "name": "3.12:tests/test_layers_lint.py",
+   "seconds": 0.8481711485770864,
+   "tests": 0.587
+  },
+  {
+   "name": "3.12:tests/test_flight.py",
+   "seconds": 71.91913013930856,
+   "tests": 48.367
+  },
+  {
+   "name": "3.12:tests/test_saved_runs.py#55/85",
+   "seconds": 48.55004544099995,
+   "tests": 31.284
+  },
+  {
+   "name": "3.12:tests/test_moe_precision.py#6/6",
+   "seconds": 31.05199193699991,
+   "tests": 16.078
+  },
+  {
+   "name": "3.12:tests/test_tolerance_lint.py",
+   "seconds": 3.256438508809216,
+   "tests": 2.144
+  },
+  {
+   "name": "3.12:tests/test_recurrence_chunk.py#5/8",
+   "seconds": 32.44217144200002,
+   "tests": 20.078
+  },
+  {
+   "name": "3.12:tests/test_host_placement.py#3/3",
+   "seconds": 120.86865791199943,
+   "tests": 91.515
+  },
+  {
+   "name": "3.12:tests/test_liveness_deferred_products.py",
+   "seconds": 65.469762419711,
+   "tests": 46.421
+  },
+  {
+   "name": "3.12:tests/test_decode_attention.py#54/69",
+   "seconds": 41.985088239000106,
+   "tests": 31.143
+  },
+  {
+   "name": "3.12:tests/test_model_protocols.py#23/101",
+   "seconds": 74.173287429,
+   "tests": 55.704
+  },
+  {
+   "name": "3.12:tests/test_decode_attention.py#56/69",
+   "seconds": 60.838868246999944,
+   "tests": 50.772
+  },
+  {
+   "name": "3.12:tests/test_compile_ahead.py#11/11",
+   "seconds": 25.019293226000002,
+   "tests": 7.164999999999999
+  },
+  {
+   "name": "3.12:tests/test_lm_recipe.py#2/6",
+   "seconds": 53.73112321799999,
+   "tests": 37.266
+  },
+  {
+   "name": "3.12:tests/test_duplicates.py",
+   "seconds": 20.344585251477337,
+   "tests": 13.025
+  },
+  {
+   "name": "3.12:tests/test_decoder_export.py#16/35",
+   "seconds": 106.05945957899999,
+   "tests": 83.05
+  },
+  {
+   "name": "3.12:tests/test_multiprocess.py#15/52",
+   "seconds": 40.79135323900027,
+   "tests": 24.57
+  },
+  {
+   "name": "3.12:tests/test_contracts_recurrence.py#11/15",
+   "seconds": 47.76144080300003,
+   "tests": 25.853
+  },
+  {
+   "name": "3.12:tests/test_capability_matrix.py#27/70",
+   "seconds": 35.159302697000385,
+   "tests": 20.238999999999997
+  },
+  {
+   "name": "3.12:tests/test_norm_swiglu.py#6/6",
+   "seconds": 46.51318704500002,
+   "tests": 35.691
+  },
+  {
+   "name": "3.12:tests/test_attention_splash.py",
+   "seconds": 66.80153958896322,
+   "tests": 54.028
+  },
+  {
+   "name": "3.12:tests/test_decision_packing.py#test_a_packed_window_of_parallel_rows_decides_each_row_as_the_row_alone",
+   "seconds": 23.56621359499968,
+   "tests": 1.396
+  },
+  {
+   "name": "3.12:tests/test_cross_attention.py#2/7",
+   "seconds": 48.41231804,
+   "tests": 24.442999999999998
+  },
+  {
+   "name": "3.12:tests/test_qwen_qualification.py#5/6",
+   "seconds": 68.96204181000002,
+   "tests": 46.791000000000004
+  },
+  {
+   "name": "3.12:tests/test_tools.py#6/9",
+   "seconds": 52.70461737599999,
+   "tests": 35.94
+  },
+  {
+   "name": "3.12:tests/test_multiprocess.py#40/52",
+   "seconds": 91.125273049,
+   "tests": 57.498
+  },
+  {
+   "name": "3.12:tests/test_gemma4_unified.py#2/9",
+   "seconds": 45.01442728299935,
+   "tests": 22.224
+  },
+  {
+   "name": "3.12:tests/test_gpu_torchax.py",
+   "seconds": 0.004467124924844574,
+   "tests": 0.002
+  },
+  {
+   "name": "3.12:tests/test_data_mixtures.py",
+   "seconds": 83.73719766909738,
+   "tests": 61.876
+  },
+  {
+   "name": "3.12:tests/test_x64_bits.py#1/9",
+   "seconds": 53.011901863999995,
+   "tests": 29.983999999999998
+  },
+  {
+   "name": "3.12:tests/test_pytest_selection.py",
+   "seconds": 27.413894888290425,
+   "tests": 20.32
+  },
+  {
+   "name": "3.12:tests/test_masked_diffusion.py#4/11",
+   "seconds": 50.80127342899959,
+   "tests": 33.129000000000005
+  },
+  {
+   "name": "3.12:tests/test_barren_reads.py#3/3",
+   "seconds": 70.55248022399996,
+   "tests": 61.874
+  },
+  {
+   "name": "3.12:tests/test_live_gateway.py",
+   "seconds": 55.693434171625185,
+   "tests": 39.006
+  },
+  {
+   "name": "3.12:tests/test_attention_algebra.py#1/6",
+   "seconds": 38.81344489199989,
+   "tests": 26.092
+  },
+  {
+   "name": "3.12:tests/test_compile_ahead.py#5/11",
+   "seconds": 112.92979121500002,
+   "tests": 91.337
+  },
+  {
+   "name": "3.12:tests/test_saved_runs.py#30/85",
+   "seconds": 72.56327288,
+   "tests": 54.563
+  },
+  {
+   "name": "3.12:tests/test_aggregation.py#2/2",
+   "seconds": 88.86849780700004,
+   "tests": 70.938
+  },
+  {
+   "name": "3.12:tests/test_behavior_correction.py",
+   "seconds": 6.694152971205259,
+   "tests": 4.24
+  },
+  {
+   "name": "3.12:tests/test_parallelism_matrix.py#5/38",
+   "seconds": 66.72715810900013,
+   "tests": 52.29299999999999
+  },
+  {
+   "name": "3.12:tests/test_layer_stack.py#4/10",
+   "seconds": 49.95302362699999,
+   "tests": 33.326
+  },
+  {
+   "name": "3.12:tests/test_native_diffusion.py#21/32",
+   "seconds": 52.715095578000046,
+   "tests": 42.808
+  },
+  {
+   "name": "3.12:tests/test_benchmark_step.py#2/3",
+   "seconds": 80.37610993800001,
+   "tests": 72.291
+  },
+  {
+   "name": "3.12:tests/test_examples.py#6/13",
+   "seconds": 59.92057600000004,
+   "tests": 43.554
+  },
+  {
+   "name": "3.12:tests/test_recurrence_mosaic.py#test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference",
+   "seconds": 29.737918236999988,
+   "tests": 9.575
+  }
+ ]
+}
