@@ -903,46 +903,53 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
 
 @pytest.mark.parametrize("layout", [None, KVCache(page_size=4)], ids=["dense", "paged"])
 def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(layout):
-    """A row of two documents prefilled into a cache (`segment_ids`), then single-token steps continuing its
-    last document, each naming its one document (a call's first continues its row's last,
-    `dew.batch.Coordinates.starts`): every layer reads each document's own keys over the cache
-    (`dew.nn.kv_cache.DOCUMENTS`), so the second document's prefill logits and every step's are on par
-    (check 1) with the second document prefilled alone into a row of its own and decoded the same steps, the
-    truth that run in float64."""
+    """A row of two documents and its padding (segment 0) prefilled into a cache (`segment_ids`), then
+    single-token steps continuing its last document, each naming its one document (a call's first continues
+    its row's last, `dew.batch.Coordinates.starts`): every layer reads each document's own keys over the
+    cache (`dew.nn.kv_cache.DOCUMENTS`) and the padding writes none, so the second document's prefill logits
+    and every step's are on par (check 1) with the second document prefilled alone into a cache of its own
+    and decoded the same steps, the truth one uncached float64 call over that document and the steps'
+    tokens."""
     model = tiny(**({} if layout is None else {"kv_cache": layout}))
-    first, second, steps = 6, 4, 3
-    segment_ids = jnp.asarray([[1] * first + [2] * second] * 2)
-    positions = jnp.asarray([list(range(first)) + list(range(second))] * 2)
+    first, second, padding, steps = 6, 4, 2, 3
+    prompt = first + second + padding
+    segment_ids = jnp.asarray([[1] * first + [2] * second + [0] * padding] * 2)
+    positions = jnp.asarray([list(range(first)) + list(range(second)) + [0] * padding] * 2)
 
-    def packed(model):
-        def run(params, ids):
-            prefill, state = model.apply(params, ids[:, :first + second], decode=True, positions=positions,
-                                         segment_ids=segment_ids, mutable=["cache"])
-            logits = [prefill[:, first:]]
-            for step in range(steps):
-                token = first + second + step
-                out, state = model.apply({**params, **state}, ids[:, token:token + 1], decode=True,
-                                         positions=jnp.full((2, 1), second + step),
-                                         segment_ids=jnp.ones((2, 1), jnp.int32), mutable=["cache"])
-                logits.append(out)
-            return jnp.concatenate(logits, axis=1)
-        return jax.jit(run)
+    def cached(model, params, ids, **prefill):
+        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+        return model.apply({**params, "cache": cache}, ids, decode=True, mutable=["cache"], **prefill)
 
-    def alone(model):
-        def run(params, ids):
-            prefill, state = model.apply(params, ids[:, first:first + second], decode=True, mutable=["cache"])
-            logits = [prefill]
-            for step in range(steps):
-                token = first + second + step
-                out, state = model.apply({**params, **state}, ids[:, token:token + 1], decode=True,
-                                         mutable=["cache"])
-                logits.append(out)
-            return jnp.concatenate(logits, axis=1)
-        return jax.jit(run)
+    def stepped(model, params, state, ids, named):
+        logits = []
+        for step in range(steps):
+            token = ids[:, prompt + step:prompt + step + 1]
+            out, state = model.apply({**params, **state}, token, decode=True, mutable=["cache"],
+                                     **({"positions": jnp.full((2, 1), second + step),
+                                         "segment_ids": jnp.ones((2, 1), jnp.int32)} if named else {}))
+            logits.append(out)
+        return logits
 
-    assert_as_exact(packed(model), alone(model), drawn(model, length=first + second + steps),
+    @jax.jit
+    def packed(params, ids):
+        prefill, state = cached(model, params, ids[:, :prompt], positions=positions, segment_ids=segment_ids)
+        return jnp.concatenate([prefill[:, first:first + second],
+                                *stepped(model, params, state, ids, named=True)], axis=1)
+
+    @jax.jit
+    def alone(params, ids):
+        prefill, state = cached(model, params, ids[:, first:first + second])
+        return jnp.concatenate([prefill, *stepped(model, params, state, ids, named=False)], axis=1)
+
+    wide = float64(model)
+
+    def truth(params, ids):
+        tokens = jnp.concatenate([ids[:, first:first + second], ids[:, prompt:prompt + steps]], axis=1)
+        return wide.apply(params, tokens)
+
+    assert_as_exact(packed, alone, drawn(model, length=prompt + steps),
                     f"packed prefill decoded {'dense' if layout is None else 'paged'}",
-                    seeds=SEEDS['packed alone'], truth_fn=alone(float64(model)))
+                    seeds=SEEDS['packed alone'], truth_fn=truth)
 
 
 def test_padding_in_a_packed_row_reaches_no_query(rng):

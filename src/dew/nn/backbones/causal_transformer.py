@@ -1171,6 +1171,14 @@ class CausalTransformer(LinearProducts):
         # prediction depths read its coordinates alone.
         coordinates = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids,
                                         valid=attention_mask, positions=positions, right_padded=right_padded)
+        if (decode and coordinates is not None and coordinates.max_segments > 1
+                and coordinates.segments is not None and coordinates.valid is None):
+            # A cache keeps a packed row's real tokens alone: its padding (segment 0) writes no key and moves
+            # no recurrent state, its documents' starts counted over its real tokens.
+            coordinates = build_coordinates(tokens.shape[:2], segments=coordinates.segments,
+                                            valid=coordinates.segments != 0, positions=coordinates.positions,
+                                            max_segments=coordinates.max_segments,
+                                            right_padded=coordinates.right_padded)
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, input_embeddings=input_embeddings, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
@@ -2448,6 +2456,9 @@ class CausalTransformer(LinearProducts):
         numbered from 1, its first continuing its row's last (`Coordinates.starts`): a row's later steps
         continue its last document, each naming its one (`Coordinates.segments` of 1), which reads that
         document's keys alone; a step naming none reads every key its row holds."""
+        if self.engram is not None:
+            # Its cached lookback reads the n-grams before a token by place, across a document's start.
+            return "Engram's n-gram lookback, which reads across a cached row's documents"
         types = self.per_layer_types
         default = self.layer_mixer
         for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):

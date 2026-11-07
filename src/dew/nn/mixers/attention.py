@@ -1171,10 +1171,11 @@ class CausalSelfAttention(nn.Module):
             key_places, history = held
             if S == 1:
                 (mask, _), causal = self._decode_masks(positions, B, kv_len, None, history,
-                                                       documents=True), False
+                                                       documents=segment_ids is not None), False
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
-                documents, causal, window = self._cached_call(positions, history,
+                named = history if segment_ids is not None else None
+                documents, causal, window = self._cached_call(positions, named,
                                                               jnp.arange(kv_len)[None, :] <= last)
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
@@ -1193,7 +1194,8 @@ class CausalSelfAttention(nn.Module):
                     documents=segment_ids is not None), False
                 cursor = mask
             else:  # several tokens appended after the keys their rows held
-                documents, causal, window = self._cached_call(positions, history,
+                named = history if segment_ids is not None else None
+                documents, causal, window = self._cached_call(positions, named,
                                                               cached_validity(self, key.shape[-3]))
             key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
             if kv_store is not None and self.ctx.kv_store_key is not None:
@@ -1231,7 +1233,11 @@ class CausalSelfAttention(nn.Module):
                                     image_groups=groups.image_groups)
             causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
             implementation = masked()
-        max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
+        # A cache call's one document a row bounds its documents; one naming them, its cache's numbering,
+        # none a call states (no varlen kernel's offsets take it).
+        max_segments = (None if documents is None or (isinstance(documents, CrossDocuments)
+                                                      and segment_ids is not None)
+                        else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs)
@@ -1573,20 +1579,26 @@ class CausalSelfAttention(nn.Module):
         first = spans.start[:, 0]
         return seen, first if own_start is None else jnp.maximum(first, own_start)
 
-    def _cached_call(self, positions, history: dict[str, jax.Array], held
+    def _cached_call(self, positions, history: dict[str, jax.Array] | None, held
                      ) -> tuple[CrossDocuments, bool, int | None]:
         """A cache call of several tokens at `positions` `[B, S]` (-1 for padding) over the keys
-        `held` `[B, K]` marks filled, as its documents, causality and window: each token's document and
-        each held key's as the cache keeps them (`DOCUMENTS`), whose last keys are the call's tokens,
-        appended in order after the keys the row held (`CrossDocuments`). Causality and the layer's window,
-        where it narrows the K keys, align to those keys, which is the cache's own mask
-        (`causal_attention_mask` over the slots); flash reads them as packed sequences and no kernel needs
-        a mask for them."""
+        `held` `[B, K]` marks filled, as its documents, causality and window: one document a row, whose
+        last keys are the call's tokens, appended in order after the keys the row held; or, a call naming
+        its documents (its cache's `history`), each token's and each held key's as the cache keeps them
+        (`DOCUMENTS`), in ascending order along the slots (`CrossDocuments`). Causality and the layer's
+        window, where it narrows the K keys, align to those keys, which is the cache's own mask
+        (`causal_attention_mask` over the slots); flash reads one document a row as packed sequences, and no
+        kernel needs a mask for them."""
         window = self.ctx.sliding_window
-        kept = history[DOCUMENTS]
-        slots = jnp.asarray(positions, jnp.int32).reshape(kept.shape[0], -1)
-        own = jnp.where(slots >= 0, jnp.take_along_axis(kept, jnp.maximum(slots, 0), axis=1), 0)
-        documents = CrossDocuments(own, jnp.where(jnp.asarray(held, bool), kept, 0))
+        held = jnp.asarray(held, bool)
+        if history is None:
+            documents = CrossDocuments(jnp.asarray(jnp.asarray(positions) >= 0, jnp.int32),
+                                       held.astype(jnp.int32))
+        else:
+            kept = history[DOCUMENTS]
+            slots = jnp.asarray(positions, jnp.int32).reshape(kept.shape[0], -1)
+            own = jnp.where(slots >= 0, jnp.take_along_axis(kept, jnp.maximum(slots, 0), axis=1), 0)
+            documents = CrossDocuments(own, jnp.where(held, kept, 0))
         return documents, True, None if window is None or window >= held.shape[-1] else window
 
     def _paged(self, append: Append, query: jax.Array, positions: jax.Array, starts=None,
