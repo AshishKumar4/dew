@@ -1267,9 +1267,8 @@ def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | No
 
 
 
-def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array,
-           multiplier: jax.Array | None = None, chunk: int | None = None, bound: float = 1.0
-           ) -> tuple[jax.Array, ...]:
+def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array, *,
+           multiplier: jax.Array | None, chunk: int | None, bound: float) -> tuple[jax.Array, ...]:
     """Weights `p` narrowed to the values' dtype times the tile's `value`s, as the mainloop's `dot`, a
     `chunk` of keys at a time (`products_of`); with a dropout `multiplier` (at most `bound`), the dropped
     weights `p * multiplier` as `dropped_parts` narrows them."""
@@ -1420,7 +1419,8 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
     accumulate = keys.accumulate if held is None else None
     if accumulate is None:
         chunk = chunk_of(spec)
-        times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk)
+        times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk,
+                                  bound=1.0 if keys.coords.drop is None else keys.coords.drop.bound)
         # `B` takes the old anchor's term before the factor (`split_taken`), its rounding kept where the walk
         # compensates (`kept_in_turn`), then the tile's other keys' products as a step takes them.
         low, term = state.low, (split_term(own, moved, rows(arg.key), arg.multiplier),)
@@ -2196,7 +2196,7 @@ def _derived_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         # The template's step over the forms' weights (the denominator's terms, before their narrowing for
         # the product) and rescale.
         factor, weights, value, held = _derived_parts(state, keys, accumulated, added)
-        times = functools.partial(_times, keys.dot, value, multiplier=None, chunk=chunk_of(spec))
+        times = functools.partial(_times, keys.dot, value, multiplier=None, chunk=chunk_of(spec), bound=1.0)
         after.append(stepped(state, state.m, factor, weights, times(weights), held, times))
         return tuple(getattr(after[0], field) if field in ("acc", "total") else None for field in fields)
 
