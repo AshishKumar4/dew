@@ -41,14 +41,13 @@ names=sorted(params)
 rflat=flatten_dict(rg)
 rr=[ri,rt]
 dd=[di,dt]
+bad=[]
 for k in names:
     a=rflat[tuple(k.split("/"))]
     b=t.from_dew(cls,k,t.node(dg,t.dew_path(cls,k)),t.LAYOUT[case]["params"][k])
     rr.append(a); dd.append(b)
     rms=float(np.sqrt(np.mean(np.asarray(a-b)**2)))
-    if rms>1e-12:
-        report("PARAM "+k,a,b)
-report("gradients",jnp.concatenate([a.ravel() for a in rr]),jnp.concatenate([a.ravel() for a in dd]))
+    if rms>1e-12: bad.append((rms,k,a,b))
 refout, refstate=refmodel.apply({"params":reftree},image,times,text,capture_intermediates=True,mutable=["intermediates"])
 dewout, dewstate=dewmodel.apply({"params":dewtree,"constants":constants},image,times,t.TextContext(text,jnp.ones(text.shape[:2],jnp.float64)),capture_intermediates=True,mutable=["intermediates"])
 def arrays(state):
@@ -58,6 +57,15 @@ def arrays(state):
         if leaves: result["/".join(k[:-1])]=leaves[0]
     return result
 rc,dc=arrays(refstate),arrays(dewstate)
+count=0
 for k in rc:
-    if k in dc and rc[k].shape==dc[k].shape and (k.count("/")<1 or "norm" in k.lower()):
-        report("INTER "+k,rc[k],dc[k])
+    if k in dc and rc[k].shape==dc[k].shape:
+        a=rc[k]
+        if k.endswith(("/norm1","/norm2")) or k=="conv_out_norm":
+            a=jax.nn.swish(a)
+        if float(np.sqrt(np.mean(np.asarray(a-dc[k])**2)))>1e-12 and count<12:
+            report("FIRST_INTER "+k,a,dc[k]); count+=1
+for _,k,a,b in sorted(bad,reverse=True)[:5]:
+    report("WORST_PARAM "+k,a,b)
+report("FINAL_output",ra,da)
+report("FINAL_gradients",jnp.concatenate([a.ravel() for a in rr]),jnp.concatenate([a.ravel() for a in dd]))
