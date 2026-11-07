@@ -22,6 +22,7 @@ import pytest
 from affine_run import FEATURES, Regression
 from export_support import Stalled
 from jax.extend.backend import get_backend
+from port_support import row_names_port
 from process_support import assert_exits_cleanly
 from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
@@ -37,7 +38,6 @@ from dew.distributed.placement import Layout, MeshSpec, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
-from dew.nn.kernels.generation import chosen
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
@@ -946,12 +946,11 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The
-    delta rule runs its port (`chosen`), whatever the generation's row names, at the default product
-    precision its fp32 products are declared at (`recurrence_chunk._port_precision`; the suite's lanes
-    configure 'highest'): the half rung recomputes the memory the port names (`checkpoint_name`), and the
-    portable route, an A10's, names none."""
+    delta rule runs its port (`port_support.row_names_port`), whatever the generation's row names: the half
+    rung recomputes the memory the port names (`checkpoint_name`), and the portable route, an A10's, names
+    none."""
     half = "all_but_delta_memory"
-    with chosen(gated_delta_rule="fla"), jax.default_matmul_precision("default"):
+    with row_names_port("gated_delta_rule", "fla"):
         free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
         trainer = lm(**DELTA)
         state, _, _ = trainer.place()

@@ -574,6 +574,16 @@ def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     assert within(error, bound), (float(error.max()), float(bound.max()))
 
 
+def assert_within_derived_bound(value, truth, bound, label: str) -> None:
+    """`value` within `bound` of its float64 `truth`, element by element, where `bound` is derived from the
+    roundings the computation alone takes (its caller states the derivation), as
+    `assert_fp32_reduction_bound` holds a reduction: a float64 run whose output a narrower step rounds, held
+    to that step's rounding."""
+    error = np.abs(np.asarray(value, np.float64) - np.asarray(truth, np.float64))
+    bound = np.asarray(bound, np.float64)
+    assert within(error, bound), f"{label}: {float(np.max(error / bound)):.3g} times its derived bound"
+
+
 RESOLUTION = 1024 * float(np.finfo(np.float64).eps)
 """The smallest row float64 resolves, over its leaf's size: a row below it is
 float64's own rounding of the leaf (a packed row's padding at 4e-19 of a

@@ -251,9 +251,6 @@ def ungrouped_reference(qwix, settings: dict, group_width: int):
     return reference, peaks_of
 
 
-@pytest.mark.skipif(jax.default_backend() == "gpu",
-                    reason="Dew refuses a grouped quantized convolution on a GPU; "
-                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("group_width", [1, 4])
 def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width, dtype):
@@ -308,9 +305,7 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
                     seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
-@pytest.mark.parametrize("groups", [1, pytest.param(16, marks=pytest.mark.skipif(
-    jax.default_backend() == "gpu", reason="Dew refuses a grouped quantized convolution on a GPU; "
-                                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it"))])
+@pytest.mark.parametrize("groups", [1, 16])
 def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision_it_pins(groups):
     """A quantized convolution keeps its call's contract, as a quantized matmul does: one that asks
     for a float32 result from bf16 operands returns float32, where before it returned the bf16
@@ -366,8 +361,9 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
         return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", feature_group_count=groups,
                                             dimension_numbers=("NHWC", "HWIO", "NHWC"))
 
-    # Qwix's own quantized training convolves its integers into int32, which XLA:GPU cannot run, so
-    # the reference runs on the CPU whatever the platform.
+    # The reference is Qwix's own quantized training, its integers convolved into int32, computed on the
+    # CPU whatever the platform: an independent product beside a GPU's, which takes the convolution in
+    # float32 chunks.
     cpu, qwix_own = jax.devices("cpu")[0], jax.jit(lambda x, kernel: reference(kernel, x, peaks_of(x)))
 
     @as_given
@@ -378,9 +374,6 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
                     f"float32 result of {groups} groups", seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
-@pytest.mark.skipif(jax.default_backend() == "gpu",
-                    reason="Dew refuses a grouped quantized convolution on a GPU; "
-                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
 @pytest.mark.parametrize("dilation", [1, 2])
 @pytest.mark.parametrize("group_width", [1, 4])
 def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(group_width, dilation):
