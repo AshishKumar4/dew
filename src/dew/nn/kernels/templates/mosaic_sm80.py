@@ -168,6 +168,14 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     operands_in_registers = True
 
+    def column_unit(self, dtype) -> int:
+        # A warp's lanes, whatever loader stages its tiles: the guarded attention walk's 32-column key
+        # blocks held where its 64 held no tile's registers at width 128 (its fragments are registers), a
+        # TMA ring staging such a block at a 64-byte swizzle (`mosaic.staged`); cp.async's stores move rows
+        # through registers, a row's columns over a warp's lanes at least (`mosaic.copied`).
+        del dtype
+        return resources.THREADS // 4
+
     products_overlap = False
 
     takes_tf32 = True
@@ -670,13 +678,6 @@ class Mma(MmaIssuer, CpAsync):
     # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
-
-    def column_unit(self, dtype) -> int:
-        # Its stores move rows through registers, a row's columns over a warp's lanes at least
-        # (`mosaic.copied`), each lane holding an element (the guarded attention walk's 32-column blocks,
-        # whose 64 held no tile's registers at width 128).
-        del dtype
-        return resources.THREADS // 4
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).

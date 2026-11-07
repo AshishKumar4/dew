@@ -53,8 +53,8 @@ def groups(generation_name: str, dtype, *, stated: bool = False, tpu: bool = Fal
       not takes the next issuer.
     - wgmma: TMA rings a producer fills (`mosaic_sm90.WGMMA`), then rings its consumers fill
       (`mosaic_sm90.FED`).
-    - mma.sync, which every NVIDIA GPU from sm80 issues: TMA rings its consumer fills (`MmaFed`), then
-      cp.async (`mosaic_sm80.Mma`).
+    - mma.sync, which every NVIDIA GPU from sm80 issues: TMA rings its consumer fills where the device moves
+      blocks by TMA (`MmaFed`), cp.async where it does not (`mosaic_sm80.Mma`).
     - A TPU core's MXU (`mosaic_tpu.MXU`), for a launch written wholly against the family's seams (`tpu`,
       the module's account).
 
@@ -75,12 +75,14 @@ def groups(generation_name: str, dtype, *, stated: bool = False, tpu: bool = Fal
 
 
 def legal(family: mosaic.Family, architecture: generation.Architecture) -> bool:
-    """Whether a device of `architecture` runs `family`'s components: its TMA rings where the device moves
-    blocks by TMA (`Architecture.tma`), its cluster within the multiprocessors the device's multicast reaches
+    """Whether a device of `architecture` runs `family`'s components: its loader the copy Mosaic GPU moves the
+    device's blocks by (`Architecture.tma`: TMA rings from sm90, cp.async before it, whose waits Mosaic
+    lowers for no TMA device), its cluster within the multiprocessors the device's multicast reaches
     (`Architecture.cluster`), its block-scaled products where its tensor instructions read such operands
     (`Architecture.block_scales`)."""
-    return ((architecture.tma or not isinstance(family, mosaic.RingFamily))
-            and family.cluster <= architecture.cluster
+    copies = {mosaic.RingFamily: True, mosaic_sm80.CpAsync: False}
+    by_tma = next((tma for loader, tma in copies.items() if isinstance(family, loader)), architecture.tma)
+    return (by_tma == architecture.tma and family.cluster <= architecture.cluster
             and (architecture.block_scales or not family.takes_block_scales))
 
 
