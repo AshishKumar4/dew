@@ -28,7 +28,6 @@ from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import _records
-from dew._model_types import QWEN35_TYPES
 from dew.batch import Variables, unboxed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid, SourceSchedule
@@ -54,6 +53,7 @@ from dew.interop.generation_config import (
     return_sequences,
     source_decoding,
 )
+from dew.interop.layouts import CROSSING_UNWRITTEN, Unwritable
 from dew.interop.pipeline_assembly import (
     SourceTask,
     assemble_pipeline,
@@ -68,15 +68,16 @@ from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.saved_sources import RunPipeline, pinned_run, pipeline_of_run, released_run
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
+from dew.interop.wrappers import corrected
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_names import group_layers
-from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
+from dew.nn.protocols import MediaWrapper
 from dew.nn.sharding import boxed, current_boxes, drawn_axes
 from dew.objectives.base import SavedTask
 from dew.registry import (
@@ -398,17 +399,29 @@ class Pretrained:
         # A run over a source's own processor records its source, and the bundle writes its files.
         processor = None if task is None or task.processor is None else load_processor(task.processor, model)
         trained = models[model_config.name]
-        if trained is CausalTransformer:
-            decoder = from_record(CausalTransformer, model)
+        if trained is CausalTransformer or isinstance(model, MediaWrapper):
+            # A wrapper's bundle is its family's release layout (`PretrainedDecoder.from_model`). A run's
+            # cross-attention is its source's extension, which no family writes: the bundle is its
+            # source's, carrying the run's model, as `with_cross_attention` attaches it, and `save`
+            # refuses it.
             generation = (masked_generation_config(budget, None, held.eos_token_ids)
                           if isinstance(held, MaskedSettings) else
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
-            bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
-                                                          generation_config=generation), processor=processor)
+            if isinstance(model, MediaWrapper):
+                bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
+                                                      generation_config=generation)
+            else:
+                decoder = from_record(CausalTransformer, model)
+                source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
+                                                      tokenizer=tokenizer, generation_config=generation)
+                bundle = replace(source, model=decoder)
+            bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
+                # A masked run's model is a decoder: no wrapper denoises.
                 bundle = PretrainedMaskedDecoder(
-                    decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
+                    from_record(CausalTransformer, model), bundle.variables, bundle.processor,
+                    bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif trained is models["diffusion_gemma"]:
@@ -693,8 +706,7 @@ class Pretrained:
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
-            raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
-                             "keeps this model")
+            raise ValueError(CROSSING_UNWRITTEN)
         # A tree enters plain: a draw's boxes are its model's table, which no export reads. A stage-local
         # fit's store, and a banked one, is read by its layers' names (`stored_layers`), a bank's rows read
         # home as they are written.
@@ -806,16 +818,15 @@ class PretrainedDecoder(Pretrained):
     def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
                    generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
-        """Wrap a decoder trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
+        """Wrap a model trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
 
-        The config is derived from the native computation, and every variable
-        collection is encoded through the matching family. That is the same encoder a
-        loaded source of the derived family exports through, so both write the same
-        weights. Gemma 4 writes frozen or trainable layer-scalar values into HF
-        buffers; reloading that layout reproduces the computation, but not which
-        scalars were trainable. The config is derived from a `causal_transformer`'s
-        fields, so any other model is refused. A decoder with cross-attention or DEX takes the
-        config of the decoder they extend and runs as a bundle, but `save` refuses it.
+        The layout is the one every writer asks (`layouts.source_layout`): a wrapper's family's release
+        layout, or a decoder's family's, the one its fields match, a differential extension and a
+        low-rank adapter written as the decoder they extend; a model it cannot write is refused here,
+        saying why. A decoder's every variable collection is encoded through the matching family, the
+        same encoder a loaded source of the family exports through, so both write the same weights.
+        Gemma 4 writes frozen or trainable layer-scalar values into HF buffers; reloading that layout
+        reproduces the computation, but not which scalars were trainable.
 
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
@@ -823,19 +834,26 @@ class PretrainedDecoder(Pretrained):
         what generation_config.json records; None uses the native defaults with
         the exported model's cache mode.
         """
-        try:
-            decoder = from_record(CausalTransformer, model)
-        except ValueError as error:
-            raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
-        # Cross-attention blocks and DEX have no layout in any family: the config is the decoder's they
-        # extend, and `export` refuses the extensions themselves.
-        config = decoders.export_config(decoder.with_cross_attention(None).with_dex(None))
-        built = record_fields(decoder, CausalTransformer)
-        return cls(decoder, variables, None, config, None, built,
-                   {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
+        from dew.interop.layouts import source_layout
+
+        layout = source_layout(model)
+        if isinstance(layout, Unwritable):
+            raise decoder_parts.ExportRefused(
+                f"{type(model).__name__} has no Hugging Face layout Dew writes: {layout.reason}")
+        if isinstance(model, MediaWrapper):
+            wrapper = from_record(MultimodalTransformer, model)
+            return cls(wrapper, variables, None, layout.config, None,
+                       record_fields(wrapper, MultimodalTransformer),
+                       dict(decoders.GENERATION_DEFAULTS) if generation_config is None else generation_config,
+                       export_adapter=lambda _, values, __: layout.tensors(values), tokenizer=tokenizer)
+        decoder = from_record(CausalTransformer, model)
+        # The layout's own writer reads a decoder bundle's export (`source_layout`), which encodes through
+        # its family.
+        return cls(decoder, variables, None, layout.config, None, record_fields(decoder, CausalTransformer),
+                   {**decoders.GENERATION_DEFAULTS,
+                    'use_cache': layout.config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
-                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer,
-                   code=decoders.release_code(decoder))
+                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer, code=layout.code)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
@@ -1238,29 +1256,10 @@ def pipeline_axes(loaded: PretrainedPipeline) -> dict[tuple[str, ...], tuple[str
     return {**objective.tower_axes(), **objective.denoiser_axes(encoders)}
 
 
-def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str],
-                        fields: Mapping[str, object]) -> None:
-    """Compose a wrapper's attention metadata with each kind's source-declared mixer fields."""
-    kinds = decoder_parts.kinds_of(config).copy()
-    for name in names:
-        kind = kinds.get(name, {})
-        mixer = _records.record(kind.get("mixer") or config.get("mixer")
-                               or {"class": "attention", "fields": {}}, "mixer")
-        held = _records.record(mixer.get("fields", {}), "mixer.fields")
-        kinds[name] = NativeFields(LayerKind, {
-            **kind, "mixer": {**mixer, "fields": {**held, **fields}}})
-    config["kinds"] = kinds
-
-
-def _layer_kinds(config: decoder_parts.DecoderFields) -> tuple[str, ...]:
-    """Each layer kind a decoder's `layer_types` names, once, in order."""
-    return tuple(dict.fromkeys(_records.strings(config["layer_types"], "layer_types")))
-
-
 def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                          max_seq_len: int | None) -> decoder_parts.DecoderFields:
     """Read the decoder fields a wrapper's text_config states, with the corrections
-    its own family makes to them.
+    its own family makes to them (`hf_decoders.WRAPPER_LAYOUTS`' `TextCorrection`s).
 
     Gemma 3 projects its logits without the causal-LM class's final tanh cap
     and attends its image spans both ways; Gemma 4 does the same on its
@@ -1275,20 +1274,11 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        _wrapper_attention(text_fields, _layer_kinds(text_fields), {"bidirectional_images": True})
-    if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        _wrapper_attention(text_fields, ("sliding_attention",), {"bidirectional_images": True})
-    # Unified states vision unless its config says otherwise, and reads each vision block whole on
-    # every layer kind, past the sliding window.
-    if family == "gemma4_unified" and text_config.get("use_bidirectional_attention", "vision") == "vision":
-        _wrapper_attention(text_fields, _layer_kinds(text_fields), {"bidirectional_blocks": True})
-    if family in QWEN35_TYPES:
-        rope = _records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
-        sections = rope.get("mrope_section", [11, 11, 10])
-        if (not isinstance(sections, (list, tuple)) or len(sections) != 3
-                or any(type(value) is not int or value < 0 for value in sections)):
-            raise ValueError("mrope_section must contain three nonnegative integer widths")
-        _wrapper_attention(text_fields, ("full_attention",), {"mrope_section": list(sections)})
+    # What the wrapper adds to its decoder's kinds, which its writer takes back out
+    # (`wrappers.uncorrected`): one declaration, both ways.
+    layout = decoders.WRAPPER_LAYOUTS.get(str(family))
+    if layout is not None:
+        corrected(layout, text_config, text_fields)
     return text_fields
 
 
