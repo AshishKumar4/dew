@@ -7,6 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Dreamer 4's tokenizer (`CausalTokenizer`) reads its tokens' places by two-axis rotary positions
+  (`positions="rotary"`, the default), as the paper does, and RMS-normalizes its latents before the
+  squeeze; tutorial 12's tokenizer now reconstructs its balls (held-out squared error 0.0067 against
+  the mean frame's 0.14 after 8,000 updates). A run saved before reads `positions="learned"`, as it
+  trained.
 - A decision objective's "none of the above" draws no longer touch a yes-or-no choice by default
   (`none_of_the_above_options` defaults to 3); a run recorded before keeps its recorded floor.
 - A profile window may convert its reports as it stops, in the run's own process (`ProfileWindow(wait=True)`),
