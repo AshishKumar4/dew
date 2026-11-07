@@ -9,17 +9,20 @@ commit d867969800d4a8fd045505eabc65e1e66f30794f, which jax 0.12.0.1 pins.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import functools
 import itertools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 
 import jax
 import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
 
+from dew._devices import xla_flag
+from dew.algebra.terms import parameter_key, parameters_key
 from dew.nn.programs import bodies, called, computed, inlined, named, opaque, platform_branch
 
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
@@ -447,7 +450,7 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
             operands = list(map(read, equation.invars))
             if named(equation.primitive) == "dot_general" and len(operands) == 3:
                 # A product with its bias, as the derivation reads a sum XLA's GEMM computes
-                # (`footprint.biased`): the product of the first two, plus the third.
+                # (`biased`): the product of the first two, plus the third.
                 *operands, bias = operands
                 out = equation.primitive.bind(*operands, **equation.params) + bias
             else:
@@ -460,3 +463,261 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
 def _even(offsets: Sequence[int]) -> bool:
     """Whether `offsets` step by one stride throughout (`get_linear_stride`)."""
     return len({later - earlier for earlier, later in itertools.pairwise(offsets)}) <= 1
+
+
+CUBLAS_OUTPUTS = frozenset({"float8_e4m3fn", "float8_e5m2", "float16", "bfloat16", "float32", "float64",
+                            "complex64"})
+"""The output types cuBLAS computes a product of a matrix and a vector or two matrices in
+(`IsCublasSupportedMatMul`)."""
+
+
+CUBLAS_MATRIX_OUTPUTS = frozenset({"float8_e3m4", "float8_e4m3", "float8_e4m3fnuz", "float8_e5m2fnuz",
+                                   "complex128"})
+"""The output types cuBLAS computes a product of two matrices alone in (`IsCublasSupportedMatMul`)."""
+
+
+LOWERED = {"gpu": "cuda"}
+"""The platform JAX lowers for where a derivation names only its kind (`lowering_platform`)."""
+
+
+GEMM_REWRITE_SIZE = 100
+"""The least a product's non-contracting sizes summed times its contracting size is for XLA to hand it to
+cuBLAS (`xla_gpu_gemm_rewrite_size_threshold`, `kDefaultMinGemmRewriteSize` in
+xla/debug_options_flags.cc); below it XLA's own emitters compute it (`IsMatrixMultiplicationTooSmall
+ForRewriting`, xla/service/gpu/matmul_utils.cc)."""
+
+
+def simplified(program: jcore.Jaxpr, platform: str, lowering: str | None = None) -> jcore.Jaxpr:
+    """`program` as XLA compiles it for `platform`, as JAX lowers it for `lowering` (`compiled`;
+    `platform`'s own name where none is given, a GPU's CUDA's), each equation that repeats another one
+    (`deduplicated`), each sum into a scatter (`folded`) and, on a GPU, each sum a product computes
+    (`biased`) as XLA's simplifiers and its GEMM rewriter make them, the rewriter a GPU's alone, in every
+    program it runs, a loop's body among them, as XLA's passes run over every computation (`throughout`)."""
+    gemm = biased if platform == "gpu" else (lambda each: each)
+    return throughout(lambda each: gemm(folded(deduplicated(each))),
+                      compiled(program, lowering or LOWERED.get(platform, platform)))
+
+
+def throughout(rewrite: Callable[[jcore.Jaxpr], jcore.Jaxpr], program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` rewritten by `rewrite`, and so each program its equations run (a loop's body, a
+    conditional's branches), each rewritten once however many equations run it."""
+    made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]] = {}
+
+    def within(value):
+        if isinstance(value, jcore.Jaxpr):
+            if (held := made.get(id(value))) is not None and held[0] is value:
+                return held[1]
+            # A native kernel's program is no computation XLA's passes run over (`opaque`).
+            inner = rewrite(value.replace(eqns=[equation if opaque(equation) else equation.replace(params={
+                key: within(param) for key, param in equation.params.items()}) for equation in value.eqns]))
+            made[id(value)] = (value, inner)
+            return inner
+        if type(value) in (tuple, list):
+            return type(value)(within(each) for each in value)
+        return value
+
+    return within(program)
+
+
+def biased(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a cuBLAS product (`cublas_product`) read by that sum alone and a value of
+    its type the product's own: a product of three operands, the sum's addend its third, run where the
+    sum ran, as XLA's GEMM rewriter folds the sum into the GEMM, its bias (`FuseMatrixBiasAdd`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc: a GEMM of one user, its beta 1), which writes in the
+    bias's buffer where nothing else reads it (`in_place`). A tiled head's weight gradient adds each
+    tile's product to its loop's carry: Qwen3.5-4B's step under 'full' at two microbatches was derived
+    holding each tile's 2.37 GiB product beside the carry, which XLA's GEMM writes in (row 4089)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    readers = collections.Counter(value for equation in program.eqns for value in equation.invars
+                                  if isinstance(value, jcore.Var))
+    readers.update(value for value in program.outvars if isinstance(value, jcore.Var))
+    dropped: set[int] = set()
+    replaced: dict[int, jcore.JaxprEqn] = {}
+    for equation in program.eqns:
+        if named(equation.primitive) not in ("add", "add_any") or len(equation.invars) != 2:
+            continue
+        out = equation.outvars[0]
+        first, second = equation.invars
+        for made, addend in ((first, second), (second, first)):
+            if not isinstance(made, jcore.Var) or not isinstance(addend, jcore.Var):
+                continue
+            product = producers.get(made)
+            if (product is None or not cublas_product(product) or len(product.invars) != 2
+                    or readers[made] != 1 or made.aval != out.aval or addend.aval != out.aval
+                    or not isinstance(out.aval, ShapedArray) or np.issubdtype(out.aval.dtype, np.integer)
+                    or id(product) in dropped):
+                continue
+            dropped.add(id(product))
+            replaced[id(equation)] = product.replace(invars=[*product.invars, addend], outvars=[out])
+            break
+    if not replaced:
+        return program
+    return program.replace(eqns=[replaced.get(id(equation), equation) for equation in program.eqns
+                                 if id(equation) not in dropped])
+
+
+def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a value and a zero that value (`zeros_added`), and each sum of a value
+    and a scatter-add read by that sum alone a scatter-add into the sum of that value and the scatter's
+    base, the base dropped where it is a zero, as XLA's simplifier folds them (`A + scatter(B, I, U) =>
+    scatter(A + B, I, U)` and `A + 0 => A`, `AlgebraicSimplifierVisitor::HandleAdd`,
+    xla/hlo/transforms/simplifiers/algebraic_simplifier.cc):
+    a tied embedding's gradient, its head's product and the scatter of its rows' cotangents, is one
+    buffer, which the scatter writes in place (`in_place`). Qwen3.5-4B's step under 'full' was derived
+    holding the product, the scatter and their sum at its end, 7.1 GiB against XLA's 4.4 (row 4089)."""
+    program = zeros_added(program)
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    readers = collections.Counter(value for equation in program.eqns for value in equation.invars
+                                  if isinstance(value, jcore.Var))
+    readers.update(value for value in program.outvars if isinstance(value, jcore.Var))
+    dropped: set[int] = set()
+    replaced: dict[int, list[jcore.JaxprEqn]] = {}
+    for equation in program.eqns:
+        if named(equation.primitive) not in ("add", "add_any") or len(equation.invars) != 2:
+            continue
+        first, second = equation.invars
+        for scattered, other in ((first, second), (second, first)):
+            if not isinstance(scattered, jcore.Var):
+                continue
+            scatter = producers.get(scattered)
+            if (scatter is None or named(scatter.primitive) != "scatter-add" or readers[scattered] != 1
+                    or scattered.aval != equation.outvars[0].aval or id(scatter) in dropped):
+                continue
+            base, *rest = scatter.invars
+            if zero(base, producers):
+                summed, sums = other, []
+            else:
+                summed = jcore.Var(equation.outvars[0].aval)
+                sums = [equation.replace(invars=[other, base], outvars=[summed])]
+            dropped.add(id(scatter))
+            replaced[id(equation)] = [*sums, scatter.replace(invars=[summed, *rest],
+                                                             outvars=equation.outvars)]
+            break
+    if not replaced:
+        return program
+    return program.replace(eqns=[each for equation in program.eqns if id(equation) not in dropped
+                                 for each in replaced.get(id(equation), [equation])])
+
+
+def zero(value: jcore.Var | jcore.Literal, producers: Mapping) -> bool:
+    """Whether `value` is a zero: a literal zero, or one broadcast, cast or laid out otherwise (`bitcast`):
+    a scanned head's zero carry, which its loop of one turn, run inline (`compiled_program.once`), reads
+    unstacked."""
+    producer = producers.get(value) if isinstance(value, jcore.Var) else None
+    while producer is not None and producer.invars and (
+            named(producer.primitive) in ("broadcast_in_dim", "convert_element_type") or bitcast(producer)):
+        value = producer.invars[0]
+        producer = producers.get(value) if isinstance(value, jcore.Var) else None
+    return isinstance(value, jcore.Literal) and not np.any(np.asarray(value.val))
+
+
+def zeros_added(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each sum of a value and a zero of its shape that value (`A + 0 => A`,
+    `AlgebraicSimplifierVisitor::HandleAdd`): a tiled head of one tile adds its weight gradient to its
+    loop's zero carry, which its body runs inline (`compiled_program.once`)."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
+    kept = []
+    for equation in program.eqns:
+        operands = [renamed.get(value, value) if isinstance(value, jcore.Var) else value
+                    for value in equation.invars]
+        if named(equation.primitive) in ("add", "add_any") and len(operands) == 2:
+            first, second = operands
+            out = equation.outvars[0]
+            for added, other in ((first, second), (second, first)):
+                if zero(added, producers) and other.aval == out.aval:
+                    renamed[out] = other
+                    break
+            if out in renamed:
+                continue
+        kept.append(equation.replace(invars=operands))
+    if not renamed:
+        return program
+    return program.replace(eqns=kept, outvars=[renamed.get(value, value) if isinstance(value, jcore.Var)
+                                               else value for value in program.outvars])
+
+
+def operand_key(value: jcore.Var | jcore.Literal) -> Hashable:
+    """An equation's operand as two equal equations read it: a variable itself, a literal by its type and
+    value (`parameter_key`)."""
+    if isinstance(value, jcore.Literal):
+        return ("literal", str(value.aval), parameter_key(value.val))
+    return value
+
+
+def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
+    """`program` with each equation that repeats an earlier one, its primitive and parameters over the
+    same operands (`parameters_key`), read as that one, as XLA computes it once (`HloCSE`,
+    xla/hlo/transforms/simplifiers/hlo_cse.cc): a tied head's weights cast for the embedding and cast
+    again for the head are one cast, which the embedding's optimization barrier holds and the head reads
+    (Qwen3.5-4B's fused tiled head, 1.18 GiB derived twice: row 4089). An equation with effects is its
+    own, as XLA's side-effecting instructions are, and so is an optimization barrier, which a recomputed
+    region reads through to be computed again, and one whose parameters hold a function: a callback's is
+    named by its module and qualified name alone (`parameter_key`), which two closures of one factory
+    share, and JAX lowers each callback to a custom call of its own host callback's index
+    (`emit_python_callback`, jax/_src/callback.py), which XLA computes apart."""
+    renamed: dict[jcore.Var, jcore.Var] = {}
+    first: dict[Hashable, list] = {}
+    kept = []
+    for equation in program.eqns:
+        operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
+        own = (equation.effects or named(equation.primitive) == "optimization_barrier"
+               or any(map(callable, equation.params.values())))
+        key = None if own else (parameters_key(equation.primitive, equation.params),
+                                tuple(map(operand_key, operands)))
+        if key is not None and key in first:
+            renamed.update(zip(equation.outvars, first[key], strict=True))
+            continue
+        if key is not None:
+            first[key] = equation.outvars
+        kept.append(equation.replace(invars=operands))
+    return program.replace(eqns=kept, outvars=[renamed.get(value, value) if computed(value) else value
+                                               for value in program.outvars])
+
+
+def cublas_product(equation: jcore.JaxprEqn) -> bool:
+    """Whether XLA hands `equation`, a matrix product, to cuBLAS, which takes a workspace, as the GEMM
+    rewriter asks (xla/backends/gpu/transforms/gemm_rewriter.cc's `HandleDot`): one each of whose
+    operands contracts a dimension, one at least a matrix (its non-contracting sizes not all one), whose
+    output type cuBLAS computes (`IsCublasSupportedMatMul`, xla/service/gpu/ir_emission_utils.cc, its
+    dimensions as XLA's dot decomposition leaves them, one of each kind), and that XLA's own emitters
+    do not take for being too small (`GEMM_REWRITE_SIZE`, or the run's
+    `--xla_gpu_gemm_rewrite_size_threshold`; `IsDotSupportedByClassicalEmitters`, matmul_utils.cc). A
+    product XLA's Triton GEMM fusions take instead takes none, which this does not tell apart: it
+    holds the workspace."""
+    if named(equation.primitive) != "dot_general":
+        return False
+    (left_contracting, right_contracting), (left_batch, right_batch) = equation.params["dimension_numbers"]
+    left, right = dimensions(equation.invars[0]), dimensions(equation.invars[1])
+    if not left_contracting or not right_contracting:
+        return False
+    contracting = int(math.prod(left[axis] for axis in left_contracting))
+    kept_left = int(math.prod(size for axis, size in enumerate(left)
+                              if axis not in (*left_contracting, *left_batch)))
+    kept_right = int(math.prod(size for axis, size in enumerate(right)
+                               if axis not in (*right_contracting, *right_batch)))
+    matrices = (kept_left != 1) + (kept_right != 1)
+    produced = str(element_type(equation.outvars[0]))
+    operands = tuple(str(element_type(value)) for value in equation.invars)
+    supported = (produced in CUBLAS_OUTPUTS or (produced == "int32" and operands == ("int8", "int8"))
+                 or (produced in CUBLAS_MATRIX_OUTPUTS and matrices == 2))
+    if matrices == 0 or not supported:
+        return False
+    threshold = int(xla_flag("xla_gpu_gemm_rewrite_size_threshold") or GEMM_REWRITE_SIZE)
+    classical = produced in ("float16", "float32", "bfloat16") and emitted_algorithm(equation)
+    return (kept_left + kept_right) * contracting >= threshold or not classical
+
+
+def emitted_algorithm(equation: jcore.JaxprEqn) -> bool:
+    """Whether XLA's own emitters compute `equation`'s product at its algorithm
+    (`IsSupportedByElementalIrEmitter`, xla/service/algorithm_util.cc): an unset one, or bf16 or f32
+    operands accumulated in f32."""
+    precision = equation.params.get("precision")
+    if not isinstance(precision, jax.lax.DotAlgorithmPreset):
+        return True
+    return precision.name in ("DEFAULT", "BF16_BF16_F32", "F32_F32_F32")
+
+
+def element_type(value) -> np.dtype | None:
+    """`value`'s element type, none where it is no array."""
+    return value.aval.dtype if isinstance(value.aval, ShapedArray) else None
