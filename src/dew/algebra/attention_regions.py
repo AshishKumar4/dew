@@ -156,7 +156,8 @@ def written(region: Attention) -> Callable:
         mask = None if region.mask is None else _folded(region, _laid_mask(region, next(extra)), q.shape)
         bias = None if region.bias is None else next(extra)
         if bias is not None:
-            bias = _folded(region, jnp.transpose(bias, region.bias_perm) if region.bias_perm else bias, q.shape)
+            laid = jnp.transpose(bias, region.bias_perm) if region.bias_perm else bias
+            bias = _folded(region, laid, q.shape)
         out = scaled_dot_product_attention(q, k, v, causal=region.causal, sliding_window=region.window,
                                            softcap=region.softcap, mask=mask, bias=bias)
         out = out.reshape(*batch, *row_sizes, *heads, out.shape[-1])
