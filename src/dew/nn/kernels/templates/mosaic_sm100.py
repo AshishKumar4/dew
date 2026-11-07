@@ -713,12 +713,13 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     operands_in_registers = False
     products_overlap = False  # each product is awaited where its value is read (`summed`)
 
-    def product_scratch(self, consumers: int) -> tuple:
-        # A consumer's widest accumulator and widest 16-bit register operand side by side, and its barrier.
-        widest = self.widest_product
-        return (accumulator_columns(self.rows, widest * consumers),
-                operand_columns(self.rows, widest * consumers, jnp.bfloat16),
-                plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True))
+    def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> dict:
+        # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
+        # groups, so a narrower product's is no column slice of a wider one's (Mosaic GPU's layout inference
+        # refused one, jsf-tmem4).
+        return {"tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
+                         for width in widths},
+                "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
 
     @contextlib.contextmanager
     def products_in(self, refs):
@@ -728,21 +729,18 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
         finally:
             _PRODUCTS.reset(token)
 
-    def _scratch(self):
-        """This consumer's accumulator, operand and barrier of the program's product scratch."""
+    def _scratch(self, width: int):
+        """The building role's accumulator `width` columns wide and its barrier (`product_scratch`'s)."""
         found = _PRODUCTS.get()
-        if found is None:
-            raise ValueError(f"{self.name}'s products take the program's scratch (`product_scratch`)")
-        accumulators, operands, barriers = found
-        consumer = lax.axis_index("wg")
-        widest = self.widest_product
-        return (accumulators.at[:, pl.ds(consumer * widest, widest)],
-                operands.at[:, pl.ds(consumer * widest, widest)], barriers.at[consumer])
+        if found is None or width not in found["tmem"]:
+            raise ValueError(f"{self.name} has no {width}-column accumulator in its program's product "
+                             f"scratch (`product_scratch`'s widths)")
+        role = mosaic.ROLE.get()
+        return found["tmem"][width][role], found["done"].at[role]
 
     def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
         del interpret
-        accumulators, _, done = self._scratch()
-        tmem = accumulators.at[:, pl.ds(0, shape[1])]
+        tmem, done = self._scratch(shape[1])
         issue(Accumulator(tmem, shape))
         return _awaited(tmem, done)
 
@@ -754,22 +752,12 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
         return dataclasses.replace(acc, accumulate=True)
 
     def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
-        # Each part written into tensor memory and its product issued from there (the TS form), awaited
-        # before the part's tensor memory is given back.
-        _, operands, done = self._scratch()
-        for formed in parts:
-            part = mosaic.unscaled_part(formed)
-            tmem = operands.at[:, pl.ds(0, part.shape[1])]
-            plgpu.async_store_tmem(tmem, part)
-            plgpu.commit_tmem()
-            acc = self.products(acc, Accumulator(tmem, part.shape, dtype=part.dtype), rhs, interpret)
-            plgpu.tcgen05_commit_arrive(done)
-            plgpu.barrier_wait(done)
-        return acc
+        # A 64-row product takes no left operand from tensor memory (tcgen05.py: M=128 alone) nor registers:
+        # its callers stage it (`operands_in_registers` False).
+        raise NotImplementedError(f"{self.name} takes a register left operand staged (`Family.staged`)")
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        return self.summed((lhs.shape[0], rhs.shape[1]),
-                           lambda acc: self.register_products(acc, (lhs,), rhs, interpret), interpret)
+        return self.register_products(None, (lhs,), rhs, interpret)
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
         def issue(acc):
@@ -782,7 +770,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
     def added_into(self, acc: Accumulator, value: jax.Array, interpret: bool) -> Accumulator:
         # Its products done (a commit awaited), its value read, `value` added, written back.
         del interpret
-        _, _, done = self._scratch()
+        _, done = self._scratch(acc.shape[1])
         plgpu.tcgen05_commit_arrive(done)
         plgpu.barrier_wait(done)
         plgpu.async_store_tmem(_tensor_memory(acc), _read(_tensor_memory(acc)) + value)
@@ -790,7 +778,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[jax.Array]):
         return dataclasses.replace(acc, accumulate=True)
 
     def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
-        _, _, done = self._scratch()
+        _, done = self._scratch(acc.shape[1])
         plgpu.tcgen05_commit_arrive(done)
         plgpu.barrier_wait(done)
         plgpu.async_store_tmem(_tensor_memory(acc), scale(_read(_tensor_memory(acc))))

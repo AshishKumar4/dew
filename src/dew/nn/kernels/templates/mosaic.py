@@ -306,12 +306,25 @@ class Exchange:
         self.family.turn(self.read, self.consumers, wait=False)
 
 
+ROLE: contextvars.ContextVar[int] = contextvars.ContextVar("role", default=0)
+"""The consumer role a program's code is built for (`per_role`'s static index, the first where one role
+runs): the role's own share of what the program holds a role each (`Issuer.product_scratch`)."""
+
+
 def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
     """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
-    index: Mosaic GPU slices a swizzled tile only at static columns (a role's share of a block's, shared
-    keys at width 256: offsets from the traced index spilled 20 bytes, a static role's none)."""
+    index (`ROLE` while it is built): Mosaic GPU slices a swizzled tile only at static columns (a role's
+    share of a block's, shared keys at width 256: offsets from the traced index spilled 20 bytes, a static
+    role's none)."""
     for role in range(roles):
-        pl.when(index == role)(functools.partial(run, role, index))
+        def built(role=role):
+            token = ROLE.set(role)
+            try:
+                run(role, index)
+            finally:
+                ROLE.reset(token)
+
+        pl.when(index == role)(built)
 
 
 def unwalked(family: "Family") -> Callable:
@@ -1343,12 +1356,12 @@ class Issuer[Accumulator](abc.ABC):
     def column(self) -> plgpu_core.SomeLayout:
         """A column vector's layout: the accumulator's reduced over its rows."""
 
-    def product_scratch(self, consumers: int) -> tuple:
-        """The memory a program's products take where the issuer scopes each product's accumulator itself
-        (tcgen05's chunks: tensor memory and a tensor-core barrier, a consumer each), allocated at the
-        program's scope, which a role's own scope may not allocate (Mosaic GPU's thread axis); none where
-        its products need none."""
-        del consumers
+    def product_scratch(self, consumers: int, widths: tuple[int, ...]) -> tuple | dict:
+        """The memory a program's products take where the issuer keeps each product's accumulator itself
+        (tcgen05's chunks: tensor memory of each product width in `widths` and a tensor-core barrier, a
+        consumer role each), allocated at the program's scope: a role's own scope may not allocate (Mosaic
+        GPU's thread-collective allocations wait for every warpgroup); none where its products need none."""
+        del consumers, widths
         return ()
 
     @contextlib.contextmanager
