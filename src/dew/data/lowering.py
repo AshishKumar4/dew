@@ -1906,20 +1906,20 @@ class _Build:
         if isinstance(stage, Repeat):
             certain = not any(_drops(written) for written in pipeline.stages[:at])
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
+        from dew.data.ordering import WindowShuffle
+
         if isinstance(stage, Shuffle) and _completes(pipeline, at):
             # Each example's count waits for every window holding a piece of it (`dew.data.completion`).
             units = Numbered(_as_iter(rows, self.loading), reach=_reach(pipeline, at))
             if self.read == "memory":
                 return released(units, stage.window, stage.seed)
             if stage.window is not None:
-                drawn = gx.WindowShuffleIterDataset(units, window_size=stage.window, seed=stage.seed)
+                drawn = WindowShuffle(units, window=stage.window, seed=stage.seed)
                 return Completed(drawn)
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:
-            rows = gx.WindowShuffleIterDataset(
-                _as_iter(rows, self.loading), window_size=stage.window, seed=stage.seed
-            )
+            rows = WindowShuffle(_as_iter(rows, self.loading), window=stage.window, seed=stage.seed)
         elif isinstance(stage, (Shuffle, Slice)):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} needs an indexed pipeline")
