@@ -1086,7 +1086,7 @@ def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
     )
 
 
-def row_field(column: object, rows: int) -> bool:
+def row_field(column, rows: int) -> bool:
     """Whether a batch's field `column` holds one value a row of its `rows` (`rows_of`): a list or tuple of
     that many, an array along its leading axis; any other field holds one value for the whole step (a
     step-wide array, a shared conditioning row, a host count, `dew.batch.ConsumedCount`). The one test of
