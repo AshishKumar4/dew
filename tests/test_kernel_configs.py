@@ -957,6 +957,14 @@ def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
     _assert_launches("sm90", "nvfp4 16 rows", functools.partial(_nvfp4_projected, 16, None), 1, "dew_gmm")
 
 
+def test_a_hoppers_nvfp4_prefill_shares_its_stage_decode():
+    """An NVFP4 projection at a prefill's 4096 rows on a compile-only H100, its packed kernel named: its
+    consumers share each stage's decode, each its share of the columns, meeting at a named barrier
+    (`mosaic_gpu._shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
+    _assert_launches("sm90", "nvfp4 4096 rows", functools.partial(_nvfp4_projected, 4096, "packed"), 1,
+                     "dew_gmm")
+
+
 def _gathered_projection():
     """An expert projection of gathered rows (`gemm.gemm`'s `gather`: Qwen3-30B-A3B's gate|up, 2048 deep and
     768 wide, eight experts, 1024 tokens of top-2 slots), its tokens read where they lie."""
