@@ -333,6 +333,62 @@ class HostWalks:
         return self.x[:, None].copy()
 
 
+class Lent:
+    """A buffer a simulator lends through DLPack, another framework's array as it hands it over."""
+
+    def __init__(self, held: np.ndarray):
+        self.held = held
+
+    def __dlpack__(self, **options):
+        return self.held.__dlpack__(**options)
+
+    def __dlpack_device__(self):
+        return self.held.__dlpack_device__()
+
+
+class ReusingWalks(HostWalks):
+    """`HostWalks` answering every observation and reward from one buffer each, lent through DLPack and
+    written again in place every step, as a GPU simulator's fixed output buffers are."""
+
+    def __init__(self, count: int, length: int):
+        super().__init__(count, length)
+        self.observed, self.rewarded = np.zeros((count, 1), np.float32), np.zeros(count, np.float32)
+
+    def _lent(self, observation) -> Lent:
+        self.observed[...] = observation
+        return Lent(self.observed)
+
+    def reset(self, seed: int):
+        return self._lent(super().reset(seed))
+
+    def step(self, action):
+        following = super().step(action)
+        self.rewarded[...] = following.reward
+        return TimeStep(self._lent(following.observation), Lent(self.rewarded), following.terminated,
+                        following.truncated)
+
+    def restart(self, mask):
+        return self._lent(super().restart(mask))
+
+
+def test_a_simulator_writing_each_step_into_one_buffer_records_every_step_it_answered():
+    """A simulator that lends its observations and rewards from the same buffers every step, writing each
+    step over the last (`ReusingWalks`), records what the same walks answered in fresh arrays record, every
+    step's observation and reward bit for bit: a rollout keeps an owned copy of each step it takes in
+    (`dew.rl.simulator.taken`), not a view a later step overwrites (row 4641)."""
+    from dew.rl.simulator import simulator_rollout, simulator_start
+
+    recorded = []
+    for simulator in (HostWalks(5, 3), ReusingWalks(5, 3)):
+        carry = simulator_start(simulator, jax.random.key(4))
+        recorded.append(simulator_rollout(simulator, pushes, None, carry, 11)[1])
+    fresh, reused = recorded
+    np.testing.assert_array_equal(reused.observation, fresh.observation)
+    for name in ("observation", "reward"):
+        np.testing.assert_array_equal(getattr(reused.following, name), getattr(fresh.following, name))
+    assert np.unique(np.asarray(fresh.observation), axis=0).shape[0] > 1
+
+
 @contextlib.contextmanager
 def kept_as_left(walks):
     """A host simulator's walks stepped in a cooldown branch, then put back as the run left them: their
