@@ -1006,6 +1006,21 @@ def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
         assert keyed.heuristics_config == ba.heuristics_config
 
 
+@pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
+def test_a_backward_config_on_a_family_the_device_lacks_is_illegal(accurate):
+    """An A100's backward at a config of an H100's families (wgmma, its dK/dV launch on wgmma.fed) is not
+    legal (`MosaicBackward.legal`): the device has no bundle of them, so its legality refuses it, as the
+    attention matrix's cells of two launches ask of every generation (tests/attention_matrix.py), and its
+    derived config is legal there."""
+    two = attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, dkv_family="wgmma.fed", dkv_consumers=2)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, ba = _backward_call(SHAPES["interpreted"], 128, accurate=accurate)
+        derived = op.derived(ba, target)
+        assert derived is not None and op.legal(ba, derived, target)
+        assert not op.legal(ba, two, target)
+
+
 def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
     """A config a pin or a stored pick names is held to the tiles a program takes (`whole_tiles`) as a
     derived one is: an 8-query tile under a family's 16- or 64-row products, or three consumers where the
