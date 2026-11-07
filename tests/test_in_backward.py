@@ -99,13 +99,21 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
                     truth_fn=jax.jit(whole_step(wide, widened(layered))))
 
 
+EIGHT_BIT = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8")
+"""Adamw keeping its moments in 8 bits (`OptimConfig.state_dtype`), codes and their blocks' scales no
+backward writes as a float cotangent: its step takes the whole gradient first."""
+
+
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("optimizer", [ADAMW, GROUPED], ids=["adamw", "groups"])
-def test_a_scanned_steps_runs_update_in_their_backward_and_train(optimizer):
-    """A one-stage step over a decoder that scans its layers, under an update that reads each gradient
-    alone (adamw, whole or by groups), updates its runs in their backward (`Transaction.planned`): it moves
-    their weights and moments, advances the optimizer's count once, and its loss falls."""
-    run = trainer(decoder(scan=True), optimizer)
+@pytest.mark.parametrize("optimizer, wider", [(ADAMW, {}), (GROUPED, {}),
+                                              (EIGHT_BIT, {"emb_features": 64, "mlp_features": 256})],
+                         ids=["adamw", "groups", "8-bit"])
+def test_a_scanned_steps_runs_train_under_each_update(optimizer, wider):
+    """A one-stage step over a decoder that scans its layers trains under each update: one that reads each
+    gradient alone (adamw, whole or by groups) updates its runs in their backward (`Transaction.planned`),
+    and one keeping its layers' moments in 8 bits takes the whole gradient first. Each moves the runs'
+    weights, advances the optimizer's count once a step, and its loss falls."""
+    run = trainer(decoder(scan=True, **wider), optimizer)
     state, _, _ = run.place()
     before = jax.device_get(state.variables["params"]["stages"])
     batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
@@ -137,24 +145,3 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
         held.append(compile_ahead(run, token_rows(VOCAB, 1, SEQ + 1)).temp_bytes)
     plain, scanned = held
     assert scanned <= plain, (scanned, plain)
-
-
-@pytest.mark.mesh(devices=8)
-def test_a_scanned_step_keeping_8_bit_moments_trains():
-    """A scanned step whose optimizer keeps its layers' moments in 8 bits (`OptimConfig.state_dtype`), codes
-    and their blocks' scales no backward writes as a float cotangent, takes the whole gradient first, and
-    trains: its loss falls and its runs' weights move."""
-    run = trainer(decoder(scan=True, emb_features=64, mlp_features=256),
-                  OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8"))
-    state, _, _ = run.place()
-    before = jax.device_get(state.variables["params"]["stages"])
-    batch = shard_batch(run.device_mesh, token_rows(VOCAB, BATCH, SEQ + 1))
-    step = run.compile(state, batch)
-    losses, moved = [], state
-    for _ in range(3):
-        moved, loss, *_ = step(moved, batch)
-        losses.append(float(loss))
-    assert losses[-1] < losses[0], losses
-    after = jax.device_get(moved.variables["params"]["stages"])
-    assert all(not np.array_equal(old, new)
-               for old, new in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True))
