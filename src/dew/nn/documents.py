@@ -80,8 +80,12 @@ def _padding_last(ids: jax.Array) -> jax.Array:
 
 
 def _searched(ordered: jax.Array, wanted: jax.Array, side: str) -> jax.Array:
-    """Each of `wanted` `[B, N]`'s position in its row of `ordered` `[B, M]` (`jnp.searchsorted`)."""
-    return jax.vmap(lambda row, ids: jnp.searchsorted(row, ids, side=side))(ordered, wanted)
+    """Each of `wanted` `[B, N]`'s position in its row of `ordered` `[B, M]` (`jnp.searchsorted`), its binary
+    search unrolled into one program: the default's loop ran each of its log2(M) trips as a launch of its
+    own, a GPU's loop iteration each (M-DD-10, W63-gh200: a speculative verify of 4 queries over 4096 keys
+    284 us against its 22 us attention)."""
+    return jax.vmap(lambda row, ids: jnp.searchsorted(row, ids, side=side, method="scan_unrolled"))(ordered,
+                                                                                                    wanted)
 
 
 def query_order(ids: jax.Array) -> jax.Array:
