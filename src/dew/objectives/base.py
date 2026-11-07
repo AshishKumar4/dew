@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, SavedRun, TextGeneration
     from dew.inputs import InputSpec
     from dew.interop.layouts import Unwritable
+    from dew.interop.pretrained import Pretrained
     from dew.interop.releases import ReleasePlan
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
@@ -676,6 +677,15 @@ class ReleasedTask(SavedTask, Protocol):
     def unstated(cls, run: SavedRun) -> Unwritable | None:
         """Why its release does not state `run`'s model, read off the run's record before its weights are;
         None where it does."""
+        ...
+
+    @classmethod
+    def source_of(cls, run: SavedRun, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+                  dtype: DTypeLike | None, param_dtype: DTypeLike | None) -> Pretrained:
+        """`run`, a step its native release holds (`dew.inference.models.ReleasedRun`), as the source a
+        run that names it starts from (`dew.interop.pretrained.Pretrained.load`): its task's bundle,
+        its weights placed on `mesh` under `layout`, computing in `dtype` and stored in `param_dtype`
+        where given; refused where its task has no bundle a run starts from."""
         ...
 
 
