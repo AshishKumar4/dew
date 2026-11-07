@@ -603,12 +603,13 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
     row's other operands bound by their shapes (a weight of the row's width, a gate of its shape), the
     region's scalar constants each an epsilon, and the call's choices (the weight's offset, its side of the
     cast, the gate's activation) each tried; the earliest row and the latest result first, so the largest
-    region the e-graph proves is the one written. A row made by a sum the body reads on is tried as a
+    region the e-graph proves is the one written. A row is a value its statistic's sum is made from by
+    equations of one operand each (a cast, a square: `_summed_rows`). A row made by a sum the body reads on
+    is tried as a
     stream's too, the sum among the results. The weight's side of the cast and its association (folded
     into the inverse first, Flax's `x (r w)`, `weight_first`) are each the call's own choices."""
     anchor = index.jaxpr.eqns[place].outvars[0]
-    rows = sorted(((distance, var) for var, distance in _backward(index, anchor).items()
-                   if var is not anchor and var.aval.ndim >= 1), key=lambda pair: -pair[0])
+    rows = [(0, row) for row in _summed_rows(index, anchor)]
     outputs = sorted(((distance, var) for var, distance in _forward(index, anchor).items()
                       if var is not anchor and var.aval.ndim >= 1), key=lambda pair: -pair[0])
     for (_, row), (_, output) in itertools.product(rows, outputs):
@@ -786,6 +787,23 @@ def _chain(index: fusion.Index, var: jcore.Var, reach: int = 3) -> list[jcore.Va
     return _sources(index, var, reach)[::-1]
 
 
+def _summed_rows(index: fusion.Index, anchor: jcore.Var) -> list[jcore.Var]:
+    """The rows an inverse square root's statistic may be read from, farthest first: for each sum of a value
+    of at least one axis among the anchor's sources (`_backward`), that value and the values it is made from
+    by equations of one non-constant operand each (a cast, a square, a layout: `_sources`), those of the
+    summed value's shape."""
+    rows: dict[jcore.Var, None] = {}
+    for var in _backward(index, anchor):
+        made = index.producer.get(var)
+        if made is None or jax_name(index.jaxpr.eqns[made].primitive) != "reduce_sum":
+            continue
+        summed = index.jaxpr.eqns[made].invars[0]
+        if isinstance(summed, jcore.Var):
+            rows.update(dict.fromkeys(source for source in _sources(index, summed, REACH)
+                                      if source.aval.shape == summed.aval.shape))
+    return list(rows)
+
+
 def _sources(index: fusion.Index, var: jcore.Var, reach: int) -> list[jcore.Var]:
     """`var` and the values it is made from by up to `reach` equations of one operand each (a scale by a
     constant, a cast, a layout), farthest first."""
@@ -794,8 +812,8 @@ def _sources(index: fusion.Index, var: jcore.Var, reach: int) -> list[jcore.Var]
         place = index.producer.get(current)
         if place is None:
             break
-        operands = [atom for atom in index.jaxpr.eqns[place].invars
-                    if isinstance(atom, jcore.Var) and not _constant(index, atom)]
+        operands = list(dict.fromkeys(atom for atom in index.jaxpr.eqns[place].invars
+                                      if isinstance(atom, jcore.Var) and not _constant(index, atom)))
         if len(operands) != 1:
             break
         current = operands[0]
