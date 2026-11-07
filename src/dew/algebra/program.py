@@ -264,7 +264,8 @@ def structure(window: jcore.Jaxpr) -> Hashable:
     for equation in window.eqns:
         equations.append((terms.parameters_key(equation.primitive, equation.params),
                           tuple(map(operand, equation.invars)), tuple(var.aval for var in equation.outvars)))
-        position.update({var: len(position) for var in equation.outvars})
+        for var in equation.outvars:
+            position[var] = len(position)
     return tuple(var.aval for var in window.invars), tuple(equations), tuple(map(operand, window.outvars))
 
 

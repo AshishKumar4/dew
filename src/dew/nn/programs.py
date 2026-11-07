@@ -9,12 +9,15 @@ which branch a platform runs and which bodies XLA sees.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TypeGuard
 
 import jax
 import jax.extend.core as jcore
+import jax.numpy as jnp
+from jax._src import mesh as mesh_lib
 from jax.interpreters import ad
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
@@ -208,3 +211,41 @@ def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
             len(equation.invars), len(equation.outvars)):
         return found[0]
     return None
+
+
+def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | None:
+    """`primitive`'s outputs over concrete `operands`, computed as this host computes a constant: at compile
+    time, on its CPU, outside any mesh a program traces under and without the outputs' stated shardings
+    (`_on_host`); None where an operand is an array this process cannot read whole (one laid across another
+    process's devices), or an operand or output is of an extended dtype (a PRNG key, which no host array
+    holds), neither a constant of this host. The one evaluator of a program's constants, the compile
+    point's and a compiled program's plan alike."""
+    if any((isinstance(value, jax.Array) and not value.is_fully_addressable) or _extended(value)
+           for value in operands):
+        return None
+    params = {name: None if name in ("sharding", "out_sharding") else value for name, value in params.items()}
+    with _on_host():
+        made = primitive.bind(*operands, **params)
+    made = list(made) if primitive.multiple_results else [made]
+    return None if any(map(_extended, made)) else made
+
+
+def _extended(value) -> bool:
+    """Whether `value` is of an extended dtype (a PRNG key's)."""
+    return jax.dtypes.issubdtype(getattr(value, "dtype", None) or jnp.result_type(value), jax.dtypes.extended)
+
+
+@contextlib.contextmanager
+def _on_host() -> Iterator[None]:
+    """Compile-time evaluation on this host's CPU, no mesh in context, abstract or concrete: a step traced
+    under its devices' mesh (`jax.set_mesh`, a compile-only TPU topology's, a multi-process one's) would
+    place an eager primitive's operands on devices that run nothing here. `jax.set_mesh(None)` does the
+    same swaps but refuses to run under a trace, which a program's rewrite may be."""
+    abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
+    concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
+    try:
+        with jax.ensure_compile_time_eval(), jax.default_device(jax.devices("cpu")[0]):
+            yield
+    finally:
+        mesh_lib.device_context.set_local(concrete)
+        mesh_lib.abstract_mesh_context_manager.set_local(abstract)
