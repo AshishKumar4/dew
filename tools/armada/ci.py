@@ -370,11 +370,8 @@ def contents(name: str) -> bytes:
 
 def probed(path: Path) -> bytes:
     """What an existence or size probe (followed.py's `PROBES`) answers of `path`: missing, a directory, or a
-    file with whether it executes and, but for a Python module, its size, the stat a probe reads beside its
-    kind. Its bytes are none of it: a file's edit of the same size reruns no prober, which reads it only by
-    opening it, its own input; its times are no checkout's to keep. A module's size is what its comments
-    make it, and its code is the input of whatever runs it (`code_unit`): `inspect.getsourcefile` probes
-    each module it names (train 668: a helper's comment edit re-keyed its 458 probers)."""
+    file, whether it executes and, but for a Python module (its code its runners' input, `code_unit`), its
+    size; never its bytes or times (train 668: a probed helper's comment edit re-keyed its 458 probers)."""
     if path.is_dir():
         return b"directory"
     if not path.is_file():
@@ -410,7 +407,24 @@ class Reading:
 
     parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
     modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
+    durations: dict[str, dict[str, float]] | None = None
+    cuts: dict[tuple[str, int], list[list[str]]] = dataclasses.field(default_factory=dict)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def cut(self, name: str, count: int) -> list[list[str]]:
+        """File `name`'s tests cut into `count` groups (`members`), the record parted by file once a reading
+        and each cut once (train 662's plan: 3,620 group keys each parsed the record, a minute of two)."""
+        if self.durations is None:
+            self.durations = {}
+            for node, seconds in durations_record().items():
+                self.durations.setdefault(node.split("::")[0], {})[node] = seconds
+        if (name, count) not in self.cuts:
+            held = sites(name)
+            recorded = {node: seconds for node, seconds in self.durations.get(name, {}).items()
+                        if session.test_name(node) not in held}
+            ordered = sorted(recorded)
+            self.cuts[(name, count)] = session.cut(ordered, [recorded[node] for node in ordered], count)
+        return self.cuts[(name, count)]
 
     def part(self, path: str) -> bytes:
         """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`contents`)."""
@@ -449,7 +463,7 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     if SITE.fullmatch(split):
         digest.update(split.encode())
     elif split and split != COLLECT:
-        digest.update(split.encode() + json.dumps(members(name, split)).encode())
+        digest.update(split.encode() + json.dumps(members(name, split, reading)).encode())
     return digest.hexdigest()
 
 
@@ -723,15 +737,16 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
     one reading of the inputs (`Reading`)."""
     for each in classes:
         found = recorded(record_key(python, row(python, name, split), each, common), token)
-        if found is not None and fresh(found, name, common, reading):
+        if found is None or found["depends"] is None:
+            continue
+        # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
+        # these, kept by that key (`green_key`) whatever ran since.
+        key = cache_key(common, name, split, found["depends"], reading)
+        if found["key"] is not None and found["key"] == key:
             return found
-        # The last run's record is another commit's: its file's inputs, as that run found them, hashed
-        # here, name the green run of exactly these, kept by its key (`green_key`) whatever ran since.
-        if found is not None and found["depends"] is not None:
-            key = cache_key(common, name, split, found["depends"], reading)
-            kept = recorded(green_key(python, row(python, name, split), each, key), token)
-            if kept is not None and kept["key"] == key:
-                return kept
+        kept = recorded(green_key(python, row(python, name, split), each, key), token)
+        if kept is not None and kept["key"] == key:
+            return kept
     return None
 
 
@@ -794,16 +809,13 @@ def durations_record() -> dict[str, float]:
     return json.loads(session.DURATIONS.read_text()) if session.DURATIONS.is_file() else {}
 
 
-def members(name: str, split: str) -> list[str]:
+def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
     """The node ids of test file `name`'s recorded tests that split.py cuts into group `split` ("G/N"):
     the file's entries in the durations record in node-id order, but its check-1 sites', which its groups set
-    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together."""
-    held = sites(name)
-    recorded = {node: seconds for node, seconds in durations_record().items()
-                if node.split("::")[0] == name and session.test_name(node) not in held}
-    ordered = sorted(recorded)
+    aside (`selected`), cut by their seconds (`session.cut`), a shared setup's tests together; as `reading`
+    cuts them, once a reading (`Reading.cut`)."""
     index, count = (int(part) for part in split.split("/"))
-    return session.cut(ordered, [recorded[node] for node in ordered], count)[index - 1]
+    return (Reading() if reading is None else reading).cut(name, count)[index - 1]
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
@@ -1594,12 +1606,10 @@ def dumped(done: subprocess.Popen, stacks: Path) -> str:
 
 def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
                stacks: Path) -> tuple[int, str, bool, str, set[str] | None]:
-    """A task's pytest `command` run under `environment` to its `deadline`: its exit code, its output,
-    whether it passed the deadline, every thread's stack then (`dumped`), and the data files its processes
-    opened (`watched`), none where one of its group outlived the kill and may open more. pytest leads a
-    process group of its own, so what its tests start ends with it. Its output is streamed as it comes by a
-    reader of its own, which nothing waits on past pytest's end: a test's child holding the pipe open (a
-    pool worker, a server) cannot keep the verdict from being written."""
+    """A task's pytest `command` run to its `deadline`: its exit code, output, whether it passed the deadline,
+    its threads' stacks then (`dumped`) and the data files it opened (`watched`), none where its group
+    outlived the kill. pytest leads its own process group; its output streams through a reader nothing
+    waits on past its end, so a child holding the pipe open cannot keep the verdict from being written."""
     lines: list[str] = []
     # Every data file the task's processes open, held from before pytest starts until its group stopped
     # (`watched`): each is the input of every file the task runs.
@@ -1656,10 +1666,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
-    # A task that resumes keeps its progress (progress.py) and, recalled before, sets aside by their exact ids
-    # the tests its attempt passed (`resumed`, progress.py's `SET_ASIDE`), their seconds kept for the rows. A
-    # check-1 site's map task, whose artifacts are its judge's draws alone, a release check and a traced run
-    # resume none, and keep none.
+    # A resuming task keeps its progress and sets aside the tests its recalled attempt passed (`resumed`,
+    # SET_ASIDE); a site's map task (its artifacts its judge's draws), a release and a trace resume none.
     resumes = site is None and not release and coverage is None
     done_before = resumed(tests) if resumes else {}
     aside = out.with_name(f"{out.name}.set-aside.json")
