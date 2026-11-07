@@ -1287,9 +1287,12 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
     spilling = {name: kernels for name, kernels in spilling.items() if kernels}
     if not spilling:
         return cases, found
-    for name, kernels in spilling.items():
-        bound, tiles = launched[name]
-        report.refuse_launch(template.MOSAIC, bound, tiles, kernels)
+    # Refused as the run's compile refuses them: under the target, whose capacities the launch's identity
+    # reads.
+    with generation.assumed(generation.gpu_target(target)):
+        for name, kernels in spilling.items():
+            bound, tiles = launched[name]
+            report.refuse_launch(template.MOSAIC, bound, tiles, kernels)
     plans.clear()
     refused.clear()
     apart.clear()
