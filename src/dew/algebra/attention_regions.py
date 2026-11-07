@@ -24,7 +24,6 @@ with the program's own (check 1), not bitwise.
 
 from __future__ import annotations
 
-import collections
 import math
 from collections.abc import Callable
 from typing import NamedTuple
@@ -41,6 +40,16 @@ MASK_ENTRIES = 1 << 26
 XLA's."""
 
 CASTS = frozenset({"convert_element_type"})
+
+
+def _widening(source: np.dtype, target: np.dtype) -> bool:
+    """A float cast to a float of at least as many bits: every value kept."""
+    return _floating(source, target) and target.itemsize >= source.itemsize
+
+
+def _floating(source: np.dtype, target: np.dtype) -> bool:
+    """A cast between floats (Flax's sum widened, then narrowed back to the weights' dtype)."""
+    return all(jnp.issubdtype(dtype, jnp.floating) for dtype in (source, target))
 
 
 class Attention(NamedTuple):
@@ -70,10 +79,10 @@ class Attention(NamedTuple):
     out_dtype: np.dtype
 
 
-def regions(jaxpr: jcore.Jaxpr) -> list[Attention]:
-    """Every attention region of `jaxpr` (the module's account), the first found where two would share an
-    equation."""
-    graph = _Graph(jaxpr)
+def regions(index) -> list[Attention]:
+    """Every attention region of the body `index` reads (`fusion.Index`; the module's account), the first
+    found where two would share an equation."""
+    graph, jaxpr = _Graph(index), index.jaxpr
     found, claimed = [], set()
     for place, equation in enumerate(jaxpr.eqns):
         if jax_name(equation.primitive) != "exp":
@@ -126,17 +135,13 @@ def taken(region: Attention) -> bool:
 
 
 class _Graph:
-    """A body's producers and readers."""
+    """A body's index (`fusion.Index`: its producers, readers and returned values) with the reads this
+    module's matcher takes: an equation by its primitive, a value past the casts a rule admits, and a value
+    the program makes from no input."""
 
-    def __init__(self, jaxpr: jcore.Jaxpr):
-        self.jaxpr = jaxpr
-        self.producer = {var: place for place, eqn in enumerate(jaxpr.eqns) for var in eqn.outvars}
-        self.readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
-        for place, eqn in enumerate(jaxpr.eqns):
-            for var in eqn.invars:
-                if isinstance(var, jcore.Var):
-                    self.readers[var].add(place)
-        self.escaping = {var for var in jaxpr.outvars if isinstance(var, jcore.Var)}
+    def __init__(self, index):
+        self.jaxpr, self.producer, self.readers, self.escaping = (index.jaxpr, index.producer, index.readers,
+                                                                  index.escaping)
         self._constants: dict[jcore.Var, object] = {}
 
     def made(self, atom, *names: str):
@@ -146,12 +151,26 @@ class _Graph:
             return None
         return place
 
-    def uncast(self, atom, places: list[int]):
-        """`atom` past the casts that made it, their places added to `places`."""
+    def uncast(self, atom, places: list[int], admits: Callable[[np.dtype, np.dtype], bool]):
+        """`atom` past the casts that made it, each from the dtype its input holds to its own where `admits`
+        the pair, their places added to `places`; at the first cast it does not admit, that cast's output."""
         while (place := self.made(atom, *CASTS)) is not None:
+            source = self.jaxpr.eqns[place].invars[0]
+            if not admits(np.dtype(source.aval.dtype), np.dtype(atom.aval.dtype)):
+                break
             places.append(place)
-            atom = self.jaxpr.eqns[place].invars[0]
+            atom = source
         return atom
+
+    def excluding(self, atom, dtype) -> bool:
+        """Whether `atom` is a constant scalar no logit of `dtype` lies under: -inf, or a sentinel at least
+        half `dtype`'s most negative finite value (jax's and Flax's `finfo.min` fills), whose exponential
+        beside any finite logit's is zero."""
+        value = self.constant(atom)
+        if value is None or np.ndim(value) != 0:
+            return False
+        value = float(value)
+        return value == -math.inf or value <= 0.5 * float(np.finfo(dtype).min)
 
     def constant(self, atom):
         """`atom`'s value where no input of the program makes it (literals and iotas through any equation
@@ -210,12 +229,17 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
         return None
     (reader,) = graph.readers[weights]
     if jax_name(eqns[reader].primitive) in CASTS:
+        # The weights cast once, to the values' dtype, as both spellings narrow them for the product.
+        cast_to = np.dtype(eqns[reader].outvars[0].aval.dtype)
+        if not _floating(np.dtype(weights.aval.dtype), cast_to):
+            return None
         places.append(reader)
         weights = eqns[reader].outvars[0]
         if len(graph.readers[weights]) != 1:
             return None
         (reader,) = graph.readers[weights]
-    if jax_name(eqns[reader].primitive) != "dot_general":
+    if jax_name(eqns[reader].primitive) != "dot_general" or any(
+            np.dtype(var.aval.dtype) != np.dtype(weights.aval.dtype) for var in eqns[reader].invars):
         return None
     product = (reader, weights)
     second, weights_read = product
@@ -239,58 +263,93 @@ def _matched(graph: _Graph, exp_place: int) -> Attention | None:
 
 def _rows_maximum(graph: _Graph, centre, logits, scaled, perm: tuple[int, ...],
                   places: list[int]) -> int | None:
-    """The keys axis (the softmax's layout, `logits`') where `centre` is the logits' largest over it,
-    broadcast back, held from its gradient, raised to a constant (jax.nn's `initial`) and laid out again in
-    any order, through casts: a maximum of `logits` itself, or of `scaled` before the layout `perm` moved it
-    (jax.nn's vmapped softmax over a grouped call); None where it is not."""
-    eqns, atom = graph.jaxpr.eqns, centre
+    """The keys axis (the softmax's layout, `logits`') where `centre` is the logits' largest over it, each
+    row's own (`_back_to_rows`): broadcast back, held from its gradient, raised to an excluding initial
+    value (jax.nn's -inf), laid out again and widened, in any order; a maximum of `logits` itself, or of
+    `scaled` before the layout `perm` moved it (jax.nn's vmapped softmax over a grouped call). None where it
+    is not."""
+    eqns, atom, chain = graph.jaxpr.eqns, centre, []
     while True:
         place = graph.made(atom, "broadcast_in_dim", "stop_gradient", "max", "transpose", *CASTS)
         if place is None:
             break
         eqn = eqns[place]
-        if jax_name(eqn.primitive) == "max":
+        name = jax_name(eqn.primitive)
+        if name == "max":
             a, b = eqn.invars
             constant, atom = (a, b) if graph.constant(a) is not None else (b, a)
-            if graph.constant(constant) is None or np.ndim(graph.constant(constant)) != 0:
+            if not graph.excluding(constant, logits.aval.dtype):
                 return None
         else:
+            if name in CASTS and not _widening(np.dtype(eqn.invars[0].aval.dtype), np.dtype(atom.aval.dtype)):
+                return None
             atom = eqn.invars[0]
-        places.append(place)
+        chain.append(place)
     reduced = graph.made(atom, "reduce_max")
     if reduced is None or len(eqns[reduced].params["axes"]) != 1:
         return None
-    axis, read = int(eqns[reduced].params["axes"][0]), eqns[reduced].invars[0]
+    reduce_axis, read = int(eqns[reduced].params["axes"][0]), eqns[reduced].invars[0]
     if read is logits:
-        places.append(reduced)
-        return axis
-    if read is graph.uncast(scaled, []) or read is scaled:
-        places.append(reduced)
-        return perm.index(axis)
-    return None
+        axis, labels = reduce_axis, [a for a in range(read.aval.ndim) if a != reduce_axis]
+    elif read is scaled:
+        axis = perm.index(reduce_axis)
+        labels = [perm.index(a) for a in range(read.aval.ndim) if a != reduce_axis]
+    else:
+        return None
+    if not _back_to_rows(eqns, chain[::-1], labels, centre, axis):
+        return None
+    places += [*chain, reduced]
+    return axis
+
+
+def _back_to_rows(eqns, chain: list[int], labels: list[int], value, axis: int) -> bool:
+    """Whether a row reduction's value (its axes `labels`: the softmax axes they hold, the reduced `axis`
+    gone), through `chain`'s equations in order (transposes, broadcasts, casts, holds and maxima of a
+    scalar), reaches `value` laid along the softmax's axes again: each of its axes but `axis` the same axis,
+    `axis` a broadcast one. A sum or maximum broadcast to another row's place (`[None, :]` of a reduced
+    vector) does not."""
+    labels = list(labels)
+    for place in chain:
+        eqn = eqns[place]
+        name = jax_name(eqn.primitive)
+        if name == "transpose":
+            labels = [labels[d] for d in eqn.params["permutation"]]
+        elif name == "broadcast_in_dim":
+            laid: list[int | None] = [None] * len(eqn.params["shape"])
+            for source, target in enumerate(eqn.params["broadcast_dimensions"]):
+                laid[int(target)] = labels[source]
+            labels = laid
+    rank = value.aval.ndim
+    return len(labels) == rank and all(labels[a] == (None if a == axis else a) for a in range(rank))
 
 
 def _normalized(graph: _Graph, exponential, axis: int, places: list[int]) -> int | None:
-    """The place of the division of the exponential (or its cast) by its sum over `axis`, broadcast back
-    (casts between)."""
+    """The place of the division of the exponential (no cast between) by its sum over `axis` (the sum read
+    from the exponential widened, and narrowed back to its dtype, as Flax's), broadcast back to its own rows
+    (`_back_to_rows`)."""
     eqns = graph.jaxpr.eqns
     for reader in sorted(graph.readers[exponential]):
         if jax_name(eqns[reader].primitive) != "div":
             continue
         numerator, denominator = eqns[reader].invars
-        found: list[int] = []
-        if graph.uncast(numerator, found) is not exponential:
+        if numerator is not exponential:
             continue
-        atom = graph.uncast(denominator, found)
+        chain: list[int] = []
+        atom = graph.uncast(denominator, chain, _floating)
         broadcast = graph.made(atom, "broadcast_in_dim")
         if broadcast is None:
             continue
-        found.append(broadcast)
-        summed = graph.made(graph.uncast(eqns[broadcast].invars[0], found), "reduce_sum")
-        if (summed is None or tuple(eqns[summed].params["axes"]) != (axis,)
-                or graph.uncast(eqns[summed].invars[0], found) is not exponential):
+        chain.append(broadcast)
+        summed = graph.made(graph.uncast(eqns[broadcast].invars[0], chain, _floating), "reduce_sum")
+        if summed is None or tuple(eqns[summed].params["axes"]) != (axis,):
             continue
-        places += [*found, summed, reader]
+        widened: list[int] = []
+        if graph.uncast(eqns[summed].invars[0], widened, _widening) is not exponential:
+            continue
+        labels = [a for a in range(exponential.aval.ndim) if a != axis]
+        if not _back_to_rows(eqns, chain[::-1], labels, denominator, axis):
+            continue
+        places += [*chain, *widened, summed, reader]
         return reader
     return None
 
@@ -324,7 +383,7 @@ def _unmasked(graph: _Graph, logits, places: list[int]):
         mask, fill, kept = eqn.invars  # select_n(predicate, on_false, on_true)
         axes, perm = identity, identity
     mask_value = graph.constant(mask)
-    if mask_value is None or axes is None or graph.constant(fill) is None:
+    if mask_value is None or axes is None or not graph.excluding(fill, logits.aval.dtype):
         return nothing
     places.append(place)
     aligned = np.reshape(mask_value.astype(bool), [mask_value.shape[axes.index(a)] if a in axes else 1
@@ -365,7 +424,7 @@ def _scaled_product(graph: _Graph, scaled, places: list[int]):
     where the product is scaled otherwise or is no `dot_general`."""
     eqns, nothing = graph.jaxpr.eqns, (None,) * 6
     scale = None
-    atom = graph.uncast(scaled, places)
+    atom = graph.uncast(scaled, places, _widening)
     if (multiplied := graph.made(atom, "mul")) is not None:
         a, b = eqns[multiplied].invars
         if graph.constant(b) is not None and np.ndim(graph.constant(b)) == 0:
@@ -375,7 +434,7 @@ def _scaled_product(graph: _Graph, scaled, places: list[int]):
         else:
             return nothing
         places.append(multiplied)
-        atom = graph.uncast(atom, places)
+        atom = graph.uncast(atom, places, _widening)
     first = graph.made(atom, "dot_general")
     if first is None:
         return nothing

@@ -67,11 +67,12 @@ def fused_program(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
     from dew.algebra import attention_regions
     from dew.nn.kernels import fused_gemm
 
-    attention = [region for region in attention_regions.regions(jaxpr)
+    index = Index(jaxpr)
+    attention = [region for region in attention_regions.regions(index)
                  if _decided(jaxpr, region.places, _read(jaxpr, region.places), (region.output,),
                              lambda region=region: attention_regions.taken(region))]
     held = {place for region in attention for place in region.places}
-    products = [region for region in _regions(jaxpr) if not held & set(region.places)
+    products = [region for region in _regions(index) if not held & set(region.places)
                 and _decided(jaxpr, region.places, region.inputs, region.outputs,
                              lambda region=region: _takes(fused_gemm, jaxpr, region))]
     if not attention and not products:
@@ -93,6 +94,22 @@ def _read(jaxpr: jcore.Jaxpr, places: Sequence[int]) -> tuple[jcore.Var, ...]:
 def _fusing(replay: Callable, fused_gemm) -> Callable:
     """A product region's call: `fused_gemm.fused` over the region as the program wrote it (`_replayed`)."""
     return lambda *inputs: fused_gemm.fused(replay, *inputs)
+
+
+class Index:
+    """A body's equations by the values they make (`producer`), each value's readers (`readers`: the places
+    of the equations that read it) and the values the body returns (`escaping`): what both region finders
+    read (`_regions`, `attention_regions.regions`)."""
+
+    def __init__(self, jaxpr: jcore.Jaxpr):
+        self.jaxpr = jaxpr
+        self.producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
+        self.readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
+        for place, equation in enumerate(jaxpr.eqns):
+            for var in equation.invars:
+                if isinstance(var, jcore.Var):
+                    self.readers[var].add(place)
+        self.escaping = {var for var in jaxpr.outvars if isinstance(var, jcore.Var)}
 
 
 class Written(NamedTuple):
@@ -170,18 +187,12 @@ def _follows(operand: tuple[int, ...], shape: tuple[int, ...]) -> bool:
                            and all(axis in (1, extent) for axis, extent in zip(operand, shape, strict=True)))
 
 
-def _regions(jaxpr: jcore.Jaxpr) -> list[Region]:
+def _regions(index: Index) -> list[Region]:
     """Each product of `jaxpr` (`_form`) and the elementwise equations after it that read its values,
     each of the product's shape over operands that follow its tiles (`_follows`, `CONSUMERS`), up to the
     first equation outside them that reads one of their values, with the layout equations of its captured
     operands that no other equation reads (`CAPTURED`)."""
-    readers = collections.defaultdict(set)
-    for place, equation in enumerate(jaxpr.eqns):
-        for var in equation.invars:
-            if isinstance(var, jcore.Var):
-                readers[var].add(place)
-    escaping = {var for var in jaxpr.outvars if isinstance(var, jcore.Var)}
-    producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
+    jaxpr, readers, escaping, producer = index.jaxpr, index.readers, index.escaping, index.producer
     found: list[Region] = []
     claimed: set[int] = set()
     for start, equation in enumerate(jaxpr.eqns):

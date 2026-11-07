@@ -252,3 +252,39 @@ def test_a_plain_programs_attention_under_a_mask_of_its_inputs_stays_as_written(
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
     with generation.assumed("sm90"):
         assert not _attention_routes(lambda: dew.jit(input_masked).trace(*shapes))
+
+
+def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False):
+    """Causal softmax attention as a program writes it out (its products as einsums, a causal where, the
+    safe softmax), each keyword a way it computes something other than attention: a finite fill keeping the
+    future keys' weight, logits truncated through `logits_cast`, a maximum's initial value above the logits,
+    each row divided by another row's sum (heads and rows swapped in its broadcast)."""
+    def attend(q, k, v):
+        s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+        if logits_cast is not None:
+            s = s.astype(logits_cast).astype(jnp.float32)
+        s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, fill)
+        e = jnp.exp(s - jax.lax.stop_gradient(jnp.max(s, -1, keepdims=True, initial=initial)))
+        total = jnp.sum(e, -1)
+        if other_rows:
+            total = jax.lax.broadcast_in_dim(total, (*e.shape[:-1], 1), (0, 2, 1))
+        else:
+            total = total[..., None]
+        return jnp.einsum("bhts,bshd->bthd", (e / total).astype(v.dtype), v)
+    return attend
+
+
+@pytest.mark.parametrize(("variant", "options"), [("attention", {}), ("finite fill", {"fill": 0.0}),
+                                                  ("truncated logits", {"logits_cast": jnp.int32}),
+                                                  ("initial above", {"initial": 1e30}),
+                                                  ("another row's sum", {"other_rows": True})])
+def test_only_attention_written_out_is_rewritten_as_dews(variant, options):
+    """Causal softmax attention written out runs Dew's kernel through `dew.jit` on an H100; written out with
+    any step computing otherwise (a finite fill, truncated logits, an initial maximum above the logits, a
+    row normalized by another's sum), it stays as written, XLA's."""
+    import dew
+
+    shapes = (jax.ShapeDtypeStruct((1, 16, 16, 32), jnp.bfloat16),) * 3
+    with generation.assumed("sm90"):
+        routes = _attention_routes(lambda: dew.jit(written_out(**options)).trace(*shapes))
+    assert bool(routes) == (variant == "attention"), routes
