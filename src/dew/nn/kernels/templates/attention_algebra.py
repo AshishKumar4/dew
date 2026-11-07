@@ -1807,27 +1807,31 @@ def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
     reductions, `_scaled`) joins the walk's running `exponent`, the largest so far (-inf before any), and
     both parts are `x` times `2^(14 - exponent')`, the high part rounded and the low part its remainder
     rounded at the same scale, so both products issue into one accumulator held at that scale. Returns the
-    new exponent, the factor that takes the accumulator from the old scale to the new (1 before any tile,
-    else at most 1) and the parts; a product of them is taken back by `2^(exponent' - 14)` (`restored`).
-    A part's entries far below the running largest lose their low bits to `dtype`'s subnormals, as an fp32
-    sum of them loses them to its rounding."""
+    new exponent, the power of two that takes the accumulator from the old scale to the new (`running_shift`:
+    0 before any tile, else at most 0) and the parts; a product of them is taken back by
+    `running_restored`. A part's entries far below the running largest lose their low bits to `dtype`'s
+    subnormals, as an fp32 sum of them loses them to its rounding. Every power of two is built on a tile of
+    `x`'s shape (`power2`): Mosaic GPU bitcasts no scalar ("Scalars must be represented by non-vector
+    types", et-fp16lower)."""
     largest = jnp.max(jnp.max(jnp.abs(x), axis=-1))
     tile = jnp.ceil(jnp.log2(jnp.where(largest > 0, largest, 1.0)))
     # A GPU's approximate log2 flushes a subnormal largest to zero (`_scaled`, row 4464): such a tile, as an
     # empty one, moves no exponent.
     tile = jnp.where((largest > 0) & finite(tile), tile, -jnp.inf)
     new = jnp.maximum(exponent, tile)
-    factor = jnp.where(exponent == -jnp.inf, 1.0, jnp.exp2(exponent - jnp.where(new == -jnp.inf, 0.0, new)))
-    scaled = power2(x, jnp.where(new == -jnp.inf, 0.0, 14.0 - new))
+    shift = jnp.where(exponent == -jnp.inf, 0.0, exponent - jnp.where(new == -jnp.inf, 0.0, new))
+    scaled = power2(x, jnp.broadcast_to(jnp.where(new == -jnp.inf, 0.0, 14.0 - new), x.shape),
+                    reach=2 * 127)
     high = scaled.astype(dtype)
-    return new, factor, (high, (scaled - high.astype(jnp.float32)).astype(dtype))
+    return new, shift, (high, (scaled - high.astype(jnp.float32)).astype(dtype))
 
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
     """A product of `running_parts`' parts, or an accumulator of them, at the walk's scale taken back:
     `value` times `2^(exponent - 14)`, nothing where no tile moved the exponent."""
-    return jnp.where(exponent == -jnp.inf, 0.0, power2(value, jnp.where(exponent == -jnp.inf, 0.0,
-                                                                          exponent - 14.0)))
+    restored_value = power2(value, jnp.broadcast_to(jnp.where(exponent == -jnp.inf, 0.0, exponent - 14.0),
+                                                    value.shape), reach=2 * 127)
+    return jnp.where(exponent == -jnp.inf, 0.0, restored_value)
 
 
 def restored(value: jax.Array, exponent: jax.Array) -> jax.Array:

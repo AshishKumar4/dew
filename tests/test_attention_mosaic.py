@@ -477,14 +477,14 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("drop", [False, True], ids=["plain", "dropping"])
 @pytest.mark.parametrize("call", CALLS)
-def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call, drop):
+def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call):
     """An fp16 call's backward in the fast form's one launch (row 3886): its weights and score cotangents as
     two fp16 parts at each walk's running scale (`algebra.running_parts`), dV's and dK's accumulators taken
     to the new scale as it grows and back at the end, each tile's dQ by its own; every gradient the
-    reference's (check 1), under the interpreter."""
-    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, drop=drop, dtype=jnp.float16)
+    reference's (check 1), under the interpreter. (A dropping fp16 call takes no Mosaic walk at all: its
+    dropping walk takes bf16 operands.)"""
+    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, dtype=jnp.float16)
 
 
 @COMPILES_ON_CPU
