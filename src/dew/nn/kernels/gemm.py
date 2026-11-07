@@ -89,8 +89,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     slot reads). `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at
     each output's row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`mosaic.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
-    gather. An NVFP4 `rhs` (`NvFp4`, row 4516) is `_nvfp4_gemm`'s, frozen, a stack of banks read at its
-    `layer` as a stacked matrix is (row 4861)."""
+    gather. An NVFP4 `rhs` (`NvFp4`; a stack of banks at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen."""
     if isinstance(rhs, NvFp4):
         return _nvfp4_gemm(lhs, rhs, group_sizes, epilogue=epilogue, epilogue_operands=epilogue_operands,
                            out_dtype=out_dtype, layer=layer, gather=gather, scatter=scatter,
