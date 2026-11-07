@@ -99,9 +99,10 @@ def _step(objective, params, batch, reference):
     return {"loss": value, "gradients": gradients}
 
 
-PACKED_SEEDS = 128
-"""Check 1's declared seeds for the packed step against the per-call step, sized by `seeds_for` paired:
-the two arms run one model over the same calls, so they share their upstream rounding."""
+PACKED_SEEDS = 32
+"""Check 1's declared seeds for the packed step against the per-call step, sized by `seeds_for` paired
+over `PACKED_SAMPLES` rollouts (16 at ppo, 32 at cispo): the two arms run one model over the same calls,
+so they share their upstream rounding."""
 
 PACKED_SAMPLES = 16
 """The rollouts the packed step's check 1 reads: a norm's scale gradient sums its few entries over every
