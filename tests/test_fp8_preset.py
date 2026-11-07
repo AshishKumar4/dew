@@ -1,12 +1,15 @@
 """The 'fp8' run numerics (`dew.nn.precision.FP8`, row 2513): DeepSeek-V3's blockwise FP8 recipe on the
 projections whose role it takes, the rest in the run's dtypes."""
 
-import itertools
+import contextlib
+import dataclasses
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -15,7 +18,7 @@ from dew.nn.precision import FP8, LowPrecision, Numerics, RecipeRefused, numeric
 
 VOCAB, WIDTH = 256, 128
 SEEDS = 64
-"""The recipe projection's check-1 seeds."""
+"""The recipe's check-1 seeds, the projection's and the step's (the step's sized by `seeds_for` on armada)."""
 
 
 def mixed(dtype=jnp.bfloat16) -> CausalTransformer:
@@ -195,23 +198,26 @@ def emulated(dtype):
     return projection
 
 
-def laid_reference(dtype, sizes: tuple[int, ...]):
-    """`gemm.recipe_projection` of a projection's rows written apart in `dtype`: each group's rows (`sizes` a
-    group's, any rows past their sum outside every group) laid in whole 128-row blocks behind zero rows, the
-    recipe emulated over them (`emulated`), and each row's output read back, a row outside every group's
-    zero; a matrix `[in, out]` a dense projection's, its one group every row."""
+def laid_projection(dtype):
+    """`gemm.recipe_projection` of a projection's rows written apart in `dtype`: `run(rows, matrices, sizes)`,
+    each group's rows (`sizes` a group's, in order, any rows past their sum outside every group) laid in
+    whole 128-row blocks behind zero rows, a run of zero blocks after them, the recipe emulated over them
+    (`emulated`), and each row's output read back, a row outside every group's zero."""
     project = emulated(dtype)
-    blocks = jnp.asarray([-(-size // 128) for size in sizes], jnp.int32)
-    starts = np.cumsum([0, *sizes])
 
-    def run(rows, matrix):
-        matrices = matrix if matrix.ndim == 3 else matrix[None]
-        laid = jnp.concatenate([jnp.pad(rows[first:last], ((0, -(last - first) % 128), (0, 0)))
-                                for first, last in itertools.pairwise(starts)])
-        out = project(laid, matrices, blocks, out_dtype=dtype)
-        laid_starts = np.cumsum([0, *(128 * np.asarray(blocks))])
-        read = [out[first:first + size] for first, size in zip(laid_starts[:-1], sizes, strict=True)]
-        return jnp.concatenate([*read, jnp.zeros((rows.shape[0] - starts[-1], out.shape[1]), dtype)])
+    def run(rows, matrices, sizes):
+        count, groups = rows.shape[0], matrices.shape[0]
+        blocks = -(-sizes // 128)
+        ends = jnp.cumsum(sizes)
+        group = jnp.searchsorted(ends, jnp.arange(count), side="right")
+        held = jnp.minimum(group, groups - 1)
+        laid_rows = -(-(count + groups * 127) // 128) * 128
+        place = jnp.where(group < groups, ((jnp.cumsum(blocks) - blocks) * 128)[held] + jnp.arange(count)
+                          - (ends - sizes)[held], laid_rows)
+        laid = jnp.zeros((laid_rows, rows.shape[1]), rows.dtype).at[place].set(rows, mode="drop")
+        group_blocks = blocks.at[-1].add(laid_rows // 128 - blocks.sum())
+        out = project(laid, matrices, group_blocks, out_dtype=dtype)
+        return out.at[place].get(mode="fill", fill_value=0)
 
     return run
 
@@ -221,7 +227,7 @@ def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role
     """A projection the 'fp8' numerics take (`gemm.recipe_projection`, which a layer of the role hands its
     rows): a dense one's, every row its one group's, and experts' of ragged groups, one empty, with rows
     past them; its output and both gradients on par with the recipe written apart in float32 over the same
-    groups' whole 128-row blocks (`laid_reference`: the fake-quantized reference a recipe is measured
+    groups' whole 128-row blocks (`laid_projection`: the fake-quantized reference a recipe is measured
     against), from it in float64 (check 1)."""
     from dew.nn.precision import projection_role
 
@@ -243,8 +249,112 @@ def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role
     @as_given
     def truth(rows, matrix, cotangent):
         with jax.enable_x64(new_val=True):
-            return with_gradients(laid_reference(jnp.float64, sizes))(*widened((rows, matrix, cotangent)))
+            return reference(jnp.float64)(*widened((rows, matrix, cotangent)))
 
-    reference = with_gradients(laid_reference(jnp.float32, sizes))
-    assert_as_exact(jax.jit(with_gradients(projected)), jax.jit(reference), draw, f"recipe projection {role}",
-                    seeds=SEEDS, truth_fn=truth)
+    def reference(dtype):
+        def run(rows, matrix):
+            return laid_projection(dtype)(rows, matrix if matrix.ndim == 3 else matrix[None],
+                                          jnp.asarray(sizes, jnp.int32))
+        return with_gradients(run)
+
+    assert_as_exact(jax.jit(with_gradients(projected)), jax.jit(reference(jnp.float32)), draw,
+                    f"recipe projection {role}", seeds=SEEDS, truth_fn=truth)
+
+
+def fake_quantized(dtype):
+    """A flax method interceptor (`flax.linen.intercept_methods`) running each projection the 'fp8' numerics
+    take by role as the recipe emulated in `dtype` (`laid_projection`), written here apart from the model: the
+    attention's and the feed-forwards' `Dense` layers (q, k, v and o; gate, up and down, the shared expert's
+    among them, not its gate), each a group of every row, and the routed experts (`ExpertMLP`): their slots
+    in expert order, token by token within an expert, through the gate and up projections, the gated product
+    and the down projection, summed back with their routing weights. Every other module runs as the model
+    runs it."""
+    from dew.nn.activations import gated_product
+    from dew.nn.dense import Dense
+    from dew.nn.moe import ExpertMLP
+
+    project = laid_projection(dtype)
+    taken = {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+
+    def dense(module, x):
+        kernel = nn.unbox(module.variables["params"]["kernel"])
+        compute = module.dtype or jnp.result_type(x, kernel)
+        rows = jnp.asarray(x, compute).reshape(-1, x.shape[-1])
+        out = project(rows, jnp.asarray(kernel, compute)[None], jnp.asarray([rows.shape[0]], jnp.int32))
+        return out.reshape(*x.shape[:-1], kernel.shape[-1]).astype(compute)
+
+    def experts(module, x, weights, indices):
+        params = nn.unbox(module.variables["params"])
+        compute = module.dtype or x.dtype
+        gate, up, down = (jnp.asarray(params[name]["kernel"], compute)
+                          for name in ("gate_proj", "up_proj", "down_proj"))
+        width, top_k = x.shape[-1], indices.shape[-1]
+        chosen = indices.reshape(-1)
+        order = jnp.argsort(chosen, stable=True)
+        sizes = jnp.bincount(chosen, length=module.num_experts).astype(jnp.int32)
+        rows = jnp.asarray(x, compute).reshape(-1, width)[order // top_k]
+        hidden = gated_product("swiglu")(project(rows, gate, sizes).astype(compute),
+                                         project(rows, up, sizes).astype(compute))
+        slots = jnp.zeros((chosen.shape[0], width), compute).at[order].set(
+            project(hidden, down, sizes).astype(compute))
+        wide = jnp.promote_types(compute, jnp.float32)
+        return jnp.einsum("...ke,...k->...e", slots.reshape(*x.shape[:-1], top_k, width).astype(wide),
+                          weights.astype(wide)).astype(compute)
+
+    def interceptor(next_fun, args, kwargs, context):
+        module = context.module
+        if context.method_name == "__call__" and isinstance(module, Dense) and module.name in taken:
+            return dense(module, *args)
+        if context.method_name == "__call__" and isinstance(module, ExpertMLP):
+            return experts(module, *args)
+        return next_fun(*args, **kwargs)
+
+    return interceptor
+
+
+def step(model, numerics, interceptor=None):
+    """One training step's loss of `model`'s parameters under `numerics`, its projections through
+    `interceptor` where given (`fake_quantized`): next-token cross entropy over the drawn tokens."""
+    def loss(params, tokens):
+        with generation.run_precision(numerics), (contextlib.nullcontext() if interceptor is None
+                                                  else nn.intercept_methods(interceptor)):
+            logits = model.apply(params, tokens[:, :-1])
+        logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
+        picked = jnp.take_along_axis(jax.nn.log_softmax(logits), tokens[:, 1:, None], axis=-1)
+        return -jnp.mean(picked)
+    return loss
+
+
+def test_a_training_step_in_the_fp8_preset_is_on_par_with_a_fake_quantized_model():
+    """One training step of a dense and MoE stack under the 'fp8' numerics (Dew's recipe, XLA's arm on a
+    CPU), its loss and every parameter's gradient, on par with the same model under bf16-mixed numerics
+    whose projections the recipe takes by role run the recipe emulated in float32 in test code
+    (`fake_quantized`: the fake-quantized reference a recipe is measured against), from that reference in
+    float64 (check 1): a projection given the wrong role, or a model-level gradient the recipe's wiring
+    breaks, fails it."""
+    model = mixed()
+    plain = dataclasses.replace(FP8, low_precision=None)
+    tokens = jnp.zeros((2, 65), jnp.int32)
+    shapes = jax.eval_shape(model.init, jax.random.key(0), tokens[:, :-1])
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        params = jax.tree.map(lambda leaf: jnp.asarray(rng.normal(size=leaf.shape) * 0.05, leaf.dtype),
+                              shapes)
+        drawn = jnp.asarray(rng.integers(0, VOCAB, (2, 65)), jnp.int32)
+        return params, drawn, jnp.ones((), jnp.float32)
+
+    def arm(model, numerics, interceptor=None):
+        def run(params, tokens, cotangent):
+            return with_gradients(lambda params: step(model, numerics, interceptor)(params, tokens))(params,
+                                                                                                   cotangent)
+        return run
+
+    @as_given
+    def truth(params, tokens, cotangent):
+        with jax.enable_x64(new_val=True):
+            return arm(float64_twin(model), plain, fake_quantized(jnp.float64))(
+                widened(params), tokens, cotangent.astype(jnp.float64))
+
+    assert_as_exact(jax.jit(arm(model, FP8)), jax.jit(arm(model, plain, fake_quantized(jnp.float32))), draw,
+                    "fp8 preset step", seeds=SEEDS, truth_fn=truth)
