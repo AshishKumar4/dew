@@ -189,9 +189,8 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
-    # The l2 norm takes the queries and keys to fp32 at least before the rule reads them.
-    query, key = ((x.astype(jnp.promote_types(x.dtype, jnp.float32)) for x in (given.query, given.key))
-                  if hooks.l2norm else (given.query, given.key))
+    # The l2 norm hands the rule the queries and keys in their own dtype (`recurrence_chunk.chunk`).
+    query, key = given.query, given.key
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
                                 floor=hooks.floor, bound=hooks.inverse_bound,
@@ -722,24 +721,27 @@ evidence on the template; their reference arm in a 16-bit call is open)."""
 
 
 def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):
-    """The chunked op on the mainloop under the accurate forms, each hook combination it takes, its output and
-    final memory on par with the recurrence a token at a time's from float64 over the site's declared draws
-    (check 1), as test_recurrence_chunk holds the portable math; a call the template refuses (a launch's
-    registers past a thread's) is checked refused, its arithmetic the forward check's (`on_the_mainloop`).
-    The draws are fp32, whose products the accurate forms take in three bf16 parts, an fp32 product's
-    accuracy, as the fp32 recurrence's; under the fast forms an fp32 call's are two (`mainloop.FAST_PARTS`),
-    held to recorded fla-core instead (`the_mosaic_forward_is_as_exact_as_its_reference`): run under the
-    fast forms, the run's default since 82e5eabd30, this check put the template 42 to 83 times the fp32
-    recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
+    """The chunked op on the mainloop, each hook combination it takes, its output and final memory on par with
+    the recurrence a token at a time's from float64 over the site's declared draws (check 1), as
+    test_recurrence_chunk holds the portable math; a call the template refuses (a launch's registers past a
+    thread's) is checked refused, its arithmetic the forward check's (`on_the_mainloop`). The draws are fp32:
+    a form whose bar is the portable math (no delta rule, no rated decay) runs under the run's own forms, its
+    products in three bf16 parts under the fast forms too (`recurrence_chunk.chunk_rounding`; in two, row
+    184's write gate cell was 30 to 69 times the portable math's distance on every leaf); a form with a port
+    (the delta rule's fla, the rated scan's mamba_ssm) under the accurate forms, its fast forms' two parts
+    (`mainloop.FAST_PARTS`) held to the recorded port instead
+    (`the_mosaic_forward_is_as_exact_as_its_reference`): there they put the template 42 to 83 times the
+    fp32 recurrence's distance from float64, interpreted and on an H100 alike (flow-cells-cpu, gpuflow-a)."""
+    forms = 'accurate' if hooks.delta or hooks.rated else generation.numerics().forms
     (sample,) = hooked_draw(hooks, packed, 0)
-    if not formed('accurate', taken)(sample, hooks):
+    if not formed(forms, taken)(sample, hooks):
         with pytest.raises(REFUSED):
-            formed('accurate', jax.eval_shape)(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
+            formed(forms, jax.eval_shape)(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
         return
-    dew = jax.jit(formed('accurate', functools.partial(chunk_on, 'mosaic_gpu', hooks)))
+    dew = jax.jit(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
-                    f'the mosaic forward, {hooks} packed={packed} under the accurate forms',
+                    f'the mosaic forward, {hooks} packed={packed} under the {forms} forms',
                     seeds=HOOK_SEEDS[hooks, packed])
 
 
@@ -760,6 +762,18 @@ def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_inte
     the CPU suite took no accuracy check of (its fast-form numbers 42 to 83 times the fp32 recurrence's
     distance reached main unseen, row 3962)."""
     every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed)
+
+
+def test_a_bf16_gated_delta_nets_training_step_with_its_norm_is_on_par_interpreted():
+    """Row 184's gated delta net cell (tests/recurrence_matrix.py: the template, bf16, one sequence)
+    interpreted off a GPU, its reference the portable math there (fla's Triton kernels run on a GPU alone):
+    its output, final memory and every operand's gradient on par from float64 (check 1). The chunked op's l2
+    norm rounds the normalized queries and keys to the call's own dtype; kept fp32, the call reached the
+    template as an fp32 one, its final memory 30 to 41 times the portable math's distance in two parts
+    (acb1301632c), 29 times fla's on a GH200 (M-JS-9)."""
+    import recurrence_matrix
+
+    recurrence_matrix._on_par("recurrence", ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'))
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=16)
