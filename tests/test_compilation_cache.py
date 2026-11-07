@@ -108,3 +108,18 @@ def test_a_cache_directory_named_after_the_first_compile_holds_the_programs_comp
 
     assert len(programs(first)) == 1 and len(programs(later)) == 1
 
+
+def test_pallas_lowerings_are_kept_beside_the_compiled_programs_unless_the_user_names_a_place(
+        tmp_path, monkeypatch):
+    """A process Dew readies keeps each Pallas Mosaic GPU lowering in its compilation cache's directory,
+    where a later process reads it back; a directory the user named for them is kept as named."""
+    from process_support import fresh
+
+    script = ("import json, sys; import jax; from dew._cache import enable_compilation_cache; "
+              "enable_compilation_cache(sys.argv[1]); "
+              "print(json.dumps(jax.config.jax_pallas_lowering_cache_dir))")
+    cache = tmp_path / "cache"
+    assert fresh(script, str(cache), platforms="cpu") == str(cache / "pallas")
+    named = tmp_path / "theirs"
+    monkeypatch.setenv("JAX_PALLAS_LOWERING_CACHE_DIR", str(named))
+    assert fresh(script, str(cache), platforms="cpu") == str(named)
