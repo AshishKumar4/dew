@@ -100,3 +100,26 @@ def test_a_blockwise_fp8_projections_training_step_is_on_par():
                         "blockwise fp8 training step",
                         seeds=blockwise_matrix.SEEDS,
                         truth_fn=with_gradients(blockwise_matrix.recipe_truth(group_blocks)))
+
+
+def test_a_biased_recipe_projection_rounds_once_after_its_bias():
+    """A biased projection the 'fp8' recipe takes (`gemm.recipe_projection`'s `bias`, audit A1) adds each
+    group's bias to its rows' fp32 sums and rounds the whole once: bitwise its unbiased fp32 product plus the
+    bias, rounded to bfloat16, where a bias cancelling all but 2^-10 of each sum leaves that remainder, which
+    rounding the product to bfloat16 first lost."""
+    from dew.nn.precision import FP8, projection_role
+
+    rng = np.random.default_rng(9)
+    rows = jnp.asarray(rng.normal(size=(200, 256)), jnp.float32)
+    matrices = jnp.asarray(rng.normal(size=(2, 256, 128)) / 16, jnp.float32)
+    sizes = jnp.asarray([120, 80], jnp.int32)
+
+    def projected(bias, out_dtype):
+        with generation.run_precision(FP8), projection_role("experts"):
+            return gemm.recipe_projection(rows, matrices, sizes, out_dtype=out_dtype, bias=bias)
+
+    summed = projected(None, jnp.float32)
+    group = np.repeat([0, 1], [120, 80])
+    bias = jnp.asarray(np.stack([-np.asarray(summed)[group == g].mean(0) for g in (0, 1)]), jnp.float32)
+    out = projected(bias, jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray((summed + bias[group]).astype(jnp.bfloat16)))
