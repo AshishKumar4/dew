@@ -266,14 +266,43 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
         return jnp.broadcast_to(value, shape)
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
+    outer_product = functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ())))
+    sizes = tuple(shape[axis] for axis in axes)
+
     def outer(value: jax.Array) -> jax.Array:
         # Only the size-one axes are dropped, so a sharded kept axis keeps its own sharding.
-        ones = jnp.ones(tuple(shape[axis] for axis in axes), value.dtype)
-        product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ()))),
-                              ones, jnp.squeeze(value, axes))
+        squeezed = jnp.squeeze(value, axes)
+        if _sums_in_float64(value):
+            product = accumulated(outer_product, jnp.ones(sizes, value.dtype), squeezed)
+        else:
+            product = _blocked_spread(squeezed, sizes, outer_product)
         return jnp.transpose(product, tuple(np.argsort((*axes, *kept))))
 
     return jax.lax.platform_dependent(value, cpu=outer, default=lambda value: jnp.broadcast_to(value, shape))
+
+
+def _spread_block(count: int) -> int:
+    """The positions a blocked spread sums together first (`_blocked_spread`): the power of two nearest the
+    square root of `count`, a function of the count alone, so every program and every site sums one count of
+    positions in one order."""
+    return 2 ** max(0, round(math.log2(math.sqrt(count))))
+
+
+def _blocked_spread(value: jax.Array, sizes: tuple[int, ...], outer_product) -> jax.Array:
+    """`value` spread over `sizes` as two outer products of ones, whose transpose sums a cotangent's `N`
+    positions in blocks of `_spread_block(N)`, the blocks' sums across blocks first and then within one, each
+    an fp32 product sum (`accumulated` under `FP32_SUMS`): an error of about `(N / B + B)` units of float32's
+    roundoff, where one sum of every position, which XLA:CPU accumulates in order, loses about `N` of them
+    (a padded flow's bias, row 4520's review) and a reduction XLA's fusions block their own way sums the whole
+    and a shard's otherwise (row 4520). The positions past `N` the blocks pad are the zeros the transpose of
+    the slice that drops them adds to the cotangent."""
+    count = math.prod(sizes)
+    block = _spread_block(count)
+    blocks = -(-count // block)
+    within = accumulated(outer_product, jnp.ones((block,), value.dtype), value)
+    across = accumulated(outer_product, jnp.ones((blocks,), value.dtype), within)
+    flat = across.reshape((blocks * block, *value.shape))[:count]
+    return flat.reshape((*sizes, *value.shape))
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
