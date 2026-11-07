@@ -60,7 +60,8 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
     delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
-    (the accurate forms) take none. A decay a key dimension's form takes either pair factoring its layer's
+    (the accurate forms, or a form without the delta rule on its route, `recurrence_chunk.chunk_rounding`)
+    take none. A decay a key dimension's form takes either pair factoring its layer's
     floor gives (`algebra.factored_range`, `algebra.key_diagonal_pairs_back`)."""
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
