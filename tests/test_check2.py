@@ -308,6 +308,17 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
         assert ct.certified(fn, ints)[1] == [], fn
 
 
+def test_an_integer_division_is_held_at_every_64_bit_magnitude():
+    """An integer division truncates toward zero and wraps to its width: int64's least value, -2^63, over 3
+    is -3074457345618258602, and uint64's values past 2^63 divide as themselves, each held as XLA computes
+    it (row 1966's head review)."""
+    with jax.enable_x64(new_val=True):
+        signed = (np.int64([-(2 ** 63), -(2 ** 63), 7, -7, 2 ** 63 - 1]), np.int64([3, -3, -2, 2, -1]))
+        unsigned = (np.uint64([2 ** 64 - 1, 2 ** 63 + 5]), np.uint64([3, 2]))
+        for operands in (signed, unsigned):
+            assert ct.certified(jax.lax.div, *operands)[1] == [], operands
+
+
 def _first_equation(fn, operands, name):
     """The first `name` equation check 2 holds running `fn` on `operands` (`certified.observing`): its
     params, the operands its contract was given and its results."""

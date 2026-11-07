@@ -419,10 +419,16 @@ def _arithmetic(build):
 def _truncated(result, dividend, divisor):
     """An integer division's quotient as `lax.div` gives it, truncated toward zero, wrapped to the result's
     width."""
-    wide = [np.asarray(value).astype(np.int64) for value in (dividend, divisor)]
-    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-        quotient = np.sign(wide[0]) * np.sign(wide[1]) * (np.abs(wide[0]) // np.abs(wide[1]))
-    return quotient.astype(np.asarray(result).dtype)
+    dtype = np.asarray(result).dtype
+    dividends, divisors = (np.asarray(value).ravel().tolist()
+                           for value in np.broadcast_arrays(dividend, divisor))
+    # Python's integers hold every magnitude (int64's -2**63, uint64's past 2**63) exactly; the quotient wraps
+    # to the result's width once.
+    bits = 8 * dtype.itemsize
+    quotients = [((abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)) % (1 << bits) if b else 0
+                 for a, b in zip(dividends, divisors, strict=True)]
+    return np.asarray(quotients, np.uint64 if bits == 64 else np.int64).astype(dtype).reshape(
+        np.shape(result))
 
 
 def _rounding(name: str, integral):
