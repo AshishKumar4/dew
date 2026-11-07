@@ -32,7 +32,6 @@ from dew.batch import Batch
 from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
 from dew.nn.kernels.options import owned_program
-from dew.optim import learning_rate
 from dew.state import REPLICA_FIELDS, Replicas, ReplicaState, TrainState
 from dew.training.transaction import cleared, example_groups, window_dropped
 
@@ -193,13 +192,6 @@ def rated(state: TrainState) -> optax.OptState:
     `held_rates`, `with_rates`): its own, or under DiLoCo the groups' inner one, its rates stacked, every
     group's alike, which those read at the first group's and set at every group's."""
     return state.opt_state if state.inner is None else state.inner.opt_state
-
-
-def learning_rate_of(state: TrainState) -> jax.typing.ArrayLike | None:
-    """The learning rate a run's optimizer state holds (`dew.optim.learning_rate`), under DiLoCo the first
-    group's, every group's alike."""
-    rate = learning_rate(rated(state))
-    return rate if state.inner is None or rate is None else jnp.asarray(rate)[0]
 
 
 def rates_set(state: TrainState, setting: Callable[[optax.OptState], optax.OptState]) -> TrainState:

@@ -1549,6 +1549,34 @@ def test_causal_windows_keep_each_boundary_target_and_restore_carry():
     resumed.close()
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.bool_, np.int8])
+def test_causal_windows_restore_an_aligned_fields_carry_as_its_own_dtype(dtype):
+    """A window's carry of an aligned field, a floating per-token weight, a mask or ids, saved as a
+    position's record (JSON) restores as the field held it: the windows read after the restore are the
+    ones read after the save, value and dtype (A22: a floating carry was read as integers and refused)."""
+    from dew.data.pipeline import Windows
+    from dew.data.steps.windows import CausalWindows
+
+    rows = grain.MapDataset.source([
+        {"text": np.arange(start, end, dtype=np.int32), "weight": (np.arange(start, end) / 4).astype(dtype)}
+        for start, end in ((0, 4), (4, 11))]).to_iter_dataset()
+    windows = CausalWindows(rows, Windows(3, fields=("text", "weight")))
+    reader = iter(windows)
+    next(reader)
+    saved = json.loads(json.dumps(reader.get_state()))
+    rest = list(itertools.islice(reader, 10))
+    resumed = iter(windows)
+    resumed.set_state(saved)
+    again = list(itertools.islice(resumed, 10))
+    assert len(rest) == len(again) == 2
+    for read, restored in zip(rest, again, strict=True):
+        assert read["weight"].dtype == restored["weight"].dtype == dtype
+        for name in ("text", "weight"):
+            np.testing.assert_array_equal(read[name], restored[name])
+    reader.close()
+    resumed.close()
+
+
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_causal_windows_reject_per_document_field_drift_in_every_read(read):
     stored = Memory([

@@ -32,7 +32,7 @@ from flax import linen as nn
 
 from dew.batch import Variables
 from dew.nn.dense import Dense
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scatter import gather_positions
 
 from ..dit import (
@@ -358,9 +358,10 @@ class JepaPredictor(_JepaStackOptions):
 
     def __call__(self, context, context_idx, target_idx, train: bool = False):
         """Map context embeddings [B, (T,) N_ctx, F] to predictions [B, (T,) N_tgt, F]."""
-        pos_embed = jnp.asarray(
-            scan_ordered_pos_embed(self.predictor_features, *self.grid, self.scan_order),
-            dtype=self.dtype or jnp.float32)
+        dtype = self.dtype or jnp.float32
+        table = scan_ordered_pos_embed(self.predictor_features, *self.grid, self.scan_order,
+                                       at_least_fp32(dtype))
+        pos_embed = jnp.asarray(table, dtype=dtype)
 
         def positions(indices):
             # Each row's own indices read the replicated table where the row is placed.

@@ -38,7 +38,7 @@ import math
 from pathlib import Path
 
 import numpy as np
-from common import kernel_summary, trimmed_kernels
+from common import kernel_summary, stated_peak_gib, trimmed_kernels
 
 from dew._accuracy import rms
 
@@ -145,7 +145,7 @@ def performance(records: dict[str, dict]) -> dict:
             "rate": timed.get("images_per_s", timed.get("tokens_per_s")),
             "step_ms": timed.get("step_ms_mean"),
             "mfu": record.get("mfu"),
-            "peak_gib": max(record["memory"]["peak_allocated_bytes"]) / 2 ** 30,
+            "peak_gib": stated_peak_gib(record["memory"]["peak_allocated_bytes"]),
             "busy_ms": profile.get("device_busy_ms_per_step"),
             "window_ms": profile.get("device_window_ms_per_step"),
             "busy_percent": profile.get("device_busy_percent"),
@@ -277,7 +277,8 @@ def main() -> None:
               f"{cell(row['rate'], '8.0f')} {cell(row['step_ms'], '8.1f')} "
               f"{cell(None if row['mfu'] is None else 100 * row['mfu'], '6.1f')} "
               f"{cell(None if row['compute_mfu'] is None else 100 * row['compute_mfu'], '8.1f')} "
-              f"{row['peak_gib']:>9.2f} {cell(row['busy_ms'], '8.1f')} {cell(row['busy_percent'], '6.1f')} "
+              f"{cell(row['peak_gib'], '9.2f')} {cell(row['busy_ms'], '8.1f')} "
+              f"{cell(row['busy_percent'], '6.1f')} "
               f"{cell(row['kernels_per_step'], '9.0f')}")
     print("\n  the profiled window per device-step, ms: compute kernels, NCCL beside no compute kernel "
           "(exposed) and beside one (overlapped), gaps ended by a host-to-device copy (input) or anything "

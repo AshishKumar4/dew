@@ -3,6 +3,7 @@
 import contextlib
 import functools
 from fractions import Fraction
+from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +45,13 @@ def reference_attention(q, k, v):
     return scaled_dot_product_attention(q, k, v, implementation="reference")
 
 
+def qkv_draws(dtype):
+    """Seeded draws of a query, a key and a value of `BF16_QKV`'s shape in `dtype`."""
+    def draw(seed):
+        return tuple(jax.random.normal(jax.random.fold_in(jax.random.key(1), seed), (3, *BF16_QKV), dtype))
+    return draw
+
+
 @pytest.mark.parametrize("arguments", [
     {"precision": jax.lax.Precision.HIGHEST},
     {"precision": jax.lax.DotAlgorithmPreset.F32_F32_F32},
@@ -54,9 +62,7 @@ def test_auto_computes_arithmetic_only_the_reference_path_performs(arguments):
     """'auto' given a matmul precision, a dot algorithm among them, a softmax dtype or a compute dtype no
     fused kernel honours computes on par with naming the reference path over the seeds (check 1), the
     reference path run in float64 its truth."""
-    def draw(seed):
-        return tuple(jax.random.normal(jax.random.fold_in(jax.random.key(1), seed), (3, *BF16_QKV),
-                                       jnp.bfloat16))
+    draw = qkv_draws(jnp.bfloat16)
 
     def call(implementation):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
@@ -88,6 +94,45 @@ LAYERS = {
         qk_nope_head_dim=8, qk_rope_head_dim=0, v_head_dim=8, index_n_heads=2, index_head_dim=8,
         index_topk=4, index_kpool=2, **policy),
 }
+
+
+@pytest.mark.parametrize("implementation, target", [("xla", "sm90"), ("template", None), ("tpu", None)])
+def test_an_fp32_call_stating_highest_multiplies_every_product_at_highest(implementation, target):
+    """An fp32 call stating precision='highest' in a run at the default precision multiplies every fp32
+    product of its gradient, forward and backward, at HIGHEST on each fused route that takes it
+    (`precision.at_precision`, which holds the call's precision over the backward a custom derivative traces
+    after the call): jax.nn's xla attention, fp32's declared cell on an H100 and an A100, traced as an H100
+    runs it; the template, whose portable mainloop (an A100's, a call Mosaic and Triton decline) multiplies at
+    the configuration its products read (`templates.attention.interpreted_dot`); and splash's route, its
+    Pallas kernels interpreted off a TPU. Never at the run's default."""
+    def loss(q, k, v):
+        return jnp.sum(scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                                    precision="highest", causal=True) ** 2)
+
+    draw = jax.random.normal(jax.random.key(1), (3, 1, 128, 2, 64), jnp.float32)
+    with generation.run_precision(Numerics("32-true")), generation.assumed(target):
+        precisions = dot_precisions(jax.grad(loss, argnums=(0, 1, 2)), *draw)
+    narrowed = [stated for stated, dtype, _ in precisions if dtype == jnp.float32 and stated != HIGHEST]
+    assert precisions and not narrowed, narrowed
+
+
+@pytest.mark.parametrize("scope", ["plain", "forward mode"])
+def test_an_fp32_call_stating_highest_takes_its_forward_derivative_on_jax_nn_s_xla_attention(scope):
+    """jax.nn's xla attention is JAX's own products, which forward mode differentiates as written: an fp32
+    call stating 'highest', traced as an H100 runs it, takes its tangent, with `forward_mode_attention` or
+    without, every fp32 product at HIGHEST (the forward's scope, `configured_precision`, each product keeping
+    the precision it was traced at)."""
+    from dew.nn.attention import forward_mode_attention
+
+    def call(q, k, v):
+        return scaled_dot_product_attention(q, k, v, implementation="xla", precision="highest", causal=True)
+
+    draw = jax.random.normal(jax.random.key(1), (3, 1, 128, 2, 64), jnp.float32)
+    held = forward_mode_attention() if scope == "forward mode" else contextlib.nullcontext()
+    with generation.run_precision(Numerics("32-true")), generation.assumed("sm90"), held:
+        precisions = dot_precisions(lambda q, k, v: jax.jvp(call, (q, k, v), (q, k, v)), *draw)
+    narrowed = [stated for stated, dtype, _ in precisions if dtype == jnp.float32 and stated != HIGHEST]
+    assert precisions and not narrowed, narrowed
 
 
 @pytest.mark.parametrize("span", [{"window": 4}, {"chunk": 4}])
@@ -705,3 +750,117 @@ def test_a_weighted_total_rounds_once_and_keeps_excluded_values_out(axis):
     np.testing.assert_array_equal(np.asarray(total), np.sum(kept, axis=reduced).astype(np.float32))
     exact_mass = np.sum(weights.astype(np.float64), axis=reduced).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(mass), exact_mass)
+
+
+def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_states_none():
+    """A run's configured product precision (`Numerics.matmul`, `run_precision`) is each route's declaration
+    where a call states none (`dew.nn.precision.effective_precision`): attention hands a call to the
+    reference path, which honours it, where whole products of its dtype do not compute the run's
+    (`exact_products`: an algorithm narrowing them; a 16-bit or fp32 query at 'highest' keeps the fused
+    routes, which multiply whole); a native recurrence keeps an
+    fp32 product whole at 'highest' whatever the forms (`rounds_products`), the ports, whose fp32 products
+    are TF32, take no fp32 call there, and the template takes none under an algorithm that narrows its
+    operands, each handing the call to XLA, which computes the declaration; a dilated depthwise
+    convolution's exact forms take a declaration of exact products alone, not one narrowing the operands;
+    and Muon's iteration multiplies in its fast forms in bfloat16 for a 16-bit compute dtype
+    (`iteration_dtype`: bf16-mixed's measured default, and 16-mixed's, whose float16 would divide a zero
+    update by a zero norm) and in the compute dtype otherwise, float32 under 32-true and float64 under a
+    float64 run."""
+    from dew.newton_schulz import ns_operands
+    from dew.nn import precision
+    from dew.nn.attention import reference_only
+    from dew.nn.kernels import recurrence_chunk
+    from dew.nn.precision import Dtypes, Numerics
+
+    def admits(supports, dtype) -> bool:
+        requirement = next(one for one in supports if one.code == "precision")
+        return requirement.analysis(SimpleNamespace(dtype=np.dtype(dtype))) is None
+
+    query = jnp.ones((1, 4, 2, 8), jnp.float32)
+    ports = (recurrence_chunk.PORT_SUPPORTS, recurrence_chunk.SSD_SUPPORTS)
+    # The suite's lanes configure 'highest' (lane_environment); the run here declares the default.
+    with generation.run_precision(Numerics("32-true")), jax.default_matmul_precision("default"):
+        assert not reference_only(query, None, None, force_fp32_for_softmax=True)
+        assert precision.rounds_products() and recurrence_chunk.fast_rounding(jnp.float32)
+        assert all(admits(supports, np.float32) for supports in (*ports, recurrence_chunk.TEMPLATE_SUPPORTS))
+    with generation.run_precision(Numerics("32-true", matmul="highest")):
+        assert not reference_only(query, None, None, force_fp32_for_softmax=True)
+        assert not reference_only(query.astype(jnp.bfloat16), None, None, force_fp32_for_softmax=True)
+        assert precision.effective_precision(None) == "highest"
+        assert not precision.rounds_products() and not recurrence_chunk.fast_rounding(jnp.float32)
+        # A 16-bit call's rounded numbers are its intermediates', mamba_ssm's and fla's, its products whole
+        # at any precision: the run's fast forms take them at 'highest' too, and its accurate ones never.
+        assert recurrence_chunk.fast_rounding(jnp.bfloat16)
+        assert recurrence_chunk.chunk_rounding(delta=True, dtype=jnp.bfloat16)
+    with generation.run_precision(Numerics("32-true", forms="accurate", matmul="default")):
+        assert not recurrence_chunk.fast_rounding(jnp.bfloat16)
+        assert not any(admits(supports, np.float32) for supports in ports)
+        assert all(admits(supports, jnp.bfloat16) for supports in ports)
+        assert admits(recurrence_chunk.TEMPLATE_SUPPORTS, np.float32)
+    with generation.run_precision(Numerics("32-true", matmul="TF32_TF32_F32")):
+        assert reference_only(query, None, None, force_fp32_for_softmax=True)
+        assert not admits(recurrence_chunk.TEMPLATE_SUPPORTS, np.float32)
+    # The TPU scan and the selective template widen a 16-bit call's operands and multiply them in fp32,
+    # which bf16 parts narrow.
+    widening = (recurrence_chunk.TPU_SCAN_SUPPORTS, recurrence_chunk.SELECTIVE_SUPPORTS)
+    with generation.run_precision(Numerics("32-true", matmul="BF16_BF16_F32")):
+        assert not any(admits(supports, jnp.bfloat16) for supports in widening)
+    with generation.run_precision(Numerics("32-true", matmul="highest")):
+        assert all(admits(supports, jnp.bfloat16) for supports in widening)
+    tf32 = jax.lax.DotAlgorithmPreset.TF32_TF32_F32
+    assert precision.exact_products(None, jnp.float32)
+    assert precision.exact_products(jax.lax.Precision.HIGHEST, jnp.float32)
+    assert precision.exact_products(jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jnp.bfloat16)
+    assert not precision.exact_products(tf32, jnp.float32)
+    assert not precision.exact_products(jax.lax.DotAlgorithmPreset.BF16_BF16_F32, jnp.float32)
+    for numerics, dtype in ((Numerics(), jnp.bfloat16), (Numerics("16-mixed"), jnp.bfloat16),
+                            (Numerics("32-true"), jnp.float32),
+                            (Numerics(forms="accurate"), jnp.float32),
+                            (Numerics(Dtypes(compute="float64")), jnp.float64)):
+        with generation.run_precision(numerics):
+            assert ns_operands(jnp.float32) == jnp.dtype(dtype), numerics
+
+
+
+@pytest.mark.kernel
+def test_an_fp32_delta_rules_route_computes_the_runs_declared_products():
+    """An fp32 gated delta rule's forward, routed for an H100 under the run's fast forms at each declared
+    product precision, takes a route that computes the declaration: at the default, any (the port's TF32
+    products, the template's two bf16 parts an operand: `fast_rounding`); at 'highest' and F32_F32_F32 no
+    route that narrows them (the port refuses, `_port_precision`), the template's launches multiplying
+    whole (its three parts an operand, twice the default's two parts' products, by the FLOPs each launch
+    states) where it takes the call; and under a TF32 algorithm XLA alone, which computes it (the template's
+    and the port's 'precision' requirements)."""
+    from dew.nn.kernels import recurrence
+    from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+    from dew.nn.kernels.templates import product
+    from dew.nn.kernels.templates.recurrence import mainloop
+    from dew.training._lowering import kernel_calls
+
+    rows, length, heads, width = 1, 128, 2, 64
+    operands = [jax.ShapeDtypeStruct((rows, length, heads, width), jnp.float32)] * 3 + [
+        jax.ShapeDtypeStruct((rows, length, heads), jnp.float32)] * 2
+    hooks = recurrence.Hooks(decay='scalar', scale=width ** -0.5, write_bound=1.0)
+
+    def forward(query, key, value, log_decay, beta):
+        return chunk(hooks, Chunk(query, key, value, log_decay=log_decay, beta=beta))[0]
+
+    def routed(matmul: str) -> tuple[set[str], list[float]]:
+        mesh = generation.gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+        with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh),
+              generation.routes() as found, generation.run_precision(Numerics("32-true")),
+              jax.default_matmul_precision(matmul)):
+            lowered = jax.jit(forward).trace(*operands).lower(lowering_platforms=("cuda",))
+        kernels = {route.kernel for route in found if route.choice == "gated_delta_rule"}
+        launches = [call.flops or 0.0 for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
+        return kernels, sorted(launches)
+
+    fast, fast_flops = routed("default")
+    whole_terms = len(product.terms(mainloop.PARTS, mainloop.PARTS))
+    rounded_terms = len(product.terms(mainloop.FAST_PARTS, mainloop.FAST_PARTS))
+    for matmul in ("highest", "F32_F32_F32"):
+        kernels, flops = routed(matmul)
+        assert "fla" not in kernels, matmul
+        if kernels == {"mosaic_gpu"} and fast == {"mosaic_gpu"}:
+            assert flops == [held * whole_terms / rounded_terms for held in fast_flops], matmul
+    assert routed("TF32_TF32_F32") == ({"xla"}, [])

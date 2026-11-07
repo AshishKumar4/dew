@@ -23,12 +23,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_same_artifact, chain_roundings
+from process_support import raised
+from reference_error import assert_as_exact, assert_computes_the_oracle, assert_same_artifact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
-from tool_support import FIXTURES, REPO_ROOT, linted, load
+from tool_support import FIXTURES, REPO_ROOT, linted, load, run_from
 
 from dew.telemetry.trace import window_split
 
@@ -364,10 +365,9 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients(states_dt
 # tools/layout_parity.py
 # ---------------------------------------------------------------------------
 
-def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
-    """The layout tool's default judge (the floor judge, `floored`), from its command line on eight host
-    devices, runs a model under the mixture and the objective the command gives and writes its rows to
-    --out; --window, which is check 1's, without --seeds is refused."""
+def test_the_layout_tool_runs_the_options_it_is_given(tmp_path):
+    """The layout tool, from its command line on eight host devices, runs a model under the mixture and
+    the objective the command gives and writes its rows to --out."""
     import json
     import subprocess
     import sys
@@ -381,13 +381,12 @@ def test_the_layout_tools_floor_judge_runs_the_options_it_is_given(tmp_path):
                               env=environment, capture_output=True, text=True, check=False)
 
     out = tmp_path / "rows.json"
-    done = tool("--models", "moe", "--layouts", "expert4", "--out", str(out), "--mixture", '{"top_k": 1}',
-                "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
+    done = tool("--models", "moe", "--layouts", "expert4", "--seeds", "0", "--out", str(out),
+                "--mixture", '{"top_k": 1}', "--objective", '{"balance": {"aux_loss_alpha": 0.01}}')
     assert done.returncode == 0, done.stdout[-2000:] + done.stderr[-2000:]
     (row,) = json.loads(out.read_text())
     assert (row["status"], row["mixture"]["top_k"], row["objective"]["balance"]["aux_loss_alpha"]) == (
         "works", 1, 0.01)
-    assert tool("--models", "dense", "--layouts", "data4", "--window", "2").returncode != 0
 
 
 def test_the_layout_tools_step_counts_the_work_a_runs_step_counts(monkeypatch):
@@ -405,7 +404,9 @@ def test_the_layout_tools_step_counts_the_work_a_runs_step_counts(monkeypatch):
     assert tokens == case.batch_size * case.seq_len, (tokens, case.batch_size, case.seq_len)
 
 
-def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
+def test_residual_orders_preserve_the_tiny_nemotron_function():
+    """A residual order is an exact symmetry of Nemotron-H's tiny mixture of experts: the reordered
+    float64 model computes its logits within float64's rounding of the computation itself."""
     from residual_orders import model_axes, permuted
 
     from dew.interop import Pretrained
@@ -414,7 +415,6 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
                              attention_impl='reference')
     order = np.array([3, 0, 12, 5, 10, 1, 8, 7, 2, 14, 4, 13, 6, 15, 9, 11])
     ids = jnp.array([[2, 7, 11, 3]], jnp.int32)
-    tool = load('layout_parity')
     axes = model_axes(loaded.model, ids)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), loaded.variables)
@@ -422,8 +422,7 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
         truth = np.asarray(model.apply(wide, ids))
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    tool.order_invariance({'logits': reordered}, {'logits': truth},
-                          float(reordered.sum()), float(truth.sum()), roundings=roundings)
+    assert_computes_the_oracle(reordered, truth, "Nemotron-H MoE reordered", roundings=roundings)
 
 
 def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width():
@@ -447,18 +446,7 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
         order = orders(residual_width(variables, axes), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
-
-
-def test_a_nonfinite_order_fails_the_invariance_check():
-    """A residual order whose function or loss is not finite fails the check, as a NaN compares
-    with nothing."""
-    tool = load('layout_parity')
-    for logits, loss in ((np.array([np.nan, 1.0]), 1.0), (np.array([1.0, 2.0]), np.nan)):
-        with pytest.raises(ValueError):
-            tool.order_invariance({'logits': logits}, {'logits': np.array([1.0, 2.0])}, loss, 1.0,
-                                  roundings=1)
+    assert_computes_the_oracle(reordered, truth, "KDA decoder reordered", roundings=roundings)
 
 
 def test_residual_orders_preserve_a_looped_ngpt():
@@ -480,8 +468,7 @@ def test_residual_orders_preserve_a_looped_ngpt():
         order = orders(residual_width(loaded.variables, axes), 2, seed=6)[1]
         reordered = np.asarray(model.apply(permuted(wide, order, axes), ids))
         roundings = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(wide))
-    load('layout_parity').order_invariance({'logits': reordered}, {'logits': truth},
-                                           float(reordered.sum()), float(truth.sum()), roundings=roundings)
+    assert_computes_the_oracle(reordered, truth, "looped nGPT reordered", roundings=roundings)
 
 
 class Drawing:
@@ -552,9 +539,9 @@ def test_layout_parity_reads_the_first_step_as_the_trainer_does():
 
 
 def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
-    """The reference's audit, its float64 anchor and the anchor's loss each read the trainer's first step
-    (`first_step`, ledger 3057, 3092) over the state they judge, which the test above holds to the
-    trainer's: a site that built its Step by hand would pass by it, and is caught here."""
+    """The reference's audit and its float64 anchor each read the trainer's first step (`first_step`,
+    ledger 3057, 3092) over the state they judge, which the test above holds to the trainer's: a site that
+    built its Step by hand would pass by it, and is caught here."""
     tool = load("layout_parity")
     read = []
     first_step = tool.first_step
@@ -568,10 +555,7 @@ def test_layout_parity_reads_every_first_step_through_the_trainers(monkeypatch):
     with jax.enable_x64(new_val=True), tempfile.TemporaryDirectory() as directory:
         tool.Judge(reference, tool.References(Path(directory)), "jepa").audit()
         tool.Anchor(reference, "jepa")
-        state, _, _ = tool._trainer(reference, {}, one_device=True).place()
-        tool.anchor_loss(reference, tool.drawn_batch(reference, 0), state.replace(
-            updates=jnp.asarray(5, jnp.int32)))
-    assert read == [0, 0, 5]
+    assert read == [0, 0]
 
 
 def test_layout_parity_holds_every_arm_to_the_references_sample():
@@ -654,13 +638,40 @@ def test_a_shared_draw_cache_computes_past_its_disk_reserve_and_keeps_nothing_th
         assert computed.loss == kept.loss and any(Path(directory).iterdir())
 
 
+def test_a_gpu_memory_read_where_no_device_states_its_peak_says_so_never_a_peak_of_0():
+    """CI's recorder reads the most memory a test process used from its devices' allocators
+    (`followed.gpu_memory`); where none states it (the CPU's, an allocator keeping no peak) it says so, which
+    the recorder writes as no memory known, never a peak of 0 it did not read (train 657's review)."""
+    followed = load("followed", "tools/armada")
+    # A reason, in place of the (pool, peak) it cannot read.
+    assert isinstance(followed.gpu_memory("cpu"), str)
+
+
+def test_a_reference_run_whose_devices_state_no_peak_records_and_compares_its_peak_as_unknown():
+    """A reference run on devices that state no allocator peak (a CPU, row 4597) records None per device, and
+    its comparison reads the largest stated peak, unknown where none is stated, never raising on the run's
+    record nor taking a peak it did not measure (train 679's review: compare.py and the runs' summaries
+    raised TypeError on max over None). The tool runs from its directory, as it imports its siblings."""
+    with run_from("compare", "tools/reference_runs") as compare:
+        common = sys.modules["common"]
+        stated = common.device_memory([{"peak_bytes_in_use": 3 << 30, "bytes_limit": 8 << 30}, {}])
+        assert stated == {"peak_allocated_bytes": [3 << 30, None], "bytes_limit": [8 << 30, None]}
+        record = {"framework": "dew", "precision": "bf16", "parallel": "data", "world": 1,
+                  "throughput": {"tokens_per_s": 10.0, "step_ms_mean": 5.0}, "mfu": None}
+        rows = compare.performance({"stated": {**record, "memory": stated},
+                                    "unstated": {**record, "memory": common.device_memory([{}, {}])}})
+    assert (rows["stated"]["peak_gib"], rows["unstated"]["peak_gib"]) == (3.0, None)
+
+
 def test_the_layout_parity_command_runs_its_main(tmp_path):
     """`python tools/layout_parity.py` runs the tool, which refuses `--prepare` with no `--references`
     directory to write, where a script whose entry point is gone exits 0 having checked nothing."""
-    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa", "--prepare"]
+    command = [sys.executable, str(REPO_ROOT / "tools" / "layout_parity.py"), "--models", "jepa",
+               "--seeds", "0", "--prepare"]
     finished = subprocess.run(command, capture_output=True, text=True, timeout=600, cwd=tmp_path)
     # Its refusal is a SystemExit of its own, no traceback's error, and it wrote nothing.
-    assert finished.returncode == 1 and not any(tmp_path.iterdir()), finished.stderr[-2000:]
+    assert finished.returncode == 1 and not raised(finished) and not any(tmp_path.iterdir()), (
+        finished.stderr[-2000:])
 
 
 def test_prepared_windows_hold_every_draw_a_windowed_run_reads():

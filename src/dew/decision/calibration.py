@@ -83,13 +83,16 @@ class Temperatures:
     buckets: Mapping[str, float] = field(default_factory=dict)
     lowest: float = 0.5
     highest: float = 5.0
+    default: float = 1.0
+    """The temperature of a question no bucket or type names: a release's one global temperature, over every
+    type."""
 
     def of(self, kind: str, count: int) -> float:
         """Return the temperature for a question of type `kind` (`Question.kind`) with `count` options.
 
-        That is its bucket's temperature, or else its type's, or else 1.
+        That is its bucket's temperature, or else its type's, or else the `default`.
         """
-        return self._held(self.buckets.get(_bucket(kind, count), self.types.get(kind, 1.0)))
+        return self._held(self.buckets.get(_bucket(kind, count), self.types.get(kind, self.default)))
 
     def applied(self) -> "Temperatures":
         """Return these temperatures as `of` applies them, each held within [`lowest`, `highest`].
@@ -98,7 +101,8 @@ class Temperatures:
         then answers as this does.
         """
         return replace(self, types={kind: self._held(value) for kind, value in self.types.items()},
-                       buckets={name: self._held(value) for name, value in self.buckets.items()})
+                       buckets={name: self._held(value) for name, value in self.buckets.items()},
+                       default=self._held(self.default))
 
     def _held(self, value: float) -> float:
         return min(self.highest, max(self.lowest, value))

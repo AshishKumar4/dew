@@ -61,11 +61,15 @@ with their batch, reduce globally in the device step and accumulate in the same
 logging record as the loss, including every microbatch in an accumulation window.
 No new device-to-host read is inserted between steps. `train/tokens` is the mean
 number of targets the loss scored per attempted step in the reporting interval
-(`Objective.scored_tokens`, none on a repeat row), the count a token budget,
-`fit(tokens=)`, commits; the inputs stay the FLOP count's. A step here
-is a microbatch (`state.step`); optimizer commits are `state.updates`.
-`train/tokens_per_s` is the interval's total scored targets over its non-compile
-time, independent of gradient accumulation and the rate used to compare runs. Compilation
+(`Objective.scored_tokens`, none on a repeat row), committed or not; the inputs
+stay the FLOP count's. A step here is a microbatch (`state.step`); optimizer
+commits are `state.updates`. `train/committed_tokens` is the targets the
+interval's committed updates trained on, the count a token budget,
+`fit(tokens=)`, spends: an interval that cuts an accumulation window holds a
+share of its commits' tokens that its own steps did not score, so it is reported
+apart from the steps' rate. `train/tokens_per_s` is the interval's total scored
+targets over its non-compile time, independent of gradient accumulation and the
+rate used to compare runs. Compilation
 time is excluded from all throughput denominators. The peak in MFU is the sum
 over the training mesh; the compiler's FLOPs remain per-device.
 

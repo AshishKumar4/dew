@@ -85,10 +85,10 @@ def laid(parallel: bool) -> tuple[DecisionInputs, ...]:
 def draw(seed: int) -> dict[str, np.ndarray]:
     """A seed's weights for the tiny checkpoint's model: kernels and embeddings at their initializer's
     scale, norms' scales about one and biases off zero, under Dew's paths (`dew.`) and Laya's names
-    (`param.`, `dew.decision.laya.laya_tensors`), the requests the fixture's cases."""
+    (`param.`, its release's: `PretrainedDecision.export`), the requests the fixture's cases."""
     from flax.traverse_util import flatten_dict, unflatten_dict
 
-    from dew.decision.laya import laya_tensors
+    from dew.decision.sources import PretrainedDecision
 
     rng = np.random.default_rng([1557, 7, seed])
     checkpoint = tiny()
@@ -102,7 +102,7 @@ def draw(seed: int) -> dict[str, np.ndarray]:
         else:
             leaf = rng.normal(0.0, 1.0, shape) / np.sqrt(np.prod(shape[:-1]))
         drawn[path] = leaf.astype(np.float32)
-    tensors, _ = laya_tensors(checkpoint.model, unflatten_dict(drawn))
+    tensors = PretrainedDecision.of(replace(checkpoint, variables=unflatten_dict(drawn))).export()
     return {**{f"dew.{'/'.join(path)}": value for path, value in drawn.items()},
             **{f"param.{name}": np.asarray(tensors[name], np.float32) for name in tensors}}
 
@@ -145,7 +145,7 @@ def test_the_rule_catches_a_head_that_ignores_the_question_type():
     the head; dropping it moves the logits past the rule: check 1 decides
     against it, the truth the typed head's own float64 run."""
     drawn, reference, truth = indexed_recording(recording(FIXTURE), "laya", LAYA_SEEDS, inputs_of=draw,
-                                                truth_fn=lambda inputs: dew(jnp.float64, inputs))
+                                                truth_fn=jax.jit(lambda inputs: dew(jnp.float64, inputs)))
     untyped = jax.jit(lambda inputs: dew(jnp.float32, inputs, typed=False))
     with pytest.raises(GateFailure) as failed:
         assert_as_exact(as_given(lambda index, inputs: untyped(inputs)), reference, drawn,

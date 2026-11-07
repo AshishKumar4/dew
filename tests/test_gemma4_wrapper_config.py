@@ -35,15 +35,11 @@ def test_gemma4_unshared_layers_ignore_the_double_width_flag(tmp_path):
 
 
 @pytest.mark.network
-def test_published_gemma4_tiny_logits_and_cached_generation(tmp_path):
-    """The revision-pinned published tiny Gemma 4's text and image logits as near their float64 truth as
-    the reference's fp32 run, and its cached greedy continuation the reference's where no step is near
+def test_published_gemma4_tiny_logits_and_cached_generation():
+    """The revision-pinned published tiny Gemma 4's text and image logits on par with the reference's fp32
+    run over drawn prompts, and its cached greedy continuation the reference's where no step is near
     a tie (`assert_published_checkpoint`)."""
     from interop_support import assert_published_checkpoint
 
-    from tools.wrapper_checkpoint_parity import measure_checkpoint
-
-    measured = measure_checkpoint('trl-internal-testing/tiny-Gemma4ForConditionalGeneration',
-                                  tmp_path / 'measurement.json',
-                                  revision='0dc1746b7f9f623b748e735ed5a4302eb4baf346')
-    assert_published_checkpoint(measured, 'Gemma4')
+    assert_published_checkpoint('trl-internal-testing/tiny-Gemma4ForConditionalGeneration',
+                                '0dc1746b7f9f623b748e735ed5a4302eb4baf346', 'Gemma4')

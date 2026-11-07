@@ -66,6 +66,28 @@ no stream segments stands in the row's one stream, which a one-entry table reads
   its rows as it trained; a layout field added after runs were saved keeps their data identity until a run
   sets it (`dew._records.ADDED`).
 
+## 2b. A request's questions over one state
+
+A question layout writes a row a question, each holding the request's state (`QuestionLayout.rows`), so a
+request of `q` questions over a state of `S` tokens reads `q·S` of state. With `shared_state=n` a row asks
+up to `n` of the request's questions over one copy: what each question's own row writes before its
+question, the state there, once, and each question's own part after it (`_shared`).
+
+- **Reading.** The row's streams (§2a): the shared part is stream 0, reading itself causally; question `k`
+  is stream `k`, reading the shared part whole and itself causally, and with `siblings` each question before
+  it whole. The layout lowers that table itself (`Layout.attention`, `n + 1` streams).
+- **Positions.** Each question's part keeps the positions its own row lays it at, from the shared part's
+  end (`Encoded.positions`, carried as the parallel layout's are), so with `siblings` off it decides as its
+  own row does: the tests hold this to check 1 against each question's own row.
+- **Splits.** Questions join the first row that holds the same shared part, has room for their part within
+  `max_len` and asks fewer than `n`; a request that outgrows a row takes several, each repeating the state,
+  and a question whose own row cuts the state keeps a row of its own.
+- **Refusals.** It takes the place of parallel options, blocks, a row's own reads and a question written to
+  its context, each of which sets what a token reads; a head that reads one question a row
+  (`Head.one_question`, Laya's) refuses its rows as it refuses a joint row's; a backbone whose recurrent
+  mixers read no key runs refuses them (`MixerCall`) until a document can enter from a given memory (row
+  1506).
+
 ## 3. The head reads the main pass
 
 The joint head separates what it pools from what it attends to (`JointSchemaHead.__call__`). Question and option spans give its queries (`span_means`). The row's normed states are the memory its routing and field layers read, and the row's last token is the readout.

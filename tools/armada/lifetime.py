@@ -117,9 +117,9 @@ def started(code, offset):
     name = code.co_filename
     if not followed.checkout(name, root):
         return sys.monitoring.DISABLE
+    # A conftest's fixtures and hooks as any module's functions: each file's run that ran one keys it, so no
+    # event of it is turned off after its first owner's (`followed.code_unit`).
     write(owner(), followed.code_unit(code, root))
-    if Path(name).name == "conftest.py":
-        return sys.monitoring.DISABLE
     if code.co_name == "<module>":
         # Each module body sees every reader it calls, however many bodies called it before.
         sys.monitoring.restart_events()
@@ -194,11 +194,12 @@ def boot() -> None:
     directory.mkdir(exist_ok=True)
     children = str(directory)
     for name, module in list(sys.modules.items()):
-        write(SHARED, f"{followed.IMPORTED}{name.partition('.')[0]}")
+        write(SHARED, followed.shadowing(name))
         if followed.checkout(file := getattr(module, "__file__", None) or "", root):
             write(SHARED, file[len(root):])
     importer = followed.imports(lambda item: write(owner(), item))
     sys.meta_path.insert(0, importer)
+    sys.meta_path.append(followed.missed(lambda item: write(owner(), item), root))
     followed.opening(kept, root)
     sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
     sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
