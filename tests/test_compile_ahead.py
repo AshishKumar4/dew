@@ -150,8 +150,8 @@ def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_c
     and one of 3, which cuts the first phase's 12 rows and not the second's 8, is refused, where it was
     compiled ahead for a run that then plans another program (row 4812's review)."""
     from dew.data import Memory, phases
-    from dew.data.pipeline import Pipeline
     from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
     from dew.mesh import LayoutRefused
     from dew.training.ahead import compile_ahead, compile_only_gpus, first_step_batch
 
