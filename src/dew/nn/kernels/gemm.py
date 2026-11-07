@@ -47,7 +47,7 @@ from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_deriv
 from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
-from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded
+from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import declared
 from dew.nn.precision import at_least_fp32, refuse_recipe
 from dew.nn.sharding import seen_whole
@@ -119,7 +119,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter):
         config = XlaConfig(transpose_rhs, precision, compute if straight else None, dense)
         lhs = lhs if gather is None else lhs[gather]
-        return _scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
+        return scattered(xla_mainloop(config, lhs if straight else lhs.astype(compute), rhs, group_sizes,
                                        prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                                        epilogue_axes, dtypes, several, paired=paired, first=first), scatter)
 
@@ -1076,7 +1076,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         # launch takes whole its two products apart, each through the launches that take it (`_apart`).
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
         if launch is grouped_matmul.APART:
-            return _scattered(_apart(lhs if gather is None else lhs[gather], (rhs, paired), group_sizes,
+            return scattered(_apart(lhs if gather is None else lhs[gather], (rhs, paired), group_sizes,
                                      prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                                      epilogue_axes, dtypes, several=several, summed_as=summed_as or dtypes,
                                      transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu,
@@ -1091,19 +1091,10 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         outs = xla_mainloop(config, lhs if gather is None else lhs[gather], rhs, group_sizes, prologue,
                             prologue_arrays, prologue_axes, epilogue, epilogue_arrays, epilogue_axes, dtypes,
                             several, paired=paired, first=first)
-        return _scattered(outs, scatter)
+        return scattered(outs, scatter)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays, paired, first, gather, scatter)
-
-
-def _scattered(outs, scatter: jax.Array | None):
-    """`outs` (one output or a tuple), each row `i` written at row `scatter[i]` (`gemm`'s `scatter`, a
-    permutation, so every row is written once), as XLA's program and a launch's stores give them; as they
-    are without one."""
-    if scatter is None:
-        return outs
-    return jax.tree.map(lambda out: jnp.zeros_like(out).at[scatter].set(out, unique_indices=True), outs)
 
 
 def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
