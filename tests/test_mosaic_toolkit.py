@@ -1293,7 +1293,7 @@ def _chunks_products(x, w, *, interpret):
                 carried_gmem[...] = family.register_products(ones, (held,), slots['w'])
                 return carry, accumulators
 
-            family.roles(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
+            family.scheduled(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
                          lambda: family.stream(rings, views, 0, 1))
 
         # The issuer's scratch, its staged left operand's tile among it (`Family.scoped`'s `products`).
