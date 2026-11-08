@@ -338,32 +338,35 @@ def test_calls_compiled_together_run_their_executables_after_and_compile_nothing
     """Calls of programs within `compiled_together` answer with their results' shapes and run nothing,
     each traced on this thread; as the block ends each is compiled, all at once, and kept by its program,
     so the same calls after it compile nothing and answer as a call compiled alone does; a call whose
-    executable the program keeps lowers nothing again within a block."""
+    executable the program keeps lowers nothing again within a block, a call the block lowered already
+    compiles once, and a block within another is the outer one's, waiting on nothing."""
     from dew.nn.kernels.options import compiled_together
 
     run = program(lambda x: x * 2 + 1)
     other = program(lambda x: jnp.sin(x))
+    nested = program(lambda x: x - 1)
+    two, three, four, five = jnp.ones(2), jnp.ones(3), jnp.ones(4), jnp.ones(5)
+
+    def compiled(programs) -> int:
+        return [program.kind for program in programs].count("compiled")
+
     with Compiles(None) as compiles, compiled_together():
-        shapes = [run(jnp.ones(2)), run(jnp.ones(3)), other(jnp.ones(4)), run(jnp.ones(2))]
+        shapes = [run(two), run(three), other(four), run(two)]
     assert [(shape.shape, shape.dtype) for shape in shapes] == [((2,), jnp.float32), ((3,), jnp.float32),
                                                                 ((4,), jnp.float32), ((2,), jnp.float32)]
-    # A call the block lowered already lowers and compiles once.
-    assert [program.kind for program in compiles.programs].count("compiled") == 3
+    assert compiled(compiles.programs) == 3
     with Compiles(None) as again:
-        outputs = [run(jnp.ones(2)), run(jnp.ones(3)), other(jnp.ones(4))]
+        outputs = [run(two), run(three), other(four)]
         with compiled_together():
-            run(jnp.ones(2))
+            run(two)
     assert [program for program in again.programs if program.kind in ("compiled", "lowered")] == []
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 3.0))
     np.testing.assert_array_equal(outputs[2], jnp.sin(jnp.ones(4)))
-    # A block within another is the outer one's: its call compiles once, as the outer block ends, and
-    # waits on nothing.
-    nested = program(lambda x: x - 1)
     with Compiles(None) as joined, compiled_together():
-        nested(jnp.ones(5))
+        nested(five)
         with compiled_together():
-            nested(jnp.ones(5))
-    assert [program.kind for program in joined.programs].count("compiled") == 1
+            nested(five)
+    assert compiled(joined.programs) == 1
 
 
 @jax.tree_util.register_dataclass
