@@ -1325,8 +1325,13 @@ class Issuer[Accumulator](abc.ABC):
 
     rewrites_in_persist: bool = False
     """Whether its persistent walk rewrites a step's slots in a role of its own before the products read them
-    (`persist`'s `prepared`: a kernel gradient's neighbouring groups' rows zeroed), its consumers issuing no
-    product a rewrite could precede."""
+    (`persist`'s `prepared`: a kernel gradient's neighbouring groups' rows zeroed, in `rewriting`'s
+    layouts), its consumers issuing no product a rewrite could precede."""
+
+    @property
+    def rewriting(self) -> "Issuer":
+        """The issuer whose layouts a rewrite of a step's slots reads their tiles in: its own."""
+        return self
 
     sums_in_persist: bool = False
     """Whether its persistent walk sums an exactly summed launch's steps a window at a time itself

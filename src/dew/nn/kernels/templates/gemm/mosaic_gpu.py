@@ -1763,8 +1763,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                           for stage in (rows_stage, cotangent_stage)]
                 shares = [(stage.at[:, pl.ds(column, width)], None) for stage, width in widths
                           for column in range(0, stage.shape[1], width)]
-                _zero_neighbours_of(family, shares, index + start, starts_gmem[g_i], ends_gmem[g_i], steps,
-                                    block_k, aligned_skip=True)
+                _zero_neighbours_of(family.rewriting, shares, index + start, starts_gmem[g_i], ends_gmem[g_i],
+                                    steps, block_k, aligned_skip=True)
 
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             rewrite = {'prepared': rewritten} if family.rewrites_in_persist and not k_major else {}
