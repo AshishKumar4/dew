@@ -84,8 +84,9 @@ def _experts_draw(seed: int):
               "gate_up_proj_bias": jnp.zeros((experts, 2 * intermediate), jnp.float32),
               "down_proj": jnp.asarray(rng.normal(size=(experts, intermediate, hidden)), jnp.float32),
               "down_proj_bias": jnp.zeros((experts, hidden), jnp.float32)}
-    products = jnp.stack([_expert_slots(x, jnp.full_like(indices, e), params, down=jnp.float64)[0, 0]
-                          for e in range(experts)])
+    with jax.enable_x64(new_val=True):
+        products = np.stack([np.asarray(_expert_slots(x, jnp.full_like(indices, e), params,
+                                                      down=jnp.float64)[0, 0]) for e in range(experts)])
     delta = rng.normal(scale=1e-2, size=products.shape) * np.abs(np.asarray(products))
     params["down_proj_bias"] = jnp.asarray(jnp.asarray(-products + delta, jnp.bfloat16), jnp.float32)
     return x, weights, indices, params

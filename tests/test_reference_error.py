@@ -1298,7 +1298,8 @@ def _tiny_row(dew_ulps):
             y = jnp.dot(x, w, precision="highest")
             tiny = x[:1, :w.shape[1]] * 2.0 ** -60
             if ulps:
-                tiny = (tiny.astype(jnp.float64) * (1 + ulps * unit)).astype(tiny.dtype)
+                # One rounding of the exact product, in either arm's dtype (1 + ulps units is exact in both).
+                tiny = tiny * jnp.asarray(1 + ulps * unit, tiny.dtype)
             return {"y": jnp.concatenate([y, tiny])}
         return product
 
