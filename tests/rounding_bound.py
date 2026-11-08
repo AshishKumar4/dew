@@ -57,10 +57,11 @@ ONCE = frozenset({"add", "add_any", "sub", "mul", "div", "sqrt", "square", "redu
 """IEEE 754's correctly rounded operations: one rounding, at most u times the result."""
 
 ULPS = {"exp": 1.42, "log": 2.05, "log1p": 3.64, "expm1": 1.21, "logistic": 2.49, "tanh": 4.9,
-        "erf": 6.71, "rsqrt": 2.8}
+        "erf": 6.71, "rsqrt": 2.8, "sin": 1.07, "cos": 1.07}
 """Each elementary function's error bound, in units of u times its true result: the largest of XLA
 CPU's float32 implementations over every normal float32 input whose result is a normal float32, read
-exhaustively against float64 references (2^32 inputs each, 11-02), rounded up at the second decimal.
+exhaustively against float64 references (2^32 inputs each, 11-02; sin and cos 11-08, 1.0606 each, a
+rotary position's), rounded up at the second decimal.
 XLA CPU flushes subnormal inputs to zero, so the bound holds where no elementary function reads one."""
 
 SCATTERS = {"scatter": jax.lax.scatter, "scatter-add": jax.lax.scatter_add,
