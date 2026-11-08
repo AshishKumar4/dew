@@ -600,6 +600,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     STAGED_ROWS: ClassVar[bool] = False
     """Whether a consumer prepares its share of each step's rows stage itself (the kernel gradient's
     prologue and group zeroing, `registers`)."""
+    K_MAJOR: ClassVar[bool] = False
+    """Whether its operands lie rows-contiguous, step-scaled (`MosaicStepScaledTgmm`): whole steps of one
+    group, nothing staged to rewrite."""
     FP8: ClassVar[bool] = False
     """Whether the launch multiplies FP8 operands (`_fp8`): a forward product's alone."""
     STEPS: ClassVar[tuple[int, ...] | None] = None
@@ -769,11 +772,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         where its register model counts what they hold (a paired product's epilogue over its two
         accumulators alone every family's counts, `registers`); a step that prepares its operands (a
         prologue's rewrite, a consumer's own share of the rows' stage, an exactly summed step's product
-        apart) where its consumers issue their products."""
+        apart, but where its persistent walk sums the windows itself, `sums_in_persist`, or rewrites the
+        stage in a role of its own, `rewrites_in_persist`) where its consumers issue their products."""
         dtype = ba.arguments['tokens'].dtype
         hooked = ba.arguments['hooks'] != NO_HOOKS and not _pair_alone(ba, family)
         summed = bool(ba.arguments.get('exact_sums'))
-        prepared = ba.arguments['hooks'].prologue is not None or self.STAGED_ROWS or summed
+        prepared = (ba.arguments['hooks'].prologue is not None
+                    or (self.STAGED_ROWS and not self.rewritten(family))
+                    or (summed and not family.sums_in_persist))
         # Gathered rows (`gmm_call`'s `gather`) are a ring family's producer's gather, no prologue rewriting
         # them (`mosaic_gpu._gather_refused`).
         gathered = ba.arguments.get('gather') is not None
@@ -866,15 +872,22 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
         def scope(stages: int) -> resources.Scope:
             staged = dataclasses.replace(config, stages=stages)
-            return self._allocations(ba, staged, family).scope(family, staged, steps)
+            return self._allocations(ba, staged, family).scope(family, staged, steps,
+                                                               rewritten=self.rewritten(family))
 
         shared = resources.program_shared(generation.shared_budget(generation.gpu_target()), config.programs)
         most = shared // ((config.block_m + config.block_n) * config.block_k)
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
             most = min(most, max(2, steps))
-        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most,
-                                tile=launched)
+        # A family rewriting the staged rows in a role of its own runs it beside the consumers
+        # (`mosaic_gpu.tgmm`'s `roles`).
+        roles = config.warpgroups + self.rewritten(family)
+        return resources.Launch(scope, roles, self.registers(ba, config), most=most, tile=launched)
+
+    def rewritten(self, family: mosaic.Family) -> bool:
+        """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`)."""
+        return self.STAGED_ROWS and not self.K_MAJOR and family.rewrites_in_persist
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
@@ -896,7 +909,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         accumulators = 1 if ba.arguments.get('paired') is None else 2
         if ((accumulators > 1 and not family.takes_pairs)
                 or family.accumulator_rows not in (None, config.block_m // config.warpgroups)
-                or family.tensor_columns(config.block_n, accumulators) > (target.tmem_columns or 0)):
+                or family.tensor_columns(config.block_n, accumulators, bool(ba.arguments.get('exact_sums')))
+                > (target.tmem_columns or 0)):
             return False
         if not self._granular(ba, config, family):
             return False
@@ -1205,9 +1219,6 @@ register model reads the same 216 at every depth."""
 class MosaicTgmm(_Mosaic):
     """`Tgmm` on Hopper (`mosaic_gpu.tgmm`): `block_m` x `block_n` tiles of each group's gradient, its rows
     `block_k` at a time."""
-
-    K_MAJOR: ClassVar[bool] = False
-    """Whether its operands lie rows-contiguous, step-scaled (`MosaicStepScaledTgmm`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
 

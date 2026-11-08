@@ -26,18 +26,21 @@ def unwalked(family: Family) -> Callable:
     return walk
 
 
-def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str) -> tuple[jax.Array, ...]:
+def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str,
+          turns: Callable | None = None) -> tuple[jax.Array, ...]:
     """A persistent kernel's tiles (`Family.persist`'s): the grid `tiles` spread over the launch's programs
     along `axis`, each tile's `schedule(index)`, `(active, steps, views, tile)`, visited as `visit(counter,
     active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
-    of the active tiles before it) and its turn round accumulators a tile takes whole (`done`: the active
-    tiles before it). Returns both past the last tile."""
+    of the active tiles before it) and its turn round accumulators (`done`: the turns the active tiles before
+    it took, one a tile, or `turns(steps)` where given: an exactly summed tile's windows). Returns both past
+    the last tile."""
     @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=(jnp.int32(0), jnp.int32(0)))
     def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
         counter, done = carry
         active, steps, views, tile = schedule(loop.index)
         visit(counter, active, steps, views, tile, done)
-        return counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
+        taken = 1 if turns is None else turns(steps)
+        return counter + jnp.where(active, steps, 0), done + jnp.where(active, taken, 0)
 
     return ended
 

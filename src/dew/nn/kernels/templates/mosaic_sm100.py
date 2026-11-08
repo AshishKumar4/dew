@@ -561,9 +561,26 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         # E2M1), not along a tile's columns: the columns step by the 128 its block scales' tiles take.
         return min(super().column_unit(dtype), BLOCK_SCALED_COLUMNS)
 
-    def tensor_columns(self, columns: int, accumulators: int) -> int:
-        # Each turn holds every accumulator of a tile (`persist`).
-        return self.turns * columns * accumulators
+    sums_in_persist = True  # each window's partial promoted by the epilogue warpgroup (`persist`'s `summed`)
+
+    rewrites_in_persist = True  # a rewriting warpgroup between the loads and the products (`prepared`)
+
+    @property
+    def rewriting(self) -> mosaic.Issuer:
+        """The layouts a rewriting warpgroup reads a stage's tiles in (`persist`'s `prepared`): wgmma's, whose
+        64-row tiles a swizzled stage loads natively; tcgen05's own is tensor memory's 128 lanes."""
+        return mosaic_sm90.WGMMA
+
+    def summed_window(self, block_k: int) -> int:
+        # A window is `product.SUMMED_DEPTH` deep, its in-order adds no deeper than mma.sync's window's.
+        from dew.nn.kernels.templates import product
+
+        return max(1, product.SUMMED_DEPTH // block_k)
+
+    def tensor_columns(self, columns: int, accumulators: int, summed: bool = False) -> int:
+        # Each turn holds every accumulator of a tile (`persist`); exactly summed, the turns hold a window's
+        # partials and the tile's running sums take as many columns again.
+        return (self.turns + summed) * columns * accumulators
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
@@ -603,15 +620,31 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         warpgroups: the table's and one)."""
         mosaic.tabled(lax.axis_index("wg"), table, lambda: _issuing(load, products))
 
-    def persist_scratch(self, consumers: int) -> tuple[tuple, int]:
-        # Its accumulator turns' barriers, filled and drained (`persist`), and its tensor memory's address.
+    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
+        # Its accumulator turns' barriers, filled and drained (`persist`), each rewritten ring's slots'
+        # publish barriers (`prepared`), and its tensor memory's address.
         return ((plgpu.Barrier(num_barriers=self.turns, orders_tensor_core=True),
-                 plgpu.Barrier(num_barriers=self.turns, num_arrivals=consumers, orders_tensor_core=True)),
+                 plgpu.Barrier(num_barriers=self.turns, num_arrivals=consumers, orders_tensor_core=True),
+                 *(plgpu.Barrier(num_barriers=stages) for stages in rewrites)),
                 resources.TMEM_ADDRESS_BYTES)
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = ()) -> None:
+                unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
+                prepared: Callable | None = None) -> None:
+        """`mosaic.Family.persist`. With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots
+        before its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role
+        of its own past the consumers (`warpgroups`: the launch's consumers one more): it waits for each
+        step's loads, rewrites them, publishes them to the tensor cores and arrives at the step's `masked`
+        barrier, which the product warp waits for in the loads' place (a ring of three parties: the
+        producer's loads, the rewrite, the products). With `summed`, an exactly summed launch's
+        (`exact_sums`): each tile's
+        steps `summed` at a time, a window, each window's products into a turn's partials of their own (its
+        first product not accumulating), which the epilogue warpgroup promotes into the tile's running sums
+        in tensor memory (`promoted`: each chunk of the partial and the running sum out, an IEEE add, the
+        sum back) once their commit arrives, freeing the turn for the window after next; the tile's store
+        reads the running sums. Each window is a turn (`persistent.tiled`'s `turns`), so the products of a
+        window run while the epilogue promotes the one before."""
         if not accumulators:
             raise ValueError(f"{self._HOME}: a persistent launch states their shapes (`accumulators`)")
         rows = {shape[0] for shape in accumulators}
@@ -622,55 +655,66 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         for ring in rings.values():
             ring.initialized()
         staging = self.output_staging(outputs, consumers)
+        rewrites = () if prepared is None else tuple(ring.stages for ring in rings.values())
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
 
-        def scoped(tmem, done, read, *smems):
-            def turn_of(done_tiles) -> mosaic.Turn:
-                return mosaic.Turn.of(done_tiles, self.turns)
+        def windows(steps):
+            return 1 if not summed else (steps + summed - 1) // summed
+
+        def scoped(tmem, done, read, *rest):
+            # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
+            # slot's `masked` barrier in its loads' place.
+            masked = dict(zip(rings, rest[:len(rewrites)], strict=True)) if rewrites else {}
+            smems = rest[len(rewrites):]
+            issued = ({name: _published(ring, masked[name]) for name, ring in rings.items()} if masked
+                      else rings)
+            def turn_of(done_turns) -> mosaic.Turn:
+                return mosaic.Turn.of(done_turns, self.turns)
+
+            def at_columns(first: int | jax.Array) -> tuple:
+                # Every accumulator of a tile, each its columns of tensor memory from `first`.
+                return tuple(Accumulator(columns(tmem, first + offset, shape[1]), shape)
+                             for offset, shape in zip(offsets, accumulators, strict=True))
 
             def held(turn: mosaic.Turn) -> tuple:
                 # The turn's accumulators: each its columns of the turn's share of tensor memory.
-                return tuple(Accumulator(columns(tmem, turn.slot * width + offset, shape[1]), shape)
-                             for offset, shape in zip(offsets, accumulators, strict=True))
+                return at_columns(turn.slot * width)
 
-            def products(counter, active, steps, views, tile, done_tiles):
-                # The product warp: each active tile's steps into its turn's accumulators once the tile
-                # `turns` back has been read out of them, then a commit the epilogue waits on.
-                @pl.when(active)
-                def _():
-                    turn = turn_of(done_tiles)
-                    pl.when(turn.counter >= self.turns)(lambda: plgpu.barrier_wait(
-                        read.at[turn.slot], parity=turn.freed))
-                    into = held(turn)
+            # An exactly summed tile's running sums: the columns past the turns'.
+            running = at_columns(self.turns * width) if summed else ()
 
-                    def walk(step, start, shapes, *, initial=None):
-                        if initial is not None:
-                            raise NotImplementedError(f"{self._HOME}; a walk starts it from no value")
+            products = self._issued(issued, issue, turn_of, held, running, read, done, summed=summed,
+                                    interpret=interpret, unrolled=unrolled)
 
-                        def stepped(at, slots, carry, accs):
-                            return step(at - counter, slots, carry, accs)
-
-                        return self.walk(rings, ((stepped, counter, counter + steps),), start, shapes,
-                                         interpret, initial=into, unrolled=unrolled)
-
-                    issue(0, tile, walk, active=True)
-                    plgpu.tcgen05_commit_arrive(done.at[turn.slot])
+            def promoted(turn: mosaic.Turn, first) -> None:
+                self._promoted(held(turn), running, first)
+                plgpu.barrier_arrive(read.at[turn.slot])
 
             def epilogue(index):
                 store = self._stores(smems, index)
 
-                def visit(counter, active, steps, views, tile, done_tiles):
-                    del counter, steps, views
+                def visit(counter, active, steps, views, tile, done_turns):
+                    del counter, views
 
                     @pl.when(active)
                     def _():
-                        turn = turn_of(done_tiles)
-                        plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
-                        into = held(turn)
+                        if summed:
+                            def window(at, carry):
+                                turn = turn_of(done_turns + at)
+                                plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
+                                promoted(turn, at == 0)
+                                return carry
+
+                            lax.fori_loop(0, windows(steps), window, None)
+                            into = running
+                        else:
+                            turn = turn_of(done_turns)
+                            plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
+                            into = held(turn)
 
                         def walk(step, start, shapes, *, initial=None):
-                            # The products issued it: the tile's accumulators, done.
+                            # The products issued it: the tile's accumulators (its running sums), done.
                             del step, initial
                             if tuple(shapes) != accumulators:
                                 raise ValueError(f"a tile walks {shapes}, its launch stated {accumulators}")
@@ -678,12 +722,13 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                         finish(index, tile, issue(index, tile, walk, active=True), store, active=True)
                         plgpu.wait_load_tmem()
-                        plgpu.barrier_arrive(read.at[turn.slot])
+                        if not summed:
+                            plgpu.barrier_arrive(read.at[turn.slot])
 
                     pl.when(~active)(lambda: finish(index, tile, issue(index, tile, persistent.unwalked(self),
                                                                        active=False), store, active=False))
 
-                persistent.tiled(tiles, schedule, visit, axis=axis)
+                persistent.tiled(tiles, schedule, visit, axis=axis, turns=windows)
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
             def load():
@@ -693,17 +738,123 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                     ring.drain(loaded)
 
             def issue_all():
-                _, computed = persistent.tiled(tiles, schedule, products, axis=axis)
+                _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
                 mosaic.drained(read, computed, self.turns)
 
-            self.roles_of(((consumers, epilogue),), load=load, products=issue_all)
+            def rewrite(index):
+                del index
+                persistent.tiled(tiles, schedule, functools.partial(_rewritten, rings, masked, prepared),
+                                 axis=axis)
 
-        pl.run_scoped(scoped, plgpu.TMEM((self.rows, self.turns * width), jnp.float32),
-                      *self.persist_scratch(consumers)[0], *staging, collective_axes="wg")
+            table = ((consumers, epilogue),) + (((1, rewrite),) if prepared is not None else ())
+            self.roles_of(table, load=load, products=issue_all)
 
+        # Each ring's slots' rewrites published, a barrier of the ring's own (a wait of the product warp's
+        # one turn each).
+        pl.run_scoped(scoped, plgpu.TMEM((self.rows, (self.turns + bool(summed)) * width), jnp.float32),
+                      *self.persist_scratch(consumers, rewrites)[0], *staging, collective_axes="wg")
+
+
+    def _issued(self, rings, issue: Callable, turn_of: Callable, held: Callable, running: tuple, read,
+                done, *, summed: int, interpret: bool, unrolled: bool) -> Callable:
+        """`persist`'s product warp's visit of a tile (`persistent.tiled`'s): each active tile's windows (its
+        steps, where not `summed`) into a turn's accumulators once the window `turns` back has been read out
+        of them, each window then a commit the epilogue waits on."""
+        def products(counter, active, steps, views, tile, done_turns):
+            del views
+
+            def freed(turn: mosaic.Turn) -> None:
+                pl.when(turn.counter >= self.turns)(lambda: plgpu.barrier_wait(read.at[turn.slot],
+                                                                               parity=turn.freed))
+
+            @pl.when(active)
+            def _():
+                # A tile not summed takes one turn, freed and held before its walk is issued.
+                turn = None if summed else turn_of(done_turns)
+                if turn is not None:
+                    freed(turn)
+                into = None if turn is None else held(turn)
+
+                def walked(lo, hi, start, shapes, accumulators: tuple, step):
+                    def stepped(at, slots, carry, accs):
+                        return step(at - counter, slots, carry, accs)
+
+                    return self.walk(rings, ((stepped, lo, hi),), start, shapes, interpret,
+                                     initial=accumulators, unrolled=unrolled)
+
+                def walk(step, start, shapes, *, initial=None):
+                    if initial is not None:
+                        raise NotImplementedError(f"{self._HOME}; a walk starts it from no value")
+                    if not summed:
+                        return walked(counter, counter + steps, start, shapes, into, step)
+
+                    def window(index, carry):
+                        each = turn_of(done_turns + index)
+                        freed(each)
+                        lo = counter + index * summed
+                        carry, _ = walked(lo, jnp.minimum(lo + summed, counter + steps), carry, shapes,
+                                          held(each), step)
+                        plgpu.tcgen05_commit_arrive(done.at[each.slot])
+                        return carry
+
+                    return lax.fori_loop(0, (steps + summed - 1) // summed, window, start), running
+
+                issue(0, tile, walk, active=True)
+                if turn is not None:
+                    plgpu.tcgen05_commit_arrive(done.at[turn.slot])
+
+        return products
+
+    def _promoted(self, partials: tuple, totals: tuple, first) -> None:
+        """A window's `partials` added into the tile's running sums `totals` in tensor memory by an IEEE add
+        (the first window's, where `first`, the running sums as they are), a chunk at a time, every load
+        done and every store visible once it returns (`persist`'s `summed`)."""
+        for partial, total in zip(partials, totals, strict=True):
+            span = self.chunk_columns(total.shape[1])
+            for start in range(0, total.shape[1], span):
+                part = plgpu.async_load_tmem(_columns(partial.ref, start, span), layout=STORED)
+                into = _columns(total.ref, start, span)
+                # The first window's partial is the sum; a later one's adds onto it (a branch: a scalar
+                # selects no tile in warpgroup semantics, and the sum's columns hold nothing before it).
+                pl.when(first)(lambda into=into, part=part: plgpu.async_store_tmem(into, part))
+                pl.when(~first)(lambda into=into, part=part: plgpu.async_store_tmem(
+                    into, plgpu.async_load_tmem(into, layout=STORED) + part))
+        plgpu.commit_tmem()
+        plgpu.wait_load_tmem()
 
 RINGS = Tcgen05Rings()
 """The tcgen05 bundle (`bundles.of` on sm100 and sm103)."""
+
+
+def _published(ring: mosaic.Ring, masked) -> CommittedRing:
+    """`ring` as the product warp reads it where a role rewrites its slots (`Tcgen05Rings.persist`'s
+    `prepared`): each slot awaited at `masked`, the rewrite's publish barrier, in its loads' place, and
+    released by the products' commit; a gathered ring's (its loads' barriers its own mbarriers,
+    `gathered.Committed`) a committed ring of its slots and release barrier."""
+    if isinstance(ring, CommittedRing):
+        return dataclasses.replace(ring, full=masked)
+    return CommittedRing(smem=ring.smem, full=masked, consumed=ring.consumed)
+
+
+def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, steps, views, tile,
+               done) -> None:
+    """A rewriting role's visit of a persistent tile (`Tcgen05Rings.persist`'s `prepared`): each of its steps'
+    slots, once loaded, rewritten (`prepared(tile, index, slots)`), published to the tensor cores and each
+    ring's `masked` barrier of the step arrived at; none where the tile streams nothing."""
+    del views, done
+
+    @pl.when(active)
+    def _():
+        def step(index, carry):
+            turn = mosaic.Turn.of(counter + index, min(ring.stages for ring in rings.values()))
+            slots = {name: ring.acquire(turn) for name, ring in rings.items()}
+            prepared(tile, index, slots)
+            plgpu.commit_smem()
+            for barriers in masked.values():
+                plgpu.barrier_arrive(barriers.at[mosaic.opaque(turn.slot)])
+            return carry
+
+        lax.fori_loop(0, steps, step, None)
 
 
 def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:

@@ -1387,11 +1387,26 @@ class Issuer[Accumulator](abc.ABC):
     the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
     in tensor memory, read out in chunks), its two products run apart."""
 
-    def tensor_columns(self, columns: int, accumulators: int) -> int:
+    rewrites_in_persist: bool = False
+    """Whether its persistent walk rewrites a step's slots in a role of its own before the products read them
+    (`persist`'s `prepared`: a kernel gradient's neighbouring groups' rows zeroed, in `rewriting`'s
+    layouts), its consumers issuing no product a rewrite could precede."""
+
+    @property
+    def rewriting(self) -> "Issuer":
+        """The issuer whose layouts a rewrite of a step's slots reads their tiles in: its own."""
+        return self
+
+    sums_in_persist: bool = False
+    """Whether its persistent walk sums an exactly summed launch's steps a window at a time itself
+    (`persist`'s `summed`), each window's products in an accumulator of their own promoted into the running
+    sum by an IEEE add: a step then needs no consumer issuing its products (`summed_apart`)."""
+
+    def tensor_columns(self, columns: int, accumulators: int, summed: bool = False) -> int:
         """The tensor memory columns a program's `accumulators` fp32 accumulators of `columns` columns each
-        take (`generation.GpuTarget.tmem_columns` bounds them): none where its consumers hold them in
-        registers."""
-        del columns, accumulators
+        take (`generation.GpuTarget.tmem_columns` bounds them), exactly summed (`summed`, its windows'
+        partials beside the running sums) or not: none where its consumers hold them in registers."""
+        del columns, accumulators, summed
         return 0
 
     def column_registers(self, columns: int, dtype) -> int:
@@ -2058,11 +2073,12 @@ class Transport[Allocated, Opened](abc.ABC):
         del consumers
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
-    def persist_scratch(self, consumers: int) -> tuple[tuple, int]:
+    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
         """What `persist` scopes in shared memory besides its outputs' staging, which a template's
-        allocations count (`resources.Scope`): its barriers, and its address words
+        allocations count (`resources.Scope`): its barriers (with `rewrites`, each rewritten ring's slots'
+        publish barriers, by its slot count: `persist`'s `prepared`), and its address words
         (`resources.Scope.addresses`); none where its accumulators live in registers."""
-        del consumers
+        del consumers, rewrites
         return (), 0
 
     def published(self) -> None:
