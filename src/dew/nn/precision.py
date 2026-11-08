@@ -388,11 +388,28 @@ def products_dtype(*operands) -> jnp.dtype | None:
 
 
 def _intercepted() -> bool:
-    """Whether this thread traces a quantized model's method, whose products Qwix owns
-    (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    """Whether this thread traces a quantized model's method (`dew._cache.QUANTIZED_TRACE`, which jit's
+    cache keys on), whose sums are Qwix's products' fp32 ones throughout: Dew's wide CPU test arithmetic
+    takes none of them in float64 (`_sums_in_float64`, `compensates_loops`), so the quantized model compares
+    bitwise with the unquantized one under `FP32_SUMS`."""
     from dew._cache import QUANTIZED_TRACE
 
     return QUANTIZED_TRACE.value is not None
+
+
+def products_quantized() -> bool:
+    """Whether a quantized model's rule owns the products the module calling forms: in the trace of a
+    quantized model's method (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on), a Qwix rule matching
+    `dot_general` at that module (`qwix.pallas.get_current_rule`, Qwix's query for code that runs its own
+    products). A module its rules leave alone forms the plain model's products, summed as the plain model
+    sums them."""
+    from dew._cache import QUANTIZED_TRACE
+
+    if QUANTIZED_TRACE.value is None:
+        return False
+    from qwix import pallas as qwix_pallas
+
+    return qwix_pallas.get_current_rule("dot_general") is not None
 
 
 _OWN_DERIVATIVES = (core.primitives.custom_vjp_call_p, core.primitives.custom_jvp_call_p)
@@ -521,13 +538,14 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     product past the template) of float32 operands into float32, summed as a vectorized dot sums it where a
     CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other platform;
     None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`), a
-    library intercepts it (Qwix's), its declared algorithm narrows the operands (`exact_products`: its own
+    quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
+    sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
     product keeps the declaration), or its dtypes are others. A layer's projections alone: a product the
     algebra derives or a mixer forms (attention's `dP` and `D`, whose sums cancel bit for bit on a one-key
     row) keeps XLA's sum."""
     from dew.nn import pairwise
 
-    if (_sums_in_float64(lhs, rhs) or _intercepted() or not exact_products(precision, jnp.float32)
+    if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
             or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
             or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
                        for operand in (lhs, rhs))):
@@ -540,6 +558,20 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     blocked = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=dimension_numbers,
                                 precision=precision)
     return jax.lax.platform_dependent(lhs, rhs, cpu=blocked, default=plain)
+
+
+def projected(product: Callable) -> Callable:
+    """`product`, a layer's projection (a `jax.lax.dot_general`), summed on a CPU as `projection_product`
+    sums it where that takes it: whether or not the GEMM template's dispatch runs it (`gemm.dot_general`,
+    which a wrapper's scope skips: an adapter's, `dew.nn.dense.intercepted`), a layer's projection is
+    summed alike."""
+    def summed(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
+        if not kwargs and (projection := projection_product(
+                product, lhs, rhs, dimension_numbers, precision, preferred_element_type)) is not None:
+            return projection
+        return product(lhs, rhs, dimension_numbers, precision=precision,
+                       preferred_element_type=preferred_element_type, **kwargs)
+    return summed
 
 
 CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
