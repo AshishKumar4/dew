@@ -2234,22 +2234,23 @@ def _translated(config: Mapping[str, object],
                 attention_impl: AttentionImpl, max_seq_len: int | None, streaming: bool,
                 packed_experts: bool = False) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
-    weights decoded, or its expert banks held packed (`packed_experts`, `_packed_banks`), the decoder,
-    media wrapper or DiffusionGemma translated and checked against its tree, and any stored input scales
-    bound. No processor, generation config or bundle is built."""
+    weights decoded, or its expert banks held packed (`packed_experts`, `quantized_loads.packed_banks`),
+    the decoder, media wrapper or DiffusionGemma translated and checked against its tree, and any stored
+    input scales bound. No processor, generation config or bundle is built."""
     banks: dict[str, NvFp4] = {}
     placing, given = streaming, tensors
     if packed_experts:
         tensors, banks = quantized_loads.packed_banks(tensors, config)
         # Its leaves translated as views read when placed, as a streaming load's: the banks' unread leaves
-        # are replaced before any is read (`_with_banks`), the rest read below where the load places none.
+        # are replaced before any is read (`quantized_loads.with_banks`), the rest read below where the
+        # load places none.
         streaming = streaming or bool(banks)
     tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
     if banks:
-        # The banks are the source's quantized weights too (MXFP4's, `_packed_banks`), which an export
-        # writes back as it stored them.
+        # The banks are the source's quantized weights too (MXFP4's, `quantized_loads.packed_banks`),
+        # which an export writes back as it stored them.
         from dew.interop.codecs import MXFP4 as codec
 
         specs = tensor_specs(given)
