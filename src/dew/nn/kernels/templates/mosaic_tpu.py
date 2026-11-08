@@ -146,8 +146,7 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     def written(self, smem, value: jax.Array) -> None:
         smem[...] = value.astype(smem.dtype)
 
-    def products(self, acc: jax.Array, lhs, rhs, interpret: bool, *, accumulate: bool = True) -> jax.Array:
-        del interpret
+    def products(self, acc: jax.Array, lhs, rhs, *, accumulate: bool = True) -> jax.Array:
         return acc + _product(lhs, rhs) if accumulate else _product(lhs, rhs)
 
     def settled(self, pending: int = 0) -> None:
@@ -161,23 +160,20 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         del interpret
         return acc + value.astype(jnp.float32)
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
-        del interpret
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         if then is not None:
             then()
         return _product(lhs, rhs)
 
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        del interpret
+    def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         return _product(lhs, rhs)
 
-    def register_products(self, acc: jax.Array, parts, rhs, interpret: bool) -> jax.Array:
-        del interpret
+    def register_products(self, acc: jax.Array, parts, rhs) -> jax.Array:
         return acc + sum(_product(part, rhs) for part in parts)
 
     def rescaled_products(self, acc: jax.Array, scale, parts, rhs, interpret: bool) -> jax.Array:
         # `scale` the factor's function of the held value (`Issuer.rescaled_products`), not a factor.
-        return self.register_products(scale(acc), parts, rhs, interpret)
+        return self.register_products(scale(acc), parts, rhs)
 
 
 class VmemRings(mosaic.Family[dict, Streams, jax.Array]):

@@ -494,21 +494,19 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
                 loop.then()
         return carry, accumulators
 
-    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True
                  ) -> Accumulator:
         # The left operand from shared memory, or from tensor memory (an `Accumulator` a role wrote,
         # tcgen05's TS form: FlashAttention 4's P·V); the right from shared memory.
-        del interpret  # Mosaic GPU's interpreter models tensor memory and tcgen05's products
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
         return dataclasses.replace(acc, accumulate=True)
 
-    def scaled_products(self, acc: Accumulator, lhs, rhs, scales: tuple, interpret: bool) -> Accumulator:
+    def scaled_products(self, acc: Accumulator, lhs, rhs, scales: tuple) -> Accumulator:
         """`products` of block-scaled operands (an MX product's: each 32 depths of `lhs`'s rows and `rhs`'s
         columns times its E8M0 scale), `scales` the step's two `ScaleRing` slots, each its shared-memory tiles
         and their tensor memory: both copied in, then the products read them (`tcgen05_mma`'s `a_scale`,
         `b_scale`)."""
-        del interpret  # Mosaic GPU's interpreter models scaled tcgen05 products
         (a_tiles, a_scale), (b_tiles, b_scale) = scales
         plgpu.async_copy_scales_to_tmem(a_tiles, a_scale)
         plgpu.async_copy_scales_to_tmem(b_tiles, b_scale)
@@ -529,13 +527,13 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def added_into(self, acc, value, interpret: bool):
         raise NotImplementedError(f"{self._HOME}; nothing adds a register tile into one")
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False):
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None):
         raise NotImplementedError(f"{self._HOME}; a fresh product takes the launch's, not its own")
 
-    def registers_product(self, lhs, rhs, interpret: bool):
+    def registers_product(self, lhs, rhs):
         raise NotImplementedError(f"{self._HOME}; its operands are read from shared or tensor memory")
 
-    def register_products(self, acc, parts, rhs, interpret: bool):
+    def register_products(self, acc, parts, rhs):
         raise NotImplementedError(f"{self._HOME}; its operands are read from shared or tensor memory")
 
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
@@ -811,19 +809,18 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         role = mosaic.ROLE.get()
         return found["tmem"][width][role], found["done"].at[role]
 
-    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
-        del interpret
+    def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         tmem, done = self._scratch(shape[1])
         issue(Accumulator(tmem, (shape[0], max(shape[1], PADDED))))
         found = _awaited(tmem, done)
         return found if shape[1] >= PADDED else found[:, :shape[1]]
 
-    def products(self, acc: Accumulator | jax.Array, lhs, rhs, interpret: bool, *, accumulate: bool = True
+    def products(self, acc: Accumulator | jax.Array, lhs, rhs, *, accumulate: bool = True
                  ) -> Accumulator | jax.Array:
         if not isinstance(acc, Accumulator):
             # A sum the walk carries in registers: the product in a fresh accumulator, added to it.
             return acc + self.summed((acc.shape[0], acc.shape[1]),
-                                     lambda fresh: self.products(fresh, lhs, rhs, interpret), interpret)
+                                     lambda fresh: self.products(fresh, lhs, rhs))
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
         if rhs.shape[1] < PADDED:
             rhs = self._padded(rhs)
@@ -856,13 +853,13 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # in a fresh accumulator, added to it (`summed`).
         if not isinstance(acc, Accumulator):
             return acc + self.summed((acc.shape[0], acc.shape[1]), lambda fresh: self.register_products(
-                fresh, parts, rhs, interpret), interpret)
+                fresh, parts, rhs))
         _, done = self._scratch(acc.shape[1])
         for part in parts:
             tile = self._left(part)
             plgpu.store(tile, part, optimized=False)
             plgpu.commit_smem()
-            acc = self.products(acc, tile, rhs, interpret)
+            acc = self.products(acc, tile, rhs)
             plgpu.tcgen05_commit_arrive(done)
             plgpu.barrier_wait(done)
         return acc
@@ -876,17 +873,17 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
                              f"product scratch (`product_scratch`'s lefts), not {part.shape} {part.dtype}")
         return tiles[mosaic.ROLE.get()]
 
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+    def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         return self.summed((lhs.shape[0], rhs.shape[1]), lambda acc: self.register_products(
-            acc, (lhs,), rhs, interpret), interpret)
+            acc, (lhs,), rhs))
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def issue(acc):
-            self.products(acc, lhs, rhs, interpret)
+            self.products(acc, lhs, rhs)
             if then is not None:
                 then()
 
-        return self.summed(shape, issue, interpret)
+        return self.summed(shape, issue)
 
     def added_into(self, acc: Accumulator | jax.Array, value: jax.Array, interpret: bool
                    ) -> Accumulator | jax.Array:
@@ -905,13 +902,13 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     def rescaled_products(self, acc: Accumulator | jax.Array, scale, parts, rhs, interpret: bool
                           ) -> Accumulator | jax.Array:
         if not isinstance(acc, Accumulator):
-            return self.register_products(scale(acc), parts, rhs, interpret)
+            return self.register_products(scale(acc), parts, rhs)
         _, done = self._scratch(acc.shape[1])
         plgpu.tcgen05_commit_arrive(done)
         plgpu.barrier_wait(done)
         plgpu.async_store_tmem(_tensor_memory(acc), scale(_read(_tensor_memory(acc))))
         plgpu.commit_tmem()
-        return self.register_products(dataclasses.replace(acc, accumulate=True), parts, rhs, interpret)
+        return self.register_products(dataclasses.replace(acc, accumulate=True), parts, rhs)
 
     def settled(self, pending: int = 0) -> None:
         # Every product is awaited where its accumulator is read (`summed`): nothing in flight past it.

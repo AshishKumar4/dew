@@ -411,20 +411,21 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         their elements themselves."""
         return self.dtype.itemsize <= 2
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
-        out = self.products(self.zeros(shape), lhs, rhs, interpret=interpret)
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+        out = self.products(self.zeros(shape), lhs, rhs)
         if then is not None:
             then()
         return out
 
-    def products(self, acc, lhs, rhs, interpret: bool, *, accumulate: bool = True):
+    def products(self, acc, lhs, rhs, *, accumulate: bool = True):
+        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
         if not accumulate:
             # A fresh product: onto zeros, its accumulator a value (`read` is that value).
             acc = self.zeros(acc.shape)
         if jnp.dtype(lhs.dtype) != self.dtype:
             # Another dtype's operands (fp32's, as TF32) by that dtype's issuer: its fragments' layouts and
             # depths are its own, its accumulator's the same.
-            return dataclasses.replace(self, dtype=jnp.dtype(lhs.dtype)).products(acc, lhs, rhs, interpret)
+            return dataclasses.replace(self, dtype=jnp.dtype(lhs.dtype)).products(acc, lhs, rhs)
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
@@ -478,8 +479,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # pass lowers (tf32-dump-sm80 at ca3dd0f0a, a splat to the accumulator's registers).
         return issued(plgpu.layout_cast(acc, self.layout), left, right)
 
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs, interpret)
+    def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
+        return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs)
 
     def summed_window(self, block_k: int) -> int:
         # Its accumulator is a value, carried across a window's steps and added into the running sum at
@@ -488,7 +489,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # truncating in-order adds no deeper than a promoted FP8 product's step.
         return max(1, product.SUMMED_DEPTH // block_k)
 
-    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
+    def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:
         # A step's fresh accumulator starts from zeros tied to the running sum (an optimization barrier),
         # so no step's products issue before the last step's add. Its products are values, independent of
@@ -497,16 +498,16 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # sum, 616 bytes spilled at the A100 forward's 128 x 128 tile; a traced grid's walk, its drain not
         # unrolled, spilled none (NSDBG-5).
         running, fresh = lax.optimization_barrier((running, self.zeros(running.shape)))
-        fresh = self.products(fresh, lhs, rhs, interpret)
+        fresh = self.products(fresh, lhs, rhs)
         return running + (fresh if scale is None else fresh * scale(0, running.shape[1]))
 
-    def register_products(self, acc, parts, rhs, interpret: bool):
+    def register_products(self, acc, parts, rhs):
         for formed in parts:
-            acc = self.products(acc, mosaic.unscaled_part(formed), rhs, interpret)
+            acc = self.products(acc, mosaic.unscaled_part(formed), rhs)
         return acc
 
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
-        return self.register_products(scale(acc), parts, rhs, interpret)
+        return self.register_products(scale(acc), parts, rhs)
 
     def added_into(self, acc: jax.Array, value: jax.Array, interpret: bool) -> jax.Array:
         """`Issuer.added_into` for a register accumulator: its sum with `value`, in the accumulator's
