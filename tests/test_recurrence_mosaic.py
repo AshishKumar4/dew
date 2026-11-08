@@ -7,7 +7,7 @@ over one sequence a row and packed documents, value heads over fewer key heads, 
 off a block's width, bf16 and fp32 operands and lengths off the chunks, and every hook combination the
 mainloop takes (a decay a head or none, with and without the delta rule, Mamba2's rated decay, the skip and
 the norm) on the chunked op's own draws (`test_recurrence_chunk`). Off such a GPU the cases run in Mosaic
-GPU's interpreter on the wgmma bundle (`bundles.INTERPRETED`) at one row of a shorter length
+GPU's interpreter on the interpreted target's bundle (`mainloop.issued`) at one row of a shorter length
 (`INTERPRETED_LENGTH`), whose products are the dots they compute: coverage of the mainloop's algebra and its
 roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
@@ -30,6 +30,7 @@ from test_recurrence_chunk import (
     draw as hooked_draw,
     formed,
     hosted,
+    routed,
     sigmoid,
     softplus,
     token_by_token,
@@ -239,7 +240,7 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
         jax.eval_shape(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)), operands)
-    family = mainloop.family_of() or bundles.INTERPRETED
+    family, _ = mainloop.issued()
     if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
@@ -277,13 +278,9 @@ def drawn_forward(case: str, dtype: str) -> Callable:
     (its `check1_shards` mark). A map task of 128 seeds of the three 256-seed cases took 1045 to 1071 s on
     main's CI (Main, 2026-11-02); the 128-seed cases under a decay a key dimension 250 s and past 600 s whole
     (int-g1-each at 7683420535), a task of 8 seeds of both 117 to 125 s, half of it their compiles
-    (keyed-shards at 7e3a5fb48)."""
+    (keyed-shards at 7e3a5fb48); on each route (`routed`)."""
     DRAWN_FORWARD.add((case, dtype))
-
-    def check():
-        the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype])
-
-    return lambda test: functools.update_wrapper(check, test)
+    return routed(lambda: the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype]))
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
@@ -1070,6 +1067,24 @@ def _two_roles(name: str, bound, derived, family, facts, *, packed: bool) -> lis
     return [] if two is None else [(two, 'two roles ')]
 
 
+def _gate_call(name: str, dtype, given: list, starts, tiles, family, *, training: bool):
+    """A gate case's call (`KernelCase`'s): `name`'s forward, or training step over the output's and final
+    memory's cotangents in `given`, at `tiles` on `family`, over packed documents where `starts` are given."""
+    formed = {key: value for key, value in _form(name, dtype).items() if key != 'wide' or not training}
+    run = functools.partial(mainloop_backward.gradients if training else chunk_forward.forward, **formed,
+                            floor=resource_floor(name))
+    skip = list(_skipped(name, dtype).values())
+    packed = starts is not None
+
+    def fn(*operands):
+        *operands, documents = operands if packed else (*operands, None)
+        *operands, fused = (*operands, None) if not skip else operands
+        return run(*operands, tiles=tiles, starts=documents, max_segments=8 if packed else None,
+                   family=family, skip=fused)
+
+    return fn, (*given, *skip, *([starts] if packed else []))
+
+
 def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: tuple | None = None,
                    launched: dict | None = None) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
@@ -1166,24 +1181,11 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             apart[label] = {launch.name for launch in plans[label]
                             if launch.registers > _model(launch, family).budget}
 
-        def call():
-            given = list(args)
-            if training:
-                given += [array(rows, length, value_heads, value_width),
-                          array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
-            formed = {key: value for key, value in _form(name, dtype).items()
-                      if key != 'wide' or not training}
-            run = functools.partial(mainloop_backward.gradients if training else chunk_forward.forward,
-                                    **formed, floor=resource_floor(name))
-            skip = list(_skipped(name, dtype).values())
-
-            def fn(*operands):
-                *operands, documents = operands if packed else (*operands, None)
-                *operands, fused = (*operands, None) if not skip else operands
-                return run(*operands, tiles=tiles, starts=documents, max_segments=8 if packed else None,
-                           family=family, skip=fused)
-
-            return fn, (*given, *skip, *([starts] if packed else []))
+        given = list(args)
+        if training:
+            given += [array(rows, length, value_heads, value_width),
+                      array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
+        call = functools.partial(_gate_call, name, dtype, given, starts, tiles, family, training=training)
 
         # A refused tile compiled for the model's evidence alone, which no call runs (`KernelCase.required`).
         return KernelCase(label, call, {launch.name: _model(launch, family) for launch in plans[label]},

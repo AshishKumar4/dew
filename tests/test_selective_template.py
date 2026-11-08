@@ -26,6 +26,7 @@ from reference_error import (
     with_gradients,
 )
 from selective_support import selective_draw, selective_xla
+from test_recurrence_chunk import ROUTES, on_route
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -94,7 +95,8 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
     """`case`'s output and every input's gradient through the template, at `tiles` where given (else the
     device's plan), on par from float64 with the portable scan's, over check 1's fewest draws."""
     shape = SHAPES[case]
-    family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), dtype)
+    family = bundles.of(generation.interpreted_target().generation if INTERPRETED
+                        else generation.device_generation(), dtype)
     planned = {} if tiles is None else {"chunk": tiles.chunk, "plan": (tiles.positions, tiles.resident)}
     template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED, **planned)
 
@@ -111,17 +113,22 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
 
 # The template's scan interpreted, each case a check-1 site of its own, its eight draws in armada map tasks of
 # four (`check1_shards`): whole, both took 200 s (site-tasks2 at d87423e30), a task of two seeds of both 91 s
-# (site-tasks at c17a54df2).
+# (site-tasks at c17a54df2); on each route (`ROUTES`).
+@pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_template_is_as_exact_as_the_portable_scan_interpreted():
-    """`the_template_is_as_exact_as_the_portable_scan` over one row."""
-    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False)
+def test_the_template_is_as_exact_as_the_portable_scan_interpreted(route):
+    """`the_template_is_as_exact_as_the_portable_scan` over one row, on the route's bundle (`on_route`)."""
+    with on_route(route):
+        the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False)
 
 
+@pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_interpreted():
-    """`the_template_is_as_exact_as_the_portable_scan` over packed documents."""
-    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
+def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_interpreted(route):
+    """`the_template_is_as_exact_as_the_portable_scan` over packed documents, on the route's bundle
+    (`on_route`)."""
+    with on_route(route):
+        the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
 
 
 @pytest.mark.parametrize("regime", REGIMES)
@@ -134,7 +141,8 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
     at every chunk (`selective.PARTIALS`), which no CPU test held once the regime cases went to the GPU flow
     alone (row 3133)."""
     shape = SHAPES["interpreted"]
-    family = mosaic_sm90.WGMMA if INTERPRETED else bundles.of(generation.device_generation(), jnp.float32)
+    family = bundles.of(generation.interpreted_target().generation if INTERPRETED
+                        else generation.device_generation(), jnp.float32)
     template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
 
     def draws(seed):

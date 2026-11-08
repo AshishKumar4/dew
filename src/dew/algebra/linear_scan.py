@@ -366,20 +366,21 @@ def _read(vector, matrix, keys: int) -> jax.Array:
     return jnp.sum(jnp.broadcast_to(product, (keys, jnp.shape(product)[-1])), axis=0)
 
 
-def value_of(term: Token, read: Callable[[int], jax.Array], keys: int) -> jax.Array:
-    """A free term's value over a state of `keys` keys, its leaves `read(index)` (`Token.value`'s)."""
+def value_of(term: Token, read: Callable[[int], jax.Array], keys: int, dtype) -> jax.Array:
+    """A free term's value over a state of `keys` keys, its leaves `read(index)` (`Token.value`'s), its
+    constants in the computation's `dtype`."""
     if (args := get_callable_args(term, Token.value)) is not None:
         return read(terms.integer(args[0]))
     if (args := get_callable_args(term, Token.literal)) is not None:
-        return jnp.asarray(terms.real(args[0]), jnp.float32)
+        return jnp.asarray(terms.real(args[0]), dtype)
     if get_callable_args(term, Token.zero) is not None:
-        return jnp.zeros((), jnp.float32)
+        return jnp.zeros((), dtype)
     if (args := get_callable_args(term, Token.read)) is not None:
         vector, matrix = args
-        return _read(value_of(vector, read, keys), value_of(matrix, read, keys), keys)
+        return _read(value_of(vector, read, keys, dtype), value_of(matrix, read, keys, dtype), keys)
     for constructor, applied in _APPLIED:
         if (args := get_callable_args(term, constructor)) is not None:
-            return applied(*(value_of(arg, read, keys) for arg in args))
+            return applied(*(value_of(arg, read, keys, dtype) for arg in args))
     raise Refused("a part of the token's affine map that reads the state")
 
 

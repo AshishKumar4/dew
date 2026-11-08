@@ -37,7 +37,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import across, product, report, resources
+from dew.nn.kernels.templates import across, persistent, product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -143,30 +143,36 @@ def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, sett
     b2b872c91; CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
     (`mosaic_gpu.uses_pdl`) and the runtime launches it with programmatic stream serialization. Interpreted,
     or on a GPU without grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on),
-    `entry` as it is.
+    `entry` as it is. Its body traces knowing whether it runs interpreted (`interpreting`), as every family's
+    products read it.
 
     With `ahead`, a program first runs it, once, on the refs of its `settled` operands (indices among the
     launch's operands) and its `scratch` refs (the body's last), before its wait, and then `entry` on every
-    ref and what `ahead` returned: the reads of operands no launch before it writes (a decode step's
-    weights, loaded once a run) issued under the previous launch's tail, which its other operands' and its
-    outputs' refs, not given to `ahead`, cannot be. The launch declares `settled` on its call (`SETTLED`),
-    and the compile point refuses a program where one is not an input it holds whole
+    ref and what `ahead` returned, where it returned anything: the reads of operands no launch before it
+    writes (a decode step's weights, loaded once a run) issued under the previous launch's tail, which its
+    other operands' and its outputs' refs, not given to `ahead`, cannot be. The launch declares `settled` on
+    its call (`SETTLED`), and the compile point refuses a program where one is not an input it holds whole
     (`lowered.unsettled`)."""
-    waits = not interpreted(interpret) and generation.gpu_target().architecture.dependent_launch
-    if ahead is None and not waits:
+    interpreting_ = bool(interpreted(interpret))
+    waits = not interpreting_ and generation.gpu_target().architecture.dependent_launch
+    if ahead is None and not waits and not interpreting_:
         return entry
 
     def body(*refs):
-        own = refs[len(refs) - scratch:]
-        held = None if ahead is None else ahead(*(refs[index] for index in settled), *own)
-        if waits:
-            plgpu.griddepcontrol_wait()
-        if ahead is None:
-            entry(*refs)
-        else:
-            entry(*refs, held)
-        if waits:
-            plgpu.griddepcontrol_launch_dependents()
+        token = _INTERPRETING.set(interpreting_)
+        try:
+            own = refs[len(refs) - scratch:]
+            held = None if ahead is None else ahead(*(refs[index] for index in settled), *own)
+            if waits:
+                plgpu.griddepcontrol_wait()
+            if held is None:
+                entry(*refs)
+            else:
+                entry(*refs, held)
+            if waits:
+                plgpu.griddepcontrol_launch_dependents()
+        finally:
+            _INTERPRETING.reset(token)
 
     return body
 
@@ -175,6 +181,18 @@ SETTLED = "dew_settled"
 """The frontend attribute a launch's call declares the operands its programs read ahead of their wait under
 (`dependent`'s `settled`), their indices joined by commas: each must be an input of the program that no
 operation of it produces (`lowered.unsettled`)."""
+
+
+_INTERPRETING: contextvars.ContextVar[bool] = contextvars.ContextVar("interpreting", default=False)
+"""Whether the launch whose body is tracing runs in Pallas's interpreter (`dependent`, which every launch's
+body passes through)."""
+
+
+def interpreting() -> bool:
+    """Whether the launch whose program is tracing runs in Pallas's interpreter: a family's products issue
+    no instruction the interpreter lacks there (mma.sync's sums, `mosaic_sm80.Mma.products`), whatever a
+    caller states (row 5209's A100 backward: products called with no interpret flag issued mma.sync's)."""
+    return _INTERPRETING.get()
 
 
 _RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
@@ -356,52 +374,6 @@ def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
         pl.when(index == role)(built)
 
 
-def unwalked(family: "Family") -> Callable:
-    """A walk of no steps (`Family.persist`'s, where a tile streams nothing): its carry and accumulators as
-    they start."""
-    def walk(step, start, shapes, *, initial=None):
-        del step
-        return start, family.started(shapes, initial)
-
-    return walk
-
-
-def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str) -> tuple[jax.Array, ...]:
-    """A persistent kernel's tiles (`Family.persist`'s): the grid `tiles` spread over the launch's programs
-    along `axis`, each tile's `schedule(index)`, `(active, steps, views, tile)`, visited as `visit(counter,
-    active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
-    of the active tiles before it) and its turn round accumulators a tile takes whole (`done`: the active
-    tiles before it). Returns both past the last tile."""
-    @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=(jnp.int32(0), jnp.int32(0)))
-    def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
-        counter, done = carry
-        active, steps, views, tile = schedule(loop.index)
-        visit(counter, active, steps, views, tile, done)
-        return counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
-
-    return ended
-
-
-def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
-             store: Callable, index, walking: Callable, *, axis: str) -> jax.Array:
-    """Consumer role `index`'s tiles of a persistent kernel (`tiled`'s), issued and finished in turn
-    (`Family.persist`'s `issue` and `finish`): each tile's accumulators `issue(index, tile, walk,
-    active=...)`, `walk` its steps' (`walking(counter, active, steps, views)`, built where the tile is
-    visited) where it streams any, a walk of none (`unwalked`) where not, then `finish(index, tile, accs,
-    store, active=...)`. Returns the counter past the last tile."""
-    def visit(counter, active, steps, views, tile, done):
-        del done
-        walk = walking(counter, active, steps, views)
-
-        def run(walk, *, active: bool):
-            finish(index, tile, issue(index, tile, walk, active=active), store, active=active)
-
-        pl.when(active)(lambda: run(walk, active=True))
-        pl.when(~active)(lambda: run(unwalked(family), active=False))
-
-    return tiled(tiles, schedule, visit, axis=axis)[0]
-
-
 class Pieces(tuple):
     """A step's tile loaded as several copies (`viewed`, `Ring.load`): its block's rows in as many equal
     parts, each a view of its own, in order (a `Rows` step's runs)."""
@@ -455,8 +427,8 @@ def viewed(view: tuple, block: tuple, step):
 
 
 def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
-    """A producer's loads of one persistent tile (`tiled`'s visit): each of its steps' blocks into its
-    stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
+    """A producer's loads of one persistent tile (`persistent.tiled`'s visit): each of its steps' blocks
+    into its stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
     del tile, done
 
     @pl.loop(0, jnp.where(active, steps, 0))
@@ -1356,7 +1328,7 @@ class Issuer[Accumulator](abc.ABC):
     """Whether its products scale each 32 depths of their operands by an E8M0 scale in the instruction (an MX
     product's, `scaled_products`): tcgen05's block-scaled MMA; no other family's products do (row 4519)."""
 
-    def scaled_products(self, acc, lhs, rhs, scales: tuple, interpret: bool):
+    def scaled_products(self, acc, lhs, rhs, scales: tuple):
         """`products` of block-scaled operands (`takes_block_scales`), `scales` the step's two scale slots."""
         raise NotImplementedError(f"{self.name}'s products take no block scales")
 
@@ -1483,11 +1455,10 @@ class Issuer[Accumulator](abc.ABC):
         del products
         return 0
 
-    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+    def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
         `shape` (zero), its value once they are done: a register accumulator's, which a family whose
         accumulator is a ref scopes (wgmma's)."""
-        del interpret
         return issue(self.zeros(shape))
 
     @abc.abstractmethod
@@ -1537,12 +1508,12 @@ class Issuer[Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
         product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum)."""
 
     @abc.abstractmethod
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+    def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
     def summed_window(self, block_k: int) -> int:
@@ -1552,18 +1523,18 @@ class Issuer[Accumulator](abc.ABC):
         del block_k
         return 1
 
-    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
+    def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
         fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
         `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
         by an IEEE add."""
         rows, columns = running.shape
-        fresh = self.product(lhs, rhs, (rows, columns), interpret=interpret)
+        fresh = self.product(lhs, rhs, (rows, columns))
         return running + (fresh if scale is None else fresh * scale(0, columns))
 
     @abc.abstractmethod
-    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True
                  ) -> Accumulator:
         """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step);
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
@@ -1585,7 +1556,7 @@ class Issuer[Accumulator](abc.ABC):
         shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
         (`products`)."""
         for i, j in product.terms(len(left), len(right)):
-            acc = self.products(acc, left[i], right[j], interpret)
+            acc = self.products(acc, left[i], right[j])
         return acc
 
     def apart(self, shape: tuple[int, int], left: tuple, right: tuple, interpret: bool) -> jax.Array:
@@ -1594,13 +1565,13 @@ class Issuer[Accumulator](abc.ABC):
         meet first: a tensor core's accumulation truncates (mma.sync's), so a part accumulated onto a larger
         one loses its last bit where a sum rounds it."""
         def issue(i: int, j: int, acc: Accumulator) -> Accumulator:
-            return self.products(acc, left[i], right[j], interpret)
+            return self.products(acc, left[i], right[j])
 
-        return functools.reduce(jnp.add, (self.summed(shape, functools.partial(issue, i, j), interpret)
+        return functools.reduce(jnp.add, (self.summed(shape, functools.partial(issue, i, j))
                                           for i, j in product.terms(len(left), len(right))))
 
     @abc.abstractmethod
-    def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
+    def register_products(self, acc: Accumulator, parts, rhs) -> Accumulator:
         """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
         registers, `parts` an iterable that may form each as it is taken
         (`attention_algebra.formed_parts`)."""
@@ -1776,6 +1747,11 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether the warpgroup loading its rings gathers a step's rows from a table (a gathered stream's `Rows`
     of one row: `gathered.Ring`, its threads' cp.async copies; a ring family's producer, or a consumer that
     feeds its rings; mma.sync's one warpgroup beside its pipeline, `mosaic_sm80._gathered_walk`)."""
+
+    gathers_alone: bool = True
+    """Whether a walk gathering some streams' rows loads the others whole beside them (a GEMM's gathered
+    rows beside its matrix); where not (mma.sync's walk, which gathers every stream's rows or none), only a
+    call gathering every stream takes its gathers."""
 
     gathers_interpreted: bool = False
     """Whether its gathered streams copy their rows interpreted too (mma.sync's walk, row by row); where not
@@ -2354,7 +2330,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         staging = self.output_staging(outputs, consumers)
 
         def producer():
-            loaded, _ = tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
+            loaded, _ = persistent.tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
             for ring in rings.values():
                 ring.drain(loaded)
 
@@ -2378,7 +2354,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 return self._tile_walk(rings, counter, jnp.where(active, steps, 0), views, index,
                                        interpret=interpret, in_flight=in_flight, unrolled=unrolled)
 
-            ended = consumed(self, tiles, schedule, issue, finish, store, index, walking, axis=axis)
+            ended = persistent.consumed(self, tiles, schedule, issue, finish, store, index, walking,
+                                        axis=axis)
             self._ended(rings, ended, index)
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 

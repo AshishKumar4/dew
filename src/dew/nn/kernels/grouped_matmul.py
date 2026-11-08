@@ -764,7 +764,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _takes(self, ba, family: mosaic.Family) -> bool:
         """Whether `family`'s bundle runs the call: 16-bit operands, or FP8 ones it takes (`_fp8`); gathered
-        rows where its producer gathers them (`Transport.gathers_rows`); a hooked or exactly summed call
+        rows where its producer gathers them beside the matrix's whole loads (`Transport.gathers_rows`,
+        `gathers_alone`); a hooked or exactly summed call
         where its register model counts what they hold (a paired product's epilogue over its two
         accumulators alone every family's counts, `registers`); a step that prepares its operands (a
         prologue's rewrite, a consumer's own share of the rows' stage, an exactly summed step's product
@@ -778,7 +779,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         gathered = ba.arguments.get('gather') is not None
         tabled = gathered or ba.arguments.get('scatter') is not None
         return ((jnp.dtype(dtype).itemsize == 2 or self._fp8(ba, dtype, family))
-                and (not tabled or family.gathers_rows)
+                and (not tabled or (family.gathers_rows and family.gathers_alone))
                 and (not gathered or ba.arguments['hooks'].prologue is None)
                 and (family.issues_in_consumers or not prepared)
                 and (family.counts_hooks or not hooked) and (family.counts_sums or not summed))
