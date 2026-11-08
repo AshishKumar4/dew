@@ -15,7 +15,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts
+from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts, walked_sums
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     TileWalk,
@@ -213,16 +213,9 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
             segments = functools.partial(program.segmented, step, run)
 
             shapes = ((block_k, columns), (block_k, columns))
-            # fp16's running scales carried, dV's and dK's (`_sixteen_step`), their sums taken back by them.
-            start = (jnp.float32(-jnp.inf),) * 2 if exponents else ()
             exchange.open()
-            scales, (dk, dv) = family.walk_own(
-                streams, views, (lo, hi), streamed, index,
-                lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), start, shapes,
-                                                             walk.interpret, first=counted))
-            if scales:
-                dv, dk = (algebra.running_restored(sums, scale) for sums, scale in zip((dv, dk), scales,
-                                                                                       strict=True))
+            dk, dv = walked_sums(walk, streams, views, (lo, hi), streamed, index, segments, shapes,
+                                 scaled=bool(exponents))
             for value, ref in ((dk, dk_ref), (dv, dv_ref)):
                 family.added(value, ref.at[row, pl.ds(k_first, block_k), key_head, mine], walk.interpret,
                              smem=smem.at[pl.ds(0, block_k)])
