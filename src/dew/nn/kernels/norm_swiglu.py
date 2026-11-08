@@ -276,9 +276,48 @@ def elementwise(function) -> bool:
     (distinct extents, so a transpose shows, and two shapes, so an array built at one input's shape fails
     the other), every equation, nested ones too, reads and writes only the input's shape or scalars, none of
     them positional (`_POSITIONAL`), and each one Pallas's Triton lowering takes (an exact gelu's erfc it
-    takes none of); every array it closes over a scalar. A callable that does not trace on an array
+    takes none of); every array it closes over a scalar; and its program the same at both shapes but for
+    the shapes themselves, so no value reads the input's extents (`y / y.shape[-1]` is a row's mean at the
+    row's width alone, which a padded tile does not have). A callable that does not trace on an array
     (TypeError, ValueError) is none."""
-    return all(_maps_alone(function, shape) for shape in PROBES)
+    if not all(_maps_alone(function, shape) for shape in PROBES):
+        return False
+    first, second = (jax.make_jaxpr(function)(jax.ShapeDtypeStruct(shape, jnp.float32)) for shape in PROBES)
+    return _alike(first, second, *PROBES)
+
+
+def _alike(first, second, shape, other) -> bool:
+    """Whether two traces of one function, at input `shape` and `other`, are one program but for those
+    shapes: equation by equation the same primitives, literals and constants, and the same parameters, a
+    parameter that is the input's shape at each taken as one, nested programs alike."""
+    def same(a, b) -> bool:
+        if isinstance(a, jax.extend.core.ClosedJaxpr) and isinstance(b, jax.extend.core.ClosedJaxpr):
+            return programs(a, b)
+        if isinstance(a, jax.extend.core.Jaxpr) and isinstance(b, jax.extend.core.Jaxpr):
+            return equations(a, b)
+        if isinstance(a, tuple) and isinstance(b, tuple) and (a, b) == (shape, other):
+            return True
+        if isinstance(a, jax.extend.core.Literal) and isinstance(b, jax.extend.core.Literal):
+            return np.array_equal(a.val, b.val)
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError):
+            return repr(a) == repr(b)
+
+    def equations(a, b) -> bool:
+        return len(a.eqns) == len(b.eqns) and all(
+            x.primitive is y.primitive and x.params.keys() == y.params.keys()
+            and all(same(x.params[key], y.params[key]) for key in x.params)
+            and all(same(u, v) for u, v in zip(x.invars, y.invars, strict=True)
+                    if isinstance(u, jax.extend.core.Literal) or isinstance(v, jax.extend.core.Literal))
+            for x, y in zip(a.eqns, b.eqns))
+
+    def programs(a, b) -> bool:
+        return (len(a.consts) == len(b.consts)
+                and all(np.array_equal(u, v) for u, v in zip(a.consts, b.consts, strict=True))
+                and equations(a.jaxpr, b.jaxpr))
+
+    return programs(first, second)
 
 
 PROBES = ((2, 3), (5, 7))
@@ -314,54 +353,6 @@ def _maps_alone(function, shape: tuple[int, int]) -> bool:
         return all(np.ndim(const) == 0 for const in closed.consts) and mapped(closed.jaxpr)
 
     return isinstance(out, jax.ShapeDtypeStruct) and out.shape == shape and closed_mapped(closed)
-
-
-@dataclasses.dataclass(frozen=True, eq=False)
-class _Logical:
-    """An `elementwise` activation traced once at the call's logical shape (`traced`, at `shape`) and
-    applied to a kernel's tile of any shape: the traced graph evaluated on the tile, each shape it states
-    (`broadcast_in_dim`'s, a reshape's) the tile's and every constant the trace's, so an activation reading
-    its operand's shape (`y / y.shape[-1]`) divides by the row's width, not a padded tile's (norms.py's
-    arithmetic), and its pullback derives from the same graph (`jax.vjp` through it)."""
-
-    traced: jax.extend.core.ClosedJaxpr
-    shape: tuple[int, ...]
-
-    @classmethod
-    def of(cls, epilogue, shape: tuple[int, ...]) -> "_Logical | None":
-        return None if epilogue is None else cls(
-            jax.make_jaxpr(epilogue)(jax.ShapeDtypeStruct(shape, jnp.float32)), tuple(shape))
-
-    def __call__(self, y: jax.Array) -> jax.Array:
-        (out,) = _on_tile(self.traced.jaxpr, self.traced.consts, self.shape, y.shape, y)
-        return out
-
-
-def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
-    """`jaxpr`, traced at the `logical` shape, evaluated on `args` of the `tile` shape: each shape parameter
-    that is the logical shape the tile's, a nested program (a jit's, a custom rule's primal) evaluated so too
-    in place."""
-    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
-
-    def read(atom):
-        return atom.val if isinstance(atom, jax.extend.core.Literal) else values[atom]
-
-    for equation in jaxpr.eqns:
-        given = [read(atom) for atom in equation.invars]
-        nested = next((value for key, value in equation.params.items()
-                       if key in ("jaxpr", "call_jaxpr", "fun_jaxpr")
-                       and isinstance(value, jax.extend.core.ClosedJaxpr)), None)
-        if nested is not None:
-            given = given[len(given) - len(nested.jaxpr.invars):]
-            outputs = _on_tile(nested.jaxpr, nested.consts, logical, tile, *given)
-        else:
-            params = {key: tuple(tile) if isinstance(value, tuple) and tuple(value) == logical else value
-                      for key, value in equation.params.items()}
-            with equation.ctx.manager:
-                made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
-            outputs = made if equation.primitive.multiple_results else [made]
-        values.update(zip(equation.outvars, outputs, strict=True))
-    return [read(atom) for atom in jaxpr.outvars]
 
 
 def _runs(case) -> bool:
@@ -1128,7 +1119,7 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
                            lambda x, scale: portable(x, None, scale)[1], axes=axes, weight_first=weight_first,
                            epilogue=epilogue)
     norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(weight_first=weight_first,
-                                                                     epilogue=_Logical.of(epilogue, x.shape))
+                                                                     epilogue=epilogue)
 
     def forward(x, branch, scale):
         outputs, mean_square = _rms_with_mean_square(x, branch, scale, None, norm)
@@ -1153,7 +1144,7 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
     multiplies, as `unweighted_rmsnorm` rounds it; `weight_first` and `epilogue` as `stream_rms_norm`'s."""
     norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded,
                                                                      weight_first=weight_first,
-                                                                     epilogue=_Logical.of(epilogue, x.shape))
+                                                                     epilogue=epilogue)
 
     def forward(x, scale):
         (_, y), mean_square = _rms_with_mean_square(x, None, scale, None, norm)

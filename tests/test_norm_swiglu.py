@@ -242,7 +242,8 @@ def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_
     """Row 821: the fused norm applies an activation after it (`RMSNorm.activation`, a U-Net's output norm's
     swish) where `norm_swiglu.elementwise` holds: every equation maps each element alone and Pallas's Triton
     lowering takes it. Activations of one element each, exact gelu's erfc aside, take the kernel; one that
-    reads other elements or positions takes XLA's."""
+    reads other elements, positions or its operand's extents (`y / y.shape[-1]`, which a padded tile divides
+    by its own width) takes XLA's."""
     from dew.nn import activations
 
     for function in (jax.nn.silu, jax.nn.swish, activations.silu, jax.nn.relu, activations.gelu_tanh,
@@ -252,7 +253,8 @@ def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_
     jitted = jax.jit(lambda x: x * positions)
     for function in (activations.gelu_exact, jax.nn.softmax, lambda x: jnp.cumsum(x, -1), lambda x: x.T,
                      lambda x: x + jnp.arange(3.0), lambda x: x.sum(-1), lambda x: x * positions,
-                     lambda x: jitted(x), lambda x: x + jnp.ones((2, 3), x.dtype)):
+                     lambda x: jitted(x), lambda x: x + jnp.ones((2, 3), x.dtype), lambda x: x / x.shape[-1],
+                     lambda x: x * x.size):
         assert not norm_swiglu.elementwise(function), function
     x = jnp.ones((4, 64), jnp.bfloat16)
     with generation.assumed("sm90"):
@@ -294,33 +296,6 @@ def test_a_norms_activation_and_every_gradient_hold_the_float64_gate(dtype, afte
     # activation's derivative first, so no exact sum of the forward's rounded factors states its rounding.
     compare((functools.partial(norm, dtype), fused, functools.partial(norm, jnp.float64)),
             lambda draw: norm_operands((2, 3, 31), dtype, jnp.float32, draw), ("y", "x", "weight"),
-            SEEDS[(2, 3, 31)])
-
-
-def test_a_norms_activation_reading_its_width_divides_by_the_rows_not_a_padded_tiles():
-    """An activation reading its operand's shape (`y / y.shape[-1]`, which `elementwise` takes) after the
-    fused norm, interpreted on a CPU at a width no tile divides (3 columns, a 4-wide tile): its output and its
-    input's and weight's gradients on par with the portable norm's (check 1), which divides by the row's 3
-    columns (norms.py), where a tile's 4 put every output a third off."""
-    def activation(y):
-        return y / y.shape[-1]
-
-    def norm(output_dtype, x, scale, implementation="xla"):
-        return stream_rms_normalized(x, None, scale, 1e-5, output_dtype, scale_offset=False,
-                                     scale_after_cast=False, fp32_statistics=True,
-                                     implementation=implementation, activation=activation)[1]
-
-    def fused(x, scale):
-        def portable(x, branch, scale):
-            return stream_rms_normalized(x, branch, scale, 1e-5, jnp.float32, scale_offset=False,
-                                         scale_after_cast=False, fp32_statistics=True,
-                                         implementation="xla", activation=activation)
-
-        return norm_swiglu.stream_rms_norm(x, None, scale, 1e-5, jnp.float32, offset=False, after_cast=False,
-                                           portable=portable, epilogue=activation)[1]
-
-    compare((functools.partial(norm, jnp.float32), fused, functools.partial(norm, jnp.float64)),
-            lambda draw: norm_operands((2, 5, 3), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),
             SEEDS[(2, 3, 31)])
 
 
