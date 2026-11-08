@@ -625,12 +625,13 @@ def _persisted_operands(rows: int):
 def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_in_chunks():
     """Interpreted: a persistent walk on tcgen05's bundle (`mosaic_sm100.RINGS`), its product warp issuing
     each tile's steps into one of two accumulator turns in tensor memory and the epilogue reading each
-    tile's out in chunks, over three tiles (the turns wrap) with the middle one multiplying nothing: each
-    tile's rows exactly its product, the middle's zeros."""
+    tile's out in chunks, over three tiles (the turns wrap) with the middle one multiplying nothing, as a
+    Blackwell's tensor memory holds them: each tile's rows exactly its product, the middle's zeros."""
     from dew.nn.kernels.templates import mosaic_sm100
     family = mosaic_sm100.RINGS
     x, w = _persisted_operands(family.rows)
-    got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
+    with generation.assumed("sm100"):
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
