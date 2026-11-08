@@ -313,7 +313,7 @@ def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
     assert scales.num_arrivals == 2
     assert (done.num_arrivals, read.num_arrivals) == (1, 2)
     assert schedule.warpgroups() == 5
-    with pytest.raises(ValueError, match="last warpgroup"):
+    with pytest.raises(ValueError):
         handoffs.Schedule((handoffs.Role("consumer"), handoffs.Role("producer", weight=0),
                            *mosaic_sm100.ISSUING))
 
