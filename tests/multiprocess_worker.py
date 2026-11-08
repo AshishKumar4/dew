@@ -1315,17 +1315,19 @@ def mode_replica_key(args) -> dict:
 
     mesh = MeshSpec(fsdp=args.fsdp_size).build()
     replicated = NamedSharding(mesh, PartitionSpec())
-    key = jax.device_put(jax.random.key(7, impl="rbg"), replicated)
+    words = np.asarray(jax.random.key_data(jax.random.key(7, impl="rbg")))
+    data = jax.make_array_from_callback(words.shape, replicated, lambda index: words[index])
+    key = jax.random.wrap_key_data(data, impl="rbg")
     shape = jax.ShapeDtypeStruct(key.shape, key.dtype, sharding=replicated)
     template = {"key": key, "shape": shape}
-    data = jax.random.key_data(key)
     tree = ({"key": data, "shape": data} if jax.process_index() == 0
             else jax.tree.map(_zeros, template))
     recovered = _from_replicas(tree, _grid(template), frozenset({0}))
 
     def read(words, drawn) -> dict:
-        return {"words": np.asarray(words).tolist(),
-                "draw": np.asarray(jax.random.normal(drawn, (3,))).tolist()}
+        # Each process's own copy of a value the pool replicates.
+        return {"words": np.asarray(words.addressable_data(0)).tolist(),
+                "draw": np.asarray(jax.random.normal(drawn, (3,)).addressable_data(0)).tolist()}
 
     return {name: read(value, jax.random.wrap_key_data(value, impl="rbg"))
             for name, value in recovered.items()} | {
