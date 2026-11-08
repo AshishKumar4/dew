@@ -14,7 +14,16 @@ from dew.nn.kernels.templates import (
     bundles,
     mosaic,
 )
-from dew.nn.kernels.templates.attention import DQ_GRADS, Dropout, Hooks, Kind, PaddedCall, Param, by_power
+from dew.nn.kernels.templates.attention import (
+    DQ_GRADS,
+    Dropout,
+    Hooks,
+    Kind,
+    PaddedCall,
+    Param,
+    by_power,
+    interpreted_rows,
+)
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_launch
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_launch
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch
@@ -62,8 +71,11 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         # draw keeps it (`algebra.anchor_multipliers`, the factor the forward's output took it by): no first
         # pass of its own (row 2252, the centre launch's dropped products recomputed every key tile).
         values = values * algebra.anchor_multipliers(drop, key_index)[..., None]
+    # D's and the anchor's products with dO, summed as the launch's issuer sums dP
+    # (`gradient.off_anchor_delta`).
     anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
-                                                values, cotangent, key_index, shift)
+                                                values, cotangent, key_index, shift,
+                                                rows=interpreted_rows if interpret else gradient.summed_rows)
     # The family's swizzled tiles hold whole rows (`Family.column_unit`).
     query, key, value, dout = (_columns(array, family.column_unit(array.dtype))
                                for array in (query, key, value, dout))

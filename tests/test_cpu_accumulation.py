@@ -323,8 +323,10 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         return sum(equation.primitive.name == "platform_index" for equation in found)
 
     def contractions(found) -> int:
-        # A float32 contraction's platform choice: a conditional one of whose branches is a product.
-        return sum(equation.primitive.name == "cond"
+        # A float32 contraction's platform choices: those a conditional reads one of whose branches is a
+        # product (a conditional's nested in a branch read their own).
+        chosen = {equation.outvars[0] for equation in found if equation.primitive.name == "platform_index"}
+        return sum(equation.primitive.name == "cond" and equation.invars[0] in chosen
                    and any(inner.primitive.name == "dot_general" for branch in equation.params["branches"]
                            for inner in equations(branch))
                    for equation in found)
