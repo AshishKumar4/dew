@@ -665,8 +665,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         def scoped(tmem, done, read, *rest):
             # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
             # slot's `masked` barrier in its loads' place.
-            masked, smems = (rest[0], rest[1:]) if prepared is not None else (None, rest)
-            issued = rings if prepared is None else {name: dataclasses.replace(ring, full=masked)
+            count = len(rings) if prepared is not None else 0
+            masked, smems = dict(zip(rings, rest[:count], strict=True)), rest[count:]
+            issued = rings if prepared is None else {name: dataclasses.replace(ring, full=masked[name])
                                                      for name, ring in rings.items()}
             def turn_of(done_turns) -> mosaic.Turn:
                 return mosaic.Turn.of(done_turns, self.turns)
@@ -748,7 +749,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             table = ((consumers, epilogue),) + (((1, rewrite),) if prepared is not None else ())
             self.roles_of(table, load=load, products=issue_all)
 
-        masked = () if prepared is None else (plgpu.Barrier(num_barriers=stages),)
+        # Each ring's slots' rewrites published, a barrier of the ring's own (a wait of the product warp's
+        # one turn each).
+        masked = () if prepared is None else tuple(plgpu.Barrier(num_barriers=stages) for _ in rings)
         pl.run_scoped(scoped, plgpu.TMEM((self.rows, (self.turns + bool(summed)) * width), jnp.float32),
                       *self.persist_scratch(consumers)[0], *masked, *staging, collective_axes="wg")
 
@@ -822,10 +825,10 @@ RINGS = Tcgen05Rings()
 """The tcgen05 bundle (`bundles.of` on sm100 and sm103)."""
 
 
-def _rewritten(rings: dict, masked, prepared: Callable, counter, active, steps, views, tile, done) -> None:
+def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, steps, views, tile, done) -> None:
     """A rewriting role's visit of a persistent tile (`Tcgen05Rings.persist`'s `prepared`): each of its steps'
-    slots, once loaded, rewritten (`prepared(tile, index, slots)`), published to the tensor cores and the
-    step's `masked` barrier arrived at; none where the tile streams nothing."""
+    slots, once loaded, rewritten (`prepared(tile, index, slots)`), published to the tensor cores and each
+    ring's `masked` barrier of the step arrived at; none where the tile streams nothing."""
     del views, done
 
     @pl.when(active)
@@ -835,7 +838,8 @@ def _rewritten(rings: dict, masked, prepared: Callable, counter, active, steps, 
             slots = {name: ring.acquire(turn) for name, ring in rings.items()}
             prepared(tile, index, slots)
             plgpu.commit_smem()
-            plgpu.barrier_arrive(masked.at[mosaic.opaque(turn.slot)])
+            for barriers in masked.values():
+                plgpu.barrier_arrive(barriers.at[mosaic.opaque(turn.slot)])
             return carry
 
         lax.fori_loop(0, steps, step, None)
