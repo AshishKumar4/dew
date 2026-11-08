@@ -134,7 +134,8 @@ def test_a_config_built_runs_step_exchanges_on_an_expert_mesh_by_default(tmp_pat
 
     from run_kinds import lm, trained
 
-    from dew.training._lowering import Lowered, custom_calls
+    from dew.nn.kernels.lowered import custom_calls
+    from dew.training._lowering import Lowered
 
     run = lm(tmp_path, drawn=False)
     fields = {**run.model.fields, "mixture": {"experts": 8, "top_k": 2, "expert_features": 16}}
