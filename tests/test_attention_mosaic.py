@@ -958,10 +958,11 @@ def test_a_training_forwards_row_whose_sums_stay_in_range_takes_no_shift_whateve
     """A training forward's head whose rows see 512 keys, the row's largest magnitude near fp32's largest
     under a weight near fp32's least normal at the row's maximum (`held`: a key's value, its logit 86.5
     below the row's peak; or a resumed state's sums, its maximum 120 binades below it), every other key
-    weighing nothing or holding zeros: its weighted values stay small, so no row shifts (`algebra.row_shift` of its terms at the walk's
-    maximum, `algebra.Reach`, `algebra.started_reach`), though its count times its largest magnitude passes
-    fp32's largest by 2^9, and its small weight is not shifted out of range. Its output is exactly 2^64
-    times the call's over its values and sums at 2^-64, which no bound comes near."""
+    weighing nothing or holding zeros: its weighted values stay small, so no row shifts (`algebra.row_shift`
+    of its terms at the walk's maximum, `algebra.Reach`, `algebra.started_reach`), though its count times
+    its largest magnitude passes fp32's largest by 2^9, and its small weight is not shifted out of range.
+    Its output is exactly 2^64 times the call's over its values and sums at 2^-64, which no bound comes
+    near."""
     queries, keys, width = 64, 512, 64
     spans = template.spans(queries, keys, 1)
     streams = jax.random.split(jax.random.key(1), 3)
