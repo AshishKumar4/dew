@@ -1143,27 +1143,9 @@ class CausalSelfAttention(nn.Module):
                   else self.ctx.sliding_window)
         cursor = starts = None  # the decode mask the kernels stand in for, when this call builds it
         if prefix is not None:
-            # Every canvas query reads the same retained encoder keys and all
-            # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
-            # layer retains the last window-1 prefix keys.
-            cached_key = cache_leaf(self, "cached_key")
-            cached_value = cache_leaf(self, "cached_value")
-            alloc = cached_key.shape[-3]
-            prefix_slots = jnp.arange(alloc)[None, :]
-            valid_prefix = cached_validity(self, alloc)
-            if self.ctx.sliding_window is not None:
-                valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.ctx.sliding_window)
-            canvas_valid = (jnp.ones((B, S), bool) if attention_metadata is None
-                            or attention_metadata.valid is None else attention_metadata.valid)
-            keep = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
-            mask = jnp.broadcast_to(keep[:, None, None, :], (B, 1, S, alloc + S))
-            key = jnp.concatenate([cached_key, key], axis=-3)
-            value = jnp.concatenate([cached_value, value], axis=-3)
+            mask, key, value, key_places = self._prefixed(key, value, places, prefix, attention_metadata,
+                                                          B, S)
             causal, window = False, None
-            # The encoder's dense cache keeps a place a slot, `[rows, alloc, 1]`.
-            key_places = (jnp.concatenate([cache_leaf(self, PLACES)[..., 0],
-                                           jnp.broadcast_to(places, (B, S))], axis=-1)
-                          if self._reads_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
             # The provider's stashed keys carry the full history, read as its own cache is.
             key_places, history = held
@@ -1231,6 +1213,31 @@ class CausalSelfAttention(nn.Module):
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs, query_places)
+
+    def _prefixed(self, key, value, places, prefix, attention_metadata: AttentionMetadata | None, batch: int,
+                  queries: int):
+        """A canvas call's keys and values behind its retained encoder keys (`prefix` each row's prefix
+        length), the mask over them and their places: every canvas query reads the same retained encoder
+        keys and all canvas keys (modeling_diffusion_gemma.py:1399-1401), a local layer the last window-1
+        prefix keys."""
+        cached_key = cache_leaf(self, "cached_key")
+        cached_value = cache_leaf(self, "cached_value")
+        alloc = cached_key.shape[-3]
+        prefix_slots = jnp.arange(alloc)[None, :]
+        valid_prefix = cached_validity(self, alloc)
+        if self.ctx.sliding_window is not None:
+            valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.ctx.sliding_window)
+        canvas_valid = (jnp.ones((batch, queries), bool) if attention_metadata is None
+                        or attention_metadata.valid is None else attention_metadata.valid)
+        keep = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
+        mask = jnp.broadcast_to(keep[:, None, None, :], (batch, 1, queries, alloc + queries))
+        # The encoder's dense cache keeps a place a slot, `[rows, alloc, 1]`.
+        key_places = (jnp.concatenate([cache_leaf(self, PLACES)[..., 0],
+                                       jnp.broadcast_to(places, (batch, queries))], axis=-1)
+                      if self._reads_places else jnp.arange(alloc + queries))
+        joined = (jnp.concatenate([cached, own], axis=-3) for cached, own in ((cached_key, key),
+                                                                               (cached_value, value)))
+        return (mask, *joined, key_places)
 
     def _key_validity(self, key_valid, mask, valid, implementation: AttentionImpl,
                       masked: Callable[[], AttentionImpl], batch: int, keys: int):

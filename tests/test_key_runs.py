@@ -117,6 +117,17 @@ PROMPT, CALL = 6, 4
 """A cached call of four tokens after a prompt of six."""
 
 
+def _prefilled(decoder, rows: int, call: int):
+    """`decoder`'s parameters, its cache after a prompt of `PROMPT` tokens a row prefilled in one cached call,
+    and a block of `call` tokens a row to call it with."""
+    prompt = jax.random.randint(jax.random.key(0), (rows, PROMPT), 0, VOCAB)
+    block = jax.random.randint(jax.random.key(2), (rows, call), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), prompt)
+    _, made = decoder.apply(params, rows, method=CausalTransformer.init_cache, mutable=["cache"])
+    _, prefilled = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"])
+    return params, prefilled["cache"], block
+
+
 @pytest.mark.parametrize("call", [CALL, 1], ids=["block", "step"])
 def test_a_cached_calls_keys_validity_alone_hides_those_keys_from_its_own_visibility(call):
     """A cached call (`call` tokens after a prompt, a decode step's one among them) stating its keys'
@@ -125,20 +136,15 @@ def test_a_cached_calls_keys_validity_alone_hides_those_keys_from_its_own_visibi
     place, less those the validity marks out."""
     decoder = model(full_attention={})
     rows, slots = 2, TINY_DECODER["max_seq_len"]
-    prompt = jax.random.randint(jax.random.key(0), (rows, PROMPT), 0, VOCAB)
-    block = jax.random.randint(jax.random.key(2), (rows, call), 0, VOCAB)
-    params = decoder.init(jax.random.key(1), prompt)
-    _, made = decoder.apply(params, rows, method=CausalTransformer.init_cache, mutable=["cache"])
-    _, prefilled = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"])
+    params, cache, block = _prefilled(decoder, rows, call)
     valid = np.ones((rows, slots), bool)
     valid[0, 2], valid[1, PROMPT - 1] = False, False
     places = PROMPT + np.arange(call)
     seen = (np.arange(slots)[None, None, :] <= places[None, :, None]) & valid[:, None, :]
 
     def read(**visibility):
-        return np.asarray(decoder.apply({**params, "cache": prefilled["cache"]}, block, decode=True,
-                                        mutable=["cache"], method=CausalTransformer.hidden_states,
-                                        **visibility)[0])
+        return np.asarray(decoder.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
+                                        method=CausalTransformer.hidden_states, **visibility)[0])
 
     hidden = read(attention_key_valid=jnp.asarray(valid))
     assert hidden.tobytes() == read(attention_pairwise_mask=jnp.asarray(seen)).tobytes()
@@ -159,13 +165,7 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
 
     decoder = model(**kinds)
     rows, slots = 2, TINY_DECODER["max_seq_len"]
-    prompt = jax.random.randint(jax.random.key(0), (rows, PROMPT), 0, VOCAB)
-    block = jax.random.randint(jax.random.key(2), (rows, CALL), 0, VOCAB)
-    params = decoder.init(jax.random.key(1), prompt)
-    _, made = decoder.apply(params, rows, method=CausalTransformer.init_cache, mutable=["cache"])
-    # The prompt prefilled in one cached call.
-    _, prefilled = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"])
-    cache = prefilled["cache"]
+    params, cache, block = _prefilled(decoder, rows, CALL)
     runs = jnp.broadcast_to(jnp.asarray([[0, PROMPT], [PROMPT, PROMPT + CALL]])[None, None],
                             (rows, CALL, 2, 2))
     places = jnp.concatenate([jnp.arange(PROMPT), jnp.arange(CALL), jnp.arange(slots - PROMPT - CALL)])
