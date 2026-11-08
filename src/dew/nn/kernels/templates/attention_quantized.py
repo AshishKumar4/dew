@@ -151,11 +151,19 @@ def _attend_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
 
 def _attend_backward(saved: tuple, dout: jax.Array) -> tuple:
     """The straight-through gradients (`_straight_through`) of the query, key, value and score parameters;
-    the spans take none."""
-    query, key, value, spans, hooks = saved
-    _, pullback = jax.vjp(lambda q, k, v, h: _straight_through(q, k, v, spans, h), query, key, value, hooks)
-    d_query, d_key, d_value, d_hooks = pullback(dout)
-    return d_query, d_key, d_value, None, d_hooks
+    the spans take none. Traced with a quantization provider's interception off (Qwix's, which the forward's
+    call is off by `dew.quantization.UNQUANTIZED`): a backward traced inside a quantized method would have
+    its products quantized again."""
+    from qwix._src import interception
+
+    def pulled(saved, dout):
+        query, key, value, spans, hooks = saved
+        _, pullback = jax.vjp(lambda q, k, v, h: _straight_through(q, k, v, spans, h), query, key, value,
+                              hooks)
+        d_query, d_key, d_value, d_hooks = pullback(dout)
+        return d_query, d_key, d_value, None, d_hooks
+
+    return interception.disable_interceptions(pulled)(saved, dout)
 
 
 attend = contracted("test_a_quantized_attention_holds_its_reverse_orders")(
