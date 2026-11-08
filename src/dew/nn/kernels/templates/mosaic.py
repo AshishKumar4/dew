@@ -355,8 +355,10 @@ class Pieces(tuple):
 class Rows:
     """A block's rows in runs at a table's entries, the toolkit's one table-indexed row form: its run `i`,
     `rows` rows, at run `table[start + i]` of the array's rows (`table` an int32 ref, its entries in runs),
-    its other block indices `rest`, each run a copy of its own (`viewed`'s `Pieces`). A paged pool's key
-    tile across the pages it spans takes a run a page."""
+    its other block indices `rest`: a gathered stream's (`Transport.gathers_rows`), each run copied by the
+    loading warpgroup (`gathered.Ring`), or interpreted where no lane-level copy runs, a piece of its own
+    (`viewed`'s `Pieces`). A paged pool's key tile across the pages it spans takes a run a key
+    (`attention_mosaic_forward.paged_reads`)."""
 
     table: Any
     start: Any
