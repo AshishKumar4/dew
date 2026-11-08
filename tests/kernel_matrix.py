@@ -230,6 +230,34 @@ TPU_FLOWS: tuple[str, ...] = (
 """The flows that run the matrices' TPU cells on the TPU tier (`-m tpu`), by pytest node id."""
 
 
+def ops() -> dict[str, list]:
+    """Every kernel op Dew's dispatches serve (`selection.Op`), by its choice, read from the production
+    modules under `dew.nn` as they define them, a module's own or held in a module's mapping or sequence (a
+    layer's selectors by choice, `joined.JOINS`): none is listed here."""
+    import pkgutil
+
+    import dew.nn
+    from dew.nn.kernels import selection
+
+    def held(value):
+        if isinstance(value, selection.Op):
+            yield value
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from held(item)
+        elif isinstance(value, list | tuple):
+            for item in value:
+                yield from held(item)
+
+    found: dict[str, list] = {}
+    for module in pkgutil.walk_packages(dew.nn.__path__, "dew.nn."):
+        for value in vars(importlib.import_module(module.name)).values():
+            for op in held(value):
+                if all(op is not seen for seen in found.get(op.choice, [])):
+                    found.setdefault(op.choice, []).append(op)
+    return found
+
+
 def head_shapes(case: dict[str, str], heads: dict[str, tuple[int, int]]) -> tuple:
     """An attention family's case's query heads and key heads (by its `heads` axis, `heads`' table), head
     width and dtype, as its cells draw them."""
