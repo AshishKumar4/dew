@@ -31,7 +31,7 @@ from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
 from .ngpt import NGPT, normed_hidden
-from .precision import at_least_fp32, float32_dot_general, scaled, sqrt_or_zero
+from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, LogicalAxes, constrain
 
@@ -72,10 +72,18 @@ def gaussian_cutoff(x, sparsity: float):
     # whose fp32 argument rounds to an end takes an infinite cutoff, as the reference's gate does.
     quantile = wide(scipy.special.erfinv(float(argument)))
     multiplier = jnp.asarray(quantile * wide(math.sqrt(2)), x.dtype)
-    mean = jnp.mean(x, axis=-1, keepdims=True)
+    # The mean and the deviation's mean square each summed rounded once (`compensated_sum`): a gate value
+    # near the cutoff keeps only its distance above it, which a cutoff off by an ulp or two moves by its
+    # whole size.
+    def mean_of(values):
+        """`values`' mean over the row, summed in at least fp32 and divided there, as `jnp.mean` does."""
+        total = compensated_sum(values.astype(wide), (values.ndim - 1,))[..., None]
+        return (total / values.shape[-1]).astype(x.dtype)
+
+    mean = mean_of(x)
     # A constant row (a padded row of zeros) has deviation zero, which takes a
     # zero gradient, as torch's std backward gives it.
-    std = sqrt_or_zero(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
+    std = sqrt_or_zero(mean_of(jnp.square(x - mean)))
     return mean + std * multiplier
 
 
