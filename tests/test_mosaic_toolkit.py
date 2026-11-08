@@ -1357,6 +1357,17 @@ def test_a_programs_settled_arguments_are_read_as_such_and_never_donated():
         synced(weights)
     with pytest.raises(options.SettledDonated):
         options.Fetched(synced)(weights)
+    # Donated however the call passes it: by keyword only, or among variadic arguments.
+    def by_name(*, weights):
+        return weights * 2.0
+
+    def variadic(*arrays):
+        return arrays[1] * 2.0
+
+    with pytest.raises(options.SettledDonated):
+        options.program(by_name, donate_argnames="weights")(weights=weights)
+    with pytest.raises(options.SettledDonated):
+        options.program(variadic, donate_argnums=1)(x, weights)
     options.unsettle(weights)
     doubled = synced(weights)
     np.testing.assert_array_equal(np.asarray(served(doubled, x)), np.asarray(x * 2.0))
