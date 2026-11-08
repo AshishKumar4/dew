@@ -105,10 +105,10 @@ class Schedule:
         """Each hand-off's allocations (`stated`), in turn."""
         return tuple(shape.scratch(target) for shape in self.stated())
 
-    def opened(self, refs: Sequence) -> dict[str, Any]:
-        """Each hand-off opened by name over its scoped `refs` (`scratch`'s, in turn)."""
-        return {handoff.name: shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
-                for handoff, shape, ref in zip(self.handoffs, self.stated(), refs, strict=True)}
+    def opened(self, refs: Sequence) -> tuple:
+        """Each hand-off opened over its scoped `refs` (`scratch`'s), in the hand-offs' order."""
+        return tuple(shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
+                     for shape, ref in zip(self.stated(), refs, strict=True))
 
     def run[R](self, **bodies: Callable[..., R]) -> R | None:
         """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
