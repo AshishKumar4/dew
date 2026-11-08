@@ -464,9 +464,9 @@ class Loading:
         a GH200, row 4862), and each costs a process's start first, its imports. They start where they
         pay for themselves over the run: where the time a sampled batch takes to make, read in turn with
         no thread reading ahead, each after the first, which opens the read, times the `batches` the run
-        reads (its planned steps) is more than a worker's measured start (`worker_start_seconds`). A short run, one whose
-        batches take no Python to speak of, or one whose length nothing states (None), which no
-        measure shows they pay for, reads in the process."""
+        reads (its planned steps) is more than a worker's measured start (`worker_start_seconds`). A
+        short run, one whose batches take no Python to speak of, or one whose length nothing states
+        (None), which no measure shows they pay for, reads in the process."""
         if self.workers != "auto":
             return self
         reading, sampled, seconds = iter(records), [], []

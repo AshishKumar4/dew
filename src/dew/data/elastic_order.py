@@ -16,7 +16,7 @@ from dew.batch import Batch
 from dew.data.storage import MIRRORS, carried_mirrors
 
 type Grouping = Callable[[], Callable[[Sequence], Batch]]
-"""What makes a worker's group of inputs one element (`lowering._Grouped`): called once a read opens."""
+"""What makes a worker's group of inputs one element (`handoff._Grouped`): called once a read opens."""
 
 
 class _Gathered(pygrain.MapDataset):
@@ -46,7 +46,7 @@ class _Gathered(pygrain.MapDataset):
 
 class _InputOrder(pygrain.IterDataset):
     """An elastic read's indexed rows read in its loading workers (`_Build.handed`), in the inputs'
-    order whatever their count: groups of `size` consecutive inputs (`lowering._Grouped`), group k read by
+    order whatever their count: groups of `size` consecutive inputs (`handoff._Grouped`), group k read by
     worker k mod W, which Grain's interleave of the workers hands on in turn, so group after group
     in order. Its position is the input its next group begins at, so a resume opens its workers
     there (`rows[next:]`) on any count; `size` is the chain's batch, the same on every topology, so
@@ -196,7 +196,7 @@ class _Kept(pygrain.IterDataset):
     """The groups of `size` consecutive rows of the stream `rows` that one loading worker keeps
     (`_StreamOrder`): every group whose number is its slice's (`set_slice`, which stops here, so Grain never
     deals the stream's shards between the workers), from the stream's `position` where given, the first
-    `opening` rows long, each grouped (`lowering._Grouped`) with the stream's position after it."""
+    `opening` rows long, each grouped (`handoff._Grouped`) with the stream's position after it."""
 
     def __init__(self, rows: pygrain.IterDataset, size: int, position: Mapping[str, object] | None,
                  grouping: Grouping, opening: int | None = None):
