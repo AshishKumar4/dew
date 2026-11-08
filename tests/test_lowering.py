@@ -403,6 +403,30 @@ def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop
     assert scanned["unsized"] == unrolled["unsized"] == counted.unsized
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_decoders_residual_norms_run_the_fused_kernel_on_a_data_parallel_step():
+    """A bf16 decoder whose layers norm each branch's output (`sandwich_norms`) and whose stack ends in its
+    final norm, its training step lowered for an H100 over two devices' automatic data axis with the fused
+    norm chosen (`dew.kernels.use`): every residual-shaped norm names its input's axes
+    (`decoder_block.residual_normed`), so each runs on its shard's rows and the step lowers with the norm's
+    kernels, where an unplaced call on an automatic axis is refused the kernel (row 822)."""
+    import optax
+
+    import dew
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from dew.training._lowering import Lowered
+
+    model = CausalTransformer(vocab_size=256, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
+                              max_seq_len=128, dtype=jnp.bfloat16, sandwich_norms=True)
+    trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0), lower_for="sm90")
+    state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+    with dew.kernels.use(rms_norm="pallas"), pytest.raises(Lowered) as lowered:
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
+    assert {"rms_norm_forward", "rms_norm_backward"} <= set(triton_kernels(lowered.value.lowered))
+
+
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
 def test_a_packed_delta_net_lowers_for_an_a100_whatever_documents_its_rows_declare(bound):
     """A bf16 gated delta net over packed rows of 128 tokens in 8 documents, their bound undeclared
