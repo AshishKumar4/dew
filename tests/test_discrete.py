@@ -283,8 +283,7 @@ NELBO weight, where the unweighted pooled ratio is heavy-tailed across draws and
 count under the census (row 4664: Inconclusive, 0.409 to 1.539 over 40 draws)."""
 
 
-@pytest.mark.check1_shards(seeds=LOSS_SEEDS, per_task=LOSS_SEEDS, conditioning=LOSS_CONDITIONING,
-                           conditioning_per_task=128)
+@pytest.mark.check1_shards(seeds=8, per_task=8, conditioning=512, conditioning_per_task=128)
 def test_the_loss_is_the_mean_of_the_terms_evaluation_reports_under_the_weights_it_is_handed(rng):
     """The training loss is the batch's per-token NELBO terms averaged over
     every position, and evaluation reports those terms, zero where a token
