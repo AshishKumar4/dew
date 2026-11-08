@@ -243,19 +243,20 @@ class Counted(LMObjective):
         return super().loss(variables, batch, step)
 
 
-def lm(split=None, accumulation=1, objective=LMObjective, **fields):
-    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                              max_seq_len=SEQ, **fields)
-    return one_device(Trainer(objective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, **fields):
+    model = CausalTransformer(vocab_size=64, emb_features=width, num_layers=layers, num_heads=2,
+                              mlp_features=2 * width, max_seq_len=seq, **fields)
+    return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
 
 
-def trained(trainer, steps=3):
-    """The state after `steps` steps of BATCH."""
+def trained(trainer, steps=3, batch=None):
+    """The state after `steps` steps of `batch`, BATCH where None."""
+    batch = BATCH if batch is None else batch
     state, _, _ = trainer.place()
-    step = trainer.compile(state, BATCH)
+    step = trainer.compile(state, batch)
     for _ in range(steps):
-        state, *_ = step(state, BATCH)
+        state, *_ = step(state, batch)
     return state
 
 
@@ -1008,21 +1009,35 @@ DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear
                                linear_key_head_dim=8, linear_value_head_dim=8)}
 """A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
 
+HALVED = {"seq": 256, "width": 64, "layers": 2, **DELTA}
+"""A decoder of two gated delta net layers over 256 tokens, the delta rule's memory a share of the step
+that its half rung saves: at four microbatches of 32 rows the rung needs 3.4 to 3.7 MB less than no
+recomputation on an A100 and an H100, where the one-layer, sixteen-token decoder's needs 512 bytes more
+(row 3341's GPU cell)."""
+HALVED_BATCH = {"text": jnp.asarray((np.arange(ROWS * 257).reshape(ROWS, 257) * 7) % 64, jnp.int32)}
+
 
 def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The
-    delta rule runs its port (`port_support.row_names_port`), whatever the generation's row names: the half
-    rung recomputes the memory the port names (`checkpoint_name`), and the portable route, an A10's, names
-    none."""
+    decoder's delta rule holds a share of the step the half rung saves (`HALVED`), which the cell checks
+    first. The delta rule runs its port (`port_support.row_names_port`), whatever the generation's row
+    names: the half rung recomputes the memory the port names (`checkpoint_name`), and the portable route,
+    an A10's, names none."""
     half = "all_but_delta_memory"
     with row_names_port("gated_delta_rule", "fla"):
-        free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
-        trainer = lm(**DELTA)
+        def measured(**fields) -> int:
+            trainer = lm(split=4, **HALVED, **fields)
+            return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=HALVED_BATCH))
+
+        room = measured(remat=half)
+        assert room < measured(), "the half rung saves memory at four microbatches"
+        free(monkeypatch, room)
+        trainer = lm(**HALVED)
         state, _, _ = trainer.place()
-        trials = Trials(state, BATCH)
-        trainer.compile(state, BATCH, trials)
+        trials = Trials(state, HALVED_BATCH)
+        trainer.compile(state, HALVED_BATCH, trials)
         assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
     assert_searched(asked(trainer), (4, half), 2, half=half)
