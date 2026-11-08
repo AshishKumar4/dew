@@ -306,10 +306,9 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
 def served_small_pages() -> tuple[int, ...]:
     """The pages fewer than a key tile holds whose decode this GPU's family serves
     (`attention_mosaic._pages_hold`): 16, 4 and 1 key where its loading warpgroup gathers a tile's rows
-    through the table (`Transport.gathers_rows`); 16 alone, a page of whole 8-row tiles each its own copy,
-    where it loads a block in pieces."""
+    through the table (`Transport.gathers_rows`), none where it does not."""
     family = bundles.of(generation.device_generation(), jnp.bfloat16)
-    return (16, 4, 1) if family.gathers_rows else (16,)
+    return (16, 4, 1) if family.gathers_rows else ()
 
 
 def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
