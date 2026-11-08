@@ -799,11 +799,13 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                        query_block=tiles.consumers * tiles.block_q if inference else None, by_position=True)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural,
-                           headroom=algebra.headroom(query.dtype if scales is not None else value.dtype),
+                           # A quantized model's codes and values, each at most 127, sum far within fp32.
+                           headroom=hooks.rounds is None and algebra.headroom(
+                               query.dtype if scales is not None else value.dtype),
                            initial=hooks.initial is not None,
                            queries=(call.queries if call.query.shape[1] > call.queries or call.per_span > 1
                                     else None),
-                           prescale=power / taken, subtracted=subtracted)
+                           prescale=power / taken, subtracted=subtracted, rounds=hooks.rounds)
     unit = family.column_unit(query.dtype)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     hooked = _hooked_of(hooks, call, unit)
