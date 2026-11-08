@@ -168,3 +168,32 @@ def vectorized(a: jax.Array, b: jax.Array) -> jax.Array:
         if carried is not None:
             sums = jnp.concatenate([sums, carried])
     return sums[0]
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("width", [4, 64], ids=["blocked", "wide"])
+def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share(width):
+    """A projection's pairwise product (`pairwise_dot_general`) on a mesh whose Explicit data axis splits its
+    rows over two devices: its value and both gradients, the matrix's contracting the split rows a device's
+    share at a time (`_summed`), each the dot's own where every sum is exact (small integers) and placed as
+    XLA's product and gradients place them; each share summed in two-row blocks at 4 features, and in float64
+    at 64 (`_shared`)."""
+    rng = np.random.default_rng(4863)
+    rows, matrix = (jnp.asarray(rng.integers(-3, 4, size=shape), jnp.float32)
+                    for shape in ((12, width), (width, 3)))
+    product = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=(((1,), (0,)), ((), ())))
+
+    def gradients(product, rows, matrix):
+        value, pull = jax.vjp(product, rows, matrix)
+        return value, *pull(jnp.round(4 * jnp.cos(value)))
+
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with pytest.MonkeyPatch.context() as patched, jax.set_mesh(mesh):
+        # Two-row blocks: a device's six rows its matrix's gradient sums as three blocks.
+        patched.setattr(pairwise, "contraction_block", lambda depth, lanes=None: min(depth, 2))
+        split = jax.device_put(rows, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+        summed = jax.jit(functools.partial(gradients, product))(split, matrix)
+        plain = jax.jit(functools.partial(gradients, jnp.matmul))(split, matrix)
+    for got, want in zip(summed, plain, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
