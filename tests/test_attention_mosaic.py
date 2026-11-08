@@ -587,15 +587,18 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("form", ["fused", "fused-shared-keys"])
 @pytest.mark.parametrize("call", CALLS)
-def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call):
+def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call, form):
     """An fp16 call's backward in the fast form's one launch (row 3886): its weights and score cotangents as
     two fp16 parts at each walk's running scale (`algebra.running_parts`), dV's and dK's accumulators taken
     to the new scale as it grows and back at the end, each tile's dQ by its own; every gradient the
-    reference's (check 1), under the interpreter, heads 64 wide, where one launch's registers hold fp16's
-    parts (at 128 the derivation takes the two launches). (A dropping fp16 call takes no Mosaic walk at
+    reference's (check 1), under the interpreter: each consumer its own keys, heads 64 wide, or two sharing
+    a key block, each its share's exponents exchanged before its parts (`attention_mosaic_coop`), heads 128
+    wide, where each launch's registers hold fp16's parts. (A dropping fp16 call takes no Mosaic walk at
     all: its dropping walk takes bf16 operands.)"""
-    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, dtype=jnp.float16, width=64)
+    _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, dtype=jnp.float16,
+                    width=FORM_WIDTHS.get(form, 64))
 
 
 @COMPILES_ON_CPU

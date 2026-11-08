@@ -1842,16 +1842,32 @@ def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
     (0 before any tile, else at most 0) and the parts; a product of them is taken back by
     `running_restored`. A part's entries far below the running largest lose their low bits to `dtype`'s
     subnormals, as an fp32 sum of them loses them to its rounding."""
+    new = jnp.maximum(exponent, tile_exponent(x))
+    return new, running_shift(exponent, new), parts_at(x, new, dtype)
+
+
+def tile_exponent(x: jax.Array) -> jax.Array:
+    """An fp32 tile's largest magnitude's exponent, rounded up (two one-axis reductions, `_scaled`), -inf
+    where it holds none: `running_parts`' tile's."""
     largest = jnp.max(jnp.max(jnp.abs(x), axis=-1))
     tile = jnp.ceil(jnp.log2(jnp.where(largest > 0, largest, 1.0)))
     # A GPU's approximate log2 flushes a subnormal largest to zero (`_scaled`, row 4464): such a tile, as an
     # empty one, moves no exponent.
-    tile = jnp.where((largest > 0) & finite(tile), tile, -jnp.inf)
-    new = jnp.maximum(exponent, tile)
-    shift = jnp.where(exponent == -jnp.inf, 0.0, exponent - jnp.where(new == -jnp.inf, 0.0, new))
-    scaled = scaled_by(x, jnp.where(new == -jnp.inf, 0.0, 14.0 - new))
+    return jnp.where((largest > 0) & finite(tile), tile, -jnp.inf)
+
+
+def running_shift(old: jax.Array, new: jax.Array) -> jax.Array:
+    """The power of two that takes an accumulator from the running scale of exponent `old` to `new`'s
+    (`running_parts`): 0 before any tile, else at most 0."""
+    return jnp.where(old == -jnp.inf, 0.0, old - jnp.where(new == -jnp.inf, 0.0, new))
+
+
+def parts_at(x: jax.Array, exponent: jax.Array, dtype=jnp.float16) -> tuple[jax.Array, jax.Array]:
+    """An fp32 tile `x` as two `dtype` parts at the running scale of `exponent`, its tile's own or larger
+    (`running_parts`): `x` times `2^(14 - exponent)` rounded, then its remainder rounded."""
+    scaled = scaled_by(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent))
     high = scaled.astype(dtype)
-    return new, shift, (high, (scaled - high.astype(jnp.float32)).astype(dtype))
+    return high, (scaled - high.astype(jnp.float32)).astype(dtype)
 
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:
