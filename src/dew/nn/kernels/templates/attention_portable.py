@@ -415,9 +415,9 @@ def _launched(query, key, spans: tuple, scale: float, how: algebra.Recompute, bl
     """A backward launch's facts of its call: the logits' scale as the forward took it (1 for raw products,
     scaled in the weights, `how`), the query heads a key head serves, and its spans' `(start, end, query
     ids, key ids)` block map at its tiles."""
-    keys = key.shape[1]
+    start, end, query_ids, key_ids = spans
     return (scale if how.factor is None else 1.0, query.shape[2] // key.shape[2],
-            block_map(KeySpans(*spans, keys), block_q, block_k))
+            block_map(KeySpans(start, end, query_ids, key_ids, key.shape[1]), block_q, block_k))
 
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params, *,
