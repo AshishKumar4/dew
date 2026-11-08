@@ -988,9 +988,10 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
         return replace(recorded, source=held)
     _log.warning("tier 2: model_type %r is no registered family; verifying which convention computes it "
                  "against its %s code by check 1 on a shrunken instance, its forward and its backward over "
-                 "drawn inputs: seconds for most types, minutes for a recurrent hybrid's backward on a "
-                 "CPU, done once a type%s.", model_type, 'remote' if source.remote is not None else
-                 "transformers'", ' and recorded' if key is not None else ' (its local code at each load)')
+                 "drawn inputs: seconds for most types, about two minutes for a recurrent hybrid's "
+                 "backward (Falcon-H1's on 24 CPU cores), done once a type%s.", model_type,
+                 'remote' if source.remote is not None else "transformers'",
+                 ' and recorded' if key is not None else ' (its local code at each load)')
     verdict = _verified(hf_config, source)
     if isinstance(verdict, VerifiedMapping):
         if key is not None:
