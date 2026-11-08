@@ -1302,6 +1302,37 @@ def mode_evaluation_contract(args) -> dict:
     return {"results": results, "closed": closed}
 
 
+def mode_replica_key(args) -> dict:
+    """A key of an implementation not the default (`rbg`, four words) replicated across the data axis the
+    two processes split: process 1 lost its copy and holds zeros where its template places it
+    (`_zeros`), a concrete key's and a shape's alike, and receives process 0's key data over the mesh
+    (`_from_replicas`)."""
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.checkpoints._replicas import _from_replicas, _grid, _zeros
+    from dew.distributed.placement import MeshSpec
+
+    mesh = MeshSpec(fsdp=args.fsdp_size).build()
+    replicated = NamedSharding(mesh, PartitionSpec())
+    key = jax.device_put(jax.random.key(7, impl="rbg"), replicated)
+    shape = jax.ShapeDtypeStruct(key.shape, key.dtype, sharding=replicated)
+    template = {"key": key, "shape": shape}
+    data = jax.random.key_data(key)
+    tree = ({"key": data, "shape": data} if jax.process_index() == 0
+            else jax.tree.map(_zeros, template))
+    recovered = _from_replicas(tree, _grid(template), frozenset({0}))
+
+    def read(words, drawn) -> dict:
+        return {"words": np.asarray(words).tolist(),
+                "draw": np.asarray(jax.random.normal(drawn, (3,))).tolist()}
+
+    return {name: read(value, jax.random.wrap_key_data(value, impl="rbg"))
+            for name, value in recovered.items()} | {
+        "expected": read(data, key),
+        "zeros": [list(np.shape(leaf)) for leaf in jax.tree.leaves(jax.tree.map(_zeros, template))]}
+
+
 def mode_evaluation_replicas(args) -> dict:
     """Record counts follow logical rows rather than sequence/stage replicas."""
     import jax
@@ -2430,7 +2461,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
-         "evaluation_replicas": mode_evaluation_replicas,
+         "evaluation_replicas": mode_evaluation_replicas, "replica_key": mode_replica_key,
          "evaluation_kept": mode_evaluation_kept,
          "evaluation_clocks": mode_evaluation_clocks,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
