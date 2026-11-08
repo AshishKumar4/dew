@@ -435,8 +435,8 @@ def test_a_flat_tables_groups_column_reaches_its_example():
 def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_beside_the_label_loss():
     """With `input_lm` w the loss is the label loss, unchanged to the bit, beside w times the rows' own
     next-token cross entropy, reported as `input_ce`: bit for bit the loss a language model of the same
-    backbone scores over the window's tokens as its documents (`LMObjective`, its head tiled), every
-    token after a row's first scored and none across rows (row 4742)."""
+    backbone scores over the windows' tokens, a row each, as its documents (`LMObjective`, its head tiled),
+    every token after a row's first scored, none on the padding (row 4742)."""
     from dew.batch import coordinates, part
     from dew.objectives.lm.objective import LMObjective
 
@@ -461,11 +461,10 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
     assert np.array_equal(np.asarray(value), np.asarray(label + 0.25 * term.mean()[0]))
     assert np.array_equal(np.asarray(aux.metrics["input_ce"]), np.asarray(term.mean()[0]))
     tokens, segments = np.asarray(batch["tokens"]), np.asarray(batch["segments"])
-    assert np.unique(segments[segments > 0]).size == 2, "the window packs both rows"
     language = LMObjective(backbone, tokens.shape[1] - 1, head_tile="tiled")
     text = {"text": jnp.asarray(tokens), "text_coordinates": coordinates(segments=segments)}
     scored, _ = language.loss(part(variables, "backbone"), text, step)
     assert np.array_equal(np.asarray(term.total), np.asarray(scored.total))
     assert np.array_equal(np.asarray(term.mass), np.asarray(scored.mass))
-    # Each row's tokens after its first are scored: none across the rows, none on the padding.
-    assert int(np.asarray(term.mass)) == int(np.sum(segments > 0)) - 2
+    # Each row's tokens after its first are scored, a row to a window: none on the padding.
+    assert int(np.asarray(term.mass)) == int(np.sum(segments > 0)) - len(segments)
