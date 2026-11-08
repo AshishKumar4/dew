@@ -406,6 +406,23 @@ def test_a_call_named_onto_the_template_lowers_for_a_gpu(name, differentiated, f
     assert len([route for route in found if route.choice == "attention_mainloop"]) == 1 + differentiated
 
 
+def test_the_jax_nn_form_takes_values_of_the_querys_heads_beside_keys_of_fewer():
+    """The reference path's jax.nn form (`scale_logits`) over keys of one head and values of the query's two
+    (Z-Image's joint attention's) is, bit for bit, the same call over the keys repeated to the query's heads:
+    its query heads group over the keys' head only where the values share it (`_grouped_as_jax_nn`)."""
+    streams = jax.random.split(jax.random.key(4), 3)
+    query = jax.random.normal(streams[0], (2, 16, 2, 8), jnp.bfloat16)
+    key = jax.random.normal(streams[1], (2, 16, 1, 8), jnp.bfloat16)
+    value = jax.random.normal(streams[2], (2, 16, 2, 8), jnp.bfloat16)
+
+    def attend(key):
+        return scaled_dot_product_attention(query, key, value, implementation="reference", causal=True,
+                                            scale_logits=True)
+
+    repeated = jnp.repeat(key, 2, axis=2)
+    assert np.asarray(attend(key)).tobytes() == np.asarray(attend(repeated)).tobytes()
+
+
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
 @pytest.mark.parametrize(("heads", "kv_heads"), [(4, 4), (4, 2), (8, 1)], ids=["mha", "gqa", "mqa"])
 def test_the_reference_scaling_its_logits_after_the_product_is_jax_nns_xla_attention(heads, kv_heads, causal):
