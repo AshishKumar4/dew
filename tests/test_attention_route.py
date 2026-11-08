@@ -755,12 +755,15 @@ def a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     """A causal call of `length` tokens, two query heads over one key head (`WIDTH` wide), through the
     template on whichever mainloop the GPU runs it, on par with the reference path (check 1): D, the
     refinement and the denominator are sums the mainloops run in sequence over its key tiles where the
-    reference sums by tree, so a ratio that grew with the sequence would show here (math review P2.5)."""
+    reference sums by tree, so a ratio that grew with the sequence would show here (math review P2.5).
+    Every entry is sized by the terms attention's float64 gradients carry through their cancellation
+    (`_causal_terms`): the first query keeps one key, so its gradient is float64 zero, which a mainloop
+    forming D from its rounded output (an A100's) holds to that rounding."""
     case = {"causal": True}
     draw = drawing(length, length, dtype, sinks=False, heads=2, kv_heads=1, rows=1)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
                     f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS,
-                    truth_fn=_causal_truth(length))
+                    truth_fn=_causal_truth(length), terms=_causal_terms(length))
 
 
 TRUTH_ROWS = 1024
@@ -798,6 +801,25 @@ def _causal_truth(length: int):
         return whole(out), whole(d_query), d_key.sum(0), d_value.sum(0), None
 
     return truth
+
+
+def _causal_terms(length: int):
+    """The float64 terms of a causal call of `length` tokens (`attention_terms` over the keys each query
+    keeps), `TRUTH_ROWS` queries at a time as its truth is (`_causal_truth`): each block's output's and query
+    gradient's terms its own, the keys' and values' the root of the blocks' summed squares; a function of a
+    draw `(query, key, value, sinks, dout)`, the sinks' gradient none."""
+    def terms(query, key, value, sinks, dout):
+        del sinks
+        blocks = []
+        for first in range(0, length, TRUTH_ROWS):
+            rows = slice(first, first + TRUTH_ROWS)
+            keep = (np.arange(first, first + TRUTH_ROWS)[:, None] >= np.arange(length)[None, :])[None, None]
+            blocks.append(attention_terms(query[:, rows], key, value, dout[:, rows], keep))
+        out, d_query = (np.concatenate([block[leaf] for block in blocks], axis=1) for leaf in (0, 1))
+        d_key, d_value = (np.sqrt(sum(np.square(block[leaf]) for block in blocks)) for leaf in (2, 3))
+        return out, d_query, d_key, d_value, None
+
+    return terms
 
 
 def test_the_accurate_form_is_one_option_away():
