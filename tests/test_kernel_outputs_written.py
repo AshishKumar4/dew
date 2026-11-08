@@ -3,9 +3,9 @@ some program skips trips `jax_debug_nans` wherever the launch runs alone, and ho
 The fused norms' and SiLU products' Triton launches, the TPU's GEMM launches, interpreted on a CPU over
 finite operands, forward and reverse, at the shapes that take their less common paths: a row past the norm's
 register tile, a residual stream, a gate, an activation after the norm, ragged groups with an empty one and
-rows past them; and Mosaic GPU's grouped GEMM launches, the class's one gate. `kernel_outputs.launched_outputs`
-runs each launch alone and reads every output it declares, those its caller slices away too; an element it
-never wrote holds the interpreter's NaN."""
+rows past them; and Mosaic GPU's grouped GEMM launches, the class's one gate. `kernel_outputs`'
+`launched_outputs` runs each launch alone and reads every output it declares, those its caller slices away
+too; an element it never wrote holds the interpreter's NaN."""
 
 import dataclasses
 import functools
@@ -178,13 +178,14 @@ def test_the_gpus_partial_gemm_launches_write_every_output(product):
         if product == "balanced gmm":
             lhs, rhs = drawn((1408, 128), (1, 128, 128))
             assert mosaic_gpu.balanced_tail(tiles, (11, 1), 2, (2, 2), target, 8) is not None
-            assert_written(lambda lhs, rhs: mosaic_gpu.gmm(lhs, rhs, jnp.asarray([1408], jnp.int32),
-                                                           transpose_rhs=False, dense=True, **options), lhs, rhs)
+            sizes = jnp.asarray([1408], jnp.int32)
+            assert_written(lambda lhs, rhs: mosaic_gpu.gmm(lhs, rhs, sizes, transpose_rhs=False, dense=True,
+                                                           **options), lhs, rhs)
         elif product == "balanced tgmm":
             lhs, rhs = drawn((320, 128), (320, 1408))
             assert mosaic_gpu.balanced_tail(tiles, (1, 11), 5, (2, 2), target, 8) is not None
-            assert_written(lambda lhs, rhs: mosaic_gpu.tgmm(lhs, rhs, jnp.asarray([320], jnp.int32), dense=True,
-                                                            **options), lhs, rhs)
+            sizes = jnp.asarray([320], jnp.int32)
+            assert_written(lambda lhs, rhs: mosaic_gpu.tgmm(lhs, rhs, sizes, dense=True, **options), lhs, rhs)
         else:
             # 203 rows, which the scattered product pads to whole 8-row stores (`Scattered`'s -1 entries).
             lhs, rhs = drawn((203, 128), (4, 128, 256))

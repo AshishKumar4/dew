@@ -825,12 +825,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                              swizzles=SCALE_SWIZZLES if step_scales is not None
                                              else None, **_gathered(gather, tiles, lhs.dtype, interpret)))
 
-    # A depth split's outputs: each run's partial, a `[m, n]` slice of its own. A scattered product's, its
-    # `stored` rows alone, which its table's entries land on, each once: its padded rows land nowhere, so
-    # rows past them would be declared and never written (NSNAN-2).
-    rows = m if stored is None else stored
-    out_type = tuple(jax.ShapeDtypeStruct((rows, n) if tiles.splits == 1 else (tiles.splits, rows, n), dtype)
-                     for dtype in dtypes)
+    out_type = _declared(m if stored is None else stored, n, tiles.splits, dtypes)
     operands = (lhs, rhs, *(() if paired is None else (paired,)), *(() if scales is None else (scales,)),
                 *(step_scales or ()), *(mx_scales or ()), *(() if gather is None else (gather,)),
                 *(() if scatter is None else (scatter,)))
@@ -842,6 +837,15 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                                    *prologue_operands, *epilogue_operands, *out_type))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
                   *_workspace(tail, (multiprocessors, 2, consumers, *part)))
+
+
+def _declared(rows: int, n: int, splits: int, dtypes: tuple) -> tuple:
+    """Dew: a `gmm` launch's outputs, `[rows, n]` each, a depth split's each run's partial a slice of its own
+    (`[splits, rows, n]`). A scattered product declares its stored rows alone, which its table's entries land
+    on, each once: its padded rows land nowhere, so rows past them would be declared and never written
+    (NSNAN-2)."""
+    return tuple(jax.ShapeDtypeStruct((rows, n) if splits == 1 else (splits, rows, n), dtype)
+                 for dtype in dtypes)
 
 
 def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family, part: tuple, m: int, g: int,
