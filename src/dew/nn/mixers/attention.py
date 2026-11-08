@@ -188,6 +188,11 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("a tree call's attention is masked by its key runs, each token's cache and "
                          "ancestors (attention_key_runs)")
     if metadata.pairwise_mask is None and metadata.key_runs is None:
+        # A validity hides keys from a call's own visibility, which a call of neither does not state: read
+        # alone it would hide nothing (row 4771).
+        if metadata.key_valid is not None:
+            raise ValueError("attention_key_valid hides keys from a call's own visibility; it requires "
+                             "attention_pairwise_mask or attention_key_runs")
         return None
     key_positions, valid = metadata.key_positions, metadata.key_valid
     if key_positions is not None and key_positions.shape != (batch, keys):
