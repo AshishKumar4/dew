@@ -843,8 +843,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         plgpu.commit_smem()
         return padded
 
-    def register_products(self, acc: Accumulator | jax.Array, parts, rhs, interpret: bool
-                          ) -> Accumulator | jax.Array:
+    def register_products(self, acc: Accumulator | jax.Array, parts, rhs) -> Accumulator | jax.Array:
         # A 64-row product takes no left operand from tensor memory (tcgen05.py: M=128 alone) nor registers:
         # each part is staged into the building role's shared tile of its depth and dtype
         # (`product_scratch`'s lefts), made visible to the tensor core's proxy, multiplied from there, and
