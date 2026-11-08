@@ -777,6 +777,13 @@ def _random_bits(params, operands, result, fmt):
     return np.asarray(result) == np.asarray(expected)
 
 
+def _unset(params, operands, result, fmt):
+    """An uninitialized buffer (`empty2`, JAX's filler for the residual slots a `cond`'s other branch defines:
+    conditionals.py `_join_cond_outputs`): no arithmetic and no value of anyone's, so whatever it holds keeps
+    it; a computation reading it is held by its own contract and by the program's check 1."""
+    return np.ones(np.shape(result), bool)
+
+
 def _wrapped(params, operands, result, fmt):
     """A key wrapped from its data: the key's data is the operand, bit for bit."""
     import jax
@@ -1014,6 +1021,7 @@ CONTRACTS = {
     "gather": _moved(_gathered),
     "stack": _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
     "random_bits": _random_bits,
+    "empty2": _unset,
     "random_wrap": _wrapped,
     "random_unwrap": _unwrapped,
 }
