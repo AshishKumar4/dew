@@ -156,6 +156,32 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
 
 
 @INTERPRETS
+@pytest.mark.parametrize("far", [False, True], ids=["no-rewalk", "a-row-rewalked"])
+@pytest.mark.parametrize("call", ["one-query", "verify-four"])
+def test_every_output_a_decode_steps_launches_declare_is_written_interpreted(call, far):
+    """Each launch of a decode step writes every output it declares on every path (NSNAN-2): its masked
+    rewalk, whose programs that walk nothing write nothing, rewalks into the plain launch's outputs in place
+    and declares none of its own, a merging walk's unsplit. Under JAX's NaN check (`jax.debug_nans`), which
+    the Mosaic interpreter's unwritten outputs (NaN) trip, a step whose rows need no rewalk and one whose
+    first row's query is 2^16 times a drawn one (past the fold's reach, rewalked natural) run op by op, so
+    the check reads each launch's outputs, their result bit for bit the unchecked run's."""
+    positions, heads, kv_heads = CALLS[call]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    if far:
+        query = query.at[0].multiply(2.0 ** 16)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    unchecked = np.asarray(ours(query, key, value))
+    with jax.debug_nans(new_val=True):
+        checked = np.asarray(ours(query, key, value))
+    assert checked.tobytes() == unchecked.tobytes()
+
+
+@INTERPRETS
 @pytest.mark.parametrize("hook", ["plain", "sinks", "far"])
 def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk_interpreted(hook):
     """A decode step of 17 rows over 8 key heads (136 programs, past an H100's 132 multiprocessors), so its
