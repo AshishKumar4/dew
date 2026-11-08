@@ -590,20 +590,37 @@ derivative of its own (`_own_backward`) and depends on its operands' types and i
 _JAX_CODE = (jax.lax.dot_general.__code__, jnp.einsum.__code__)
 """The code of the contractions every other one calls through, as JAX defines it: a library that
 intercepts JAX's products in place (Qwix's `quantize_model` replaces `jax.lax.dot_general`'s and
-`jax.numpy.einsum`'s) changes it, and a trace cached before would skip the library's product."""
+`jax.numpy.einsum`'s) changes it (`_quantized`)."""
+
+_REACHED = {jnp.einsum: ("einsum", "dot_general"), jnp.dot: ("dot", "dot_general")}
+"""The ops of JAX's a contraction reaches, as Qwix names the ops it intercepts, where more than
+`dot_general` (which every other contraction calls through)."""
+
+
+def _quantized(function: Callable) -> bool:
+    """Whether Qwix quantizes the contraction `function` at the module calling it: under its interception of
+    JAX's products (`_JAX_CODE` changed), a rule of its matching an op the contraction reaches, as Qwix's own
+    query answers it (`qwix.pallas.get_current_rule`, which its providers intercept). Qwix owns the products
+    it quantizes; a contraction no rule matches stays float, and Dew's sums govern it, so a quantized model's
+    kept-in-float parts compute as the unquantized model's."""
+    if (jax.lax.dot_general.__code__, jnp.einsum.__code__) == _JAX_CODE:
+        return False
+    from qwix import pallas as qwix_pallas
+
+    return any(qwix_pallas.get_current_rule(op) is not None
+               for op in _REACHED.get(function, ("dot_general",)))
 
 
 def _contraction(product: Callable, preferred_element_type) -> tuple | None:
     """`product` as a key of one of JAX's contractions (`CONTRACTIONS`, each as JAX defines it), bound through
     plain `functools.partial`s around it (a subclass may call it otherwise) to arguments with no array among
     them, with the dtype it is asked for: the contraction, the arguments' tree and their leaves; None for any
-    other product."""
+    other product, and for one Qwix quantizes (`_quantized`), whose product is its own."""
     function, arguments, keywords = product, (), {}
     while isinstance(function, functools.partial) and type(function) is functools.partial:
         arguments, keywords = function.args + arguments, {**function.keywords, **keywords}
         function = function.func
-    intercepted = (jax.lax.dot_general.__code__, jnp.einsum.__code__) != _JAX_CODE
-    if intercepted or not any(function is contraction for contraction in CONTRACTIONS):
+    if not any(function is contraction for contraction in CONTRACTIONS) or _quantized(function):
         return None
     leaves, tree = jax.tree.flatten((arguments, keywords, preferred_element_type))
     if not all(isinstance(leaf, Hashable) and not isinstance(leaf, jax.Array | np.ndarray)
