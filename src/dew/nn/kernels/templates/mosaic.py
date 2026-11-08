@@ -1353,6 +1353,12 @@ class Issuer[Accumulator](abc.ABC):
     product. Where not (tcgen05's: one warp issues them, the tensor core reading each stage as loaded), a
     call needing that is not a template's launch's there."""
 
+    product_control: int = 0
+    """The registers a consumer thread keeps beside its walk's control (`resources.CONTROL_REGISTERS`) for
+    the products' state the issuer holds itself: none where a product's accumulator is the walk's own
+    registers; tcgen05's chunks' each width's tensor-memory address, its staged left tile's and its commit
+    barrier's phase (`Tcgen05ChunksIssuer.product_control`)."""
+
     takes_register_left: bool = True
     """Whether its product takes its left operand from a consumer's registers (`register_products`: wgmma's
     RS form, mma.sync's fragments); a family without it takes a register value staged into a shared tile

@@ -56,11 +56,11 @@ def _join_swizzle(block: tuple, streams, name: str) -> int:
 
 
 def _joined(pieces: list, joined, interpret: bool):
-    """A step's pieces (`Rows`' runs, each landed in a slot of its own) copied into its one tile, in order,
-    through registers a piece at a time, a row's columns over a warp's lanes (`mosaic._row_layout`: the one
-    layout a plain piece's load and a swizzled tile's store both take on sm80, FS-PIECESV-1; each warp
-    writing every row alike): a sync first, so no warp still reads the last step's tile, and after, so none
-    reads a row not yet copied."""
+    """A step's pieces (`Rows`' runs, each landed in a slot of its own at the swizzle its copy tiles, `walk`)
+    copied into its one tile, in order, through registers a piece at a time, a row's columns over a warp's
+    lanes (`mosaic._row_layout`: the one layout a swizzled piece's load and a swizzled tile's store both take
+    on sm80, FS-PIECESV-1; each warp writing every row alike): a sync first, so no warp still reads the last
+    step's tile, and after, so none reads a row not yet copied."""
     rows = pieces[0].shape[0]
     mosaic.synced(interpret)
     for each, piece in enumerate(pieces):
@@ -587,10 +587,12 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 return step(index + lo, Slots(slots), carried, accumulators)
 
             # A tile's blocks staged swizzled for ldmatrix (`_staging`); a stream in pieces a block a run of
-            # its `Rows` view, each staged plain for its join's register copy.
+            # its `Rows` view, each staged at the swizzle its own copy tiles (`mosaic.copied_swizzle`: a
+            # 16-key page of 64 bf16 columns, 2 by 1 tiles at 128 bytes, which cp.async's copy layout takes
+            # in none, is 2 by 2 at 64), which its join's register copy reads it at (`_joined`).
             specs = []
             for name in names:
-                shape = blocks[name][0]
+                shape, dtype = blocks[name]
                 index_map = streams.views[name][1]
                 if name not in copies:
                     staging = _staging(blocks[name], streams.pipeline.swizzles.get(name))
@@ -598,7 +600,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                                                  transforms=staging))
                     continue
                 run = (shape[0] // copies[name], *shape[1:])
-                specs += [plgpu.BlockSpec(run, functools.partial(_run, index_map, lo, each))
+                piece = mosaic.swizzle_transforms(dtype, mosaic.copied_swizzle(run, dtype))
+                specs += [plgpu.BlockSpec(run, functools.partial(_run, index_map, lo, each), transforms=piece)
                           for each in range(copies[name])]
             operands = [streams.views[name][0] for name in names for _ in range(copies.get(name, 1))]
 

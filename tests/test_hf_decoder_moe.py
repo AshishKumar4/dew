@@ -320,28 +320,39 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
             np.asarray(dequantize_mxfp4(stored[stem + "_blocks"], stored[stem + "_scales"])))
 
 
+@pytest.mark.mesh(devices=2)
 def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(tmp_path):
-    """An MXFP4 GPT-OSS loaded packed onto a mesh of this process's devices (`packed_experts` with
-    `mesh`): each bank's three leaves placed by its dense matrix's axes as the bank lays them out
-    (`quantization.expert_leaf_axes`), its words and block scales sharded as the dense matrix's experts are,
-    and its logits on par with the unplaced packed load's (check 1)."""
-    from dew.distributed.placement import MeshSpec
+    """An MXFP4 GPT-OSS loaded packed onto a mesh whose expert axis takes two devices (`packed_experts`
+    with `mesh`): each bank's three leaves placed by its dense matrix's axes as the bank lays them out
+    (`quantization.expert_leaf_axes`), its words, block scales and tensor scales sharded on the expert
+    axis as the dense matrix's experts are, and its logits on par with the unplaced packed load's
+    (check 1)."""
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.nn.kernels.gemm import NvFp4
     from dew.quantization import QUANTIZATION
 
     source = _mxfp4_gpt_oss(tmp_path)
+    mesh = MeshSpec(expert=2)
     placed = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
-                             packed_experts=True, mesh=MeshSpec())
+                             packed_experts=True, mesh=mesh)
     held = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
                            packed_experts=True)
     dense = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
-                            mesh=MeshSpec())
+                            mesh=mesh)
     params = dict(flatten_dict(dict(dense.variables["params"])))
     banks = flatten_dict(dict(placed.variables[QUANTIZATION]),
                          is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+    sharded = 0
     for path, bank in banks.items():
         experts = params[path].sharding.spec[0]
-        assert bank.words.sharding.spec[0] == experts and bank.scales.sharding.spec[0] == experts
+        assert experts is not None
+        for leaf in (bank.words, bank.scales, bank.scale):
+            # A leaf under the layout's least sharded size stays whole, as a dense one does
+            # (`Layout.min_shard`): the gate-up banks' words are past it.
+            first = None if leaf.size < Layout().min_shard else experts
+            assert (tuple(leaf.sharding.spec) or (None,))[0] == first, (path, leaf.shape, leaf.sharding)
+            sharded += first is not None
+    assert sharded
 
     def draw(seed: int):
         return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
@@ -349,7 +360,30 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     def logits(loaded):
         return jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens))
 
-    assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=4)
+    assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=8)
+
+
+def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
+    """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_experts` with `scan_layers`, row
+    4861): the scan stacks each bank's three leaves as it stacks a dense matrix and slices a layer's back,
+    so its logits and their gradient are the unscanned packed load's bit for bit."""
+    import tempfile
+
+    source = _mxfp4_gpt_oss(Path(tempfile.mkdtemp()))
+    scanned, plain = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=True,
+                                      scan_layers=scan) for scan in (True, False))
+    tokens = jax.random.randint(jax.random.key(0), (2, 8), 0, PACKED_CONFIG["vocab_size"])
+
+    def loss(loaded):
+        return jax.jit(jax.value_and_grad(
+            lambda params: jnp.sum(loaded.model.apply({**loaded.variables, "params": params}, tokens) ** 2)))(
+                loaded.variables["params"])
+
+    # A scan is how the model runs, its stored tree the same (`Pretrained.load`'s `Scanning`).
+    (scanned_loss, scanned_grad), (plain_loss, plain_grad) = loss(scanned), loss(plain)
+    np.testing.assert_array_equal(np.asarray(scanned_loss), np.asarray(plain_loss))
+    jax.tree.map(lambda left, right: np.testing.assert_array_equal(np.asarray(left), np.asarray(right)),
+                 scanned_grad, plain_grad)
 
 
 def test_an_mxfp4_gpt_oss_whose_experts_are_no_whole_stages_loads_packed_as_it_loads_dense():

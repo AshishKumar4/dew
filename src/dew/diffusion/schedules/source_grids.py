@@ -31,6 +31,7 @@ from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import RectifiedFlow, static_shift
 from dew.diffusion.schedules.karras import rho_ramp
 from dew.diffusion.transforms import PredictionTransform
+from dew.nn.programs import on_host
 from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
@@ -118,10 +119,13 @@ class _PairedGrid:
     """
 
     def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
-        self.table = jnp.asarray(sigmas, jnp.float32)
-        self.times = jnp.asarray(model_times, jnp.float32)
-        self.rows = jnp.arange(len(sigmas), dtype=jnp.float32)
-        self.prior = jnp.asarray(prior, jnp.float32)
+        # Placed as constants are, on this host's CPU (`on_host`), as a grid built while its sample traces
+        # under a mesh of devices that run nothing here (a compile-only GPU's) is.
+        with on_host():
+            self.table = jnp.asarray(sigmas, jnp.float32)
+            self.times = jnp.asarray(model_times, jnp.float32)
+            self.rows = jnp.arange(len(sigmas), dtype=jnp.float32)
+            self.prior = jnp.asarray(prior, jnp.float32)
         self.T = float(len(sigmas) - 1)
 
     def sigmas(self, t):
@@ -167,9 +171,10 @@ class StageSigmaGrid(SigmaGrid):
     def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
         super().__init__(sigmas, model_times, prior)
         stages = np.asarray(sigmas, np.float64)[1::2]
-        self.stages = jnp.asarray(stages[::-1].copy(), jnp.float32)
-        self.stage_positions = jnp.asarray(
-            np.arange(1, len(sigmas), 2, dtype=np.float32)[::-1].copy())
+        with on_host():
+            self.stages = jnp.asarray(stages[::-1].copy(), jnp.float32)
+            self.stage_positions = jnp.asarray(
+                np.arange(1, len(sigmas), 2, dtype=np.float32)[::-1].copy())
 
     def t_of_sigma(self, sigma):
         return self.T - _interpolate(sigma, self.stages, self.stage_positions)
@@ -590,8 +595,7 @@ def sampling_grid(policy: SourcePolicy, betas: np.ndarray, prediction: Predictio
     if policy.flow is not None:
         sigmas, times, prior = _flow_grid(policy, policy.flow, steps, tokens, origin)
         schedule = FlowGrid(sigmas, np.append(times, 0.0), prior)
-        return (Process(schedule, prediction),
-                jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))
+        return Process(schedule, prediction), _descending(len(sigmas) - 1, 1)
     if policy.family in ("tabulated", "lambda") and steps > policy.train_steps:
         raise ValueError("The sampling count must fit the training table")
     if policy.family == "tabulated":
@@ -605,14 +609,18 @@ def sampling_grid(policy: SourcePolicy, betas: np.ndarray, prediction: Predictio
     elif policy.family == "stage":
         sigmas, times, prior = _stage_grid(policy, betas, steps)
         schedule = StageSigmaGrid(sigmas, times, prior)
-        return (Process(schedule, prediction),
-                jnp.arange(len(sigmas) - 1, -1, -2, dtype=jnp.float32))
+        return Process(schedule, prediction), _descending(len(sigmas) - 1, 2)
     else:
         sigmas, times, prior = _lambda_grid(policy, betas, steps)
         paired = FlowGrid if policy.flow_shift is not None else VPGrid
         schedule = paired(sigmas, np.append(times, times[-1]), prior)
-    return (Process(schedule, prediction),
-            jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))
+    return Process(schedule, prediction), _descending(len(sigmas) - 1, 1)
+
+
+def _descending(top: int, stride: int) -> jax.Array:
+    """The grid's descending rows from `top` to 0 by `stride`, on this host's CPU (`on_host`)."""
+    with on_host():
+        return jnp.arange(top, -1, -stride, dtype=jnp.float32)
 
 
 def _tabulated(policy: SourcePolicy, betas: np.ndarray, prediction: PredictionTransform,
@@ -630,8 +638,8 @@ def _tabulated(policy: SourcePolicy, betas: np.ndarray, prediction: PredictionTr
     final = 1.0 if policy.clean_terminal else float(1 - betas[0])
     schedule = TabulatedVP(betas, final_alpha_cumprod=final,
                            stride=policy.train_steps // steps if policy.stride else None)
-    return (Process(schedule, prediction),
-            jnp.asarray(np.append(times, terminal), jnp.float32))
+    with on_host():
+        return Process(schedule, prediction), jnp.asarray(np.append(times, terminal), jnp.float32)
 
 
 __all__ = ["FlowGrid", "SigmaGrid", "StageSigmaGrid", "TabulatedVP", "VPGrid", "published_betas"]

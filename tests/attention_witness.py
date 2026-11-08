@@ -102,14 +102,6 @@ def finished(acc, total, fmt) -> Iv:
     return cast(Iv(np.where(quotient == 0, 0.0, lo), np.where(quotient == 0, 0.0, hi)), fmt)
 
 
-def tiles(keys: int, count: int) -> int:
-    """The key tile width a launch walking `keys` keys in `count` tiles takes: the one power of two, at least
-    16, of which `count` cover the keys and `count - 1` do not."""
-    widths = [width for width in (16, 32, 64, 128, 256) if (count - 1) * width < keys <= count * width]
-    assert len(widths) == 1, (keys, count, widths)
-    return widths[0]
-
-
 def witnessed(query, key, value, kept, *, interpret: bool, records=None) -> dict[str, tuple[np.ndarray, ...]]:
     """Each stored state and the output of the certify launch over `query`, `key` and `value` (`[B, S, H, D]`,
     bf16) under the mask `kept` (`[B or 1, 1, Q, K]`, `attention_oracle.kept`'s), held to its enclosure:
@@ -117,11 +109,8 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None) -> dict
     lane = attention_lane(interpret)
     q, k, v = (np.asarray(np.asarray(x, np.float32), np.float64) for x in (query, key, value))
     if records is None:
-        out, rows, sums = certified(query, key, value, spans_of(kept, query.shape[0]), interpret=interpret)
-        records = {"out": np.asarray(out, np.float64), "m": np.asarray(rows[0], np.float64),
-                   "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64)}
-    count = records["m"].shape[2]
-    width = tiles(k.shape[1], count)
+        records = launched(query, key, value, kept, interpret=interpret)
+    count, width = records["m"].shape[2], records["tile"]
     factor = walk_factor(q.shape[3])
     lane = Lane(lane.reach, lane.flushes, width)
     held = {name: [] for name in ("m", "l", "acc", "out")}
@@ -156,9 +145,9 @@ def witnessed(query, key, value, kept, *, interpret: bool, records=None) -> dict
 
 
 def certified(query, key, value, spans, *, interpret: bool):
-    """The certify launch's records (`attention_mosaic.certified`): interpreted, at a Hopper's tiles, the
-    target an interpreted launch derives its config for (`generation.assumed`); natively, on a device whose
-    mainloop runs the call, its test skipped with the mainloop's own reason where it declines it
+    """The certify launch's tiles and records (`attention_mosaic.certified`): interpreted, at a Hopper's
+    tiles, the target an interpreted launch derives its config for (`generation.assumed`); natively, on a
+    device whose mainloop runs the call, its test skipped with the mainloop's own reason where it declines it
     (`attention_mosaic.forward_declined`: an Ampere's, whose family the mainloop does not yet qualify)."""
     import pytest
 
@@ -196,11 +185,13 @@ def operands(seed: int):
     return q.astype(jnp.bfloat16), (2 * k).astype(jnp.bfloat16), v.astype(jnp.bfloat16)
 
 
-def records(query, key, value, mask, *, interpret: bool) -> dict[str, np.ndarray]:
-    """The certify launch's own records (`attention_mosaic.certified`) under `mask`, as float64."""
-    out, rows, sums = certified(query, key, value, spans_of(mask, query.shape[0]), interpret=interpret)
+def launched(query, key, value, mask, *, interpret: bool) -> dict:
+    """The certify launch's own records (`attention_mosaic.certified`) under `mask`, as float64, and the key
+    tile it walked (`tile`), each record's tiles that wide."""
+    spans = spans_of(mask, query.shape[0])
+    tiles, (out, rows, sums) = certified(query, key, value, spans, interpret=interpret)
     return {"out": np.asarray(out, np.float64), "m": np.asarray(rows[0], np.float64),
-            "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64)}
+            "l": np.asarray(rows[1], np.float64), "acc": np.asarray(sums, np.float64), "tile": tiles.block_k}
 
 
 def refused(found: dict, name: str) -> int:
@@ -225,7 +216,7 @@ def assert_faults_refused(*, interpret: bool) -> None:
     mask one key short of its own."""
     q, k, v = operands(2)
     mask = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=False)
-    truth = records(q, k, v, mask, interpret=interpret)
+    truth = launched(q, k, v, mask, interpret=interpret)
     m, acc = truth["m"], truth["acc"]
     alpha = np.exp2(np.where(np.isfinite(m[:, :, :-1]), m[:, :, :-1] - m[:, :, 1:], 0.0))
     dropped = dict(truth, acc=np.concatenate(
@@ -237,6 +228,6 @@ def assert_faults_refused(*, interpret: bool) -> None:
     assert refused(witnessed(q, k, v, mask, interpret=interpret, records=narrowed), "acc")
     causal = attention_oracle.kept(SHAPE[1], SHAPE[1], causal=True)
     shifted = causal & ~np.eye(SHAPE[1], dtype=bool)[None, None]
-    claimed = records(q, k, v, causal, interpret=interpret)
+    claimed = launched(q, k, v, causal, interpret=interpret)
     held = witnessed(q, k, v, shifted, interpret=interpret, records=claimed)
     assert sum(refused(held, name) for name in ("m", "l", "acc"))

@@ -276,7 +276,9 @@ def parameter_key(value) -> Hashable:
     its mesh, partitions, memory and logical device order; an array by its dtype, shape and bytes' digest; a
     function by its module and name, a partial one with its bound arguments. Any other object is its type's
     name and the object itself, compared by its own equality, never by its printed form, which a key kept in
-    another process cannot read (`opaque`). `value` is any parameter JAX's primitives take, which share no
+    another process cannot read (`opaque`); an object that cannot be hashed (JAX's `WrappedFun` of a
+    derivative rule, hashing an `Unhashable` tree) by its identity, held alive by the key (`_Identity`), so
+    it is equal to itself alone. `value` is any parameter JAX's primitives take, which share no
     type."""
     if value is None or isinstance(value, (bool, str)):
         return type(value).__name__, value
@@ -326,7 +328,28 @@ def parameter_key(value) -> Hashable:
                                         for name, part in value.items()), key=repr))
     if isinstance(value, types.FunctionType):
         return "function", value.__module__, value.__qualname__
+    try:
+        hash(value)
+    except TypeError:
+        # A function JAX wraps (a derivative rule's `WrappedFun`) hashes its parts, an `Unhashable` tree among
+        # them: keyed by its identity.
+        return "object", _named(type(value)), _Identity(value)
     return "object", _named(type(value)), value
+
+
+class _Identity:
+    """An unhashable parameter as a key: equal to a key of the same object alone, the object held."""
+
+    __slots__ = ("held",)
+
+    def __init__(self, held):
+        self.held = held
+
+    def __hash__(self) -> int:
+        return id(self.held)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _Identity) and other.held is self.held
 
 
 def opaque(key) -> Hashable:
@@ -434,14 +457,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
         _typed(dtypes, magnitudes, env[var], var, magnitude)
         leaves += 1
 
+    literal = _literals(forms, literals, shapes, dtypes, magnitudes)
+
     def read(atom) -> Node:
-        if isinstance(atom, jcore.Literal):
-            literals.append(_held(atom.val))
-            term = forms.literal(len(literals) - 1)
-            shapes.append((term, _shape(atom)))
-            _typed(dtypes, magnitudes, term, atom, _magnitude(atom.val))
-            return term
-        return env[atom]
+        return literal(atom) if isinstance(atom, jcore.Literal) else env[atom]
 
     def magnitude_of(atom) -> Magnitude | None:
         return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else magnitudes[key(env[atom])]
@@ -751,6 +770,33 @@ def _held(value: np.ndarray | complex) -> np.ndarray | complex:
     if isinstance(value, TypedNdArray):
         return TypedNdArray(np.array(value), value.aval)
     return np.array(value) if isinstance(value, np.ndarray) else value
+
+
+def _literals[Node: (Term, Skeleton)](forms: type[Node], literals: list, shapes: list, dtypes: dict,
+                                      magnitudes: dict) -> Callable[[jcore.Literal], Node]:
+    """A region's reader of its literals into `literals`: each once by its value as the program holds it
+    (`literal_key`), so equal constants are one term."""
+    index: dict[Hashable, int] = {}
+
+    def literal(atom: jcore.Literal) -> Node:
+        named = literal_key(atom)
+        if named not in index:
+            index[named] = len(literals)
+            literals.append(_held(atom.val))
+        term = forms.literal(index[named])
+        shapes.append((term, _shape(atom)))
+        _typed(dtypes, magnitudes, term, atom, _magnitude(atom.val))
+        return term
+
+    return literal
+
+
+def literal_key(atom: jcore.Literal) -> Hashable:
+    """A literal's identity in a region: its dtype, shape and bits, so two literals are one term where they
+    are the same constant, and never where they round apart. Its weak type is no part of it: an equation's
+    types are settled where it is traced, so a weak and a strong literal of one dtype compute alike."""
+    value = np.asarray(atom.val)
+    return str(value.dtype), value.shape, value.tobytes()
 
 
 def _shape(atom) -> tuple[int, ...]:

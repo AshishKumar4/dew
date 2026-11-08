@@ -48,7 +48,7 @@ import test_contracts_attention as contracts
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import BF16_PRODUCTS, Cell, cells_of, repeats_bit_for_bit, run_cells, when
+from gpu_flow import BF16_PRODUCTS, Cell, cells_of, in_parts, parted, repeats_bit_for_bit, run_cells, when
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
@@ -59,12 +59,11 @@ CASES = ("causal-documents-window", *triton.IRREGULAR)
 """The Triton sweeps' calls (`triton.every_config_on_a_gpu`)."""
 
 
-def sweep(check, space) -> Cell:
-    """`check` at every config of `space` over every call of CASES, as one cell: each config its own
-    inner cell, every failure kept (`run_cells`)."""
-    return Cell(f"{check.__name__.replace('_', ' ')}: {len(space)} configs by {len(CASES)} calls",
-                lambda: run_cells([Cell(f"{case} {config}", functools.partial(check, config, case))
-                                   for case in CASES for config in space]))
+def sweep(check, space) -> list[Cell]:
+    """`check` at every config of `space` over every call of CASES, each config's call its own cell."""
+    name = check.__name__.replace('_', ' ')
+    return [Cell(f"{name}: {case} {config}", functools.partial(check, config, case))
+            for case in CASES for config in space]
 
 
 def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple, kv_heads: int = 8) -> None:
@@ -96,12 +95,17 @@ def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple, kv_heads: int = 8)
                         names=[f"the {name}'s gradient" for name in ("query", "key", "value", "bias")])
 
 
-def test_the_attention_kernels_run_on_this_gpu():
+KERNEL_PARTS = 4
+"""The kernels flow's parts (`in_parts`): 310 s whole on a GH200 (MAINGPU-709ddea7a)."""
+
+
+@in_parts(KERNEL_PARTS)
+def test_the_attention_kernels_run_on_this_gpu(part):
     """Every kernel cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
-    together; the Mosaic cells on an H100 alone."""
-    run_cells([
-        sweep(triton.every_config_on_a_gpu, triton.FORWARD_TILES),
-        sweep(triton.every_backward_config_on_a_gpu, triton.BACKWARD_TILES),
+    together, a part's share of them (`in_parts`); the Mosaic cells on an H100 alone."""
+    run_cells(parted([
+        *sweep(triton.every_config_on_a_gpu, triton.FORWARD_TILES),
+        *sweep(triton.every_backward_config_on_a_gpu, triton.BACKWARD_TILES),
         # The Pallas-Triton dK/dV launch's prescaled query on an H100: right and repeating (the pipeliner's
         # race, attention_triton_stages).
         *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
@@ -152,7 +156,7 @@ def test_the_attention_kernels_run_on_this_gpu():
         *(Cell(f"a paged decode step of {page}-key pages is on par",
                functools.partial(decode_template.a_paged_decode_step_of_small_pages_is_on_par, page))
           for page in (16, 4, 1)),
-    ])
+    ], part, KERNEL_PARTS))
 
 
 def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
@@ -206,24 +210,34 @@ KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misre
 is the two-GPU flow's (tests/test_gpu_mesh.py)."""
 
 
-def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
+FUSED_PARTS = 2
+"""The fused kernels' flow's parts (`in_parts`): 155 s whole on a GH200 (MAINGPU-709ddea7a)."""
+
+
+@in_parts(FUSED_PARTS)
+def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops, part):
     """Every test_kernels and masked-rows cell above on this GPU (`gpu_flow.cells_of`), without XLA's
-    deterministic ops, each one's failure kept and all raised together."""
-    run_cells([
+    deterministic ops, each one's failure kept and all raised together, a part's share of them."""
+    run_cells(parted([
         *(cell for check in KERNEL_CELLS
           for cell in cells_of(check, without_deterministic_ops=without_deterministic_ops)
           for cell in [dataclasses.replace(cell, run=when(bf16_dot_runs(), BF16_PRODUCTS, cell.run))]),
         *cells_of(masked_rows.a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels,
                   without_deterministic_ops=without_deterministic_ops),
-    ])
+    ], part, FUSED_PARTS))
+
+
+MATRIX_PARTS = 2
+"""The attention matrix's parts (`in_parts`): 124 s whole on a GH200 (MAINGPU-709ddea7a)."""
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
-def test_the_attention_matrix_holds_on_this_gpu():
+@in_parts(MATRIX_PARTS)
+def test_the_attention_matrix_holds_on_this_gpu(part):
     """Attention's check-1 matrix (tests/kernel_matrix.py): the route's training step on par with the
     reference path at every pair of axis values the route serves, each cell on its own GPU, without XLA's
-    deterministic ops (a deterministic run never derives the one launch its cells pin)."""
-    run_cells(cells_of(matrix.a_routes_training_step_is_on_par))
+    deterministic ops (a deterministic run never derives the one launch its cells pin), a part's share."""
+    run_cells(parted(cells_of(matrix.a_routes_training_step_is_on_par), part, MATRIX_PARTS))
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
@@ -241,19 +255,25 @@ def test_the_decode_matrix_holds_on_this_gpu():
     run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
 
 
+MOSAIC_PARTS = 8
+"""The Mosaic flow's parts (`in_parts`): past the 3600 s deadline whole on a GH200 (MAINGPU-df3e6ac66), its
+cells' kernels' compiles most of it."""
+
+
 @pytest.mark.usefixtures("without_deterministic_ops")
-def test_the_mosaic_template_holds_on_an_h100():
+@in_parts(MOSAIC_PARTS)
+def test_the_mosaic_template_holds_on_an_h100(part):
     """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
-    long sequence, each one's failure kept and all raised together, without XLA's deterministic ops: the
-    fused backward forms its cells pin add dQ atomically, which a deterministic run never derives
-    (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's `_repeat_promised`) they
-    failed as unpaired draws (row 3171)."""
-    run_cells([
+    long sequence, each one's failure kept and all raised together, a part's share of them, without XLA's
+    deterministic ops: the fused backward forms its cells pin add dQ atomically, which a deterministic run
+    never derives (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's
+    `_repeat_promised`) they failed as unpaired draws (row 3171)."""
+    run_cells(parted([
         *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
-    ])
+    ], part, MOSAIC_PARTS))
 

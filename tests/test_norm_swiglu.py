@@ -29,7 +29,7 @@ from tuned import each_config
 
 from dew.nn import attention, norms
 from dew.nn.activations import gated_product, packed_gated_product
-from dew.nn.kernels import norm_swiglu, tuning
+from dew.nn.kernels import generation, norm_swiglu, tuning
 from dew.nn.norms import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
 
 pytestmark = pytest.mark.kernel
@@ -122,7 +122,7 @@ SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (2, 3, 1000): 32, (4099, 256): 8, (24
          "unweighted, one value": 512,
          "step of distinct rows": 8, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
          (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
-         "composed": 32, "gates": 8}
+         "composed": 32, "gates": 8, (25, 9000): 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 XLA compared with itself resolves the factor in every output and gradient (on armada)."""
 
@@ -194,6 +194,107 @@ def norm_operands(shape, dtype, scale_dtype, draw: int = 0):
         0.7 + 0.2 * jax.random.normal(drawn_key(24, draw), (shape[-1],))).astype(scale_dtype)
     seed = jax.random.normal(drawn_key(25, draw), shape).astype(dtype)
     return (x, scale), seed
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("streamed", [False, True])
+def test_a_wide_rows_norm_walks_its_columns_and_holds_the_float64_gate(dtype, streamed):
+    """Row 820: rows past the register tile (`norm_swiglu.NARROW_WIDTH`, 8192), 9000 features, three steps of
+    `WIDE_COLUMNS` the last a partial one, 25 rows over three programs of the reverse (each walking several
+    row blocks into its partial row), normed by the fused kernels interpreted on a CPU: the mean square
+    summed a step at a time, the input's cotangent from the whole row's reduction, the weight's partial
+    sums each program's row in memory; with a residual stream too. The selector takes the call where the
+    kernel is chosen (a cell no receipt declares yet); its output and every gradient on par with XLA's
+    (check 1)."""
+    with generation.assumed("sm90"):
+        # A cell of its own, which no receipt declares yet: XLA's by default, the kernel's where chosen.
+        wide = (jnp.ones((25, 9000), dtype), jnp.ones((9000,)), dtype)
+        assert norm_swiglu.rms_kernel("auto", *wide, fp32_statistics=True) == "xla"
+        with generation.chosen(rms_norm="pallas"):
+            assert norm_swiglu.rms_kernel("auto", *wide, fp32_statistics=True) == "pallas"
+    seam = fused_seam(1e-5, dtype, offset=False, after_cast=False)
+
+    def xla(output_dtype, x, branch, scale):
+        return stream_rms_normalized(x, branch, scale, 1e-5, output_dtype, scale_offset=False,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla")[1]
+
+    def draw(seed):
+        (x, scale), cotangent = norm_operands((25, 9000), dtype, jnp.float32, seed)
+        if not streamed:
+            return (x, scale), cotangent
+        return (x, jax.random.normal(drawn_key(26, seed), x.shape).astype(dtype), scale), cotangent
+
+    labels = ("y", "x", "branch", "scale") if streamed else ("y", "x", "scale")
+
+    def without_branch(function):
+        return function if streamed else lambda x, scale: function(x, None, scale)
+
+    def coefficient(operands):
+        x = operands[0] if not streamed else (operands[0] + operands[1])
+        return scale_coefficient(x, dtype, after_cast=False)
+
+    compare((without_branch(functools.partial(xla, dtype)), without_branch(lambda x, b, s: seam(x, b, s)[1]),
+             without_branch(functools.partial(xla, jnp.float64))),
+            draw, labels, SEEDS[(25, 9000)], coefficient=coefficient)
+
+
+def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_alone():
+    """Row 821: the fused norm applies an activation after it (`RMSNorm.activation`, a U-Net's output norm's
+    swish) where `norm_swiglu.elementwise` holds: every equation maps each element alone and Pallas's Triton
+    lowering takes it. Activations of one element each, exact gelu's erfc aside, take the kernel; one that
+    reads other elements or positions takes XLA's."""
+    from dew.nn import activations
+
+    for function in (jax.nn.silu, jax.nn.swish, activations.silu, jax.nn.relu, activations.gelu_tanh,
+                     jax.nn.sigmoid, jnp.tanh):
+        assert norm_swiglu.elementwise(function), function
+    positions = jnp.arange(6.0).reshape(2, 3)
+    jitted = jax.jit(lambda x: x * positions)
+    for function in (activations.gelu_exact, jax.nn.softmax, lambda x: jnp.cumsum(x, -1), lambda x: x.T,
+                     lambda x: x + jnp.arange(3.0), lambda x: x.sum(-1), lambda x: x * positions,
+                     lambda x: jitted(x), lambda x: x + jnp.ones((2, 3), x.dtype)):
+        assert not norm_swiglu.elementwise(function), function
+    x = jnp.ones((4, 64), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        assert norm_swiglu.rms_kernel("auto", x, jnp.ones((64,)), jnp.bfloat16, fp32_statistics=True,
+                                      epilogue=jax.nn.swish) == "pallas"
+        assert norm_swiglu.rms_kernel("auto", x, jnp.ones((64,)), jnp.bfloat16, fp32_statistics=True,
+                                      epilogue=jax.nn.softmax) == "xla"
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("after_cast", [False, True])
+@pytest.mark.parametrize("weight_first", [False, True])
+def test_a_norms_activation_and_every_gradient_hold_the_float64_gate(dtype, after_cast, weight_first):
+    """The fused norm with a swish after it (row 821: `_rms_forward`'s epilogue on the fp32 norm before its
+    one cast, `_rms_backward`'s cotangent through the activation at the forward's own pre-activation norm,
+    associated and rounded as the forward did it), interpreted on a CPU: its output and every gradient on
+    par with XLA's (check 1)."""
+    if after_cast and weight_first:
+        pytest.skip("a weight folded into the inverse multiplies before any cast")
+
+    def norm(output_dtype, x, scale, implementation="xla"):
+        return stream_rms_normalized(x, None, scale, 1e-5, output_dtype, scale_offset=False,
+                                     scale_after_cast=after_cast, fp32_statistics=True,
+                                     implementation=implementation, activation=jax.nn.swish,
+                                     weight_first=weight_first)[1]
+
+    def fused(x, scale):
+        def portable(x, branch, scale):
+            return stream_rms_normalized(x, branch, scale, 1e-5, dtype, scale_offset=False,
+                                         scale_after_cast=after_cast, fp32_statistics=True,
+                                         implementation="xla", activation=jax.nn.swish,
+                                         weight_first=weight_first)
+
+        return norm_swiglu.stream_rms_norm(x, None, scale, 1e-5, dtype, offset=False, after_cast=after_cast,
+                                           portable=portable, weight_first=weight_first,
+                                           epilogue=jax.nn.swish)[1]
+
+    # The weight's gradient is check 1's alone ("weight", not "scale"): its rows' cotangents pass through the
+    # activation's derivative first, so no exact sum of the forward's rounded factors states its rounding.
+    compare((functools.partial(norm, dtype), fused, functools.partial(norm, jnp.float64)),
+            lambda draw: norm_operands((2, 3, 31), dtype, jnp.float32, draw), ("y", "x", "weight"),
+            SEEDS[(2, 3, 31)])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
@@ -909,12 +1010,12 @@ def test_c53_gradients_are_as_close_to_float64_as_xla_and_measured_liger(operati
 def test_a_context_choice_of_the_norm_forces_it_over_a_calls_own():
     """A per-call implementation is the call's own preference: an explicit xla norm runs as ever, and a
     context that chooses the Pallas norm (`generation.chosen`) forces it over the call's own, so where the
-    Pallas norm cannot take the call (a row past its 8192-feature register tile) it refuses the call rather
-    than running the call's xla in silence (row 959)."""
-    from dew.nn.kernels import generation, selection
+    Pallas norm cannot take the call (an activation after it that reads other elements) it refuses the call
+    rather than running the call's xla in silence (row 959)."""
+    from dew.nn.kernels import selection
 
-    x = jnp.ones((2, 16384), jnp.float32)
-    scale = jnp.ones((16384,), jnp.float32)
-    norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True)
+    x = jnp.ones((2, 64), jnp.float32)
+    scale = jnp.ones((64,), jnp.float32)
+    norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)
     with generation.chosen(rms_norm='pallas'), pytest.raises(selection.KernelRefused):
-        norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True)
+        norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True, epilogue=jax.nn.softmax)

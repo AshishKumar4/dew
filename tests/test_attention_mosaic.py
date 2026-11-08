@@ -1006,6 +1006,21 @@ def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
         assert keyed.heuristics_config == ba.heuristics_config
 
 
+@pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
+def test_a_backward_config_on_a_family_the_device_lacks_is_illegal(accurate):
+    """An A100's backward at a config of an H100's families (wgmma, its dK/dV launch on wgmma.fed) is not
+    legal (`MosaicBackward.legal`): the device has no bundle of them, so its legality refuses it, as the
+    attention matrix's cells of two launches ask of every generation (tests/attention_matrix.py), and its
+    derived config is legal there."""
+    two = attention_mosaic.BackwardTiles(64, 64, 2, 1, family=WGMMA, dkv_family="wgmma.fed", dkv_consumers=2)
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        op, ba = _backward_call(SHAPES["interpreted"], 128, accurate=accurate)
+        derived = op.derived(ba, target)
+        assert derived is not None and op.legal(ba, derived, target)
+        assert not op.legal(ba, two, target)
+
+
 def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
     """A config a pin or a stored pick names is held to the tiles a program takes (`whole_tiles`) as a
     derived one is: an 8-query tile under a family's 16- or 64-row products, or three consumers where the
@@ -1288,6 +1303,21 @@ def test_the_forward_on_three_consumers_holds_check_1_interpreted(call, training
     tiles = attention_mosaic.Tiles(64, 64, 2, 3, family=WGMMA)
     _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
                    value_width=64, tiles=tiles, training=training)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
+@pytest.mark.parametrize("call", ["full", "causal"])
+def test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted(call, training):
+    """The forward and the training forward on a B200's tcgen05 chunks (`mosaic_sm100.CHUNKS`: consumers of
+    64 rows, three a program for the forward and two for the training forward, whose registers three do
+    not hold, each product into its scoped tensor memory and read back into registers, the weights staged
+    into the issuer's tile for the values' product), under the interpreter, which models tensor memory: on
+    par with the reference (check 1)."""
+    consumers = 3 if training == template.Kept.NONE else 2
+    tiles = attention_mosaic.Tiles(64, 64, 2, consumers, family="tcgen05.chunks")
+    _check_forward(call, jnp.bfloat16, (1, 192, 2, 1), natural=False, interpret=True, width=64,
+                   value_width=64, tiles=tiles, training=training, target=generation.gpu_target("sm100"))
 
 
 @pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["plain", "training"])
@@ -1957,11 +1987,15 @@ FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for gener
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
 FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED
                  for width in (64, 128) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+FORWARD_GATE += [("sm100", width, training, "none", jnp.bfloat16) for width in (64, 128)
+                 for training in (template.Kept.NONE, template.Kept.SPLIT)]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
 head widths, inference and both training residual forms (the 16-bit fast path's output and the anchor's
 split sums), hookless, each score hook at the widths a hooked call's derivation takes (row 2281: its live set
 beside the walk's), a softcap's inference forward 256 wide (Gemma's), all in bf16, and fp16's inference and
-training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes)."""
+training forwards (row 3514: an A100's fp16 training forward at width 64 spilled 24 bytes); and a B200's
+bf16 forwards on tcgen05's chunks (products into scoped tensor memory, read back into registers, the
+weights staged for the values' product: the Blackwell fold's H1)."""
 
 
 @COMPILES_ON_CPU
@@ -2139,6 +2173,35 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
         found = compile_mosaic_kernels(
             [KernelCase("decode", lambda: (decode, operands), _forward_kernels(op, ba, config))],
             generation_name)
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("generation_name", GATED)
+def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name):
+    """A decode step over a paged cache of 16-key pages (`attention_decode.attend` over pools `[KV, P, 16,
+    D]` and a table), 16 rows of 4096 keys, 32 query heads over 8 key heads 64 wide, its key tile of several
+    pages, each its own copy (`mosaic.Pieces`): lowered and compiled by ptxas for `generation_name` on this
+    CPU, every launch within its shared memory and spilling nothing (`mosaic_failures`). An A100's pieces
+    each a cp.async copy of 16 rows, which its copy layout tiles at 64 bytes and not at the 128 a 64-wide
+    row allows (M-DD-10's paged cells, W64-a100: 'Number of tiles is not a multiple of 4')."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import attention_decode
+
+    rows, keys, page, width = 16, 4096, 16, 64
+    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.bfloat16)
+    pool = jax.ShapeDtypeStruct((8, rows * keys // page, page, width), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((rows, keys // page), jnp.int32)
+    spans = template.spans(1, keys, rows, lengths=jnp.full((rows,), keys - 77, jnp.int32))
+
+    def decode(query, key, value, table):
+        return attention_decode.attend(query, key, value, spans, table=table)
+
+    with generation.assumed(generation_name):
+        case = KernelCase("paged decode", lambda: (decode, (query, pool, pool, table)))
+        found = compile_mosaic_kernels([case], generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 

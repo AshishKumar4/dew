@@ -35,7 +35,19 @@ from dew.inputs import CharTable, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
 from dew.objectives.base import Recorder, Step
 from dew.objectives.diffusion import DiffusionObjective
-from dew.sampling import CFG, Euler
+from dew.sampling import (
+    CFG,
+    DEIS,
+    LMS,
+    PNDM,
+    DPMSolverMultistep,
+    DPMSolverSDE,
+    DPMSolverSinglestep,
+    Euler,
+    Heun,
+    MultiStepDPM,
+    UniPC,
+)
 from dew.training import Trainer
 
 _DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
@@ -173,7 +185,7 @@ def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction(tmp
     instead."""
     from dew.diffusion.discrete import MDLM
     from dew.objectives.diffusion import Alignment
-    from dew.sampling import RK4, UniPC
+    from dew.sampling import RK4
 
     alignment = Alignment(source=str(tmp_path))
     with pytest.raises(OSError):
@@ -193,10 +205,45 @@ def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction(tmp
     DiffusionObjective(Zero(), presets.Karras(), unconditional, solver=RK4())
 
 
+@pytest.mark.parametrize(("preset", "solver"), [
+    (presets.EDM(P_mean=-0.4, P_std=1.0), Euler()),
+    (presets.EDM(P_mean=-0.4, P_std=1.0), Heun(s_churn=1.0, s_tmax=10.0)),
+    (presets.EDM(P_mean=-0.4, P_std=1.0), LMS()),
+    (presets.EDM(P_mean=-0.4, P_std=1.0), MultiStepDPM()),
+    (presets.Cosine(), DPMSolverMultistep()),
+    (presets.Cosine(), DPMSolverSinglestep(2)),
+    (presets.Cosine(), DEIS()),
+    (presets.Cosine(), PNDM()),
+    (presets.Cosine(), UniPC()),
+    (presets.EDM(P_mean=-0.4, P_std=1.0), DPMSolverSDE(seed=3)),
+], ids=lambda value: type(value).__name__)
+def test_a_sample_compiles_ahead_for_two_gpus_none_attached(preset, solver):
+    """The objective's sample program, traced under a mesh of two compile-only GPUs as an evaluation traces
+    it, compiles there over its arguments' shapes (`collecting`): its grid, its solver's checks of the grid
+    and its solver's state, all known when it traces, are evaluated on this host's CPU (`on_host`), where
+    they were evaluated on the mesh's devices, which run nothing (row 4752's class of reds)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.options import collecting
+    from dew.training import MeshSpec
+    from dew.training.ahead import compile_only_gpus
+
+    model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
+    objective = DiffusionObjective(model, preset, InputSpec(Field("image", (RES, RES, 3))), steps=3,
+                                   guidance=None, solver=solver)
+    mesh = MeshSpec().build(compile_only_gpus("sm90", 2))
+    replicated = NamedSharding(mesh, PartitionSpec())
+    variables = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated),
+                             jax.eval_shape(objective.init, jax.random.key(0)))
+    key = jax.ShapeDtypeStruct((), jax.random.key(0).dtype, sharding=replicated)
+    with jax.set_mesh(mesh), collecting() as collected:
+        objective._sample(variables, objective._sampling_batch({}), key, count=2)
+    assert len(collected) == 1
+
+
 @pytest.mark.parametrize("order, steps", [(2, 5), (3, 7)])
 def test_singlestep_solver_generates_through_the_objective(order, steps):
     from dew.diffusion import DirectPredictionTransform, LinearNoiseScheduler, Process
-    from dew.sampling import DPMSolverSinglestep
 
     process = Process(LinearNoiseScheduler(1000), DirectPredictionTransform())
     objective = DiffusionObjective(Zero(), process, InputSpec(Field("image", (2, 2, 1))),
@@ -441,7 +488,7 @@ def test_an_image_task_walks_under_cfg_plus_plus_and_a_brownian_solver(condition
     """An image task built from the objective walks under CFG++ guidance and an SDE solver with a seed,
     each a struct whose data leaf a lowered program describes (`jax.stages.ArgInfo`), which their checks
     leave alone, as jit's tracers (train 329's review: CFG++ raised TypeError once programs lowered)."""
-    from dew.sampling import CFGPlusPlus, DPMSolverSDE
+    from dew.sampling import CFGPlusPlus
 
     objective, variables, _, _ = conditional_mmdit
     task = objective.build_task(variables)
