@@ -117,8 +117,10 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
             raise ValueError(f"{form} is an H100's layout's form alone")
         if form in ("accurate", "derived"):
             return form == "accurate", None
+        # Its layout's narrow form, as its derivation takes the call forms' (`BackwardTiles.narrow`).
         return form != "default" and form != "fused", attention_mosaic.BackwardTiles(
-            64, 64, 2, 1, fused=form == "fused", columns=2 if form == "accurate-halves" else 1, family=family)
+            64, 64, 2, 1, fused=form == "fused", columns=2 if form == "accurate-halves" else 1, family=family,
+            narrow=True)
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family=WGMMA)
     if form == "fused-shared-keys":
@@ -180,10 +182,12 @@ ONE_FAMILY = frozenset({
     "test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_tile_interpreted",
     "test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted",
     "test_every_tuning_variant_is_on_par_interpreted",
+    "test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted",
 })
 """The interpreted cells of one family's mechanism, each naming its GPU itself: a TPU core's, an H100's three
 consumers, a B200's tcgen05 chunks, an H100's pinned layouts (its keys-first dK/dV launch, its consumers'
-shared logits and keys), and the tuning variants of the launches the cell's own target derives."""
+shared logits and keys), the tuning variants of the launches the cell's own target derives, and an fp32
+call's forward of bf16 parts, which an A100's pipeline loads in no pieces (row 4475)."""
 
 
 def pytest_generate_tests(metafunc):
