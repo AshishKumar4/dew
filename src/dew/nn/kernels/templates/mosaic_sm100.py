@@ -687,10 +687,6 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             products = self._issued(issued, issue, turn_of, held, running, read, done, summed=summed,
                                     interpret=interpret, unrolled=unrolled)
 
-            def promoted(turn: mosaic.Turn, first) -> None:
-                self._promoted(held(turn), running, first)
-                plgpu.barrier_arrive(read.at[turn.slot])
-
             def epilogue(index):
                 store = self._stores(smems, index)
 
@@ -699,19 +695,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                     @pl.when(active)
                     def _():
-                        if summed:
-                            def window(at, carry):
-                                turn = turn_of(done_turns + at)
-                                plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
-                                promoted(turn, at == 0)
-                                return carry
-
-                            lax.fori_loop(0, windows(steps), window, None)
-                            into = running
-                        else:
-                            turn = turn_of(done_turns)
-                            plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
-                            into = held(turn)
+                        into, turn = self._awaited(turn_of, held, running, done, read, done_turns, steps,
+                                                   summed)
 
                         def walk(step, start, shapes, *, initial=None):
                             # The products issued it: the tile's accumulators (its running sums), done.
@@ -722,7 +707,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                         finish(index, tile, issue(index, tile, walk, active=True), store, active=True)
                         plgpu.wait_load_tmem()
-                        if not summed:
+                        if turn is not None:
                             plgpu.barrier_arrive(read.at[turn.slot])
 
                     pl.when(~active)(lambda: finish(index, tile, issue(index, tile, persistent.unwalked(self),
@@ -804,6 +789,27 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                     plgpu.tcgen05_commit_arrive(done.at[turn.slot])
 
         return products
+
+    def _awaited(self, turn_of: Callable, held: Callable, running: tuple, done, read, done_turns, steps,
+                 summed: int) -> tuple:
+        """`persist`'s epilogue's wait for a tile's products: its turn's accumulators once their commit
+        arrives, and the turn the epilogue frees once it has read them; exactly summed (`summed`), each
+        window's partials promoted into the running sums as its commit arrives, each window's turn freed
+        then, the running sums the tile's accumulators and no turn left to free."""
+        if not summed:
+            turn = turn_of(done_turns)
+            plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
+            return held(turn), turn
+
+        def window(at, carry):
+            turn = turn_of(done_turns + at)
+            plgpu.barrier_wait(done.at[turn.slot], parity=turn.parity)
+            self._promoted(held(turn), running, at == 0)
+            plgpu.barrier_arrive(read.at[turn.slot])
+            return carry
+
+        lax.fori_loop(0, (steps + summed - 1) // summed, window, None)
+        return running, None
 
     def _promoted(self, partials: tuple, totals: tuple, first) -> None:
         """A window's `partials` added into the tile's running sums `totals` in tensor memory by an IEEE add

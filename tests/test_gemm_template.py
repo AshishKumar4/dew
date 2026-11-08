@@ -632,44 +632,13 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
                         truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
-@pytest.mark.parametrize("transpose_rhs", [False, True])
-def test_a_hoppers_dense_decode_product_prefetches_its_matrix_before_its_wait(transpose_rhs, monkeypatch):
-    """A Hopper's dense decode product (16 rows over a 2048 x 4096 matrix, either way stored), a dependent
-    launch, lowers for CUDA with each program's first matrix blocks prefetched into L2 before it waits for
-    the launch before it (`bodies.dependent`'s `prefetched`, row 3601): one prefetch a stage its first tile
-    loads; an A100's launch, which waits for none, prefetches nothing."""
-    from dew.nn.kernels.templates import mosaic
-
-    prefetched = []
-    real = mosaic.plgpu.async_prefetch
-    monkeypatch.setattr(mosaic.plgpu, "async_prefetch", lambda view, **kw: (prefetched.append(view.shape),
-                                                                             real(view, **kw))[1])
-    rows, depth, width = 16, 2048, 4096
-    launch = grouped_matmul.MosaicGmm()
-    matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
-    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16), jax.ShapeDtypeStruct(matrix, jnp.bfloat16),
-            jax.ShapeDtypeStruct((1,), jnp.int32))
-    options = {"out_dtype": "bfloat16", "trans_rhs": transpose_rhs, "interpret": False, "dense": True}
-    for generation_name in ("sm80", "sm90"):
-        prefetched.clear()
-        mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-        with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-            bound, target = launch.bind(*args, **options), generation.gpu_target()
-            tile = dataclasses.replace(launch.derived(bound, target), swapped=False, splits=1, raster=0)
-            assert launch.legal(bound, tile, target), tile
-            jax.jit(functools.partial(launch.replace(config=tile), **options)).trace(*args).lower(
-                lowering_platforms=("cuda",))
-        block = (tile.block_n, tile.block_k) if transpose_rhs else (tile.block_k, tile.block_n)
-        expected = [block] * min(tile.stages, depth // tile.block_k) if generation_name == "sm90" else []
-        assert prefetched == expected, (generation_name, tile)
-
-
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs):
     """A one-row dense product's tile (an M=1 decode dot over a 2048 x 2048 matrix, row 483) lowers for CUDA
-    on the CPU on each family, the matrix stored either way: the derived tile, and the swapped tile with its
-    depth split in two wherever the family takes one."""
+    on the CPU on each family, the matrix stored either way: the derived tile, the swapped tile with its
+    depth split in two wherever the family takes one, and the plain tile, whose dependent launch on a
+    Hopper prefetches its matrix's first stages before its wait (`mosaic_gpu._prefetched`, row 3601)."""
     rows, depth, width = 1, 2048, 2048
     launch = grouped_matmul.MosaicGmm()
     matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
@@ -684,7 +653,8 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
         # The derived tile, and the swapped one split in two where the family takes it, whichever the
         # derivation picks (row 4491).
         pinned = dataclasses.replace(tile, swapped=True, splits=2)
-        for config in {tile, *((pinned,) if launch.legal(bound, pinned, target) else ())}:
+        plain = dataclasses.replace(tile, swapped=False, splits=1, raster=0)
+        for config in {tile, *(each for each in (pinned, plain) if launch.legal(bound, each, target))}:
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
 
