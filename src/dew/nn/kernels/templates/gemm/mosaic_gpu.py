@@ -1706,7 +1706,7 @@ def _whole_stages(slots: dict, mine_depth) -> tuple:
     return slots['ring_0'].at[mine_depth], slots['ring_1'].transpose((1, 0))
 
 
-def _rewritten(rewrites: bool, family: mosaic.Family, starts_gmem, ends_gmem, block_k: int) -> dict:
+def _stage_rewrite(rewrites: bool, family: mosaic.Family, starts_gmem, ends_gmem, block_k: int) -> dict:
     """Dew: `tgmm`'s persist argument where its family rewrites its stage (`_rewrites`): each step's
     neighbouring groups' rows zeroed by the family's own role (`_rewritten_stage`); none elsewhere."""
     if not rewrites:
@@ -1839,7 +1839,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, accumulators=(part,),
                            **_summed(family, tiles, exact_sums),
-                           **_rewritten(rewrites, family, starts_gmem, ends_gmem, block_k))
+                           **_stage_rewrite(rewrites, family, starts_gmem, ends_gmem, block_k))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
