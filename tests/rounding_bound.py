@@ -249,14 +249,16 @@ def _weight(equation, name, params, operands, value):
         total = jnp.abs(sum(jnp.sum(operand, params["dimensions"]) for operand in pair))
         spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
         return total + gamma * gamma / u * spread
-    if name == "reduce":
-        # Dew's other float reductions are the chunked head's running logsumexp
-        # (`dew.objectives.lm.chunked`), in float64 under its wide CPU arithmetic
-        # (`dew.nn.precision.widened_reduction`) and in float32 elsewhere: each combine an exponential,
-        # a product and a sum of its running terms, so each term rounds at most an elementary function's
-        # ulps and two more of the result's magnitude.
+    if (name == "reduce" and isinstance(started := equation.invars[len(equation.invars) // 2],
+                                        jax.extend.core.Literal) and started.val == -np.inf):
+        # A running logsumexp (`dew.objectives.lm.chunked`'s, its maximum started at -inf), in float64
+        # under Dew's wide CPU arithmetic (`dew.nn.precision.widened_reduction`) and float32 elsewhere:
+        # each combine rescales a running sum by exp(a - larger), the difference rounding at most u
+        # times the row's range, which moves the exponential by as much relative, beside the
+        # exponential's ulps and two roundings of the result's magnitude.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
-        return max(terms - 1, 1) * (2 + ULPS["exp"]) * magnitude
+        spread = jnp.max(operands[0], params["dimensions"]) - jnp.min(operands[0], params["dimensions"])
+        return max(terms - 1, 1) * (2 + ULPS["exp"] + spread) * magnitude
     if name == "one_minus_square":
         # The square rounds by its magnitude, which the difference carries, and the difference by its own.
         return jnp.square(operands[0]) + magnitude
