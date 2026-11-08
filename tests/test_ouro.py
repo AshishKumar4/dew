@@ -102,6 +102,23 @@ def test_a_looped_model_exports_in_the_remote_codes_layout(tmp_path):
         exported(step_norm=False)
 
 
+def test_an_exit_step_comes_before_the_threshold_as_the_remote_code_reads_them():
+    """OuroForCausalLM.forward reads a stated `early_exit_step` before its `early_exit_threshold`: the
+    loop exits each token at the threshold alone, and reads the last pass where the last step is stated
+    whatever the threshold, or where the threshold is 1.0."""
+    from dew.interop.hf_decoders import translate_config
+
+    config = json.loads((TINY / 'config.json').read_text())
+    last = config['total_ut_steps'] - 1
+
+    def threshold(**fields):
+        return translate_config({**config, **fields})['loop']['exit_threshold']
+
+    assert threshold(early_exit_threshold=0.5) == 0.5
+    assert threshold(early_exit_threshold=0.5, early_exit_step=last) is None
+    assert threshold(early_exit_threshold=1.0) is None
+
+
 @pytest.mark.network
 def test_ouro_1_4b_computes_the_remote_codes_logits():
     """ByteDance/Ouro-1.4B in fp32 on CPU, against the remote code's argmax
