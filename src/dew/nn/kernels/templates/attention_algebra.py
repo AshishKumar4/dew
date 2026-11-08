@@ -35,7 +35,7 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Dropout, Initial, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Dropout, Initial, coded, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
 
 
@@ -66,9 +66,9 @@ class Forward:
     whole tiles (`walked_keys`: a holder of a common walk wholly past them, `seen` keeps every query from
     it; None where none does), whether the launch lowers its exponentials to the hardware's
     approximations (`approximate`, `attention_mosaic_program.approximate`; false where a hook's tanh makes it
-    lower every transcendental exactly), and the levels a quantized model's weights round to (`rounds`,
-    `attention.Hooks.rounds`: each weight `round(rounds p)` at the row's known maximum in the value product,
-    the anchored walk's, `anchored_step`; None where they do not)."""
+    lower every transcendental exactly), and the bound a quantized model's weights round to (`rounds`,
+    `attention.Hooks.rounds`: each weight its code `coded(p, rounds)` at the row's known maximum in the
+    value product, the anchored walk's, `anchored_step`; None where they do not)."""
 
     form: str
     keys: int
@@ -84,7 +84,7 @@ class Forward:
     prescale: float = 1.0
     walked_keys: int | None = None
     approximate: bool = True
-    rounds: int | None = None
+    rounds: float | None = None
     subtracted: bool = False
     """Whether the fold (`base2`) takes its exponent as the accurate form's raw one does (`raw`), a difference
     of the raw products scaled after it is taken, `exp2((s - m) * scale * log2(e))`: no logit the reference
@@ -1529,7 +1529,7 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         p = p * expand(exact_power2(-arg.shift), p)
     # A quantized model's weights in the value product its codes at the row's maximum, each at most
     # `rounds` and exact in the values' dtype; the denominator the weights themselves (`Forward.rounds`).
-    taken = p if spec.rounds is None else jnp.round(spec.rounds * p)
+    taken = p if spec.rounds is None else coded(p, spec.rounds)
     parts, others, own_tile, arg = _split_tile(keys, taken, value.dtype, arg,
                                                drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos))
     if keys.accumulate is None:

@@ -15,9 +15,9 @@ from dew._devices import deterministic_ops_requested
 from .kernels import decode_attention, generation
 from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_generation, gpu_placed
 from .kernels.selection import Kernel, Op, Requirement
-from .kernels.templates import attention_route
+from .kernels.templates import attention_quantized, attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
-from .precision import products_quantized, wide_cpu_arithmetic
+from .precision import wide_cpu_arithmetic
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 
@@ -533,15 +533,18 @@ def _attention_preferred(case: AttentionCase) -> str:
     other). A call only spans express (`AttentionCase.spans_only`: block groups, key validity, runs or counted
     places) runs the template on every backend, which alone reads them: every other kernel refuses it and the
     reference path builds its dense mask, `[B, 1, S, S]` (rows 1495, 1953). A call whose products a
-    quantized model's rule owns (`precision.products_quantized`; an adapter's or an input quantizer's
-    interception owns its projections alone, never the attention's products) runs the reference path, whose
-    products are whole."""
+    quantized model's rule owns (`attention_quantized.owner`; an adapter's or an input quantizer's
+    interception owns its projections alone, never the attention's products) and quantizes runs the
+    template's quantized attention where it takes the rule and the call (`attention_quantized.takes`), else
+    the reference path, which forms each product whole before Qwix quantizes it; a rule quantizing no
+    activation leaves them whole (`attention_quantized.whole`)."""
     backend = generation.backend()
-    if products_quantized():
-        # A quantized model's rule owns the call's products, quantizing the weights by each row's largest,
-        # which only a whole row of them states: the reference path forms them so, a walk over the keys
-        # never (the derivation refused an int8 CLIP tower's walk, "a walked reduction read other than by
-        # a monoid").
+    if (rule := attention_quantized.owner()) is not None and not attention_quantized.whole(rule):
+        # A quantized model's rule owns the call's products, quantizing the weights by each row's largest:
+        # the template's anchored walk rounds them at that maximum where it takes the rule and the call
+        # (`attention_quantized`, row 4858: no sinks, no draw), else the reference path forms them.
+        if attention_quantized.takes(rule) and not (case.sinks or case.dropout):
+            return 'template'
         return 'reference'
     if case.spans_only:
         return 'template'

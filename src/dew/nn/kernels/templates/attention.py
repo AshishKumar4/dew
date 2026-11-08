@@ -800,6 +800,14 @@ class Dropout:
         return 1.0 / (1.0 - self.rate)
 
 
+def coded(p: jax.Array, bound: float) -> jax.Array:
+    """Weights `p` at most 1 (at their row's maximum) as a quantized model's codes of them: Qwix's symmetric
+    integer quantization by the row's largest weight, 1, `round(bound p)` clipped to the type's largest,
+    `floor(bound)` (int8's bound 127.5, `qwix/_src/core/numerics.py`'s `get_symmetric_bound`, and largest
+    127)."""
+    return jnp.minimum(jnp.round(bound * p), math.floor(bound))
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Hooks:
@@ -810,9 +818,10 @@ class Hooks:
     to an output tile whose head width pads to a power of two. A pytree whose callables are static and
     whose parameters and state are its leaves, so a compiled call takes new values of them. `drop` is
     probability dropout's weights hook (`Dropout`), absent where None. `rounds`, static, is a quantized
-    model's weights hook: each weight in the value product its code `round(rounds p)` at its row's maximum,
-    the denominator the weights themselves (a Qwix int8 rule's 127, whose weights quantize by each row's
-    largest, 1 at the maximum), absent where None."""
+    model's weights hook: each weight in the value product its code at its row's maximum
+    (`coded`, `round(rounds p)` clipped, a Qwix int8 rule's bound 127.5, whose weights
+    quantize by each row's largest, 1 at the maximum), the denominator the weights themselves, absent where
+    None."""
 
     score_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     score_params: tuple[Param, ...] = ()
@@ -820,7 +829,7 @@ class Hooks:
     output_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     output_params: tuple[Param, ...] = ()
     drop: Dropout | None = None
-    rounds: int | None = dataclasses.field(default=None, metadata={"static": True})
+    rounds: float | None = dataclasses.field(default=None, metadata={"static": True})
 
 
 def shared_place(shape: tuple[int, ...], row, head) -> tuple:
@@ -992,7 +1001,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     drop = hooks.drop
     if hooks.rounds is not None:
         # The codes at the row's maximum (`Hooks.rounds`), its denominator the weights' own.
-        acc = acc0 * carried[..., None] + valued(jnp.round(hooks.rounds * p))
+        acc = acc0 * carried[..., None] + valued(coded(p, hooks.rounds))
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
     elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)

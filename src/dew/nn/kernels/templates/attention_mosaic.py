@@ -325,8 +325,8 @@ class MosaicForward(_Mainloop[Tiles]):
     """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
     each 16-bit (attention.md 4b). One for a 16-bit call."""
-    rounds: int | None = None
-    """A quantized model's weights' levels (`Hooks.rounds`), which the anchored training walk rounds them to
+    rounds: float | None = None
+    """A quantized model's weights' bound (`Hooks.rounds`), which the anchored training walk rounds them to
     at each row's maximum: a call that keeps its split residuals' alone. None where its weights stay whole."""
 
     def _hooks(self, score_params, output_params, initial, drop) -> Hooks:
