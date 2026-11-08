@@ -504,12 +504,13 @@ class Loading:
             cpus = min(cpus, self.max_workers)
         read_buffer = min(self.read_buffer, budget // read)
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
-        # The workers whose starts, one after another, the Python of the run's batches pays for.
-        paid = 0 if batches is None else int(python * batches // host.started)
-        workers = max(0, min(cpus, budget // held, paid))
-        if not paid:
-            _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each take "
-                      "less than a worker's start", batches, python * 1e3)
+        workers = 0 if batches is None else max(0, min(cpus, budget // held))
+        if workers and batches is not None and (started := host.started) > 0:
+            # The workers whose starts, one after another, the Python of the run's batches pays for.
+            workers = min(workers, int(python * batches // started))
+        if not workers:
+            _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each, on %d "
+                      "CPUs", batches, python * 1e3, host.cpus)
         _log.info("automatic loading reads in %d workers holding %d reads ahead, sized for %d CPUs and "
                   "%.2f GiB", workers, read_buffer, host.cpus, budget / 2**30)
         return dataclasses.replace(self, workers=workers, read_buffer=read_buffer)

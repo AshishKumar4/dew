@@ -122,8 +122,9 @@ def test_automatic_loading_pays_a_step_that_makes_several_batches_at_once_in_the
         sampled = rows.to_iter_dataset(grain.ReadOptions(num_threads=0, prefetch_buffer_size=0))
         return auto.resolved(sampled, reads=1, batches=batches).workers
 
-    # 10 ms a batch: a thousand pay for the four CPUs' workers, 350 for three starts of a second, 50 for none.
-    assert (resolved(1000), resolved(350), resolved(50)) == (4, 3, 0)
+    # At least 10 ms a batch: a thousand pay for the four CPUs' workers, 310 for three starts of a second
+    # (up to 12.9 ms a batch), 50 for none.
+    assert (resolved(1000), resolved(310), resolved(50)) == (4, 3, 0)
 
 
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
@@ -156,3 +157,6 @@ def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_
     for batches in (1, None):
         unpaid = on(8, 2 * (2 * held + held // 2)).resolved(rows, reads=1, batches=batches)
         assert (unpaid.workers, unpaid.read_buffer) == (0, 16)
+    # A host whose workers start at no cost takes as many as its CPUs hold over any stated run.
+    free = Loading(workers="auto", worker_buffer=2, host=Host(3, 2**40, worker_start=0.0))
+    assert free.resolved(rows, reads=1, batches=1).workers == 3
