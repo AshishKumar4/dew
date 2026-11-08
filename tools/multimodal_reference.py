@@ -6,10 +6,11 @@ Run with transformers 5.16.1, Torch and tokenizers installed:
 
 No network access or pretrained downloads are used. Each family's existing
 tiny fixture supplies the weights, and every reference lands in
-tests/fixtures/hf/<family>-native-tiny: the padded batch encoding, the
-reference logits, a cached greedy continuation, the pixel gradient and the
-logits after one SGD step. Unequal image counts per row exercise numeric
-batch alignment.
+tests/fixtures/hf/<family>-native-tiny: the padded batch encoding, a cached
+greedy continuation, and the reference logits, the pixel gradient and the
+logits after one SGD step (`numerics`) of each family not on its drawn site
+(multimodal_families.DRAWN, tools/multimodal_worker.py). Unequal image counts
+per row exercise numeric batch alignment.
 """
 
 import json
@@ -30,8 +31,10 @@ from transformers import (
 )
 from transformers.models.gemma3.image_processing_pil_gemma3 import Gemma3ImageProcessorPil
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from multimodal_families import DRAWN, FAMILIES, LEARNING_RATE
+
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
-LEARNING_RATE = 1e-4
 
 
 def _tokenizer(vocab_size: int, special: dict[str, int], **token_attributes: str) -> GemmaTokenizer:
@@ -153,45 +156,63 @@ def _sgd_step(model, singles: list[dict], valid: torch.Tensor) -> tuple[torch.Te
     return loss.cpu(), pixel_inputs
 
 
-def _write_forward_backward(model, processor, destination: Path, images: np.ndarray, prompts: list[str],
-                            audio: list[np.ndarray] | None = None) -> None:
-    """Actual wrapper forward, cached continuation, pixel gradient and SGD output.
-
-    The padded batch encoding is what Dew consumes; every reference quantity
-    comes from the reference model over one row of it at a time.
-    """
-    encoded = _encode(processor, images, prompts, audio)
+def numerics(model, encoded: dict) -> dict[str, np.ndarray]:
+    """`model`'s logits over the batch `encoded` a row at a time (zero at every padded position), then its
+    summed next-token `loss`, its `pixel_gradient` and the `updated_logits` after one SGD step
+    (`_sgd_step`, in place), in the model's dtype: the references the source draw's files hold
+    (`_write_numerics`) and a drawn site's (tools/multimodal_worker.py)."""
     valid = encoded["attention_mask"].bool()
-    vocab_size = model.config.get_text_config().vocab_size
-    logits = torch.zeros((*encoded["input_ids"].shape, vocab_size))
-    updated = torch.zeros_like(logits)
-    continuation = []
+    dtype = next(model.parameters()).dtype
+    shape = (*encoded["input_ids"].shape, model.config.get_text_config().vocab_size)
+    logits, updated = torch.zeros(shape, dtype=dtype), torch.zeros(shape, dtype=dtype)
     singles = _row_slices(encoded, model)
-    for row, single in enumerate(singles):
-        with torch.no_grad():
+    with torch.no_grad():
+        for row, single in enumerate(singles):
             logits[row, valid[row]] = model(**single, use_cache=False).logits[0]
-            generated = model.generate(**single, max_new_tokens=3, do_sample=False,
-                                       eos_token_id=None, use_cache=True, return_dict_in_generate=False)
-            continuation.append(generated[0, single["input_ids"].shape[1]:])
     loss, pixel_inputs = _sgd_step(model, singles, valid)
-    np.save(destination / "pixel_gradient.npy", torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
     with torch.no_grad():
         for row, single in enumerate(singles):
             updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
-    np.save(destination / "updated_logits.npy", updated.numpy())
-    (destination / "training.json").write_text(json.dumps(
-        {"loss": float(loss.detach()), "learning_rate": LEARNING_RATE}) + "\n")
+    return {"logits": logits.numpy(), "loss": loss.detach().numpy(), "updated_logits": updated.numpy(),
+            "pixel_gradient": torch.cat([pixels.grad for pixels in pixel_inputs]).numpy()}
 
+
+def _write_numerics(found: dict[str, np.ndarray], destination: Path, suffix: str = "") -> None:
+    """`numerics` in the source draw's files: each leaf's `<leaf><suffix>.npy` and the loss in
+    training<suffix>.json."""
+    for leaf in ("logits", "pixel_gradient", "updated_logits"):
+        np.save(destination / f"{leaf}{suffix}.npy", found[leaf])
+    (destination / f"training{suffix}.json").write_text(json.dumps({"loss": float(found["loss"])}) + "\n")
+
+
+def _write_encoding(model, processor, destination: Path, images: np.ndarray, prompts: list[str],
+                    audio: list[np.ndarray] | None = None) -> dict:
+    """The padded batch encoding Dew consumes, the raw images and prompts it encodes, and the reference's
+    cached greedy continuation of each row (`_row_slices`); returns the encoding."""
+    encoded = _encode(processor, images, prompts, audio)
+    continuation = []
+    for single in _row_slices(encoded, model):
+        with torch.no_grad():
+            generated = model.generate(**single, max_new_tokens=3, do_sample=False,
+                                       eos_token_id=None, use_cache=True, return_dict_in_generate=False)
+            continuation.append(generated[0, single["input_ids"].shape[1]:])
     np.save(destination / "raw_images.npy", images)
-    np.save(destination / "logits.npy", logits.numpy())
     np.save(destination / "continuation.npy", torch.stack(continuation).numpy())
     (destination / "prompts.json").write_text(json.dumps(prompts) + "\n")
     for key, value in encoded.items():
         np.save(destination / f"{key}.npy", value.numpy())
-    print(destination, "bytes", sum(p.stat().st_size for p in destination.iterdir()),
-          "tokens", tuple(encoded["input_ids"].shape), "pixel_values", tuple(encoded["pixel_values"].shape))
+    print(destination, "tokens", tuple(encoded["input_ids"].shape), "pixel_values",
+          tuple(encoded["pixel_values"].shape))
+    return encoded
 
 
+def _write_forward_backward(model, processor, destination: Path, images: np.ndarray, prompts: list[str],
+                            audio: list[np.ndarray] | None = None) -> None:
+    """The source draw's encoding and continuation (`_write_encoding`) and the reference's `numerics` over
+    it. The padded batch encoding is what Dew consumes; every reference quantity comes from the reference
+    model over one row of it at a time."""
+    _write_numerics(numerics(model, _write_encoding(model, processor, destination, images, prompts, audio)),
+                    destination)
 
 
 def write_gemma3n_native() -> None:
@@ -411,10 +432,9 @@ def write_gemma4_unified_native() -> None:
 
 def write_float64_truths(references: str, checkpoint: str) -> None:
     """The float64 truth of what `_write_forward_backward` recorded in `references` from the fixture
-    `checkpoint`'s model: its float64 twin (tools/torch_precision.py) over the same stored batch
-    encoding, one row at a time: its logits, then its summed next-token loss, pixel gradient and logits
-    after one SGD step of LEARNING_RATE, in logits_f64.npy, training_f64.json, pixel_gradient_f64.npy
-    and updated_logits_f64.npy. The Dew side's checks hold Dew and the fp32 reference to it
+    `checkpoint`'s model: its float64 twin's `numerics` (tools/torch_precision.py) over the same stored
+    batch encoding, in logits_f64.npy, training_f64.json, pixel_gradient_f64.npy and
+    updated_logits_f64.npy. The Dew side's checks hold Dew and the fp32 reference to it
     (tests/test_multimodal_model.py)."""
     from transformers import AutoModelForImageTextToText
 
@@ -428,25 +448,10 @@ def write_float64_truths(references: str, checkpoint: str) -> None:
                if path.stem not in recorded and not path.stem.endswith("_f64")}
     twin = float64_twin(model)
     with float64():
-        widened = {name: value.double() if value.is_floating_point() else value
-                   for name, value in encoded.items()}
-        valid = widened["attention_mask"].bool()
-        singles = _row_slices(widened, twin)
-        shape = (*widened["input_ids"].shape, twin.config.get_text_config().vocab_size)
-        logits, updated = torch.zeros(shape, dtype=torch.float64), torch.zeros(shape, dtype=torch.float64)
-        with torch.no_grad():
-            for row, single in enumerate(singles):
-                logits[row, valid[row]] = twin(**single, use_cache=False).logits[0]
-        loss, pixel_inputs = _sgd_step(twin, singles, valid)
-        with torch.no_grad():
-            for row, single in enumerate(singles):
-                updated[row, valid[row]] = twin(**single, use_cache=False).logits[0]
-    np.save(destination / "pixel_gradient_f64.npy",
-            torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
-    np.save(destination / "logits_f64.npy", logits.numpy())
-    np.save(destination / "updated_logits_f64.npy", updated.numpy())
-    (destination / "training_f64.json").write_text(json.dumps({"loss": float(loss.detach())}) + "\n")
-    print(destination, "float64 loss", float(loss.detach()), flush=True)
+        found = numerics(twin, {name: value.double() if value.is_floating_point() else value
+                                for name, value in encoded.items()})
+    _write_numerics(found, destination, "_f64")
+    print(destination, "float64 loss", float(found["loss"]), flush=True)
 
 
 def write_llama4_native() -> None:
@@ -467,7 +472,8 @@ def write_llama4_native() -> None:
     processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
     images = np.random.default_rng(1707).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <|image|> token9", "token5 <|image|> token8 <|image|> token6"]
-    _write_forward_backward(model, processor, destination, images, prompts)
+    # Its numerics are its drawn site's (tools/multimodal_worker.py, multimodal_families.DRAWN).
+    _write_encoding(model, processor, destination, images, prompts)
 
 
 
@@ -491,12 +497,7 @@ if __name__ == "__main__":
         write_gemma4_unified_native()
         sys.exit()
     if sys.argv[1:2] == ["float64"]:
-        # Which references each family's test reads, and the checkpoint they were written from: the
-        # tests' declaration, data alone.
-        sys.path.insert(0, str(ROOT.parents[1]))
-        from multimodal_families import FAMILIES
-
-        for family in sys.argv[2:] or FAMILIES:
+        for family in sys.argv[2:] or sorted(set(FAMILIES) - DRAWN):
             write_float64_truths(*FAMILIES[family])
         sys.exit()
     write_gemma3_native()
