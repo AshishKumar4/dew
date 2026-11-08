@@ -57,7 +57,7 @@ from egglog import (
 )
 from egglog.bindings import EggSmolError
 
-from dew._cache import ALGEBRA
+from dew._cache import ALGEBRA, unintercepted
 from dew.algebra import cost, extract, program, rules, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Accumulated, Added, Derived, Merged, Refused, evaluated, evaluator, inlined
@@ -790,8 +790,10 @@ def _derived(declaration: Reduction, names: tuple[str, ...], walked_axes: Mappin
         return declaration.function(**dict(zip(names, values, strict=True)))
 
     avals = [jax.ShapeDtypeStruct(*shapes[name]) for name in names]
+    # The declaration is the algebra's statement, no model's products: traced inside a quantized model's
+    # method, a provider's interception would have quantized it, a form no rule writes (row 4858).
     with jax.disable_jit():
-        closed = jax.make_jaxpr(inlined(named))(*avals)
+        closed = jax.make_jaxpr(unintercepted(inlined(named)))(*avals)
     # The ranges by input, as the region reads them (its constants apart).
     region = terms.region(closed, {index: declaration.ranges[name] for index, name in enumerate(names)
                                    if name in declaration.ranges})

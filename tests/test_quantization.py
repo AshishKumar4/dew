@@ -34,6 +34,7 @@ from dew.distributed.placement import Layout, MeshSpec
 from dew.lora import _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.kernels.templates import attention as template, attention_quantized
 from dew.nn.kv_cache import hadamard, rotated
 from dew.nn.precision import FP32_SUMS
 from dew.nn.quantizers import nearest_codewords
@@ -1447,6 +1448,9 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
         "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
         "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
         "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
+        "dew.nn.kernels.templates.attention_quantized.attend": (
+            attention_quantized.attend, (normal(1, 16, 2, 8), normal(1, 16, 1, 8), normal(1, 16, 1, 8),
+                                         template.spans(16, 16, 1, causal=True), template.Hooks()), {}),
     }
 
 
@@ -1487,6 +1491,42 @@ def test_an_einsum_of_three_operands_runs_as_the_unquantized_model_runs_it():
     with jax.default_matmul_precision(FP32_SUMS):
         plain = model.apply({}, x)
     np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), plain)
+
+
+QUANTIZED_ATTENTION_SEEDS = 24
+"""Check 1's declared seeds for an int8 attention block on the template against the reference path."""
+
+
+def test_an_int8_attention_block_on_the_template_is_on_par_with_the_reference_path():
+    """A causal attention block quantized to int8 (`Quantization`, Qwix's training rule) computing its
+    attention on the template (`attention_quantized`, row 4858: the query's, keys' and values' codes, the
+    weights rounded at each row's maximum, Qwix's straight-through backward), its output and its input's
+    gradient on par (check 1) with the block computing it on the reference path, whose products Qwix
+    quantizes itself, the truth that path in float64."""
+    from dew.nn.mixers import MixerContext
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    pytest.importorskip("qwix")
+
+    def block(implementation: str) -> nn.Module:
+        context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=32, max_seq_len=64,
+                               attention_impl=implementation)
+        return Quantization(dtype="int8").apply(CausalSelfAttention(ctx=context))
+
+    params = block("reference").init(jax.random.key(4), jnp.zeros((2, 32, 64)))
+
+    def arm(implementation: str):
+        def run(x):
+            out, pullback = jax.vjp(lambda x: block(implementation).apply(params, x), x)
+            return out, pullback(jnp.ones_like(out))[0]
+
+        return run
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), (2, 32, 64)) * 2,)
+
+    assert_as_exact(arm("template"), arm("reference"), draw, "an int8 attention block",
+                    seeds=QUANTIZED_ATTENTION_SEEDS)
 
 
 HOST_SEEDS = 8
