@@ -335,18 +335,21 @@ def unwalked(family: "Family") -> Callable:
     return walk
 
 
-def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str) -> tuple[jax.Array, ...]:
+def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str,
+          turns: Callable | None = None) -> tuple[jax.Array, ...]:
     """A persistent kernel's tiles (`Family.persist`'s): the grid `tiles` spread over the launch's programs
     along `axis`, each tile's `schedule(index)`, `(active, steps, views, tile)`, visited as `visit(counter,
     active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
-    of the active tiles before it) and its turn round accumulators a tile takes whole (`done`: the active
-    tiles before it). Returns both past the last tile."""
+    of the active tiles before it) and its turn round accumulators (`done`: the turns the active tiles before
+    it took, one a tile, or `turns(steps)` where given: an exactly summed tile's windows). Returns both past
+    the last tile."""
     @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=(jnp.int32(0), jnp.int32(0)))
     def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
         counter, done = carry
         active, steps, views, tile = schedule(loop.index)
         visit(counter, active, steps, views, tile, done)
-        return counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
+        taken = 1 if turns is None else turns(steps)
+        return counter + jnp.where(active, steps, 0), done + jnp.where(active, taken, 0)
 
     return ended
 
@@ -1369,11 +1372,16 @@ class Issuer[Accumulator](abc.ABC):
     the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
     in tensor memory, read out in chunks), its two products run apart."""
 
-    def tensor_columns(self, columns: int, accumulators: int) -> int:
+    sums_in_persist: bool = False
+    """Whether its persistent walk sums an exactly summed launch's steps a window at a time itself
+    (`persist`'s `summed`), each window's products in an accumulator of their own promoted into the running
+    sum by an IEEE add: a step then needs no consumer issuing its products (`summed_apart`)."""
+
+    def tensor_columns(self, columns: int, accumulators: int, summed: bool = False) -> int:
         """The tensor memory columns a program's `accumulators` fp32 accumulators of `columns` columns each
-        take (`generation.GpuTarget.tmem_columns` bounds them): none where its consumers hold them in
-        registers."""
-        del columns, accumulators
+        take (`generation.GpuTarget.tmem_columns` bounds them), exactly summed (`summed`, its windows'
+        partials beside the running sums) or not: none where its consumers hold them in registers."""
+        del columns, accumulators, summed
         return 0
 
     def column_registers(self, columns: int, dtype) -> int:

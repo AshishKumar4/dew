@@ -887,50 +887,40 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
     assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
 
 
-def _primitives(jaxpr, found: set) -> set:
-    """The primitives `jaxpr` and every body inside it bind."""
-    for equation in jaxpr.eqns:
-        found.add(equation.primitive.name)
-        for value in equation.params.values():
-            for inner in value if isinstance(value, (tuple, list)) else (value,):
-                body = getattr(inner, "jaxpr", inner)
-                if hasattr(body, "eqns"):
-                    _primitives(body, found)
-    return found
-
-
 @runs("sm100")
+@pytest.mark.parametrize("out", ["bfloat16", "float32"])
 @pytest.mark.parametrize("sizes", ["ragged", "one-group", "dense"])
-def test_a_blackwells_bf16_projection_on_tcgen05_and_its_gradients_hold_check_1(sizes):
-    """A Blackwell's bf16 projection (`expert_projection`'s, a dense layer's where no groups are given) with
-    bf16 outputs, so no depth step is summed apart (`product.promoted`) and its forward runs on tcgen05's
-    launch as a B200 runs it, interpreted, its gradients on the launches they take there (row 5209: the
-    kernel gradient on no tcgen05 launch yet): each as exact as XLA's ragged dot from float64, unrouted rows
-    and empty groups included."""
+def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
+    """A Blackwell's projection of bf16 operands (grouped, or a dense layer's where no groups are given) into
+    `out`, its forward and both gradients on the launches a B200 derives for them, interpreted: an fp32
+    output's depth steps summed a window at a time (`product.promoted`; tcgen05's own windows,
+    `Tcgen05Rings.persist`'s `summed`, row 5209), each as exact as XLA's product from float64, unrouted
+    rows and empty groups included."""
     group_sizes = None if sizes == "dense" else jnp.asarray(SIZES[sizes], jnp.int32)
     rows = 200 if sizes == "dense" else sum(SIZES[sizes]) + 9
+    dtype = jnp.dtype(out)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        groups = 1 if group_sizes is None else group_sizes.shape[0]
-        shape = (256, 128) if group_sizes is None else (groups, 256, 128)
+        shape = (256, 128) if group_sizes is None else (group_sizes.shape[0], 256, 128)
         return (jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16),
                 jnp.asarray(rng.normal(size=shape) / 16, jnp.bfloat16),
-                jnp.asarray(rng.normal(size=(rows, 128)), jnp.bfloat16))
+                jnp.asarray(rng.normal(size=(rows, 128)), dtype))
 
-    def projection(dtype):
-        if group_sizes is None:
-            return lambda x, w: jnp.matmul(x.astype(dtype), w.astype(dtype)).astype(dtype)
-        return lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None)
+    def on_xla(wide=None):
+        def product(x, w):
+            x, w = (x, w) if wide is None else (x.astype(wide), w.astype(wide))
+            into = dtype if wide is None else wide
+            if group_sizes is None:
+                return jnp.matmul(x, w, preferred_element_type=into)
+            return jax.lax.ragged_dot(x, w, group_sizes, preferred_element_type=into)
+        return product
 
-    def on_tcgen05(x, w, dy):
-        return with_gradients(lambda x, w: interpreted_projection(x, w, group_sizes, jnp.bfloat16))(x, w, dy)
+    def on_the_template(x, w, dy):
+        return with_gradients(lambda x, w: gemm.gemm(x, w, group_sizes, compute=jnp.bfloat16, out_dtype=dtype,
+                                                     interpret_on_cpu=True))(x, w, dy)
 
     with generation.assumed("sm100"):
-        # The premise: the forward's launch is tcgen05's.
-        forward = jax.make_jaxpr(lambda x, w: interpreted_projection(x, w, group_sizes, jnp.bfloat16))(
-            *draw(0)[:2])
-        assert any(name.startswith("tcgen05") for name in _primitives(forward.jaxpr, set())), sizes
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
-        assert_as_exact(on_tcgen05, jax.jit(with_gradients(projection(jnp.bfloat16))), draw,
-                        f"tcgen05 {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
+        assert_as_exact(on_the_template, jax.jit(with_gradients(on_xla())), draw, f"sm100 {sizes} into {out}",
+                        seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
