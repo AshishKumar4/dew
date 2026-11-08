@@ -16,7 +16,7 @@ import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
 from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import chunk_on, cotangents, formed, routed, token_by_token
+from test_recurrence_chunk import ROUTES, chunk_on, cotangents, formed, on_route, routed, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -379,3 +379,24 @@ def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template's gradient runs a call over `given`'s operands under `hooks` on the device its
     launches run for (`Mosaic.trains`: the fast backward takes it, its launches held at the call's tiles)."""
     return template.MOSAIC.trains(template_call(given, hooks), template.Mosaic.launched())
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_a_decay_a_key_dimensions_first_token_takes_no_gradient_where_its_sequence_starts_from_none(route):
+    """Packed documents under a decay a key dimension: each document after its row's first starts from no
+    memory, so its first token's decay scales nothing and its gradient is exactly zero in float64, as fla's
+    port takes it (`fla_kda.first_decay_grad`). The template's from its chunk's end, every term of the chunk,
+    held 1.5e-7 there against fla's 3.3e-9 on an A100 (row 5194); taken from the memory it scales, zero."""
+    case = 'a decay a key dimension, packed'
+    hooks = case_hooks(case)
+    with on_route(route):
+        # The route's geometry: its rows a GPU's, its documents' starts the draw's.
+        given, cotangent = drawn(jnp.bfloat16, 0, **geometry(case))
+        rule = restarted(functools.partial(chunk_on, 'mosaic_gpu', hooks), case)
+        grads = jax.device_get(with_gradients(rule)(given, cotangent))
+        (operands,) = draw(jnp.float32, 0, **geometry(case))
+    starts = np.asarray(operands.starts)
+    later = starts.copy()
+    later[:, 0] = False
+    dg = np.asarray(grads[1].log_decay)
+    assert later.any() and np.all(dg[later] == 0.0)
