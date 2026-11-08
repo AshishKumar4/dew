@@ -786,6 +786,39 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
 
 
+def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their_own(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A GPU tier's long file runs as CI's groups (`<file>#G/N`), each a task of the lane that cuts the
+    tests the file's collection here finds by the seconds the tier's GPUs took them
+    (DEW_SPLIT_DURATIONS), a test they never timed weighing their mean: so each test runs exactly once
+    over the groups, one added since and one renamed since among them, and each group's row holds its
+    own tests' cases (audit, 2026-11-08: the tier named the tests an earlier tier ran, so a new one
+    never ran, and a test named apart read "no evidence ran")."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    names = ("a", "b", "c", "renamed", "added")
+    (tmp_path / "tests/test_long.py").write_text("".join(
+        f"def test_{name}():\n    with open('ran-{name}', 'a') as ran:\n        ran.write('1')\n"
+        for name in names))
+    # The tier's GPU seconds of the tests it ran before: `renamed` was `old`, and `added` is new.
+    weights = tmp_path / "gpu-seconds.json"
+    weights.write_text(json.dumps({f"tests/test_long.py::test_{name}": 30.0
+                                   for name in ("a", "b", "c", "old")}))
+    monkeypatch.setenv("DEW_SPLIT_DURATIONS", str(weights))
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    groups = ["tests/test_long.py#1/2", "tests/test_long.py#2/2"]
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert sorted(rows) == [f"3.12:{group}" for group in groups]
+    assert all(row["exitCode"] == 0 for row in rows.values()), rows
+    assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "1")
+    held = [set(row["tests"]) for row in rows.values()]
+    assert held[0] and held[1] and not held[0] & held[1]
+    assert held[0] | held[1] == {f"tests/test_long.py::test_{name}" for name in names}
+
+
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
     """`coverage items` runs the floor's tasks with the test cache off, each writing its data among
     its artifacts; `coverage report` combines them, so a branch one task took and its other branch
