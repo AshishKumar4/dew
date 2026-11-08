@@ -188,6 +188,7 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("a tree call's attention is masked by its key runs, each token's cache and "
                          "ancestors (attention_key_runs)")
     if metadata.pairwise_mask is None and metadata.key_runs is None:
+        # A validity alone hides its keys from the layer's own visibility (`_masking`), no call's.
         return None
     key_positions, valid = metadata.key_positions, metadata.key_valid
     if key_positions is not None and key_positions.shape != (batch, keys):
@@ -1142,27 +1143,9 @@ class CausalSelfAttention(nn.Module):
                   else self.ctx.sliding_window)
         cursor = starts = None  # the decode mask the kernels stand in for, when this call builds it
         if prefix is not None:
-            # Every canvas query reads the same retained encoder keys and all
-            # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
-            # layer retains the last window-1 prefix keys.
-            cached_key = cache_leaf(self, "cached_key")
-            cached_value = cache_leaf(self, "cached_value")
-            alloc = cached_key.shape[-3]
-            prefix_slots = jnp.arange(alloc)[None, :]
-            valid_prefix = cached_validity(self, alloc)
-            if self.ctx.sliding_window is not None:
-                valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.ctx.sliding_window)
-            canvas_valid = (jnp.ones((B, S), bool) if attention_metadata is None
-                            or attention_metadata.valid is None else attention_metadata.valid)
-            keep = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
-            mask = jnp.broadcast_to(keep[:, None, None, :], (B, 1, S, alloc + S))
-            key = jnp.concatenate([cached_key, key], axis=-3)
-            value = jnp.concatenate([cached_value, value], axis=-3)
+            mask, key, value, key_places = self._prefixed(key, value, places, prefix, attention_metadata,
+                                                          B, S)
             causal, window = False, None
-            # The encoder's dense cache keeps a place a slot, `[rows, alloc, 1]`.
-            key_places = (jnp.concatenate([cache_leaf(self, PLACES)[..., 0],
-                                           jnp.broadcast_to(places, (B, S))], axis=-1)
-                          if self._reads_places else jnp.arange(alloc + S))
         elif self.ctx.kv_shared and decode:
             # The provider's stashed keys carry the full history, read as its own cache is.
             key_places, history = held
@@ -1215,6 +1198,12 @@ class CausalSelfAttention(nn.Module):
             mask, runs, window, key_places, query_places, valid = own
             causal, documents, groups, places = False, None, _Groups(), (
                 key_places if query_places is None else query_places)
+        elif attention_metadata is not None and attention_metadata.key_valid is not None:
+            # The call's keys' validity alone hides the keys it marks out from every query of the layer's own
+            # visibility (row 4771): a mask's keys taken from it (a decode step's or a prefix's, read by the
+            # masked kernel), else read by the kernel beside the rest.
+            mask, valid, implementation = self._key_validity(
+                attention_metadata.key_valid, mask, valid, implementation, masked, B, key.shape[-3])
         if self.ctx.attention_chunk is not None:
             mask = self._chunked(mask, documents, causal, window, valid, runs, groups, places, key_places, S,
                                  key.shape[-3])
@@ -1224,6 +1213,44 @@ class CausalSelfAttention(nn.Module):
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs, query_places)
+
+    def _prefixed(self, key, value, places, prefix, attention_metadata: AttentionMetadata | None, batch: int,
+                  queries: int):
+        """A canvas call's keys and values behind its retained encoder keys (`prefix` each row's prefix
+        length), the mask over them and their places: every canvas query reads the same retained encoder
+        keys and all canvas keys (modeling_diffusion_gemma.py:1399-1401), a local layer the last window-1
+        prefix keys."""
+        cached_key = cache_leaf(self, "cached_key")
+        cached_value = cache_leaf(self, "cached_value")
+        alloc = cached_key.shape[-3]
+        prefix_slots = jnp.arange(alloc)[None, :]
+        valid_prefix = cached_validity(self, alloc)
+        if self.ctx.sliding_window is not None:
+            valid_prefix = valid_prefix & (prefix_slots > prefix[:, None] - self.ctx.sliding_window)
+        canvas_valid = (jnp.ones((batch, queries), bool) if attention_metadata is None
+                        or attention_metadata.valid is None else attention_metadata.valid)
+        keep = jnp.concatenate([valid_prefix, canvas_valid], axis=-1)
+        mask = jnp.broadcast_to(keep[:, None, None, :], (batch, 1, queries, alloc + queries))
+        # The encoder's dense cache keeps a place a slot, `[rows, alloc, 1]`.
+        key_places = (jnp.concatenate([cache_leaf(self, PLACES)[..., 0],
+                                       jnp.broadcast_to(places, (batch, queries))], axis=-1)
+                      if self._reads_places else jnp.arange(alloc + queries))
+        joined = (jnp.concatenate([cached, own], axis=-3) for cached, own in ((cached_key, key),
+                                                                               (cached_value, value)))
+        return (mask, *joined, key_places)
+
+    def _key_validity(self, key_valid, mask, valid, implementation: AttentionImpl,
+                      masked: Callable[[], AttentionImpl], batch: int, keys: int):
+        """A call's keys' validity `key_valid` `[B, keys]` (`AttentionMetadata.key_valid`) beside the layer's
+        own visibility: the `mask` its keys are taken from where it has one (its kernel the masked one,
+        `masked()`), else joined to the `valid` keys the kernel reads, each only where both are. Returns the
+        mask, the validity and the kernel."""
+        key_valid = jnp.asarray(key_valid)
+        if key_valid.shape != (batch, keys) or key_valid.dtype != jnp.bool_:
+            raise ValueError("attention_key_valid must be boolean [B, keys]")
+        if mask is not None:
+            return mask & key_valid[:, None, None, :], valid, masked()
+        return None, key_valid if valid is None else jnp.asarray(valid, bool) & key_valid, implementation
 
     def _chunked(self, mask, documents, causal, window, valid, runs, groups: _Groups, places, key_places,
                  queries: int, keys: int):
