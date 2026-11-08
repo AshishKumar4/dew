@@ -90,6 +90,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
              "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
              "distribution": ("transformers", "5.16.1")}
             for family in importlib.import_module("multimodal_families").DRAWN},
+         **{f"multimodal-{family}-text": {
+             "test": "test_multimodal_model", "arms": f"{family}/text", "worker": "multimodal_worker.py",
+             "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
+             "distribution": ("transformers", "5.16.1")}
+            for family in importlib.import_module("multimodal_families").TEXT_DRAWN},
          **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
                                        "worker": "codec_worker.py",
                                        "reference": "neuralmagic/compressed-tensors 0.17.1 with "
