@@ -189,7 +189,10 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
 
 
 def _digest(value) -> Hashable:
-    """A constant by its type and bits."""
+    """A constant by its type and bits; a traced one (a value an enclosing trace closes over), which holds no
+    bits until it runs, by its type alone, as an input is."""
+    if isinstance(value, jax.core.Tracer):
+        return value.aval
     value = np.asarray(value)
     return str(value.dtype), value.shape, hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
 

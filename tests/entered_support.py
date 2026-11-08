@@ -56,14 +56,31 @@ def assert_entered_as_own_rows(module, variables, width: int, layout: str, label
     def entering(params, hidden):
         return module.apply({**variables, "params": params}, hidden, call)
 
+    # Each document's own row, the part it enters before it, every one a row of one call padded at its end:
+    # a token's output and hidden gradient its own row's, and a parameter's gradient one reduction over every
+    # document's tokens, as the entering arm's is. Each document's own call's put the one-token layout's
+    # parameter gradients a sum of six reductions against the entering arm's one, its order, not the
+    # documents', in the ratio (Kimi delta attention's `o_norm` weight 1.6 times over 32 rows of it).
+    shared_of = {number: lengths[enters[number - 1]] if enters[number - 1] else 0 for number, _ in placed}
+    longest = max(shared_of[number] + length for number, length in placed)
+    owned = np.arange(longest)[None, :] < np.asarray([[shared_of[n] + length] for n, length in placed])
+    owned = np.repeat(owned, ENTERED_ROWS, axis=0)
+    own_rows = MixerCall(AttentionMetadata(coordinates=coordinates(
+        valid=jnp.asarray(owned), segments=jnp.asarray(owned.astype(np.int32)))))
+
     def apart(params, hidden):
-        out = jnp.zeros_like(hidden)
+        rows = []
         for number, length in placed:
-            own = hidden[:, begins[number]:begins[number] + length]
             root = enters[number - 1]
             shared = hidden[:, begins[root]:begins[root] + lengths[root]] if root else hidden[:, :0]
-            row = module.apply({**variables, "params": params}, jnp.concatenate([shared, own], axis=1))
-            out = out.at[:, begins[number]:begins[number] + length].set(row[:, shared.shape[1]:])
+            row = jnp.concatenate([shared, hidden[:, begins[number]:begins[number] + length]], axis=1)
+            rows.append(jnp.pad(row, ((0, 0), (0, longest - row.shape[1]), (0, 0))))
+        found = module.apply({**variables, "params": params}, jnp.concatenate(rows, axis=0), own_rows)
+        out = jnp.zeros_like(hidden)
+        for index, (number, length) in enumerate(placed):
+            row = found[index * ENTERED_ROWS:(index + 1) * ENTERED_ROWS]
+            out = out.at[:, begins[number]:begins[number] + length].set(
+                row[:, shared_of[number]:shared_of[number] + length])
         return out
 
     def outputs(run):
