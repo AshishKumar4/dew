@@ -213,12 +213,12 @@ def test_a_decode_steps_attention_launches_write_every_output(far):
                        value)
 
 
-@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
-def test_attentions_training_launches_write_every_output_over_an_empty_row(generation_name):
+def test_attentions_training_launches_write_every_output_over_an_empty_row():
     """The attention template's training step (its forward keeping the backward's residuals, and the
-    backward), interpreted as each GPU's, over two rows of 64 queries, the first seeing no key (a zero-length
+    backward), interpreted as an H100's, over two rows of 64 queries, the first seeing no key (a zero-length
     document, `lengths` 0) and the second every one: every launch writes every output it declares, an
-    empty row's among them."""
+    empty row's among them. An A100's backward walks its launches inside a loop the audit does not walk
+    (`kernel_outputs.NESTED`)."""
     from dew.nn.kernels.templates import attention as template, attention_mosaic
 
     query, key, value, dout = drawn((2, 64, 4, 64), (2, 64, 2, 64), (2, 64, 2, 64), (2, 64, 4, 64))
@@ -231,7 +231,7 @@ def test_attentions_training_launches_write_every_output_over_an_empty_row(gener
                                           interpret=True)
         return out, grads
 
-    with generation.assumed(generation_name):
+    with generation.assumed("sm90"):
         assert_written(step, query, key, value, dout, launches=2)
 
 
