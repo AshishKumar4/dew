@@ -5,7 +5,7 @@
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT
     python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
-    python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
+    python3 tools/armada/ci.py gpu-lane --tests="tests/b.py#1/2" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
     python3 tools/armada/ci.py coverage report DIR
@@ -31,9 +31,18 @@ with CI's selection, and writes a verdict row for each. A row is red on a
 failed or erroring test, on a test skipped because its import failed (a file
 CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
-every row it holds is red, so a hang is graded, with what pytest reports as
-it is interrupted, rather than leaving the task without a verdict. A check-1
-site too long for one task, marked check1_shards(seeds, per_task) on its test
+every row it holds is red (`kind` "deadline"), so a hang is graded, with what
+pytest reports as it is interrupted, rather than leaving the task without a
+verdict. Its rows' seconds, which armada times the next plan by, are what the
+task knows of each file (`deadline_shares`): the file its tests were running
+at the deadline, the one whose test started last, carries its own tests'
+seconds and the task's wall time no file's tests account for, at least what
+the file needs, so the next plan cuts it finer; a file that finished its tests'
+own seconds; and a file that never started has none: its row says
+`"unobserved": true`, with `seconds` 0, and armada weighs no plan by it (its
+`timings` still name its file, at 0, so a file it shares with other rows is not
+timed by those alone). A check-1 site too long for one task, marked
+check1_shards(seeds, per_task) on its test
 (`sites`), runs apart from its file's tasks as armada's map and judge
 (`site_entries`): map tasks of per_task of its seeds each, or fewer where their
 measured seconds put a task past the group target (`cut_draws`), which draw them into
@@ -1385,6 +1394,20 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
     return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
 
 
+def deadline_shares(own_seconds: Mapping[str, float], reported: Container[str], wall: float,
+                    running: str | None) -> dict[str, float]:
+    """The seconds of the rows of a task that ran out of time, of the files that have any, by file: one that
+    `reported` tests, its tests' own seconds, and the file `running` at the deadline, the one whose test
+    started last (`followed.visited`), its own and all of the task's `wall` time no file's tests account for
+    (its imports and its collection, and the test the interrupt stopped, which pytest's report gives no
+    time), so its row holds at least what the file needs. A file that reported none and was not running never
+    started, and has none: absent. `apportioned` split the wall time, the interrupted test's included, over
+    the files that finished, in proportion to their tests' times, or evenly where none finished."""
+    unaccounted = max(wall - sum(own_seconds.values()), 0.0)
+    return {name: own + (unaccounted if name == running else 0.0) for name, own in own_seconds.items()
+            if name == running or name in reported}
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
          release: str = "", census: bool = False) -> int:
@@ -1394,8 +1417,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
     the plan weighs a file by what it costs a container (its import, its collection, the
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
-    at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
-    file goes there (`coverage_items`)."""
+    at 300 seconds ran a median of 392. A task that ran out of time times its rows otherwise
+    (`deadline_shares`): the file its tests were running in at least what it needs, a file that never
+    started none. With `coverage`, pytest runs under coverage.py, whose data file goes there
+    (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
@@ -1656,9 +1681,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
-                   for name in tests}
-    shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
+    shares = task_seconds(tests, cases, log, time.monotonic() - began, expired)
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         failed = [(case, kind, node) for case in own for kind in ("failure", "error")
@@ -1684,7 +1707,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                                                       for case, _, _ in failed)
         cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
                  else red_as("nodes", nodes))
-        seconds = shares[name]
+        # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
+        # row is `unobserved`, and armada weighs no plan by it.
+        unobserved = name not in shares
+        seconds = shares.get(name, 0.0)
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
@@ -1693,6 +1719,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                          + ([output[-12000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ...").
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
+                     # Where the task ran out of time, a file that never started: no seconds to time it by.
+                     **({"unobserved": True} if unobserved else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if node.split("::", 1)[0] == name},
                                **{node_of(case): float(case.get("time") or 0) for case in own}},
@@ -1710,6 +1738,21 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
     return 0
+
+
+def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: float,
+                 expired: bool) -> dict[str, float]:
+    """Each of `tests`' seconds of its task's `wall` time, by its JUnit `cases`: in proportion to its tests'
+    own times (`apportioned`); where the task ran out of time (`expired`), the file running at its deadline
+    (its executed `log`'s last visit) at least what it needs, and one that never started none
+    (`deadline_shares`)."""
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
+                   for name in tests}
+    if not expired:
+        return apportioned(own_seconds, wall, len(tests))
+    # The file whose test started last is the one running at the deadline (executed.py logs each visit).
+    stood = followed.visited(followed.log_events(log))
+    return deadline_shares(own_seconds, {file_of(case) for case in cases}, wall, stood[-1] if stood else None)
 
 
 def resumed(tests: list[str]) -> dict[str, float]:
@@ -2009,8 +2052,12 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
              deadline: float, network: bool = False) -> int:
-    """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
-    own (`tested`), and write their verdict rows to `out`. With `network`, the network lane: each file's
+    """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
+    (`tested`), and write their verdict rows to `out`: a test file, or one group of one as CI names it
+    (`<file>#G/N`, the Gth of N runs of the tests the file's collection here finds, split.py), whose row is
+    that group's, so every test of a file cut into groups runs once, whatever an earlier run of it held
+    (audit, 2026-11-08: the GPU tier's parts named tests an earlier tier ran, so a new one never ran, and a
+    test named apart read "no evidence ran"). With `network`, the network lane: each file's
     network-marked tests alone, which every other task deselects (`session.SELECTION`), run with the Hub
     open on a node that reaches it, their records on a class of their own (`device_class`), so the test
     cache reruns only those whose inputs changed (the maintainer, 2026-10-25: no CI run reached the published
@@ -2045,14 +2092,18 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
+    # Each test's file and group (`<file>#G/N`; none, a whole file).
+    parts = {name: name.partition("#")[::2] for name in tests}
+
     def needs(name: str) -> dict | None:
-        return recorded(record_key(python, row(python, name, ""), held), token)
+        return recorded(record_key(python, row(python, *parts[name]), held), token)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(tests, pool.map(needs, tests), strict=True))
-    borrowed = borrowed_records([name for name, found in records.items() if found is None], python, held,
-                                token)
-    needed = {name: gpu_needs(records[name] or borrowed.get(name), budget) for name in tests}
+    # A group no run on this class measured borrows its whole file's measure, which holds at least its own.
+    borrowed = borrowed_records(sorted({parts[name][0] for name, found in records.items() if found is None}),
+                                python, held, token)
+    needed = {name: gpu_needs(records[name] or borrowed.get(parts[name][0]), budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
@@ -2072,7 +2123,12 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
-                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
+                file, group = parts[fits]
+                # A group cut by the tier's own GPU seconds (DEW_SPLIT_DURATIONS, split.py) is no group
+                # any record's key holds: it reads no cached row, as it writes none, so no earlier cut's row
+                # stands for it beside groups cut afresh (review of b3bcbe0fe).
+                policy = "off" if group and os.environ.get("DEW_SPLIT_DURATIONS") else cache
+                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, policy,
                                     session.GRACE, common, environ, None, network)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)

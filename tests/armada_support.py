@@ -13,14 +13,28 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def loaded(tmp_path: Path, monkeypatch):
-    """tools/armada/ci.py, run from the checkout at `tmp_path`, with no test cache named: CI's own environment
-    names the shared test cache, and these runs of the tools must not read or write it."""
+    """tools/armada/ci.py, run from the checkout at `tmp_path`, with no test cache named and none of the
+    armada task these tests run in: CI's own environment names the shared test cache, and the task's own
+    artifacts and the progress of its recalled attempt (ARMADA_ARTIFACTS, ARMADA_RESUME), which these runs
+    of the tools must neither read nor write (a recalled attempt's nested tasks set aside the tests its
+    progress named, and recorded none)."""
     module = load("ci", "tools/armada")
     monkeypatch.chdir(tmp_path)
-    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
-        monkeypatch.delenv(name, raising=False)
+    apart(monkeypatch)
     (tmp_path / "tests").mkdir()
     return module
+
+
+APART = ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE",
+         "ARMADA_ARTIFACTS", "ARMADA_RESUME")
+"""What CI's environment names that these tests' runs of its tools must not see (`apart`)."""
+
+
+def apart(monkeypatch) -> None:
+    """The environment these tests' runs of CI's tools see: no shared test cache, and none of the armada task
+    the tests run in (`loaded`)."""
+    for name in APART:
+        monkeypatch.delenv(name, raising=False)
 
 
 def interpreter(root: Path, version: str) -> None:
