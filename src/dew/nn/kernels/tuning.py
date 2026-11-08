@@ -153,76 +153,79 @@ class Unreadable(ValueError):
 
 def encoded(value: object) -> JSON:
     """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
-    scalar, None or string as itself; a shape and dtype, a dtype, a tuple, a list, a mapping, an enum
-    member and a dataclass by their parts, a class and a module-level function (a template's hook) by
-    its module and name. Anything else, a lambda, a closure or a local function among them, has no JSON
-    form here, and raises: a measured pick for a launch with a hook needs a module-level hook."""
+    scalar, None or string as itself, a list element by element, and every other kind its `_KINDS` entry
+    writes, by its parts: a shape and dtype, a dtype, an enum member, a class and a module-level function (a
+    template's hook) by its module and name, a dataclass, a tuple and a mapping. Anything else, a lambda, a
+    closure or a local function among them, has no JSON form here, and raises: a measured pick for a launch
+    with a hook needs a module-level hook."""
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
-    if isinstance(value, jax.ShapeDtypeStruct):
-        return {"shape": list(value.shape), "dtype": str(value.dtype)}
-    if isinstance(value, np.dtype):
-        return {"dtype": str(value)}
-    if isinstance(value, enum.Enum):
-        return {"enum": _named(type(value)), "name": value.name}
-    if isinstance(value, type):
-        return {"class": _named(value)}
-    if isinstance(value, types.FunctionType):
-        return {"function": _function_name(value)}
-    if dataclasses.is_dataclass(value):
-        return {"dataclass": _named(type(value)),
-                "fields": {field.name: encoded(getattr(value, field.name))
-                           for field in dataclasses.fields(value) if field.init}}
-    if isinstance(value, tuple):
-        return {"tuple": [encoded(element) for element in value]}
     if isinstance(value, list):
         return [encoded(element) for element in value]
-    if isinstance(value, Mapping):
-        return {"mapping": [[encoded(key), encoded(entry)] for key, entry in value.items()]}
+    for kind in _KINDS:
+        if kind.holds(value):
+            return {kind.tag: kind.written(value), **kind.beside(value)}
     raise TypeError(f"{type(value).__name__} has no JSON form in a kernel's picks: {value!r}")
 
 
 def decoded(value: _records.JSON) -> Rebuilt:
-    """What `encoded` wrote, rebuilt. A class it names that this checkout lacks, a dataclass whose
-    stored fields are not this checkout's (but for fields it added with a default, which read as their
-    default), or JSON it did not write raises `Unreadable`; whatever the rebuilt classes raise propagates."""
+    """What `encoded` wrote, rebuilt, by the tag its object carries (`_KINDS`). A class it names that this
+    checkout lacks, a dataclass whose stored fields are not this checkout's (but for fields it added with a
+    default, which read as their default), or JSON it did not write raises `Unreadable`; whatever the
+    rebuilt classes raise propagates."""
     if isinstance(value, list):
         return [decoded(element) for element in value]
     if not isinstance(value, dict):
         return value
-    if "shape" in value:
-        return jax.ShapeDtypeStruct(_field(_records.integers, value.get("shape"), "shape"),
-                                    _dtype(_field(_records.text, value.get("dtype"), "dtype")))
-    if "dtype" in value:
-        return _dtype(_field(_records.text, value.get("dtype"), "dtype"))
-    if "enum" in value:
-        members = _located(_field(_records.text, value.get("enum"), "enum")).__dict__
-        member = members.get(_field(_records.text, value.get("name"), "name"))
-        if not isinstance(member, enum.Enum):
-            raise Unreadable(f"no such member in this checkout: {value!r}")
-        return member
-    if "class" in value:
-        return _located(_field(_records.text, value.get("class"), "class"))
-    if "function" in value:
-        return _located_function(_field(_records.text, value.get("function"), "function"))
-    if "dataclass" in value:
-        cls = _located(_field(_records.text, value.get("dataclass"), "dataclass"))
-        fields = value.get("fields")
-        # A field the checkout added with a default reads as that default: the pick was made without it.
-        if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
-                field.name for field in dataclasses.fields(cls) if field.init and (
-                    field.name in fields or (field.default is dataclasses.MISSING
-                                             and field.default_factory is dataclasses.MISSING))}:
-            raise Unreadable(f"{cls.__qualname__}'s stored fields are not this checkout's: {fields!r}")
-        return cls(**{name: decoded(field) for name, field in fields.items()})
-    if "tuple" in value:
-        elements = value.get("tuple")
-        if not isinstance(elements, list):
-            raise Unreadable(f"a stored tuple is no list: {elements!r}")
-        return tuple(decoded(element) for element in elements)
-    pairs = value.get("mapping")
+    for kind in _KINDS:
+        if kind.tag in value:
+            return kind.rebuilt(value)
+    raise Unreadable(f"stored JSON this module did not write: {value!r}")
+
+
+@dataclasses.dataclass(frozen=True)
+class _Kind:
+    """One kind of value the picks' JSON holds (`_KINDS`), declared once for both directions: its object's
+    `tag`, whose value is `written(value)` and beside which `beside(value)` writes the rest of its parts;
+    whether a value is of it (`holds`); and the value `rebuilt` from the whole object."""
+    tag: str
+    holds: Callable[[object], bool]
+    written: Callable[..., JSON]
+    rebuilt: Callable[[dict], Rebuilt]
+    beside: Callable[..., dict] = lambda value: {}
+
+
+def _enum_member(stored: dict) -> enum.Enum:
+    members = _located(_field(_records.text, stored.get("enum"), "enum")).__dict__
+    member = members.get(_field(_records.text, stored.get("name"), "name"))
+    if not isinstance(member, enum.Enum):
+        raise Unreadable(f"no such member in this checkout: {stored!r}")
+    return member
+
+
+def _dataclass(stored: dict) -> Rebuilt:
+    cls = _located(_field(_records.text, stored.get("dataclass"), "dataclass"))
+    fields = stored.get("fields")
+    # A field the checkout added with a default reads as that default: the pick was made without it.
+    if not dataclasses.is_dataclass(cls) or not isinstance(fields, dict) or set(fields) != {
+            field.name for field in dataclasses.fields(cls) if field.init and (
+                field.name in fields or (field.default is dataclasses.MISSING
+                                         and field.default_factory is dataclasses.MISSING))}:
+        raise Unreadable(f"{cls.__qualname__}'s stored fields are not this checkout's: {fields!r}")
+    return cls(**{name: decoded(field) for name, field in fields.items()})
+
+
+def _tuple(stored: dict) -> tuple:
+    elements = stored.get("tuple")
+    if not isinstance(elements, list):
+        raise Unreadable(f"a stored tuple is no list: {elements!r}")
+    return tuple(decoded(element) for element in elements)
+
+
+def _mapping(stored: dict) -> dict:
+    pairs = stored.get("mapping")
     if not isinstance(pairs, list):
-        raise Unreadable(f"stored JSON this module did not write: {value!r}")
+        raise Unreadable(f"a stored mapping is no list of pairs: {pairs!r}")
     rebuilt = {}
     for pair in pairs:
         if not isinstance(pair, list) or len(pair) != 2:
@@ -301,6 +304,31 @@ def _located(name: str) -> type:
     if not isinstance(found, type):
         raise Unreadable(f"{name} names no class in this checkout")
     return found
+
+
+_KINDS = (
+    # A shape and dtype before a dtype, whose tag its object carries too.
+    _Kind("shape", lambda value: isinstance(value, jax.ShapeDtypeStruct), lambda value: list(value.shape),
+         lambda stored: jax.ShapeDtypeStruct(_field(_records.integers, stored.get("shape"), "shape"),
+                                             _dtype(_field(_records.text, stored.get("dtype"), "dtype"))),
+         beside=lambda value: {"dtype": str(value.dtype)}),
+    _Kind("dtype", lambda value: isinstance(value, np.dtype), str,
+         lambda stored: _dtype(_field(_records.text, stored.get("dtype"), "dtype"))),
+    _Kind("enum", lambda value: isinstance(value, enum.Enum), lambda value: _named(type(value)), _enum_member,
+         beside=lambda value: {"name": value.name}),
+    _Kind("class", lambda value: isinstance(value, type), _named,
+         lambda stored: _located(_field(_records.text, stored.get("class"), "class"))),
+    _Kind("function", lambda value: isinstance(value, types.FunctionType), _function_name,
+         lambda stored: _located_function(_field(_records.text, stored.get("function"), "function"))),
+    _Kind("dataclass", dataclasses.is_dataclass, lambda value: _named(type(value)), _dataclass,
+         beside=lambda value: {"fields": {field.name: encoded(getattr(value, field.name))
+                                          for field in dataclasses.fields(value) if field.init}}),
+    _Kind("tuple", lambda value: isinstance(value, tuple), lambda value: [encoded(e) for e in value], _tuple),
+    _Kind("mapping", lambda value: isinstance(value, Mapping),
+         lambda value: [[encoded(key), encoded(entry)] for key, entry in value.items()], _mapping),
+)
+"""Each kind of value the picks' JSON holds but a scalar's and a list's, in the order a value is matched
+against them (`encoded`) and a stored object read by its tag (`decoded`)."""
 
 
 def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
