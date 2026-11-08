@@ -322,42 +322,40 @@ def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there
     assert float(held.total) != float(swapped.total)
 
 
-SHIFT_UNITS = 16
+SHIFT_UNITS = 32
 """The held-out clips a dynamics model's forecast is judged over, a unit a clip."""
 
 
-def test_a_dynamics_model_forecasts_the_shifting_latents_it_trained_on():
-    """A dynamics model trained by shortcut forcing on clips whose latents shift a place each frame (each
+def test_a_dynamics_model_reads_its_context_to_forecast_the_shifting_latents_it_trained_on():
+    """A dynamics model trained by diffusion forcing on clips whose latents shift a place each frame (each
     clip's first frame drawn from a unit normal, every frame after it the one before rolled along its
-    latents, 512 clips of 4 frames) for 2,000 updates of 16 clips forecasts held-out clips' last two
-    frames from their first two in 4 steps (`WorldModelObjective.generate`), judged by the learning gate,
-    a unit a clip: it errs less than the mean frame, which knows no clip, and less than holding the last
-    context frame, which knows no shift. Its context reads at the smallest step size, the only one
-    training draws a near-clean frame at (Eq. 4's grid); read at the forecast's own step, 1/4, where no
-    frame trained at level 0.9, the context reads as noise and the forecast as the mean frame (row 4802:
-    tutorial 12's dynamics forecast no ball over a tokenizer that reconstructed it)."""
+    latents, 1,024 clips of 4 frames) for 1,000 updates of 32 clips predicts held-out clips' last frame
+    from pure noise, its three before it near clean at the finest step, within half the mean frame's
+    error, judged by the learning gate, a unit a clip: its tokens know their frame and place by
+    rotary positions (Dreamer 4's, `Dynamics.positions`). By learned vectors started at 0.02 the same
+    model erred 0.71 against the mean frame's 0.84, no better than it does from a context of noise
+    (row 4802: tutorial 12's dynamics forecast no ball over a tokenizer that reconstructed it); rotary,
+    0.19."""
     import optax
 
-    from dew.objectives.world_model import CausalTokenizer, WorldModelObjective
+    from dew.objectives.world_model import diffusion_forcing_loss
 
     def clips(rows, seed):
         first = np.random.default_rng(seed).normal(size=(rows, 1, 4, 4)).astype(np.float32)
         return np.concatenate([np.roll(first, shift, axis=2) for shift in range(4)], axis=1)
 
-    model = Dynamics(latents=4, bottleneck=4, spatial=4, width=64, depth=2, heads=2, levels=4, frames=4)
-    trained, held = clips(512, 0), clips(SHIFT_UNITS, 1)
+    model = Dynamics(latents=4, bottleneck=4, spatial=4, width=32, depth=2, heads=2, levels=4, frames=4)
+    trained, held = clips(1024, 0), clips(SHIFT_UNITS, 1)
     d_min = 1.0 / model.k_max
 
     def loss(params, clean, key):
-        exponent_key, level_key, noise_key = jax.random.split(key, 3)
-        exponent = jax.random.randint(exponent_key, clean.shape[:2], 0, model.levels)
-        d = 1.0 / 2.0 ** exponent.astype(jnp.float32)
-        tau = jnp.floor(jax.random.uniform(level_key, clean.shape[:2]) / d) * d
+        level_key, noise_key = jax.random.split(key)
+        tau = jnp.floor(jax.random.uniform(level_key, clean.shape[:2]) / d_min) * d_min
         noise = jax.random.normal(noise_key, clean.shape)
 
         def f(noisy, tau, d):
             return model.apply(params, noisy, tau, d)
-        return jnp.mean(shortcut_forcing_loss(f, clean, noise, tau, d, d_min))
+        return jnp.mean(diffusion_forcing_loss(f, clean, noise, tau, d_min))
 
     params = model.init(jax.random.key(0), jnp.asarray(trained[:1]), jnp.ones((1, 4)), jnp.ones((1, 4)))
     optimizer = optax.adam(1e-3)
@@ -369,20 +367,19 @@ def test_a_dynamics_model_forecasts_the_shifting_latents_it_trained_on():
         return optax.apply_updates(params, changes), state
 
     state = optimizer.init(params)
-    for step in range(2000):
-        start = 16 * step % 512
-        batch = jnp.asarray(trained[start:start + 16])
+    for step in range(1000):
+        start = 32 * step % 1024
+        batch = jnp.asarray(trained[start:start + 32])
         params, state = update(params, state, batch, jax.random.key(step + 1))
 
-    tokenizer = CausalTokenizer((8, 8, 1), patch=4, width=16, depth=1, heads=2, latents=4, bottleneck=4)
-    tokens = tokenizer.init(jax.random.key(4), jnp.zeros((1, 8, 8, 1)))
-    objective = WorldModelObjective(model, tokenizer, tokens)
-    forecast = np.asarray(objective.generate(params, jnp.asarray(held[:, :2]), 2, jax.random.key(5), steps=4))
-    later = held[:, 2:]
-    axes = (1, 2, 3)
-    missed = np.mean(np.square(forecast - later), axes)
-    contrasts = {"errs less than the mean frame": np.mean(np.square(later), axes) - missed,
-                 "errs less than the last context frame": (np.mean(np.square(held[:, 1:2] - later), axes)
-                                                           - missed)}
+    clean = jnp.asarray(held)
+    noise = jax.random.normal(jax.random.key(9), clean.shape)
+    level = 1 - d_min
+    tau = jnp.concatenate([jnp.full((SHIFT_UNITS, 3), level), jnp.zeros((SHIFT_UNITS, 1))], 1)
+    noisy = jnp.concatenate([level * clean[:, :3] + (1 - level) * noise[:, :3], noise[:, 3:]], 1)
+    predicted = np.asarray(model.apply(params, noisy, tau, jnp.full((SHIFT_UNITS, 4), d_min)))[:, 3]
+    last = held[:, 3]
+    missed = np.mean(np.square(predicted - last), (1, 2))
+    contrasts = {"errs within half the mean frame's error": np.mean(np.square(last), (1, 2)) / 2 - missed}
     assert_learns(lambda units: {claim: values[units] for claim, values in contrasts.items()},
                   "a dynamics model's shifting latents", units=SHIFT_UNITS)
