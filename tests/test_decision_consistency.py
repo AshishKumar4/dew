@@ -441,20 +441,20 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
     padding; a backbone that attends both ways is read as its causal twin. A validation weighs it as
     training does, its gradient reaches the backbone and leaves the decision head's as the label loss's,
     and the run counts its pass and its head as work (row 4742)."""
+    from test_decision_packing import ROWS, windows
+
     from dew.batch import coordinates, part
+    from dew.decision.head import DecisionHead
     from dew.nn.flops import counted_flops
     from dew.objectives.lm.objective import LMObjective
 
-    backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len, causal=causal)
-    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
-    built = {"tokenizer": TOKENIZER, "specials": SPECIALS, "layout": LAYOUT, "head": head}
+    # Rows of one question each, several of which a window packs (tests/test_decision_packing.py's).
+    backbone = tiny_backbone().clone(max_seq_len=ROWS.max_len, causal=causal)
+    built = {"tokenizer": TOKENIZER, "specials": SPECIALS, "layout": ROWS, "head": DecisionHead(32, layers=1),
+             "shuffle_options": False}
     plain = DecisionObjective(backbone, **built)
     weighted = DecisionObjective(backbone, **built, input_lm=0.25)
-    reader = decision_rows([NEGATED] * 6, 2, [NEGATED] * 6, objective=plain.data()).val(DataPartition())
-    try:
-        batch = next(reader)
-    finally:
-        reader.close()
+    batch = windows(plain, 2)
     tokens, segments = np.asarray(batch["tokens"]), np.asarray(batch["segments"])
     assert int(segments.max()) > 1, "no window packed two rows"
     variables = plain.init(jax.random.key(0))
