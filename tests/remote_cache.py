@@ -562,22 +562,27 @@ def install_from_environment() -> RemoteCache | None:
 
 
 def main(arguments: list[str]) -> int:
-    """`python tests/remote_cache.py prefetch GENERATION TOPOLOGY ITEM...`: a GPU job's prepare, on its node's
-    CPU, fetching the bundles of each of its run's items (a test file, or a group of one as CI names it,
-    `<file>#G/N`) into the cache directory its run reads (`dew._cache.default_compilation_cache_dir`), keyed
-    for the node's GPU as its serialized TOPOLOGY names it (`dew.training.ahead.host_gpus`)."""
-    command, generation, topology, *items = arguments
+    """`python tests/remote_cache.py prefetch TOPOLOGY ITEM...`: a GPU job's prepare, on its node's CPU, fetching
+    the bundles of each of its run's items (a test file, or a group of one as CI names it, `<file>#G/N`) into
+    the cache directory its run reads (`dew._cache.default_compilation_cache_dir`), keyed for the node's GPU as
+    its serialized TOPOLOGY names it (dew-ops' session hands a prepare its node's, $DEW_NODE_TOPOLOGY)."""
+    command, topology, *items = arguments
     if command != "prefetch" or not requested():
-        raise SystemExit("usage: remote_cache.py prefetch GENERATION TOPOLOGY ITEM..., with "
-                         "DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN set")
-    from dew._cache import default_compilation_cache_dir
-    from dew.training.ahead import host_gpus
+        raise SystemExit("usage: remote_cache.py prefetch TOPOLOGY ITEM..., with DEW_XLA_CACHE_URL and "
+                         "DEW_XLA_CACHE_TOKEN set")
+    from jax.experimental import topologies
 
-    [device] = host_gpus(generation, topology, 1)
+    from dew._cache import default_compilation_cache_dir
+    from dew.training.ahead import compile_only_gpus
+
+    # The CUDA plugin, which a serialized topology deserializes through, initialized with no GPU and no
+    # client, as a compile-only target initializes it (`dew.training.ahead.host_gpus`).
+    compile_only_gpus("a100", 1)
+    kind = topologies.TopologyDescription.deserialize(Path(topology).read_bytes()).devices[0].device_kind
     bundles = [bundle(file, group or None, None)
                for file, _, group in (item.partition("#") for item in items)]
     written = prefetch(Path(default_compilation_cache_dir()), os.environ["DEW_XLA_CACHE_URL"],
-                       os.environ["DEW_XLA_CACHE_TOKEN"], prefix(device.device_kind, "gpu"), bundles)
+                       os.environ["DEW_XLA_CACHE_TOKEN"], prefix(kind, "gpu"), bundles)
     print(f"shared XLA cache: {written} programs fetched ahead for {len(bundles)} bundles")
     return 0
 
