@@ -1,4 +1,4 @@
-"""The measurement lane's timing harness: a manifest of cases, timed in one exclusive window per GPU kind.
+"""The measurement lane's timing harness: a manifest of cases, timed in one window per GPU kind.
 
 A case is a builder (an import path, `builder(cell, implementation)` returning `(call, draw)`: the callable
 and a draw of its arguments by index, so every arm meets the same inputs in the same order), its cells (the
@@ -19,6 +19,10 @@ kernel and their sum, an eviction's own left out where the case evicts), with ea
 it; a case whose question is host-bound latency asks for the wall clock alone (`"clock": "wall"`). Profiles
 (Nsight Compute) run after every round, each arm's in a process of its own, never in a timed one.
 
+Run by a node's session, a window builds beside the node's other jobs, packed as any job is, and holds its
+GPUs alone only for what it measures: each case's rounds run inside a window the harness asks the session
+for (`dew.telemetry.benchmark.exclusive_window`), and a case's profiles inside one of their own.
+
     python tools/timing.py run MANIFEST.json --out DIR    # DIR/timing.jsonl's rows, DIR/profiles' reports
     python tools/timing.py jobs --ref SHA KIND=MANIFEST.json ... > JOBS.json   # a window a GPU kind
     python tools/timing.py worker                         # one process's arms, JSON lines on stdin and stdout
@@ -29,6 +33,7 @@ device_ms (the sum), kernels ([name, ms], launch order), wall_ms, digest, evicte
 process's compilation cache is new to its window), gpu (name, uuid, driver, clocks as the round began)."""
 import argparse
 import contextlib
+import functools
 import hashlib
 import importlib
 import importlib.util
@@ -39,6 +44,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import TextIO
 
 TOOLS = Path(__file__).resolve().parent
 INSTRUMENT = TOOLS.parent / "src/dew/telemetry/benchmark.py"
@@ -83,9 +89,11 @@ def built(case: dict, cell: dict, arm: dict) -> tuple:
     return getattr(module, function)(cell, arm.get("implementation"))
 
 
+@functools.cache
 def instrument():
-    """dew.telemetry.benchmark as the window holds it, loaded from its file under a name of its own (it
-    imports only jax, numpy and the standard library), so an arm's tree's own copy is never read."""
+    """dew.telemetry.benchmark as the window holds it, loaded once from its file under a name of its own (it
+    imports only jax, numpy and the standard library), so an arm's tree's own copy is never read, and Dew
+    itself is not imported by a process that has opened a backend (its numerical policy would warn)."""
     spec = importlib.util.spec_from_file_location("_timing_instrument",
                                                   os.environ.get("DEW_TIMING_INSTRUMENT", INSTRUMENT))
     module = importlib.util.module_from_spec(spec)
@@ -245,6 +253,30 @@ def gpu() -> dict:
     return {"name": name, "uuid": uuid, "driver": driver, "sm_clock": sm, "memory_clock": memory}
 
 
+def rounded(case: dict, units: list[dict], rows: TextIO, order: int) -> int:
+    """`case`'s built `units` timed in interleaved rounds, the warm-up's first: each call's row written to
+    `rows`, numbered from `order`. The number the next call takes."""
+    for round_ in range(-case.get("warmup", WARMUP), case.get("rounds", ROUNDS)):
+        facts = gpu()
+        for index, _ in enumerate(case["cells"]):
+            mine = [unit for unit in units if unit["index"] == index]
+            for unit in mine if round_ % 2 == 0 else mine[::-1]:
+                answer = unit["process"].ask({
+                    "op": "time", "key": unit["key"], "repeats": case.get("repeats", 5),
+                    "evict": case.get("evict", False), "draws": case.get("draws", 1),
+                    "index": round_ * case.get("repeats", 5)})
+                for repeat, called in enumerate(answer["calls"]):
+                    rows.write(json.dumps({
+                        "case": case["name"], "cell": unit["cell"], "arm": unit["arm"]["name"],
+                        "tree": unit["built"]["tree"], "jax": unit["built"]["jax"],
+                        "implementation": unit["arm"].get("implementation"), "round": round_,
+                        "warmup": round_ < 0, "repeat": repeat, "order": order, **called,
+                        "digest": unit["built"]["digest"], "evicted": case.get("evict", False),
+                        "cache": "cold", "gpu": facts}) + "\n")
+                order += 1
+    return order
+
+
 def run(manifest: dict, out: Path, repo: Path) -> int:
     """Every case of `manifest` built, timed in interleaved rounds and profiled: its rows in
     out/timing.jsonl."""
@@ -275,24 +307,8 @@ def run(manifest: dict, out: Path, repo: Path) -> int:
                                                 "arm": arm})
                         units.append({"key": key, "index": index, "cell": cell, "arm": arm,
                                       "process": worker_of, "built": answer})
-                for round_ in range(-case.get("warmup", WARMUP), case.get("rounds", ROUNDS)):
-                    facts = gpu()
-                    for index, _ in enumerate(case["cells"]):
-                        mine = [unit for unit in units if unit["index"] == index]
-                        for unit in mine if round_ % 2 == 0 else mine[::-1]:
-                            answer = unit["process"].ask({
-                                "op": "time", "key": unit["key"], "repeats": case.get("repeats", 5),
-                                "evict": case.get("evict", False), "draws": case.get("draws", 1),
-                                "index": round_ * case.get("repeats", 5)})
-                            for repeat, called in enumerate(answer["calls"]):
-                                rows.write(json.dumps({
-                                    "case": case["name"], "cell": unit["cell"], "arm": unit["arm"]["name"],
-                                    "tree": unit["built"]["tree"], "jax": unit["built"]["jax"],
-                                    "implementation": unit["arm"].get("implementation"), "round": round_,
-                                    "warmup": round_ < 0, "repeat": repeat, "order": order, **called,
-                                    "digest": unit["built"]["digest"], "evicted": case.get("evict", False),
-                                    "cache": "cold", "gpu": facts}) + "\n")
-                            order += 1
+                with instrument().exclusive_window():
+                    order = rounded(case, units, rows, order)
                 for unit in units:
                     unit["process"].ask({"op": "release", "key": unit["key"]})
     finally:
@@ -307,28 +323,31 @@ def run(manifest: dict, out: Path, repo: Path) -> int:
 
 def profiled(case: dict, out: Path, repo: Path) -> None:
     """Each of `case`'s cells and arms profiled by Nsight Compute (`profile`: its kernel regex, count,
-    sections and source-level sampling), each in a process of its own, its report under out/profiles."""
+    sections and source-level sampling), each in a process of its own, its report under out/profiles, all of
+    them inside one window a node's session gives (`dew.telemetry.benchmark.exclusive_window`)."""
     profile = case["profile"]
     (out / "profiles").mkdir(exist_ok=True)
-    for index, cell in enumerate(case["cells"]):
-        for arm in case["arms"]:
-            tree = checkout(arm.get("tree"), out, repo)
-            sections = [word for section in profile.get("sections", NCU_SECTIONS)
-                        for word in ("--section", section)]
-            sampling = ["--section", "SourceCounters"] if profile.get("pcsamp") else []
-            report = out / "profiles" / f"{case['name']}-{index}-{arm['name']}"
-            request = json.dumps({"op": "once", "case": case, "cell": cell, "arm": arm})
-            variables = {**os.environ, **arm.get("env", {}),
-                         "PYTHONPATH": os.pathsep.join([str(tree / "src"), str(tree), str(tree / "tools")]),
-                         "DEW_TIMING_SETUP": arm.get("setup") or ""}
-            # Profiling off until the worker's `once` starts it around its second call, so no compile,
-            # autotuning or warm-up launch is what ncu captures.
-            subprocess.run(["ncu", "--profile-from-start", "off", "-k", f"regex:{profile['kernel']}",
-                            "-c", str(profile.get("count", 1)),
-                            *sections, *sampling, "-o", str(report), sys.executable, str(TOOLS / "timing.py"),
-                            "worker", "--clock", "wall"],
-                           input=request + "\n" + json.dumps({"op": "quit"}) + "\n", text=True,
-                           cwd=tree, env=variables, check=True)
+    trees = {arm["name"]: checkout(arm.get("tree"), out, repo) for arm in case["arms"]}
+    with instrument().exclusive_window():
+        for index, cell in enumerate(case["cells"]):
+            for arm in case["arms"]:
+                tree = trees[arm["name"]]
+                sections = [word for section in profile.get("sections", NCU_SECTIONS)
+                            for word in ("--section", section)]
+                sampling = ["--section", "SourceCounters"] if profile.get("pcsamp") else []
+                report = out / "profiles" / f"{case['name']}-{index}-{arm['name']}"
+                request = json.dumps({"op": "once", "case": case, "cell": cell, "arm": arm})
+                path = os.pathsep.join([str(tree / "src"), str(tree), str(tree / "tools")])
+                variables = {**os.environ, **arm.get("env", {}), "PYTHONPATH": path,
+                             "DEW_TIMING_SETUP": arm.get("setup") or ""}
+                # Profiling off until the worker's `once` starts it around its second call, so no compile,
+                # autotuning or warm-up launch is what ncu captures.
+                subprocess.run(["ncu", "--profile-from-start", "off", "-k", f"regex:{profile['kernel']}",
+                                "-c", str(profile.get("count", 1)),
+                                *sections, *sampling, "-o", str(report), sys.executable,
+                                str(TOOLS / "timing.py"), "worker", "--clock", "wall"],
+                               input=request + "\n" + json.dumps({"op": "quit"}) + "\n", text=True,
+                               cwd=tree, env=variables, check=True)
 
 
 LEVEL = 0.95
@@ -348,7 +367,7 @@ def summarized(manifest: dict, out: Path) -> None:
     `order`'s case, cell and arm) and each round's GPU."""
     import statistics
 
-    from dew.telemetry import benchmark
+    benchmark = instrument()
 
     rows = [json.loads(line) for line in (out / "timing.jsonl").read_text().splitlines()]
     cases, lines = [], []
@@ -429,10 +448,10 @@ WINDOW_MINUTES = 15
 
 def jobs(ref: str, manifests: dict[str, Path], name: str) -> dict:
     """One measurement window a GPU kind, as `dewops.node` takes them (`node submit`): each a timing
-    (`"kind"`), alone on its GPU, at `ref`, running this harness over that kind's manifest (beside the jobs'
-    file, which stages it as $SESSION/extra/<its name>), its minutes a minute for each 60 timed calls past
-    `WINDOW_MINUTES` (the measurement lane batches every pending measurement of a kind into its window, bible
-    §6)."""
+    (`"kind"`), packed beside the node's other jobs and alone on its GPU around its rounds, at `ref`, running
+    this harness over that kind's manifest (beside the jobs' file, which stages it as $SESSION/extra/<its
+    name>), its minutes a minute for each 60 timed calls past `WINDOW_MINUTES` (the measurement lane batches
+    every pending measurement of a kind into its window, bible §6)."""
     windows = []
     for kind, path in manifests.items():
         manifest = json.loads(path.read_text())

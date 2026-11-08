@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `dew.telemetry.benchmark.exclusive_window(cores=None)` holds a job's measured region alone on its node's GPUs
+  where a node's session runs the job. It asks the session for a window (`$OUT/window`, a byte to
+  `$SESSION/wake`), waits for the grant, synchronizes the device and runs the block; on exit it synchronizes,
+  gives the window back and waits for the session to take back what it gave. A session that cannot give it
+  raises `WindowRefused`. Without `$SESSION` it does nothing. `tools/timing.py` runs each case's rounds, and its
+  profiles, inside one, so a timing or profile job shares its node with other jobs through its builds and holds
+  the GPUs alone only for what it measures.
 - Dreamer 4's tokenizer (`CausalTokenizer`) reads its tokens' places by two-axis rotary positions
   (`positions="rotary"`, the default), as the paper does, and RMS-normalizes its latents before the
   squeeze; tutorial 12's tokenizer, trained 8,000 updates, now reconstructs its balls (held-out squared
