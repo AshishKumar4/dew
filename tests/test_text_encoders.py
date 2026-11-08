@@ -29,7 +29,7 @@ from interop_support import respelled
 from reference_error import as_given, assert_as_exact
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec, T5Text
-from dew.nn.text_encoders import CLIPModel, translate_config
+from dew.interop.text_encoders import CLIPModel, translate_config
 from dew.registry import to_record
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"

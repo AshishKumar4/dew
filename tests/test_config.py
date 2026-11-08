@@ -161,7 +161,8 @@ def test_a_token_budget_refuses_a_ramp_or_a_budget_under_one_token():
 def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
     """The data's batch stage is the run's one batch: a budget of tokens an update sets the
     accumulation to that many of the data's token batches (`TrainerConfig.accumulating`), and refuses
-    data batched in rows, a budget no whole number of its batches, or an accumulation set otherwise."""
+    data batched in rows, a budget no whole number of its batches, phases of other token batches, or an
+    accumulation set otherwise."""
     trainer = TrainerConfig(update_tokens=98304, steps=1)
     tokens = Loader(train=lambda partition: iter(()), val=None, records=None, batch=8, batch_tokens=24576)
     assert trainer.accumulating(tokens).accumulation == 4
@@ -173,6 +174,12 @@ def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
             trainer.accumulating(refused)
     with pytest.raises(ValueError):
         dataclasses.replace(trainer, accumulation=3).accumulating(tokens)
+    # Phases of one token batch accumulate alike; phases of 24,576 then 12,288 tokens, which one
+    # accumulation would pool into updates of 98,304 then 49,152 tokens, are refused (row 4885).
+    alike = dataclasses.replace(tokens, batches=(8, 8), token_batches=(24576, 24576))
+    assert trainer.accumulating(alike).accumulation == 4
+    with pytest.raises(ValueError):
+        trainer.accumulating(dataclasses.replace(alike, batches=(8, 4), token_batches=(24576, 12288)))
 
 
 @dataclasses.dataclass(frozen=True)

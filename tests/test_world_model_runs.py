@@ -113,6 +113,23 @@ def test_each_stage_from_its_record_trains_as_the_stage_composed_in_python(stage
     assert_bitwise(stages.dynamics, trained)
 
 
+def test_a_tokenizer_run_saved_before_rotary_positions_reads_as_it_learned_them(stages, tmp_path):
+    """A tokenizer stage records its tokenizer's positions, "rotary" by default (Dreamer 4's, row 4669), and
+    reads back with them; one saved before the tokenizer took them, its record stating none, reads as it
+    trained, its places learned vectors alone (`earlier_tokenizer_positions`), so its saved tokenizer
+    computes as it was trained."""
+    record = json.loads((stages.root / "tokenizer" / "run.json").read_text())
+    model = record["fields"]["model"]
+    assert {**model.get("defaults", {}), **model["fields"]}.get("positions") == "rotary"
+    frame = (SIZE, SIZE, 1)
+    assert RunConfig.load(str(stages.root / "tokenizer")).model.build(frame=frame).positions == "rotary"
+    earlier = {**model, **{part: {name: value for name, value in model.get(part, {}).items()
+                                  if name != "positions"} for part in ("fields", "defaults")}}
+    fields = {**record["fields"], "model": earlier}
+    (tmp_path / "run.json").write_text(json.dumps({**record, "fields": fields}))
+    assert RunConfig.load(str(tmp_path)).model.build(frame=frame).positions == "learned"
+
+
 def test_a_dynamics_stage_names_the_step_it_read_of_its_tokenizer_and_reads_back_as_itself(stages):
     """A dynamics stage that names its tokenizer's run alone resolves, as it starts, the tokenizer's latest
     step, which its record then names; the run.json it writes reads back as the stage, as does each

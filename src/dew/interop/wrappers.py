@@ -27,9 +27,9 @@ from dew.interop.safetensors_io import LazyTensors
 
 if TYPE_CHECKING:
     from dew.interop.decoder_parts import DecoderFields
+    from dew.interop.towers.common import ProjectorLayout, TowerLayout
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.multimodal import MultimodalTransformer
-    from dew.nn.vision.common import ProjectorLayout, TowerLayout
 
 type TextConfig = Mapping[str, object]
 
@@ -146,8 +146,8 @@ def wrapper_layout(model: MultimodalTransformer, *,
     rest by their records), and its tensors under the wrapper's names. `config` is a loaded source's own
     config.json, which a save writes as published."""
     from dew.interop import hf_decoders
+    from dew.interop.towers import projector_layout, tower_layout
     from dew.nn.multimodal import MultimodalTransformer
-    from dew.nn.vision.common import projector_layout, tower_layout
     from dew.registry import from_record, projectors, towers
 
     wrapper = from_record(MultimodalTransformer, model)

@@ -22,6 +22,7 @@ from dew.nn.kernels.templates.attention import (
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
+    BlockMap,
     Dropout,
     Gradients,
     Hooks,
@@ -292,13 +293,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     (`gradient.dropout_centre`); then dQ and the dQ program's hook gradients under it, `D` refined once from
     its own sums (`gradient.refinement`)."""
     batch, queries, heads, _ = query.shape
-    # The logits' scale as the forward took it: 1 for raw products, scaled in the weights (`how`).
-    factor = scale if how.factor is None else 1.0
-    keys, kv_heads = key.shape[1], key.shape[2]
-    group = heads // kv_heads
+    keys = key.shape[1]
+    factor, group, bounds = _launched(query, key, spans, scale, how, block_q, block_k)
     blocks = queries // block_q
-    start, end, query_ids, key_ids = spans
-    bounds = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
     summed = tuple(kind in DQ_GRADS for kind in score_kinds)
 
     def program(index):
@@ -408,6 +405,16 @@ def _dq_outputs(dq, rows_out, chosen, written, kinds: tuple[Kind, ...], blocks: 
     return jnp.swapaxes(queried(dq), 1, 2), tuple(queried(x) for x in rows_out), queried(chosen), grads
 
 
+def _launched(query, key, spans: tuple, scale: float, how: algebra.Recompute, block_q: int, block_k: int
+              ) -> tuple[float, int, BlockMap]:
+    """A backward launch's facts of its call: the logits' scale as the forward took it (1 for raw products,
+    scaled in the weights, `how`), the query heads a key head serves, and its spans' `(start, end, query
+    ids, key ids)` block map at its tiles."""
+    start, end, query_ids, key_ids = spans
+    return (scale if how.factor is None else 1.0, query.shape[2] // key.shape[2],
+            block_map(KeySpans(start, end, query_ids, key_ids, key.shape[1]), block_q, block_k))
+
+
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params, *,
                 score_mod, score_kinds: tuple[Kind, ...], scale: float, prescale: float, grad_scale: float,
                 how: algebra.Recompute, block_q: int, block_k: int, accurate: bool, drop=None):
@@ -416,13 +423,9 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     key and tile parameters' gradients (`DKV_GRADS`, `[B, H, Kp]` and `[B, H, Qp, Kp]`)."""
 
     batch, queries, heads, _ = query.shape
-    # The logits' scale as the forward took it: 1 for raw products, scaled in the weights (`how`).
-    factor = scale if how.factor is None else 1.0
-    keys, kv_heads = key.shape[1], key.shape[2]
-    group = heads // kv_heads
+    keys = key.shape[1]
+    factor, group, ranges = _launched(query, key, spans, scale, how, block_q, block_k)
     blocks = keys // block_k
-    start, end, query_ids, key_ids = spans
-    ranges = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
 
 
     def program(index):
@@ -495,12 +498,9 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     and cotangents recomputed once where the two launches recompute them twice. dQ `[B, Qp, H, D]` fp32, dK
     and dV a query head's `[B, Kp, H, ...]`."""
     batch, queries, heads, width = query.shape
-    factor = scale if how.factor is None else 1.0
-    keys, kv_heads = key.shape[1], key.shape[2]
-    group = heads // kv_heads
+    keys = key.shape[1]
+    factor, group, ranges = _launched(query, key, spans, scale, how, block_q, block_k)
     blocks = keys // block_k
-    start, end, query_ids, key_ids = spans
-    ranges = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
 
     def program(index):
         row, head = index // heads, index % heads

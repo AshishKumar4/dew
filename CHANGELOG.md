@@ -16,6 +16,17 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dreamer 4's tokenizer (`CausalTokenizer`) reads its tokens' places by two-axis rotary positions
+  (`positions="rotary"`, the default), as the paper does, and RMS-normalizes its latents before the
+  squeeze; tutorial 12's tokenizer, trained 8,000 updates, now reconstructs its balls (held-out squared
+  error 0.0067 against the mean frame's 0.14; at the 2,000 updates the tutorial as recorded trains,
+  0.12). A run saved before reads `positions="learned"`, as it
+  trained.
+- Phases (`dew.data.phases`, `dew.data.schedule`) may each read batches of their own: a phase's end on the
+  step clock is the records of the phases before it and its own steps in its own rows, each batch steps a
+  program of its own, and under accumulation a phase of another batch than the one before it begins where
+  an update does, refused where it would begin inside one. They were refused unless every phase
+  batched alike.
 - Every release Dew writes is planned once and written once (`dew.interop.releases.ReleasePlan`): `dew
   export`, `Pretrained.save`, `Decide.save_pretrained` and `SavedModel.save_pretrained` each write a plan of
   a model part, a decision head's files, the task's assets and one release record, and `export` returns the

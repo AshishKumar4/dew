@@ -24,7 +24,7 @@ from functools import cache, partial
 import numpy as np
 import torch
 from reference_source import package, published_files
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 REPO, COMMIT = "facebookresearch/jepa", "51c59d518fc63c08464af6de585f78ac0c7ed4d5"
 FILES = {
@@ -91,22 +91,18 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's outputs and gradients under its configuration and weights, in float32 and float64."""
     from torch_precision import widened
 
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        inputs = {key.removeprefix(f"{name}."): value for key, value in cases.items()
-                  if key.startswith(f"{name}.")}
+    def answer(inputs):
         config = {key.removeprefix("config."): value.item() for key, value in inputs.items()
                   if key.startswith("config.")}
         encoder, predictor = build(config)
         with torch.no_grad():
             for key, parameter in trainable(encoder, predictor):
                 parameter.copy_(torch.from_numpy(inputs[f"param.{key}"]))
-        for leaf, value in walked(encoder, predictor, inputs, torch.float32).items():
-            out[f"{name}.reference.{leaf}"] = value
+        reference = walked(encoder, predictor, inputs, torch.float32)
         with widened():
-            for leaf, value in walked(encoder, predictor, inputs, torch.float64).items():
-                out[f"{name}.truth.{leaf}"] = value
-    return out
+            return reference, walked(encoder, predictor, inputs, torch.float64)
+
+    return drawn(cases, answer)
 
 
 if __name__ == "__main__":

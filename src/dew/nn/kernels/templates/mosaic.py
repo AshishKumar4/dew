@@ -309,8 +309,10 @@ class Pieces(tuple):
 class Rows:
     """A block's rows in runs at a table's entries, the toolkit's one table-indexed row form: its run `i`,
     `rows` rows, at run `table[start + i]` of the array's rows (`table` an int32 ref, its entries in runs),
-    its other block indices `rest`, each run a copy of its own (`viewed`'s `Pieces`). A paged pool's key
-    tile across the pages it spans takes a run a page."""
+    its other block indices `rest`: a gathered stream's (`Transport.gathers_rows`), each run copied by the
+    loading warpgroup (`gathered.Ring`), or interpreted where no lane-level copy runs, a piece of its own
+    (`viewed`'s `Pieces`). A paged pool's key tile across the pages it spans takes a run a key
+    (`attention_mosaic_forward.paged_reads`)."""
 
     table: Any
     start: Any
@@ -1640,15 +1642,10 @@ class Transport[Allocated, Opened](abc.ABC):
     (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
 
     copies_in_pieces: bool = True
-    """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`): TMA's each into
-    its own rows of the slot, awaited at the slot's one barrier; cp.async's each a block of its pipeline's
-    own, joined into one tile through registers (`mosaic_sm80.CpAsync.walk`): a paged call's key tile of
-    several pages takes a copy a page."""
-
-    pieces_of_views: bool = True
-    """Whether a block's pieces (`copies_in_pieces`) may be pieces of any view (a TMA ring's: an fp32
-    operand's parts, `Pieces`), where cp.async's are a table's runs alone (`mosaic.Rows`, a paged call's
-    pages: `mosaic_sm80._run`)."""
+    """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`), TMA's each into
+    its own rows of the slot, awaited at the slot's one barrier: an fp32 operand's parts, or an interpreted
+    gathered stream's rows where its copies gather none (`gathers_interpreted`). cp.async's pipeline loads
+    a step's block whole or gathers its rows, and a TPU's DMA a block in one copy."""
 
     gathers_rows: bool = False
     """Whether the warpgroup loading its rings gathers a step's rows from a table (a gathered stream's `Rows`

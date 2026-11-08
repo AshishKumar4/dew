@@ -132,3 +132,18 @@ def test_an_isolated_cell_takes_its_own_directory_and_the_suites_per_test_settin
     assert seen["rungs"] == str(directory / "rungs") and seen["cache"] == str(directory / "data-cache")
     assert seen["answers"] == str(directory / "hub-answers") and os.environ.get("DEW_RUNG_RECORDS") == before
 
+
+
+def test_a_mosaic_cell_runs_only_where_the_device_lowers_its_generations_copies():
+    """On an H100, a cell of an A100's Triton kernels runs, and one of its Mosaic GPU kernels is skipped:
+    Mosaic GPU lowers copies by the device, TMA on an H100, so the A100's cp.async pipelines are not
+    what it runs (`generation_support.lowers_as`). An H100's own Mosaic GPU cell runs."""
+    from dew.nn.kernels import generation
+
+    ran = []
+    with generation.assumed("sm90"):
+        skipped = run_cells([Cell("triton sm80", lambda: ran.append("triton sm80"), "sm80"),
+                             Cell("mosaic sm80", lambda: ran.append("mosaic sm80"), "sm80", mosaic=True),
+                             Cell("mosaic sm90", lambda: ran.append("mosaic sm90"), "sm90", mosaic=True)])
+    assert ran == ["triton sm80", "mosaic sm90"]
+    assert skipped == ["mosaic sm80"]
