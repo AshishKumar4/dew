@@ -190,22 +190,6 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             return prepared
         return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
 
-    def step(state, prepared, issue=None):
-        decay, h = state[:2]
-        natural, values = prepared.values
-        (leaving,) = prepared.split.carry(values, h, issue)
-        decay = _held(decay + natural.astype(decay.dtype))
-        if not isinstance(state, Walk):
-            return decay, leaving
-        if prepared.corrected and state.transfer is None:
-            raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
-        if state.transfer is not None and prepared.transition is None:
-            raise Refused("a walk that carries its transfer steps a chunk prepared without its transition "
-                          "(`prepare(chunk, transition=True)`)")
-        transfer = (None if state.transfer is None
-                    else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
-        return Walk(decay, leaving, transfer)
-
     def mapped(prepared, state, issue=None):
         # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's.
         (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue or _issued)
@@ -228,9 +212,28 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                               {name: chunk[name] for name in names})
         return pullback((d_outputs, d_state))
 
-    return Derived(init, step, merge, finish, mapped,
+    return Derived(init, _stepped, merge, finish, mapped,
                    {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare,
                    replay=replay)
+
+
+def _stepped(state, prepared: Prepared, issue=None):
+    """A walk's state after a prepared chunk (`derive_scan`'s `step`): its decay summed, its state the
+    chunk's carry from it, and where the walk carries its transfer, the chunk's transition composed on it."""
+    decay, h = state[:2]
+    natural, values = prepared.values
+    (leaving,) = prepared.split.carry(values, h, issue)
+    decay = _held(decay + natural.astype(decay.dtype))
+    if not isinstance(state, Walk):
+        return decay, leaving
+    if prepared.corrected and state.transfer is None:
+        raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
+    if state.transfer is not None and prepared.transition is None:
+        raise Refused("a walk that carries its transfer steps a chunk prepared without its transition "
+                      "(`prepare(chunk, transition=True)`)")
+    transfer = (None if state.transfer is None
+                else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
+    return Walk(decay, leaving, transfer)
 
 
 def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
@@ -531,7 +534,7 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool):
     token's output is placed at its row by a constant one-hot column and the rows summed, the carry's own
     language (`carry.split` reads products and sums, not a concatenation)."""
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
-    placed = jnp.eye(B.shape[0], dtype=jnp.float32)
+    placed = jnp.eye(B.shape[0], dtype=B.dtype)
     outputs = 0.0
     for t in range(B.shape[0]):
         decay = decays.entering[0] if t == 0 else decays.between[t, t - 1]
@@ -558,6 +561,7 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     (`linear_scan.Parts`) at the token's values, each in float32 at least."""
     shape = aval(parts.update.jaxpr.invars[0]).shape
     zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
+    carried = at_least_fp32(zero.dtype)  # the parts' constants': a float64 run's are float64
     envs: dict = {}
 
     def read(index: int):
@@ -569,7 +573,7 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
         return env[atom].astype(at_least_fp32(env[atom].dtype))
 
     def along(term, extent: int):
-        value = linear_scan.value_of(term, read, shape[0])
+        value = linear_scan.value_of(term, read, shape[0], carried)
         return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
 
     keys, values = shape
@@ -577,7 +581,7 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     corrects = parts.correction is not None
     # A correction `B (X^T D h)` is the transition's `-s B C^T D h`: `C = -X`, of unit strength.
     C = -along(parts.correction, keys) if corrects else jnp.zeros_like(B)
-    s = jnp.float32(1.0 if corrects else 0.0)
+    s = jnp.asarray(1.0 if corrects else 0.0, carried)
     exponent = along(parts.exponent, keys if parts.per_key else 1)
     return exponent, B, U, s, C, along(parts.reader, keys), along(parts.free, values)
 
@@ -627,7 +631,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str):
         for start in starts:
             keys = slice(start, min(start + sub, count))
             if start > first:
-                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start), jnp.float32))
+                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start),
+                                        at_least_fp32(jnp.result_type(left, right, joined))))
             elif start == first:
                 blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * joined[own, keys]))
             else:

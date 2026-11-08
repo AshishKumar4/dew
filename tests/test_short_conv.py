@@ -24,6 +24,7 @@ from reference_error import (
     with_gradients,
     within,
 )
+from test_recurrence_chunk import ROUTES, on_route
 
 from dew.nn.kernels import generation, short_conv
 from dew.nn.linear import causal_conv1d, xla_conv1d
@@ -170,12 +171,20 @@ def row_truth(x, weights, parts, grads, segments):
     ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, True),
     ((2, 9), ((128, None),), 2, True, False, False),
 ])
-def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
+@pytest.mark.parametrize("route", ROUTES)
+def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed, route):
     """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them, at
     lengths that leave runs and a tile partly past the end, and over packed documents that start inside a
     window: bf16 pieces and the projection's bf16 gradient rounded where XLA rounds them, and every fp32 leaf
     (a call's of fp32 pieces, and the taps' and bias's gradients, fp32 sums over every token whatever the
-    pieces' dtype) on par with XLA's from float64 over seeded draws (check 1)."""
+    pieces' dtype) on par with XLA's from float64 over seeded draws (check 1), on each route's bundle
+    (`on_route`)."""
+    with on_route(route):
+        computes_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed)
+
+
+def computes_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
+    """`test_the_kernels_compute_causal_conv1d`'s checks on the route in force."""
     segments = documents(*shape) if packed else None
     _, _, _, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
 
