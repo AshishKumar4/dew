@@ -90,12 +90,19 @@ from dew.nn.kernels.templates.cost import estimate
 
 def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype, *, splits: int, peaks: bool,
                training: bool, finishes: bool, certified: int = 0, merges: bool = False,
-               flags: bool = False) -> tuple:
+               flags: bool = False, in_place: bool = False) -> tuple:
     """`_launch`'s outputs' types: a peak walk's maxima and anchor keys; a training walk's status, residual
     rows, anchor keys and split sums; else its status and output `[B, S·Qp, H, Dv]` (a split launch's slices
     along its query axis), and its finished rows where it `finishes`. A split launch that `merges` its slices
     gives their status, its merged output `[B, Qp, H, Dv]` and finished rows `[2, B, H, Qp]`; the slices'
-    states its merge reads are a workspace it takes in place (`_Read.slots`), no output."""
+    states its merge reads are a workspace it takes in place (`_Read.slots`), no output. A launch `in_place`
+    into the plain launch's outputs (`_Read.into`) writes them in place and declares none of its own: a
+    masked launch's programs that walk nothing write nothing, and an output they could leave unwritten (its
+    rows' status, which none reads) is uninitialized memory (NSNAN-2). It merges nothing."""
+    if in_place:
+        if merges:
+            raise ValueError("a launch into the plain launch's outputs merges no slices")
+        return ()
     rows_out = splits * queries
     # A plain launch that `flags` its rows states their rewalk and their block's beside their maxima
     # (`_Flags`).
@@ -1804,15 +1811,8 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                          parts=parts)
     out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
-                          certified=steps if certified else 0, merges=merges, flags=flags)
-    # A launch into the plain launch's outputs (`_Read.into`) writes them in place and declares no output of
-    # its own: a masked launch's programs that walk nothing write nothing, and an output they could leave
-    # unwritten (its rows' status, which none reads) is uninitialized memory (NSNAN-2). It merges nothing.
-    in_place = read.into is not None
-    if in_place:
-        if merges:
-            raise ValueError("a launch into the plain launch's outputs merges no slices")
-        out_type = ()
+                          certified=steps if certified else 0, merges=merges, flags=flags,
+                          in_place=read.into is not None)
     layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training),
                      relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None)
 
@@ -1843,11 +1843,10 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                streamed, block.first, read.spans, read.hooked, (row, head), hooks=hooks,
                                interpret=interpret)
                 return
-            written = ((None, *read.into) if in_place
-                       else (*refs.written, *read.slots) if merges else refs.written)
+            written = _written_refs(refs.written, read)
             # A block of the columns writes its own of the output's, the whole call's in place.
             columns_at = (pl.ds(column * value_width, value_width)
-                          if column is not None and (column_blocks > 1 or in_place) else None)
+                          if column is not None and (column_blocks > 1 or read.into is not None) else None)
             status, out_view, finished, residuals, certify, merging = _written_views(
                 block, written, tuple(stage.at[index] for stage in refs.stages), training=training,
                 finishes=finishes, columns_at=columns_at, certified=certified,
@@ -1892,6 +1891,15 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                                       hook_reduces(hooks) or hooks.output_mod is not None,
                                                       guarded=read.guard is not None or flags)
                          )(query, key, value, *leaves)
+
+
+def _written_refs(written: tuple, read: _Read) -> tuple:
+    """The refs a forward program writes its outputs into (`_Block`'s views read them by place): its
+    launch's outputs, the plain launch's held in place where it writes `into` them (its status place None,
+    `_Block.status`), and a merging launch's slots after them (`_Read.slots`)."""
+    if read.into is not None:
+        return (None, *read.into)
+    return written if read.slots is None else (*written, *read.slots)
 
 
 def _program_views(family: mosaic.Family, refs, read: _Read, *, peaks: bool, group: int, page: int | None,
