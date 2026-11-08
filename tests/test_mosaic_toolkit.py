@@ -1276,7 +1276,7 @@ def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product
 
 
 def _read_ahead(interpret):
-    """A launch adding its first operand, read ahead of its wait (`mosaic.dependent`'s `ahead`, `settled`),
+    """A launch adding its first operand, read ahead of its wait (`bodies.dependent`'s `ahead`, `settled`),
     to its second, read after it."""
     def ahead(weights_ref):
         return weights_ref[...]
@@ -1291,7 +1291,7 @@ def _read_ahead(interpret):
 
 
 def test_a_launch_reads_ahead_of_its_wait_only_what_its_program_takes_whole():
-    """A launch reading an operand ahead of its wait (`mosaic.dependent`'s `settled`) lowered for an H100: the
+    """A launch reading an operand ahead of its wait (`bodies.dependent`'s `settled`) lowered for an H100: the
     compile point takes it where the operand is the program's input, through a nested program's call and a
     loop that hands it back each trip unchanged (`lowered.unsettled`), and refuses it where the program
     produces the operand or a loop's trip changes it, before compiling (`report.compiled`)."""
@@ -1327,7 +1327,7 @@ def test_a_launch_reads_ahead_of_its_wait_only_what_its_program_takes_whole():
 
 @INTERPRETS
 def test_a_launch_runs_what_it_reads_ahead_of_its_wait_once_and_hands_it_on():
-    """Interpreted, a launch reading its first operand ahead of its wait (`mosaic.dependent`'s `ahead`) adds
+    """Interpreted, a launch reading its first operand ahead of its wait (`bodies.dependent`'s `ahead`) adds
     it to its second, as the program's sum does."""
     rng = np.random.default_rng(3601)
     weights, x = (jnp.asarray(rng.standard_normal((128, 64)), jnp.float32) for _ in range(2))

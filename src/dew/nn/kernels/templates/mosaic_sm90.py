@@ -10,7 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import fed, mosaic, resources
+from dew.nn.kernels.templates import bodies, fed, mosaic, resources
 
 
 class WgmmaLayout:
@@ -99,13 +99,13 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
-        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
     def products(self, acc, lhs, rhs, *, accumulate: bool = True):
-        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         mosaic.committed()
         if interpret:
             fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
@@ -123,7 +123,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         return super().read(value, first=first, columns=columns)
 
     def register_products(self, acc, parts, rhs):
-        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         for formed in parts:
             part = mosaic.unscaled_part(formed)
             mosaic.committed()
@@ -136,7 +136,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         """`Family.summed` into a scoped warpgroup accumulator: reading it (`acc_ref[...]`) waits on the
         products `issue` issued into it, so the value is theirs once they are done."""
-        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         if interpret:
             return issue(self.zeros(shape))
 

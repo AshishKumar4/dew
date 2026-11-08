@@ -269,17 +269,17 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
 
 
 class Unsettled(ValueError):
-    """A program whose launch reads an operand ahead of its wait (`mosaic.dependent`'s `settled`) that is not
+    """A program whose launch reads an operand ahead of its wait (`bodies.dependent`'s `settled`) that is not
     an input of the program no operation of it produces: the launch before it may still be writing it."""
 
 
 def unsettled(lowered: jax.stages.Lowered) -> list[str]:
-    """Each operand a launch of `lowered` reads ahead of its wait (`mosaic.SETTLED`) that the program
+    """Each operand a launch of `lowered` reads ahead of its wait (`bodies.SETTLED`) that the program
     produces, or that reaches the launch through an operation this walk does not see through, by the
     launch's target and the operand's index. An operand is settled where it is the entry's argument, passed
     through calls (each call of a function), through a loop that hands it back unchanged each trip, and
     through a per-shard region (`sdy.manual_computation`), whose block arguments are its operands."""
-    from dew.nn.kernels.templates.mosaic import SETTLED
+    from dew.nn.kernels.templates.bodies import SETTLED
 
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"

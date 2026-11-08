@@ -251,7 +251,7 @@ class SettledDonated(ValueError):
 
 def settled(value) -> bool:
     """Whether `value` is, as its program was handed it, an argument the program declares settled
-    (`program`'s `settled`): one its launches may read ahead of their wait (`mosaic.dependent`), which the
+    (`program`'s `settled`): one its launches may read ahead of their wait (`bodies.dependent`), which the
     compile point holds to an input of the program no operation of it produces (`lowered.unsettled`)."""
     return id(value) in _SETTLED.get()
 
@@ -274,7 +274,7 @@ class OuterProgram:
     `lower` and `trace` are its jit's. Called within another trace (a `jax.grad`, a `jax.vmap`, an
     enclosing jit), it is its jit, which the enclosing program compiles as its own. Its `settled` arguments
     (positions) are those no executable of the run writes, which its launches may read ahead of their wait
-    (`settled`, `mosaic.dependent`): a call blocks once on each array of them not yet settled and marks it,
+    (`settled`, `bodies.dependent`): a call blocks once on each array of them not yet settled and marks it,
     and no Dew program donates a marked array (`unsettle` first)."""
 
     CACHED: ClassVar[int] = 4096
