@@ -227,7 +227,7 @@ def test_a_launch_inside_a_loop_or_a_branch_is_run_trip_by_trip():
     x = jnp.ones((4, 8), jnp.float32)
     programs = {"scan": lambda x: jax.lax.scan(lambda c, _: (launch(c), None), x, length=3)[0],
                 "while": lambda x: jax.lax.fori_loop(0, 2, lambda _, c: launch(c), x),
-                "cond": lambda x: jax.lax.cond(True, launch, lambda x: x, x)}
+                "cond": lambda x: jax.lax.cond(x[0, 0] > 0, launch, lambda x: x, x)}
     trips = {"scan": 3, "while": 2, "cond": 1}
     for name, program in programs.items():
         found = launched_outputs(program, x)
