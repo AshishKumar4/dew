@@ -87,9 +87,13 @@ its parts is read from the source's own modeling code."""
 BATCH, LENGTH = 2, 12
 """The probe's token grid, which the committed fixtures share."""
 _DRAWN = (8, 16)
-"""Each of check 1's draws' token grid (`logits_parity`, `gradient_parity`): enough tokens that a
-gradient summed over them (an embedding's rows, a norm's scale, a learned activation's scalars) is
-filled on every draw, so its error over the draws sizes, as a test's `model_draw` draws 8 x 16."""
+"""Each of check 1's draws of the logits' token grid (`logits_parity`), as a test's `model_draw` draws:
+past LENGTH, so a window the probe tells conventions apart by is applied on every draw."""
+_GRADIENT_DRAWN = (128, 4)
+"""Each of check 1's draws of the gradients' token grid (`gradient_parity`): many short sequences, so a
+gradient summed over the draw is filled, and a recurrence's backward, which carries one rounding event
+along a sequence into every parameter, sums over enough independent sequences for its error to size
+(Falcon-H1's mamba sizes at 128 x 4, not at 64 x 8 nor 8 x 16)."""
 
 _HEAD_DIM = 16
 _VOCAB = 256
@@ -893,8 +897,9 @@ def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
                 for path, leaf in flax_traverse.flatten_dict(tree['params']).items()}
 
     def draw(seed: int):
-        ids = probe_ids(_VOCAB, seed, _DRAWN)
-        cotangent = np.random.RandomState(11 + seed).standard_normal((*_DRAWN, _VOCAB)).astype(np.float32)
+        ids = probe_ids(_VOCAB, seed, _GRADIENT_DRAWN)
+        cotangent = np.random.RandomState(11 + seed).standard_normal((*_GRADIENT_DRAWN, _VOCAB)).astype(
+            np.float32)
         reference = theirs(source.reference, ids, cotangent, 'float32')
         with _wide(), jax.enable_x64(new_val=True):
             truth = theirs(source.twin, ids, cotangent.astype(np.float64), 'float64')
