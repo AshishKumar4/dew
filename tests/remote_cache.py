@@ -45,6 +45,7 @@ background thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 """
 
 import contextlib
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -58,6 +59,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 
 FAILURES = 3
@@ -208,8 +210,16 @@ class RemoteCache:
                 if file in self.held:
                     return
                 self.held[file] = set()
-            entries = self._fetched(file)
-            borrowed = [] if entries else self._siblings(file)
+            # What a prepare fetched into the directory ahead for it (`prefetch`), its values there already,
+            # with no request; else the Worker's bundle, or another cut's for a recut group.
+            if (record := taken_prefetched(self.directory, self._key(file))) is not None:
+                with self.state:
+                    self.chunked[file] = record["chunks"]
+                entries = [(key, None) for keys in record["chunks"] for key in keys]
+                borrowed = [(key, None) for key in record["borrowed"]]
+            else:
+                entries = self._fetched(file)
+                borrowed = [] if entries else self._siblings(file)
         except UNREACHABLE as error:
             self._failed(error)
             return
@@ -231,7 +241,7 @@ class RemoteCache:
                 # `closed` writes them into its own bundle under its own cut, once.
                 for key, value in borrowed:
                     keys.append(key)
-                    if self._seeded(key, value):
+                    if value is not None and self._seeded(key, value):
                         new += 1
                         self.seen.add(key)
             except UNREACHABLE as error:
@@ -244,16 +254,11 @@ class RemoteCache:
         with self.lock:
             self.programs_fetched += new
 
-    def _fetched(self, file: str) -> list[tuple[str, bytes | None]]:
+    def _fetched(self, file: str) -> list[tuple[str, bytes]]:
         """The entries of `file`'s bundle on the Worker, each of its chunks in turn up to the first it
         lacks; none where it has none or the remote was given up. An answer counts as one only once its
-        programs are in the directory (`opened`). A bundle a prepare fetched into the directory already
-        (`prefetch`) is its programs' keys alone, no value to write, with no request."""
-        if (held := read_prefetched(self.directory).get(self._key(file))) is not None:
-            with self.state:
-                self.chunked[file] = held
-            return [(key, None) for keys in held for key in keys]
-        entries: list[tuple[str, bytes | None]] = []
+        programs are in the directory (`opened`)."""
+        entries: list[tuple[str, bytes]] = []
         chunks: list[list[str]] = []
         for index in range(CHUNKS):
             if self.given_up:  # checked as each request is made
@@ -271,36 +276,10 @@ class RemoteCache:
         return entries
 
     def _siblings(self, file: str) -> list[tuple[str, bytes]]:
-        """For split group `file` with no bundle of its own, the entries of up to SIBLINGS groups of its
-        file's other cuts whose share of the file overlaps its own, the nearest overlap first, together
-        within MAX_BYTES; none for a file that is no split group."""
-        group = GROUP.match(file)
-        if group is None or self.given_up:
-            return []
-        index, count = int(group["index"]), int(group["count"])
-        start, end = (index - 1) / count, index / count
-        overlaps = []
-        for name in itertools.islice(self.store.keys(f"{self._key(group['path'])}/"), SIBLING_KEYS):
-            other = GROUP.match(f"{group['path']}/{name}")
-            if other is None or other["rest"] != group["rest"] or int(other["count"]) == count:
-                continue
-            at, of = int(other["index"]), int(other["count"])
-            low, high = (at - 1) / of, at / of
-            if low < end and high > start:
-                overlaps.append((min(end, high) - max(start, low), name))
-        entries, left = [], MAX_BYTES
-        for _, name in sorted(overlaps, reverse=True)[:SIBLINGS]:
-            if self.given_up or left <= 0:
-                break
-            try:
-                bundle = self.store.get(self._key(f"{group['path']}/{name}"), limit=left)
-            except ValueError:  # past what is left, or no whole bundle: the next may fit
-                continue
-            if bundle is not None:
-                left -= len(bundle)
-                with self.lock:
-                    self.bytes_fetched += len(bundle)
-                entries += unpacked(bundle)
+        """`siblings` of `file` on the Worker, unless the remote was given up, each bundle read counted."""
+        entries, read = siblings(self.store, self._key, file, lambda: self.given_up)
+        with self.lock:
+            self.bytes_fetched += read
         return entries
 
     def _seeded(self, key: str, value: bytes) -> bool:
@@ -421,43 +400,100 @@ def seeded(directory: Path, key: str, value: bytes) -> bool:
     return True
 
 
-PREFETCHED = ".prefetched.json"
-"""In a cache directory, the bundles a prepare fetched into it (`prefetch`): each chunk's programs by the
-bundle's key on the Worker, which a run's `opened` restores from the directory with no request."""
+def siblings(store: r2.Store, key: Callable[[str], str], file: str,
+             stopped: Callable[[], bool]) -> tuple[list[tuple[str, bytes]], int]:
+    """For split group `file` with no bundle of its own, the entries of up to SIBLINGS groups of its file's
+    other cuts whose share of the file overlaps its own, the nearest overlap first, together within
+    MAX_BYTES, and the bytes read; none for a file that is no split group, nor once `stopped`. `key` is a
+    bundle's key on the Worker."""
+    group = GROUP.match(file)
+    if group is None or stopped():
+        return [], 0
+    index, count = int(group["index"]), int(group["count"])
+    start, end = (index - 1) / count, index / count
+    overlaps = []
+    for name in itertools.islice(store.keys(f"{key(group['path'])}/"), SIBLING_KEYS):
+        other = GROUP.match(f"{group['path']}/{name}")
+        if other is None or other["rest"] != group["rest"] or int(other["count"]) == count:
+            continue
+        at, of = int(other["index"]), int(other["count"])
+        low, high = (at - 1) / of, at / of
+        if low < end and high > start:
+            overlaps.append((min(end, high) - max(start, low), name))
+    entries, left = [], MAX_BYTES
+    for _, name in sorted(overlaps, reverse=True)[:SIBLINGS]:
+        if stopped() or left <= 0:
+            break
+        try:
+            bundle = store.get(key(f"{group['path']}/{name}"), limit=left)
+        except ValueError:  # past what is left, or no whole bundle: the next may fit
+            continue
+        if bundle is not None:
+            left -= len(bundle)
+            entries += unpacked(bundle)
+    return entries, MAX_BYTES - left
 
 
-def read_prefetched(directory: Path) -> dict[str, list[list[str]]]:
-    """The bundles fetched into `directory` ahead (`PREFETCHED`); none where nothing was."""
-    path = directory / PREFETCHED
-    return json.loads(path.read_text()) if path.is_file() else {}
+PREFETCHED = ".prefetched"
+"""In a cache directory, a record of each bundle a prepare fetched into it (`prefetch`), by its key's
+digest: the programs of each of its chunks, or, for a recut group with none of its own, those it borrowed
+from its file's other cuts (`siblings`). A run's `opened` restores the bundle from the directory with no
+request and removes its record, so a later run of it asks the Worker again (`taken_prefetched`)."""
+
+
+def prefetched_path(directory: Path, key: str) -> Path:
+    return directory / PREFETCHED / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+
+
+def taken_prefetched(directory: Path, key: str) -> dict | None:
+    """The record of bundle `key` a prepare fetched into `directory` (`prefetch`), removed as it is read:
+    `chunks` and `borrowed`; None where none is."""
+    path = prefetched_path(directory, key)
+    try:
+        record = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    path.unlink(missing_ok=True)
+    return record
 
 
 def prefetch(directory: Path, url: str, token: str, prefix: str, bundles: list[str]) -> int:
     """`bundles` (each a test file's in its partition, `bundle`) fetched from the Worker into `directory`,
-    each chunk of each, and named in its PREFETCHED, so a run on a GPU that opens them finds them there and
+    each chunk of each, or, for a recut group with no bundle of its own, its file's other cuts' it overlaps
+    (`siblings`), each recorded there (`PREFETCHED`), so a run on a GPU that opens them finds them there and
     asks nothing (Main, 2026-11-08: a cold on-demand A100 started each part's files fetching them as they
-    ran): the programs written. A remote that cannot be reached stops it where it is, the bundles fetched so
-    far named, and the run fetches the rest itself."""
+    ran, and a tier's groups are recut as its GPU seconds move): the programs written. A remote that cannot
+    be reached stops it where it is, the bundles fetched so far recorded, and the run fetches the rest
+    itself."""
     store = r2.Store(url, token, "dew-ci-xla-cache", TIMEOUT_SECONDS)
     directory.mkdir(parents=True, exist_ok=True)
-    held, written = read_prefetched(directory), 0
+
+    def key(name: str) -> str:
+        return f"{prefix.strip('/')}/bundles/{name}"
+
+    written = 0
     try:
         for name in bundles:
-            key, chunks = f"{prefix.strip('/')}/bundles/{name}", []
+            chunks, borrowed = [], []
             for index in range(CHUNKS):
-                body = store.get(chunk(key, index), limit=MAX_BYTES)
+                body = store.get(chunk(key(name), index), limit=MAX_BYTES)
                 if body is None:
                     break
                 entries = unpacked(body)
                 written += sum(seeded(directory, program, value) for program, value in entries)
                 chunks.append([program for program, _ in entries])
-            if chunks:
-                held[key] = chunks
+            if not chunks:
+                entries, _ = siblings(store, key, name, lambda: False)
+                written += sum(seeded(directory, program, value) for program, value in entries)
+                borrowed = [program for program, _ in entries]
+            if chunks or borrowed:
+                path = prefetched_path(directory, key(name))
+                path.parent.mkdir(exist_ok=True)
+                staged = path.with_suffix(".partial")
+                staged.write_text(json.dumps({"chunks": chunks, "borrowed": borrowed}))
+                staged.replace(path)
     except UNREACHABLE as error:
         logger.warning("the shared XLA cache is unreachable (%s); the run fetches the rest", error)
-    staged = directory / f"{PREFETCHED}.partial"
-    staged.write_text(json.dumps(held))
-    staged.replace(directory / PREFETCHED)
     return written
 
 
