@@ -779,8 +779,8 @@ def _random_bits(params, operands, result, fmt):
 
 def _unset(params, operands, result, fmt):
     """An uninitialized buffer (`empty2`, JAX's filler for the residual slots a `cond`'s other branch defines:
-    conditionals.py `_join_cond_outputs`): no arithmetic and no value of anyone's, so whatever it holds keeps
-    it; a computation reading it is held by its own contract and by the program's check 1."""
+    conditionals.py `_join_cond_outputs`): no arithmetic, and the taken branch never reads the other
+    branch's slots, so no value of it is any computation's."""
     return np.ones(np.shape(result), bool)
 
 
