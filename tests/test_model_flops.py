@@ -497,6 +497,21 @@ def test_lm_counts_only_the_prediction_depths_the_loss_trains(mtp_weight):
     assert objective.training_flops(None, batch) == 3 * (trunk + depths)
 
 
+@pytest.mark.parametrize("exit_entropy", [None, 0.1])
+def test_lm_counts_the_head_over_every_pass_the_exit_objective_scores(exit_entropy):
+    """Ouro's exit objective (`LMObjective.exit_entropy`) scores each of a loop's three passes through the
+    head, so its forward and its training count the head three times; without it the last pass's
+    alone."""
+    model = decoder(loop=Loop(3, layers=(1, 3), exit_gate=True))
+    objective = LMObjective(model, seq_len=6, exit_entropy=exit_entropy)
+    batch = packed_batch()
+    passes = 1 if exit_entropy is None else 3
+    trunk = model.model_flops(objective.real_lengths(batch))
+    head = model.logits_flops(objective._prediction_lengths(batch))
+    assert objective.model_flops(None, batch) == trunk + passes * head
+    assert objective.training_flops(None, batch) == 3 * (trunk + passes * head)
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_prediction_depth_work_excludes_pad_holes_and_unscored_document_boundaries(packed):
     model = decoder(num_nextn_predict_layers=2)
@@ -716,13 +731,19 @@ GATED_NORM_SITES = ("embedding_layernorm", "norm", "input_layernorm", "post_atte
     {"embedding_norm": True, "embedding_norm_reads": "lookup", "embedding_features": 4},
     {"loop": Loop(3, reinject=True)},
     {"loop": Loop(3, layers=(1, 2)), "final_norm": False},
-], ids=["projected-lookup", "reinjecting-loop", "stepped-loop-unnormed-end"])
+    {"loop": Loop(3, exit_gate=True)},
+    {"loop": Loop(3, layers=(0, 2), exit_gate=True)},
+    {"loop": Loop(3, exit_gate=True), "final_norm": False},
+], ids=["projected-lookup", "reinjecting-loop", "stepped-loop-unnormed-end", "gated-loop", "gated-loop-coda",
+        "gated-loop-unnormed-end"])
 def test_gated_norms_count_each_run_at_its_width(fields):
     """A norm gated by a low-rank map of its own output (`NormSpec.gate_rank`, A.X-K2's) counts its gate's
     two maps each time a call runs it, at its width: the embedding's at the lookup's where it norms the
     lookup before `project_in`, the final one's after the stack and before or between a loop's passes
-    (seven runs of a reinjecting loop of three, two of a stepped one whose stack ends in no norm), and a
-    layer's before its sublayers: as many products as the forward traces beside the ungated decoder's."""
+    (seven runs of a reinjecting loop of three, two of a stepped one whose stack ends in no norm; under an
+    exit gate each pass's exit read through it, which serves the step's norm where no coda runs between
+    them, and none where the stack ends in no norm), and a layer's before its sublayers: as many products
+    as the forward traces beside the ungated decoder's."""
     lengths = np.array([4, 4], np.int64)
     operands = (jnp.ones((2, 4), jnp.int32),)
 

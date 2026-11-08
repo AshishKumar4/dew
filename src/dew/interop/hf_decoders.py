@@ -142,6 +142,13 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     return translate_config(_text_config(hf_config))
 
 
+_WRAPPER_TEXT_SCOPE: Mapping[str, tuple[str, tuple[str, ...]]] = {
+    "sensenova_loop": ("sensenova_loop_text", ("loop_settings", "mhc"))}
+"""A wrapper whose language model reads settings the wrapper states at its own scope: the type it reads as
+and those keys, which join its text_config (`_text_config`): SenseNova-Loop's loop and streams
+(`families.sensenova`)."""
+
+
 _TEXT_TYPES = {"lfm3_vl": "lfm3"}
 """A wrapper's text model type where its config class builds another than `<wrapper>_text`: Lfm3VlConfig
 defaults its text_config to Lfm3Config (configuration_lfm3_vl.py, `__post_init__`)."""
@@ -264,6 +271,10 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     text = dict(typed_part(hf_config, text, "text"))
+    scoped = _WRAPPER_TEXT_SCOPE.get(_records.text(hf_config.get("model_type"), "model_type"))
+    if scoped is not None:
+        model_type, keys = scoped
+        text = {**text, "model_type": model_type, **{key: hf_config[key] for key in keys if key in hf_config}}
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -447,6 +458,18 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     if video is not None:
         video = _records.integer(video, "video_token_id")
     return _wrapper_fields(family, used, text, tower, projector, image, None, video=video)
+
+
+def _sensenova_loop_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
+    """Read SenseNova-Loop (sensenova/SenseNova-Loop-9B-Preview's remote code): Qwen 3.5's wrapper, whose
+    language model reads the loop and the mHC streams its wrapper states (`families.sensenova`,
+    `_text_config`), its tower Qwen 3.5's, a Conv3d patch embedding as `patch_conv3d` states."""
+    used.update(("loop_settings", "mhc", "model_name", "auto_map"))
+    if hf_config.get("patch_conv3d", True) is not True:
+        refuse(f"patch_conv3d {hf_config.get('patch_conv3d')!r}",
+               "Qwen 3.5's tower embeds patches by a Conv3d")
+    used.add("patch_conv3d")
+    return _qwen35_wrapper(hf_config, used)
 
 
 def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -646,6 +669,7 @@ _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
+    "sensenova_loop": _sensenova_loop_wrapper,
     "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper,
     **dict.fromkeys(_TEXT_VLMS, _text_vlm_wrapper)}
 

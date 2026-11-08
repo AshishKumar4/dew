@@ -54,7 +54,7 @@ from dew.nn.precision import capped_logits, head_product, scaled_logits
 if TYPE_CHECKING:
     from dew._records import JSON
     from dew.nn.backbones.decoder_block import RematPolicy
-    from dew.nn.backbones.decoder_stack import DecoderBank, StackView
+    from dew.nn.backbones.decoder_stack import DecoderBank, Loop, StackView
     from dew.nn.continuum import HeadTerms, LevelTerms
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
@@ -705,16 +705,38 @@ class StagedStacks(Protocol):
     def stage_sites(self, store: VariableDict, stages: int) -> tuple[DecoderBank, ...]: ...
 
 
+ExitPasses = tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]]
+"""What a looped decoder's forward gathered of its exits (`Looped.exit_passes`): the states the head reads
+of each pass before the last, and every pass's exit-gate logit."""
+
+
+@runtime_checkable
+class Looped(Protocol):
+    """A decoder whose layer stack may run a block of its layers over its own output (`Loop`), None
+    where it runs it once, and, where its loop gates its exits, what a forward with the `exits`
+    collection open gathered of them: the states the head reads of each pass before the last, and every
+    pass's exit-gate logit, as its own scope holds them in `collections`."""
+
+    @property
+    def loop(self) -> Loop | None: ...
+
+    def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses: ...
+
+
 @runtime_checkable
 class Looping(Protocol):
     """A model whose layer stack can run a block of it several times over its own output,
     and the same model at `steps` passes of its block (None keeps its count), or of the block
     `layers`, [first, end), which gives a model with no loop one; None where they cannot.
-    `backprop_steps` trains through the final passes and `remat` checkpoints each pass;
-    None keeps an existing loop's value, or a fresh loop's default."""
+    `backprop_steps` trains through the final passes, `remat` checkpoints each pass, `implicit`
+    takes each later pass by the θ-method, `exit_gate` weighs each pass's exit and `exit_threshold`
+    exits each token where they reach it; None keeps an existing loop's value, or a fresh loop's
+    default."""
 
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
-                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None: ...
+                    backprop_steps: int | None = None, remat: bool | None = None,
+                    implicit: bool | None = None, exit_gate: bool | None = None,
+                    exit_threshold: float | None = None) -> Self | None: ...
 
 
 @runtime_checkable
