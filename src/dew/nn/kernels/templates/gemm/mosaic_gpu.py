@@ -1742,7 +1742,12 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                     return
                 place = _tgmm_place(m, depth.start + wg * depth_half, columns.start, tiles)
                 if tail is None:
-                    store(0, summed, o_gmem.at[g_i], place)
+                    # Its columns as its family reads them out (`chunks`: a register home's whole,
+                    # tensor memory's a chunk at a time), each at its column.
+                    row_start, first_row, stored, column, *ladder = place
+                    for start_column, (chunk,) in family.chunks((summed,)):
+                        at = column + start_column if start_column else column
+                        store(0, chunk, o_gmem.at[g_i], (row_start, first_row, stored, at, *ladder))
                     return
                 first, gathered = gathered
                 family.fixed_up(summed, workspace.at[:, 0, wg], None if ready is None else ready.at[:, wg],
