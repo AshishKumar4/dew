@@ -454,9 +454,9 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     with a zero step, which neither decays nor writes. `chunk` divides the backward's block
     (`block_positions`), which starts from a chunk's entering state the forward keeps."""
     # The backward's plan its caller derived (`Selective.derived`), else this device's, interpreted the
-    # interpreted bundle's generation's (`generation.INTERPRETED_GENERATION`).
-    positions, resident = plan or backward_plan(generation.gpu_target(
-        generation.INTERPRETED_GENERATION if interpret else None))
+    # interpreted target's (`generation.interpreted_target`).
+    positions, resident = plan or backward_plan(generation.interpreted_target() if interpret
+                                                else generation.gpu_target())
     if block_scan.THREADS * positions % chunk:
         raise ValueError(f"a chunk of {chunk} tokens divides no backward block of "
                          f"{block_scan.THREADS * positions}: its blocks start at no kept state")
@@ -553,8 +553,8 @@ class Selective(base.Template[Tiles]):
         from dew.nn.kernels.templates import bundles
 
         del return_residuals
-        family = (bundles.INTERPRETED if interpret
-                  else bundles.of(generation.device_generation(), jnp.result_type(x)))
+        family = bundles.of((generation.interpreted_target().generation if interpret
+                             else generation.device_generation()), jnp.result_type(x))
         assert family is not None, "a bundle claims the device's family (`recurrence_chunk.selective_kernel`)"
         return selective_scan(x, dt, A, B, C, D, state, starts, family=family, chunk=config.chunk,
                               interpret=interpret, plan=(config.positions, config.resident)), None
@@ -589,10 +589,10 @@ class Selective(base.Template[Tiles]):
 
     @staticmethod
     def _facts(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> generation.GpuTarget:
-        """The facts a call's launches run by: `target`'s, interpreted the interpreted bundle's generation's
-        (`generation.INTERPRETED_GENERATION`)."""
+        """The facts a call's launches run by: `target`'s, interpreted the interpreted target's
+        (`generation.interpreted_target`)."""
         interpreted = ba.arguments.get("interpret", False)
-        return generation.gpu_target(generation.INTERPRETED_GENERATION) if interpreted else target
+        return generation.interpreted_target() if interpreted else target
 
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
         return super().legal(ba, config, self._facts(ba, target))
@@ -612,8 +612,7 @@ class Selective(base.Template[Tiles]):
 
         arguments = ba.arguments
         x, dt, b, c = (arguments[name] for name in ("x", "dt", "B", "C"))
-        family = bundles.INTERPRETED if arguments.get("interpret", False) else bundles.of(target.generation,
-                                                                                            x.dtype)
+        family = bundles.of(self._facts(ba, target).generation, x.dtype)
         assert family is not None, f"no bundle of the template claims {target.generation} (`eligible`)"
         return resources.shared_bytes(family, forward_scope(family, config.chunk, b.shape[-1],
                                                             (x.dtype, dt.dtype, b.dtype, c.dtype),

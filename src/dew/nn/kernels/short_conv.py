@@ -98,12 +98,11 @@ def preactivation(window, taps, bias):
 
 
 def _launched(interpret: bool):
-    """The family the kernels issue by, and whether they interpret (off a GPU, the interpreted bundle's)."""
-    from .templates import bundles
+    """The family the kernels issue by, and whether they interpret (`mainloop.issued`)."""
     from .templates.recurrence import mainloop
 
-    family = mainloop.family_of(jnp.float32)
-    return {"family": family or bundles.INTERPRETED, "interpret": interpret or family is None}
+    family, interpreted = mainloop.issued(jnp.float32)
+    return {"family": family, "interpret": interpret or interpreted}
 
 
 def _forward(x, taps, bias, valid, documents, parts, activation: bool, eps: float, dtype, interpret: bool):

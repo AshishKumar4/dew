@@ -7,6 +7,7 @@ import contextlib
 import dataclasses
 import functools
 import itertools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -78,6 +79,34 @@ def formed(forms: str, fn):
             return fn(*args, **kwargs)
 
     return run
+
+
+
+ROUTES = (None, 'sm80') if jax.default_backend() != 'gpu' else (None,)
+"""The routes an interpreted check runs (`on_route`), each a GPU's own bundle at its own facts: the
+interpreter's (`generation.interpreted_target`, wgmma's at the widest tiles that hold) and an A100's
+(mma.sync's at its derived tiles), whose arithmetic the interpreter runs as the A100 does (launch by launch
+to 1e-4, M-JS-29d): wgmma's alone interpreted, an A100's wrong Kimi delta attention gradients went unseen off
+a GPU (row 5194). On a GPU, the device's own alone."""
+
+
+def on_route(route: str | None):
+    """Within the block, an interpreted check's launches take `route`'s bundle and facts (`ROUTES`)."""
+    return generation.assumed(route, interpreted=True) if route else contextlib.nullcontext()
+
+
+def routed(check) -> Callable:
+    """The decorator making `check` the test it decorates, run on each route (`ROUTES`, `on_route`): its
+    name and documentation the test's, its one parameter the route."""
+    def run(route):
+        with on_route(route):
+            check()
+
+    def declared(test):
+        run.__name__, run.__qualname__, run.__doc__ = test.__name__, test.__qualname__, test.__doc__
+        return pytest.mark.parametrize('route', ROUTES)(run)
+
+    return declared
 
 
 def chunk_on(kernel: str, hooks, *args, **kwargs):
