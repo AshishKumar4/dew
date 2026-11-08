@@ -77,6 +77,8 @@ EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
 """The worker of the pools that run on the examples clock."""
 READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pool that counts the rounds a fit agrees its reads in."""
+REPLICA_KEY = Path(__file__).with_name("replica_key_worker.py")
+"""The worker of the pool that recovers a lost key from a replica."""
 CLOCKED = 17
 """The examples a pool's run bounded in examples is bounded to: of ten records, seven read twice, and in
 one global order a last global batch of one row, which one share holds and the other does not."""
@@ -1431,7 +1433,7 @@ def test_a_process_that_lost_its_copy_of_a_key_of_another_implementation_recover
     recovered from a replica as every other leaf is: the process that lost it holds zeros in its own
     implementation's words, from a concrete key's template and from a shape's (`_zeros`), and receives
     the holder's words, which draw what the key draws."""
-    for report in run_pool("replica_key", tmp_path / "pool", 2):
+    for report in run_pool("replica_key", tmp_path / "pool", 2, script=REPLICA_KEY):
         assert report["zeros"] == [[4], [4]]
         for name in ("key", "shape"):
             assert report[name] == report["expected"]
