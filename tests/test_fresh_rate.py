@@ -6,6 +6,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 from test_optim import assert_updates_as
@@ -25,8 +26,8 @@ def test_a_fresh_group_claims_the_fresh_modules_ahead_of_its_own_patterns():
     one before the run names them."""
     grouped = OptimConfig(learning_rate=RATE, param_groups=(
         dataclasses.replace(FRESH, patterns=("head/*",)), BASE)).with_fresh(("layers_1/cross_attention",))
-    assert grouped.param_groups == (
-        dataclasses.replace(FRESH, patterns=("layers_1/cross_attention/*", "head/*"), fresh=False), BASE)
+    claimed = ("layers_1/cross_attention", "layers_1/cross_attention/*", "head/*")
+    assert grouped.param_groups == (dataclasses.replace(FRESH, patterns=claimed, fresh=False), BASE)
     plain = OptimConfig(learning_rate=RATE, param_groups=(BASE,))
     assert plain.with_fresh(("layers_1/cross_attention",)) == plain
     claiming = OptimConfig(learning_rate=RATE, param_groups=(FRESH, BASE))
@@ -109,6 +110,41 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     assert {label for path, label in labels.items() if path[0] != "head" and not crossing(path)} == {"base"}
     assert decision(variables=None).fresh_modules() == ()
     assert decision(variables=declared.init(jax.random.key(0))).fresh_modules() == ()
+
+
+def test_a_parameter_a_loaded_module_gains_starts_at_its_draw_and_trains_in_the_fresh_group():
+    """A loaded decoder whose modules gain parameters of their own, an exit gate a loop gives it
+    (`Pretrained.with_model`) or DEX's projections and lambda in its attention (`Pretrained.with_dex`),
+    starts each at its initializer's draw, the loaded weights as they were, and names each by its path
+    among what it drew fresh (`Pretrained.fresh`): a fresh group claims that parameter alone, by its own
+    path, as it claims a fresh module's (`OptimConfig.with_fresh`), and the loaded parameters stay in the
+    base group. A model that gains none keeps the source's tree."""
+    from flax.traverse_util import flatten_dict
+    from test_decision_context import LLAMA
+
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import _initialized
+    from dew.nn.backbones.decoder_stack import Loop
+    from dew.nn.dex import DifferentialExtension
+    from dew.nn.inputs import request_key
+
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    gated = source.with_model(dataclasses.replace(source.model, loop=Loop(steps=2, exit_gate=True)), key=3)
+    assert gated.fresh == ("early_exit_gate/bias", "early_exit_gate/kernel")
+    drawn = flatten_dict(_initialized(gated.model, request_key(3))["params"])
+    held = flatten_dict(gated.variables["params"])
+    for path in (("early_exit_gate", "kernel"), ("early_exit_gate", "bias")):
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(drawn[path]))
+    for path, leaf in flatten_dict(source.variables["params"]).items():
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(leaf))
+    once = source.with_model(dataclasses.replace(source.model, loop=Loop(steps=2)), key=3)
+    assert once.fresh == () and once.variables is source.variables
+    extended = source.with_dex(DifferentialExtension(((0, (1, 3)),), anneal_steps=10, trains="all"), key=0)
+    assert extended.fresh and all(name.startswith("layers_0/") for name in extended.fresh)
+    for variant in (gated, extended):
+        claimed = OptimConfig(param_groups=(FRESH, BASE)).with_fresh(variant.fresh).param_groups
+        labels = labelled(claimed, variant.variables["params"])
+        assert {"/".join(path) for path, label in labels.items() if label == "fresh"} == set(variant.fresh)
 
 
 def groups(root, name: str) -> tuple[ParamGroup, ...]:

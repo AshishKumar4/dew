@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.traverse_util import unflatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import _records
@@ -205,14 +205,20 @@ def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], boo
     XLA; with `shaped`, a source loaded without its weights, their shapes alone."""
     from dew.batch import select, thaw
     from dew.nn.inputs import request_key
+
+    def drawn(draw: jax.Array) -> Variables:
+        return select(thaw(_initialized(model, draw)), selected)
+
+    return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
+
+
+def _initialized(model: nn.Module, key: jax.Array) -> Variables:
+    """`model`'s variables drawn from `key`, plain, over a token more than the prediction depths it carries,
+    which each read one further on (`_extension_drawn`)."""
     from dew.nn.protocols import Predicting
 
     length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
-
-    def drawn(draw: jax.Array) -> Variables:
-        return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))), selected)
-
-    return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
+    return unboxed(model.init(key, jnp.zeros((1, length), jnp.int32)))
 
 
 @dataclass(frozen=True)
@@ -295,9 +301,10 @@ class Pretrained:
     source's own transformers loader as the source does; read from the source's snapshot, which a
     weights conversion may not be, when the save writes it."""
     fresh: tuple[str, ...] = ()
-    """The modules of `model` drawn fresh beside the loaded weights, by their paths under `params`
-    (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run trains in a fresh group
-    (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
+    """What of `model` was drawn fresh beside the loaded weights, by its path under `params`: a module
+    (`layers_1/cross_attention`, what `with_cross_attention` adds) or a parameter a loaded module gained
+    (`layers_1/self_attn/lambda_q1`, what `with_dex` and `with_model` draw), which a run trains in a fresh
+    group (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     numerics: Numerics | None = None
     """The numerics the load was asked for (`load(precision=...)`), whose dtypes it computes and stores
     in and whose products' precision and forms its tasks trace under (`formed`), a saved run's those its
@@ -652,6 +659,32 @@ class Pretrained:
                              base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
+    def with_model(self, model: nn.Module, *, key: int | jax.Array) -> Self:
+        """This source with `model` in its model's place, every parameter `model` declares that the source
+        holds none of drawn from its initializer under `key` (`_extension_drawn`) and named among what it
+        drew fresh (`fresh`), so a run trains it in its fresh group as it trains a module drawn beside the
+        base: a transformation of a loaded model that gives its loaded modules parameters of their own (a
+        loop's) starts them as a fresh model would. A model that declares none is this source's own."""
+        from dew.batch import merge, thaw
+
+        held = {("params", *path) for path in flatten_dict(dict(thaw(self.variables).get("params", {})))}
+        declared = jax.eval_shape(_initialized, model, jax.random.key(0))
+        missing = {("params", *path) for path in flatten_dict(dict(declared.get("params", {})))} - held
+        if not missing:
+            return replace(self, model=model)
+        shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
+        added = _extension_drawn(model, lambda path: tuple(path) in missing, key, shaped=shaped)
+        return self._drawn_beside(model, merge(self.variables, added), added)
+
+    def _drawn_beside(self, model: nn.Module, variables: Variables, added: Variables) -> Self:
+        """This source with `model` over `variables`, each parameter of `added` named among what it drew
+        fresh (`fresh`) by its path under `params`."""
+        from dew.optim import parameter_name
+
+        drawn = {parameter_name(path)
+                 for path, _ in jax.tree_util.tree_leaves_with_path(added.get("params", {}))}
+        return replace(self, model=model, variables=variables, fresh=tuple(sorted({*self.fresh, *drawn})))
+
     def with_cross_attention(self, cross: CrossBlocks, *, key: int | jax.Array,
                              frozen: bool = True) -> Self:
         """Return this source with gated cross-attention before the layers `cross` names, each
@@ -690,7 +723,8 @@ class Pretrained:
         """Return this source with DEX's differential on `extension`'s chosen heads (`dew.nn.dex`), its
         projections drawn from `key` under `params` and its lambdas zero, so the model computes what the
         source does until they train, and each layer's chosen heads and lambda_init held beside them
-        (`dew.nn.dex.DEX_CONSTANTS`); the rest trains as the extension's recipe says
+        (`dew.nn.dex.DEX_CONSTANTS`), its drawn parameters what the source drew fresh (`fresh`), which a run
+        trains in its fresh group; the rest trains as the extension's recipe says
         (`DifferentialExtension.trains`: the paper's, the attention's key, value and output projections
         beside it and the rest under `FROZEN`, or all of it), a source's frozen weights staying frozen. A
         source loaded without its weights takes the extension's shapes. The source's own format holds no
@@ -723,7 +757,7 @@ class Pretrained:
                 return taken and (training is None or path in training or path[-1] in DEX_PARAMETERS)
 
             variables = freeze(variables, lambda path: trains(tuple(map(str, path))))
-        return replace(self, model=model, variables=variables)
+        return self._drawn_beside(model, variables, added)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """Return the tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
