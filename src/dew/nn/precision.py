@@ -496,9 +496,15 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
 
 
 def accumulated(product: Callable[..., jax.Array], *operands,
-                preferred_element_type: DTypeLike | None = None) -> jax.Array:
+                preferred_element_type: DTypeLike | None = None, chained: bool = False) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
-    einsum, a matmul): the plain product, but in a process running wide CPU arithmetic
+    einsum, a matmul): where a CPU runs one of JAX's contractions (`CONTRACTIONS`) of float32 operands,
+    each of its float32 products summed as a vectorized dot sums it (`_summed_pairwise`: a layer's
+    projection's sum, `projection_product`, row 4863), XLA's one FMA chain a sum the mixers' contractions
+    took too (a Mamba layer's chunk einsums: Jamba's and Falcon-H1's logits and gradients apart from
+    their sources'); `chained`, XLA's chain kept, as the algebra's derived products keep it
+    (`dew.algebra.forms.evaluator`: attention's dP and D, whose sums cancel bit for bit on a one-key row
+    only where both sum alike). Elsewhere the plain product, but in a process running wide CPU arithmetic
     (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32 (`products_dtype`) a CPU
     sums the products in float64 and rounds the sum once to the dtype the product returns.
     Each fp32 product is exact in float64, so the result is within half an fp32 ulp of the float64
@@ -526,6 +532,9 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if not _sums_in_float64(*operands):
+        if (not chained and (key := _contraction(product, preferred_element_type)) is not None
+                and products_dtype(*operands) == jnp.dtype(jnp.float32)):
+            return _paired_once(key)(*operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
         return _traced_once(key)(*operands)
@@ -540,9 +549,8 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`), a
     quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
     sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
-    product keeps the declaration), or its dtypes are others. A layer's projections alone: a product the
-    algebra derives or a mixer forms (attention's `dP` and `D`, whose sums cancel bit for bit on a one-key
-    row) keeps XLA's sum."""
+    product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
+    takes it too (`_paired`), but the algebra's derived products (`accumulated`'s `chained`)."""
     from dew.nn import pairwise
 
     if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
@@ -615,6 +623,55 @@ def _traced_once(key: tuple) -> Callable:
     arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
     product = functools.partial(function, *arguments, **keywords)
     return nested(functools.partial(_summed_wide, product, preferred_element_type))
+
+
+@functools.lru_cache(maxsize=1024)
+def _paired_once(key: tuple) -> Callable:
+    """`_summed_pairwise` of the contraction `key` names (`_contraction`) as one program JAX traces once for
+    its operands' types, as `_traced_once` is the wide sum's."""
+    function, tree, leaves = key
+    arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
+    product = functools.partial(function, *arguments, **keywords)
+    return nested(functools.partial(_summed_pairwise, product, preferred_element_type))
+
+
+def _summed_pairwise(product: Callable, preferred_element_type, *operands) -> jax.Array:
+    """`accumulated`'s product of float32 operands: its trace's float32 products each summed as a layer's
+    projection's is (`_paired`); the plain product where its library states its derivative
+    (`_own_backward`)."""
+    narrow = functools.partial(product, preferred_element_type=preferred_element_type)
+    traced = jax.make_jaxpr(narrow)(*operands)
+    if _own_backward(traced.jaxpr):
+        return narrow(*operands)
+    (summed,) = _paired(traced.jaxpr, traced.consts, *operands)
+    return summed
+
+
+def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
+    """`jaxpr` evaluated on `operands`, each `dot_general` in it, a jit's program's included (`jnp.einsum`'s),
+    the product `projection_product` takes where it takes it: a CPU's vectorized-dot sum of float32
+    operands into float32."""
+    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, operands, strict=True))
+
+    def read(atom):
+        return atom.val if isinstance(atom, core.Literal) else values[atom]
+
+    for equation in jaxpr.eqns:
+        given = [read(atom) for atom in equation.invars]
+        params = equation.params
+        inner = params.get("jaxpr")
+        if equation.primitive is jax.lax.dot_general_p and (made := projection_product(
+                jax.lax.dot_general, *given, params["dimension_numbers"], params["precision"],
+                params["preferred_element_type"])) is not None:
+            outputs = [made]
+        elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.ClosedJaxpr):
+            outputs = _paired(inner.jaxpr, inner.consts, *given)
+        else:
+            functions, bound = equation.primitive.get_bind_params(params)
+            made = equation.primitive.bind(*functions, *given, **bound)
+            outputs = made if equation.primitive.multiple_results else [made]
+        values.update(zip(equation.outvars, outputs, strict=True))
+    return [read(atom) for atom in jaxpr.outvars]
 
 
 def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Array:
@@ -698,16 +755,18 @@ def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
 
 
 def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
-                        preferred_element_type: DTypeLike | None = None, **kwargs) -> jax.Array:
+                        preferred_element_type: DTypeLike | None = None, *, chained: bool = False,
+                        **kwargs) -> jax.Array:
     """`jax.lax.dot_general` at `precision`, accumulated as Dew accumulates a CPU's float32 products
-    (`accumulated`): the product a flax layer forms (`nn.Dense(dot_general=...)`). Unstated, JAX's
-    configured precision decides (`jax_default_matmul_precision`), as it does a flax layer's. At the
-    `BF16_BF16_F32` algorithm it is `bf16_dot_general`'s product."""
+    (`accumulated`, its sum XLA's chain where `chained`): the product a flax layer forms
+    (`nn.Dense(dot_general=...)`). Unstated, JAX's configured precision decides
+    (`jax_default_matmul_precision`), as it does a flax layer's. At the `BF16_BF16_F32` algorithm it is
+    `bf16_dot_general`'s product."""
     if _bf16_algorithm(precision):
         return _held(bf16_dot_general(lhs, rhs, dimension_numbers), preferred_element_type, lhs, rhs)
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers,
                                          precision=precision, **kwargs),
-                       lhs, rhs, preferred_element_type=preferred_element_type)
+                       lhs, rhs, preferred_element_type=preferred_element_type, chained=chained)
 
 
 def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike = None,
