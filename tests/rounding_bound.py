@@ -127,6 +127,9 @@ class TapRule:
             unit = _unit(name, params, dtype)
             tap = _mixed(self.key ^ (_GOLDEN * jnp.asarray(index + 1, jnp.uint64)))
             draw = _signs(tap, jnp.shape(value))
+            # An infinite result (a masked logit's -inf carried on) is exact: nothing rounds it, and its
+            # weight, a multiple of its magnitude, is no rounding's.
+            weight = jnp.where(jnp.isfinite(value), weight, 0.0)
             tapped.append(value + self.scale * unit * weight * draw)
         return tapped
 
