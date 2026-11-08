@@ -15,7 +15,11 @@ JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, 
 `jax_compilation_cache_max_size` (Dew sets none) it neither evicts nor stamps them
 (jax/_src/lru_cache.py in jax 0.11.2), so the files a directory gains while a file's tests run are
 the programs they compiled, which a watch of the directory reports as they arrive
-(tools/armada/watched.py's `Writes`), so no switch of bundle lists it. The programs they only read
+(tools/armada/watched.py's `Writes`), so no switch of bundle lists it. A bundle past the Worker's bound
+(`MAX_BYTES`) is kept in chunks of it (`chunk`), each a body of its own, so a file keeps every program
+it compiled: one bundle at the bound dropped the rest, which every run compiled afresh, and a bundle at
+it was never sent again (2026-11-08: the A100 tier's parts compiled 1,767 programs afresh, 922 s,
+their bundles read at 100.0 MB). The programs they only read
 are not seen, so a program another file's bundle brought in joins this file's bundle only where it
 is compiled under it. Each pytest
 worker that keeps a bundle has a directory of its own (conftest), so the files a worker's bundle
@@ -72,6 +76,9 @@ WATCHED = importlib.util.module_from_spec(_WATCHED)
 _WATCHED.loader.exec_module(WATCHED)  # inotify's one reader (tools/armada/watched.py's `Writes`)
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
+CHUNKS = 32
+"""The most chunks of `MAX_BYTES` one file's bundle spans (`chunk`): a file's programs past them go
+without."""
 SIBLINGS = 3
 """The most other-cut groups a recut group seeds from, nearest overlap first, within one `MAX_BYTES`."""
 SIBLING_KEYS = 64
@@ -123,11 +130,15 @@ class RemoteCache:
         self.queued: dict[str, set[str]] = {}
         """The compiled programs each bundle's last upload was made for: a bundle the cap cut short is not
         sent again until its tests compile another."""
+        self.chunked: dict[str, list[list[str]]] = {}
+        """The programs of each chunk of each bundle on the Worker, as read or last written: a chunk that
+        holds the same is not sent again."""
         self.unrestored: set[str] = set()
         """The bundles whose fetched programs did not all reach the directory: never written back, so a
         partial restore does not replace a whole bundle."""
         # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
         self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
+        """Each body to send, by its key on the Worker (a chunk's, `chunk`)."""
         self.uploader = threading.Thread(target=self._uploading, daemon=True, name="xla-cache")
         self.uploader.start()
         self.programs_fetched = self.uploaded = 0
@@ -159,6 +170,9 @@ class RemoteCache:
 
     def _key(self, file: str) -> str:
         return f"{self.prefix}/bundles/{file}"
+
+    def _chunk(self, file: str, index: int) -> str:
+        return chunk(self._key(file), index)
 
     def _programs(self) -> set[str]:
         return {path.name.removesuffix(SUFFIX) for path in self.directory.glob(f"*{SUFFIX}")}
@@ -229,16 +243,25 @@ class RemoteCache:
             self.programs_fetched += new
 
     def _fetched(self, file: str) -> list[tuple[str, bytes]]:
-        """The entries of `file`'s bundle on the Worker; none where it has none or the remote was given
-        up. An answer counts as one only once its programs are in the directory (`opened`)."""
-        if self.given_up:  # checked as each request is made
-            return []
-        bundle = self.store.get(self._key(file), limit=MAX_BYTES)
-        if bundle is None:
-            return []
-        with self.lock:
-            self.bytes_fetched += len(bundle)
-        return unpacked(bundle)
+        """The entries of `file`'s bundle on the Worker, each of its chunks in turn up to the first it
+        lacks; none where it has none or the remote was given up. An answer counts as one only once its
+        programs are in the directory (`opened`)."""
+        entries: list[tuple[str, bytes]] = []
+        chunks: list[list[str]] = []
+        for index in range(CHUNKS):
+            if self.given_up:  # checked as each request is made
+                break
+            bundle = self.store.get(self._chunk(file, index), limit=MAX_BYTES)
+            if bundle is None:
+                break
+            with self.lock:
+                self.bytes_fetched += len(bundle)
+            found = unpacked(bundle)
+            chunks.append([key for key, _ in found])
+            entries += found
+        with self.state:
+            self.chunked[file] = chunks
+        return entries
 
     def _siblings(self, file: str) -> list[tuple[str, bytes]]:
         """For split group `file` with no bundle of its own, the entries of up to SIBLINGS groups of its
@@ -292,8 +315,10 @@ class RemoteCache:
         return True
 
     def closed(self, file: str) -> None:
-        """Bundle `file` written back, where its tests compiled a program it lacked: the programs
-        compiled under it, then those fetched for it, each that fits within `MAX_BYTES`; nothing sent
+        """Bundle `file` written back, where its tests compiled a program it lacked: the programs fetched
+        for it, in its bundle's order, then those compiled under it, in chunks of at most `MAX_BYTES`
+        (`CHUNKS` of them), a program past the bound going without; each chunk sent whose programs differ
+        from what the Worker holds there, so a bundle that grew sends its last chunks alone; nothing sent
         where none of those it lacked fits."""
         if not self.available or file in self.unrestored:
             return
@@ -307,33 +332,45 @@ class RemoteCache:
                 # its file's other cuts (`_siblings`), are not, and are written under its own cut once.
                 if not {*written, *fetched} - self.held.get(file, set()) - self.queued.get(file, set()):
                     return
-            entries, size = [], 0
-            for key in dict.fromkeys([*written, *fetched]):
+            chunks: list[list[tuple[str, bytes]]] = [[]]
+            size = 0
+            for key in dict.fromkeys([*fetched, *written]):
                 path = self.directory / f"{key}{SUFFIX}"
                 if not path.exists():
                     continue
                 cost = HEADER.size + len(key.encode()) + path.stat().st_size
-                if size + cost > MAX_BYTES:  # a program past what is left goes without; the rest may fit
+                if cost > MAX_BYTES:  # a program past the bound goes without; the rest may fit
                     continue
+                if size + cost > MAX_BYTES:
+                    if len(chunks) == CHUNKS:
+                        continue
+                    chunks.append([])
+                    size = 0
                 value = path.read_bytes()
                 size += HEADER.size + len(key.encode()) + len(value)
-                entries.append((key, value))
+                chunks[-1].append((key, value))
         except UNREACHABLE as error:
             self._failed(error)
             return
         with self.state:
             self.queued[file] = {*written, *fetched}
-            if not {key for key, _ in entries} - self.held.get(file, set()):
+            kept = {key for entries in chunks for key, _ in entries}
+            if not kept - self.held.get(file, set()):
                 return  # nothing new fits: the Worker's bundle stays as it is
-            self.held[file] = {key for key, _ in entries}
-        self.uploads.put((file, packed(entries)))
+            self.held[file] = kept
+            held = self.chunked.get(file, [])
+            changed = [index for index, entries in enumerate(chunks)
+                       if index >= len(held) or [key for key, _ in entries] != held[index]]
+            self.chunked[file] = [[key for key, _ in entries] for entries in chunks]
+        for index in changed:
+            self.uploads.put((self._chunk(file, index), packed(chunks[index])))
 
     def _uploading(self) -> None:
         while True:
-            file, bundle = self.uploads.get()
+            key, bundle = self.uploads.get()
             try:
                 if not self.given_up:  # checked as each request is made: a queued bundle goes unsent
-                    self.store.put(self._key(file), bundle)
+                    self.store.put(key, bundle)
                     self._answered()
                     with self.lock:
                         self.uploaded += 1
@@ -371,6 +408,13 @@ def bundle(node: str, group: str | None, worker: str | None) -> str:
     (tools/armada/split.py's `G/N`) and an xdist worker compile apart, so each keeps its own."""
     parts = (group and group.replace("/", "-of-"), worker)
     return "/".join([node.split("::")[0], *(part for part in parts if part)])
+
+
+def chunk(key: str, index: int) -> str:
+    """The Worker's key of chunk `index` of the bundle at `key`: the first is the bundle's own, so a
+    bundle within one chunk is where it always was; each next is `<key>/=<index>`, which no split
+    group's name (`GROUP`) takes for one of its file's cuts."""
+    return key if index == 0 else f"{key}/={index}"
 
 
 HEADER = struct.Struct(">IQ")
