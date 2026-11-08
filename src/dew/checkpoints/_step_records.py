@@ -23,7 +23,8 @@ if TYPE_CHECKING:
 
 
 def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSON, artifact: JSON,
-                boxed: Mapping[tuple[str, ...], LogicalAxes] | None, tree: object = None) -> dict:
+                boxed: Mapping[tuple[str, ...], LogicalAxes] | None,
+                tree: Mapping[str, object] | None = None) -> dict:
     """What a persistent and a local save both record of a step: the leaves of each average it stores as
     their differences from their weights, by the average's name, its control state, its rung, its inference
     artifact, its boxed axes and the implementation of each key its `tree` holds (`key_record`)."""
@@ -31,7 +32,7 @@ def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSO
             "artifact": artifact, "boxed": boxed_record(boxed), "keys": key_record(tree)}
 
 
-def key_record(tree: object) -> dict[str, str]:
+def key_record(tree: Mapping[str, object] | None) -> dict[str, str]:
     """Each key's implementation among `tree`'s arrays, by its dtype's name (`key<rbg>`: "rbg"), which a
     restore types the key's stored data by (`dew.checkpoints._keyed`), as Orbax's array metadata store
     would, which the handler Dew saves with keeps none of (`dew.checkpoints._types`). An implementation

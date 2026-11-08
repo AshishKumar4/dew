@@ -703,7 +703,7 @@ class Trainer(Generic[Loss, Effects]):
         self._resume_rung(checkpoints.rung(resume))
         # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
         # run's own key's.
-        key = state.key if jax.dtypes.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (
+        key = state.key if jnp.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (
             jax.random.wrap_key_data(state.key, impl=jax.random.key_impl(self.key)))
         state = dataclasses.replace(state, key=jax.device_put(key, shardings.key))
         if int(state.window_size) % self.accumulation:
