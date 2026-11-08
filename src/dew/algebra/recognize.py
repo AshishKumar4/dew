@@ -1,23 +1,22 @@
 """Recognition at the compile point (docs/design/algebra.md §2 "Fusion", row 4783): a body's regions written
 as Dew's kernels where they compute what the kernels' calls compute, as the e-graph proves it.
 
-A family (`FAMILIES`) is one kind of call the compile point writes: Dew's RMSNorm, its stream and gated norms,
-and SwiGLU. Its math is declared once, as the call itself on its portable path
-(`implementation='xla'`), the arithmetic its kernels are held to, so no second account of it is written here.
-Around each equation of the family's anchor (a primitive its declaration always holds: `rsqrt`, `logistic`)
-the family names its candidates (`Candidate`): a call over some of the body's values (its operands),
-making some of its values (its results), its static arguments read from the region's own constants (an
-epsilon), each choice the call takes tried rather than assumed. An anchor's candidates go into one
-e-graph (`_equalities`): the equations of the regions they span and every candidate's declaration traced over
-the same operands, made canonical (`normal_form.canonical`) and held in one term region, so a parameter, a
-cast or a constant the two share is one term; then saturated under exactly the rule sets the call's numerics
-admit (`rules.admitted`: the exact sets alone under the accurate forms, so a product reordered or a scale
-moved across one matches only under the fast forms). A candidate whose every result is in its declaration's
-e-class, whose region the body reads nothing of but its results (`_between`), and whose call the family's
-selector gives a kernel of Dew's (`Candidate.taken`) is the call's, its region written as the call
-(`fusion.Written`). Equal, never near: a different constant, cast, axis or order is another program, and stays
-as traced.
-"""
+A family (`ATTENTION`, `NORMS`) is one kind of call the compile point writes: Dew's attention, RMSNorm, its
+stream and gated norms, and SwiGLU. Its math is declared once, as the call itself on its portable path
+(`implementation='xla'`, attention's `'reference'`), the arithmetic its kernels are held to, so no second
+account of it is written here. Around each equation of the family's anchor (a primitive its declaration always
+holds: `exp`, `rsqrt`, `logistic`) the family names its candidates (`Candidate`): a call over some of the
+body's values (its operands), making some of its values (its results), its static arguments read from the
+region's own constants (an epsilon, a softcap, a mask's fill), each choice the call takes tried rather than
+assumed. An anchor's candidates go into one e-graph (`_equalities`): the equations of the regions they span
+and every candidate's declaration traced over the same operands, made canonical (`normal_form.canonical`) and
+held in one term region, so a parameter, a cast or a constant the two share is one term; then saturated under
+exactly the rule sets the call's numerics admit (`rules.admitted`: the exact sets alone under the accurate
+forms, so a product reordered or a scale moved across one matches only under the fast forms). A candidate
+whose every result is in its declaration's e-class, whose region the body reads nothing of but its results
+(`_between`), and whose call the family's selector gives a kernel of Dew's (`Candidate.taken`) is the call's,
+its region written as the call (`fusion.Written`). Equal, never near: a different constant, cast, axis or
+order is another program, and stays as traced. """
 
 from __future__ import annotations
 
@@ -36,9 +35,10 @@ from egglog import eq
 from jax.extend import core as jcore
 
 from dew import _cache
-from dew.algebra import SATURATION, derive, fusion, normal_form, program, rules, terms
+from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program, rules, terms
 from dew.nn.kernels import generation
 from dew.nn.programs import bodies, jax_name
+from dew.nn.sharding import sequence_shards
 
 REACH = 8
 """How far from its anchor a family looks for a candidate's operands and results, in equations: past the
@@ -63,24 +63,26 @@ class Candidate(NamedTuple):
 
 
 class Family(NamedTuple):
-    """A kind of call (`FAMILIES`): its anchor primitive and its candidates around an equation of it."""
+    """A kind of call (`ATTENTION`, `NORMS`): its anchor primitive and its candidates around an equation of
+    it."""
 
     anchor: str
     candidates: Callable[[fusion.Index, int], Iterator[Candidate]]
 
 
-def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int] = frozenset()) -> list[
-        fusion.Written]:
+def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Family],
+               held: frozenset[int] = frozenset()) -> list[fusion.Written]:
     """Every region of `jaxpr` (`index`'s) the e-graph proves computes a family's call and whose call takes
-    a kernel of Dew's, written as that call (the module's account): the families in order, so a gated
-    norm's activation is the norm's rather than a SwiGLU's, an anchor's candidates in the order its family
+    a kernel of Dew's, written as that call (the module's account): `families` in order (`ATTENTION`,
+    `NORMS`), an anchor's candidates in the order its family
     names them, the first equal one taken, no two regions sharing an equation nor one `held` (a product's
     epilogue's). Each region's choice is held by its structure and its constants' values (`_HELD_REGIONS`),
     the body's whole recognition by its structure and constants (`_HELD_BODIES`)."""
-    key = (_body_key(jaxpr, index), held, derive.context(), _cache.KERNEL_CHOICES.value)
+    key = (_body_key(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
+           _cache.KERNEL_CHOICES.value)
     if key not in _HELD_BODIES:
         _HELD_BODIES[key] = [_positioned(jaxpr, written)
-                             for written in _recognizing(jaxpr, index, held)]
+                             for written in _recognizing(jaxpr, index, held, families)]
         if len(_HELD_BODIES) > fusion.DECISIONS_HELD:
             _HELD_BODIES.popitem(last=False)
     _HELD_BODIES.move_to_end(key)
@@ -122,12 +124,13 @@ def _placed(jaxpr: jcore.Jaxpr, held: tuple) -> fusion.Written:
                           tuple(values[place] for place in outputs), at, call)
 
 
-def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int]) -> list[fusion.Written]:
+def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
+                 families: Sequence[Family]) -> list[fusion.Written]:
     """`recognized`'s search."""
     accurate = generation.numerics().forms == "accurate"
     found: list[fusion.Written] = []
     claimed: set[int] = set(held)
-    for family in FAMILIES:
+    for family in families:
         for place, equation in enumerate(jaxpr.eqns):
             if place in claimed or not _holds(equation, family.anchor):
                 continue
@@ -334,7 +337,8 @@ _DECLARATIONS: collections.OrderedDict[Hashable, Callable] = collections.Ordered
 
 def _declaration(candidate: Candidate) -> Callable:
     """`candidate`'s declaration as its traced program over its operands' types, run over values to its
-    results' leaves; traced once for each call, choices and types (`_DECLARATIONS`)."""
+    results' leaves, each of Dew's choices by the platform its default branch (`forms.inlined`); traced once
+    for each call, choices and types (`_DECLARATIONS`)."""
     declared = candidate.declared
     function = declared.func
     cells = tuple(cell.cell_contents for cell in function.__closure__ or ())
@@ -342,7 +346,9 @@ def _declaration(candidate: Candidate) -> Callable:
     key = (function.__code__, _typed(function.__defaults__), _typed(keywords), _typed(cells),
            _typed(tuple(sorted(declared.keywords.items()))), _typed(tuple(candidate.operands)))
     if key not in _DECLARATIONS:
-        traced = jax.make_jaxpr(lambda *values: jax.tree.leaves(declared(*values)))(
+        # Dew's own choices by the platform read as their default branch (`forms.inlined`): its product under
+        # a wide arithmetic is the product a program writes; a program's own choices stay as written.
+        traced = jax.make_jaxpr(lambda *values: jax.tree.leaves(forms.inlined(declared)(*values)))(
             *(_shape(var) for var in candidate.operands))
         _DECLARATIONS[key] = jcore.jaxpr_as_fun(traced)
         if len(_DECLARATIONS) > fusion.DECISIONS_HELD:
@@ -426,19 +432,22 @@ def _walked_back(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.
     return found
 
 
-def _extras(index: fusion.Index, row: jcore.Var, output: jcore.Var) -> list[jcore.Var] | None:
-    """The values beside `row` the equations from it to `output` read: each a value of the body made from
-    neither it nor constants alone (a weight, a gate, a branch), in the order first read; None where `output`
-    is not made from it. Made from the row is read as far as a candidate's operands lie from its results
-    (twice `REACH`)."""
-    descendants = _forward(index, row, 2 * REACH)
-    if output not in descendants:
+def _extras(index: fusion.Index, row: jcore.Var | Sequence[jcore.Var],
+            output: jcore.Var) -> list[jcore.Var] | None:
+    """The values beside `row` (one value, or several: attention's query, keys and values) the equations
+    from it to `output` read: each a value of the body made from neither it nor constants alone (a weight,
+    a gate, a branch, a bias), in the order first read; None where `output` is not made from every one.
+    Made from a row is read as far as a candidate's operands lie from its results (twice `REACH`)."""
+    rows = (row,) if isinstance(row, jcore.Var) else tuple(row)
+    reached = [_forward(index, source, 2 * REACH) for source in rows]
+    if not all(output in found for found in reached):
         return None
+    descendants = set().union(*reached)
     extras: dict[jcore.Var, None] = {}
     seen, frontier = set(), [output]
     while frontier:
         var = frontier.pop()
-        if var in seen or var == row:
+        if var in seen or var in rows:
             continue
         seen.add(var)
         if var not in descendants and not _constant(index, var):
@@ -664,7 +673,179 @@ def _sources(index: fusion.Index, var: jcore.Var, reach: int) -> list[jcore.Var]
     return chain[::-1]
 
 
-FAMILIES = (Family("rsqrt", _norms), Family("logistic", _swiglus))
-"""The calls the compile point recognizes, in the order it looks for them: the norms first, so a gated norm's
-activation is the norm's rather than a SwiGLU's. Attention is `attention_regions`' until its call takes a
-program's mask fill (row 4783)."""
+def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
+    """Softmax attention's candidates around the exponential at `place` (Dew's
+    `scaled_dot_product_attention` over `[B, S, H, D]`): its query and keys the logits product's operands or
+    the values they are made from by up to two equations (a scale, a cast), its values the weights' product's
+    other operand or its source, its result that product's output or a value made of it by up to three (a
+    layout, a cast); a value the region reads beside them a bias where it is floating and a mask where it is
+    boolean, a mask of constants alone folded into the region (`normal_form.canonical`); each scalar constant
+    it divides or multiplies by a softcap, or none, each constant the region selects in place of masked logits
+    its fill, or the call's own, each band its causal mask keeps a sliding window (`_selections`), the call
+    causal or not, its softmax in float32 or in its operands' dtype, and its scale on the query before the
+    product (Flax's) or on the float32 logits after it (jax.nn's), each tried. Its declaration is the call's
+    portable path, on its reference path (`implementation='reference'`), its products as its kernels compute
+    them."""
+    anchor = index.jaxpr.eqns[place].outvars[0]
+    logits = _nearest_product(index, _backward(index, anchor), upstream=True)
+    weighed = _nearest_product(index, _forward(index, anchor), upstream=False)
+    if logits is None or weighed is None:
+        return
+    reached = _forward(index, anchor)
+    query, key = index.jaxpr.eqns[logits].invars
+    values = next((atom for atom in index.jaxpr.eqns[weighed].invars if atom not in reached), None)
+    if not all(isinstance(atom, jcore.Var) for atom in (query, key, values)):
+        return
+    sources = [_sources(index, query, 2), _sources(index, key, 2), _sources(index, values, 2)]
+    made = index.jaxpr.eqns[weighed].outvars[0]
+    farthest_first = sorted(((distance, var) for var, distance in _forward(index, made, 3).items()),
+                            key=lambda pair: -pair[0])
+    for q, k, v in itertools.product(*sources):
+        if q.aval.ndim != 4 or k.aval.ndim != 4 or v.aval.ndim != 4:
+            continue
+        for _, output in farthest_first:
+            if output.aval.shape != (*q.aval.shape[:-1], v.aval.shape[-1]):
+                continue
+            extras = _extras(index, (q, k, v), output)
+            if extras is None or len(extras) > 1:
+                continue
+            logits_shape = (q.aval.shape[0], q.aval.shape[2], q.aval.shape[1], k.aval.shape[1])
+            biases = [var for var in _addends(index, logits, anchor) if var.aval.shape == logits_shape]
+            for extra in ([extras[0]] if extras else [None, *biases]):
+                given = () if extra is None else (extra,)
+                region = _between(index, (q, k, v, *given), (output,)) or ()
+                fills, windows = _selections(index, (q, k, v, *given), region, output)
+                # Under a sequence axis the call takes no fill: its exchanges weigh a masked key nothing.
+                fills = fills if sequence_shards() == 1 else []
+                yield from _attention_candidates(q, k, v, output, extra,
+                                                 [None, *_scalars(index, region, frozenset({"div", "mul"}))],
+                                                 [None, *fills], [None, *windows])
+
+
+def _addends(index: fusion.Index, logits: int, anchor: jcore.Var) -> list[jcore.Var]:
+    """The values added to the logits between their product (at `logits`) and the exponential's
+    `anchor`, each made without the product: a bias a program computes from its own inputs, the queries
+    among them, which `_extras` reads as the region's own arithmetic and not an operand beside it."""
+    product = index.jaxpr.eqns[logits].outvars[0]
+    downstream = _forward(index, product, 2 * REACH)
+    upstream = _backward(index, anchor, 2 * REACH)
+    found: dict[jcore.Var, None] = {}
+    for var in upstream:
+        place = index.producer.get(var)
+        if var not in downstream or place is None or jax_name(index.jaxpr.eqns[place].primitive) != "add":
+            continue
+        for atom in index.jaxpr.eqns[place].invars:
+            if isinstance(atom, jcore.Var) and atom not in downstream:
+                # The addend as the call takes it, `[B, H, Q, K]`: it or a value it is laid out from (a
+                # grouped layout's reshape, a cast).
+                found.update(dict.fromkeys(var for var in _sources(index, atom, REACH) if var.aval.ndim == 4))
+    return list(found)
+
+
+def _nearest_product(index: fusion.Index, reached: dict[jcore.Var, int], *, upstream: bool) -> int | None:
+    """The place of the `dot_general` nearest the anchor among the values `reached` (made from them where
+    `upstream`, reading them otherwise), None where there is none."""
+    places = []
+    for var, distance in reached.items():
+        made = index.producer.get(var)
+        near = ([made] if made is not None else []) if upstream else index.readers[var]
+        places += [(distance, place) for place in near
+                   if jax_name(index.jaxpr.eqns[place].primitive) == "dot_general"]
+    return min(places)[1] if places else None
+
+
+def _attention_candidates(q, k, v, output, extra, softcaps, fills, windows) -> Iterator[Candidate]:
+    """`_attentions`' candidates over one query, keys, values and result (the module's account)."""
+    from dew.nn.attention import scaled_dot_product_attention
+
+    dtype = output.aval.dtype
+    boolean = extra is not None and extra.aval.dtype == jnp.bool_
+    choices = itertools.product((False, True), softcaps, (True, False), (True, False), fills, windows)
+    for causal, softcap, wide, after, fill, window in choices:
+        if window is not None and not causal:
+            continue
+
+        def attend(query, key, value, *given, causal=causal, softcap=softcap, wide=wide, after=after,
+                   fill=fill, window=window, implementation='auto'):
+            extra_ = given[0] if given else None
+            return scaled_dot_product_attention(
+                query, key, value, implementation=implementation, causal=causal, softcap=softcap,
+                sliding_window=window, force_fp32_for_softmax=wide, scale_logits=after, mask_fill=fill,
+                mask=extra_ if boolean else None, bias=None if boolean else extra_).astype(dtype)
+
+        operands = (q, k, v, *([extra] if extra is not None else []))
+        yield Candidate(operands, (output,), attend, functools.partial(attend, implementation='reference'),
+                        functools.partial(_attention_taken, attend, operands))
+
+
+def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequence[int],
+                output: jcore.Var) -> tuple[list[float], list[int]]:
+    """What the region at `places` selects, in its normal form (`normal_form.canonical`: nested programs
+    inlined, constants computed): each constant of one value throughout it selects in place of masked
+    values (a mask's fill: -inf, a finite large negative), and each window a constant causal band mask keeps
+    (a key within `w` positions at or before its query, `w` short of the keys' count: a sliding window),
+    each once."""
+    if not places:
+        return [], []
+    read = (atom for place in places for atom in index.jaxpr.eqns[place].invars
+            if isinstance(atom, jcore.Var) and atom not in index.consts
+            and index.producer.get(atom) not in places)
+    inputs = list(dict.fromkeys([*operands, *read]))
+    run, consts = _window(index, places, inputs, [output])
+    closed = normal_form.canonical(jax.make_jaxpr(lambda *values: run(*consts, *values))(
+        *(_shape(var) for var in inputs)))
+    fills: dict[float, None] = {}
+    windows: dict[int, None] = {}
+    for equation in closed.jaxpr.eqns:
+        if jax_name(equation.primitive) != "select_n":
+            continue
+        for atom in equation.invars:
+            if not isinstance(atom, jcore.Literal):
+                continue
+            held = np.asarray(atom.val)
+            if held.dtype == np.bool_ and held.ndim >= 2:
+                width = _band(held)
+                if width is not None:
+                    windows[width] = None
+            elif held.size and jnp.issubdtype(held.dtype, jnp.floating) and np.all(held == held.flat[0]):
+                fills[float(held.flat[0])] = None
+    return list(fills), list(windows)
+
+
+def _band(mask: np.ndarray) -> int | None:
+    """The width `w` of a causal band `mask` keeps over its last two axes (query, key), the same for every
+    leading index: key `j` kept for query `i` exactly where `0 <= i - j < w`; None where it keeps another
+    pattern, or every key at or before its query (plain causality)."""
+    queries, keys = mask.shape[-2:]
+    distance = np.arange(queries)[:, None] - np.arange(keys)[None, :]
+    for width in range(1, keys):
+        if np.array_equal(np.broadcast_to((distance >= 0) & (distance < width), mask.shape), mask):
+            return width
+    return None
+
+
+KEPT = frozenset({"xla", "reference"})
+"""The attention routes that are no kernel of Dew's."""
+
+
+def _attention_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
+    """Whether Dew's selector gives the call a kernel of its own (the template, FlashAttention, cuDNN; none
+    of `KEPT`): the call traced over its operands' shapes, its attention route read (`generation.routes`);
+    not where a kernel a call names refuses it (`KernelRefused`)."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    with generation.routes(alone=True) as found:
+        try:
+            jax.eval_shape(attend, *(_shape(var) for var in operands))
+        except KernelRefused:
+            # A kernel a call names that does not take the call: the program's own math runs it.
+            return False
+    return any(route.choice == "attention" and route.kernel not in KEPT for route in found)
+
+
+ATTENTION = (Family("exp", _attentions),)
+"""Attention, recognized before the products, so a product inside it is none of theirs."""
+
+NORMS = (Family("rsqrt", _norms), Family("logistic", _swiglus))
+"""The norms, after the products, so an epilogue's norm is the product's; a gated norm before a SwiGLU, so its
+activation is the norm's."""
