@@ -46,6 +46,7 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     gradients,
     interpreted_dot,
+    interpreted_rows,
     kept_dtype,
     kernel_dot,
     key_tiles,
@@ -595,6 +596,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     query, dout = by_power(query_ref[...], prescale), dout_ref[...]
     peak, total = peak_ref[...], total_ref[...]
     product = functools.partial(_issued, interpret=interpret)
+    # D's and the anchor's products with dO, summed as `product` sums dP (`gradient.off_anchor_delta`).
+    row_products = interpreted_rows if interpret else gradient.summed_rows
     start, end = start_ref[...], end_ref[...]
     query_ids = [ref[...] for ref in id_refs[:1]]
 
@@ -629,13 +632,14 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         prior = forward_total_ref[...]
         anchor, delta, key_index = gradient.split_delta(
             others_ref[...], own_ref[...], others_total_ref[...], prior, state_total, anchor_value_ref[...],
-            dout, key_index, shift)
+            dout, key_index, shift, rows=row_products)
     else:
         state = program.off_anchor_pass(bounds_ref[0], bounds_ref[1], formed, before, maximum, key_index,
                                         shift, how, product)
         prior = algebra.power2(state.total, shift)
         anchor, delta, key_index = gradient.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
-                                                            shares[1], key_index, shift)
+                                                            shares[1], key_index, shift,
+                                                            rows=row_products)
     peak = maximum
     index_out_ref[...] = key_index
     summed = tuple(kind in DQ_GRADS for kind in score_kinds)

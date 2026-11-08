@@ -1066,6 +1066,18 @@ def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
     return product.interpreted(declared, a, b, (((a.ndim - 1,), (0,)), ((), ())))
 
 
+def interpreted_rows(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Each row's `a · b` over the last axis, fp32, as `interpreted_dot` issues a product off a GPU: D's and
+    the anchor's products with dO (`attention_gradient.off_anchor_delta`'s `rows`), summed as the CPU arm's
+    dP is, so the anchor key's dP and c cancel exactly."""
+    from dew.nn.kernels.templates import product
+    from dew.nn.precision import products_dtype
+
+    declared = product.declared(products_dtype(a, b), None, outputs=(jnp.float32,))
+    batch = tuple(range(a.ndim - 1))
+    return product.interpreted(declared, a, b, (((a.ndim - 1,), (b.ndim - 1,)), (batch, batch)))
+
+
 def power_of_two(width: int) -> int:
     """The power of two from 16 that holds `width`: a head width a kernel tiles."""
     return max(16, 1 << (width - 1).bit_length())
