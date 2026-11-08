@@ -153,7 +153,7 @@ class Unreadable(ValueError):
 
 def encoded(value: object) -> JSON:
     """`value`, an op's field, a launch's argument or a config, as JSON `decoded` rebuilds equal: a
-    scalar, None or string as itself, a list element by element, and every other kind its `KINDS` entry
+    scalar, None or string as itself, a list element by element, and every other kind its `_KINDS` entry
     writes, by its parts: a shape and dtype, a dtype, an enum member, a class and a module-level function (a
     template's hook) by its module and name, a dataclass, a tuple and a mapping. Anything else, a lambda, a
     closure or a local function among them, has no JSON form here, and raises: a measured pick for a launch
@@ -162,14 +162,14 @@ def encoded(value: object) -> JSON:
         return value
     if isinstance(value, list):
         return [encoded(element) for element in value]
-    for kind in KINDS:
+    for kind in _KINDS:
         if kind.holds(value):
             return {kind.tag: kind.written(value), **kind.beside(value)}
     raise TypeError(f"{type(value).__name__} has no JSON form in a kernel's picks: {value!r}")
 
 
 def decoded(value: _records.JSON) -> Rebuilt:
-    """What `encoded` wrote, rebuilt, by the tag its object carries (`KINDS`). A class it names that this
+    """What `encoded` wrote, rebuilt, by the tag its object carries (`_KINDS`). A class it names that this
     checkout lacks, a dataclass whose stored fields are not this checkout's (but for fields it added with a
     default, which read as their default), or JSON it did not write raises `Unreadable`; whatever the
     rebuilt classes raise propagates."""
@@ -177,15 +177,15 @@ def decoded(value: _records.JSON) -> Rebuilt:
         return [decoded(element) for element in value]
     if not isinstance(value, dict):
         return value
-    for kind in KINDS:
+    for kind in _KINDS:
         if kind.tag in value:
             return kind.rebuilt(value)
     raise Unreadable(f"stored JSON this module did not write: {value!r}")
 
 
 @dataclasses.dataclass(frozen=True)
-class Kind:
-    """One kind of value the picks' JSON holds (`KINDS`), declared once for both directions: its object's
+class _Kind:
+    """One kind of value the picks' JSON holds (`_KINDS`), declared once for both directions: its object's
     `tag`, whose value is `written(value)` and beside which `beside(value)` writes the rest of its parts;
     whether a value is of it (`holds`); and the value `rebuilt` from the whole object."""
     tag: str
@@ -203,7 +203,7 @@ def _enum_member(stored: dict) -> enum.Enum:
     return member
 
 
-def _dataclass(stored: dict) -> object:
+def _dataclass(stored: dict) -> Rebuilt:
     cls = _located(_field(_records.text, stored.get("dataclass"), "dataclass"))
     fields = stored.get("fields")
     # A field the checkout added with a default reads as that default: the pick was made without it.
@@ -306,25 +306,25 @@ def _located(name: str) -> type:
     return found
 
 
-KINDS = (
+_KINDS = (
     # A shape and dtype before a dtype, whose tag its object carries too.
-    Kind("shape", lambda value: isinstance(value, jax.ShapeDtypeStruct), lambda value: list(value.shape),
+    _Kind("shape", lambda value: isinstance(value, jax.ShapeDtypeStruct), lambda value: list(value.shape),
          lambda stored: jax.ShapeDtypeStruct(_field(_records.integers, stored.get("shape"), "shape"),
                                              _dtype(_field(_records.text, stored.get("dtype"), "dtype"))),
          beside=lambda value: {"dtype": str(value.dtype)}),
-    Kind("dtype", lambda value: isinstance(value, np.dtype), str,
+    _Kind("dtype", lambda value: isinstance(value, np.dtype), str,
          lambda stored: _dtype(_field(_records.text, stored.get("dtype"), "dtype"))),
-    Kind("enum", lambda value: isinstance(value, enum.Enum), lambda value: _named(type(value)), _enum_member,
+    _Kind("enum", lambda value: isinstance(value, enum.Enum), lambda value: _named(type(value)), _enum_member,
          beside=lambda value: {"name": value.name}),
-    Kind("class", lambda value: isinstance(value, type), _named,
+    _Kind("class", lambda value: isinstance(value, type), _named,
          lambda stored: _located(_field(_records.text, stored.get("class"), "class"))),
-    Kind("function", lambda value: isinstance(value, types.FunctionType), _function_name,
+    _Kind("function", lambda value: isinstance(value, types.FunctionType), _function_name,
          lambda stored: _located_function(_field(_records.text, stored.get("function"), "function"))),
-    Kind("dataclass", dataclasses.is_dataclass, lambda value: _named(type(value)), _dataclass,
+    _Kind("dataclass", dataclasses.is_dataclass, lambda value: _named(type(value)), _dataclass,
          beside=lambda value: {"fields": {field.name: encoded(getattr(value, field.name))
                                           for field in dataclasses.fields(value) if field.init}}),
-    Kind("tuple", lambda value: isinstance(value, tuple), lambda value: [encoded(e) for e in value], _tuple),
-    Kind("mapping", lambda value: isinstance(value, Mapping),
+    _Kind("tuple", lambda value: isinstance(value, tuple), lambda value: [encoded(e) for e in value], _tuple),
+    _Kind("mapping", lambda value: isinstance(value, Mapping),
          lambda value: [[encoded(key), encoded(entry)] for key, entry in value.items()], _mapping),
 )
 """Each kind of value the picks' JSON holds but a scalar's and a list's, in the order a value is matched
