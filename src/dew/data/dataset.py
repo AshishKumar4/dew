@@ -343,6 +343,14 @@ class Host:
 
     cpus: int
     memory: int
+    worker_start: float | None = None
+    """How long a loading worker takes to start here, in seconds; measured on this process's host where
+    None (`worker_start_seconds`)."""
+
+    @property
+    def started(self) -> float:
+        """A loading worker's start here, as stated or as this process's host measures it."""
+        return worker_start_seconds() if self.worker_start is None else self.worker_start
 
     @classmethod
     def current(cls, cgroup: Path | None = None, root: Path = cgroups.ROOT) -> Host:
@@ -434,9 +442,11 @@ class Loading:
     cache: bool = True
     """Whether a run reads its chains' leading deterministic steps from the records an earlier run
     made of the same records (`dew.data.cache.automatic_root`), which changes none of them."""
+    host: Host | None = None
+    """The host automatic workers are sized for (`resolved`): this process's (`Host.current`) where None,
+    or another's, its CPUs, memory and a worker's start as it states them."""
 
-    def resolved(self, records: pygrain.IterDataset, *, reads: int, host: Host | None = None,
-                 batches: int | None = None) -> Loading:
+    def resolved(self, records: pygrain.IterDataset, *, reads: int, batches: int | None = None) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
         by default) from its CPUs and its memory together. The sizing is static: it reads the batches'
         bytes, the CPUs and the memory once, as a read opens, and measures no throughput, so it never
@@ -464,7 +474,7 @@ class Loading:
         a GH200, row 4862), and each costs a process's start first, its imports. They start where they
         pay for themselves over the run: where the time a sampled batch takes to make, read in turn with
         no thread reading ahead, each after the first, which opens the read, times the `batches` the run
-        reads (its planned steps) is more than a worker's measured start (`worker_start_seconds`). A
+        reads (its planned steps) is more than a worker's start there (`Host.started`). A
         short run, one whose batches take no Python to speak of, or one whose length nothing states
         (None), which no measure shows they pay for, reads in the process."""
         if self.workers != "auto":
@@ -480,7 +490,7 @@ class Loading:
         if not sampled:
             return dataclasses.replace(self, workers=0)
         python = statistics.median(seconds[1:] or seconds)
-        host = Host.current() if host is None else host
+        host = Host.current() if self.host is None else self.host
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)
         budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
@@ -490,7 +500,7 @@ class Loading:
         read_buffer = min(self.read_buffer, budget // read)
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
         workers = max(0, min(cpus, budget // held))
-        if workers and (batches is None or python * batches <= worker_start_seconds()):
+        if workers and (batches is None or python * batches <= host.started):
             _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each take "
                       "less than a worker's start", batches, python * 1e3)
             workers = 0

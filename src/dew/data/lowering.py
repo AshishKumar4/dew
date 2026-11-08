@@ -1777,7 +1777,9 @@ class _Build:
         stage = pipeline.stages[at]
         counted = isinstance(stage, FlatMap) and stage.examples and counting
         examples, counting = (True, _consumes(pipeline)) if counted else (examples, counting)
-        run = tuple(pipeline.stages[at:carried])
+        # The hand-off ends a spread at its first stage that is no record step (`_handoff`).
+        run = tuple(stage for stage in pipeline.stages[at:carried] if isinstance(stage, _RECORD))
+        assert len(run) == carried - at, "a spread runs record steps alone"
         seeds = tuple(self.stage_seed(pipeline, index, partition) if isinstance(step, RandomMap) else None
                       for index, step in enumerate(run, start=at))
         assert isinstance(rows, pygrain.MapDataset), "a spread read's rows are indexed to its expansion"

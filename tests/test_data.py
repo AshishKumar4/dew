@@ -32,6 +32,7 @@ from dew.data.compile import compile, held, validation
 from dew.data.dataset import (
     Checkpointable,
     DataPartition,
+    Host,
     Records as IndexedRows,
     describe,
     take_batch,
@@ -209,29 +210,37 @@ class _Jittered:
         return {"index": record["index"], "drawn": float(record["index"]) * rng.uniform()}
 
 
-def test_a_training_read_naming_no_loading_reads_in_workers_where_they_pay_for_themselves(monkeypatch):
-    """A training read whose chain names no loading reads in automatic workers (`_TRAINING_LOADING`) where
-    the Python its batches take over the batches the run reads is more than a worker's start
-    (`Loading.resolved`), here two for two CPUs over a run of a million steps, and in the training process
-    over a run of two. In workers its batches are those it reads in the process, in their order, and a
-    position either saved resumes in the other on the batches the uninterrupted read goes on to (row 4862)."""
-    from dew.data import dataset
-    from dew.data.dataset import Host
+TWO_CPUS = Host(2, 2**34, worker_start=1.0)
+"""A host of two CPUs whose loading worker starts in a second, which automatic loading sizes for
+(`Loading.host`)."""
 
-    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
-    monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 1.0)
-    resolved, sizing = [], dataset.Loading.resolved
 
-    def recorded(self, *args, **kwargs):
-        loading = sizing(self, *args, **kwargs)
-        resolved.append(loading.workers)
-        return loading
+def test_a_training_read_in_automatic_workers_reads_in_them_where_they_pay_for_themselves():
+    """A training read in automatic workers (`Loading(workers="auto")`, which a chain that names no loading
+    trains with) reads in them where the Python its batches take over the batches the run reads is more
+    than a worker's start (`Loading.resolved`), here in two for two CPUs over a run of a million steps, and
+    in the training process over a run of two. In workers its batches are those it reads in the process,
+    in their order, and a position either saved resumes in the other on the batches the uninterrupted read
+    goes on to (row 4862)."""
+    auto = Loading(workers="auto", host=TWO_CPUS)
+    rows = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered())
+    chain = rows.batch(4)
 
-    monkeypatch.setattr(dataset.Loading, "resolved", recorded)
-    chain = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered()).batch(4)
-    short, automatic = compile(chain, seed=5, steps=2), compile(chain, seed=5, steps=10**6)
+    def processes(steps: int) -> set[int]:
+        # The processes that ran the read's steps: the training process's, or its workers'.
+        where = rows.map(_Where()).batch(4)
+        reader = compile(where, seed=5, steps=steps, loading=auto).train(DataPartition())
+        try:
+            return {int(pid) for batch in listed(reader, 3) for pid in batch["pid"]}
+        finally:
+            reader.close()
+
+    assert processes(2) == {os.getpid()}
+    workers = processes(10**6)
+    assert len(workers) == 2 and os.getpid() not in workers
+    short = compile(chain, seed=5, steps=2, loading=auto)
+    automatic = compile(chain, seed=5, steps=10**6, loading=auto)
     inline = compile(chain, seed=5, loading=Loading(workers=0))
-    assert resolved == [0, 2]
     reader, whole = automatic.train(DataPartition()), inline.train(DataPartition())
     try:
         read = listed(reader, 12)
@@ -264,20 +273,17 @@ class _Spread:
         return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
 
 
-def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers(monkeypatch):
+def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers():
     """A training read cut per share, its steps run in its loading workers before an expansion that makes
     its rows a stream, reads the batches it reads in no workers in one, two, four and the count automatic
     loading resolves to (`IN_ORDER`, `_Build.in_order`): each worker reads whole groups of consecutive inputs
     by index and they are handed on in turn. A position saved in any count resumes in any other on the
     batches the uninterrupted read goes on to (row 4862)."""
-    from dew.data.dataset import Host
-
-    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
     chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
              .flat_map(_Spread()).batch(4))
 
     def loader(workers):
-        return compile(chain, seed=5, loading=Loading(workers=workers))
+        return compile(chain, seed=5, loading=Loading(workers=workers, host=TWO_CPUS))
 
     def read(workers, count: int, state=None) -> tuple[list, object]:
         reader = loader(workers).train(DataPartition())
@@ -308,22 +314,18 @@ class _Where:
         return {**record, "pid": os.getpid()}
 
 
-def test_a_read_cut_per_share_expands_and_draws_in_its_workers_alike_in_any_count(monkeypatch):
+def test_a_read_cut_per_share_expands_and_draws_in_its_workers_alike_in_any_count():
     """A training read cut per share whose expansion and the random steps after it run in its loading
     workers (`_PerInput`), each input spread there whole and each draw keyed by its input and its row in it:
     its batches are those it reads in no workers in one, two, four and the count automatic loading resolves
     to, a position saved in any count resumes in any other, and the expansion runs in the workers, not the
     reading process (row 4862: a decision run's expansion and layout held the reading process's
     interpreter)."""
-    from dew.data import dataset
-    from dew.data.dataset import Host
-
-    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
-    monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 0.0)
     expanded = Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().flat_map(_Spread())
 
     def read(chain, workers, count: int, state=None) -> tuple[list, object]:
-        reader = compile(chain, seed=5, steps=10**6, loading=Loading(workers=workers)).train(DataPartition())
+        reader = compile(chain, seed=5, steps=10**6, loading=Loading(workers=workers, host=TWO_CPUS)).train(
+            DataPartition())
         try:
             if state is not None:
                 reader.set_state(state)
@@ -354,20 +356,16 @@ class _Tokens:
 
 
 @pytest.mark.parametrize("chain", ["chunked", "expanded twice"])
-def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain, monkeypatch):
+def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain):
     """A read cut per share in its inputs' order (`IN_ORDER`), in no workers and in two, counts what a
     version 10 read counts of the same batches: a cut into chunks its records' chunks
     (`data/chunks_per_record`), which the reading process keeps, and an objective's expansion after
     another the source examples it makes rows of (`FlatMap.examples`), each where it stands (review of
     row 4862)."""
-    from dew.data import dataset
-    from dew.data.dataset import Host
     from dew.data.pipeline import FlatMap
     from dew.data.plan import FILE_SHARDS
     from dew.data.text import Chunks
 
-    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
-    monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 0.0)
     source = Pipeline(Memory(_Indexed(30)), name="docs").shuffle(5).repeat()
     if chain == "chunked":
         built = source.map(_Tokens()).flat_map(Chunks(2, fields=("tokens",))).random_map(_Jittered()).batch(4)
@@ -376,7 +374,8 @@ def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain,
 
     def counted(workers, version):
         pinned = {} if version is None else {"plan_version": version}
-        loader = compile(built, seed=5, steps=10**6, loading=Loading(workers=workers), **pinned)
+        loading = Loading(workers=workers, host=TWO_CPUS)
+        loader = compile(built, seed=5, steps=10**6, loading=loading, **pinned)
         reader = loader.train(DataPartition())
         try:
             listed(reader, 6)
