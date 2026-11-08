@@ -1040,7 +1040,13 @@ def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monk
         trainer.compile(state, HALVED_BATCH, trials)
         assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), 2, half=half)
+    # The derivation forecasts the split it asks first (row 3341), so the search starts there, not at the
+    # batch whole as an underived search does (`assert_searched`): four missed at no recomputation before
+    # the half rung fit it, no split past four was asked, and none below it fit.
+    probes = asked(trainer)
+    assert probes.index((4, None, False)) < probes.index((4, half, True))
+    assert all(split <= 4 for split, _, _ in probes)
+    assert not any(fits for split, _, fits in probes if split < 4)
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
