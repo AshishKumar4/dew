@@ -533,6 +533,7 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if not _sums_in_float64(*operands):
         if (not chained and (key := _contraction(product, preferred_element_type)) is not None
+                and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
                 and products_dtype(*operands) == jnp.dtype(jnp.float32)):
             return _paired_once(key)(*operands)
         return product(*operands, preferred_element_type=preferred_element_type)
