@@ -304,8 +304,8 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
     each term `known` names (by `terms.key`) its value there, each matrix product `product(a, b)` where a
     caller holds its own (a mainloop's issuer; `product(name, a, b)` where `named` names each product's
     role from its operands' terms, an issuer staging each role apart) and every other product Dew's
-    (`float32_dot_general`), each exponential a declaration implements by its own (`exponential`: the
-    language's name of its base and its function, `exponential(x, scale=1.0)`,
+    (`float32_dot_general`, its sum XLA's chain), each exponential a declaration implements by its own
+    (`exponential`: the language's name of its base and its function, `exponential(x, scale=1.0)`,
     `derive.Reduction.exponential`; a product with a literal its `scale`, `_scaled`) and each rescale of
     two anchors by the declaration's (`rescale`, `terms.RESCALE`), every other term the engine's
     (`terms.value_of`)."""
@@ -342,9 +342,12 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
                         for operand, flip in zip((a, b), oriented, strict=True))
                 made = product(a, b) if named is None else product(named(left, right), a, b)
             else:
+                # XLA's chained sum: a derived product's sum cancels its own reductions bit for bit where
+                # both sum alike (a one-key row's dP - D).
                 made = float32_dot_general(a, b, params["dimension_numbers"],
                                            precision=params.get("precision"),
-                                           preferred_element_type=params.get("preferred_element_type"))
+                                           preferred_element_type=params.get("preferred_element_type"),
+                                           chained=True)
         elif (exponential is not None and (args := get_callable_args(term, terms.Term.unary)) is not None
               and terms.text(args[1]) == exponential[0]):
             made = exponential[1](*_scaled(args[0], value))
