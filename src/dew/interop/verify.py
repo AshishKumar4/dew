@@ -795,8 +795,9 @@ def _users_arithmetic():
 @dataclass(frozen=True)
 class _Source:
     """The probe's reference at float32 and its float64 twin (`source_twin`), whose runs over each draw
-    the parities judge Dew's against, and the probe's own weights (`initial`, by parameter name), which
-    each draw's are scattered from (`seeded`)."""
+    the parities judge Dew's against, and the probe's own weights (`initial`, its state by name, its
+    parameters and the buffers its checkpoint carries), which each draw's are scattered from
+    (`seeded`)."""
 
     reference: PreTrainedModel
     twin: PreTrainedModel
@@ -805,12 +806,13 @@ class _Source:
     @classmethod
     def of(cls, reference: PreTrainedModel, twin: PreTrainedModel) -> _Source:
         """The reference and its twin at the reference's weights as they stand, the probe's own."""
-        return cls(reference, twin, _parameters(reference))
+        return cls(reference, twin, _state(reference))
 
     def seeded(self, seed: int) -> dict[str, np.ndarray]:
         """Draw `seed`'s weights into the reference and its twin, each draw of check 1 its own, as a
         test's draws are, so no weight is a factor every draw shares: the probe's own at seed 0, scattered
-        from them (`scatter_weights`) at any other. The reference's parameters by name."""
+        from them (`scatter_weights`) at any other. The reference's state by name, as its checkpoint
+        stores it."""
         import torch
 
         with torch.no_grad():
@@ -818,7 +820,7 @@ class _Source:
                 parameter.copy_(torch.from_numpy(self.initial[name]))
             if seed:
                 scatter_weights(self.reference, _WEIGHT_SEED + seed)
-            held = _parameters(self.reference)
+            held = _state(self.reference)
             for name, parameter in self.twin.named_parameters():
                 parameter.copy_(torch.from_numpy(held[name]))
         return held
@@ -838,8 +840,9 @@ _WEIGHT_SEED = 1234
 """The seed `scatter_weights` draws the probe's own weights at, which a draw's are offset from."""
 
 
-def _parameters(model: PreTrainedModel) -> dict[str, np.ndarray]:
-    return {name: parameter.detach().cpu().numpy().copy() for name, parameter in model.named_parameters()}
+def _state(model: PreTrainedModel) -> dict[str, np.ndarray]:
+    """`model`'s state by name, its parameters and persistent buffers, as `save_pretrained` reads it."""
+    return {name: tensor.detach().cpu().numpy().copy() for name, tensor in model.state_dict().items()}
 
 
 def _judged(draw, label: str) -> int:
