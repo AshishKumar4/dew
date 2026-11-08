@@ -9,6 +9,7 @@ sums), and the Triton mainloop's, as the route feeds them. Its configs are its T
 the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import gc
@@ -69,6 +70,11 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
 WGMMA = mosaic_sm90.WGMMA.name
 """An H100's warpgroup MMA layout with a producer, the tiles' family where a site states its own."""
+INTERPRETED_ON = {"sm90": WGMMA, "sm80": "mma.sync"}
+"""The GPUs an interpreted cell runs as (`_device`), each family's own walk: an H100's warpgroup MMA and an
+A100's mma.sync (Main 11-08: an interpreted check of one family alone left the A100's backward unchecked on
+a CPU). A cell of one family's mechanism names its GPU itself (`ONE_FAMILY`)."""
+_INTERPRETED = contextvars.ContextVar("interpreted_on", default="sm90")
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_program.split_queries`), as the derivation takes it."""
@@ -79,6 +85,9 @@ BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
                   *(RAISED_FORMS if resources.RAISES_HONORED else ()), "accurate")
 """The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
 where raises hold (`RAISED_FORMS`), and the accurate."""
+WGMMA_FORMS = ("fused-keys-first", "fused-shared-keys", *RAISED_FORMS)
+"""The backward's forms on an H100's layouts alone (`FED`'s fed consumers, its shared keys and dQ), which an
+A100's mma.sync, one warpgroup, takes none of."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
 state or a draw alone."""
@@ -101,6 +110,15 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
     their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
     producer adding it (`fused-producer-dq`); or the fast form at its derivation's tiles (`derived`)."""
+    family = INTERPRETED_ON[_INTERPRETED.get()]
+    if family != WGMMA:
+        # An A100's forms: its own layout's two launches or one, the accurate and the derived.
+        if form in WGMMA_FORMS:
+            raise ValueError(f"{form} is an H100's layout's form alone")
+        if form in ("accurate", "derived"):
+            return form == "accurate", None
+        return form != "default" and form != "fused", attention_mosaic.BackwardTiles(
+            64, 64, 2, 1, fused=form == "fused", columns=2 if form == "accurate-halves" else 1, family=family)
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family=WGMMA)
     if form == "fused-shared-keys":
@@ -122,9 +140,13 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
                                                              **FED)
 
 
-FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2, family=WGMMA)
-"""The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
-pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
+def _form_tiles(generation_name: str | None = None) -> attention_mosaic.Tiles:
+    """The call forms' tiles on `generation_name`'s family (the interpreted cell's where None,
+    `INTERPRETED_ON`): the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
+    pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams; an
+    H100's pair two consumers' blocks, an A100's one consumer's each (mma.sync's one warpgroup)."""
+    family = INTERPRETED_ON[generation_name or _INTERPRETED.get()]
+    return attention_mosaic.Tiles(64, 64, 2, 2 if family == WGMMA else 1, family=family)
 HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
 """The (query, value) head widths the forward and the backward are checked at: a value wider than its
 query, a narrower one, and both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
@@ -149,11 +171,48 @@ def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int 
     return draw
 
 
+ONE_FAMILY = frozenset({
+    "test_a_tpu_cores_forward_is_on_par_interpreted", "test_a_tpu_cores_backward_is_on_par_interpreted",
+    "test_the_forward_on_three_consumers_holds_check_1_interpreted",
+    "test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted",
+    "test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_row_interpreted",
+    "test_a_backward_whose_dkv_launch_holds_more_keys_than_its_dq_launch_writes_every_key_interpreted",
+    "test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_tile_interpreted",
+    "test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted",
+    "test_every_tuning_variant_is_on_par_interpreted",
+})
+"""The interpreted cells of one family's mechanism, each naming its GPU itself: a TPU core's, an H100's three
+consumers, a B200's tcgen05 chunks, an H100's pinned layouts (its keys-first dK/dV launch, its consumers'
+shared logits and keys), and the tuning variants of the launches the cell's own target derives."""
+
+
+def pytest_generate_tests(metafunc):
+    """Each interpreted cell (a test named `*_interpreted`) once a GPU of `INTERPRETED_ON`, as its family's
+    own walk (`interpreted_on`), but a cell of one family's mechanism (`ONE_FAMILY`)."""
+    name = metafunc.function.__name__
+    if name.endswith("_interpreted") and name not in ONE_FAMILY:
+        metafunc.parametrize("interpreted_on", list(INTERPRETED_ON), indirect=True)
+
+
+@pytest.fixture(autouse=True)
+def interpreted_on(request):
+    """The GPU this cell runs as interpreted (`_device`, `_form_tiles`, `_backward_form`): its parameter's,
+    an H100 where it has none; a backward form of an H100's layouts alone (`WGMMA_FORMS`) is no A100
+    cell."""
+    generation_name = getattr(request, "param", "sm90")
+    form = getattr(getattr(request.node, "callspec", None), "params", {}).get("form")
+    if INTERPRETED_ON[generation_name] != WGMMA and form in WGMMA_FORMS:
+        pytest.skip(f"{form} is an H100's layout's form alone")
+    token = _INTERPRETED.set(generation_name)
+    yield generation_name
+    _INTERPRETED.reset(token)
+
+
 def _device(interpret: bool, target: generation.GpuTarget | None = None):
     """The device a site's launches are sized and run for: interpreted on the CPU, which has no instruction
-    family of its own, `target`'s facts (an H100's where None, `generation.assumed`); the process's own
-    compiled."""
-    return generation.assumed(target or "sm90") if interpret else contextlib.nullcontext()
+    family of its own, `target`'s facts (where None, the GPU the interpreted cell runs as, `INTERPRETED_ON`,
+    `generation.assumed`); the process's own compiled."""
+    return generation.assumed(target or _INTERPRETED.get()) if interpret else contextlib.nullcontext()
 
 
 def _pinned(forward: attention_mosaic.Tiles | None = None,
@@ -231,7 +290,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
                  param_rows: int | None = None):
-    """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `FORM_TILES`
+    """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `_form_tiles`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
     (rows, queries, query and key heads, four and two under a hook) over the spans' keys in `dtype`, heads
@@ -263,7 +322,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
         hooks = hooked(params, initial)
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
         # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
-        with _device(interpret), _pinned(FORM_TILES if width == 64 and not (backward and score) else None,
+        with _device(interpret), _pinned(_form_tiles() if width == 64 and not (backward and score) else None,
                                          config):
             if not backward:
                 return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
@@ -634,9 +693,9 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
 def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
-    `FORM_TILES`, under the interpreter."""
+    `_form_tiles`, under the interpreter."""
     _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=width,
-                   value_width=value_width, tiles=FORM_TILES)
+                   value_width=value_width, tiles=_form_tiles())
 
 
 @INTERPRETS
@@ -716,7 +775,7 @@ def _keys_first(spans, *, form: str, scale: float):
     accurate, config = _backward_form(form)
 
     def gradients(query, key, value, dout):
-        with _device(interpret=True), _pinned(FORM_TILES, config):
+        with _device(interpret=True), _pinned(_form_tiles(), config):
             residuals = attention_mosaic.forward(query, key, value, spans, scale=scale,
                                                  residuals=template.Kept.SPLIT,
                                                  interpret=True)[1:]
@@ -1414,7 +1473,7 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
             with _device(interpret=True):
                 return attention_mosaic_forward._plain_forward(
                     query, key, value, spans, template.Hooks(), scale=scale, natural=attention_mosaic.NATURAL,
-                    tiles=FORM_TILES, interpret=True)
+                    tiles=_form_tiles(), interpret=True)
 
         def reference(query, key, value, dout, scale=scale):
             del dout
@@ -1696,9 +1755,9 @@ def the_forward_is_on_par_over_every_call_form_on_an_h100(form):
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
 def the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
-    `FORM_TILES`, compiled on an H100."""
+    `_form_tiles`, compiled on an H100."""
     _check_forward("causal", jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, width=width,
-                   value_width=value_width, tiles=FORM_TILES)
+                   value_width=value_width, tiles=_form_tiles("sm90"))
 
 
 @ON_HOPPER
