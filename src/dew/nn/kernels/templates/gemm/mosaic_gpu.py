@@ -801,10 +801,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          block_scaled=mx_scales is not None)
                 step = _met(step, tiles.raster, meetings, tile[-1], wg, programs=multiprocessors,
                             walks=grid[0] * grid[1])
-                # The unrouted rows, and a slot past the last tile, multiply nothing: zeros. A family whose
-                # persist sums the windows itself walks the steps plainly (`summed` below).
-                return _walked_products(family, walk, step, part, len(matrices),
-                                        exact_sums and not family.sums_in_persist)
+                # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
+                return _walked_products(family, walk, step, part, len(matrices), exact_sums)
 
             def finish(wg, tile, accs, store, *, active):
                 if tail is not None and not active:
@@ -816,12 +814,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                               partials=None if tail is None else (workspace, ready))
 
             walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
-            summed = ({'summed': family.summed_window(tiles.block_k)}
-                      if exact_sums and family.sums_in_persist else {})
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, exact_sums),
-                           accumulators=(part,) * len(matrices), **summed)
+                           accumulators=(part,) * len(matrices), **_summed(family, tiles, exact_sums))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
@@ -1335,13 +1331,20 @@ def _met(step: Callable, chunk: int, meetings, walked, wg, *, programs: int, wal
     return met
 
 
+def _summed(family: mosaic.Family, tiles: Tiles, exact_sums: bool) -> dict:
+    """Dew: the persist arguments of an exactly summed launch on a family that sums its windows itself
+    (`mosaic.Family.sums_in_persist`): a window's steps (`summed_window`); none on any other."""
+    return {'summed': family.summed_window(tiles.block_k)} if exact_sums and family.sums_in_persist else {}
+
+
 def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int, exact_sums: bool) -> tuple:
     """Dew: a cooperative `gmm` consumer's `count` products over its steps (`walk`, `step` a `_gmm_step`
     whose operands it reads), each into an fp32 tile of `shape`: as the tensor cores add, or with
     `exact_sums` each step's product summed apart and added into the running sum by an IEEE add, as
     `_walked_gradient`'s: an FP8 product's running sum promoted into fp32 every step, Hopper's FP8 tensor
-    cores summing within one in a narrower accumulator (testing.md, FP8 products)."""
-    if not exact_sums:
+    cores summing within one in a narrower accumulator (testing.md, FP8 products). A family whose persist
+    sums the windows itself (`mosaic.Family.sums_in_persist`, `_summed`) walks the steps plainly."""
+    if not exact_sums or family.sums_in_persist:
         _, accs = walk(step, None, (shape,) * count)
         return accs
 
