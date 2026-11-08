@@ -282,17 +282,20 @@ def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
     return from_record(tuple[ParamGroup, ...], groups)
 
 
-def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
-    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree
-    is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
+def trained_modules(objective: Objective[Loss, Effects],
+                    modules: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree is
+    drawn (`Objective.init`, its shapes alone), and those that are one (a parameter a loaded module
+    gained, `Pretrained.with_model`): a tied readout is drawn with none."""
     if not modules:
-        return ()
+        return (), ()
     from dew.batch import unboxed
     from dew.optim import parameter_name
 
     trained = unboxed(abstract(lambda: objective.init(jax.random.key(0))))["params"]
     names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
-    return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
+    return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
+            tuple(module for module in modules if module in names))
 
 
 def _best_argument():
@@ -2096,11 +2099,11 @@ class RunConfig:
                 if recorded is not None:
                     return to_record(recorded, tuple[ParamGroup, ...])
             groups = named or self.optim.fresh_groups()
-            modules = trained_modules(objective, objective.fresh_modules()) if any(
-                group.fresh for group in groups) else ()
-            if not named and not modules:
+            modules, leaves = trained_modules(objective, objective.fresh_modules()) if any(
+                group.fresh for group in groups) else ((), ())
+            if not named and not modules and not leaves:
                 return to_record((), tuple[ParamGroup, ...])
-            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules)
+            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
             return to_record(claimed.param_groups, tuple[ParamGroup, ...])
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
         return self.optim if groups == self.optim.param_groups else dataclasses.replace(
@@ -2236,15 +2239,18 @@ class DecoderRunConfig(RunConfig):
         if not self.loops:
             return start
         return looping(start, self.loop_steps, self.loop_layers, backprop_steps=self.loop_backprop_steps,
-                       remat=self.loop_remat or None)
+                       remat=self.loop_remat or None, key=self.trainer.key)
 
 
 def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
-            backprop_steps: int | None = None, remat: bool | None = None) -> "Pretrained":
+            backprop_steps: int | None = None, remat: bool | None = None,
+            key: int | jax.Array = 0) -> "Pretrained":
     """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
-    the loop's backward memory; None keeps a looped checkpoint's own value."""
+    the loop's backward memory; None keeps a looped checkpoint's own value. A loop that gives its
+    layers parameters of their own draws them from `key` beside the loaded weights, fresh
+    (`Pretrained.with_model`)."""
     from dew.nn.protocols import Looping
 
     looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
@@ -2252,7 +2258,7 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     if looped is None:
         raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
                          "its layers to repeat and --loop-steps how many times")
-    return dataclasses.replace(start, model=looped)
+    return start.with_model(looped, key=key)
 
 
 __all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "Release", "RunConfig",
