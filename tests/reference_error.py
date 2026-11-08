@@ -1496,7 +1496,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets")
+    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "example_mse",
+             "example_worst")
     verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
@@ -1537,10 +1538,14 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
 
         def leaf(name):
             start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
+            examples = {field: evidence[field][name][row] for field in ("example_mse", "example_worst")
+                        if name in evidence[field]}
             return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
                                 evidence["zero_rows"][name][start:stop],
                                 evidence["zero_errors"][name][start:stop],
-                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]))
+                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]),
+                                **{field: None if np.isnan(value).all() else value
+                                   for field, value in examples.items()})
 
         return {name: leaf(name) for name in mse}
 

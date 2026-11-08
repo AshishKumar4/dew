@@ -652,6 +652,10 @@ class RecordedLeaf:
     share: float | None = None
     """The share of its worst sized row's squared error the row's largest element carries (`_Draws.factor`),
     zero where no row is sized; None where the leaf was recorded as rows alone (`rows_summary`)."""
+    example_mse: np.ndarray | None = None
+    example_worst: np.ndarray | None = None
+    """At a site whose leaves stack independent examples, each example's evidence (`example_mse`,
+    `example_worst`); None elsewhere."""
 
     @property
     def log_worst(self) -> float:
@@ -1000,22 +1004,48 @@ def _shares(found: list[list], count: int) -> np.ndarray:
                        for seed in found], np.float64).reshape(count, -1, 2)
 
 
+def example_mse(arm, truth) -> np.ndarray | None:
+    """An arm's mean squared error from its float64 `truth` on each of a leaf's independent examples, its
+    first axis (`judge`'s `examples`); None for a leaf of no axis."""
+    truth = np.asarray(truth, np.float64)
+    if truth.ndim == 0:
+        return None
+    return np.mean(np.square(np.asarray(arm, np.float64) - truth), axis=tuple(range(1, truth.ndim)))
+
+
+def example_worst(arm, truth) -> np.ndarray | None:
+    """An arm's worst sized row on each of a leaf's independent examples: the log of its RMS error from its
+    float64 `truth` over the row's size, the rows those of the leaf's last axis, sized by their truth's RMS,
+    rows under RESOLUTION of their example's size left out. None for a leaf under rank two (no rows), or
+    one with an example of no sized row."""
+    truth = np.asarray(truth, np.float64)
+    if truth.ndim < 2:
+        return None
+    rows = truth.reshape(truth.shape[0], -1, truth.shape[-1])
+    sizes = np.stack([_scaled_rms(example) for example in rows])
+    sized = sizes > RESOLUTION * np.sqrt(np.mean(np.square(rows), axis=(1, 2)))[:, None]
+    if not sized.any(axis=1).all():
+        return None
+    errors = (np.asarray(arm, np.float64) - truth).reshape(rows.shape)
+    logs = log_over(np.stack([_scaled_rms(example) for example in errors]), np.where(sized, sizes, 1.0))
+    return np.max(np.where(sized, logs, LOG_ZERO), axis=1)
+
+
+def _theirs(reference, truth, evidence, field: str):
+    """The reference's per-example `evidence` of a leaf: a recorded leaf's as its recording holds it
+    (`RecordedLeaf.<field>`), a live one's read against `truth`."""
+    return getattr(reference, field) if isinstance(reference, RecordedLeaf) else evidence(reference, truth)
+
+
 def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
     """Each leaf's per-example log RMS ratios of Dew (`leaves`) against the reference (`references`, a
-    tree of the truth's structure), a leaf's first axis its independent examples (`assert_as_exact`'s
-    `examples`): half the log of each example's mean squared error from its float64 truth over the
-    reference's, examples both arms hold exactly left out. None for a leaf of no axis, or where one arm is
-    exact on an example and the other is not."""
+    tree of the truth's structure, live or recorded): half the log of each example's mean squared error
+    from its float64 truth over the reference's (`example_mse`), examples both arms hold exactly left out.
+    None for a leaf of no axis, or where one arm is exact on an example and the other is not."""
     found: list[np.ndarray | None] = []
     for leaf, reference, truth in zip(leaves, jax.tree.leaves(references), truths, strict=True):
-        truth = np.asarray(truth, np.float64)
-        if truth.ndim == 0 or isinstance(reference, RecordedLeaf):
-            found.append(None)
-            continue
-        axes = tuple(range(1, truth.ndim))
-        mine = np.mean(np.square(np.asarray(leaf, np.float64) - truth), axis=axes)
-        theirs = np.mean(np.square(np.asarray(reference, np.float64) - truth), axis=axes)
-        if np.any((mine > 0) != (theirs > 0)):
+        mine, theirs = example_mse(leaf, truth), _theirs(reference, truth, example_mse, "example_mse")
+        if mine is None or theirs is None or np.any((mine > 0) != (theirs > 0)):
             found.append(None)
             continue
         kept = mine > 0
@@ -1024,31 +1054,14 @@ def _example_ratios(leaves, references, truths) -> list[np.ndarray | None]:
 
 
 def _example_worst_rows(leaves, references, truths) -> list[np.ndarray | None]:
-    """Each leaf's per-example paired worst rows at a site that stacks examples (`assert_as_exact`'s
-    `examples`): on each example, the log of Dew's worst row's RMS error from float64 over its size, less
-    the reference's worst row's on the same example, its rows those of the leaf's last axis, sized by their
-    truth's RMS, rows under RESOLUTION of their example's size left out. None for a leaf under rank two (no
-    rows), or an example with no sized row."""
+    """Each leaf's per-example paired worst rows at a site that stacks examples (`judge`'s `examples`): on
+    each example, Dew's worst sized row less the reference's on the same example (`example_worst`, the
+    reference's live or recorded). None for a leaf under rank two (no rows), or an example with no sized
+    row."""
     found: list[np.ndarray | None] = []
     for leaf, reference, truth in zip(leaves, jax.tree.leaves(references), truths, strict=True):
-        truth = np.asarray(truth, np.float64)
-        if truth.ndim < 2 or isinstance(reference, RecordedLeaf):
-            found.append(None)
-            continue
-        width = truth.shape[-1]
-        rows = truth.reshape(truth.shape[0], -1, width)
-        sizes = np.stack([_scaled_rms(example) for example in rows])
-        sized = sizes > RESOLUTION * np.sqrt(np.mean(np.square(rows), axis=(1, 2)))[:, None]
-        if not sized.any(axis=1).all():
-            found.append(None)
-            continue
-        worst = []
-        for arm in (leaf, reference):
-            errors = (np.asarray(arm, np.float64) - truth).reshape(rows.shape)
-            logs = log_over(np.stack([_scaled_rms(example) for example in errors]),
-                            np.where(sized, sizes, 1.0))
-            worst.append(np.max(np.where(sized, logs, LOG_ZERO), axis=1))
-        found.append(worst[0] - worst[1])
+        mine, theirs = example_worst(leaf, truth), _theirs(reference, truth, example_worst, "example_worst")
+        found.append(None if mine is None or theirs is None else mine - theirs)
     return found
 
 
