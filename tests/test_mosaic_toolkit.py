@@ -1262,3 +1262,30 @@ def test_a_launch_runs_what_it_reads_ahead_of_its_wait_once_and_hands_it_on():
     weights, x = (jnp.asarray(rng.standard_normal((128, 64)), jnp.float32) for _ in range(2))
     launched = jax.jit(_read_ahead(interpret=True))(weights, x)
     np.testing.assert_array_equal(np.asarray(launched), np.asarray(weights + x))
+
+
+def test_a_programs_settled_arguments_are_read_as_such_and_never_donated():
+    """A program declaring an argument settled (`options.program`'s `settled`, a server's loaded weights)
+    knows its value as such while it traces (`options.settled`), and the others not; a program donating an
+    array one has read as settled refuses it (`SettledDonated`) until it is unsettled (`options.unsettle`),
+    whether called or fetched."""
+    from dew.nn.kernels import options
+
+    seen = {}
+
+    def step(weights, x):
+        seen.update(weights=options.settled(weights), x=options.settled(x))
+        return x @ weights
+
+    weights, x = jnp.eye(4, dtype=jnp.float32), jnp.ones((2, 4), jnp.float32)
+    served = options.program(step, settled=(0,))
+    np.testing.assert_array_equal(np.asarray(served(weights, x)), np.asarray(x))
+    assert seen == {"weights": True, "x": False}
+    synced = options.program(lambda weights: weights * 2.0, donate_argnums=0)
+    with pytest.raises(options.SettledDonated):
+        synced(weights)
+    with pytest.raises(options.SettledDonated):
+        options.Fetched(synced)(weights)
+    options.unsettle(weights)
+    doubled = synced(weights)
+    np.testing.assert_array_equal(np.asarray(served(doubled, x)), np.asarray(x * 2.0))
