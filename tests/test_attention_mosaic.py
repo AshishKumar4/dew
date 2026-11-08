@@ -116,11 +116,12 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
         # An A100's forms: its own layout's two launches, the accurate and the derived.
         if form in WGMMA_FORMS:
             raise ValueError(f"{form} is an H100's layout's form alone")
-        if form in ("accurate", "derived"):
+        if form in ("default", "accurate", "derived"):
+            # Its derived tiles, which its registers hold (a 64 x 64 tile of the call forms' at one column
+            # block holds 280 a thread, past its 255).
             return form == "accurate", None
-        # Its layout's narrow form, as its derivation takes the call forms' (`BackwardTiles.narrow`).
-        return form != "default", attention_mosaic.BackwardTiles(
-            64, 64, 2, 1, columns=2 if form == "accurate-halves" else 1, family=family, narrow=True)
+        # Its layout's narrow form in two column halves (`BackwardTiles.narrow`).
+        return True, attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=2, family=family, narrow=True)
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family=WGMMA)
     if form == "fused-shared-keys":
@@ -183,11 +184,13 @@ ONE_FAMILY = frozenset({
     "test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted",
     "test_every_tuning_variant_is_on_par_interpreted",
     "test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted",
+    "test_an_fp16_backward_in_one_launch_holds_check_1_interpreted",
 })
 """The interpreted cells of one family's mechanism, each naming its GPU itself: a TPU core's, an H100's three
 consumers, a B200's tcgen05 chunks, an H100's pinned layouts (its keys-first dK/dV launch, its consumers'
 shared logits and keys), the tuning variants of the launches the cell's own target derives, and an fp32
-call's forward of bf16 parts, which an A100's pipeline loads in no pieces (row 4475)."""
+call's forward of bf16 parts, which an A100's pipeline loads in no pieces (row 4475), and an fp16
+backward's one launch, an H100's layouts'."""
 
 
 def pytest_generate_tests(metafunc):
