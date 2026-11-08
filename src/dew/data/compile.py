@@ -786,6 +786,7 @@ def compile(
             rejections=rejections,
             resume=resume,
             plan_version=plan_version,
+            steps=steps,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
@@ -1248,10 +1249,20 @@ def _compile_phases(
     rejections: Literal["drop", "mask"],
     resume: Literal["exact", "non-exact"],
     plan_version: int = PLAN_VERSIONS[-1],
+    steps: int | None = None,
 ) -> Loader:
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
+
+    def planned(index: int) -> int | None:
+        """The batches phase `index` reads of a run of `steps`, which automatic loading sizes its workers
+        for (`Loading.resolved`): its own steps on the step clock, else the run's."""
+        if steps is None or tokens:
+            return steps
+        start = source.ends[index - 1] if index else 0
+        until = source.ends[index]
+        return max(0, (steps if until is None else min(until, steps)) - (start or 0))
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
     def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
@@ -1289,7 +1300,7 @@ def _compile_phases(
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
-        loaded = _compiled(phase, packed, host=host, resume=resume)
+        loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index))
         if loaded.plan is None or loaded.plan.lowering != "global":
             raise ValueError(
                 f"phase {index} needs a global order; "
@@ -1311,7 +1322,7 @@ def _compile_phases(
         consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
         if not any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
             return built[index][0]
-        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume)
+        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume, batches=planned(index))
 
     def training(partition: DataPartition) -> Iterator[Batch]:
         def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:

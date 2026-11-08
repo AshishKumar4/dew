@@ -343,6 +343,54 @@ def test_a_read_cut_per_share_expands_and_draws_in_its_workers_alike_in_any_coun
     assert pids and os.getpid() not in pids
 
 
+@dataclasses.dataclass(frozen=True)
+class _Tokens:
+    """A record's index as a document of `index % 5 + 1` tokens."""
+
+    identity = "tokens@1"
+
+    def __call__(self, record):
+        return {"tokens": np.arange(record["index"] % 5 + 1, dtype=np.int32)}
+
+
+@pytest.mark.parametrize("chain", ["chunked", "expanded twice"])
+def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain, monkeypatch):
+    """A read cut per share in its inputs' order (`IN_ORDER`), in no workers and in two, counts what a
+    version 10 read counts of the same batches: a cut into chunks its records' chunks
+    (`data/chunks_per_record`), which the reading process keeps, and an objective's expansion after
+    another the source examples it makes rows of (`FlatMap.examples`), each where it stands (review of
+    row 4862)."""
+    from dew.data import dataset
+    from dew.data.dataset import Host
+    from dew.data.pipeline import FlatMap
+    from dew.data.plan import FILE_SHARDS
+    from dew.data.text import Chunks
+
+    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
+    monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 0.0)
+    source = Pipeline(Memory(_Indexed(30)), name="docs").shuffle(5).repeat()
+    if chain == "chunked":
+        built = source.map(_Tokens()).flat_map(Chunks(2)).random_map(_Jittered()).batch(4)
+    else:
+        built = source.flat_map(_Spread())._then(FlatMap(_Spread(), examples=True)).batch(4)
+
+    def counted(workers, version):
+        pinned = {} if version is None else {"plan_version": version}
+        loader = compile(built, seed=5, steps=10**6, loading=Loading(workers=workers), **pinned)
+        reader = loader.train(DataPartition())
+        try:
+            listed(reader, 6)
+            return {name: value for name, value in loader.statistics().items()
+                    if name.startswith(("data/chunks", "data/rows", "data/examples", "data/consumed"))}
+        finally:
+            reader.close()
+
+    earlier = counted(0, FILE_SHARDS)
+    assert earlier
+    for workers in (0, 2):
+        assert counted(workers, None) == earlier
+
+
 @pytest.mark.parametrize("workers", [0, 2])
 def test_a_position_saved_under_plan_version_10_resumes_as_10_read_it(workers):
     """A per-share read saved under plan version 10, in no workers or in two, which each read every

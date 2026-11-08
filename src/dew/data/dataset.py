@@ -462,9 +462,9 @@ class Loading:
         Workers take the read's Python off the training process, whose step's dispatch waits on the
         interpreter it holds (a decision run's encoding: 20.9 against 10.5 ms a step in four workers on
         a GH200, row 4862), and each costs a process's start first, its imports. They start where they
-        pay for themselves over the run: where the Python a sampled batch takes in the reading process,
-        each after the first, which opens the read, times the `batches` the run reads (its planned steps)
-        is more than a worker's measured start (`worker_start_seconds`). A short run, one whose
+        pay for themselves over the run: where the time a sampled batch takes to make, read in turn with
+        no thread reading ahead, each after the first, which opens the read, times the `batches` the run
+        reads (its planned steps) is more than a worker's measured start (`worker_start_seconds`). A short run, one whose
         batches take no Python to speak of, or one whose length nothing states (None), which no
         measure shows they pay for, reads in the process."""
         if self.workers != "auto":

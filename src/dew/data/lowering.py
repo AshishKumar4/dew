@@ -1306,7 +1306,11 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool 
             grain = isinstance(stage, Native) and (native or expanded)
             # Before the expansion, a draw after a drop is keyed by its place among the rows kept.
             drawn = not expanded and marked and isinstance(stage, RandomMap)
-            if windowed or pooled or placed or grain or drawn or (
+            # An expansion whose counts the reading process keeps (a cut into chunks, `Chunked`; a later
+            # objective's of the source examples it makes rows of, `FlatMap.examples`) runs there.
+            counted = isinstance(stage, FlatMap) and (
+                isinstance(stage.step, Chunks) or (expanded and stage.examples))
+            if windowed or pooled or placed or grain or drawn or counted or (
                     expanded and not isinstance(stage, (*_RECORD, Native))):
                 return at
             expanded = expanded or isinstance(stage, FlatMap)
@@ -1513,13 +1517,17 @@ class _Build:
 
     @property
     def in_order(self) -> bool:
-        """Whether its loading workers read its inputs in their order (`_InputOrder`, `_StreamOrder`), so its
-        rows and its position are those a read in none makes, whatever their count: an elastic read's, and
+        """Whether its loading workers read its inputs in their order (`_InputOrder`, `_StreamOrder`), so
+        its rows and its position are those a read in none makes, whatever their count: an elastic read's, and
         from `IN_ORDER` a training read cut per share of indexed inputs. A stream cut per share reads its
         shards in its workers' own, each worker's shards its own, as a stream is read through and never by
-        index: in order, every worker would read the whole stream (`_StreamOrder`)."""
+        index: in order, every worker would read the whole stream (`_StreamOrder`). So does a cache of
+        steps that drop records, which its workers read as a stream of each input's outputs, its views'
+        repeat that stream's (`_carried`), where a read in none repeats the views over its inputs."""
+        cached = self.lowering.cache is not None and not self.lowering.one_to_one
+        streams = self.read == "streamed" or cached
         return self.elastic or (self.training and not self.global_order and self.version >= IN_ORDER
-                                and self.read != "streamed")
+                                and not streams)
 
     def child(self, index: int) -> _Build:
         """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
@@ -2245,7 +2253,9 @@ class _Build:
         nothing, yet starts a process that imports the program and keeps about six pipes open
         until the reader is collected."""
         loading = self.loading
-        bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
+        # Read in turn, no thread reading ahead, so a batch's time is the work that makes it.
+        bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0, threads=0,
+                                                                     read_buffer=0))
         size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
         if loading.workers == "auto" and not (self.global_order or self.in_order):
             # A read whose rows are its workers' count's (`in_order`) reads in the process, so its rows and
