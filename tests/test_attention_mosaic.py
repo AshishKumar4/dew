@@ -494,11 +494,11 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
         if not params and initial is None:
             # No hook parameter takes a gradient (a softcap's hook has none): the operands' terms alone, the
             # draw's hooks `((), None)` as they are.
-            return (*found[1:], *hooks)
+            return (*found[1:4], *hooks)
         assert traced_terms is not None, "a hooked call's parameters' terms trace its reference"
         with jax.enable_x64(new_val=True):
             _, traced = traced_terms(*widened((query, key, value, dout, *hooks)))
-        return (*found[1:], *traced[3:])
+        return (*found[1:4], *traced[3:])
 
     return terms
 

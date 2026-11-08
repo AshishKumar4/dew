@@ -12,8 +12,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
-from float64_terms import float64_terms
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 
@@ -170,7 +169,10 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
     gradient's terms, a fifth, are those logit sizes before the scale and the
     cap, their squares summed over the rows and heads the bias shares. A
     `score` of the scaled logits in the cap's place (`float64_weights`) carries
-    them through its slope, as the cap's."""
+    them through its slope, as the cap's. With `sinks`, their gradients' terms
+    are last: each sink a logit beside the keys whose value is zero, its
+    gradient's terms its share's sizes, a logit's as above with no product,
+    their squares summed over the rows and queries of its head."""
     with jax.enable_x64(new_val=True):
         q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
@@ -183,8 +185,8 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         out = jnp.einsum('bhqk,bkhd->bqhd', weights, values)
         delta = jnp.einsum('bqhd,bqhd->bhq', out, dout)[..., None]
         # dP's and delta's terms' squares, summed: the difference's, carried.
-        energy = (jnp.einsum('bqhd,bkhd->bhqk', dout ** 2, values ** 2)
-                  + jnp.einsum('bqhd,bqhd->bhq', out ** 2, dout ** 2)[..., None])
+        delta_energy = jnp.einsum('bqhd,bqhd->bhq', out ** 2, dout ** 2)[..., None]
+        energy = jnp.einsum('bqhd,bkhd->bhqk', dout ** 2, values ** 2) + delta_energy
         bias_sizes = jnp.maximum(jnp.abs(weights * (products - delta)), weights * jnp.sqrt(energy))
         logit_sizes = bias_sizes / np.sqrt(width)
         if softcap is not None:
@@ -203,6 +205,10 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         if shared is not None:
             axes = tuple(axis for axis in (0, 1) if shared.shape[axis] == 1 and bias_sizes.shape[axis] > 1)
             squares = (*squares, (bias_sizes ** 2).sum(axis=axes, keepdims=True))
+        if sunk is not None:
+            share = 1 - weights.sum(-1, keepdims=True)
+            sink_sizes = jnp.maximum(jnp.abs(share * delta), share * jnp.sqrt(delta_energy))
+            squares = (*squares, (sink_sizes ** 2).sum(axis=(0, 2, 3)))
         return [np.sqrt(np.asarray(x)) for x in squares]
 
 
@@ -249,9 +255,9 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, truth=Non
     (`kept`), the truth is attention written out over them (`exact_attention`) and every entry is sized by
     the terms attention's float64 gradients carry through their cancellation (`attention_terms`: a query
     that keeps one key has a logit gradient of float64 zero, which a fused kernel forms from its rounded
-    output), a sink's gradient by the truth's own terms. Without, `truth` is the truth and each row is sized
-    by its final sums' terms (a call whose keys this file does not lay out, every query keeping many). A
-    packed call's tokens, one run `[T, H, D]`, are read as a batch of one."""
+    output), a sink's gradient as a logit's beside the keys. Without, `truth` is the truth and each row is
+    sized by its final sums' terms (a call whose keys this file does not lay out, every query keeping
+    many). A packed call's tokens, one run `[T, H, D]`, are read as a batch of one."""
     def batched(fn):
         def run(*arrays):
             if arrays[0].ndim == 4:
@@ -275,12 +281,8 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, truth=Non
     def terms(*inputs):
         query, key, value, *rest = inputs
         sinks = rest[0] if len(rest) == 2 else None
-        found = batched(lambda q, k, v, s, dy: attention_terms(q, k, v, dy, keep, sinks=s)[:4])(
-            query, key, value, sinks, rest[-1])
-        if sinks is not None:
-            with jax.enable_x64(new_val=True):
-                found = [*found, float64_terms(with_gradients(exact), *widened(inputs))[1][4]]
-        return split(tuple(found))
+        return split(tuple(batched(lambda q, k, v, s, dy: attention_terms(q, k, v, dy, keep, sinks=s))(
+            query, key, value, sinks, rest[-1])))
 
     assert_as_exact(jax.jit(program(fused)), jax.jit(program(reference)), draw, label, seeds=seeds,
                     truth_fn=program(exact), terms=terms)
