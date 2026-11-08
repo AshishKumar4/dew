@@ -64,9 +64,11 @@ class Forward:
     power of two the queries took before their products (`prescale`, `attention.prescale`), which `scale`
     is the call's scale over, the keys a launch's walk reaches where past the call's though they are
     whole tiles (`walked_keys`: a holder of a common walk wholly past them, `seen` keeps every query from
-    it; None where none does), and whether the launch lowers its exponentials to the hardware's
+    it; None where none does), whether the launch lowers its exponentials to the hardware's
     approximations (`approximate`, `attention_mosaic_program.approximate`; false where a hook's tanh makes it
-    lower every transcendental exactly)."""
+    lower every transcendental exactly), and the levels a quantized model's weights round to (`rounds`,
+    `attention.Hooks.rounds`: each weight `round(rounds p)` at the row's known maximum in the value product,
+    the anchored walk's, `anchored_step`; None where they do not)."""
 
     form: str
     keys: int
@@ -82,6 +84,7 @@ class Forward:
     prescale: float = 1.0
     walked_keys: int | None = None
     approximate: bool = True
+    rounds: int | None = None
     subtracted: bool = False
     """Whether the fold (`base2`) takes its exponent as the accurate form's raw one does (`raw`), a difference
     of the raw products scaled after it is taken, `exp2((s - m) * scale * log2(e))`: no logit the reference
@@ -1524,7 +1527,10 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         # A row's factor, one product an element (a shift is at most `HEADROOM`'s complement of the keys'
         # count and fp32's largest binade, well within `exact_power2`'s exponents).
         p = p * expand(exact_power2(-arg.shift), p)
-    parts, others, own_tile, arg = _split_tile(keys, p, value.dtype, arg,
+    # A quantized model's weights in the value product its codes at the row's maximum, each at most
+    # `rounds` and exact in the values' dtype; the denominator the weights themselves (`Forward.rounds`).
+    taken = p if spec.rounds is None else jnp.round(spec.rounds * p)
+    parts, others, own_tile, arg = _split_tile(keys, taken, value.dtype, arg,
                                                drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos))
     if keys.accumulate is None:
         acc = state.acc + summed_products(parts, value, keys.dot)
@@ -1549,6 +1555,22 @@ def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
     state, arg, own, others_total = jax.lax.fori_loop(
         lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
         (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing))
+    return settled(state), arg, own, others_total
+
+
+def anchored_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Carry:
+    """A training forward's walk (`training_walk`'s carry) at each row's maximum and anchor found before it:
+    a walk of `argmax` over the logits alone, then `anchored_step`s from `anchored`'s carry, as the Mosaic
+    training launch walks a peak walk's anchors; a quantized call's (`Forward.rounds`), whose weights round
+    at that maximum."""
+
+    def peaked(index, arg):
+        keys = keys_at(index)
+        return argmax(arg, keys.logits, keys.coords.k_pos)
+
+    arg = jax.lax.fori_loop(lo, hi, peaked, no_argmax(start.total.shape[0]))
+    state, arg, own, others_total = jax.lax.fori_loop(
+        lo, hi, lambda index, carry: anchored_step(spec, carry, keys_at(index)), anchored(spec, start, arg))
     return settled(state), arg, own, others_total
 
 

@@ -115,6 +115,9 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
     if hooks is not None and hooks.drop is not None:
         return Refusal('dropout', "the Pallas-Triton mainloop takes no probability dropout (the route runs a "
                        "dropping call on the reference path, ledger row 1521)")
+    if hooks is not None and hooks.rounds is not None:
+        return Refusal('rounds', "the Pallas-Triton mainloop walks no maximum before its weights, so rounds "
+                       "none (`Hooks.rounds`); the Mosaic and plain-JAX mainloops do")
     return None
 
 

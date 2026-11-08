@@ -228,13 +228,18 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
     # fold its logits' reach (`algebra.walked`).
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score_mod,
-                           natural, algebra.headroom(value.dtype), hooks.initial is not None,
-                           compensated=algebra.compensates(value.dtype), prescale=power)
-    if not residuals:
+                           natural, hooks.rounds is None and algebra.headroom(value.dtype),
+                           hooks.initial is not None, compensated=algebra.compensates(value.dtype),
+                           prescale=power, rounds=hooks.rounds)
+    # A quantized call's weights round at each row's maximum, which its training walk finds first
+    # (`attention_program.walk`), its residuals let go where the call keeps none.
+    if not residuals and hooks.rounds is None:
         out, _ = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k, residuals=False)
         return out[:, :queries, :, :value_width]
     out, (m, denominator, anchors, split) = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k,
                                                         residuals=True)
+    if not residuals:
+        return out[:, :queries, :, :value_width]
     sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
                  split.others_total[:, :, :queries], split.shift[:, :, :queries])
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
