@@ -275,7 +275,16 @@ LOSS_SEEDS = 8
 `seeds_for`, paired: both arms read the same per-token terms, whose NELBO weights 1 / t run to a
 thousand where a row's time is drawn near zero, so one arm's error alone resolves in no 4096 seeds)."""
 
+LOSS_CONDITIONING = 512
+"""The masked loss site's weighed draws (`seeds_for(..., conditioning=True)`, paired, armada at
+5eb90717dc's rounding scale, 512 with XLA:CPU's YNNPACK fusions on, as a CPU user compiles (the census),
+and off): each draw's error weighed by the reference's own rounding scale there, which carries its
+NELBO weight, where the unweighted pooled ratio is heavy-tailed across draws and decides at no declared
+count under the census (row 4664: Inconclusive, 0.409 to 1.539 over 40 draws)."""
 
+
+@pytest.mark.check1_shards(seeds=LOSS_SEEDS, per_task=LOSS_SEEDS, conditioning=LOSS_CONDITIONING,
+                           conditioning_per_task=128)
 def test_the_loss_is_the_mean_of_the_terms_evaluation_reports_under_the_weights_it_is_handed(rng):
     """The training loss is the batch's per-token NELBO terms averaged over
     every position, and evaluation reports those terms, zero where a token
@@ -319,7 +328,7 @@ def test_the_loss_is_the_mean_of_the_terms_evaluation_reports_under_the_weights_
         return mean
 
     assert_as_exact(loss, mean_of_terms(objective), draw, "masked loss",
-                    seeds=LOSS_SEEDS, truth_fn=mean_of_terms(wide))
+                    seeds=LOSS_SEEDS, truth_fn=mean_of_terms(wide), conditioning=LOSS_CONDITIONING)
 
     averaged = jax.tree.map(lambda leaf: 1.5 * leaf, params)
     handed = objective.evaluate(params, {"text": rows}, Step(jnp.asarray(0), rng, averaged))
