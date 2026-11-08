@@ -58,7 +58,15 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
+from dew.nn.kernels.templates import (
+    axes,
+    bodies,
+    bundles,
+    cost as unit_cost,
+    mosaic,
+    resources,
+    tail as tail_of,
+)
 from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, scattered, sides_extended, sides_padded
 
 
@@ -399,14 +407,18 @@ class Allocations:
     staged: tuple
     outputs: tuple
 
-    def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None) -> resources.Scope:
+    def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None,
+              rewritten: bool = False) -> resources.Scope:
         """Its allocations by lifetime (`resources.shared_bytes`): its streams where its family places them
         (`mosaic.Family.lifetimes`, in no more slots than a walk's `steps` where they are known), and each
         output staged as its family stages it (`mosaic.Family.output_staging`, the allocations `persist`
-        makes), after the walks where the family scopes them apart, its pipeline's memory reused."""
+        makes), after the walks where the family scopes them apart, its pipeline's memory reused; with
+        `rewritten`, its streams' slots rewritten by its family's own role (`persist`'s `prepared`), whose
+        publish barriers `persist` scopes too."""
         consumers = tiles.warpgroups
         staging = tuple(family.output_staging(self.outputs, consumers))
-        persisted, addresses = family.persist_scratch(consumers)
+        rewrites = tuple(tiles.stages for _ in self.blocks) if rewritten else ()
+        persisted, addresses = family.persist_scratch(consumers, rewrites)
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
         streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
         held, walks = family.lifetimes(streams, steps)
@@ -817,7 +829,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, exact_sums),
-                           accumulators=(part,) * len(matrices))
+                           accumulators=(part,) * len(matrices), **_summed(family, tiles, exact_sums))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
@@ -834,9 +846,39 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
                            resident=tiles.programs, scalars=0 if dense else 1,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
-                                                   *prologue_operands, *epilogue_operands, *out_type))
+                                                   *prologue_operands, *epilogue_operands, *out_type),
+                           **_prefetched(tiles, grid, k // block_k, transpose_rhs, interpret,
+                                         dense=dense, parts=(tail, scales, mx_scales, gather)))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
                   *_workspace(tail, (multiprocessors, 2, consumers, *part)))
+
+
+def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, interpret, *, dense: bool,
+                parts: tuple) -> dict:
+    """Dew: a dense `gmm`'s matrix prefetched into L2 before its launch's wait for the one before it
+    (`bodies.dependent`'s `prefetched`, `bodies.waits`): each program's first tile's matrix blocks of its
+    first stages, so its first loads hit L2 rather than wait on memory under the previous launch's tail
+    (M-FS-12: a decode GEMM's prologue exposed 3-5%; row 3601). A plain dense product's alone (no tail,
+    scales or gathered rows: `parts` all None), whose first tile a program's index states (its persistent
+    walk's first, `persistent.tiled`); a grouped one's needs its routing, written before the wait. A
+    prefetch reads nothing into the program, so a matrix the launch before it still writes is prefetched
+    early, never read stale."""
+    plain = dense and all(part is None for part in parts)
+    if not (plain and tiles.splits == 1 and not tiles.raster and tiles.cluster == 1
+            and bodies.waits(interpret)):
+        return {}
+    block = (tiles.block_n, tiles.block_k) if transpose_rhs else (tiles.block_k, tiles.block_n)
+
+    def prefetched(lhs_gmem, matrix_gmem, *refs):
+        # The matrix is the launch's second operand, after the rows (`gmm`'s operands: a dense call's
+        # take no table).
+        del lhs_gmem, refs
+        _, column_tile = tail_of.planar_snake(lax.axis_index("programs"), grid, 1, tiles.grid_block_n)
+        view = (_matrix_columns(matrix_gmem.at[0], column_tile, block_n=tiles.block_n,
+                                transpose_rhs=transpose_rhs), _rhs_index(transpose_rhs))
+        return [mosaic.viewed(view, block, step) for step in range(min(tiles.stages, steps))]
+
+    return {'prefetched': prefetched}
 
 
 def _declared(rows: int, n: int, splits: int, dtypes: tuple) -> tuple:
@@ -1333,13 +1375,20 @@ def _met(step: Callable, chunk: int, meetings, walked, wg, *, programs: int, wal
     return met
 
 
+def _summed(family: mosaic.Family, tiles: Tiles, exact_sums: bool) -> dict:
+    """Dew: the persist arguments of an exactly summed launch on a family that sums its windows itself
+    (`mosaic.Family.sums_in_persist`): a window's steps (`summed_window`); none on any other."""
+    return {'summed': family.summed_window(tiles.block_k)} if exact_sums and family.sums_in_persist else {}
+
+
 def _walked_products(family: mosaic.Family, walk, step, shape: tuple, count: int, exact_sums: bool) -> tuple:
     """Dew: a cooperative `gmm` consumer's `count` products over its steps (`walk`, `step` a `_gmm_step`
     whose operands it reads), each into an fp32 tile of `shape`: as the tensor cores add, or with
     `exact_sums` each step's product summed apart and added into the running sum by an IEEE add, as
     `_walked_gradient`'s: an FP8 product's running sum promoted into fp32 every step, Hopper's FP8 tensor
-    cores summing within one in a narrower accumulator (testing.md, FP8 products)."""
-    if not exact_sums:
+    cores summing within one in a narrower accumulator (testing.md, FP8 products). A family whose persist
+    sums the windows itself (`mosaic.Family.sums_in_persist`, `_summed`) walks the steps plainly."""
+    if not exact_sums or family.sums_in_persist:
         _, accs = walk(step, None, (shape,) * count)
         return accs
 
@@ -1639,6 +1688,52 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         step_scales=step_scales)
 
 
+def _rewrites(family: mosaic.Family, k_major: bool, tables: tuple) -> bool:
+    """Dew: whether `tgmm`'s stage is rewritten by its family's own role (`mosaic.Family.rewrites_in_persist`,
+    a role beside its consumers): its loads' rows, never rows its tables gather, nor a k-major launch's
+    whole steps of one group (`grouped_matmul._Mosaic.rewritten`)."""
+    return family.rewrites_in_persist and not k_major and all(table is None for table in tables)
+
+
+def _whole_stages(slots: dict, mine_depth) -> tuple:
+    """Dew: a `tgmm` step's two stages read whole as its products take them: rewritten by its family's own
+    role (`mine_depth` None, `_rewritten_stage`), or a k-major launch's depth rows of the rows' block and
+    the cotangent's block read transposed (whole steps of one group, nothing to rewrite)."""
+    if mine_depth is None:
+        return slots['ring_0'].transpose((1, 0)), slots['ring_1']
+    return slots['ring_0'].at[mine_depth], slots['ring_1'].transpose((1, 0))
+
+
+def _stage_rewrite(rewrites: bool, family: mosaic.Family, starts_gmem, ends_gmem, block_k: int) -> dict:
+    """Dew: `tgmm`'s persist argument where its family rewrites its stage (`_rewrites`): each step's
+    neighbouring groups' rows zeroed by the family's own role (`_rewritten_stage`); none elsewhere."""
+    if not rewrites:
+        return {}
+    return {'prepared': functools.partial(_rewritten_stage, family, starts_gmem, ends_gmem, block_k)}
+
+
+def _rewritten_stage(family: mosaic.Family, starts_gmem, ends_gmem, block_k: int, tile, index, slots) -> None:
+    """Dew: a `tgmm` step's neighbouring groups' rows zeroed in both stages, whole (`_zero_neighbours_of`),
+    by its family's rewriting role (`mosaic.Family.persist`'s `prepared`), in the layouts it reads them in
+    (`rewriting`)."""
+    g_i, _, _, steps, start, *_ = tile
+    widths = [(stage, mosaic.swizzle_columns(stage.dtype, mosaic.SWIZZLE_BYTES))
+              for stage in (slots['ring_0'], slots['ring_1'])]
+    shares = [(stage.at[:, pl.ds(column, width)], None) for stage, width in widths
+              for column in range(0, stage.shape[1], width)]
+    _zero_neighbours_of(family.rewriting, shares, index + start, starts_gmem[g_i], ends_gmem[g_i], steps,
+                        block_k, aligned_skip=True)
+
+
+def _stored_chunks(family: mosaic.Family, summed, store: Callable, place: tuple) -> None:
+    """Dew: a `tgmm` tile's columns stored as its family reads them out (`chunks`: a register home's whole,
+    tensor memory's a chunk at a time), each at its column (`store(value, place)`)."""
+    row_start, first_row, stored, column, *ladder = place
+    for start_column, (chunk,) in family.chunks((summed,)):
+        at = column + start_column if start_column else column
+        store(chunk, (row_start, first_row, stored, at, *ladder))
+
+
 @tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
                       'prologue_axes', 'exact_sums', 'tail', 'k_major'))
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
@@ -1660,6 +1755,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
     lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
+    rewrites = _rewrites(family, k_major, tables)
     k, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers = tiles.warpgroups
@@ -1678,9 +1774,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
              rhs_gmem, *refs):
         table_gmems, refs = _tables_placed(tables, refs)
         *side_gmems, o_gmem = refs
-        workspace = None
-        if tail is not None:
-            *side_gmems, workspace = side_gmems
+        side_gmems, workspace = (side_gmems, None) if tail is None else (side_gmems[:-1], side_gmems[-1])
         scale_gmems, side_gmems = _scales_apart(side_gmems, step_scales is not None)
         ready = None if tail is None else family.partials_ready((multiprocessors, consumers), bool(interpret))
 
@@ -1712,10 +1806,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 def staged_at(index, slots):
                     # The step of its group's the program walks, from its first (`start`).
                     index = index + start
-                    if k_major:
-                        # Its depth rows of the rows' block and the cotangent's block read transposed: whole
-                        # steps of one group, nothing to rewrite.
-                        return slots['ring_0'].at[mine_depth], slots['ring_1'].transpose((1, 0))
+                    if rewrites or k_major:
+                        return _whole_stages(slots, None if rewrites else mine_depth)
                     # A vector read from global memory at the step's row block (`read`).
                     read_refs = {i: side_gmems[i].at[pl.ds((first + index) * block_k, block_k)] for i in read}
                     hook = (None if prologue is None
@@ -1733,19 +1825,21 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 if tail is not None and not active:
                     return
                 place = _tgmm_place(m, depth.start + wg * depth_half, columns.start, tiles)
+                out_gmem = o_gmem.at[g_i]
                 if tail is None:
-                    store(0, summed, o_gmem.at[g_i], place)
+                    _stored_chunks(family, summed, lambda value, at: store(0, value, out_gmem, at), place)
                     return
                 first, gathered = gathered
                 family.fixed_up(summed, workspace.at[:, 0, wg], None if ready is None else ready.at[:, wg],
-                                program, first, gathered,
-                                lambda value: store(0, value, o_gmem.at[g_i], place),
+                                program, first, gathered, lambda value: store(0, value, out_gmem, place),
                                 firsts=workspace.at[:, 1, wg])
 
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
-                           in_flight=family.in_flight, accumulators=(part,))
+                           in_flight=family.in_flight, accumulators=(part,),
+                           **_summed(family, tiles, exact_sums),
+                           **_stage_rewrite(rewrites, family, starts_gmem, ends_gmem, block_k))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
@@ -1755,11 +1849,12 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
-                           consumers=consumers, interpret=interpret, approx_math=False, name="dew_tgmm",
+                           consumers=consumers + rewrites, interpret=interpret, approx_math=False,
+                           name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
-    present = tuple(table for table in tables if table is not None)
-    return kernel(*groups, lhs, rhs, *present, *(step_scales or ()), *prologue_operands,
+    return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
+                  *prologue_operands,
                   *_workspace(tail, (multiprocessors, 2, consumers, *part)))
 
 
@@ -1920,6 +2015,9 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
     (`tgmm`'s `step_scales`); with a `window` of several steps (`mosaic.Issuer.summed_window`), the
     tensor cores' sum of each window's steps added at its end, the last window's however short. A tile of
     no steps is zero."""
+    if exact_sums and family.sums_in_persist:
+        # Its persist sums the windows itself (`_summed`): the steps walked plainly.
+        exact_sums = False
     if exact_sums and scaling is None and window > 1:
         def windowed_step(index, slots, running, accumulators):
             (fresh,) = accumulators
