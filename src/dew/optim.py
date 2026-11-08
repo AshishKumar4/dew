@@ -2301,8 +2301,8 @@ class OptimConfig:
         peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
         multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
         taken = {group.name for group in named}
-        name = next(name for name in ("fresh", *(f"fresh{index}" for index in itertools.count(1)))
-                    if name not in taken)
+        names = itertools.chain(("fresh",), (f"fresh{index}" for index in itertools.count(1)))
+        name = next(name for name in names if name not in taken)
         # The fresh group decays as the run's ungrouped optimizer would.
         fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=self.spared)
         if not named:
