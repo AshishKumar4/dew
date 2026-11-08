@@ -217,6 +217,7 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     computes is verified against transformers (tier 2), an unregistered causal LM none computes runs
     as transformers' own forward (tier 3), and one transformers has no class for is refused, as are a
     storage format the codecs cannot decode and a family's refusal."""
+    from dew import parity
     from dew.interop.pretrained import (
         DecoderRoute,
         DiffusionGemmaRoute,
@@ -232,7 +233,7 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     assert isinstance(source_route(fixture_config("gemma3-tiny-mm")), WrapperRoute)
     assert isinstance(source_route(fixture_config("diffusion-gemma-sft")), DiffusionGemmaRoute)
     verified = source_route(tier_two_config())
-    assert isinstance(verified, VerifiedRoute) and verified.verified.error <= verified.verified.bound
+    assert isinstance(verified, VerifiedRoute) and verified.verified.seeds >= parity.FEWEST_SEEDS
     torch_route = source_route(tiny_config("cohere").to_dict())
     assert isinstance(torch_route, TorchRoute) and torch_route.admitted.model_type == "cohere"
     llama = fixture_config("llama-tiny")
