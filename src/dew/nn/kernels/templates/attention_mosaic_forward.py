@@ -1623,23 +1623,23 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
         turn(arrive=False)
         found = algebra.argmax(arg[0], logits, coords.k_pos)
         if magnitudes is None:
-            return (found,), accumulators
+            return (found, arg[1]), accumulators
         tile = family.columns_of(magnitudes.at[row, kv_head, pl.ds(index * tiles.block_k, tiles.block_k)])
         return (found, algebra.reach_step(arg[1], logits, tile)), accumulators
 
     row, _, kv_head = place
+    # Its rows' reach (`algebra.Reach`), which only a walk reading the keys' magnitudes moves.
     start = (algebra.Argmax(family.full((tiles.block_q,), -jnp.inf),
                             family.full((tiles.block_q,), 0, jnp.int32)),
-             *(() if magnitudes is None else (algebra.Reach(family.zeros((tiles.block_q,)),
-                                                            family.zeros((tiles.block_q,))),)))
+             algebra.Reach(family.zeros((tiles.block_q,)), family.zeros((tiles.block_q,))))
     walked, _ = family.walk_own(
         streams, views, (lo, hi), streamed, consumer,
         lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), start, (), interpret,
                                                      first=counted),
         between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
-    arg = walked[0]
-    rows = (arg.peak,) if magnitudes is None else (arg.peak, *walked[1])
+    arg, reach = walked
+    rows = (arg.peak,) if magnitudes is None else (arg.peak, reach.largest, reach.seen)
     family.stored(tuple(map(family.as_row, rows)), (peak_views[0], *peak_views[2:]), smem=row_smem)
     family.stored((family.as_row(arg.key),), (peak_views[1],), smem=keys_smem)
 

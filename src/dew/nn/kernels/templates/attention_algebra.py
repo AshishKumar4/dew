@@ -645,8 +645,9 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
         if not form.headroom:
             return outputs
         assert kept is not None, "a walk under headroom keeps its guarded rows (`kept`)"
+        keep = kept
         return once(taken & (jnp.max(over.astype(jnp.int32)) > 0),
-                    lambda plain: kept(over, launch(form, over)[0], plain), outputs)
+                    lambda plain: keep(over, launch(form, over)[0], plain), outputs)
 
     outputs, maxima, over = plain_launch(spec)
     if not spec.reaches:
