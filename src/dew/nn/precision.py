@@ -535,10 +535,10 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         if (not chained and (key := _contraction(product, preferred_element_type)) is not None
                 and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
                 and products_dtype(*operands) == jnp.dtype(jnp.float32)):
-            return _paired_once(key)(*operands)
+            return _traced_once(key, _summed_pairwise)(*operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
-        return _traced_once(key)(*operands)
+        return _traced_once(key, _summed_wide)(*operands)
     return _summed_wide(product, preferred_element_type, *operands)
 
 
@@ -613,27 +613,17 @@ def _contraction(product: Callable, preferred_element_type) -> tuple | None:
 
 
 @functools.lru_cache(maxsize=1024)
-def _traced_once(key: tuple) -> Callable:
-    """`_summed_wide` of the contraction `key` names (`_contraction`) as one program JAX traces once for its
-    operands' types: a gated delta net layer's portable chunked math sums some 64 contractions a call,
-    each traced afresh at about 6.6 ms (the wide sum, its derivative and the narrow one each traced
-    again), 130 s of a decision witness's trace under Dew's test arithmetic (row 3142). Its arithmetic is
-    the product's own, the call a nested program XLA inlines. The most recent 1024 contractions are kept,
-    a model's working set many times over."""
+def _traced_once(key: tuple, summed: Callable) -> Callable:
+    """`summed` (`_summed_wide`, `_summed_pairwise`) of the contraction `key` names (`_contraction`) as one
+    program JAX traces once for its operands' types: a gated delta net layer's portable chunked math sums
+    some 64 contractions a call, each traced afresh at about 6.6 ms (the wide sum, its derivative and the
+    narrow one each traced again), 130 s of a decision witness's trace under Dew's test arithmetic (row
+    3142). Its arithmetic is the product's own, the call a nested program XLA inlines. The most recent 1024
+    contractions are kept, a model's working set many times over."""
     function, tree, leaves = key
     arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
     product = functools.partial(function, *arguments, **keywords)
-    return nested(functools.partial(_summed_wide, product, preferred_element_type))
-
-
-@functools.lru_cache(maxsize=1024)
-def _paired_once(key: tuple) -> Callable:
-    """`_summed_pairwise` of the contraction `key` names (`_contraction`) as one program JAX traces once for
-    its operands' types, as `_traced_once` is the wide sum's."""
-    function, tree, leaves = key
-    arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
-    product = functools.partial(function, *arguments, **keywords)
-    return nested(functools.partial(_summed_pairwise, product, preferred_element_type))
+    return nested(functools.partial(summed, product, preferred_element_type))
 
 
 def _summed_pairwise(product: Callable, preferred_element_type, *operands) -> jax.Array:
@@ -661,15 +651,17 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
         given = [read(atom) for atom in equation.invars]
         params = equation.params
         inner = params.get("jaxpr")
+        product = functools.partial(jax.lax.dot_general, out_sharding=params.get("out_sharding"))
         if equation.primitive is jax.lax.dot_general_p and (made := projection_product(
-                jax.lax.dot_general, *given, params["dimension_numbers"], params["precision"],
+                product, *given, params["dimension_numbers"], params["precision"],
                 params["preferred_element_type"])) is not None:
             outputs = [made]
         elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.ClosedJaxpr):
             outputs = _paired(inner.jaxpr, inner.consts, *given)
         else:
-            functions, bound = equation.primitive.get_bind_params(params)
-            made = equation.primitive.bind(*functions, *given, **bound)
+            # As JAX evaluates an equation (`jax.core.eval_jaxpr`): its context, its bind's parameters.
+            with equation.ctx.manager:
+                made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
             outputs = made if equation.primitive.multiple_results else [made]
         values.update(zip(equation.outvars, outputs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
