@@ -817,6 +817,10 @@ def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their
     held = [set(row["tests"]) for row in rows.values()]
     assert held[0] and held[1] and not held[0] & held[1]
     assert held[0] | held[1] == {f"tests/test_long.py::test_{name}" for name in names}
+    # Cut by other seconds, the groups run again, each test once more: no row an earlier cut left stands for one.
+    weights.write_text(json.dumps({"tests/test_long.py::test_a": 300.0}))
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
 
 
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
