@@ -12,8 +12,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
-from float64_terms import float64_terms
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 
@@ -256,9 +255,9 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, truth=Non
     (`kept`), the truth is attention written out over them (`exact_attention`) and every entry is sized by
     the terms attention's float64 gradients carry through their cancellation (`attention_terms`: a query
     that keeps one key has a logit gradient of float64 zero, which a fused kernel forms from its rounded
-    output), a sink's gradient by the truth's own terms. Without, `truth` is the truth and each row is sized
-    by its final sums' terms (a call whose keys this file does not lay out, every query keeping many). A
-    packed call's tokens, one run `[T, H, D]`, are read as a batch of one."""
+    output), a sink's gradient as a logit's beside the keys. Without, `truth` is the truth and each row is
+    sized by its final sums' terms (a call whose keys this file does not lay out, every query keeping
+    many). A packed call's tokens, one run `[T, H, D]`, are read as a batch of one."""
     def batched(fn):
         def run(*arrays):
             if arrays[0].ndim == 4:
@@ -282,12 +281,8 @@ def attention_on_par(fused, reference, draw, label: str, *, keep=None, truth=Non
     def terms(*inputs):
         query, key, value, *rest = inputs
         sinks = rest[0] if len(rest) == 2 else None
-        found = batched(lambda q, k, v, s, dy: attention_terms(q, k, v, dy, keep, sinks=s)[:4])(
-            query, key, value, sinks, rest[-1])
-        if sinks is not None:
-            with jax.enable_x64(new_val=True):
-                found = [*found, float64_terms(with_gradients(exact), *widened(inputs))[1][4]]
-        return split(tuple(found))
+        return split(tuple(batched(lambda q, k, v, s, dy: attention_terms(q, k, v, dy, keep, sinks=s))(
+            query, key, value, sinks, rest[-1])))
 
     assert_as_exact(jax.jit(program(fused)), jax.jit(program(reference)), draw, label, seeds=seeds,
                     truth_fn=program(exact), terms=terms)
