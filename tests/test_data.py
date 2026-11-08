@@ -345,12 +345,12 @@ def test_a_read_cut_per_share_expands_and_draws_in_its_workers_alike_in_any_coun
 
 @dataclasses.dataclass(frozen=True)
 class _Tokens:
-    """A record's index as a document of `index % 5 + 1` tokens."""
+    """A record's index beside a document of `index % 5 + 1` tokens."""
 
     identity = "tokens@1"
 
     def __call__(self, record):
-        return {"tokens": np.arange(record["index"] % 5 + 1, dtype=np.int32)}
+        return {"index": record["index"], "tokens": np.arange(record["index"] % 5 + 1, dtype=np.int32)}
 
 
 @pytest.mark.parametrize("chain", ["chunked", "expanded twice"])
@@ -370,7 +370,7 @@ def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain,
     monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 0.0)
     source = Pipeline(Memory(_Indexed(30)), name="docs").shuffle(5).repeat()
     if chain == "chunked":
-        built = source.map(_Tokens()).flat_map(Chunks(2)).random_map(_Jittered()).batch(4)
+        built = source.map(_Tokens()).flat_map(Chunks(2, fields=("tokens",))).random_map(_Jittered()).batch(4)
     else:
         built = source.flat_map(_Spread())._then(FlatMap(_Spread(), examples=True)).batch(4)
 
