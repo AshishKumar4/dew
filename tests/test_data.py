@@ -253,6 +253,50 @@ def test_a_training_read_naming_no_loading_reads_its_records_python_in_workers_a
             resumed.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class _Spread:
+    """An expansion of each record into as many rows as its index modulo three, none for every third."""
+
+    identity = "spread@1"
+
+    def __call__(self, record):
+        return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
+
+
+def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers(monkeypatch):
+    """A training read cut per share, its steps run in its loading workers before an expansion that makes
+    its rows a stream, reads the batches it reads in no workers in one, two, four and the count automatic
+    loading resolves to (`IN_ORDER`, `_Build.in_order`): each worker reads whole groups of consecutive inputs
+    by index and they are handed on in turn. A position saved in any count resumes in any other on the
+    batches the uninterrupted read goes on to (row 4862)."""
+    from dew.data.dataset import Host
+
+    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
+    chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
+             .flat_map(_Spread()).batch(4))
+
+    def loader(workers):
+        return compile(chain, seed=5, loading=Loading(workers=workers))
+
+    def read(workers, count: int, state=None) -> tuple[list, object]:
+        reader = loader(workers).train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            read = listed(reader, count)
+            return read, reader.get_state()
+        finally:
+            reader.close()
+
+    whole, _ = read(0, 12)
+    assert loader(0).plan.lowering == "per-share"
+    for workers in (1, 2, 4, "auto"):
+        assert read(workers, 12)[0] == whole
+    for saved_in, resumed_in in ((2, 4), (4, 0), (0, "auto")):
+        head, saved = read(saved_in, 5)
+        assert head + read(resumed_in, 7, saved)[0] == whole
+
+
 def test_a_training_read_of_stored_records_reads_in_the_training_process():
     """A training read that names no loading and runs no Python on its records, stored records shuffled into
     batches, starts no worker: a process would only copy what the training process reads as fast."""

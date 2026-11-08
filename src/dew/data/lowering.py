@@ -134,7 +134,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import PLAN_VERSIONS, Manifest
+from dew.data.plan import IN_ORDER, PLAN_VERSIONS, Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
@@ -1432,6 +1432,13 @@ class _Build:
     def global_order(self) -> bool:
         return not self.lowering.per_share
 
+    @property
+    def in_order(self) -> bool:
+        """Whether its loading workers read its inputs in their order (`_InputOrder`, `_StreamOrder`), so
+        its rows and its position are those a read in none makes, whatever their count: an elastic read's,
+        and from `IN_ORDER` a training read cut per share's."""
+        return self.elastic or (self.training and not self.global_order and self.version >= IN_ORDER)
+
     def child(self, index: int) -> _Build:
         """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
         by the name it goes by there (`_member_key`)."""
@@ -1457,7 +1464,7 @@ class _Build:
         # batch they would read every count-th of its rows.
         pooled = (count or written) and (_dropping(pipeline, self.lowering)
                                          or _streamed_take(pipeline, self.read))
-        ordered = self.elastic
+        ordered = self.in_order
         if self.global_order or not self.training or not (ordered or pooled):
             return self
         pool = next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
@@ -1479,7 +1486,7 @@ class _Build:
         under the same, a corpus a mixture keeps across an edit included."""
         build = self.owning(pipeline)
         source = pipeline.source
-        if build.pool is None:
+        if build.pool is None or build.in_order:
             return {}
         if not isinstance(source, (Mixture, Phases)):
             return {"/".join(str(key) for key in build.corpus): build.pool.count}
@@ -1764,7 +1771,7 @@ class _Build:
         # This corpus's own workers, where they read its first steps (`pooled`): those steps keep
         # each record they drop as a marker, which the reading process drops after them.
         pool = self.owning(pipeline).pool
-        pooled = (pool is not None and (pool.count > 0 or self.elastic)
+        pooled = (pool is not None and (pool.count > 0 or self.in_order)
                   and not isinstance(source, (Mixture, Phases)))
         # A Grain step of the caller's reads its rows as Grain gives them, without a marker.
         native = next((isinstance(stage, Native) for stage in pipeline.stages
@@ -1795,7 +1802,7 @@ class _Build:
         marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
         marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
-        if self.elastic and carried >= 0:
+        if self.in_order and carried >= 0:
             carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked))
         ran, counting, examples = consumed, _counts_own_rows(pipeline), False
         # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
@@ -2030,7 +2037,7 @@ class _Build:
         # a whole batch's count, the same on every topology.
         size = self.batch if self.elastic else partition.rows(self.batch)
         read = functools.partial(self.read_in, pipeline=pipeline, partition=partition, pool=pool)
-        if self.elastic and not isinstance(rows, pygrain.MapDataset):
+        if self.in_order and not isinstance(rows, pygrain.MapDataset):
             # Its rows come as a stream (a streamed read, a cache of each input's outputs), which every
             # worker reads whole, keeping its groups (`_StreamOrder`), and the reading process alone
             # keeps every group: one position, whatever the count of workers it is read in.
@@ -2038,7 +2045,7 @@ class _Build:
                                    _Ungrouped(size).flat_map, alone=not pool.count)
             return Accepted(ordered, _name(pipeline), _label(pipeline), certain_after=certain_after,
                             rows=_counts_rows(pipeline, at))
-        if self.elastic and isinstance(rows, pygrain.MapDataset):
+        if self.in_order and isinstance(rows, pygrain.MapDataset):
             handed = _InputOrder(rows, size, read, _Grouped)
         else:
             grouped = _as_iter(rows, self.loading).batch(size, drop_remainder=False, batch_fn=_Grouped())

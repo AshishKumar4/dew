@@ -735,11 +735,21 @@ def read_otherwise_at_10(saved: Mapping[str, object]) -> str | None:
             "position goes on only as 9 read it")
 
 
+def read_otherwise_at_11(saved: Mapping[str, object]) -> str | None:
+    """Why version 11 reads a version 10 data plan's order otherwise, None where it reads it alike: where its
+    read is cut per share, whose inputs 10 read where they were, every W-th in each loading worker or inline
+    in none, and 11 reads in their order in groups (`IN_ORDER`), a position of another form."""
+    if saved.get("lowering") != "per-share":
+        return None
+    return ("version 10 read this share's inputs where its workers took them, and version 11 reads them in "
+            "their order, so this position goes on only as 10 read it")
+
+
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
     position's one translation, where a reader's `set_state` decodes it. A plan of version 7 reads as 8, one
     of 8 as 9 and one of 9 as 10, where the later reads its order alike (`read_otherwise_at_8`,
-    `read_otherwise_at_9`, `read_otherwise_at_10`). A
+    `read_otherwise_at_9`, `read_otherwise_at_10`, `read_otherwise_at_11`). A
     token store a Dew before row 3028
     named without saying how its documents are read is named as today's names it where that Dew read the
     same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
@@ -750,8 +760,11 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
         saved = {**saved, "version": 8}
     if saved.get("version") == 8 and plan.version >= 9 and read_otherwise_at_9(saved, plan) is None:
         saved = {**saved, "version": 9}
-    if saved.get("version") == 9 and plan.version == FILE_SHARDS and read_otherwise_at_10(saved) is None:
+    if saved.get("version") == 9 and plan.version >= FILE_SHARDS and read_otherwise_at_10(saved) is None:
         saved = {**saved, "version": FILE_SHARDS}
+    if (saved.get("version") == FILE_SHARDS and plan.version >= IN_ORDER
+            and read_otherwise_at_11(saved) is None):
+        saved = {**saved, "version": IN_ORDER}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved
@@ -927,12 +940,20 @@ workers outnumber its files (`dew.data.sources.files.Files.manifest`): 9's shard
 numbered across every file, so a stream read every file's footer before its first record (FineWeb-Edu's
 default configuration's 2410 files, 196 s, row 4131)."""
 
-PLAN_VERSIONS = (8, 9, FILE_SHARDS)
+IN_ORDER = 11
+"""The plan version from which a training read cut per share reads its inputs in their order in any count of
+loading workers (`dew.data.lowering._Build.in_order`): its workers read whole groups of consecutive inputs
+by index and hand them on in turn (`dew.data.elastic_order._InputOrder`), so its batches are those it reads
+in none and its position names no count of them. 10's workers each read every W-th input and batched its
+own, so its batches and its position were its count's (row 4862)."""
+
+PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
 in the mixture that reads it or a named chain's own, into each shuffle of its own, so corpora of one length
 shuffled by one seed read in orders of their own and a named corpus reads one order mixed or alone (row
-3840), where 8 read them in one permutation; 10 streams a Parquet store by its files (`FILE_SHARDS`). A run
-saved under an earlier version reads by it (carried to 1.0, ledger 1552)."""
+3840), where 8 read them in one permutation; 10 streams a Parquet store by its files (`FILE_SHARDS`); 11
+reads a per-share read's inputs in their order in its workers (`IN_ORDER`). A run saved under an earlier
+version reads by it (carried to 1.0, ledger 1552)."""
 
 
 def read_by(version: int) -> int:
