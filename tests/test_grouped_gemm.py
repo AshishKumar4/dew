@@ -885,3 +885,50 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
         jax.tree.map(np.testing.assert_array_equal, check(fused), check(apart))
     unread = np.setdiff1d(np.arange(tokens.shape[0]), np.asarray(table))
     assert np.all(np.asarray(jax.vjp(fused, *operands)[1](cotangent)[0])[unread] == 0)
+
+
+def _primitives(jaxpr, found: set) -> set:
+    """The primitives `jaxpr` and every body inside it bind."""
+    for equation in jaxpr.eqns:
+        found.add(equation.primitive.name)
+        for value in equation.params.values():
+            for inner in value if isinstance(value, (tuple, list)) else (value,):
+                body = getattr(inner, "jaxpr", inner)
+                if hasattr(body, "eqns"):
+                    _primitives(body, found)
+    return found
+
+
+@runs("sm100")
+@pytest.mark.parametrize("sizes", ["ragged", "one-group", "dense"])
+def test_a_blackwells_bf16_projection_and_its_gradients_on_tcgen05_hold_check_1(sizes):
+    """A Blackwell's bf16 projection (`expert_projection`'s, a dense layer's where no groups are given) with
+    bf16 outputs, so no depth step is summed apart (`product.promoted`) and its forward and both gradients
+    run on tcgen05's launches as a B200 runs them, interpreted: each as exact as XLA's ragged dot from
+    float64, unrouted rows and empty groups included."""
+    group_sizes = None if sizes == "dense" else jnp.asarray(SIZES[sizes], jnp.int32)
+    rows = 200 if sizes == "dense" else sum(SIZES[sizes]) + 9
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        groups = 1 if group_sizes is None else group_sizes.shape[0]
+        shape = (256, 128) if group_sizes is None else (groups, 256, 128)
+        return (jnp.asarray(rng.normal(size=(rows, 256)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=shape) / 16, jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(rows, 128)), jnp.bfloat16))
+
+    def projection(dtype):
+        if group_sizes is None:
+            return lambda x, w: jnp.matmul(x.astype(dtype), w.astype(dtype)).astype(dtype)
+        return lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None)
+
+    def on_tcgen05(x, w, dy):
+        return with_gradients(lambda x, w: interpreted_projection(x, w, group_sizes, jnp.bfloat16))(x, w, dy)
+
+    with generation.assumed("sm100"):
+        # The premise: the launches the forward and both gradients take are tcgen05's.
+        traced = jax.make_jaxpr(on_tcgen05)(*draw(0))
+        assert any(name.startswith("tcgen05") for name in _primitives(traced.jaxpr, set())), sizes
+        # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
+        assert_as_exact(on_tcgen05, jax.jit(with_gradients(projection(jnp.bfloat16))), draw,
+                        f"tcgen05 {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
