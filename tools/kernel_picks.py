@@ -4,8 +4,8 @@ model's training step at its real shapes.
 The step is lowered from abstract state (`Trainer(lower_for=...)` on this
 GPU's generation), so a model this GPU cannot hold still lowers, and each
 Pallas launch the step holds is measured here and stored beside the
-compilation cache (`dew._cache.kernel_picks_path`), where every later run on
-a GPU of this model and jax reads it. Each stored launch whose derived config
+compilation cache (`dew._cache.kernel_picks_path`), where every later tuning run
+(`tune_kernels`) on a GPU of this model and jax reads it. Each stored launch whose derived config
 lost is printed last as a gap in the derivation (`tuning.gaps`), a row for its
 family's maintainers. FSDP splits the parameters, not the rows a norm
 or an expert matmul reads, so one device at a pool's per-device batch holds

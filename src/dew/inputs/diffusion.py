@@ -16,10 +16,10 @@ import numpy as np
 from flax import linen as nn
 
 from dew.batch import Variables, coordinates
-from dew.diffusion.process import DenoisingCondition
-from dew.inputs.condition import ConditionEncoder, ConditionWork
+from dew.inputs.condition import ConditionEncoder
 from dew.nn.blocks import torch_nearest_resize
-from dew.nn.flops import counted_flops, projection_flops
+from dew.nn.flops import ConditionWork, counted_flops, projection_flops
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.precision import accumulated
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead

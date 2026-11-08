@@ -34,8 +34,9 @@ from interop_support import (
 )
 from reference_error import assert_as_exact
 
+from dew.interop.autoencoders.wan import load_wan_vae
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.wan import chunked_decode, chunked_moments, load_wan_vae
+from dew.nn.autoencoders.wan import chunked_decode, chunked_moments
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5

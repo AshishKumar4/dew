@@ -5,6 +5,7 @@ and each field, or pair of fields, a `CausalTransformer` cannot build refused wh
 from __future__ import annotations
 
 import dataclasses
+import itertools
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -153,6 +154,34 @@ def _ngpt(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
             raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
                              f"feed-forward's; {layer_type!r} runs {mixer!r}")
 
+def _ranged_streams(model: CausalTransformer):
+    """Streams over a range of layers (`HyperConnections.hc_layers`) lie inside the stack. V4's depths
+    read the streams the trunk ends with (`streams_end_stack`), which a range ending before the trunk's
+    last layer, or one a loop runs again, leaves plain: no streams for them to read."""
+    hc = model.hyper_connections
+    if hc is None or hc.hc_layers is None:
+        return
+    if hc.hc_layers[1] > model.num_layers:
+        raise ValueError(f"the streams' layers {hc.hc_layers} end past layer {model.num_layers}")
+    if model.mtp_hyper_connections is not None and not model.streams_end_stack:
+        raise ValueError(f"V4's prediction depths read the streams the trunk ends with, and streams over "
+                         f"layers {hc.hc_layers} of {model.num_layers}"
+                         f"{' under a loop' if model.loop is not None else ''} leave it plain")
+
+
+def _plain_between_passes(model: CausalTransformer, name: str) -> bool:
+    """Whether what `name` carries beside the residual leaves it plain at the loop's ends: streams over a
+    range of layers inside one of its phases, the layers before its block, the block or those after
+    (SenseNova-Loop's `execution_plan`, which refuses a range across a phase boundary)."""
+    hc = model.hyper_connections
+    if name != "hyper_connections" or hc is None or hc.hc_layers is None or model.loop is None:
+        return False
+    first, end = model.loop.layers or (0, model.num_layers)
+    bounds = (0, first, end, model.num_layers)
+    start, stop = hc.hc_layers
+    return any(left <= start and stop <= right for left, right in itertools.pairwise(bounds))
+
+
 def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKind]):
     """Raise `ValueError` for a field, or a pair of fields, that this model cannot build.
 
@@ -172,8 +201,9 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
         if model.hyper_connections is None or mtp_hc.hc_mult != model.hyper_connections.hc_mult:
             raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
     _kinds(model, kinds)
+    _ranged_streams(model)
     carried = [name for name in ("altup", "hyper_connections", "attention_residuals", "dspark")
-               if getattr(model, name) is not None]
+               if getattr(model, name) is not None and not _plain_between_passes(model, name)]
     if model.loop is not None and carried:
         raise ValueError(f"a loop norms the one residual between its passes, and {carried} carry "
                          "others beside it; a model with them runs its stack once (loop=None)")

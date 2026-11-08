@@ -27,7 +27,7 @@ import types
 import numpy as np
 import torch
 from reference_source import github, ran, selected
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 REPO, COMMIT = "vllm-project/vllm", "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 PATH = "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"
@@ -50,22 +50,19 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     from torch_precision import widened
 
     route = grouped_topk()
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        inputs = {key.removeprefix(f"{name}."): value for key, value in cases.items()
-                  if key.startswith(f"{name}.")}
+    def arm(inputs, dtype):
         config = {key.removeprefix("config."): value.item() for key, value in inputs.items()
                   if key.startswith("config.")}
         arguments = {key: config[key] for key in ("topk", "renormalize", "num_expert_group", "topk_group",
                                                   "routed_scaling_factor")}
         arguments["scoring_func"] = "sigmoid" if config["sigmoid"] else "softmax"
-        for kind, dtype in (("reference", torch.float32), ("truth", torch.float64)):
-            gate = torch.from_numpy(inputs["logits"]).to(dtype)
-            correction = torch.from_numpy(inputs["bias"]).to(dtype) if config["bias"] else None
-            with widened() if dtype == torch.float64 else contextlib.nullcontext():
-                weights, ids = route(gate, gate, **arguments, e_score_correction_bias=correction)
-            out[f"{name}.{kind}.weights"] = torch.zeros_like(gate).scatter(-1, ids.long(), weights).numpy()
-    return out
+        gate = torch.from_numpy(inputs["logits"]).to(dtype)
+        correction = torch.from_numpy(inputs["bias"]).to(dtype) if config["bias"] else None
+        with widened() if dtype == torch.float64 else contextlib.nullcontext():
+            weights, ids = route(gate, gate, **arguments, e_score_correction_bias=correction)
+        return {"weights": torch.zeros_like(gate).scatter(-1, ids.long(), weights).numpy()}
+
+    return drawn(cases, lambda inputs: (arm(inputs, torch.float32), arm(inputs, torch.float64)))
 
 
 if __name__ == "__main__":
