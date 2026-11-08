@@ -50,7 +50,7 @@ from ..mlp import GatedMLP
 from .joint import TIME_FEATURES, JointAttention, embedding, embedding_flops, layer_norm
 
 if TYPE_CHECKING:
-    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.inputs import DenoisingCondition
 
 
 def _image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:

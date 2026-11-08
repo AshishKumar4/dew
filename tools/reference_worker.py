@@ -45,6 +45,24 @@ type Applied = Callable[[dict[str, object], dict[str, np.ndarray]], Mapping[str,
 """The reference's run of a case: its parameters and inputs to its outputs by leaf."""
 
 
+def draws(cases: Mapping[str, np.ndarray]) -> dict[str, dict[str, np.ndarray]]:
+    """A request's draws, each its inputs by name: the arrays `<draw>.<input>`."""
+    found: dict[str, dict[str, np.ndarray]] = {}
+    for key, value in cases.items():
+        name, _, given = key.partition(".")
+        found.setdefault(name, {})[given] = value
+    return dict(sorted(found.items()))
+
+
+def drawn(cases: Mapping[str, np.ndarray],
+          run: Callable[[dict[str, np.ndarray]], tuple[Mapping[str, np.ndarray], Mapping[str, np.ndarray]]]
+          ) -> dict[str, np.ndarray]:
+    """A torch worker's answer: each draw's (`draws`) reference leaves and float64 truth's, `run(inputs)`,
+    keyed under the draw (`paired`)."""
+    return {f"{name}.{key}": value for name, inputs in draws(cases).items()
+            for key, value in paired(*run(inputs)).items()}
+
+
 def answered(cases: Mapping[str, np.ndarray],
              applying: Callable[[str], contextlib.AbstractContextManager[Applied]]) -> dict[str, np.ndarray]:
     """Every case's outputs in float32 (`reference`) and float64 (`truth`): JAX's float64 enabled for the
@@ -53,17 +71,14 @@ def answered(cases: Mapping[str, np.ndarray],
     import jax
     import jax.numpy as jnp
 
-    names = sorted({key.split(".", 1)[0] for key in cases})
     out = {}
     for dtype, kind, wide in (("float32", "reference", False), ("float64", "truth", True)):
         jax.config.update("jax_enable_x64", wide)
         with applying(dtype) as apply:
-            for name in names:
-                prefix, given = f"{name}.param.", f"{name}."
-                params = {key.removeprefix(prefix): jnp.asarray(value, dtype) for key, value in cases.items()
-                          if key.startswith(prefix)}
-                case = {key.removeprefix(given): value for key, value in cases.items()
-                        if key.startswith(given) and not key.startswith(prefix)}
+            for name, inputs in draws(cases).items():
+                params = {key.removeprefix("param."): jnp.asarray(value, dtype)
+                          for key, value in inputs.items() if key.startswith("param.")}
+                case = {key: value for key, value in inputs.items() if not key.startswith("param.")}
                 for leaf, value in apply(params, case).items():
                     out[f"{name}.{kind}.{leaf}"] = np.asarray(value, dtype)
     return out

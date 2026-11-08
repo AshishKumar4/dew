@@ -20,9 +20,9 @@ from arm_arithmetic import float64_held
 from jax.sharding import NamedSharding, PartitionSpec as P
 from reference_error import as_given, assert_as_exact, without_ynn
 
-from dew.diffusion.process import DenoisingCondition
 from dew.mesh import batch_axes
 from dew.nn.conv import Conv
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.sharding import pipeline_microbatches
 from dew.registry import models
 from dew.training import Layout, MeshSpec

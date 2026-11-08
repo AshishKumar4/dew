@@ -31,22 +31,21 @@ from dew.interop.hf_decoders import (
 )
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
-from dew.interop.unread import Stored
-from dew.interop.weights import nested
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import layer_scalar_mode
-from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.multimodal import VisionConditioner
-from dew.nn.vision import tower_layout, tower_variables as vision_variables
-from dew.nn.vision.gemma4 import (
-    Gemma4Projector,
-    Gemma4Vision,
+from dew.interop.towers import tower_layout, tower_variables as vision_variables
+from dew.interop.towers.gemma4 import (
     gemma4_projector_layouts,
     gemma4_tower_layouts,
     translate_gemma4_projector_config,
     translate_gemma4_projector_weights,
     translate_gemma4_vision_config,
 )
+from dew.interop.unread import Stored
+from dew.interop.weights import Tree, nested, translate_parameters
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import layer_scalar_mode
+from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.multimodal import VisionConditioner
+from dew.nn.vision.gemma4 import Gemma4Projector, Gemma4Vision
 from dew.registry import from_record, projectors, towers
 
 if TYPE_CHECKING:
@@ -55,8 +54,8 @@ if TYPE_CHECKING:
 VISION_PREFIX = "model.encoder.vision_tower."
 PROJECTION_PREFIX = "model.encoder.embed_vision."
 """Where a DiffusionGemma checkpoint keeps its Gemma 4 tower's and embedder's tensors: under its
-encoder, by the names a Gemma 4 wrapper gives them (`Gemma4Vision.checkpoint`,
-`Gemma4Projector.checkpoint`)."""
+encoder, by the names a Gemma 4 wrapper gives them (`dew.interop.towers.gemma4`'s `GEMMA4_VISION`,
+`GEMMA4_PROJECTOR`)."""
 
 
 # The wrapper config states these three with a default this assembly supplies
@@ -105,6 +104,35 @@ def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
         raise ValueError("DiffusionGemma publishes no audio encoder")
     return DiffusionGemma(text=text, canvas_length=_integer(config, "canvas_length", 256),
                           conditioner=conditioner)
+
+
+def translate_self_conditioning(
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
+) -> Tree[Stored]:
+    """Self-conditioning parameters, cast per weight before the layout copy."""
+    paths = {
+        "pre_norm.weight": ("pre_norm", "scale"),
+        "gate_proj.weight": ("gate_proj", "kernel"),
+        "up_proj.weight": ("up_proj", "kernel"),
+        "down_proj.weight": ("down_proj", "kernel"),
+    }
+    seen = set()
+
+    def path_of(name: str) -> tuple[str, ...]:
+        bare = name.removeprefix("self_conditioning.")
+        if bare not in paths:
+            raise ValueError(f"unknown tensor name {name!r}")
+        path = paths[bare]
+        if path[0] in seen:
+            raise ValueError(f"duplicate self-conditioning tensor {name!r}")
+        seen.add(path[0])
+        return path
+
+    params = translate_parameters(hf_tensors, path_of, param_dtype)
+    missing = {path[0] for path in paths.values()} - seen
+    if missing:
+        raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
+    return params
 
 
 def translate_weights(

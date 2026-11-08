@@ -7,9 +7,10 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.diffusion.process import DenoisingCondition, Process, aligned_conditions
+from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, KarrasVENoiseScheduler
 from dew.diffusion.transforms import EpsilonPredictionTransform, KarrasPredictionTransform
+from dew.nn.inputs import DenoisingCondition
 
 
 class Conditioned(nn.Module):

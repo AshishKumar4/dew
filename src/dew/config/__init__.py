@@ -282,17 +282,20 @@ def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
     return from_record(tuple[ParamGroup, ...], groups)
 
 
-def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
-    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree
-    is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
+def trained_modules(objective: Objective[Loss, Effects],
+                    modules: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree is
+    drawn (`Objective.init`, its shapes alone), and those that are one (a parameter a loaded module
+    gained, `Pretrained.with_model`): a tied readout is drawn with none."""
     if not modules:
-        return ()
+        return (), ()
     from dew.batch import unboxed
     from dew.optim import parameter_name
 
     trained = unboxed(abstract(lambda: objective.init(jax.random.key(0))))["params"]
     names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
-    return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
+    return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
+            tuple(module for module in modules if module in names))
 
 
 def _best_argument():
@@ -683,19 +686,24 @@ class TrainerConfig:
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
     Only a process with the GPU to itself measures, and the picks persist beside
-    the compilation cache for every later run that sets it too. It measures Dew's
-    own launches (the kernel templates, `attention_impl="template"`); tokamax's
-    flash kernel (`"triton"`) runs at tokamax's heuristic config, unmeasured.
+    the compilation cache for every later run that sets it too, each pick read for
+    its own launch alone. It measures each of Dew's own launches that declares
+    variants to time (the kernel templates, `attention_impl="template"`, the norms,
+    SwiGLU and decode attention); tokamax's flash kernel (`"triton"`) runs at
+    tokamax's heuristic config, unmeasured.
     Unset, nothing is measured or read: every launch takes the config it derives
     from the GPU's facts (row 4837).
     """
 
     def accumulating(self, dataset: Loader) -> Self:
-        """This config with the accumulation its token budget sets over `dataset`'s token batches:
-        `update_tokens` a whole number of them. Raises ValueError for a budget over data batched in
-        rows, one no whole number of them, or an accumulation set otherwise."""
+        """This config with the accumulation its token budget sets over `dataset`'s token batches, every
+        phase's alike (`Loader.token_batches`): `update_tokens` a whole number of them. Raises ValueError for
+        rows, no whole number, phases of other token batches or an accumulation set otherwise."""
         if self.update_tokens is None:
             return self
+        if len(set(dataset.token_batches)) > 1:
+            raise ValueError(f"--trainer.update-tokens sets one accumulation; the phases batch "
+                             f"{list(dataset.token_batches)} tokens: batch alike or set the accumulation")
         if dataset.batch_tokens is None or self.update_tokens % dataset.batch_tokens:
             raise ValueError(f"--trainer.update-tokens {self.update_tokens} is no whole number of the data's "
                              f"token batches ({dataset.batch_tokens}); batch the data by tokens "
@@ -988,8 +996,6 @@ def _chain_label(chain: Dataset | None) -> str:
     return str(calls[-1]).rpartition(":")[2].rpartition(".")[2] if calls else "data"
 
 
-CHAINS = ("data", "validation")
-"""A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
 
 
 def _chain_record(value: Dataset | Mapping[str, Dataset] | None) -> JSON:
@@ -1050,6 +1056,10 @@ def _routed(saved: Mapping[str, object], unseeded: str) -> Iterator[None]:
         named = registry.class_record(saved)
         recorded = named is not None and _reads_back(named[1])
         raise refused.routed(recorded=recorded, unseeded=unseeded) from None
+
+
+CHAINS = ("data", "validation")
+"""A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
 
 
 def _reads_back(fields: Mapping[str, object]) -> bool:
@@ -1153,12 +1163,6 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     if not isinstance(held, dict):
         raise KeyError(f"{key} holds {held!r}, not a record of fields")
     return held
-
-
-def _without(record: Mapping[str, JSON], names: tuple[str, ...]) -> dict[str, JSON]:
-    """`record` without a field of `names` wherever it nests one: a wrapper's language model's, a decision
-    run's backbone's among them (`_records.without_fields`)."""
-    return {key: _records.without_fields(value, names) for key, value in record.items() if key not in names}
 
 
 def _holds(config: "RunConfig", path: str) -> bool:
@@ -1483,11 +1487,9 @@ class RunConfig:
 
     def built_fresh(self) -> None:
         """Refuse `source` in a run whose model is built from `model`, loading no source: what it says
-        `Pretrained.load` builds of a source (`source_keywords`) reaches nothing such a run builds. How
-        its layers execute (`EXECUTED`), which a saved run records whatever its source, is no such word."""
-        unsourced = SourceOptions()
-        executed = {name: getattr(unsourced, name) for name in self.EXECUTED if hasattr(unsourced, name)}
-        if dataclasses.replace(self.source, **executed) != unsourced:
+        `Pretrained.load` builds of a source (`source_keywords`), how it scans its layers among it, reaches
+        nothing such a run builds, whose own fields say it (`--model.scan_layers`)."""
+        if self.source != SourceOptions():
             raise ValueError(f"--source says what a run builds of the source it loads, and this "
                              f"{type(self).__name__} loads none: its model is built from --model, whose "
                              "own fields say it; or start the run from a source")
@@ -1512,7 +1514,7 @@ class RunConfig:
         if recorded is None:
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        before, now = (_without(record, self.EXECUTED)
+        before, now = (_records.without_fields(record, self.EXECUTED)
                        for record in (recorded._fields_record(), self._fields_record()))
         # A field the saved run left to its build and its record holds unresolved, which no checkpoint
         # states either (`earlier_option_writing`), is the one this build resolves (`BUILT`).
@@ -2116,11 +2118,11 @@ class RunConfig:
                 if recorded is not None:
                     return to_record(recorded, tuple[ParamGroup, ...])
             groups = named or self.optim.fresh_groups()
-            modules = trained_modules(objective, objective.fresh_modules()) if any(
-                group.fresh for group in groups) else ()
-            if not named and not modules:
+            modules, leaves = trained_modules(objective, objective.fresh_modules()) if any(
+                group.fresh for group in groups) else ((), ())
+            if not named and not modules and not leaves:
                 return to_record((), tuple[ParamGroup, ...])
-            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules)
+            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
             return to_record(claimed.param_groups, tuple[ParamGroup, ...])
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
         return self.optim if groups == self.optim.param_groups else dataclasses.replace(
@@ -2244,35 +2246,55 @@ class DecoderRunConfig(RunConfig):
     """Checkpoint every pass of the loop, including the first, and recompute
     it in the backward pass; requires a loop and leaves decoding unchanged.
     False keeps a checkpoint's own choice."""
+    loop_implicit: bool = False
+    """Relax each later pass toward the block's input by a per-channel θ drawn
+    at zero (`Loop.implicit`), so the looped decoder starts as the one loaded
+    computes; False keeps a checkpoint's own choice."""
+    loop_exit_gate: bool = False
+    """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which an
+    objective's `exit_entropy` trains as Ouro does; False keeps a checkpoint's own choice."""
+    loop_exit_threshold: float | None = None
+    """Exit each token at the first pass whose cumulative exit probability reaches this
+    (`Loop.exit_threshold`); None keeps a checkpoint's own choice."""
 
     @property
     def loops(self) -> bool:
         """Whether the run asks anything of a loop (`looped`)."""
         return (self.loop_steps is not None or self.loop_layers is not None
-                or self.loop_backprop_steps is not None or self.loop_remat)
+                or self.loop_backprop_steps is not None or self.loop_remat or self.loop_implicit
+                or self.loop_exit_gate or self.loop_exit_threshold is not None)
 
     def looped(self, start: "Pretrained") -> "Pretrained":
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
         return looping(start, self.loop_steps, self.loop_layers, backprop_steps=self.loop_backprop_steps,
-                       remat=self.loop_remat or None)
+                       remat=self.loop_remat or None, implicit=self.loop_implicit or None,
+                       exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
+                       key=self.trainer.key)
 
 
 def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
-            backprop_steps: int | None = None, remat: bool | None = None) -> "Pretrained":
+            backprop_steps: int | None = None, remat: bool | None = None,
+            implicit: bool | None = None, exit_gate: bool | None = None,
+            exit_threshold: float | None = None, key: int | jax.Array = 0) -> "Pretrained":
     """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
-    the loop's backward memory; None keeps a looped checkpoint's own value."""
+    the loop's backward memory, `implicit` its later passes' rule (`Loop.implicit`), and `exit_gate` and
+    `exit_threshold` its exits (`Loop.exit_gate`); None keeps a looped checkpoint's own value. A loop
+    that gives its layers parameters of their own (an implicit loop's θ, an exit gate) draws them from
+    `key` beside the loaded weights, fresh (`Pretrained.with_model`)."""
     from dew.nn.protocols import Looping
 
-    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
+    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat,
+                                      implicit=implicit, exit_gate=exit_gate,
+                                      exit_threshold=exit_threshold)
               if isinstance(start.model, Looping) else None)
     if looped is None:
         raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
                          "its layers to repeat and --loop-steps how many times")
-    return dataclasses.replace(start, model=looped)
+    return start.with_model(looped, key=key)
 
 
 __all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "Release", "RunConfig",

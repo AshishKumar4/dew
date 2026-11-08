@@ -683,23 +683,96 @@ def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = N
                         dtype=dtype, zero_sizes=held.own[~sized], worst_log=logged)
 
 
+def _computed_here(program, *trees):
+    """`program(*trees, xp=...)` in float64, its small results on the host: in one compiled program where
+    every array lives on a GPU, whose float64 arithmetic keeps subnormals as numpy does (IEEE's; XLA:CPU
+    reads a subnormal float64 as zero, `1e-310 != 0` false there, and a TPU has no float64), else in numpy,
+    on a CPU the arrays' own memory. Where the arrays live decides it, not the default backend: a program
+    over arrays a GPU host placed on its CPU would run on XLA:CPU."""
+    arrays = [leaf for leaf in jax.tree.leaves(trees) if leaf is not None]
+    if not arrays or not all(isinstance(leaf, jax.Array) and all(device.platform == "gpu"
+                                                                 for device in leaf.devices())
+                             for leaf in arrays):
+        return program(*trees, xp=np)
+    compiled = _COMPILED.setdefault(program, jax.jit(functools.partial(program, xp=jnp)))
+    with jax.enable_x64(new_val=True):
+        return jax.device_get(compiled(*trees))
+
+
+_COMPILED: dict = {}
+"""Each statistics program compiled for a GPU once (`_computed_here`), jit's cache keyed by its leaves."""
+
+
+def _width(leaf) -> int:
+    """A leaf's row width: its last axis's, 0 for a leaf of rank under two, which has no rows."""
+    return np.shape(leaf)[-1] if np.ndim(leaf) >= 2 else 0
+
+
+def _laid(leaf, xp):
+    """`leaf` in float64, in C order: its sums run alike whatever layout it came in (numpy's follow
+    memory order; a compiled program's leaves are C-ordered)."""
+    return np.ascontiguousarray(leaf, np.float64) if xp is np else jnp.asarray(leaf, jnp.float64)
+
+
+def _truth_rows(truths, terms, *, xp):
+    """Each truth leaf's rows' own RMS (`_scaled_rms`) and size, the larger of it and its terms' RMS
+    where `terms` holds the leaf's float64 terms, the RMS past RESOLUTION of the leaf's own RMS, else zero;
+    and whether its every value is finite. A leaf of rank under two has no rows."""
+    found = []
+    for truth, term in zip(truths, terms, strict=True):
+        truth = _laid(truth, xp)
+        width = _width(truth)
+        if not width:
+            found.append((np.zeros(0), np.zeros(0), xp.isfinite(truth).all()))
+            continue
+        rows = truth.reshape(-1, width)
+        own = _scaled_rms(rows, xp)
+        sized = own if term is None else xp.maximum(
+            own, _scaled_rms(xp.abs(_laid(term, xp)).reshape(rows.shape), xp))
+        resolved = RESOLUTION * xp.sqrt(xp.mean(xp.square(truth)))
+        found.append((own, xp.where(sized > resolved, sized, 0.0), xp.isfinite(truth).all()))
+    return found
+
+
+def _error_rows(references, truths, *, xp):
+    """Each reference leaf against its truth: its mean squared error, whether it differs anywhere, whether
+    its every value is finite, and its error's rows' RMS (`_scaled_rms`) and largest share
+    (`_largest_share`)."""
+    found = []
+    for reference, truth in zip(references, truths, strict=True):
+        values, truth = _laid(reference, xp), _laid(truth, xp)
+        errors = values - truth
+        width = _width(truth)
+        rows = errors.reshape(-1, width) if width else xp.zeros((0, 1))
+        found.append((xp.mean(xp.square(errors)), xp.any(values != truth), xp.isfinite(values).all(),
+                      _scaled_rms(rows, xp), _largest_share(rows, xp)))
+    return found
+
+
+def _largest_share(rows, xp=np):
+    """Each row's largest element's share of the row's squared error, the row scaled by its largest first so
+    no square overflows: one for a row one element holds alone, zero for a row of zeros. In numpy, or in
+    `xp` (jax.numpy, inside check 1's programs)."""
+    rows = xp.abs(xp.asarray(rows, xp.float64))
+    largest = xp.max(rows, axis=1, keepdims=True) if rows.shape[1] else xp.zeros((len(rows), 1))
+    scaled = xp.square(rows / xp.where(largest > 0, largest, 1.0))
+    total = xp.sum(scaled, axis=1)
+    return xp.where(total > 0, 1.0 / xp.where(total > 0, total, 1.0), 0.0)
+
+
 @dataclasses.dataclass(frozen=True)
 class _LaidTruths:
-    """A draw's truth leaves read at once for both arms (`_summaries`). Every leaf that is not empty lies
-    end to end with the others in C order, by row width (its last axis's, 0 for a leaf of rank under two)
-    and then size: each run of one width and size is one (leaves, size) matrix, and each width's rows one
-    (rows, width) matrix, so a draw takes a few passes where it took a pipeline a leaf (ledger 1848:
-    190 µs a leaf at the gemma3n gradient's tiny leaves). A leaf in another layout is read as its
-    C-ordered copy. Each row has its own RMS (`_scaled_rms`) and its size, the RMS where it is past
-    RESOLUTION of its leaf, else zero (`row_errors`'). `truths` is every leaf in float64 in C order,
-    `laid` the leaves laid in order, `runs` each run's (leaves, size, width), `values` the laid leaves,
-    `own` and `sizes` their rows' own RMS and size, and `finite` whether each laid leaf's every value
-    is."""
+    """A draw's truth leaves read once for both arms (`_summaries`), every leaf that is not empty in its
+    order, its rows in C order (its last axis's, none for a leaf of rank under two). Each row has its own
+    RMS (`_scaled_rms`) and its size, the RMS where it is past RESOLUTION of its leaf, else zero
+    (`row_errors`'), computed where the leaves live in one program a draw (`_truth_rows`): only these
+    rows' statistics leave the device. `truths` is every leaf as given, `laid` the leaves that are not
+    empty, `counts` each laid leaf's rows, `own` and `sizes` their rows' own RMS and size, and `finite`
+    whether each laid leaf's every value is."""
 
     truths: list
     laid: list[int]
-    runs: list[tuple[int, int, int]]
-    values: np.ndarray
+    counts: np.ndarray
     own: np.ndarray
     sizes: np.ndarray
     finite: np.ndarray
@@ -708,66 +781,22 @@ class _LaidTruths:
     def of(truths, terms=None) -> "_LaidTruths":
         """`truths` laid, each row sized by its own RMS or, given each leaf's float64 `terms`
         (`float64_terms`), by the larger of it and its terms' RMS, as `row_errors` sizes a row that
-        cancels (`assert_as_exact`'s `terms`)."""
-        truths = [np.asarray(truth, np.float64, order="C") for truth in truths]
-        keys = sorted((truth.shape[-1] if truth.ndim >= 2 else 0, truth.size, at)
-                      for at, truth in enumerate(truths) if truth.size)
-        runs = [(len(list(run)), size, width)
-                for (width, size), run in itertools.groupby(keys, lambda key: key[:2])]
-        values = np.concatenate([np.zeros(0), *(truths[at].reshape(-1) for *_, at in keys)])
-        blocks, resolved = _blocks(values, runs), [np.zeros(0)]
-        for (_, size, width), block in zip(runs, blocks, strict=True):
-            if width:
-                # Each leaf's `distance(truth, 0)`, at each of its rows.
-                resolved.append(np.repeat(RESOLUTION * np.sqrt(np.mean(np.square(block - 0.0), axis=1)),
-                                          size // width))
-        own = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(values, runs))])
-        sized = own
-        if terms is not None:
-            # The terms laid as the truths are, leaf by leaf; a leaf no sum made is its own size.
-            laid_terms = [np.abs(np.asarray(term if term is not None else truths[at], np.float64,
-                                            order="C")).reshape(truths[at].shape)
-                          for at, term in enumerate(terms)]
-            termed = np.concatenate([np.zeros(0), *(laid_terms[at].reshape(-1) for *_, at in keys)])
-            sized = np.maximum(own, np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(termed, runs))]))
-        finite = [np.isfinite(block).all(axis=1) for block in blocks]
-        return _LaidTruths(truths, [at for *_, at in keys], runs, values, own,
-                           np.where(sized > np.concatenate(resolved), sized, 0.0),
-                           np.concatenate([np.zeros(0, bool), *finite]))
-
-
-def _blocks(values: np.ndarray, runs) -> list[np.ndarray]:
-    """`values` laid by `runs` (`_LaidTruths`), each run's leaves a (leaves, size) matrix."""
-    ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
-    return [values[start:stop].reshape(leaves, size)
-            for start, stop, (leaves, size, _) in zip(ends[:-1], ends[1:], runs, strict=True)]
-
-
-def _rows(values: np.ndarray, runs) -> list[np.ndarray]:
-    """`values` laid by `runs` (`_LaidTruths`), each width's rows, its runs' together, one (rows, width)
-    matrix."""
-    ends = list(itertools.accumulate((leaves * size for leaves, size, _ in runs), initial=0))
-    spans = {}
-    for start, stop, (_, _, width) in zip(ends[:-1], ends[1:], runs, strict=True):
-        if width:
-            spans[width] = (spans.get(width, (start,))[0], stop)
-    return [values[start:stop].reshape(-1, width) for width, (start, stop) in spans.items()]
-
-
-def _largest_share(rows: np.ndarray) -> np.ndarray:
-    """Each row's largest element's share of the row's squared error, the row scaled by its largest first so
-    no square overflows: one for a row one element holds alone, zero for a row of zeros."""
-    rows = np.abs(np.asarray(rows, np.float64))
-    largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
-    scaled = np.square(rows / np.where(largest > 0, largest, 1.0))
-    total = np.sum(scaled, axis=1)
-    return np.where(total > 0, 1.0 / np.where(total > 0, total, 1.0), 0.0)
+        cancels (`assert_as_exact`'s `terms`); a leaf no sum made is its own size."""
+        laid = [at for at, truth in enumerate(truths) if np.size(truth)]
+        found = _computed_here(_truth_rows, [truths[at] for at in laid],
+                               [None if terms is None else terms[at] for at in laid])
+        return _LaidTruths(truths, laid, np.asarray([np.size(truths[at]) // _width(truths[at])
+                                                     if _width(truths[at]) else 0 for at in laid], np.int64),
+                           np.concatenate([np.zeros(0), *(np.asarray(own) for own, _, _ in found)]),
+                           np.concatenate([np.zeros(0), *(np.asarray(sizes) for _, sizes, _ in found)]),
+                           np.asarray([finite for _, _, finite in found], bool))
 
 
 def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     """Each reference leaf's evidence against its truth in `held` (`_LaidTruths.of`) as check 1 reads it
-    (`RecordedLeaf`), every leaf read in C order with the others in a few passes; None for a reference of
-    None. The caller holds each reference to its truth's shape (`leaf_summaries`, `_evidence`)."""
+    (`RecordedLeaf`), every leaf read in one program a draw where the leaves live (`_error_rows`); None
+    for a reference of None. The caller holds each reference to its truth's shape (`leaf_summaries`,
+    `_evidence`)."""
     names = {}
 
     def dtype(reference) -> str:
@@ -786,19 +815,16 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     if not any(read):
         return summaries
     # A leaf of no reference lies as its truth, a zero error never read.
-    values = np.concatenate([np.zeros(0), *(
-        np.asarray(references[at], np.float64, order="C").reshape(-1) if ok else held.truths[at].reshape(-1)
-        for ok, at in zip(read, held.laid, strict=True))])
-    finite = np.concatenate([np.isfinite(block).all(axis=1) for block in _blocks(values, held.runs)])
-    errors = values - held.values
-    mse = np.concatenate([np.mean(block, axis=1) for block in _blocks(np.square(errors), held.runs)])
-    mse = _missed(mse, np.concatenate([np.zeros(0, bool),
-                                       *((block != 0).any(axis=1) for block in _blocks(errors, held.runs))]))
-    rows = np.concatenate([np.zeros(0), *map(_scaled_rms, _rows(errors, held.runs))])
-    shares = np.concatenate([np.zeros(0), *map(_largest_share, _rows(errors, held.runs))])
+    found = _computed_here(_error_rows, [references[at] if ok else held.truths[at]
+                                         for ok, at in zip(read, held.laid, strict=True)],
+                           [held.truths[at] for at in held.laid])
+    mse = _missed(np.asarray([mse for mse, *_ in found], np.float64),
+                  np.asarray([missed for _, missed, *_ in found], bool))
+    finite = np.asarray([finite for _, _, finite, *_ in found], bool)
+    rows = np.concatenate([np.zeros(0), *(np.asarray(rows) for *_, rows, _ in found)])
+    shares = np.concatenate([np.zeros(0), *(np.asarray(shares) for *_, shares in found)])
     # Each laid leaf's rows, its first among them, and those sized past RESOLUTION.
-    counts = np.repeat([size // width if width else 0 for _, size, width in held.runs],
-                       [leaves for leaves, _, _ in held.runs])
+    counts = held.counts
     starts = np.cumsum(counts) - counts
     sized = held.sizes > 0
     before = np.concatenate([[0], np.cumsum(sized)])
@@ -1126,7 +1152,7 @@ def _leaf_paths(tree) -> list[str]:
 @dataclasses.dataclass(frozen=True)
 class _Prepared:
     """Dew's side of a draw's evidence, read once for every reference (`_evidence`): its leaves and its
-    truth's on the host, their paths, the truth's laid rows and Dew's summaries against them."""
+    truth's where they live, their paths, the truth's laid rows and Dew's summaries against them."""
     truth: object
     paths: list
     leaves: list
@@ -1141,14 +1167,13 @@ def _term_leaves(terms, truth):
     gradient of an input given as None) takes no leaf of the terms either."""
     if terms is None:
         return None
-    return jax.tree.structure(truth).flatten_up_to(jax.device_get(terms))
+    return jax.tree.structure(truth).flatten_up_to(terms)
 
 
 def _prepared(dew, truth, terms=None) -> _Prepared:
-    """Dew's leaves and its truth's on the host in one transfer a tree, held alike (the same leaves at the
-    same paths, each the shape of its truth), the truth's rows laid once and Dew's summaries read against
-    them (`_summaries`)."""
-    dew, truth = jax.device_get((dew, truth))
+    """Dew's leaves and its truth's where they live, held alike (the same leaves at the same paths, each
+    the shape of its truth), the truth's rows laid once and Dew's summaries read against them
+    (`_summaries`): only their rows' statistics leave the device."""
     paths = _leaf_paths(truth)
     if _leaf_paths(dew) != paths:
         raise AssertionError(f"dew's leaves are {_leaf_paths(dew)}, the truth's {paths}")
@@ -1165,8 +1190,7 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
     against their truths: the reference's leaves (a recorded one's `RecordedLeaf`) and its truth held to
     Dew's truth's leaves, paths and shapes, so no leaf is paired with another's truth or compared through
     broadcasting; its truth the same tree as Dew's where `shared`."""
-    reference = jax.device_get(reference)
-    their_truth = prepared.truth if shared else jax.device_get(their_truth)
+    their_truth = prepared.truth if shared else their_truth
     paths, leaves, truths = prepared.paths, prepared.leaves, prepared.truths
     for name, tree in (("the reference", reference), ("the reference's truth", their_truth)):
         if _leaf_paths(tree) != paths:
@@ -2068,14 +2092,15 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
     `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
-    (a seeded NumPy or torch draw the generator made them by), every array stacked over the seeds on its
-    first axis, the truth in float64, and `<site>.redraw`, check 1's REDRAW it was recorded for. Inputs
-    drawn again are checked against the recording's `<site>.input_digest` (`input_digest`), so a
-    generator that changed since is named, not judged. A draw is `(index, inputs)`, the index an
-    integer `widened` keeps; the reference and the truth read the recorded outputs at it, and Dew's
-    function takes the same two arguments and ignores the index. The recording covers check 1's redraw,
-    (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than running
-    out of recorded seeds.
+    (a seeded NumPy or torch draw the generator made them by), and `<site>.replayed.<name>`, the leaves
+    the reference made that Dew replays (`record_case`), which a seed's inputs carry, every array stacked
+    over the seeds on its first axis, the truth in float64, and `<site>.redraw`, check 1's REDRAW it was
+    recorded for. Inputs drawn again are checked against the recording's `<site>.input_digest`
+    (`input_digest`), so a generator that changed since is named, not judged. A draw is `(index, inputs)`,
+    the index an integer `widened` keeps; the reference and the truth read the recorded outputs at it, and
+    Dew's function takes the same two arguments and ignores the index. The recording covers check 1's
+    redraw, (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than
+    running out of recorded seeds.
 
     A recording of the reference's evidence alone (`record_case(..., summary=True)`: `<site>.mse.<name>`,
     `<site>.worst.<name>`, `<site>.finite.<name>` and `<site>.sketch.<name>` over the seeds, the truth's
@@ -2106,7 +2131,7 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
         prefix = f"{site}.{kind}."
         return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
 
-    inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
+    inputs, reference, truth, replayed = tree("input"), tree("reference"), tree("truth"), tree("replayed")
     narrow = [name for name, value in truth.items()
               if jnp.issubdtype(value.dtype, jnp.floating) and value.dtype != np.float64]
     if narrow:
@@ -2130,12 +2155,14 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
 
     def draw(seed):
         if inputs_of is None:
-            return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
-        drawn = drawn_on_the_host(inputs_of, seed)
-        if input_digest(drawn) != digests[seed]:
-            raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
-                                 f"digest differs); the generator's draw changed since the recording")
-        return np.int32(seed), drawn
+            drawn = {name: value[seed] for name, value in inputs.items()}
+        else:
+            drawn = drawn_on_the_host(inputs_of, seed)
+            if input_digest(drawn) != digests[seed]:
+                raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones "
+                                     f"(their digest differs); the generator's draw changed since the "
+                                     f"recording")
+        return np.int32(seed), {**drawn, **{name: value[seed] for name, value in replayed.items()}}
 
     def lookup(values):
         looked = jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]

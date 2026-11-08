@@ -89,13 +89,13 @@ from dew.interop.decoder_parts import (
     spelled,
 )
 from dew.interop.layouts import Prefixed, Route, Slot, Table
+from dew.interop.towers.moonvit import translate_moonvit_config, translate_moonvit_projector_config
 from dew.interop.unread import Stored, held, valued
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.vision.moonvit import translate_moonvit_config, translate_moonvit_projector_config
 
 # KimiLinearConfig's __init__ arguments (configuration_kimi.py:11-52 of
 # Kimi-Linear-48B-A3B-Instruct at e1df551).

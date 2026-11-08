@@ -2294,13 +2294,14 @@ class OptimConfig:
         return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=self.spared),
                 ParamGroup("base", ("*",), spared=self.spared))
 
-    def with_fresh(self, modules: Sequence[str]) -> OptimConfig:
+    def with_fresh(self, modules: Sequence[str], leaves: Sequence[str] = ()) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
         parameters of `modules`, each a module's path under `params` as a parameter's name begins
-        (`parameter_name`), ahead of its own patterns: the groups a run records and trains in, its
-        modules drawn fresh beside a loaded base (`Objective.fresh_modules`). Refused where such a group
+        (`parameter_name`), and the parameters `leaves` names by their own, a loaded module's that its run
+        drew fresh (`Pretrained.with_model`), ahead of its own patterns: the groups a run records and trains
+        in, what it drew fresh beside a loaded base (`Objective.fresh_modules`). Refused where such a group
         then matches nothing, in a run that draws nothing fresh."""
-        claimed = tuple(f"{glob.escape(module)}/*" for module in modules)
+        claimed = (*(f"{glob.escape(module)}/*" for module in modules), *map(glob.escape, leaves))
         groups = []
         for group in self.param_groups:
             if group.fresh:

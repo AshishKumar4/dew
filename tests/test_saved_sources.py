@@ -31,7 +31,8 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     `--source.step latest`) starts from the weights its export does (`dew export`):
     one step from each, alike in every other option, lands every leaf bit for bit alike, and its record
     names the run it started from and the step it read. Its record resumes on a host whose cache lacks
-    the export (another node's, ledger 2774). A step beside a source that is no run is refused."""
+    the export (another node's, ledger 2774). A step beside a source that is no run is refused. A run
+    naming a head of its own over the run draws it over the run's backbone and trains."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     first = decision(tmp_path, drawn=False)
     trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
@@ -60,6 +61,12 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
         released_run(exported, step="latest")
     with pytest.raises(ValueError):
         load_diffusion_source(str(source))
+    # A run naming a head of its own over the Laya release draws it over the release's backbone, its rows
+    # laid out by the release's own tokenizer, which the backbone alone does not hold, and trains.
+    joint = ["head:joint-shape", "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1",
+             "--head.heads", "2", "--head.feedforward", "32", "--max-len", "768"]
+    drawn = started(source, "fresh_head", "--source.step", "latest", *joint)
+    assert int(drawn.step) == 1
 
 
 def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_release(tmp_path, monkeypatch):
@@ -98,7 +105,9 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     reloads answering as the run's task serves its written weights, bit for bit; the second run trains
     on from the first's final weights, head and backbone, its record names the run and step it read, and
     its task loads and answers (a run from a finished chat-format run, which the export's Laya-only
-    layout refused: "Laya's layout is a MarkerLayout over a Hugging Face tokenizer", row 4310)."""
+    layout refused: "Laya's layout is a MarkerLayout over a Hugging Face tokenizer", row 4310); and a
+    third, naming a head of its own, draws it fresh over the first's backbone and trains (it was refused:
+    "a decision release reads with its own")."""
     from run_kinds import QWEN_TINY
 
     from dew.decision import Choice, Decide
@@ -135,6 +144,20 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
     answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
+    # A run naming a head of its own over the finished run draws it fresh over the run's backbone, its
+    # head, layout and calibration set aside: it starts from the run's backbone and from the head a run
+    # drawing the same head over the base draws (row 4310's run-from-run, a fresh head).
+    fresh = ["--pretrained", str(source), "--source.step", "latest", *joint[2:]]
+    drawn = DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)).prepare().objective
+    over_base = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False)).prepare().objective
+    started = drawn.init(jax.random.key(0))
+    leaves_alike(started["params"]["backbone"], state.variables["params"]["backbone"])
+    leaves_alike(started["params"]["head"], over_base.init(jax.random.key(0))["params"]["head"])
+    third, _ = trained(DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)), tmp_path,
+                       "third", trainer={"checkpoint_final": True})
+    assert int(third.step) == 1
+    answer = Decide.from_run(str(tmp_path / "runs" / "third"))("charged twice", {"team": team})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
@@ -396,12 +419,17 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     held home rises at least half of it (`saved_export_worker.resident_growth`): at one shard, the 5 GB
     default, the writer held the whole release, which tracemalloc did not see (ledger 3794). Both read
     the one release. `dew export` to a destination they share writes it once
-    likewise, the tensors one process's export writes."""
+    likewise, the tensors one process's export writes.
+
+    The release is sixteen layers deep, 67 MB, its tensors a megabyte at most: the pages a host's
+    allocators keep from the tensors it read and freed, a few of its largest under contention (glibc's
+    arenas, XLA's CPU allocator), stay under a sixth of it on armada at its worst (twelve busy processes
+    beside the pool, two malloc arenas: row 4868), where at four layers, 17 MB, they reached past half."""
     from dew._cli.main import main
     from dew.registry import ModelConfig
 
     run = dataclasses.replace(lm(tmp_path, drawn=False), model=ModelConfig(
-        "causal_transformer", {"emb_features": 256, "num_layers": 4, "num_heads": 4, "dtype": "float32"}))
+        "causal_transformer", {"emb_features": 256, "num_layers": 16, "num_heads": 4, "dtype": "float32"}))
     trained(run, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "shared_cache"))
