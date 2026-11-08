@@ -91,9 +91,10 @@ def test_a_packed_prompts_continuation_reads_its_last_document_alone(kind):
     a two-token call (a speculative replay) read B's keys alone, so their logits, the generated tokens'
     likelihoods among them, are the same bits whatever A holds (the cache's own document identity,
     `KVCache.documents`), under full attention and under a window the prompt fits."""
-    window = {"sliding_window": 12} if kind == "window" else {}
+    kinds = {"sliding_attention": {"window": 12}} if kind == "window" else {"full_attention": {}}
+    types = tuple(kinds) * TINY_DECODER["num_layers"]
     decoder = CausalTransformer(vocab_size=PACKED_VOCAB, **TINY_DECODER, num_kv_heads=2, dtype="float32",
-                                attention_impl="xla", **window)
+                                attention_impl="xla", layer_types=types, kinds=kinds)
     segments = jnp.asarray([[1] * 4 + [2] * 3])
     b = jax.random.randint(jax.random.key(1), (1, 3), 0, PACKED_VOCAB)
     params = decoder.init(jax.random.key(0), jnp.zeros((1, 7), jnp.int32))
