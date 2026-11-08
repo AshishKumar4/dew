@@ -58,7 +58,15 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import axes, bundles, cost as unit_cost, mosaic, resources, tail as tail_of
+from dew.nn.kernels.templates import (
+    axes,
+    bodies,
+    bundles,
+    cost as unit_cost,
+    mosaic,
+    resources,
+    tail as tail_of,
+)
 from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, scattered, sides_extended, sides_padded
 
 
@@ -850,14 +858,14 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 def _prefetched(tiles: Tiles, grid: tuple, steps: int, *, transpose_rhs: bool, dense: bool, plain: bool,
                 interpret) -> dict:
     """Dew: a dense `gmm`'s matrix prefetched into L2 before its launch's wait for the one before it
-    (`mosaic.dependent`'s `prefetched`, `mosaic.waits`): each program's first tile's matrix blocks of its
+    (`bodies.dependent`'s `prefetched`, `bodies.waits`): each program's first tile's matrix blocks of its
     first stages, so its first loads hit L2 rather than wait on memory under the previous launch's tail
     (M-FS-12: a decode GEMM's prologue exposed 3-5%; row 3601). A plain dense product's alone, whose first
     tile a program's index states (its persistent walk's first, `persistent.tiled`); a grouped one's needs
     its routing, written before the wait. A prefetch reads nothing into the program, so a matrix the launch
     before it still writes is prefetched early, never read stale."""
     if not (dense and plain and tiles.splits == 1 and not tiles.raster and tiles.cluster == 1
-            and mosaic.waits(interpret)):
+            and bodies.waits(interpret)):
         return {}
     block = (tiles.block_n, tiles.block_k) if transpose_rhs else (tiles.block_k, tiles.block_n)
 

@@ -636,7 +636,7 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
 def test_a_hoppers_dense_decode_product_prefetches_its_matrix_before_its_wait(transpose_rhs, monkeypatch):
     """A Hopper's dense decode product (16 rows over a 2048 x 4096 matrix, either way stored), a dependent
     launch, lowers for CUDA with each program's first matrix blocks prefetched into L2 before it waits for
-    the launch before it (`mosaic.dependent`'s `prefetched`, row 3601): one prefetch a stage its first tile
+    the launch before it (`bodies.dependent`'s `prefetched`, row 3601): one prefetch a stage its first tile
     loads; an A100's launch, which waits for none, prefetches nothing."""
     from dew.nn.kernels.templates import mosaic
 
