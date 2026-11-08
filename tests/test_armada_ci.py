@@ -882,7 +882,8 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     tests' times, none of which the interrupted test had. Past its deadline a task times the file its tests
     were running in at its own tests' seconds and the wall time no file's tests account for, at least what the
     file needs; a file that finished, at its tests' own seconds; and a file that never started, at none: its
-    row says `unobserved`, for armada to weigh no plan by."""
+    row says `unobserved`, for armada to weigh no plan by, and names its file at 0 in its timings, so armada
+    leaves out of its file timings a file it shares with other rows."""
     deadline = 8.0
     written(tmp_path, {"test_first.py": "import time\n\n\ndef test_first():\n    time.sleep(0.5)\n",
                        "test_stuck.py": "import time\n\n\ndef test_stuck():\n    time.sleep(600)\n",
@@ -902,7 +903,8 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     assert stuck["timings"] == {"3.12:tests/test_stuck.py": stuck["seconds"]}
     # The rows claim no more than the task took, and a file that never started none of it.
     assert sum(row["seconds"] for row in rows.values()) <= wall
-    assert (never["unobserved"], never["seconds"], never["timings"]) == (True, 0.0, {})
+    assert (never["unobserved"], never["seconds"], never["timings"]) == (
+        True, 0.0, {"3.12:tests/test_never.py": 0.0})
     assert "unobserved" not in first and "unobserved" not in stuck
 
 

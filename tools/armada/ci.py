@@ -39,9 +39,10 @@ at the deadline, the one whose test started last, carries its own tests'
 seconds and the task's wall time no file's tests account for, at least what
 the file needs, so the next plan cuts it finer; a file that finished its tests'
 own seconds; and a file that never started has none: its row says
-`"unobserved": true`, with `seconds` 0 and no `timings`, which armada weighs
-no plan by. A check-1 site too long for one task, marked check1_shards(seeds,
-per_task) on its test
+`"unobserved": true`, with `seconds` 0, and armada weighs no plan by it (its
+`timings` still name its file, at 0, so a file it shares with other rows is not
+timed by those alone). A check-1 site too long for one task, marked
+check1_shards(seeds, per_task) on its test
 (`sites`), runs apart from its file's tasks as armada's map and judge
 (`site_entries`): map tasks of per_task of its seeds each, or fewer where their
 measured seconds put a task past the group target (`cut_draws`), which draw them into
@@ -1735,8 +1736,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-                     "timings": {} if unobserved else {row(python, name, group if site else ""): seconds},
-                     **cause, **asked(site),
+                     "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
     if (coverage is None and not release and not (environ and check1_wire().CENSUS in environ)
