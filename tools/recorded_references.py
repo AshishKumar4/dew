@@ -29,23 +29,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check1_wire import staged_units
 from fetched_fixtures import save
-from reference_error import (
-    FEWEST_SEEDS,
-    REDRAW,
-    SIZING_FROM,
-    as_given,
-    example_mse,
-    example_worst,
-    input_digest,
-    leaf_summaries,
-    rows_summary,
-    seeds_for,
-    seeds_resolving,
-    widened,
-)
+from reference_error import FEWEST_SEEDS, REDRAW, as_given, input_digest, seeds_for, widened
 from truth_sketch import truth_sketch
+
+from dew.parity import SIZING_FROM, example_mse, example_worst, leaf_summaries, rows_summary, seeds_resolving
+from dew.parity_stages import staged_units
 
 __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
            "record_reference", "record_shard", "save", "with_pilots"]

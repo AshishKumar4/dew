@@ -1,11 +1,7 @@
 """Check 1's map and judge contract, the one owner of what a sharded site and the plan that shards it share
 (tests/map_judge.py, tests/reference_error.py and tools/armada/ci.py, which loads this file by its path): the
-second stage's REDRAW, the environment that runs a site's test as a map task or as their judge, and the units
-the stages draw. Standard library alone, so the plan reads it without JAX."""
-
-REDRAW = 4
-"""A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails (check 1's second
-stage, `reference_error._staged`)."""
+environment that runs a site's test as a map task or as their judge; the units its stages draw are
+`dew.parity_stages`'. Standard library alone, so the plan reads it without JAX."""
 
 DRAWS = "DEW_CHECK1_DRAWS"
 """The environment variable that runs every sharded site as one map task: `start:stop`, the units the
@@ -35,10 +31,3 @@ docs/design/testing.md, "the YNNPACK switch")."""
 STAGES = "DEW_CHECK1_STAGES"
 """The file check 1 appends each judgement it completes to, its stage among it (`reference_error._logged`),
 which the plan reads to draw a site's later map tasks in its first wave."""
-
-
-def staged_units(seeds: int) -> int:
-    """The units check 1's two stages draw at a site of `seeds` declared seeds: its seeds and REDRAW times
-    as many further ones. A weighed check's (`conditioning=`) are its own declared seeds' so, drawn past
-    these."""
-    return (1 + REDRAW) * seeds
