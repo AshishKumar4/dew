@@ -86,6 +86,10 @@ its parts is read from the source's own modeling code."""
 
 BATCH, LENGTH = 2, 12
 """The probe's token grid, which the committed fixtures share."""
+_DRAWN = (8, 16)
+"""Each of check 1's draws' token grid (`logits_parity`, `gradient_parity`): enough tokens that a
+gradient summed over them (an embedding's rows, a norm's scale, a learned activation's scalars) is
+filled on every draw, so its error over the draws sizes, as a test's `model_draw` draws 8 x 16."""
 
 _HEAD_DIM = 16
 _VOCAB = 256
@@ -222,10 +226,10 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
-def probe_ids(vocab_size: int, seed: int = 0) -> np.ndarray:
-    """Return the probe's BATCH x LENGTH token ids of draw `seed`, the first the fixed ones a reference
-    is run on."""
-    return np.random.RandomState(7 + seed).randint(0, vocab_size, (BATCH, LENGTH)).astype(np.int32)
+def probe_ids(vocab_size: int, seed: int = 0, shape: tuple[int, int] = (BATCH, LENGTH)) -> np.ndarray:
+    """Return the probe's token ids of draw `seed`, `shape` (BATCH x LENGTH, the fixed ones a reference
+    is run on, at seed 0)."""
+    return np.random.RandomState(7 + seed).randint(0, vocab_size, shape).astype(np.int32)
 
 
 def twin_logits(twin: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
@@ -772,15 +776,11 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
         # A candidate's reading of tensors it does not hold disqualifies that candidate alone.
         raise _Mismatch(f"its tensors do not fill {convention}'s model ({error})") from error
     try:
-        return logits_parity(_drawn_logits(source, record, family), model,
-                             f"{convention}'s logits against {name}'s")
+        return logits_parity(source.logits, model, variables, f"{convention}'s logits against {name}'s")
     except parity_check.GateFailure as failure:
-        raise _Mismatch(f"{convention}'s fp32 logits on random shrunken instances are not on par with "
+        raise _Mismatch(f"{convention}'s fp32 logits on a random shrunken instance are not on par with "
                         f"{name}'s from its float64 twin ({failure}), so its config fields {sorted(inert)} "
                         f"or its modeling compute something {convention} does not") from failure
-    finally:
-        # The probe's own weights back, which the next candidate's and the training qualification read.
-        source.seeded(0)
 
 
 def _users_arithmetic():
@@ -795,54 +795,15 @@ def _users_arithmetic():
 @dataclass(frozen=True)
 class _Source:
     """The probe's reference at float32 and its float64 twin (`source_twin`), whose runs over each draw
-    the parities judge Dew's against, and the probe's own weights (`initial`, its state by name, its
-    parameters and the buffers its checkpoint carries), which each draw's are scattered from
-    (`seeded`)."""
+    the parities judge Dew's against."""
 
     reference: PreTrainedModel
     twin: PreTrainedModel
-    initial: Mapping[str, np.ndarray]
-
-    @classmethod
-    def of(cls, reference: PreTrainedModel, twin: PreTrainedModel) -> _Source:
-        """The reference and its twin at the reference's weights as they stand, the probe's own."""
-        return cls(reference, twin, _state(reference))
-
-    def seeded(self, seed: int) -> dict[str, np.ndarray]:
-        """Draw `seed`'s weights into the reference and its twin, each draw of check 1 its own, as a
-        test's draws are, so no weight is a factor every draw shares: the probe's own at seed 0, scattered
-        from them (`scatter_weights`) at any other. The reference's state by name, as its checkpoint
-        stores it."""
-        import torch
-
-        with torch.no_grad():
-            for name, parameter in self.reference.named_parameters():
-                parameter.copy_(torch.from_numpy(self.initial[name]))
-            if seed:
-                scatter_weights(self.reference, _WEIGHT_SEED + seed)
-            held = _state(self.reference)
-            for name, parameter in self.twin.named_parameters():
-                parameter.copy_(torch.from_numpy(held[name]))
-        return held
-
-    def weights(self, seed: int, record: decoder_parts.DecoderFields,
-                family: decoder_parts.DecoderFamily) -> Variables:
-        """Dew's tree of draw `seed`'s weights (`seeded`), read as a release stores them (`_as_stored`)."""
-        return decoders.translate_weights(_as_stored(self.reference, self.seeded(seed)), record, family)
 
     def logits(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """The reference's float32 logits over `ids` and its twin's, as float64."""
         return (np.asarray(reference_logits(self.reference, ids.astype(np.int64)), np.float64),
                 twin_logits(self.twin, ids.astype(np.int64)))
-
-
-_WEIGHT_SEED = 1234
-"""The seed `scatter_weights` draws the probe's own weights at, which a draw's are offset from."""
-
-
-def _state(model: PreTrainedModel) -> dict[str, np.ndarray]:
-    """`model`'s state by name, its parameters and persistent buffers, as `save_pretrained` reads it."""
-    return {name: tensor.detach().cpu().numpy().copy() for name, tensor in model.state_dict().items()}
 
 
 def _judged(draw, label: str) -> int:
@@ -854,32 +815,22 @@ def _judged(draw, label: str) -> int:
     return seeds
 
 
-def logits_parity(source: Callable[[int], tuple[Variables, np.ndarray, np.ndarray, np.ndarray]],
-                  model: nn.Module, label: str) -> int:
-    """Dew's float32 logits on par with the source's from its float64 twin (`_judged`), over draws
-    `source(seed)` gives as Dew's weights, the ids and the source's logits and its twin's over them
-    (`_Source`), Dew's run as a user's process runs it (`_users_arithmetic`)."""
+def logits_parity(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]], model: nn.Module,
+                  variables: Variables, label: str) -> int:
+    """Dew's float32 logits over the probe's draws of ids (`probe_ids`) on par with the source's from its
+    float64 twin (`_judged`), `source` the two over a draw's ids (`_Source.logits`), Dew's run as a user's
+    process runs it (`_users_arithmetic`)."""
+    held = jax.tree.map(lambda leaf: jnp.asarray(leaf, 'float32'), variables)
     forward = owned_program(lambda variables, ids: model.apply(variables, ids), model)
 
     def draw(seed: int):
-        variables, ids, theirs, truth = source(seed)
-        held = jax.tree.map(lambda leaf: jnp.asarray(leaf, 'float32'), variables)
+        ids = probe_ids(_VOCAB, seed, _DRAWN)
         with _users_arithmetic():
             ours = np.asarray(forward(held, ids), np.float64)
+        theirs, truth = source(ids)
         return ours, theirs, truth
 
     return _judged(draw, label)
-
-
-def _drawn_logits(source: _Source, record: decoder_parts.DecoderFields, family: decoder_parts.DecoderFamily
-                  ) -> Callable[[int], tuple[Variables, np.ndarray, np.ndarray, np.ndarray]]:
-    """`logits_parity`'s draws of `source`: each seed's weights in Dew's tree, its ids (`probe_ids`) and
-    the source's logits and its twin's over them."""
-    def drawn(seed: int):
-        variables = source.weights(seed, record, family)
-        ids = probe_ids(_VOCAB, seed)
-        return (variables, ids, *source.logits(ids))
-    return drawn
 
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
@@ -918,8 +869,7 @@ def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
                     record: decoder_parts.DecoderFields, variables: Variables, label: str) -> int:
     """Dew's float32 gradient of every parameter on par with the source's from its float64 twin's
     (`_judged`), each parameter its own leaf, so a wrong gradient of a small one is not hidden by
-    another's rounding, over the probe's draws of weights (`_Source.seeded`), ids and cotangents, the
-    collections beside the parameters `variables`'. The source's eval-mode gradients,
+    another's rounding, over the probe's draws of ids and cotangents. The source's eval-mode gradients,
     its float32 ones and its twin's, are stored as `save_pretrained` stores its weights (`_as_stored`) and
     read into Dew's tree as they are (`translate_weights`; a gradient rearranges as its parameter does)."""
     model = models.build('causal_transformer', {**record, 'dtype': 'float32', 'attention_impl': 'reference'})
@@ -940,17 +890,14 @@ def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
                 for path, leaf in flax_traverse.flatten_dict(tree['params']).items()}
 
     def draw(seed: int):
-        params = jax.tree.map(lambda leaf: jnp.asarray(leaf, 'float32'),
-                              source.weights(seed, record, family)['params'])
-        ids = probe_ids(_VOCAB, seed)
-        cotangent = np.random.RandomState(11 + seed).standard_normal((BATCH, LENGTH, _VOCAB)).astype(
-            np.float32)
+        ids = probe_ids(_VOCAB, seed, _DRAWN)
+        cotangent = np.random.RandomState(11 + seed).standard_normal((*_DRAWN, _VOCAB)).astype(np.float32)
         reference = theirs(source.reference, ids, cotangent, 'float32')
         with _wide(), jax.enable_x64(new_val=True):
             truth = theirs(source.twin, ids, cotangent.astype(np.float64), 'float64')
         with _users_arithmetic():
             ours = {'/'.join(path): np.asarray(leaf, np.float64) for path, leaf in
-                    flax_traverse.flatten_dict(compiled(params, ids, cotangent)).items()}
+                    flax_traverse.flatten_dict(compiled(held['params'], ids, cotangent)).items()}
         if set(ours) != set(reference):
             raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(reference))[:4]} apart")
         return ours, reference, truth
@@ -983,8 +930,6 @@ def _trained(source: _Source, assembly: parts.Assembly, family: decoder_parts.De
     except parity_check.GateFailure as failure:
         raise _Mismatch(f"Dew's gradients are not on par with {name}'s from its float64 twin ({failure}), so "
                         "its backward computes something Dew's does not") from failure
-    finally:
-        source.seeded(0)
 
 
 def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = None,
@@ -1133,7 +1078,7 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             reference = source.causal_lm(config).float()
             scatter_weights(reference)
             reference_logits(reference, probe_ids(_VOCAB).astype(np.int64))
-            probed = _Source.of(reference, source_twin(
+            probed = _Source(reference, source_twin(
                 reference, lambda: source.causal_lm(widened_config(copy.deepcopy(config)))))
         except Exception as error:
             raise _unavailable(model_type, f"{name} does not run its shrunken config "

@@ -73,7 +73,7 @@ def measured(model_type: str, built=None) -> tuple[int, int] | str:
     reference.set_attn_implementation("eager")
     # Its eval forward, as the probe runs it: Seed-OSS drops its sublayers' outputs in training.
     reference.eval()
-    probed = verify._Source.of(reference, verify.source_twin(
+    probed = verify._Source(reference, verify.source_twin(
         reference, lambda: (AutoModelForCausalLM.from_config(widened_config(copy.deepcopy(shrunk)))
                             if built is None else built(widened_config(copy.deepcopy(shrunk))))))
     if model_type in CONVENTIONS:
@@ -93,8 +93,7 @@ def measured(model_type: str, built=None) -> tuple[int, int] | str:
     model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
     try:
         return (verify.gradient_parity(probed, family, record, variables, f"{model_type}'s gradients"),
-                verify.logits_parity(verify._drawn_logits(probed, record, family), model,
-                                     f"{model_type}'s logits"))
+                verify.logits_parity(probed.logits, model, variables, f"{model_type}'s logits"))
     except parity.GateFailure as failure:
         return f"not on par: {failure}"
 
