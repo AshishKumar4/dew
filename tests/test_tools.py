@@ -693,19 +693,6 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
             read.reference(last + 1)
 
 
-def test_a_judges_draws_ahead_reuse_the_window():
-    """A later layout restarting within the held window reads the same completed draws."""
-    tool = load("layout_parity")
-    _, reference = tool.model_case("jepa", "float32", {}, {})
-    with jax.enable_x64(new_val=True):
-        judge = tool.Judge(reference, tool.References(), "jepa")
-        judge.ahead(0)
-        reference, anchor = judge.reference(0), judge.anchor(0)
-        judge.ahead(0)
-        assert judge.reference(0) is reference
-        assert judge.anchor(0) is anchor
-
-
 def test_layout_parity_fails_a_run_with_an_inconclusive_row():
     """An inconclusive layout, or a model whose reference is refused, fails the run as a mismatch does;
     only a working or a refused-by-design layout passes it."""

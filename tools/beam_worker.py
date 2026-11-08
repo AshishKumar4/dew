@@ -5,11 +5,13 @@ protocol tools/reference_worker.py), on the CPU.
     python tools/beam_worker.py beam-NAME    `IN OUT` lines on stdin, each `done`
 
 IN holds each draw's `<draw>.ids` `[prompts, length]`, unpadded. OUT gets, for each of beam_reference.py's
-`SETTINGS` (`case_<i>`), `<draw>.reference.case_<i>` and `<draw>.truth.case_<i>`: every prompt's returned
-beams' scores (`sequences_scores`), in float32 and in float64 (the float64 twin built and run inside
+`SETTINGS` (`case_<i>`), `<draw>.reference.<leaf>` and `<draw>.truth.<leaf>`: every prompt's returned beams'
+scores (`case_<i>`, `sequences_scores`), their generated tokens padded to the budget (`tokens_<i>`) and
+whether each ended on EOS (`ended_<i>`), in float32 and in float64 (the float64 twin built and run inside
 `torch_precision.float64`), under the checkpoint's recorded EOS and pad (its `beam.npz`).
 """
 
+import contextlib
 import sys
 
 import numpy as np
@@ -33,10 +35,11 @@ def run(name: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         mask = np.ones_like(ids, bool)
         reference, truth = {}, {}
         for index, (penalty, early) in enumerate(SETTINGS):
-            _, scores = searched(model, ids, mask, eos, pad, penalty, early)
-            reference[f"case_{index}"] = scores.astype(np.float32)
-            with float64():
-                truth[f"case_{index}"] = searched(wide, ids, mask, eos, pad, penalty, early)[1]
+            for arm, run_model, dtype in ((reference, model, np.float32), (truth, wide, np.float64)):
+                with float64() if run_model is wide else contextlib.nullcontext():
+                    tokens, scores = searched(run_model, ids, mask, eos, pad, penalty, early)
+                arm |= {f"case_{index}": scores.astype(dtype), f"tokens_{index}": tokens.astype(np.int32),
+                        f"ended_{index}": np.any(tokens == eos, axis=-1)}
         return reference, truth
 
     return drawn(cases, answer)

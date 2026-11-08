@@ -130,14 +130,22 @@ def beam_draw(name: str):
 
 
 def beam_scores(name: str):
-    """`dew(dtype, inputs)` of checkpoint `name`: its float32 search's returned beams' scores under each
-    setting (`case_<i>`)."""
+    """`dew(dtype, inputs)` of checkpoint `name`: its float32 search's returned beams under each setting,
+    their scores (`case_<i>`), their generated tokens up to each one's returned length, padded past it
+    (`tokens_<i>`), and their EOS flags (`ended_<i>`)."""
     pretrained = Pretrained.load(str(FIXTURES / name), dtype="float32", attention_impl="reference")
     eos, pad = _special(name)
 
     def dew(_, inputs) -> dict:
-        return {f"case_{index}": _scored(_searched(pretrained, inputs["ids"], eos, pad, penalty, early),
-                                        penalty) for index, (penalty, early) in enumerate(SETTINGS)}
+        found = {}
+        for index, (penalty, early) in enumerate(SETTINGS):
+            beams = _searched(pretrained, inputs["ids"], eos, pad, penalty, early)
+            generated = np.asarray(beams.tokens)[:, LENGTH:]
+            kept = np.arange(NEW_TOKENS)[None] < np.asarray(beams.lengths)[:, None]
+            found |= {f"case_{index}": _scored(beams, penalty),
+                      f"tokens_{index}": np.where(kept, generated, pad).astype(np.int32),
+                      f"ended_{index}": np.asarray(beams.terminated)}
+        return found
 
     return dew
 
@@ -145,16 +153,18 @@ def beam_scores(name: str):
 def pipeline_arms(name: str):
     """tools/venv_reference.py's `beam-<name>` site: its recording, draw, Dew run and leaves."""
     return (FIXTURES / name / "beam_recording.npz", beam_draw(name), beam_scores(name),
-            tuple(f"case_{index}" for index in range(len(SETTINGS))))
+            tuple(f"{leaf}_{index}" for index in range(len(SETTINGS))
+                  for leaf in ("case", "tokens", "ended")))
 
 
 @pytest.mark.parametrize("name", ["llama-tiny", "qwen3-tiny"])
 def test_beams_are_transformers_beam_search(name):
-    """Each returned beam's score (its summed log probability over its generated length raised to the
-    penalty), Dew's float32 search on par with transformers' over drawn prompts whose every ranking the
-    float64 search decides by the selection margin (check 1, the truth transformers' float64 search):
-    under each of four settings of the penalty and early stopping, beams ending on EOS and beams running
-    to the budget alike."""
+    """Over drawn prompts whose every ranking the float64 search decides by the selection margin, Dew's
+    float32 search returns transformers' beams, each one's tokens up to its returned length and its EOS flag
+    exactly (exact leaves, check 1's exact-reference rule), and each beam's score (its summed log
+    probability over its generated length raised to the penalty) on par with transformers' (check 1, the
+    truth transformers' float64 search): under each of four settings of the penalty and early stopping,
+    beams ending on EOS and beams running to the budget alike."""
     assert_arms_as_recorded(pipeline_arms(name), f"beam-{name}", BEAM_SEEDS[name], f"{name} beam scores",
                             host=True)
 
