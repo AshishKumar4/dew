@@ -358,11 +358,12 @@ def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
 
 def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_leaves_partial():
     """gpt-oss's expert kernel gradient (2880 deep and wide: 2880 divides by no cooperative wgmma tile's 128
-    rows) on an H100 derives a two-consumer 128-row tile, its last row tile half past the depth
-    (`mosaic_gpu.ragged_rows`; row 2295: one consumer's 64 x 192 tile ran 1.79x Triton's time), and that
-    launch lowers for CUDA; interpreted at a smaller depth no 128 rows divide (320), its value bitwise the
-    gradient at a tile that divides it, each partial share's rows past the depth stored nowhere. A depth a
-    cooperative tile divides keeps whole tiles."""
+    rows) on an H100 derives a tile the launch takes (`legal`, `candidate`), and a two-consumer 128-row tile,
+    its last row tile half past the depth (`mosaic_gpu.ragged_rows`; row 2295: one consumer's 64 x 192 tile
+    ran 1.79x Triton's time), is one it takes and lowers for CUDA; interpreted at a smaller depth no 128 rows
+    divide (320), its value bitwise the gradient at a tile that divides it, each partial share's rows past the
+    depth stored nowhere. A depth a cooperative tile divides keeps whole tiles. On an A100, a 192-row
+    mma.sync tile's shares at a 264-deep depth (72 rows past the first share) give the exact gradient."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((128,), jnp.int32)
     launch = grouped_matmul.MosaicTgmm()
@@ -371,9 +372,13 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
         bound = launch.bind(bf16((32768, 2880)), bf16((32768, 2880)), sizes, (), out_dtype="float32",
                             interpret=False)
         tile = launch.derived(bound, target)
-        assert tile is not None and tile.warpgroups == 2 and tile.block_m == 128 and 2880 % 128, tile
-        lowered = functools.partial(mosaic_gpu.tgmm, tiles=tile, out_dtype=jnp.float32, multiprocessors=132,
-                                    interpret=False)
+        assert tile is not None and launch.legal(bound, tile, target)
+        assert launch.candidate(bound, tile, target)
+        cooperative = mosaic_gpu.Tiles(128, 192, 64, 2, 1, warpgroups=2, family="wgmma")
+        assert 2880 % cooperative.block_m and launch.legal(bound, cooperative, target) and launch.candidate(
+            bound, cooperative, target)
+        lowered = functools.partial(mosaic_gpu.tgmm, tiles=cooperative, out_dtype=jnp.float32,
+                                    multiprocessors=132, interpret=False)
         jax.jit(lowered).trace(bf16((4096, 2880)), bf16((4096, 2880)), jax.ShapeDtypeStruct((16,), jnp.int32)
                                ).lower(lowering_platforms=("cuda",))
         whole = launch.derived(launch.bind(bf16((32768, 2048)), bf16((32768, 2880)), sizes, (),
@@ -390,9 +395,17 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
                                               multiprocessors=4, interpret=grouped_matmul.INTERPRETED))
 
         np.testing.assert_array_equal(gradient(128, 2), gradient(64, 1))
-    # A share's rows past a 264-deep depth at 72 a share: the store's least rung a power of two (8).
-    narrow = mosaic_gpu.Tiles(192, 64, 32, 2, 1, family="mma.sync")
-    assert mosaic_gpu._tgmm_place(264, 192, 0, narrow)[-1] == 8
+    with generation.assumed("sm80"):
+        tokens = jnp.asarray(rng.integers(-3, 4, size=(300, 264)), jnp.bfloat16)
+        cotangent = jnp.asarray(rng.integers(-3, 4, size=(300, 64)), jnp.bfloat16)
+        narrow = mosaic_gpu.Tiles(192, 64, 32, 2, 1, family="mma.sync")
+        got = mosaic_gpu.tgmm(tokens, cotangent, groups, tiles=narrow, out_dtype=jnp.float32,
+                              multiprocessors=4, interpret=grouped_matmul.INTERPRETED)
+    # Every product and sum exact (small integers): each group's rows' tokens times their cotangent.
+    ends = np.cumsum(np.asarray(groups))
+    exact = np.stack([np.asarray(tokens, np.float64)[end - size:end].T @ np.asarray(cotangent, np.float64)[
+        end - size:end] for end, size in zip(ends, np.asarray(groups), strict=True)])
+    np.testing.assert_array_equal(np.asarray(got), exact)
 
 
 def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain_product_takes():
