@@ -628,13 +628,13 @@ class _PerInput:
         held: tuple[Record, ...] = (element if position is None else _unplaced(element),)
         for stage, seed in zip(self.stages, self.seeds, strict=True):
             held = tuple(made for row, given in enumerate(held) for made in consumed_by(
-                given, functools.partial(_outputs, stage, position, rng=_keyed(seed, index, row))))
+                given, functools.partial(_outputs, stage, position, rng=_input_draws(seed, index, row))))
         if position is not None and not self.unplaced:
             held = tuple(_placed(output, position) for output in held)
         return _Spread(held)
 
 
-def _keyed(seed: int | None, index: int, row: int) -> np.random.Generator | None:
+def _input_draws(seed: int | None, index: int, row: int) -> np.random.Generator | None:
     """A spread input's random stage's draws for its `row`th row there (`_PerInput`), from the stage's
     seed and the input's `index`; none for a stage that draws none."""
     return None if seed is None else np.random.default_rng((seed, index, row))
@@ -1303,10 +1303,14 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool 
             pooled = isinstance(stage, _RECORD) and _threads((stage,)) is not None
             # A step of each row's index reads a row's place in the stream, which an input's rows share.
             placed = expanded and isinstance(stage, MapWithIndex)
-            if windowed or pooled or placed or isinstance(stage, Native) or (
-                    expanded and not isinstance(stage, _RECORD)):
+            grain = isinstance(stage, Native) and (native or expanded)
+            # Before the expansion, a draw after a drop is keyed by its place among the rows kept.
+            drawn = not expanded and marked and isinstance(stage, RandomMap)
+            if windowed or pooled or placed or grain or drawn or (
+                    expanded and not isinstance(stage, (*_RECORD, Native))):
                 return at
             expanded = expanded or isinstance(stage, FlatMap)
+            marked = marked or _drops(stage)
         return len(stages)
     for at, stage in enumerate(stages[start:], start=start):
         windowed = isinstance(stage, Shuffle) and stage.window is not None

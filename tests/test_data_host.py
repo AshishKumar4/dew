@@ -95,24 +95,34 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
     assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], False]
 
 
-def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
+def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory(monkeypatch):
     """Each worker holds its `worker_buffer` batches and its `read_buffer` reads in a process of its
     own, within half the memory the process may take; a read is a batch where the order is read by
     batch, a record where it streams. Eight 64 KiB rows make a 512 KiB batch: 2 MiB holds four reads
     of a batch and no worker, and half a host's memory that holds two and a half workers holds two,
     reading by the batch or by the record. Workers take each CPU where there is more than one, at
-    most `max_workers`."""
+    most `max_workers`. That is over a run whose batches' Python pays for the workers' start
+    (`batches`); a run too short for it, or of no stated length, reads in the process, its reads
+    sized alike (row 4862)."""
+    from dew.data import dataset
     from dew.data.dataset import WORKER_PROCESS_BYTES, Host
 
+    monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 1.0)
+    paid = 10**12  # A run long enough to pay for any start.
     rows = grain.MapDataset.source([{"x": np.zeros((8, 16384), np.float32)}] * 6).to_iter_dataset()
     auto = Loading(workers="auto", worker_buffer=2)
-    small = dataclasses.replace(auto, ram_budget_mb=2).resolved(rows, reads=1, host=Host(8, 2**40))
+    small = dataclasses.replace(auto, ram_budget_mb=2).resolved(rows, reads=1, batches=paid,
+                                                                host=Host(8, 2**40))
     assert (small.workers, small.read_buffer) == (0, 4)
     held = WORKER_PROCESS_BYTES + 2 * 2**19 + 16 * 2**19
-    roomy = auto.resolved(rows, reads=1, host=Host(8, 2 * (2 * held + held // 2)))
+    roomy = auto.resolved(rows, reads=1, batches=paid, host=Host(8, 2 * (2 * held + held // 2)))
     assert (roomy.workers, roomy.read_buffer) == (2, 16)
-    streamed = auto.resolved(rows, reads=8, host=Host(8, 2 * (2 * held + held // 2)))
+    streamed = auto.resolved(rows, reads=8, batches=paid, host=Host(8, 2 * (2 * held + held // 2)))
     assert streamed.workers == 2 and streamed.read_buffer == 16
-    assert auto.resolved(rows, reads=1, host=Host(3, 2**40)).workers == 3
-    assert auto.resolved(rows, reads=1, host=Host(1, 2**40)).workers == 0
-    assert dataclasses.replace(auto, max_workers=1).resolved(rows, reads=1, host=Host(8, 2**40)).workers == 1
+    assert auto.resolved(rows, reads=1, batches=paid, host=Host(3, 2**40)).workers == 3
+    assert auto.resolved(rows, reads=1, batches=paid, host=Host(1, 2**40)).workers == 0
+    one = dataclasses.replace(auto, max_workers=1)
+    assert one.resolved(rows, reads=1, batches=paid, host=Host(8, 2**40)).workers == 1
+    for batches in (1, None):
+        unpaid = auto.resolved(rows, reads=1, batches=batches, host=Host(8, 2 * (2 * held + held // 2)))
+        assert (unpaid.workers, unpaid.read_buffer) == (0, 16)
