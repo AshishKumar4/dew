@@ -160,9 +160,19 @@ class SeamNorm(Protocol):
     """A pre-norm that owns a block's residual seam (`dew.nn.norms.RMSNorm`):
     it adds a sublayer's branch to the stream it reads and hands that stream
     back beside the norm, `(x + branch, normed)`, so one fused pass takes the
-    add, the norm and, in reverse, the stream's own cotangent."""
+    add, the norm and, in reverse, the stream's own cotangent; called alone, it
+    reads its input's axes (`axes`) as the seam does."""
 
     def seam(self, x, branch=None, *, axes=None) -> tuple[jax.Array, jax.Array]: ...
+
+    def __call__(self, x, *, axes=None) -> jax.Array: ...
+
+
+def residual_normed(norm: Callable[..., jax.Array], x: jax.Array) -> jax.Array:
+    """`norm` of the residual-shaped `x`: a seam norm's input placed as the stream is (`RESIDUAL`), which its
+    fused kernel reads to run on each shard of an automatic mesh, where an unplaced call is XLA's (row 822);
+    another norm as it is."""
+    return norm(x, axes=RESIDUAL) if isinstance(norm, SeamNorm) else norm(x)
 
 
 @runtime_checkable
@@ -984,7 +994,7 @@ class DecoderBlock(nn.Module):
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
             mixer_routes, None if per_layer_input is None else per_layer_input.depth)
         if self.wiring.output_norms:
-            mixed = self.attention_output_norm(mixed)
+            mixed = residual_normed(self.attention_output_norm, mixed)
         attention_branch = self._branch(mixed, train, "attention")
         joined = self._joined(state)
         if not (self.wiring.parallel_residual or joined):
@@ -1014,7 +1024,7 @@ class DecoderBlock(nn.Module):
                 if self.parallel is not None:
                     hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
-                hidden = self.mlp_output_norm(hidden)
+                hidden = residual_normed(self.mlp_output_norm, hidden)
             mlp_branch = self._branch(hidden, train, "mlp")
             if self.wiring.parallel_residual:
                 # GPT-NeoX adds the two branches first, then the residual;
@@ -1320,7 +1330,7 @@ class DecoderBlock(nn.Module):
         back and normed."""
         gated = gated_product(self.gate_activation)(self.per_layer_input_gate(x), per_layer_input)
         projected = self.per_layer_projection(gated)
-        return self.post_per_layer_input_norm(projected)
+        return residual_normed(self.post_per_layer_input_norm, projected)
 
 
 class MTPBlock(nn.Module):
@@ -1428,7 +1438,7 @@ class MTPBlock(nn.Module):
         streams = predicted
         if self.hyper_connections is not None:
             predicted = self.hc_head(predicted)
-        normalized = self.final_norm(predicted)
+        normalized = residual_normed(self.final_norm, predicted)
         return normalized, normalized if self.hyper_connections is None else streams
 
 
