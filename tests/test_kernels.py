@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import (
+    ATTENTION_SEEDS,
     attention_and_grads,
     attention_on_par,
     exact_attention,
@@ -306,6 +307,13 @@ def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
     return exact_attention(query[None], key[None], value[None], sinks, keep=keep)[0]
 
 
+PACKED_SINK_SEEDS = 128
+"""The packed documents site's declared draws where it has sinks: the sinks' gradient, a value a head a
+draw summed over the documents, resolves on an A100 at 16 and 8 seeds causal (head_dim 128, 256) but 128
+and 64 full, on an H100 at 8 (`seeds_for` paired, ET-PACKEDSEEDS-a100 and -h100); at the declared 8 its
+A100 verdict drew 40 and was Inconclusive (MAINGPU-a9e29b08f@a100)."""
+
+
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("sunk", [False, True])
@@ -351,7 +359,8 @@ def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_ti
         return (*(leaf[at] for leaf in leaves[:4] for at in documents), *leaves[4:])
 
     attention_on_par(packed, dense, draw, "packed documents", split=by_document,
-                     keep=kept(len(ids[0]), len(ids[0]), causal=causal, window=window, segment_ids=ids))
+                     keep=kept(len(ids[0]), len(ids[0]), causal=causal, window=window, segment_ids=ids),
+                     seeds=PACKED_SINK_SEEDS if sunk else ATTENTION_SEEDS)
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
