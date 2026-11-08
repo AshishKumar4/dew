@@ -73,6 +73,17 @@ def family_of(dtype=jnp.bfloat16) -> mosaic.Family | None:
     mainloop has none (a CPU's)."""
     return bundles.of(generation.device_generation(), bundle_dtype(dtype), scoped=True)
 
+
+def issued(dtype=jnp.bfloat16) -> tuple[mosaic.Family, bool]:
+    """The bundle a call of `dtype`'s launches issue by, and whether Mosaic GPU's interpreter runs them: the
+    device's (`family_of`), else, off a GPU or within an interpreted assumption (`generation.assumed`), the
+    interpreted target's (`generation.interpreted_target`), so a CPU's check of an A100's route runs
+    mma.sync's bundle at the A100's facts (row 5194: wgmma's alone had been interpreted)."""
+    family = family_of(dtype)
+    if family is not None and generation.backend() == 'gpu':
+        return family, False
+    return bundles.of(generation.interpreted_target().generation, bundle_dtype(dtype), scoped=True), True
+
 def value_unit(family: mosaic.Family) -> int:
     """The values' padded width's step on `family`'s bundle: a staged operand's narrowest block of 16-bit
     columns (`Family.narrowest_columns`), which a value tile (`Call.value_block`) and a walk's value block
@@ -841,7 +852,7 @@ def _solving(call: Call) -> mosaic.Family:
     gated delta net's took 0.235 ms on warpgroup MMA's layout without a producer (`mosaic_sm90.FED`, two
     programs a multiprocessor) against 0.356 beside a producer, Qwen3-Next's 0.156 against 0.240, where the
     states launch's walk took 0.187 beside a producer against 0.202 to 0.243 without one
-    (JS-fed5-h100-d82eeb171). Interpreted, the interpreter's (`bundles.INTERPRETED`)."""
+    (JS-fed5-h100-d82eeb171). Interpreted, the interpreted target's (`issued`)."""
     if call.interpret:
         return call.family
     layouts = bundles.layouts(call.target.generation, bundle_dtype(call.given.dtype), scoped=True)

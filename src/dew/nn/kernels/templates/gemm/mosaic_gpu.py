@@ -1101,13 +1101,15 @@ def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, den
 
 def _tables_refused(gather, scatter, tiles: Tiles, family: mosaic.Family, *, prologue, dense: bool,
                     transpose_lhs: bool) -> None:
-    """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows
-    (`Family.gathers_rows`), of no prologue, transposed rows or dense call, and of a scattered one
+    """Dew: `gmm`'s refusal of a gathered product (`gather`) but on a family that gathers rows beside the
+    matrix's whole loads (`Family.gathers_rows`, `gathers_alone`), of no prologue, transposed rows or dense
+    call, and of a scattered one
     (`scatter`) but a grouped call's on such a family (its stores `mosaic.staged_rows`')."""
-    if gather is not None and (prologue is not None or dense or transpose_lhs or not family.gathers_rows):
+    gathers = family.gathers_rows and family.gathers_alone
+    if gather is not None and (prologue is not None or dense or transpose_lhs or not gathers):
         raise ValueError(f"a gathered product's rows are a ring family's gather, with no prologue, "
                          f"transposed rows or dense call, not {tiles}'s")
-    if scatter is not None and (dense or not family.gathers_rows):
+    if scatter is not None and (dense or not gathers):
         raise ValueError(f"scattered rows are a grouped call's on a ring family, not {tiles}'s")
 
 
@@ -1117,7 +1119,7 @@ def _tgmm_tables_refused(tables: tuple, tiles: Tiles, family: mosaic.Family, *, 
     rows, of no rows-contiguous layout, step scales or dense call, and the rows' table of no prologue (which
     `gmm`'s refuses alike, `_tables_refused`)."""
     if any(table is not None for table in tables) and (
-            dense or k_major or step_scaled or not family.gathers_rows
+            dense or k_major or step_scaled or not (family.gathers_rows and family.gathers_alone)
             or (tables[0] is not None and prologue is not None)):
         raise ValueError(f"a gathered kernel gradient's rows are a ring family's gather, with no prologue on "
                          f"gathered rows, rows-contiguous layout, step scales or dense call, not {tiles}'s")
@@ -1382,19 +1384,19 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
                     else slots[f'side_{i}'] for i in range(len(prologue_axes))}
         left = _transformed(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
         if summed:
-            return nothing, tuple(total + family.registers_product(left, oriented[name], interpret)
+            return nothing, tuple(total + family.registers_product(left, oriented[name])
                                   for total, name in zip(accumulators, matrices, strict=True))
-        return nothing, tuple(family.register_products(acc, (left,), oriented[name], interpret)
+        return nothing, tuple(family.register_products(acc, (left,), oriented[name])
                               for acc, name in zip(accumulators, matrices, strict=True))
     if summed:
         scale = None if scaling is None else scaling(index, slots)
-        return nothing, tuple(family.summed_apart(total, mine, oriented[name], interpret, scale)
+        return nothing, tuple(family.summed_apart(total, mine, oriented[name], scale)
                               for total, name in zip(accumulators, matrices, strict=True))
     if block_scaled:
         return nothing, tuple(family.scaled_products(acc, mine, oriented[name],
-                                                     (slots['a_scales'], slots['b_scales']), interpret)
+                                                     (slots['a_scales'], slots['b_scales']))
                               for acc, name in zip(accumulators, matrices, strict=True))
-    return nothing, tuple(family.products(acc, mine, oriented[name], interpret)
+    return nothing, tuple(family.products(acc, mine, oriented[name])
                           for acc, name in zip(accumulators, matrices, strict=True))
 
 
@@ -1922,7 +1924,7 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
         def windowed_step(index, slots, running, accumulators):
             (fresh,) = accumulators
             lhs, rhs = staged(index, slots)
-            fresh = family.products(fresh, lhs, rhs, interpret)
+            fresh = family.products(fresh, lhs, rhs)
             # A window's end adds its sum into the running sum and starts the next from zeros: a branch on
             # the step, the warpgroup's tiles not selected elementwise by a scalar.
             return lax.cond(lax.rem(index + 1, window) == 0,
@@ -1935,7 +1937,7 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
         def exact_step(index, slots, running, accumulators):
             lhs, rhs = staged(index, slots)
             scale = None if scaling is None else scaling(index, slots)
-            return family.summed_apart(running, lhs, rhs, interpret, scale), accumulators
+            return family.summed_apart(running, lhs, rhs, scale), accumulators
 
         running, _ = walk(exact_step, family.zeros(shape), ())
         return running
@@ -1943,7 +1945,7 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
     def step(index, slots, nothing, accumulators):
         (acc,) = accumulators
         lhs, rhs = staged(index, slots)
-        return nothing, (family.products(acc, lhs, rhs, interpret),)
+        return nothing, (family.products(acc, lhs, rhs),)
 
     _, (summed,) = walk(step, None, (shape,))
     return summed
