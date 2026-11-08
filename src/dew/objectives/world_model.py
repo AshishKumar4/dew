@@ -436,12 +436,8 @@ class WorldModelObjective(Objective[Ratio]):
                  steps: int = 4, tau_ctx: float = 0.1, actions: jax.Array | None = None) -> jax.Array:
         """`frames` latent frames after the `context` latents `[B, C, ...]`, one at a time, each from
         noise in `steps` steps of d = 1 / `steps` (a shortcut model's step size; the diffusion-forcing
-        baseline is told the smallest), the context at signal level 1 - `tau_ctx` and the smallest step
-        size: training draws a frame's level on its step size's grid (Eq. 4), so a frame near clean
-        reads as one only at a fine step, and a context at a coarse one (0.9 at d 1/4, which no
-        frame trains at) read as noise, its forecast the clip's mean."""
-        d_min = 1.0 / self.model.k_max
-        d_model = 1.0 / steps if self.shortcut else d_min
+        baseline is told the smallest), the context at signal level 1 - `tau_ctx`."""
+        d_model = 1.0 / steps if self.shortcut else 1.0 / self.model.k_max
         produced = context
         for _ in range(frames):
             key, noise_key, context_key = jax.random.split(key, 3)
@@ -452,8 +448,7 @@ class WorldModelObjective(Objective[Ratio]):
                 sequence = jnp.concatenate([held, current[:, None]], 1)
                 tau = jnp.concatenate([jnp.full(held.shape[:2], 1 - tau_ctx),
                                        jnp.full((context.shape[0], 1), level)], 1)
-                d = jnp.concatenate([jnp.full(held.shape[:2], d_min),
-                                     jnp.full((context.shape[0], 1), d_model)], 1)
+                d = jnp.full(tau.shape, d_model)
                 given = None if actions is None else actions[:, :sequence.shape[1]]
                 predicted = self.model.bind(self.model_variables(variables))(sequence, tau, d, given)[:, -1]
                 current = current + (predicted - current) / (1 - level) / steps
