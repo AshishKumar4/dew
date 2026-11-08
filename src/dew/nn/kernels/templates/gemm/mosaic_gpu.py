@@ -1688,8 +1688,6 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         step_scales=step_scales)
 
 
-@tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
-                      'prologue_axes', 'exact_sums', 'tail', 'k_major'))
 def _rewrites(family: mosaic.Family, k_major: bool, tables: tuple) -> bool:
     """Dew: whether `tgmm`'s stage is rewritten by its family's own role (`mosaic.Family.rewrites_in_persist`,
     a role beside its consumers): its loads' rows, never rows its tables gather, nor a k-major launch's
@@ -1736,6 +1734,8 @@ def _stored_chunks(family: mosaic.Family, summed, store: Callable, place: tuple)
         store(chunk, (row_start, first_row, stored, at, *ladder))
 
 
+@tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
+                      'prologue_axes', 'exact_sums', 'tail', 'k_major'))
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                    multiprocessors: int, interpret, prologue, prologue_operands: tuple, prologue_axes: tuple,
                    exact_sums: bool, tail=None, k_major: bool = False, step_scales=None) -> jax.Array:
