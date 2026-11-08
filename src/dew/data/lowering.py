@@ -1301,7 +1301,9 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool 
         for at, stage in enumerate(stages[start:], start=start):
             windowed = isinstance(stage, Shuffle) and stage.window is not None
             pooled = isinstance(stage, _RECORD) and _threads((stage,)) is not None
-            if windowed or pooled or isinstance(stage, Native) or (
+            # A step of each row's index reads a row's place in the stream, which an input's rows share.
+            placed = expanded and isinstance(stage, MapWithIndex)
+            if windowed or pooled or placed or isinstance(stage, Native) or (
                     expanded and not isinstance(stage, _RECORD)):
                 return at
             expanded = expanded or isinstance(stage, FlatMap)
