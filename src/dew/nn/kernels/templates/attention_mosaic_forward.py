@@ -1063,8 +1063,7 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
         # accumulator in place (`Family.issued`: a term's own accumulator read before the next serializes
         # wgmma's, ptxas C7512), the partner's turn once they are in.
         keys = program.parted(slots["keys"], tiles.block_k)
-        s = family.summed(shape, lambda acc: family.issued(acc, q.refs, keys.T.refs, interpret=interpret),
-                          interpret=interpret)
+        s = family.summed(shape, lambda acc: family.issued(acc, q.refs, keys.T.refs, interpret=interpret))
         if turn is not None:
             turn()
     else:
