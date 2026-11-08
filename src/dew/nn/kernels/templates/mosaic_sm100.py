@@ -684,7 +684,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         roles = self.persist_schedule(consumers, width, summed=bool(summed), rewrites=prepared is not None)
 
         def scoped(*allocated):
-            (tensor,) = roles.opened(allocated[:1])
+            tensor = roles.opened(allocated[:1])["accumulators"]
             # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
             # slot's `masked` barrier in its loads' place.
             masked = dict(zip(rings, allocated[1:1 + len(rewrites)], strict=True)) if rewrites else {}
