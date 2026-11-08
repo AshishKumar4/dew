@@ -426,8 +426,9 @@ class Loading:
     least, at most as many as the host's CPUs and memory hold, else none. In the
     training process the records' Python holds the interpreter the step's
     dispatch needs: a decision run's encoding held it 59% of the run on a GH200,
-    and four workers took its step from 20.9 to 10.5 ms (row 4862). Workers change no record and no order: a global order's
-    batches are the ones its records' indices make, and a read cut per share
+    and four workers took its step from 20.9 to 10.5 ms (row 4862). Workers
+    change no record and no order: a global order's batches are the ones its
+    records' indices make, and a read cut per share
     hands on its inputs in their order (`dew.data.lowering._Build.in_order`), so
     its batches and its position are a read in none's. A stream cut per share,
     which its workers would read each in shards of its own, its batches their
