@@ -309,9 +309,9 @@ def unsettled(lowered: jax.stages.Lowered) -> list[str]:
             visit(function)
 
         def settled(value: ir.Value) -> bool:
-            if not ir.BlockArgument.isinstance(value):
+            if not isinstance(value, ir.BlockArgument):
                 return False
-            argument = ir.BlockArgument(value)
+            argument = value
             holder = argument.owner.owner.operation
             if holder.name == "func.func":
                 name = ir.StringAttr(holder.attributes["sym_name"]).value
