@@ -576,8 +576,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
                                       "(`Topology`; not yet a stream of this bundle's)")
         # A gathered stream's rows are its load warp's four-row gathers (`gathered.Committed`).
-        streams = {name: gathered_rows.ring(shape, dtype, stages, swizzle=mosaic.SWIZZLE_BYTES,
-                                            released_by_products=True)
+        streams = {name: gathered_rows.ring(shape, dtype, stages, released_by_products=True)
                    if name in gathered else
                    mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
                                copies=(copies or {}).get(name, 1), released_by_products=True)

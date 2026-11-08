@@ -2273,8 +2273,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 gathered: tuple[str, ...] = ()) -> dict:
         from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `Ring`
 
-        return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers,
-                                         swizzle=(swizzles or {}).get(name)) if name in gathered
+        return {name: gathered_rows.ring(shape, dtype, stages, consumers=consumers) if name in gathered
                 else ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
                           swizzle=(swizzles or {}).get(name), copies=(copies or {}).get(name, 1))
                 for name, (shape, dtype) in blocks.items()}
