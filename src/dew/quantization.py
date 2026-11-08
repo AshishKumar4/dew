@@ -286,10 +286,12 @@ class QuantizedTrace:
 
 def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
                                  trace: QuantizedTrace) -> Callable[Arguments, Result]:
-    """`method` run under `trace` in `QUANTIZED_TRACE`."""
+    """`method` run under `trace` in `QUANTIZED_TRACE`, where a layer's product is its rules' only where one
+    matches its module (`dew.nn.dense.intercepted`, `dew.nn.precision.products_quantized`): a module they
+    leave alone forms the plain model's."""
     @functools.wraps(method)
     def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with QUANTIZED_TRACE(trace), INTERCEPTED(new_value=True):
+        with QUANTIZED_TRACE(trace):
             return method(*args, **kwargs)
     return keyed
 
