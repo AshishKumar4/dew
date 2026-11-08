@@ -413,8 +413,8 @@ class OuterProgram:
         return pending.result()
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
-        """A call's program traced afresh past a spill's refused config (`compiled`'s `relower`), on the
-        thread that keeps it (`compiled_together`)."""
+        """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
+        the thread that keeps it, each relowering with its jit kept in `relowered`."""
         fresh = self._jitted()
         relowering = self._traced(fresh, args, kwargs).lower()
         relowered.append((fresh, relowering))
@@ -475,18 +475,13 @@ class OuterProgram:
         afresh where a kernel spills."""
         from dew.nn.kernels.templates import report
 
-        relowered: list[tuple[jax.stages.Wrapped, jax.stages.Lowered]] = []
-
-        def relower() -> jax.stages.Lowered:
-            fresh = self._jitted()
-            lowered = self._traced(fresh, args, kwargs).lower()
-            relowered.append((fresh, lowered))
-            return lowered
+        relowered: Relowered = []
         lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
         if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
             return ahead()
-        executable = report.compiled(lowered, relower=relower)
+        executable = report.compiled(lowered,
+                                     relower=functools.partial(self._relowered, args, kwargs, relowered))
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted, lowered = relowered[-1]
