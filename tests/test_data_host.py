@@ -124,7 +124,7 @@ def test_automatic_loading_pays_a_step_that_makes_several_batches_at_once_in_the
         return auto.resolved(sampled, reads=1, batches=batches).workers
 
     # At least 10 ms a batch over starts of a second: 2,500 batches cost least in five workers, which the
-    # four CPUs cap, 500 in two (up to 17.9 ms a batch), and 50 pay for none.
+    # four CPUs cap, 500 in two (up to 12 ms a batch), and 50 pay for none.
     assert (resolved(2500), resolved(500), resolved(50)) == (4, 2, 0)
 
 
