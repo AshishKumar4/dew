@@ -1808,9 +1808,13 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     batches keep theirs traces once."""
     from dew.nn.flops import traced_flops
 
-    # The batch's shapes read off its leaves, as `jax.eval_shape` would give them, tracing nothing.
-    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
-        np.shape(leaf), jax.dtypes.canonicalize_dtype(np.result_type(leaf))), batch)
+    # The batch's shapes read off its leaves' abstract values, as `jax.eval_shape` would give them (a
+    # key's dtype, a weak type), tracing nothing.
+    def shaped(leaf) -> jax.ShapeDtypeStruct:
+        aval = jax.typeof(leaf)
+        return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
+
+    shapes = jax.tree.map(shaped, batch)
     signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
     kept = _TRACED.setdefault(objective, {})
     if (key := objective.trace_key()) is not None and signature not in kept:
