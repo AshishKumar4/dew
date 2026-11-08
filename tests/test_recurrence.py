@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
+from test_recurrence_chunk import ROUTES, on_route
 
 from dew.nn.kernels import recurrence
 from dew.nn.precision import FP32_SUMS
@@ -248,11 +249,19 @@ def test_a_decode_token_over_three_warpgroups_of_keys_reads_its_last_keys():
                     truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
 
 
+@pytest.mark.parametrize('route', ROUTES)
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)
-def test_a_bf16_state_steps_as_its_float64_form(hooks):
+def test_a_bf16_state_steps_as_its_float64_form(hooks, route):
     """A bf16 state is read and stepped in fp32 and written once, rounded stochastically by
     `round_to_bf16` from the token's key and value: within the rule of the XLA form's own bf16 run
-    against the float64 step, and the idle row's state its input's bits."""
+    against the float64 step, and the idle row's state its input's bits, on each route's bundle
+    (`on_route`)."""
+    with on_route(route):
+        bf16_state_steps_as_its_float64_form(hooks)
+
+
+def bf16_state_steps_as_its_float64_form(hooks):
+    """`test_a_bf16_state_steps_as_its_float64_form`'s checks on the route in force."""
     given = operands(hooks, seed=1, state_dtype=jnp.bfloat16)
     _, _, state = recurrence.step(hooks, given)
     assert state.dtype == jnp.bfloat16
