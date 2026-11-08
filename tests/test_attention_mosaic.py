@@ -885,6 +885,36 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
     assert (found_value[finite & (reference_value != 0)] != 0).all()
 
 
+def test_a_training_forwards_row_whose_sums_stay_in_range_takes_no_shift_whatever_its_values_reach():
+    """A training forward's head whose rows see 512 keys, one of them a value near bf16's largest under a
+    weight near 2^-125 (its logit 86.5 below the row's peak; the rest of the keys weigh nothing and hold
+    zeros): its weighted values stay near 8, so no row shifts (`algebra.row_shift` of the keys' weighted
+    terms, `algebra.Reach`), though its keys' count times their largest value passes fp32's largest by 2^9,
+    and its small weight is not shifted out of bf16's range. Its output is exactly 2^64 times the call's
+    over its values at 2^-64, which no bound comes near."""
+    queries, keys, width = 64, 512, 64
+    spans = template.spans(queries, keys, 1)
+    streams = jax.random.split(jax.random.key(1), 3)
+    query, key, value = (jax.random.normal(stream, (1, count, 2, width), jnp.float32)
+                         for stream, count in zip(streams, (queries, keys, keys), strict=True))
+    # Head 0's logits at a scale of 1/8: 128 at key 0, 41.5 at key 1, -72 at every other key.
+    query = query.at[:, :, 0].set(0.0).at[:, :, 0, 0].set(16.0)
+    key = key.at[:, :, 0].set(0.0).at[:, :, 0, 0].set(-36.0)
+    key = key.at[:, 0, 0, 0].set(64.0).at[:, 1, 0, 0].set(20.75)
+    value = value.at[:, :, 0].set(0.0).at[:, 1, 0].set(3e38)
+    query, key, value = (array.astype(jnp.bfloat16) for array in (query, key, value))
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family=WGMMA)
+
+    def trained(value):
+        with _device(interpret=True), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, residuals=template.Kept.SPLIT,
+                                            interpret=True)[0]
+
+    out = np.asarray(trained(value)[:, :, 0], np.float32)
+    scaled = np.asarray(trained(value * jnp.bfloat16(2.0 ** -64))[:, :, 0], np.float32)
+    np.testing.assert_array_equal(out, scaled * np.float32(2.0 ** 64))
+
+
 UNSEEN = {
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
                                          multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
