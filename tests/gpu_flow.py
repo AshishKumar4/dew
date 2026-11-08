@@ -97,6 +97,19 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     return skipped
 
 
+def in_parts(count: int):
+    """A flow's test split into `count` parts by its cells (`part`, its parameter, `[part0]` and on): one
+    long flow is a GPU tier's floor, which cuts a file by test id, and each part still runs its cells in one
+    process. A part runs every `count`-th cell from its own (`parted`), so a check's grid spreads over the
+    parts."""
+    return pytest.mark.parametrize("part", [pytest.param(index, id=f"part{index}") for index in range(count)])
+
+
+def parted(cells: Iterable[Cell], part: int, count: int) -> list[Cell]:
+    """`part`'s cells of a flow split into `count` parts (`in_parts`)."""
+    return list(cells)[part::count]
+
+
 def _skipped(marks, reason_of: str) -> Callable[[], None] | None:
     """`marks`' first `skipif` whose condition holds, as a run that skips for its reason; or None."""
     for mark in marks:

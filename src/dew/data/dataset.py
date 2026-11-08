@@ -617,16 +617,29 @@ class Ramp:
         Early steps read fewer records, so a pass over a corpus takes more
         steps than it would with the final batch from the start.
         """
-        def whole(count: int, batch: int) -> int:
-            return -(-count // batch) if tail == "read" else count // batch
+        return steps_through(self.stages(final, window), records, tail)
 
-        stages = self.stages(final, window)
-        steps = 0
-        for stage, next_stage in itertools.pairwise(stages):
-            if records < next_stage.records:
-                return steps + whole(records - stage.records, stage.batch)
-            steps += (next_stage.records - stage.records) // stage.batch
-        return steps + whole(max(records - stages[-1].records, 0), final)
+
+def phase_stages(batches: Sequence[int], starts: Sequence[int]) -> tuple[Stage, ...]:
+    """The stages of a read of phases on the step clock (`Loader.stages`): the first phase's batch, and each
+    phase's whose batch the one before it does not read, from the record it `starts` at."""
+    return tuple(Stage(batch, start) for index, (batch, start) in enumerate(zip(batches, starts, strict=True))
+                 if not index or batch != batches[index - 1])
+
+
+def steps_through(stages: Sequence[Stage], records: int, tail: Tail = "dropped") -> int:
+    """The steps that read `records` records through `stages`, each stage's steps reading its batch from the
+    record it starts at (a ramp's, `Ramp.stages`; phases of other batches, `Loader.stages`), a last step that
+    holds fewer than a batch counted where it is read (`tail`)."""
+    def whole(count: int, batch: int) -> int:
+        return -(-count // batch) if tail == "read" else count // batch
+
+    steps = 0
+    for stage, next_stage in itertools.pairwise(stages):
+        if records < next_stage.records:
+            return steps + whole(records - stage.records, stage.batch)
+        steps += (next_stage.records - stage.records) // stage.batch
+    return steps + whole(max(records - stages[-1].records, 0), stages[-1].batch)
 
 
 LONG_RUN = 1024
@@ -736,6 +749,13 @@ class Loader:
     """The committed tokens each phase of a schedule ends at (`dew.data.pipeline.schedule`), the last
     where the data ends or None where it runs on, which the trainer reads its commits against and ends
     the phase at (`PhasedStream.ending`); None for a read on no token clock."""
+    batches: tuple[int, ...] = ()
+    """Each phase's batch, of a read of phases (`dew.data.pipeline.Phases`), which every plan of the run's
+    step cuts (`dew.training.planning.splits`); none for a read of one batch, `batch`'s."""
+    stages: tuple[Stage, ...] = ()
+    """A read of phases' batches on the step clock, each from the record it starts at (`PhasedStream.stages`),
+    which its steps a count of records takes are counted through (`steps_through`); none for one of one
+    batch, or on the token clock, whose phases begin where the run's commits reach them."""
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -743,6 +763,8 @@ class Loader:
 
     def _steps(self, records: int, window: int = 1) -> int:
         """The steps that read `records` records, a last short batch counted where it is read."""
+        if self.stages:
+            return steps_through(self.stages, records, self.tail)
         if self.ramp is None:
             return -(-records // self.batch) if self.tail == "read" else records // self.batch
         return self.ramp.steps_for(records, self.batch, window, self.tail)
@@ -1416,13 +1438,23 @@ class PhasedStream:
     in it from where they left it), so one after an end the run has yet to
     reach opens once the run reaches it. A phase the run's commits passed
     within one step ends where it starts, holding no record.
+
+    Each phase reads batches of its own rows (`batches`), so a run steps each
+    phase's batch in a program of its own (`Trainer._compiled_for`). An update
+    pools one batch's microbatches: on the step clock each phase whose batch
+    differs from the one before it begins a stage of the run's batches
+    (`stages`, `Loader.stages`, as a ramp's do), where an update begins.
     """
 
     ends: Ends = "never"
 
     def __init__(self, phases: Sequence[tuple[Callable[[tuple[int, ...]], GlobalReader], int | None]],
-                 stop_seconds: float, *, tokens: Sequence[int | None] | None = None):
+                 stop_seconds: float, *, batches: Sequence[int], stages: Sequence[Stage] = (),
+                 tokens: Sequence[int | None] | None = None):
         ends = [end for _, end in phases]
+        if len(batches) != len(phases):
+            raise ValueError(f"phases need one batch each: {len(phases)} phases and {len(batches)} batches")
+        self.batches, self.stages = tuple(batches), tuple(stages)
         if tokens is None:
             phase_ends(ends, "record")
         elif any(end is not None for end in ends) or len(tokens) != len(ends):
