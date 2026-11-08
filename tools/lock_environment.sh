@@ -5,8 +5,11 @@
 # another CUDA loads its own cuDNN over JAX's. Dew's CUDA extra is the locks' one difference, by driver: locks/cpu.txt for CI and every host
 # without a GPU, for each Python and platform; locks/cuda12.txt for a driver below 580 (CUDA 12.8: the
 # A100 nodes, Colab's T4 and L4) and locks/cuda13.txt for 580 on (the H100 SXM nodes, Colab's G4), for the
-# Python 3.12 of a Linux GPU host, x86_64 or aarch64 (a GH200's Grace), whose pins are the same. A host installs
-# the one its driver reads: tools/install_environment.sh.
+# Python 3.12 of a Linux GPU host, x86_64 or aarch64 (a GH200's Grace). Each is resolved for every machine at
+# once, as the cpu lock is (--universal), so it carries each machine's pins under its markers, which differ
+# where Dew's CUDA plugins do by machine (pyproject.toml's cuda12 and cuda13 extras), and a GH200 installs the
+# same file. A host installs the one its driver reads: tools/install_environment.sh (uv pip install keeps the
+# pins whose markers its machine meets).
 # Usage, from the checkout: sh tools/lock_environment.sh
 set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
@@ -63,19 +66,11 @@ lock() {
 # A host with no GPU compiles kernels for one with the CUDA plugin of the kernel-compile extra; a GPU host's
 # own CUDA extra holds its plugin, and two CUDA plugins in one environment would both claim 'cuda'.
 lock cpu --universal --torch-backend cpu --extra kernel-compile
-gpu="--python-platform x86_64-manylinux_2_35"
-lock cuda12 --extra cuda12 --torch-backend cpu $gpu
-lock cuda13 --extra cuda13 --torch-backend cpu $gpu
-# Each GPU lock serves aarch64 too: resolved for it from the lock's own pins (uv prefers an output's pins), it
-# pins the same, which this holds, so a GH200 installs it.
-# The aarch64 resolutions are the check's alone: gone however it ends.
-trap 'rm -f locks/cuda12-aarch64.txt locks/cuda13-aarch64.txt' EXIT
-for extra in cuda12 cuda13; do
-  cp "locks/$extra.txt" "locks/$extra-aarch64.txt"
-  lock "$extra-aarch64" --extra "$extra" --torch-backend cpu --python-platform aarch64-manylinux_2_35
-  diff "locks/$extra.txt" "locks/$extra-aarch64.txt" >&2 || {
-    echo "locks/$extra.txt resolves otherwise for aarch64: lock it for each machine" >&2; exit 1; }
-done
+# Each GPU lock resolves for every machine at once, so it holds the pins each machine's markers pick: Dew's CUDA
+# plugins differ by machine (x86_64's are newer than aarch64's until aarch64's are built: pyproject.toml), which
+# a lock resolved for one machine and compared with the other's could not hold.
+lock cuda12 --universal --extra cuda12 --torch-backend cpu
+lock cuda13 --universal --extra cuda13 --torch-backend cpu
 # Each GPU extra installs on every Python pyproject.toml admits, from requires-python's floor to its newest
 # classifier, on each machine: a CUDA plugin built for fewer Pythons fails here, at the pin, and not at a user's
 # install (row 3298: post42's plugins came for 3.12 and 3.14 alone, and dewml[cuda12] refused 3.13).
@@ -83,7 +78,7 @@ floor=$(sed -n 's/^requires-python = ">=3\.\([0-9]*\)"$/\1/p' pyproject.toml)
 newest=$(sed -n 's/.*"Programming Language :: Python :: 3\.\([0-9]*\)".*/\1/p' pyproject.toml | sort -n | tail -1)
 [ -n "$floor" ] && [ -n "$newest" ] || { echo "pyproject.toml names no requires-python floor or Python classifier" >&2; exit 1; }
 checked=$(mktemp)
-trap 'rm -f locks/cuda12-aarch64.txt locks/cuda13-aarch64.txt "$checked"' EXIT
+trap 'rm -f "$checked"' EXIT
 for minor in $(seq "$floor" "$newest"); do
   for extra in cuda12 cuda13; do
     for machine in x86_64 aarch64; do
