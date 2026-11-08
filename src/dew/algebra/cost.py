@@ -37,10 +37,11 @@ def target(named: str | None = None) -> generation.GpuTarget:
     """The device a price is for: the one `named` names, else the algebra pass's (`program.passes`'s
     target), else the process's own or the one it assumes (`generation.gpu_target`: a GPU no row names its
     family's and its runtime's facts); a process of no accelerator prices as the interpreted templates'
-    generation (an H100's), as the gate lowers for."""
+    target (`generation.interpreted_target`: an H100's, or the device an interpreted check assumes), as the
+    gate lowers for."""
     named = named or ALGEBRA.value.target
     if named is None and generation.backend() not in ("gpu", "tpu"):
-        named = generation.INTERPRETED_GENERATION
+        return generation.interpreted_target()
     return generation.gpu_target(named)
 
 

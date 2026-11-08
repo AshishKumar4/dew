@@ -32,12 +32,14 @@ _log = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class Assumption:
-    """The device `assumed` stands in for the default device's: its generation, and its facts (`target`)
-    where it was given them. Equal wherever the generation and every fact are (`_facts`), as JAX's trace
-    key reads it, not by a target's identity or its partial hash."""
+    """The device `assumed` stands in for the default device's: its generation, its facts (`target`)
+    where it was given them, and whether its kernels are `interpreted` on this process's platform. Equal
+    wherever the generation, every fact and the mode are (`_facts`), as JAX's trace key reads it, not by a
+    target's identity or its partial hash."""
     generation: str
     target: GpuTarget | None = dataclasses.field(default=None, compare=False, hash=False)
     facts: Hashable = None
+    interpreted: bool = False
 
 
 def assumption() -> Assumption | None:
@@ -49,20 +51,23 @@ def assumption() -> Assumption | None:
 
 
 @contextlib.contextmanager
-def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
+def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False) -> Iterator[None]:
     """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
     process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
     kernel choice and refusal acts as on that GPU while a step traces and lowers for one on
     a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
-    and costed by them alone. None assumes nothing. JAX keys its trace and compile caches on the device
-    assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again for another."""
+    and costed by them alone. `interpreted`, the kernels run where the process places them (`backend` the
+    placed platform's) by the device's own bundles and facts, which Mosaic GPU's interpreter runs
+    (`interpreted_target`): an interpreted check of that device's route on a CPU. None assumes nothing.
+    JAX keys its trace and compile caches on the device assumed (`dew._cache.KERNEL_ASSUMED`), so a
+    function jitted for one traces again for another."""
     from dew import _cache
 
     if isinstance(generation, GpuTarget):
-        value = Assumption(generation.generation, generation, _facts(generation))
+        value = Assumption(generation.generation, generation, _facts(generation), interpreted)
     else:
-        value = None if generation is None else Assumption(generation)
+        value = None if generation is None else Assumption(generation, interpreted=interpreted)
     with _cache.KERNEL_ASSUMED(value):
         yield
 
@@ -671,9 +676,18 @@ def capability(generation: str) -> tuple[int, int] | None:
 
 
 INTERPRETED_GENERATION = "sm90"
-"""The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
-interpreted bundle's (`templates.bundles.INTERPRETED`, wgmma's); the algebra pass prices a CPU process's
-forms by its facts too (`dew.algebra.cost.target`)."""
+"""The generation whose bundles and facts an interpreted launch takes where no GPU is assumed
+(`interpreted_target`): wgmma's, whose producer role, TMA rings and barriers Mosaic GPU's interpreter
+models; the algebra pass prices a CPU process's forms by its facts too (`dew.algebra.cost.target`)."""
+
+
+def interpreted_target() -> GpuTarget:
+    """The target an interpreted launch runs a bundle of (`templates.bundles.of`) and is sized by: the GPU
+    `assumed` stands in for, else `INTERPRETED_GENERATION`'s, so a CPU's check of a device's route runs
+    that device's bundles at its facts (`assumed(..., interpreted=True)`)."""
+    found = assumption()
+    return gpu_target() if found is not None and found.generation.startswith('sm') else gpu_target(
+        INTERPRETED_GENERATION)
 
 
 def gpu_target(identifier: str | None = None) -> GpuTarget:
@@ -1302,8 +1316,9 @@ def host_memory_share() -> int:
 def backend() -> str:
     """The platform a call's code is chosen for: `placed_platform()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
-    platform acts as on that device while a step traces for it on another."""
-    if (found := assumption()) is None:
+    platform acts as on that device while a step traces for it on another; an `interpreted` assumption's
+    the placed platform's, where its kernels run."""
+    if (found := assumption()) is None or found.interpreted:
         return placed_platform()
     generation = found.generation
     if generation.startswith('sm'):
