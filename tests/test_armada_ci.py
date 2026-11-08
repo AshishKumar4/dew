@@ -899,7 +899,8 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     slept = first["tests"]["tests/test_first.py::test_first"]
     assert {row["kind"] for row in rows.values()} == {"deadline"}
     assert slept >= 0.5 and first["seconds"] == slept
-    assert stuck["seconds"] >= deadline - slept
+    # The file the deadline stopped holds the wall time the finished file's own did not.
+    assert stuck["seconds"] + slept >= deadline
     assert stuck["timings"] == {"3.12:tests/test_stuck.py": stuck["seconds"]}
     # The rows claim no more than the task took, and a file that never started none of it.
     assert sum(row["seconds"] for row in rows.values()) <= wall
