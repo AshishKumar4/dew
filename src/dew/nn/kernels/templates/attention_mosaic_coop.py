@@ -226,7 +226,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         def producer():
             family.stream(streams, views, *streamed)
 
-        family.roles(consumers, consumer, producer)
+        family.scheduled(consumers, consumer, producer)
 
     scoped, rings = _coop_allocations(family, program.tiles, width, query.dtype,
                                       min(program.tiles.stages, q_steps))
