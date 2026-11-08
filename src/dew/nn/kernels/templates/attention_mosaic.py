@@ -1049,6 +1049,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         share = config.consumers
         carried = [(block_k, width // share, jnp.float32), (block_k, value_width // share, jnp.float32)]
         products = [(block_q, block_k // share, jnp.float32)] * 2 + [(block_q, block_k // share, jnp.int8)]
+        if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+            # fp16's operands as two parts at the running scale (`attention_mosaic_coop._sixteen_step`): an
+            # operand's scaled tile and both its parts beside the products.
+            products += [(block_q, block_k // share, jnp.float32), *[(block_q, block_k // share, dtype)] * 2]
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
         # A score hook's slopes held beside both products to its pullback (as the fused launch's below).
         slope_tiles = [(block_q, block_k // share, jnp.float32)] * slopes
@@ -1201,10 +1205,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         dtype = ba.arguments["query"].dtype
         # The one launch stages its weights and score cotangents for its products (`mosaic.staged`): fp16's
-        # as two parts at the walk's running scale (`attention_mosaic_fused._sixteen_step`), queries first
-        # each consumer its own keys alone (row 3886: its two launches 4.1 times the bf16 step on an H100).
-        sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16) and not (
-            config.queries_first and not config.shared_keys)
+        # as two parts at the walk's running scale (`attention_mosaic_fused._sixteen_step`), queries first,
+        # each consumer its own keys or its share of a block they share (`attention_mosaic_coop`'s, every
+        # share's scale joined): row 3886, its two launches 4.1 times the bf16 step on an H100.
+        sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16) and not config.queries_first
         if (config.fused and (self.accurate or hooked or sixteen)) or not super().legal(ba, config, target):
             return False
         family = bundle_of(config, dtype)
