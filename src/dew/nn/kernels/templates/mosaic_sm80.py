@@ -566,12 +566,14 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = ()) -> Callable:
+               ahead: Callable | None = None, settled: tuple[int, ...] = (),
+               prefetched: Callable | None = None) -> Callable:
         # Its one warpgroup its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups, scalars  # its programs read a table from global memory as any operand
         _one(consumers, clustered=cluster > 1)
-        built = launches.kernel(mosaic.dependent(entry, interpret, ahead=ahead, settled=settled),
+        built = launches.kernel(mosaic.dependent(entry, interpret, ahead=ahead, settled=settled,
+                                                 prefetched=prefetched),
                                 name=name or self.name,
                                 out_type=out_type, grid=grid, grid_names=grid_names,
                                 compiler_params=plgpu.CompilerParams(approx_math=approx_math,

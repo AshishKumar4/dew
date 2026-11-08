@@ -111,14 +111,16 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
            model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
-           ahead: Callable | None = None, settled: tuple[int, ...] = ()) -> Callable:
+           ahead: Callable | None = None, settled: tuple[int, ...] = (),
+           prefetched: Callable | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), its `cost`
     the hardware's work and `model_flops` the model's share of it, and its `settled` operands those its
     programs read `ahead` of their wait (`dependent`, `checked`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-    launched = dependent(entry, interpret, ahead=ahead, settled=settled, scratch=len(scratch))
+    launched = dependent(entry, interpret, ahead=ahead, settled=settled, scratch=len(scratch),
+                         prefetched=prefetched)
     built = launches.kernel(launched, name=name or family, out_type=out_type, grid=grid,
                             grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
                             scratch_types=scratch,
@@ -138,7 +140,7 @@ def waits(interpret) -> bool:
 
 
 def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, settled: tuple[int, ...] = (),
-              scratch: int = 0) -> Callable:
+              scratch: int = 0, prefetched: Callable | None = None) -> Callable:
     """`entry` as a dependent launch (programmatic dependent launch, PTX's `griddepcontrol`): it waits for the
     launch before it in its stream to finish and its writes to land (`wait`) before any memory access of its
     own, so it is ordered against any launch as without it, and once its own work is done it lets the next
@@ -159,7 +161,11 @@ def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, sett
     writes (a decode step's weights, loaded once a run) issued under the previous launch's tail, which its
     other operands' and its outputs' refs, not given to `ahead`, cannot be. The launch declares `settled` on
     its call (`SETTLED`), and the compile point refuses a program where one is not an input it holds whole
-    (`lowered.unsettled`)."""
+    (`lowered.unsettled`).
+
+    With `prefetched`, `prefetched(*refs)`'s views of any operands each prefetched into L2 before the wait
+    (`plgpu.async_prefetch`): a prefetch reads nothing into the program, and L2 is where every write
+    lands, so a view the launch before it still writes is correct to prefetch, at worst early."""
     interpreting_ = bool(interpreted(interpret))
     waiting = waits(interpret)
     if ahead is None and not waiting and not interpreting_:
@@ -171,6 +177,8 @@ def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, sett
             own = refs[len(refs) - scratch:]
             held = None if ahead is None else ahead(*(refs[index] for index in settled), *own)
             if waiting:
+                for view in () if prefetched is None else prefetched(*refs):
+                    plgpu.async_prefetch(view)
                 plgpu.griddepcontrol_wait()
             if held is None:
                 entry(*refs)
@@ -1821,7 +1829,8 @@ class Transport[Allocated, Opened](abc.ABC):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = ()) -> Callable:
+               ahead: Callable | None = None, settled: tuple[int, ...] = (),
+               prefetched: Callable | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
         compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
@@ -1834,7 +1843,8 @@ class Transport[Allocated, Opened](abc.ABC):
         reserving its share of reduction scratch (`warpgroup_reduction_scratch`); its first `scalars` operands
         tables of integers its programs read an element at a time (a grouped schedule's), which a GPU reads
         from global memory and a TPU from its scalar memory; its `settled` operands (indices) read `ahead`
-        of the program's wait for the launch before it, where given (`dependent`)."""
+        of the program's wait for the launch before it, and its `prefetched` views prefetched into L2
+        before it, where given (`dependent`)."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -2272,7 +2282,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
-               ahead: Callable | None = None, settled: tuple[int, ...] = ()) -> Callable:
+               ahead: Callable | None = None, settled: tuple[int, ...] = (),
+               prefetched: Callable | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
         if cluster > self.cluster:
@@ -2281,6 +2292,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
                       model_flops=model_flops, resident=resident, ahead=ahead, settled=settled,
+                      prefetched=prefetched,
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=(self.reduction_scratch

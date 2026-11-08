@@ -542,7 +542,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         paired: jax.Array | None = None, exact_sums: bool = False,
         transpose_lhs: bool = False, first: jax.Array | None = None,
         scales: jax.Array | None = None, step_scales: tuple | None = None, mx_scales: tuple | None = None,
-        gather: jax.Array | None = None, scatter: jax.Array | None = None, settled: bool = False
+        gather: jax.Array | None = None, scatter: jax.Array | None = None
         ) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
@@ -647,7 +647,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                          sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired, tail=tail,
                          exact_sums=exact_sums, transpose_lhs=transpose_lhs, scales=scales,
                          step_scales=step_scales, scale_per=per, mx_scales=mx_scales, gather=gather,
-                         scatter=scatter, stored=None if scatter is None else rows, settled=settled)
+                         scatter=scatter, stored=None if scatter is None else rows)
     if tiles.splits > 1:
         # Each run's fp32 partial, summed in its order (the same sums every call) and rounded once.
         total = functools.reduce(jnp.add, tuple(outs[0]))
@@ -718,13 +718,13 @@ def launched(family: mosaic.Family, multiprocessors: int, walked: int, tail: tai
 
 
 @tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
-                      'dense', 'tail', 'exact_sums', 'transpose_lhs', 'scale_per', 'stored', 'settled'))
+                      'dense', 'tail', 'exact_sums', 'transpose_lhs', 'scale_per', 'stored'))
 def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
                   transpose_lhs: bool = False, paired: jax.Array | None = None, tail=None,
                   exact_sums: bool = False, scales: jax.Array | None = None, step_scales: tuple | None = None,
                   scale_per: int = 1, mx_scales: tuple | None = None, gather=None, scatter=None,
-                  stored: int | None = None, settled: bool = False) -> tuple:
+                  stored: int | None = None) -> tuple:
     """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
     its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
     on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
@@ -835,37 +835,38 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            resident=tiles.programs, scalars=0 if dense else 1,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type),
-                           **_read_ahead(settled, tiles, grid, k // block_k, transpose_rhs=transpose_rhs,
-                                         dense=dense, interpret=interpret,
+                           **_prefetched(tiles, grid, k // block_k, transpose_rhs=transpose_rhs, dense=dense,
+                                         interpret=interpret,
                                          plain=(tail is None and scales is None and mx_scales is None
                                                 and gather is None)))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
                   *_workspace(tail, (multiprocessors, 2, consumers, *part)))
 
 
-def _read_ahead(settled: bool, tiles: Tiles, grid: tuple, steps: int, *, transpose_rhs: bool, dense: bool,
-                plain: bool, interpret) -> dict:
-    """Dew: a dense `gmm`'s matrix read ahead of its launch's wait (`mosaic.dependent`'s `ahead`), where its
-    caller states it settled (an input of the program no executable of the run writes: a decode step's
-    weights, `options.program`'s `settled`) and the launch waits for the one before it (`mosaic.waits`):
-    each program's first tile's matrix blocks of its first stages prefetched into L2 under the previous
-    launch's tail, its first loads then L2 hits (M-FS-12: a decode GEMM's exposed prologue 3-5%). A plain
-    dense product's alone, whose first tile a program's index states (its persistent walk's first,
-    `persistent.tiled`): a grouped one's needs its routing, written before the wait; nothing elsewhere."""
-    if not (settled and dense and plain and tiles.splits == 1 and not tiles.raster and tiles.cluster == 1
+def _prefetched(tiles: Tiles, grid: tuple, steps: int, *, transpose_rhs: bool, dense: bool, plain: bool,
+                interpret) -> dict:
+    """Dew: a dense `gmm`'s matrix prefetched into L2 before its launch's wait for the one before it
+    (`mosaic.dependent`'s `prefetched`, `mosaic.waits`): each program's first tile's matrix blocks of its
+    first stages, so its first loads hit L2 rather than wait on memory under the previous launch's tail
+    (M-FS-12: a decode GEMM's prologue exposed 3-5%; row 3601). A plain dense product's alone, whose first
+    tile a program's index states (its persistent walk's first, `persistent.tiled`); a grouped one's needs
+    its routing, written before the wait. A prefetch reads nothing into the program, so a matrix the launch
+    before it still writes is prefetched early, never read stale."""
+    if not (dense and plain and tiles.splits == 1 and not tiles.raster and tiles.cluster == 1
             and mosaic.waits(interpret)):
         return {}
     block = (tiles.block_n, tiles.block_k) if transpose_rhs else (tiles.block_k, tiles.block_n)
 
-    def ahead(matrix_gmem):
+    def prefetched(lhs_gmem, matrix_gmem, *refs):
+        # The matrix is the launch's second operand, after the rows (`gmm`'s operands: a dense call's
+        # take no table).
+        del lhs_gmem, refs
         _, column_tile = tail_of.planar_snake(lax.axis_index("programs"), grid, 1, tiles.grid_block_n)
         view = (_matrix_columns(matrix_gmem.at[0], column_tile, block_n=tiles.block_n,
                                 transpose_rhs=transpose_rhs), _rhs_index(transpose_rhs))
-        for step in range(min(tiles.stages, steps)):
-            plgpu.async_prefetch(mosaic.viewed(view, block, step))
+        return [mosaic.viewed(view, block, step) for step in range(min(tiles.stages, steps))]
 
-    # The matrix is the launch's second operand, after the rows (`gmm`'s operands, a dense call's no table).
-    return {'ahead': ahead, 'settled': (1,)}
+    return {'prefetched': prefetched}
 
 
 def _declared(rows: int, n: int, splits: int, dtypes: tuple) -> tuple:

@@ -496,10 +496,9 @@ class Gmm(_Triton):
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
              scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
-             hooks: Hooks = NO_HOOKS, exact_sums: bool = False, settled: bool = False,
+             hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: Tile, return_residuals: bool = False):
-        # A second matrix, table rows and a read ahead of a dependent launch's wait are Mosaic GPU's alone.
-        del paired, gather, scatter, settled
+        del paired, gather, scatter  # a second matrix and table rows are Mosaic GPU's alone (`tables`)
         # Imported at first use: the kernels need jax's Pallas Triton backend,
         # which jax 0.11.2 deprecates, and importing a model must not load it.
         if dense:
@@ -1141,7 +1140,7 @@ class MosaicGmm(_Mosaic):
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
              scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
-             hooks: Hooks = NO_HOOKS, exact_sums: bool = False, settled: bool = False,
+             hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         if config.swapped:
             # The product transposed: the matrix's rows times the rows, padded to whole column tiles and
@@ -1161,7 +1160,7 @@ class MosaicGmm(_Mosaic):
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
                               dense=dense, paired=paired, exact_sums=exact_sums, gather=gather,
-                              scatter=scatter, settled=settled, **hooks.kernel_options()), None
+                              scatter=scatter, **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1514,12 +1513,11 @@ class CutlassGmm(_Cutlass):
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
              scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
-             hooks: Hooks = NO_HOOKS, exact_sums: bool = False, settled: bool = False,
+             hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         # No hooks, side operands, second matrix, stack read from a first matrix or exact sums: the launch is
         # not eligible for them (`_Cutlass.eligible`); a dense call is one group, as any.
         del prologue_operands, epilogue_operands, paired, first, gather, scatter, interpret, hooks, exact_sums
-        del settled  # a read ahead of a dependent launch's wait is Mosaic GPU's alone
         del dense, config
         _cutlass_registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
@@ -1733,11 +1731,11 @@ class MosaicTpuGmm(_MosaicTpu):
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
              first: jax.Array | None = None, gather: jax.Array | None = None,
              scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
-             hooks: Hooks = NO_HOOKS, exact_sums: bool = False, settled: bool = False,
+             hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_tpu.Blocks, return_residuals: bool = False):
         # Never set: the launch is not eligible for exact sums, a second matrix or gathered rows; a dense call
         # is one group, as any.
-        del exact_sums, dense, paired, gather, scatter, settled
+        del exact_sums, dense, paired, gather, scatter
         return mosaic_tpu.gmm(tokens, kernel, sizes, first=first, blocks=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, interpret=TPU_INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
@@ -2009,7 +2007,7 @@ def launched(launches, arguments, options, *, product: Product, whole: bool):
 def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
              paired: jax.Array | None = None, first: jax.Array | None = None, gather: jax.Array | None = None,
              scatter: jax.Array | None = None, *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS,
-             interpret: bool, promoted: bool = False, dense: bool = False, settled: bool = False) -> tuple:
+             interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
     """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
     both of one dtype, with the template's hooks (`gemm.gemm`). `promoted`,
     the declared product's (`templates.product.Product`), adds each depth step's partial apart
@@ -2020,15 +2018,13 @@ def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_oper
     banked layer's experts, `gemm.gemm`'s `layer`); `gather`, int32 `[rows]`, the rows of `tokens` the
     product's rows are, in order (a mixture of experts' tokens read where they lie, row 1376); `scatter`,
     int32 `[rows]` a permutation, the output row each product row lands at (its slots written in token
-    order); Mosaic GPU's launch alone takes either; `settled`, `kernel` an input of the program no executable
-    of the run writes (`dew.nn.kernels.options.settled`), which a Mosaic GPU launch may read ahead of its
-    wait for the launch before it (`mosaic_gpu.gmm`'s `settled`)."""
+    order); Mosaic GPU's launch alone takes either."""
     optional = (paired, first, gather, scatter)
     last = max((place for place, value in enumerate(optional) if value is not None), default=-1)
     arguments = (tokens, kernel, sizes, tuple(prologue_operands), tuple(epilogue_operands),
                  *optional[:last + 1])
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
-               'interpret': interpret, 'exact_sums': promoted, 'dense': dense, 'settled': settled}
+               'interpret': interpret, 'exact_sums': promoted, 'dense': dense}
     return _GMMS, arguments, options
 
 
