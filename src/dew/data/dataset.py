@@ -423,10 +423,10 @@ class Loading:
     (`workers="auto"`, `dew.data.compile.compile`), which `resolved` sizes from
     what it measures: workers where the Python a batch takes over the batches the
     run reads, its stated steps, pays for their starts, as many as cost the run
-    least, at most as many as the host's CPUs and memory hold, else none. In the training process the records' Python holds
-    the interpreter the step's dispatch needs: a decision run's encoding held it
-    59% of the run on a GH200, and four workers took its step from 20.9 to
-    10.5 ms (row 4862). Workers change no record and no order: a global order's
+    least, at most as many as the host's CPUs and memory hold, else none. In the
+    training process the records' Python holds the interpreter the step's
+    dispatch needs: a decision run's encoding held it 59% of the run on a GH200,
+    and four workers took its step from 20.9 to 10.5 ms (row 4862). Workers change no record and no order: a global order's
     batches are the ones its records' indices make, and a read cut per share
     hands on its inputs in their order (`dew.data.lowering._Build.in_order`), so
     its batches and its position are a read in none's. A stream cut per share,
@@ -480,8 +480,9 @@ class Loading:
         `batches` the run reads (its planned steps), over a worker's start there (`Host.started`), at most
         as many as the CPUs and the memory hold. On a GH200 a decision run of 1,500 steps, 15 ms of
         Python a batch, took 100 s in the process at 20 ms a step; 64 workers, the CPUs', 168 s at 12.4 ms;
-        13, as many as its Python pays the starts of, 136 s at 11.1 ms. A short run, one whose batches take no Python to speak of, or one whose length nothing
-        states (None), which no measure shows they pay for, reads in the process."""
+        13, as many as its Python pays the starts of, 136 s at 11.1 ms. A short run, one whose batches
+        take no Python to speak of, or one whose length nothing states (None), which no measure shows
+        they pay for, reads in the process."""
         if self.workers != "auto":
             return self
         reading, sampled, seconds = iter(records), [], []
@@ -507,8 +508,8 @@ class Loading:
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
         workers = 0 if batches is None else max(0, min(cpus, budget // held))
         if workers and batches is not None and (started := host.started) > 0:
-            # W workers started one after another and then reading P seconds of Python a batch over B
-            # batches cost W * start + B * P / W where the run waits on them, least at W = sqrt(B * P / start).
+            # W workers started one after another, then reading P seconds of Python a batch over B batches,
+            # cost W * start + B * P / W where the run waits on them, least at W = sqrt(B * P / start).
             workers = min(workers, math.isqrt(int(python * batches // started)))
         if not workers:
             _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each, on %d "
