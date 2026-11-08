@@ -879,8 +879,8 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
 
 
 def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
-    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved, and loaded
-    again, runs on this GPU in the place of the run's own compile of it: handed the arguments the
+    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved,
+    and loaded again, runs on this GPU in the place of the run's own compile of it: handed the arguments the
     run's step is (the state the trainer places, the batch, the first part), it makes outputs of
     the same tree, shapes, dtypes and placements, the same step and microstep counters, a finite
     loss, and parameters it has updated. Its floats are not held to the run's own bit for bit: XLA
@@ -926,8 +926,8 @@ def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path)
 
 
 def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
-    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and handed to
-    the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
+    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and
+    handed to the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
     trains from it, its plan's first compile the step compiled ahead: its steps advance and its
     parameters move (row 1915). A wider model's step for this GPU is another program, refused. The
     model's attention takes XLA's path, which a step compiled with no GPU attached traces too."""
