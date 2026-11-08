@@ -1285,14 +1285,16 @@ def _barren_bound(stages: Sequence[Stage], passes: tuple[int, int] | None, ran: 
 
 
 def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool = True,
-             spread: bool = False) -> int:
+             spread: bool = False, repeats: bool = False) -> int:
     """Where an elastic read's workers hand its rows on (`_InputOrder`), at the latest: before the
     first step that may make its indexed rows a stream (an expansion, a window shuffle, a Grain
     step), which no index reads, and before a random step after one that may drop, which one
     reader keys by its place among the rows kept, not among the inputs with their markers. The
     reading process runs the rest in that order, so its rows and draws are one reader's. Where not
     `native`, a Grain step is run before it, over its indexed rows (a read cut per share's, which
-    hands on after one that makes a stream, `_Build.records`). A read that `spread`s each input
+    hands on after one that makes a stream, `_Build.records`); where `repeats`, before a repeat after a
+    step that may drop, which a read in none repeats as the stream of the rows it kept, each pass alike,
+    where indexed inputs would be drawn again each pass (Grain's shuffle). A read that `spread`s each input
     (`_Spread`) runs its expansion and the record steps after it in its workers too, each draw keyed by
     its input and its row in it, and hands on before the first stage after its expansion that is no
     record step, or before a window shuffle or a Grain step."""
@@ -1305,7 +1307,8 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool 
             placed = expanded and isinstance(stage, MapWithIndex)
             grain = isinstance(stage, Native) and (native or expanded)
             # Before the expansion, a draw after a drop is keyed by its place among the rows kept.
-            drawn = not expanded and marked and isinstance(stage, RandomMap)
+            kept = (RandomMap, Repeat) if repeats else (RandomMap,)
+            drawn = not expanded and marked and isinstance(stage, kept)
             # An expansion whose counts the reading process keeps (a cut into chunks, `Chunked`; a later
             # objective's of the source examples it makes rows of, `FlatMap.examples`) runs there.
             counted = isinstance(stage, FlatMap) and (
@@ -1319,7 +1322,7 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool 
     for at, stage in enumerate(stages[start:], start=start):
         windowed = isinstance(stage, Shuffle) and stage.window is not None
         streams = windowed or isinstance(stage, FlatMap) or (native and isinstance(stage, Native))
-        if streams or (marked and isinstance(stage, RandomMap)):
+        if streams or (marked and isinstance(stage, (RandomMap, Repeat) if repeats else RandomMap)):
             return at
         marked = marked or _drops(stage)
     return len(stages)
@@ -1980,7 +1983,7 @@ class _Build:
             # A read cut per share runs its Grain steps in its workers over its indexed rows, as a read in
             # none does, and hands on after one that makes a stream (`records`); an elastic read before it.
             carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked, native=self.elastic,
-                                            spread=spreading))
+                                            spread=spreading, repeats=not self.elastic))
         return carried, spreading
 
     def spread(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, at: int, carried: int,
