@@ -737,9 +737,11 @@ def read_otherwise_at_10(saved: Mapping[str, object]) -> str | None:
 
 def read_otherwise_at_11(saved: Mapping[str, object]) -> str | None:
     """Why version 11 reads a version 10 data plan's order otherwise, None where it reads it alike: where its
-    read is cut per share, whose inputs 10 read where they were, every W-th in each loading worker or inline
-    in none, and 11 reads in their order in groups (`IN_ORDER`), a position of another form."""
-    if saved.get("lowering") != "per-share":
+    read is cut per share of indexed inputs, which 10 read where they were, every W-th in each loading worker
+    or inline in none, and 11 reads in their order in groups (`IN_ORDER`), a position of another form; a
+    stream reads alike."""
+    order = record(saved.get("order", {}), "saved order")
+    if saved.get("lowering") != "per-share" or order.get("read") == "streamed":
         return None
     return ("version 10 read this share's inputs where its workers took them, and version 11 reads them in "
             "their order, so this position goes on only as 10 read it")
@@ -941,11 +943,11 @@ numbered across every file, so a stream read every file's footer before its firs
 default configuration's 2410 files, 196 s, row 4131)."""
 
 IN_ORDER = 11
-"""The plan version from which a training read cut per share reads its inputs in their order in any count of
-loading workers (`dew.data.lowering._Build.in_order`): its workers read whole groups of consecutive inputs
-by index and hand them on in turn (`dew.data.elastic_order._InputOrder`), so its batches are those it reads
-in none and its position names no count of them. 10's workers each read every W-th input and batched its
-own, so its batches and its position were its count's (row 4862)."""
+"""The plan version from which a training read cut per share of indexed inputs reads them in their order in
+any count of loading workers (`dew.data.lowering._Build.in_order`): its workers read whole groups of
+consecutive inputs by index and hand them on in turn (`dew.data.elastic_order._InputOrder`), so its batches
+are those it reads in none and its position names no count of them. 10's workers each read every W-th input
+and batched its own, so its batches and its position were its count's (row 4862). A stream reads alike."""
 
 PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name

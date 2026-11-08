@@ -606,17 +606,20 @@ type Field = Batch | np.ndarray | np.generic | str | bytes | int | float | bool 
 @dataclasses.dataclass
 class _Grouped:
     """A loading worker's records and the markers of those its steps dropped, a batch's count at a
-    time (`_Build.handed`): where the records hold the same fields, field by field, each field's
-    arrays of one shape and type stacked as a batch's are, into shared memory once Grain asks for
-    it, and any other field's values listed; the markers beside them."""
+    time (`_Build.handed`), none of the records a store misses: where the records hold the same
+    fields, field by field, each field's arrays of one shape and type stacked as a batch's are, into
+    shared memory once Grain asks for it, and any other field's values listed; the markers beside
+    them."""
 
     shared: bool = False
 
     def enable_shared_memory_output(self) -> None:
         self.shared = True
 
-    def __call__(self, elements: Sequence[Record]) -> Batch:
-        elements = consumed_forward(elements)
+    def __call__(self, elements: Sequence[Record | None]) -> Batch:
+        # A record a store read by index misses is none, which the read leaves out, as Grain's iterating
+        # a dataset of them does.
+        elements = consumed_forward([element for element in elements if element is not None])
         markers = [element for element in elements if isinstance(element, Rejected)]
         rows = [element for element in elements if not isinstance(element, Rejected)]
         records = [row for row in rows if isinstance(row, Mapping)]
@@ -1234,15 +1237,17 @@ def _barren_bound(stages: Sequence[Stage], passes: tuple[int, int] | None, ran: 
     return 2 * rows if before and after and rows else None
 
 
-def _handoff(stages: Sequence[Stage], start: int, *, marked: bool) -> int:
+def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool = True) -> int:
     """Where an elastic read's workers hand its rows on (`_InputOrder`), at the latest: before the
     first step that may make its indexed rows a stream (an expansion, a window shuffle, a Grain
     step), which no index reads, and before a random step after one that may drop, which one
     reader keys by its place among the rows kept, not among the inputs with their markers. The
-    reading process runs the rest in that order, so its rows and draws are one reader's."""
+    reading process runs the rest in that order, so its rows and draws are one reader's. Where not
+    `native`, a Grain step is run before it, over its indexed rows (a read cut per share's, which
+    hands on after one that makes a stream, `_Build.records`)."""
     for at, stage in enumerate(stages[start:], start=start):
         windowed = isinstance(stage, Shuffle) and stage.window is not None
-        streams = windowed or isinstance(stage, (FlatMap, Native))
+        streams = windowed or isinstance(stage, FlatMap) or (native and isinstance(stage, Native))
         if streams or (marked and isinstance(stage, RandomMap)):
             return at
         marked = marked or _drops(stage)
@@ -1434,10 +1439,13 @@ class _Build:
 
     @property
     def in_order(self) -> bool:
-        """Whether its loading workers read its inputs in their order (`_InputOrder`, `_StreamOrder`), so
-        its rows and its position are those a read in none makes, whatever their count: an elastic read's,
-        and from `IN_ORDER` a training read cut per share's."""
-        return self.elastic or (self.training and not self.global_order and self.version >= IN_ORDER)
+        """Whether its loading workers read its inputs in their order (`_InputOrder`, `_StreamOrder`), so its
+        rows and its position are those a read in none makes, whatever their count: an elastic read's, and
+        from `IN_ORDER` a training read cut per share of indexed inputs. A stream cut per share reads its
+        shards in its workers' own, each worker's shards its own, as a stream is read through and never by
+        index: in order, every worker would read the whole stream (`_StreamOrder`)."""
+        return self.elastic or (self.training and not self.global_order and self.version >= IN_ORDER
+                                and self.read != "streamed")
 
     def child(self, index: int) -> _Build:
         """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
@@ -1803,7 +1811,9 @@ class _Build:
         marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
         if self.in_order and carried >= 0:
-            carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked))
+            # A read cut per share runs its Grain steps in its workers over its indexed rows, as a read in
+            # none does, and hands on after one that makes a stream (below); an elastic read before it.
+            carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked, native=self.elastic))
         ran, counting, examples = consumed, _counts_own_rows(pipeline), False
         # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
         passes: tuple[int, int] | None = None

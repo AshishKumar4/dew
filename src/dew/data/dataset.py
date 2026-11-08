@@ -412,8 +412,8 @@ class Loading:
     A training read whose chain names no loading reads with automatic workers
     (`workers="auto"`, `dew.data.compile.compile`), which `resolved` sizes from
     what it measures: workers where the Python a batch takes over the batches
-    the run reads is more than a worker's start, as many as the host's CPUs and
-    memory hold, else none. In the training process the records' Python holds
+    the run reads, its stated steps, is more than a worker's start, as many as
+    the host's CPUs and memory hold, else none. In the training process the records' Python holds
     the interpreter the step's dispatch needs: a decision run's encoding held it
     59% of the run on a GH200, and four workers took its step from 20.9 to
     10.5 ms (row 4862). Workers change no record and no order: a global order's
@@ -461,9 +461,9 @@ class Loading:
         a GH200, row 4862), and each costs a process's start first, its imports. They start where they
         pay for themselves over the run: where the Python a sampled batch takes in the reading process,
         each after the first, which opens the read, times the `batches` the run reads (its planned steps)
-        is more than a worker's measured start (`worker_start_seconds`). A short run, or one whose
-        batches take no Python to speak of, reads in the process; a run whose length nothing states
-        (None) reads in workers as its CPUs and memory size them."""
+        is more than a worker's measured start (`worker_start_seconds`). A short run, one whose
+        batches take no Python to speak of, or one whose length nothing states (None), which no
+        measure shows they pay for, reads in the process."""
         if self.workers != "auto":
             return self
         reading, sampled, seconds = iter(records), [], []
@@ -477,8 +477,8 @@ class Loading:
         if not sampled:
             return dataclasses.replace(self, workers=0)
         python = statistics.median(seconds[1:] or seconds)
-        if batches is not None and python * batches <= worker_start_seconds():
-            _log.info("automatic loading reads in the process: %d batches of %.2f ms of Python each take "
+        if batches is None or python * batches <= worker_start_seconds():
+            _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each take "
                       "less than a worker's start", batches, python * 1e3)
             return dataclasses.replace(self, workers=0)
         host = Host.current() if host is None else host
