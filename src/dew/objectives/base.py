@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import enum
 import functools
@@ -953,6 +954,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return 3 * self.model_flops(model, batch)
 
+    def trace_key(self) -> Hashable | None:
+        """A value of everything this objective's loss and its draw read beside their arguments, equal for
+        two objectives whose losses trace alike, so a trace of one serves the other's equal fit, a refit or
+        a resume in the same process building it anew (`traced_update_flops`; row 3873); None, the
+        default, where no value states them (a closure, a constant a trace bakes in), and none is shared.
+        A key reads the objective as it is now, its modules and head as a fit's rung set them."""
+        return None
+
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
 
@@ -1784,6 +1793,12 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
 _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (
     weakref.WeakKeyDictionary())
 
+_KEYED_FLOPS: collections.OrderedDict[Hashable, tuple[float, float]] = collections.OrderedDict()
+"""`traced_update_flops`' counts of objectives that state their trace (`Objective.trace_key`), by that key
+and the batch's shapes, the `KEYED_FLOPS` latest: a refit's objective, built anew, reads its equal's."""
+
+KEYED_FLOPS = 256
+
 
 def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tuple[float, float]:
     """The work of an update of `objective` on `batch` as its traced programs run it, for an objective whose
@@ -1796,6 +1811,10 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     shapes = jax.eval_shape(lambda batch: batch, batch)
     signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
     kept = _TRACED.setdefault(objective, {})
+    if (key := objective.trace_key()) is not None and signature not in kept:
+        counted = _KEYED_FLOPS.get((type(objective), key, signature))
+        if counted is not None:
+            kept[signature] = counted
     if signature not in kept:
         variables = unboxed(abstract(objective.init, jax.random.key(0)))
         step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
@@ -1809,6 +1828,10 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
 
         kept[signature] = (traced_flops(forward, variables, shapes),
                            traced_flops(gradient, variables["params"], rest, shapes))
+        if key is not None:
+            _KEYED_FLOPS[type(objective), key, signature] = kept[signature]
+            while len(_KEYED_FLOPS) > KEYED_FLOPS:
+                _KEYED_FLOPS.popitem(last=False)
     return kept[signature]
 
 __all__ = [
