@@ -74,6 +74,23 @@ def stores_typed(family: mosaic.Family, config: BackwardTiles, width: int, dtype
         family, launch_scope(family, allocations, reduced, reduces=False)) <= limit
 
 
+def walked_sums(walk: _Backward, streams, views, reach: tuple, streamed: tuple, index, segments,
+                shapes: tuple, *, scaled: bool) -> tuple[jax.Array, jax.Array]:
+    """A fused consumer `index`'s dK and dV sums, its walk over `reach` among the tiles its program streams
+    (`Family.walk_own`, `segments(lo, hi)` its steps, `shapes` its sums'); where `scaled`, fp16's running
+    scales carried, dV's and dK's (`_sixteen_step`'s and `attention_mosaic_coop`'s), and its sums taken back
+    by them (`algebra.running_restored`)."""
+    family = walk.program.family
+    start = (jnp.float32(-jnp.inf),) * 2 if scaled else ()
+    scales, (dk, dv) = family.walk_own(
+        streams, views, reach, streamed, index,
+        lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), start, shapes, walk.interpret,
+                                                     first=counted))
+    if scales:
+        dv, dk = (algebra.running_restored(sums, scale) for sums, scale in zip((dv, dk), scales, strict=True))
+    return dk, dv
+
+
 def staged_parts(dtype) -> int:
     """The parts each of a fused step's left operands stages: fp16's two at a running scale
     (`algebra.running_parts`), another 16-bit dtype's one."""
@@ -276,15 +293,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             # feed their rings, every tile any of the program's keys' readers reads, a tile none of a
             # consumer's own keys sees masked whole, its weights and its dQ zero (FlashAttention 3's two
             # warpgroups a CTA, each its own keys over one query stream).
-            # fp16's running scales carried, dV's and dK's (`_sixteen_step`), their sums taken back by them.
-            start = (jnp.float32(-jnp.inf),) * 2 if staged_parts(query.dtype) > 1 else ()
-            scales, (dk, dv) = family.walk_own(
-                streams, views, (lo, hi), streamed, index,
-                lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), start, shapes,
-                                                             walk.interpret, first=counted))
-            if scales:
-                dv, dk = (algebra.running_restored(sums, scale) for sums, scale in zip((dv, dk), scales,
-                                                                                       strict=True))
+            dk, dv = walked_sums(walk, streams, views, (lo, hi), streamed, index, segments, shapes,
+                                 scaled=staged_parts(query.dtype) > 1)
             outs = (dk_ref.at[keys_view], dv_ref.at[keys_view])
             finished = functools.partial(_fused_out, family, (dk, dv), outs, index, block_k, grouped=grouped,
                                          interpret=walk.interpret)
