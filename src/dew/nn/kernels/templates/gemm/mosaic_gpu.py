@@ -399,14 +399,18 @@ class Allocations:
     staged: tuple
     outputs: tuple
 
-    def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None) -> resources.Scope:
+    def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None,
+              rewritten: bool = False) -> resources.Scope:
         """Its allocations by lifetime (`resources.shared_bytes`): its streams where its family places them
         (`mosaic.Family.lifetimes`, in no more slots than a walk's `steps` where they are known), and each
         output staged as its family stages it (`mosaic.Family.output_staging`, the allocations `persist`
-        makes), after the walks where the family scopes them apart, its pipeline's memory reused."""
+        makes), after the walks where the family scopes them apart, its pipeline's memory reused; with
+        `rewritten`, its streams' slots rewritten by its family's own role (`persist`'s `prepared`), whose
+        publish barriers `persist` scopes too."""
         consumers = tiles.warpgroups
         staging = tuple(family.output_staging(self.outputs, consumers))
-        persisted, addresses = family.persist_scratch(consumers)
+        rewrites = tuple(tiles.stages for _ in self.blocks) if rewritten else ()
+        persisted, addresses = family.persist_scratch(consumers, rewrites)
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
         streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
         held, walks = family.lifetimes(streams, steps)

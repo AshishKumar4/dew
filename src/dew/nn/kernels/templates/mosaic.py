@@ -2006,11 +2006,12 @@ class Transport[Allocated, Opened](abc.ABC):
         del consumers
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
-    def persist_scratch(self, consumers: int) -> tuple[tuple, int]:
+    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
         """What `persist` scopes in shared memory besides its outputs' staging, which a template's
-        allocations count (`resources.Scope`): its barriers, and its address words
+        allocations count (`resources.Scope`): its barriers (with `rewrites`, each rewritten ring's slots'
+        publish barriers, by its slot count: `persist`'s `prepared`), and its address words
         (`resources.Scope.addresses`); none where its accumulators live in registers."""
-        del consumers
+        del consumers, rewrites
         return (), 0
 
     def published(self) -> None:
