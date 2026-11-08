@@ -1430,8 +1430,7 @@ def test_a_process_that_lost_its_copy_of_a_key_of_another_implementation_recover
     """A key whose implementation is not the default (`rbg`, four words where threefry's has two) is
     recovered from a replica as every other leaf is: the process that lost it holds zeros in its own
     implementation's words, from a concrete key's template and from a shape's (`_zeros`), and receives
-    the holder's words, which draw what the key draws. With the default's two words its zeros did not
-    match the holders' four (the audit of 11-08)."""
+    the holder's words, which draw what the key draws."""
     for report in run_pool("replica_key", tmp_path / "pool", 2):
         assert report["zeros"] == [[4], [4]]
         for name in ("key", "shape"):
