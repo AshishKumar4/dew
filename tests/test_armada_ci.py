@@ -953,6 +953,46 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     assert stored == kept
 
 
+def test_cis_tools_run_inside_a_recalled_task_read_and_write_none_of_its_progress(tmp_path, monkeypatch,
+                                                                                    cache_worker):
+    """CI's tools these tests run inside an armada task that was itself recalled (its ARMADA_RESUME
+    naming a test its attempt passed, and its ARMADA_ARTIFACTS) set none of their tests aside by it and
+    write none of theirs into it: their task is their own (test_armada_reuse's kept entries read red on a
+    recalled attempt, its 303 planned rows resumed and none recorded)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    passed = json.dumps({"node": "tests/test_resumed.py::test_first", "seconds": 0.001}) + "\n"
+    (outer / "progress.jsonl").write_text(passed)
+    monkeypatch.setenv("ARMADA_RESUME", str(outer))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(outer))
+    ci = loaded(tmp_path, monkeypatch)
+    (tmp_path / "tests/test_resumed.py").write_text(
+        "from pathlib import Path\n"
+        "def test_first():\n"
+        "    with Path('ran').open('a') as ran: ran.write('first')\n")
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    [row] = armada_task(ci, monkeypatch, tmp_path / "verdict.json", policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "ran").read_text() == "first"
+    assert (outer / "progress.jsonl").read_text() == passed
+
+
+def test_a_tasks_progress_keeps_a_test_that_changed_the_environment_naming_its_artifacts(tmp_path):
+    """A task's progress is kept where its session started naming it (ARMADA_ARTIFACTS), whatever a test
+    changes as it runs: one that clears it, as `loaded` does for the CI tools it runs apart, is still the
+    task's progress."""
+    (tmp_path / "test_clearing.py").write_text(
+        "def test_clears(monkeypatch):\n    monkeypatch.delenv('ARMADA_ARTIFACTS')\n")
+    subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "progress",
+                    "test_clearing.py"], cwd=tmp_path, check=True, capture_output=True,
+                   env={**os.environ, "ARMADA_ARTIFACTS": str(tmp_path / "artifacts"),
+                        "PYTHONPATH": str(ROOT / "tools/armada")})
+    progress = (tmp_path / "artifacts" / "progress.jsonl").read_text().splitlines()
+    assert [json.loads(line)["node"] for line in progress] == ["test_clearing.py::test_clears"]
+
+
 def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci, tmp_path, monkeypatch,
                                                                              cache_worker):
     """A task keeps each test it passed in its artifacts as it ends (tools/armada/progress.py), and an attempt
