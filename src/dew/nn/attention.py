@@ -392,7 +392,9 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     may carry fewer heads. Without sinks they repeat to the query's, as flax
     repeats them, which keeps flax's rounding, but in jax.nn's form
     (`scale_logits`), whose query heads group over their key head as jax.nn's
-    do (`_grouped_as_jax_nn`); with sinks the query heads
+    do (`_grouped_as_jax_nn`) where the values share the keys' heads (a call
+    whose values carry the query's heads, as Z-Image's joint attention's, has
+    no group of jax.nn's to match); with sinks the query heads
     group over their key head and no key or value repeats, as the decode
     selector (`attention_kernels.decodes`) needs where it routes a sink
     layer here rather than to the fused decode kernel, which takes sinks on a
@@ -415,7 +417,8 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     dtype = query.dtype
     *rows, length, heads, width = query.shape
     kv_heads, keys = key.shape[-2], key.shape[-3]
-    if scale_logits and sinks is None and not dropout_rate and kv_heads != heads:
+    grouped = kv_heads != heads and value.shape[-2] == kv_heads
+    if scale_logits and sinks is None and not dropout_rate and grouped:
         attend = functools.partial(reference_attention, softcap=softcap, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax, wide_logits=wide_logits,
                                    scale_logits=True, mask_fill=mask_fill)
