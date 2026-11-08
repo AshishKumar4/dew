@@ -33,6 +33,8 @@ import numpy as np
 from arm_arithmetic import unrewritten
 from float64_terms import SUMS, _static, _target, evaluated_on, walked
 
+from dew.nn.precision import compensated_add
+
 EXACT = frozenset({
     "neg", "abs", "max", "min", "select_n", "reshape", "broadcast_in_dim", "transpose", "squeeze",
     "expand_dims", "slice", "dynamic_slice", "dynamic_update_slice", "concatenate", "pad", "gather",
@@ -236,6 +238,10 @@ def _weight(equation, name, params, operands, value):
         return ULPS[name] * magnitude
     if name == "integer_pow":
         return max(abs(int(params["y"])) - 1, 1) * magnitude
+    if name == "reduce" and params["computation"] is compensated_add:
+        # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair whose sum the
+        # reduction rounds once, its error a float32 rounding of its value and its square's terms.
+        return magnitude
     if name == "one_minus_square":
         # The square rounds by its magnitude, which the difference carries, and the difference by its own.
         return jnp.square(operands[0]) + magnitude
@@ -250,6 +256,11 @@ def _bound(equation, params, operands) -> list:
     """`equation`'s primitive applied to `operands`, widened past its program's dtypes, with `params`: a
     scatter's combining computation, traced for its program's dtype, built again for theirs (`SCATTERS`)."""
     name = equation.primitive.name
+    if name == "reduce":
+        # Its combining computation, traced for its program's dtypes, is called again on theirs.
+        count = len(operands) // 2
+        return list(jax.lax.reduce(tuple(operands[:count]), tuple(operands[count:]), params["computation"],
+                                   params["dimensions"]))
     if name in SCATTERS:
         operand, indices, updates = operands
         return [SCATTERS[name](operand, indices, updates, params["dimension_numbers"],
