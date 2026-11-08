@@ -25,7 +25,8 @@ class _Gathered(pygrain.MapDataset):
     step that drops inputs (a filter's, read as None) refuses to follow, read input by input. An endless
     order, which Grain's repeat states as `sys.maxsize` inputs, holds as many groups as that counts."""
 
-    def __init__(self, rows: pygrain.MapDataset, start: int, size: int, grouping: Grouping):
+    def __init__(self, rows: pygrain.MapDataset, start: int, size: int,
+                 grouping: Callable[[Sequence], Batch]):
         super().__init__(rows)
         self._rows, self._start, self._size, self._grouping = rows, start, size, grouping
         self._groups = -(-max(len(rows) - start, 0) // size)

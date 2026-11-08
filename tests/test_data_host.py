@@ -115,7 +115,9 @@ def test_automatic_loading_pays_a_step_that_makes_several_batches_at_once_in_the
 
     rows = grain.MapDataset.source([{"x": np.zeros(4, np.float32)}] * 64).map_with_index(_Filled())
     auto = Loading(workers="auto", host=Host(4, 2**40, worker_start=1.0))
-    assert auto.resolved(rows.to_iter_dataset(), reads=1, batches=1000).workers == 4
+    # Read in turn, as automatic loading reads its sample (`_Build.tuned`): no thread reading ahead.
+    sampled = rows.to_iter_dataset(grain.ReadOptions(num_threads=0, prefetch_buffer_size=0))
+    assert auto.resolved(sampled, reads=1, batches=1000).workers == 4
 
 
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
