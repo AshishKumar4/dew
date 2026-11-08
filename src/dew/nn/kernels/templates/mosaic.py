@@ -37,7 +37,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import across, persistent, product, report, resources
+from dew.nn.kernels.templates import across, bodies, persistent, product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -99,77 +99,30 @@ def output_staging(columns: int, dtypes) -> tuple[int, int]:
     return chunk, min(columns // chunk, OUTPUT_BUFFERS)
 
 
-def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
-    """A launch's interpreter: `interpret`'s own parameters where it gives them (a read past an operand
-    poisoned, `grouped_matmul.INTERPRETED`), the default where it is True, none where False."""
-    if isinstance(interpret, plgpu.InterpretGPUParams):
-        return interpret
-    return plgpu.InterpretGPUParams() if interpret else None
-
-
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
-           model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1) -> Callable:
+           model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
+           ahead: Callable | None = None, settled: tuple[int, ...] = (),
+           prefetched: Callable | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), its `cost`
-    the hardware's work and `model_flops` the model's share of it (`checked`)."""
+    the hardware's work and `model_flops` the model's share of it, and its `settled` operands those its
+    programs read `ahead` of their wait (`dependent`, `checked`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-    built = launches.kernel(dependent(entry, interpret), name=name or family, out_type=out_type, grid=grid,
+    launched = bodies.dependent(entry, interpret, ahead=ahead, settled=settled, scratch=len(scratch),
+                         prefetched=prefetched)
+    built = launches.kernel(launched, name=name or family, out_type=out_type, grid=grid,
                             grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
                             scratch_types=scratch,
                             compiler_params=compiler_params(approx_math=approx_math, resident=resident,
                                                             reduction_scratch=reduction_scratch),
-                            interpret=interpreted(interpret),
+                            interpret=bodies.interpreted(interpret),
                             kernel_name=report.named(name), cost_estimate=cost, **clustered)
-
-    return checked(built, name or family, resident, model_flops)
-
-
-def dependent(entry: Callable, interpret) -> Callable:
-    """`entry` as a dependent launch (programmatic dependent launch, PTX's `griddepcontrol`): it waits for the
-    launch before it in its stream to finish and its writes to land (`wait`) before any memory access of its
-    own, so it is ordered against any launch as without it, and once its own work is done it lets the next
-    such launch start (`launch_dependents`), whose launch and setup then overlap this one's last programs'
-    tails. Triggered at the work's end, not its start: a trigger at entry let a dependent's programs take the
-    multiprocessors this launch's later waves needed, each waiting there on this launch to finish (an H100
-    SXM's recurrence launches, wall time per call: Qwen3.5-27B's GDN forward and Nemotron-H 30B's SSD
-    training 1.0 and 1.1% above no dependent launch at entry, within 0.5% of it at the end, pdl-sxm at
-    b2b872c91; CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
-    (`mosaic_gpu.uses_pdl`) and the runtime launches it with programmatic stream serialization. Interpreted,
-    or on a GPU without grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on),
-    `entry` as it is. Its body traces knowing whether it runs interpreted (`interpreting`), as every family's
-    products read it."""
-    if interpreted(interpret):
-        def body(*refs):
-            token = _INTERPRETING.set(True)
-            try:
-                entry(*refs)
-            finally:
-                _INTERPRETING.reset(token)
-        return body
-    if not generation.gpu_target().architecture.dependent_launch:
-        return entry
-
-    def body(*refs):
-        plgpu.griddepcontrol_wait()
-        entry(*refs)
-        plgpu.griddepcontrol_launch_dependents()
-
-    return body
-
-
-_INTERPRETING: contextvars.ContextVar[bool] = contextvars.ContextVar("interpreting", default=False)
-"""Whether the launch whose body is tracing runs in Pallas's interpreter (`dependent`, which every launch's
-body passes through)."""
-
-
-def interpreting() -> bool:
-    """Whether the launch whose program is tracing runs in Pallas's interpreter: a family's products issue
-    no instruction the interpreter lacks there (mma.sync's sums, `mosaic_sm80.Mma.products`), whatever a
-    caller states (row 5209's A100 backward: products called with no interpret flag issued mma.sync's)."""
-    return _INTERPRETING.get()
+    # Its settled operands are checked where its programs read them before their wait (`waits`): a launch
+    # that does not wait is ordered after the one before it, whatever it reads first.
+    return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else ())
 
 
 _RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
@@ -177,17 +130,27 @@ _RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", defa
 raise their registers to that residency's share (`roles`)."""
 
 
-def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None) -> Callable:
+def _is_ref(operand) -> bool:
+    """Whether a launch's operand is a ref it adds into in place (`jax.new_ref`'s)."""
+    return isinstance(jax.typeof(operand), state_types.AbstractRef)
+
+
+def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None,
+            settled: tuple[int, ...] = ()) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
     residency (`_RESIDENT`) under the name `kernel`: a launch built once for every call of its facts checks
     each call's own; and
     refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
     `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's share of the work
     its cost states (the rest its own recomputation), where given, as its custom call's frontend attribute
-    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads."""
+    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads, and the operands it reads ahead of its
+    wait, `settled` (`bodies.SETTLED`), which the compile point checks."""
+    stated = {**({} if model_flops is None else {MODEL_FLOPS: str(model_flops)}),
+              **({bodies.SETTLED: ",".join(map(str, settled))} if settled else {})}
+
     def launch(*operands):
-        if model_flops is not None:
-            with set_xla_metadata(**{MODEL_FLOPS: str(model_flops)}):
+        if stated:
+            with set_xla_metadata(**stated):
                 return checked_launch(*operands)
         return checked_launch(*operands)
 
@@ -205,11 +168,6 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
             _RESIDENT.reset(token)
 
     return launch
-
-
-def _is_ref(operand) -> bool:
-    """Whether a launch's operand is a ref it adds into in place (`jax.new_ref`'s)."""
-    return isinstance(jax.typeof(operand), state_types.AbstractRef)
 
 
 def stacked_groups(shapes: Sequence[tuple[int, ...]]) -> tuple[tuple[int, ...], ...]:
@@ -1346,11 +1304,26 @@ class Issuer[Accumulator](abc.ABC):
     the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
     in tensor memory, read out in chunks), its two products run apart."""
 
-    def tensor_columns(self, columns: int, accumulators: int) -> int:
+    rewrites_in_persist: bool = False
+    """Whether its persistent walk rewrites a step's slots in a role of its own before the products read them
+    (`persist`'s `prepared`: a kernel gradient's neighbouring groups' rows zeroed, in `rewriting`'s
+    layouts), its consumers issuing no product a rewrite could precede."""
+
+    @property
+    def rewriting(self) -> "Issuer":
+        """The issuer whose layouts a rewrite of a step's slots reads their tiles in: its own."""
+        return self
+
+    sums_in_persist: bool = False
+    """Whether its persistent walk sums an exactly summed launch's steps a window at a time itself
+    (`persist`'s `summed`), each window's products in an accumulator of their own promoted into the running
+    sum by an IEEE add: a step then needs no consumer issuing its products (`summed_apart`)."""
+
+    def tensor_columns(self, columns: int, accumulators: int, summed: bool = False) -> int:
         """The tensor memory columns a program's `accumulators` fp32 accumulators of `columns` columns each
-        take (`generation.GpuTarget.tmem_columns` bounds them): none where its consumers hold them in
-        registers."""
-        del columns, accumulators
+        take (`generation.GpuTarget.tmem_columns` bounds them), exactly summed (`summed`, its windows'
+        partials beside the running sums) or not: none where its consumers hold them in registers."""
+        del columns, accumulators, summed
         return 0
 
     def column_registers(self, columns: int, dtype) -> int:
@@ -1782,7 +1755,9 @@ class Transport[Allocated, Opened](abc.ABC):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
-               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
+               ahead: Callable | None = None, settled: tuple[int, ...] = (),
+               prefetched: Callable | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
         compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
@@ -1794,7 +1769,9 @@ class Transport[Allocated, Opened](abc.ABC):
         `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
         reserving its share of reduction scratch (`warpgroup_reduction_scratch`); its first `scalars` operands
         tables of integers its programs read an element at a time (a grouped schedule's), which a GPU reads
-        from global memory and a TPU from its scalar memory."""
+        from global memory and a TPU from its scalar memory; its `settled` operands (indices) read `ahead`
+        of the program's wait for the launch before it, and its `prefetched` views prefetched into L2
+        before it, where given (`dependent`)."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -2008,11 +1985,12 @@ class Transport[Allocated, Opened](abc.ABC):
         del consumers
         return [plgpu.SMEM(shape, dtype) for shape, dtype in outputs]
 
-    def persist_scratch(self, consumers: int) -> tuple[tuple, int]:
+    def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
         """What `persist` scopes in shared memory besides its outputs' staging, which a template's
-        allocations count (`resources.Scope`): its barriers, and its address words
+        allocations count (`resources.Scope`): its barriers (with `rewrites`, each rewritten ring's slots'
+        publish barriers, by its slot count: `persist`'s `prepared`), and its address words
         (`resources.Scope.addresses`); none where its accumulators live in registers."""
-        del consumers
+        del consumers, rewrites
         return (), 0
 
     def published(self) -> None:
@@ -2231,7 +2209,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
-               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
+               ahead: Callable | None = None, settled: tuple[int, ...] = (),
+               prefetched: Callable | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
         if cluster > self.cluster:
@@ -2239,7 +2219,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
-                      model_flops=model_flops, resident=resident,
+                      model_flops=model_flops, resident=resident, ahead=ahead, settled=settled,
+                      prefetched=prefetched,
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=(self.reduction_scratch

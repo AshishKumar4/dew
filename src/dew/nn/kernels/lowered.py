@@ -268,6 +268,72 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
     return KernelCall(kind, target, b"", "", None)
 
 
+class Unsettled(ValueError):
+    """A program whose launch reads an operand ahead of its wait (`bodies.dependent`'s `settled`) that is not
+    an input of the program no operation of it produces: the launch before it may still be writing it."""
+
+
+def unsettled(lowered: jax.stages.Lowered) -> list[str]:
+    """Each operand a launch of `lowered` reads ahead of its wait (`bodies.SETTLED`) that the program
+    produces, or that reaches the launch through an operation this walk does not see through, by the
+    launch's target and the operand's index. An operand is settled where it is the entry's argument, passed
+    through calls (each call of a function), through a loop that hands it back unchanged each trip, and
+    through a per-shard region (`sdy.manual_computation`), whose block arguments are its operands."""
+    from dew.nn.kernels.templates.bodies import SETTLED
+
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None, "a lowered program always has its StableHLO module"
+    found: list[str] = []
+    with module.context:
+        functions = {ir.StringAttr(op.attributes["sym_name"]).value: op.operation
+                     for op in module.body.operations if op.operation.name == "func.func"}
+        calls: dict[str, list[ir.Operation]] = {name: [] for name in functions}
+        launches: list[tuple[ir.Operation, tuple[int, ...]]] = []
+
+        def visit(operation: ir.Operation) -> None:
+            if operation.name == "func.call":
+                calls.setdefault(ir.FlatSymbolRefAttr(operation.attributes["callee"]).value, []).append(
+                    operation)
+            attributes = operation.attributes
+            if operation.name == "stablehlo.custom_call" and "mhlo.frontend_attributes" in attributes:
+                frontend = ir.DictAttr(attributes["mhlo.frontend_attributes"])
+                if SETTLED in frontend:
+                    launches.append((operation, tuple(
+                        int(index) for index in ir.StringAttr(frontend[SETTLED]).value.split(","))))
+            for region in operation.regions:
+                for block in region.blocks:
+                    for inner in block.operations:
+                        visit(inner.operation)
+
+        for function in functions.values():
+            visit(function)
+
+        def settled(value: ir.Value) -> bool:
+            if not isinstance(value, ir.BlockArgument):
+                return False
+            argument = value
+            holder = argument.owner.owner.operation
+            if holder.name == "func.func":
+                name = ir.StringAttr(holder.attributes["sym_name"]).value
+                if name == "main":
+                    return True
+                return bool(calls.get(name)) and all(settled(call.operands[argument.arg_number])
+                                                     for call in calls[name])
+            if holder.name == "sdy.manual_computation":
+                return settled(holder.operands[argument.arg_number])
+            if holder.name == "stablehlo.while":
+                body = holder.regions[1].blocks[0]
+                handed = list(body.operations)[-1].operands[argument.arg_number]
+                return handed == body.arguments[argument.arg_number] and settled(
+                    holder.operands[argument.arg_number])
+            return False
+
+        for launch, indices in launches:
+            target = ir.StringAttr(launch.attributes["call_target_name"]).value
+            found += [f"{target} operand {index}" for index in indices if not settled(launch.operands[index])]
+    return found
+
+
 def _model_flops(attributes) -> float | None:
     """The model's FLOPs a call's frontend attributes declare (`instrumentation.MODEL_FLOPS`), None where
     they declare none."""

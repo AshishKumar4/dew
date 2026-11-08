@@ -636,8 +636,9 @@ def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs):
     """A one-row dense product's tile (an M=1 decode dot over a 2048 x 2048 matrix, row 483) lowers for CUDA
-    on the CPU on each family, the matrix stored either way: the derived tile, and the swapped tile with its
-    depth split in two wherever the family takes one."""
+    on the CPU on each family, the matrix stored either way: the derived tile, the swapped tile with its
+    depth split in two wherever the family takes one, and the plain tile, whose dependent launch on a
+    Hopper prefetches its matrix's first stages before its wait (`mosaic_gpu._prefetched`, row 3601)."""
     rows, depth, width = 1, 2048, 2048
     launch = grouped_matmul.MosaicGmm()
     matrix = (1, width, depth) if transpose_rhs else (1, depth, width)
@@ -652,7 +653,8 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
         # The derived tile, and the swapped one split in two where the family takes it, whichever the
         # derivation picks (row 4491).
         pinned = dataclasses.replace(tile, swapped=True, splits=2)
-        for config in {tile, *((pinned,) if launch.legal(bound, pinned, target) else ())}:
+        plain = dataclasses.replace(tile, swapped=False, splits=1, raster=0)
+        for config in {tile, *(each for each in (pinned, plain) if launch.legal(bound, each, target))}:
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
 
