@@ -868,8 +868,11 @@ def _as_stored(model: PreTrainedModel, tensors: Mapping[str, np.ndarray]) -> dic
 def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
                     record: decoder_parts.DecoderFields, variables: Variables, label: str) -> int:
     """Dew's float32 gradient of every parameter on par with the source's from its float64 twin's
-    (`_judged`), each parameter its own leaf, so a wrong gradient of a small one is not hidden by
-    another's rounding, over the probe's draws of ids and cotangents. The source's eval-mode gradients,
+    (`_judged`), over the probe's draws of ids and cotangents, every parameter's gradient laid end to end
+    as one leaf: a backward the forward does not show moves some parameter's gradient by a share of its
+    value, which no other's rounding hides, where a parameter's own leaf holds too few values a draw for
+    check 1 to size (a learned activation's scalars, an embedding's rows a few tokens touch, a norm's
+    scale). The source's eval-mode gradients,
     its float32 ones and its twin's, are stored as `save_pretrained` stores its weights (`_as_stored`) and
     read into Dew's tree as they are (`translate_weights`; a gradient rearranges as its parameter does)."""
     model = models.build('causal_transformer', {**record, 'dtype': 'float32', 'attention_impl': 'reference'})
@@ -900,7 +903,8 @@ def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
                     flax_traverse.flatten_dict(compiled(held['params'], ids, cotangent)).items()}
         if set(ours) != set(reference):
             raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(reference))[:4]} apart")
-        return ours, reference, truth
+        return tuple(np.concatenate([tree[path].ravel() for path in sorted(ours)])
+                     for tree in (ours, reference, truth))
 
     return _judged(draw, label)
 
