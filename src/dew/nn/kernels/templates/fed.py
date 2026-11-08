@@ -8,7 +8,8 @@ import jax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import resources
-from dew.nn.kernels.templates.mosaic import Ring, RingFamily, Role, Schedule
+from dew.nn.kernels.templates.handoffs import Role, Schedule
+from dew.nn.kernels.templates.mosaic import Ring, RingFamily
 
 
 @dataclasses.dataclass(frozen=True)
