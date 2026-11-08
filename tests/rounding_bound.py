@@ -257,7 +257,13 @@ def _weight(equation, name, params, operands, value):
         # times the row's range, which moves the exponential by as much relative, beside the
         # exponential's ulps and two roundings of the result's magnitude.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
-        spread = jnp.max(operands[0], params["dimensions"]) - jnp.min(operands[0], params["dimensions"])
+        # A masked column (-inf, `chunked._without`) holds no mass and rescales nothing: the range is the
+        # finite logits', none where the row holds no finite one.
+        logits = operands[0]
+        finite = jnp.isfinite(logits)
+        highest = jnp.max(jnp.where(finite, logits, -jnp.inf), params["dimensions"])
+        lowest = jnp.min(jnp.where(finite, logits, jnp.inf), params["dimensions"])
+        spread = jnp.where(jnp.any(finite, params["dimensions"]), highest - lowest, 0.0)
         return max(terms - 1, 1) * (2 + ULPS["exp"] + spread) * magnitude
     if name == "one_minus_square":
         # The square rounds by its magnitude, which the difference carries, and the difference by its own.
