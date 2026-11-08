@@ -56,37 +56,19 @@ def test_a_pairwise_product_takes_every_dot_generals_axes_and_bounds_its_partial
         np.testing.assert_array_equal(np.asarray(pairwise._blocked(a, b, None)), np.asarray(whole))
 
 
-def test_a_product_sums_blocked_where_its_rows_are_few_and_in_float64_where_many():
-    """`_summed`'s choice by the bytes each sum moves: a decode row and a short batch blocked and pairwise
-    (`_blocked`'s partial sums the fewer bytes), a batch past about one and a half blocks in float64
-    (`precision.float64_sum`: the operands converted the fewer); at 128 deep (two-product blocks with
-    AVX-512's lanes) one row blocked and four in float64. Each is bitwise the arm it chose; a declared
-    algorithm narrowing the operands (fp16's) the blocked sum's at any rows."""
+def test_a_rows_product_is_its_own_whatever_rows_share_its_call():
+    """`_summed` sums every row alike, blocked and pairwise (`_blocked`), so a row's product is the same bits
+    alone as among 255 others, as a decode step's row is its prefill's and a packed document's its own
+    row's; and the matrix's gradient over a call's rows the same bits split into two calls' shares as
+    whole, at 1024 deep."""
     rng = np.random.default_rng(4863)
-
-    def chosen(rows, depth, columns):
-        a = jnp.asarray(rng.standard_normal((1, rows, depth)), jnp.float32)
-        b = jnp.asarray(rng.standard_normal((1, depth, columns)), jnp.float32)
-        got = np.asarray(pairwise._summed(a, b, None))
-        if np.array_equal(got, np.asarray(pairwise._blocked(a, b, None))):
-            return "blocked"
-        np.testing.assert_array_equal(got, np.asarray(precision.float64_sum(
-            functools.partial(jax.lax.dot_general, dimension_numbers=(((2,), (1,)), ((0,), (0,)))), a, b,
-            dtype=jnp.float32)))
-        return "float64"
-
-    block = pairwise.contraction_block(4096)
-    columns = max(512, 4 * block)
-    assert chosen(1, 4096, columns) == chosen(block, 4096, columns) == "blocked"
-    assert chosen(4 * block, 4096, columns) == "float64"
-    if pairwise.contraction_block(128) == 2:
-        assert (chosen(1, 128, 128), chosen(4, 128, 128)) == ("blocked", "float64")
-    # A declared algorithm narrowing the operands keeps them narrowed: the blocks', whatever the rows.
-    a = jnp.full((1, 256, 128), 1.0001, jnp.float32)
-    b = jnp.ones((1, 128, 96), jnp.float32)
-    narrowed = np.asarray(pairwise._summed(a, b, jax.lax.DotAlgorithmPreset.F16_F16_F16))
-    np.testing.assert_array_equal(narrowed, np.asarray(pairwise._blocked(
-        a, b, jax.lax.DotAlgorithmPreset.F16_F16_F16)))
+    a = jnp.asarray(rng.standard_normal((1, 256, 1024)), jnp.float32)
+    b = jnp.asarray(rng.standard_normal((1, 1024, 512)), jnp.float32)
+    whole = np.asarray(pairwise._summed(a, b, None))
+    for row in (0, 7, 255):
+        np.testing.assert_array_equal(np.asarray(pairwise._summed(a[:, row:row + 1], b, None)),
+                                      whole[:, row:row + 1])
+    np.testing.assert_array_equal(np.asarray(pairwise._summed(a[:, :100], b, None)), whole[:, :100])
 
 
 def test_a_layers_projection_alone_sums_as_a_vectorized_dot():
@@ -168,3 +150,30 @@ def vectorized(a: jax.Array, b: jax.Array) -> jax.Array:
         if carried is not None:
             sums = jnp.concatenate([sums, carried])
     return sums[0]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share():
+    """A projection's pairwise product (`pairwise_dot_general`) on a mesh whose Explicit data axis splits its
+    rows over two devices: its value and both gradients, the matrix's contracting the split rows a device's
+    share at a time (`_summed`), each the dot's own where every sum is exact (small integers) and placed as
+    XLA's product and gradients place them, each share summed in two-row blocks."""
+    rng = np.random.default_rng(4863)
+    rows, matrix = (jnp.asarray(rng.integers(-3, 4, size=shape), jnp.float32)
+                    for shape in ((12, 4), (4, 3)))
+    product = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=(((1,), (0,)), ((), ())))
+
+    def gradients(product, rows, matrix):
+        value, pull = jax.vjp(product, rows, matrix)
+        return value, *pull(jnp.round(4 * jnp.cos(value)))
+
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with pytest.MonkeyPatch.context() as patched, jax.set_mesh(mesh):
+        # Two-row blocks: a device's six rows its matrix's gradient sums as three blocks.
+        patched.setattr(pairwise, "contraction_block", lambda depth, lanes=None: min(depth, 2))
+        split = jax.device_put(rows, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+        summed = jax.jit(functools.partial(gradients, product))(split, matrix)
+        plain = jax.jit(functools.partial(gradients, jnp.matmul))(split, matrix)
+    for got, want in zip(summed, plain, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
