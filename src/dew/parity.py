@@ -1420,11 +1420,18 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
             return count
         count *= 2
     if count > most:
-        raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within "
-                             f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared "
-                             f"factors")
-    raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within the "
-                         f"{len(errors)} seeds recorded, {len(errors) // 4} a half of each block")
+        raise _unresolved(label, count / most, f"{label}: the reference compared with itself does not "
+                          f"resolve {PARITY} within {most} seeds at {wide[:4]}; give the site larger inputs "
+                          f"or fewer shared factors")
+    raise _unresolved(label, 4 * count / max(len(errors), 1), f"{label}: the reference compared with "
+                      f"itself does not resolve {PARITY} within the {len(errors)} seeds recorded, "
+                      f"{len(errors) // 4} a half of each block")
+
+
+def _unresolved(label: str, measure: float, message: str) -> Inconclusive:
+    """A sizing that resolves no count it may declare, as Inconclusive: its seeds leave the site undecided,
+    `measure` the count it reached over the most it may take."""
+    return Inconclusive([Finding(label, "inconclusive", measure, message)])
 
 
 def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool) -> int:
@@ -1465,5 +1472,5 @@ def _sized_count(drawn, label: str, *, start: int, most: int, paired: bool) -> i
                 return count
             count *= 2
     compared = "Dew paired with the reference" if paired else "the reference compared with itself"
-    raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
-                         f"give the site larger inputs or fewer shared factors")
+    raise _unresolved(label, count / most, f"{label}: {compared} does not resolve {PARITY} within {most} "
+                      f"seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
