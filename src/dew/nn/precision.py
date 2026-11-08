@@ -496,15 +496,15 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
 
 
 def accumulated(product: Callable[..., jax.Array], *operands,
-                preferred_element_type: DTypeLike | None = None, chained: bool = False) -> jax.Array:
+                preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
     einsum, a matmul): where a CPU runs one of JAX's contractions (`CONTRACTIONS`) of float32 operands,
     each of its float32 products summed as a vectorized dot sums it (`_summed_pairwise`: a layer's
-    projection's sum, `projection_product`, row 4863), XLA's one FMA chain a sum the mixers' contractions
-    took too (a Mamba layer's chunk einsums: Jamba's and Falcon-H1's logits and gradients apart from
-    their sources'); `chained`, XLA's chain kept, as the algebra's derived products keep it
-    (`dew.algebra.forms.evaluator`: attention's dP and D, whose sums cancel bit for bit on a one-key row
-    only where both sum alike). Elsewhere the plain product, but in a process running wide CPU arithmetic
+    projection's sum, `projection_product`, row 4863), the algebra's derived products and a mixer's
+    alike: sums that cancel each other (attention's dP and D on a one-key row) cancel bit for bit only
+    where both sum in one order, and XLA's one FMA chain left a Mamba layer's chunk einsums apart from
+    their sources' (Jamba's and Falcon-H1's logits and gradients). Elsewhere the plain product, but in a
+    process running wide CPU arithmetic
     (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32 (`products_dtype`) a CPU
     sums the products in float64 and rounds the sum once to the dtype the product returns.
     Each fp32 product is exact in float64, so the result is within half an fp32 ulp of the float64
@@ -532,7 +532,7 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if not _sums_in_float64(*operands):
-        if (not chained and (key := _contraction(product, preferred_element_type)) is not None
+        if ((key := _contraction(product, preferred_element_type)) is not None
                 and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
                 and products_dtype(*operands) == jnp.dtype(jnp.float32)):
             return _traced_once(key, _summed_pairwise)(*operands)
@@ -551,7 +551,7 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
     sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
     product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
-    takes it too (`_paired`), but the algebra's derived products (`accumulated`'s `chained`)."""
+    takes it too (`_paired`)."""
     from dew.nn import pairwise
 
     if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
@@ -748,18 +748,16 @@ def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
 
 
 def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
-                        preferred_element_type: DTypeLike | None = None, *, chained: bool = False,
-                        **kwargs) -> jax.Array:
+                        preferred_element_type: DTypeLike | None = None, **kwargs) -> jax.Array:
     """`jax.lax.dot_general` at `precision`, accumulated as Dew accumulates a CPU's float32 products
-    (`accumulated`, its sum XLA's chain where `chained`): the product a flax layer forms
-    (`nn.Dense(dot_general=...)`). Unstated, JAX's configured precision decides
-    (`jax_default_matmul_precision`), as it does a flax layer's. At the `BF16_BF16_F32` algorithm it is
-    `bf16_dot_general`'s product."""
+    (`accumulated`): the product a flax layer forms (`nn.Dense(dot_general=...)`). Unstated, JAX's
+    configured precision decides (`jax_default_matmul_precision`), as it does a flax layer's. At the
+    `BF16_BF16_F32` algorithm it is `bf16_dot_general`'s product."""
     if _bf16_algorithm(precision):
         return _held(bf16_dot_general(lhs, rhs, dimension_numbers), preferred_element_type, lhs, rhs)
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers,
                                          precision=precision, **kwargs),
-                       lhs, rhs, preferred_element_type=preferred_element_type, chained=chained)
+                       lhs, rhs, preferred_element_type=preferred_element_type)
 
 
 def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike = None,
