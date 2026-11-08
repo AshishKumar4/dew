@@ -20,8 +20,9 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms, kept
 from flax import linen as nn
+from float64_terms import float64_terms
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients
 from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
@@ -155,15 +156,18 @@ SINK_HEADS = (32, 8)
 @pytest.mark.parametrize("name", CASES)
 def test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward(name, dtype):
     """The route's output and its gradients of the query, key, value and sinks, on par with the reference
-    path (`implementation='reference'`) measured from float64 over the site's draws (check 1); a case with
-    sinks at `SINK_HEADS` over its own seeds (`SINK_SITES`)."""
+    path (`implementation='reference'`) measured from float64 over the site's draws (check 1), each entry
+    sized by its float64 terms over the keys the case keeps (`_terms`): a query that keeps one key has a dQ
+    of zero in float64, which the fast form's D, formed from the rounded output, leaves a rounding off (the
+    default form claims exact zeros only of a row of no keys, docs/design/testing.md); a case with sinks at
+    `SINK_HEADS` over its own seeds (`SINK_SITES`)."""
     case = CASES[name]
     queries, keys = geometry(case)
     heads, kv_heads = SINK_HEADS if name in SINK_SITES else (HEADS, KV_HEADS)
     seeds = SINK_SITES[name][jnp.dtype(dtype).name] if name in SINK_SITES else SEEDS
     draw = drawing(queries, keys, dtype, sinks=bool(case.get("sinks")), heads=heads, kv_heads=kv_heads)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
-                    f"template route {case} {jnp.dtype(dtype).name}", seeds=seeds)
+                    f"template route {case} {jnp.dtype(dtype).name}", seeds=seeds, terms=_terms(case))
 
 
 MESH_CASES = {
@@ -723,20 +727,24 @@ def an_fp16_call_on_an_h100_is_on_par(case):
     template_pass = jax.jit(pulled("template", CASES[case]))
     assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
                     f"fp16 Mosaic forward and backward, {case}", seeds=SEEDS,
-                    terms=False if CASES[case].get("sinks") else _terms(CASES[case], queries, keys))
+                    terms=False if CASES[case].get("sinks") else _terms(CASES[case]))
 
 
-def _terms(case: dict, queries: int, keys: int):
-    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps, a
-    function of a draw `(query, key, value, sinks, dout)`."""
-    names = keywords(case)
-    keep = kept(queries, keys, causal=case.get("causal", False), sliding_window=case.get("sliding_window"),
-                segment_ids=names.get("segment_ids"))
+def _terms(case: dict):
+    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps (its
+    spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw `(query, key, value,
+    sinks, dout)`; the sinks' gradient, where the case has sinks, its float64 truth's own terms
+    (`float64_terms` of the reference path), as `attention_on_par` sizes it."""
+    keep = case_keep(case)[:, None]
 
     def terms(query, key, value, sinks, dout):
-        del sinks
-        # The sinks' gradient, which a call without sinks holds as None.
-        return (*attention_terms(query, key, value, dout, keep), None)
+        found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))[:4]
+        if sinks is None:
+            # The sinks' gradient, which a call without sinks holds as None.
+            return (*found, None)
+        with jax.enable_x64(new_val=True):
+            truth = float64_terms(pulled("reference", case), *widened((query, key, value, sinks, dout)))[1]
+        return (*found, truth[4])
 
     return terms
 
@@ -751,7 +759,45 @@ def a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     case = {"causal": True}
     draw = drawing(length, length, dtype, sinks=False, heads=2, kv_heads=1, rows=1)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
-                    f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS)
+                    f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS,
+                    truth_fn=_causal_truth(length))
+
+
+TRUTH_ROWS = 1024
+"""The queries a long call's float64 truth attends a block at a time (`_causal_truth`)."""
+
+
+def _causal_truth(length: int):
+    """The float64 truth of a causal call of `length` tokens (check 1's `truth_fn`): the reference path's
+    attention of `TRUTH_ROWS` queries at a time over every key, masked as causal, each block's output and
+    query gradient its own and the keys' and values' gradients the blocks' sum. The whole call's truth held
+    `length` squared logits a head in float64, 3 GiB at 8192, more than a GPU tier job's pool of an A100
+    (2.69 GiB, MAINGPU-a9e29b08f); a block's are an eighth of them."""
+    keys = jnp.arange(length)
+
+    def truth(query, key, value, sinks, dout):
+        del sinks
+
+        def block(first):
+            seen = (first + jnp.arange(TRUTH_ROWS))[:, None] >= keys[None, :]
+
+            def call(query, key, value):
+                return scaled_dot_product_attention(query, key, value, implementation="reference",
+                                                    mask=seen[None, None])
+
+            row_query, row_dout = (jax.lax.dynamic_slice_in_dim(array, first, TRUTH_ROWS, axis=1)
+                                   for array in (query, dout))
+            out, pull = jax.vjp(call, row_query, key, value)
+            return (out, *pull(row_dout))
+
+        out, d_query, d_key, d_value = jax.lax.map(block, jnp.arange(0, length, TRUTH_ROWS))
+
+        def whole(blocks):
+            return jnp.moveaxis(blocks, 0, 1).reshape(query.shape)
+
+        return whole(out), whole(d_query), d_key.sum(0), d_value.sum(0), None
+
+    return truth
 
 
 def test_the_accurate_form_is_one_option_away():

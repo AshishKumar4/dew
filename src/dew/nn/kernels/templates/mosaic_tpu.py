@@ -275,9 +275,12 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None) -> dict:
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()) -> dict:
         # Each stream's ring of `STAGES` slots, whatever the stages asked: a DMA a step ahead hides a step's.
         del stages, swizzles
+        if gathered:
+            raise NotImplementedError("a TPU core's DMAs gather no rows (`gathers_rows`)")
         _one(consumers, clustered=bool(multicast))
         if any(count > 1 for count in (copies or {}).values()):
             raise ValueError("a TPU ring loads a step's block in one copy, not in pieces")
