@@ -239,9 +239,14 @@ def _weight(equation, name, params, operands, value):
     if name == "integer_pow":
         return max(abs(int(params["y"])) - 1, 1) * magnitude
     if name == "reduce" and params["computation"] is compensated_add:
-        # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair whose sum the
-        # reduction rounds once, its error a float32 rounding of its value and its square's terms.
-        return magnitude
+        # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
+        # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u.
+        terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
+        u = _unit(name, params, equation.outvars[0].aval.dtype)
+        gamma = (terms - 1) * u / (1 - (terms - 1) * u)
+        pair = operands[:len(operands) // 2]
+        spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
+        return magnitude + gamma * gamma / u * spread
     if name == "one_minus_square":
         # The square rounds by its magnitude, which the difference carries, and the difference by its own.
         return jnp.square(operands[0]) + magnitude
