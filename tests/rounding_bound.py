@@ -249,12 +249,14 @@ def _weight(equation, name, params, operands, value):
         total = jnp.abs(sum(jnp.sum(operand, params["dimensions"]) for operand in pair))
         spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
         return total + gamma * gamma / u * spread
-    if name == "reduce" and equation.outvars[0].aval.dtype == jnp.float64:
-        # A reduction Dew's wide CPU arithmetic runs in float64 (`dew.nn.precision.widened_reduction`: the
-        # chunked head's logsumexp): each combine an elementary function and a sum at most, each rounding
-        # at float64's u, a negligible share of a float32 program's.
+    if name == "reduce":
+        # Dew's other float reductions are the chunked head's running logsumexp
+        # (`dew.objectives.lm.chunked`), in float64 under its wide CPU arithmetic
+        # (`dew.nn.precision.widened_reduction`) and in float32 elsewhere: each combine an exponential,
+        # a product and a sum of its running terms, so each term rounds at most an elementary function's
+        # ulps and two more of the result's magnitude.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
-        return max(terms - 1, 1) * (1 + max(ULPS.values())) * magnitude
+        return max(terms - 1, 1) * (2 + ULPS["exp"]) * magnitude
     if name == "one_minus_square":
         # The square rounds by its magnitude, which the difference carries, and the difference by its own.
         return jnp.square(operands[0]) + magnitude
