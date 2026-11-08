@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, mosaic
+from dew.nn.kernels.templates import across, handoffs, mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -79,7 +79,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     plgpu.copy_smem_to_gmem(out_smem.at[wg], mine)
                 plgpu.wait_smem_to_gmem(0)
 
-            mosaic.Schedule((mosaic.Role("consumer", consumers), mosaic.Role("producer", weight=0))).run(
+            roles = (handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0))
+            handoffs.Schedule(roles).run(
                 consumer=consumer, producer=producer)
 
     return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, *BLOCK), jnp.float32), grid=(1,),
@@ -304,16 +305,17 @@ def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
     beside a warp role is refused, the last warpgroup holding one or the other."""
     from dew.nn.kernels.templates import mosaic_sm100
 
-    schedule = mosaic.Schedule(
-        (mosaic.Role("softmax", count=2), mosaic.Role("epilogue", count=2), *mosaic_sm100.ISSUING),
-        (mosaic.HandOff("scales", mosaic_sm100.Signals(count=2, tensor_core=False), "softmax"),
-         mosaic.HandOff("output", mosaic_sm100.Accumulators(2, 128, 64), "mma", ("epilogue",))))
+    schedule = handoffs.Schedule(
+        (handoffs.Role("softmax", count=2), handoffs.Role("epilogue", count=2), *mosaic_sm100.ISSUING),
+        (handoffs.HandOff("scales", mosaic_sm100.Signals(count=2, tensor_core=False), "softmax"),
+         handoffs.HandOff("output", mosaic_sm100.Accumulators(2, 128, 64), "mma", ("epilogue",))))
     scales, (_, done, read) = schedule.scratch(generation.gpu_target("sm100"))
     assert scales.num_arrivals == 2
     assert (done.num_arrivals, read.num_arrivals) == (1, 2)
     assert schedule.warpgroups() == 5
     with pytest.raises(ValueError, match="last warpgroup"):
-        mosaic.Schedule((mosaic.Role("consumer"), mosaic.Role("producer", weight=0), *mosaic_sm100.ISSUING))
+        handoffs.Schedule((handoffs.Role("consumer"), handoffs.Role("producer", weight=0),
+                           *mosaic_sm100.ISSUING))
 
 
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
@@ -711,7 +713,7 @@ def _relayed_products(q, k, v, *, interpret):
                 family.products(o, p, v_smem)
                 summed.committed(first)
 
-            mosaic.Schedule((mosaic.Role("relay"), *mosaic_sm100.ISSUING)).run(relay=relay, load=load,
+            handoffs.Schedule((handoffs.Role("relay"), *mosaic_sm100.ISSUING)).run(relay=relay, load=load,
                                                                                 mma=products)
 
         smem = [plgpu.SMEM(each.shape, each.dtype, transforms=mosaic.swizzle_transforms(each.dtype, 128))

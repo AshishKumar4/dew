@@ -22,7 +22,7 @@ from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import bodies, mosaic, persistent, product, report, resources
+from dew.nn.kernels.templates import bodies, handoffs, mosaic, persistent, product, report, resources
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -586,9 +586,9 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
 
-    def roles(self, consumers: int) -> mosaic.Schedule:
+    def roles(self, consumers: int) -> handoffs.Schedule:
         _one(consumers)
-        return mosaic.Schedule((mosaic.Role("consumer"),), axis=None)
+        return handoffs.Schedule((handoffs.Role("consumer"),), axis=None)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
