@@ -35,16 +35,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers.models.deepseek_v3.configuration_deepseek_v3 import (
-    DeepseekV3Config,
-)
+from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3Attention,
     DeepseekV3RotaryEmbedding,
 )
-from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
-    DeepseekV32Config,
-)
+from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
 from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32RotaryEmbedding as rotary32,

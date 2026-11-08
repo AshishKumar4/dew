@@ -9,7 +9,7 @@ the stride-two downsample pads. Every parameter is moved off its
 initialization, the group norms' unit scales and zero shifts included (and
 rounded to bfloat16-representable values, so the fixture compresses). The
 tool records those weights; the test runs Diffusers' encoder on them,
-in float32 and in its float64 twin (`torch_precision.widened`), over the
+in float32 and in its float64 twin (`_dew_torch.precision.widened`), over the
 images and probes it draws, through `walk`.
 
 Run with the Dew test environment's torch and diffusers, on CPU:

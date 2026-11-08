@@ -2,7 +2,7 @@
 
 Each walk is recorded in float32, the reference, and in float64 (`.fp64`), the truth: the
 schedulers' walks with their modules' float32 read as float64
-(`diffusers_wan_reference.float64_scheduler`), the UNet widened (`torch_precision.float64`).
+(`diffusers_wan_reference.float64_scheduler`), the UNet widened (`_dew_torch.precision.float64`).
 
 Run in the isolated reference environment on CPU:
   python tools/native_diffusion_edges_reference.py generate OUTPUT
@@ -27,7 +27,9 @@ from diffusers import (
 )
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import require
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64, float64_twin
 
 
 def check_versions():

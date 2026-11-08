@@ -77,7 +77,7 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
     import torch
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     record = json.loads((source / "flux_transformer.json").read_text())
     case = record["cases"][name]
@@ -188,7 +188,7 @@ def pipelines(source):
     import torch
     from diffusers import FluxPipeline
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     def read(dtype):
         return FluxPipeline.from_pretrained(source / "pipeline", torch_dtype=dtype, local_files_only=True)

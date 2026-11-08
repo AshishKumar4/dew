@@ -16,18 +16,22 @@ IN holds each draw's router, `<draw>.config.<argument>` each a 0-d array of `gro
 arguments, `sigmoid` whether it scores by the sigmoid (else the softmax) and `bias` whether it takes the
 balancing bias, its `logits` `[tokens, experts]` and its `bias`
 `[experts]`. OUT gets `<draw>.reference.weights` and `<draw>.truth.weights` in float32 and float64 (the
-float64 run under `torch_precision.widened`, which widens the function's float32 return cast): each token's
+float64 run under `_dew_torch.precision.widened`, which widens the function's float32 return cast): each
+token's
 weight of every expert, its chosen experts' weights scattered by their ids, zero elsewhere.
 """
 
 import contextlib
 import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import github, ran, selected
 from reference_worker import drawn, serve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO, COMMIT = "vllm-project/vllm", "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 PATH = "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"
@@ -47,7 +51,7 @@ def grouped_topk():
 
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's weights of every expert, in float32 and float64."""
-    from torch_precision import widened
+    from _dew_torch.precision import widened
 
     route = grouped_topk()
     def arm(inputs, dtype):

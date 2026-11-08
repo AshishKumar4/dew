@@ -33,6 +33,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import sys
 import types
 from pathlib import Path
 
@@ -41,7 +42,9 @@ import numpy as np
 import torch
 from recorded_draws import Tape
 from reference_source import fetched, ran, selected
-from torch_precision import replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import replaced
 
 COMMIT = "c112c526d193436838c98d81455ee51f90309470"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mdlm" / "loss.npz"

@@ -14,7 +14,8 @@ each case's `<case>.<input>`: the prompts as letter codes (`prompt`, `negative`,
 `prompt_2`, `negative_2`), the `noise` channels last, the `pixels` an image task starts from, and the
 safety checker's `checker_raw` images and `checker_input` tower input. OUT gets `<case>.reference.<leaf>`
 and `<case>.truth.<leaf>`, the call in float32 and in float64 (the generators' float64 runs: a Flax
-pipeline's modules read float32 as float64, a PyTorch pipeline built and run in `torch_precision.float64`),
+pipeline's modules read float32 as float64, a PyTorch pipeline built and run in
+`_dew_torch.precision.float64`),
 every noise the call draws the drawn one:
 
 - `hidden`, `pooled`: the prompt's encoder states and SDXL's pooled embedding;
@@ -42,6 +43,8 @@ from unittest.mock import patch
 
 import numpy as np
 from reference_worker import drawn, serve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers.tar.xz"
 FLAX = ("sd", "xl", "img2img", "inpaint")
@@ -191,13 +194,14 @@ def flax_call(task: str, case: dict[str, np.ndarray], wide: bool, wanted) -> dic
 
 @contextlib.contextmanager
 def torch_drawing(noise, wide: bool):
-    """A PyTorch pipeline's calls at float32, or at float64 (built and run in `torch_precision.float64`,
+    """A PyTorch pipeline's calls at float32, or at float64 (built and run in `_dew_torch.precision.float64`,
     DDIM's tables its module's own widened, the image processor's NumPy too), every noise its call draws
     the case's drawn `noise`."""
     import flax_precision
     import torch
     from diffusers_wan_reference import float64_scheduler
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     def drawn(shape, generator=None, device=None, dtype=None, layout=None):
         if tuple(shape) != noise.shape:
@@ -229,7 +233,8 @@ def torch_pipeline(task: str, wide: bool):
         StableDiffusionXLImg2ImgPipeline,
         StableDiffusionXLInpaintPipeline,
     )
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     cls = {"xl-inpaint": StableDiffusionXLInpaintPipeline,
            "safety": StableDiffusionPipeline}.get(task, StableDiffusionXLImg2ImgPipeline)

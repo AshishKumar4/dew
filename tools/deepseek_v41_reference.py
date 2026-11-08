@@ -83,6 +83,8 @@ import numpy as np
 import torch
 from reference_source import loaded, record_padding, saved_fixture
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
 CODE = ("inference/model.py", "inference/engram.py", "inference/vision.py",
@@ -199,7 +201,7 @@ def build(model_module, engram_module, args, seed: int, widen: bool = False):
     weights drawn. `float` and `double` leave the complex rotary tables as
     they were built. The vision half draws from a generator of its own, so
     the decoder's weights are the same with it or without."""
-    from torch_precision import float64
+    from _dew_torch.precision import float64
 
     torch.manual_seed(seed)
     # Built inside the shared `float64` when widened, so every value its constructor computes is
@@ -608,7 +610,7 @@ def widened(model_module):
     model.py and the stand-ins widened, which are their `.float()` casts, the
     MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161)
     and the rotary tables' float32 frequencies (:376, :384), rebuilt."""
-    from torch_precision import default_dtype, dtype_widened, float_as, replaced
+    from _dew_torch.precision import default_dtype, dtype_widened, float_as, replaced
 
     model_module.precompute_freqs_cis.cache_clear()
     try:

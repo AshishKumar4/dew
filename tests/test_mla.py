@@ -166,7 +166,7 @@ their names in tools/mla_reference.py."""
 def reference_block(name: str, wide: bool = False):
     """The fixture's transformers block and rotary embedding, its weights the fixture's; built in
     float64, every float32 pin widened (`float64`), where `wide`."""
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     fields, config, block, rotary = (getattr(GENERATOR, part) for part in REFERENCE[name])
     weights = {key: torch.from_numpy(value) for key, value in fixture(name).items()
@@ -182,7 +182,7 @@ def reference_walk(name: str, wide: bool = False):
     """The reference block as a function of a draw `(hidden, cotangent)`, run in float32, or in
     float64 where `wide` (the truth): its output and the hidden states' gradient under the drawn
     cotangent (`torch_with_gradients`)."""
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     block, rotary = reference_block(name, wide)
 
@@ -281,7 +281,7 @@ def test_yarn_matches_the_reference_derivation():
     frequencies, the cos/sin amplitude and the query scale exactly (as computed, the same float32 and
     Python arithmetic), and cos and sin at drawn positions on par with the reference's float32 from
     its float64 run (check 1)."""
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     yarn = yarn_of(CONFIG["v3"])
     _, rotary = reference_block("mla_v3")
@@ -765,7 +765,7 @@ def masked_reference(rule: np.ndarray, positions: np.ndarray | None = None):
     `[B, Q, K]`, its queries and keys rotated at `positions` (their indices by default): the reference
     in float32 and its truth in float64, each a function of `visibility_draw`'s draw, apart from Dew's
     metadata."""
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     places = torch.as_tensor(np.broadcast_to(np.arange(VIS_LENGTH) if positions is None else positions,
                                              (2, VIS_LENGTH)).copy())

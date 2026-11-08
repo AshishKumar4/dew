@@ -1,6 +1,6 @@
-"""The one precision context the reference generators build and run their float64 oracles under, with
-torch alone, so a generator in a torch-only environment imports it as freely as one beside Diffusers
-or transformers.
+"""The one precision context the reference generators build and run their float64 oracles under, and
+tier 2's verification its source's float64 twin (`dew.interop.verify`), with torch alone, so a
+generator in a torch-only environment imports it as freely as one beside Diffusers or transformers.
 
 A reference that runs published code at another precision than the code pins
 replaces torch's own casts for a block (`replaced`). Each generator names
@@ -25,7 +25,7 @@ from collections.abc import Callable
 import torch
 
 
-def wide(dtype):
+def wide(dtype: torch.dtype | None) -> torch.dtype | None:
     """`dtype`, float32 read as float64: what a widened reference casts to where it pins float32."""
     return torch.float64 if dtype == torch.float32 else dtype
 
@@ -99,7 +99,7 @@ def widened():
     type_ = torch.Tensor.type
 
     def widened_type(self, dtype=None, *args, **kwargs):
-        return type_(self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
+        return type_(self, *args, **kwargs) if dtype is None else type_(self, wide(dtype), *args, **kwargs)
 
     with (replaced(float_as(torch.float64), (torch.Tensor, "to", widened_to(torch.Tensor.to)),
                    (torch.Tensor, "type", widened_type), (torch, "arange", dtype_widened(torch.arange)),
@@ -146,8 +146,17 @@ def float64():
         yield
 
 
-def float64_twin(model: torch.nn.Module,
-                 build: Callable[[], torch.nn.Module] | None = None) -> torch.nn.Module:
+def widened_config(config):
+    """`config` at float64, its sub-configs (a wrapper's towers') with it, in place: what transformers
+    builds a model and each tower of at, its constructor's tables included (`float64_twin`)."""
+    config.dtype = torch.float64
+    for name in getattr(config, "sub_configs", {}):
+        if getattr(config, name, None) is not None:
+            widened_config(getattr(config, name))
+    return config
+
+
+def float64_twin[M: torch.nn.Module](model: M, build: Callable[[], M] | None = None) -> M:
     """`model`'s float64 truth, the one way a truth's twin is made: built inside `float64`, so every value
     its constructor computes (a rotary `inv_freq`, Gemma's `embed_scale`) is float64's where a float32
     build cast afterwards keeps float32's, by `build` (a library's reader at float64, a head from its
@@ -166,19 +175,14 @@ def float64_twin(model: torch.nn.Module,
     at float32 would hold them rounded to float32 (ledger 3332)."""
     import copy
 
-    def widened_config(config):
-        config.dtype = torch.float64
-        for name in getattr(config, "sub_configs", {}):
-            if getattr(config, name, None) is not None:
-                widened_config(getattr(config, name))
-
     with float64():
         if build is not None:
             twin = build()
         else:
             config = copy.deepcopy(model.config)
-            if hasattr(type(model), "from_config") and not hasattr(config, "to_dict"):
-                twin = type(model).from_config(config)
+            reader = getattr(type(model), "from_config", None)
+            if reader is not None and not hasattr(config, "to_dict"):
+                twin = reader(config)
             else:
                 widened_config(config)
                 twin = type(model)(config)

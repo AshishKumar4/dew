@@ -89,8 +89,8 @@ def flux2_arms(source, arrays, record, name):
     import torch
     from diffusers import Flux2Transformer2DModel
 
+    from _dew_torch.precision import float64, float64_twin
     from tools.diffusers_reference_helpers import flux2_ids
-    from tools.torch_precision import float64, float64_twin
 
     model, params, layouts = load(source, name)
     rows, columns = record["cases"][name]["grid"]
@@ -221,7 +221,7 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, name)
     import torch
     from diffusers import AutoencoderKLFlux2
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     autoencoder, params, layouts, _ = load_flux2_vae(source / name)
     tensors = component_tensors(source / name, "vae")
@@ -261,7 +261,7 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
     so a GPU run is judged against the source on its GPU."""
     import torch
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     monkeypatch.syspath_prepend(str(ROOT / "tools"))
     tool = tool_support.load("diffusers_flux2_reference")
@@ -344,7 +344,7 @@ def klein_pipelines(source):
     from diffusers import Flux2KleinPipeline
     from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     with pytest.MonkeyPatch.context() as patched:
         patched.syspath_prepend(str(ROOT / "tools"))
@@ -445,7 +445,7 @@ def assert_mistral3_reads_as_flux2_dev(directory, encoder) -> None:
     from diffusers import Flux2Pipeline
     from transformers import AutoModelForImageTextToText, AutoTokenizer
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     tokenizer = AutoTokenizer.from_pretrained(directory / "tokenizer", local_files_only=True)
     narrow = AutoModelForImageTextToText.from_pretrained(directory / "text_encoder",

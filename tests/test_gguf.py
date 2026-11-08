@@ -209,7 +209,7 @@ def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     from interop_support import token_draw, torch_logits
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     rng = np.random.default_rng(0)
     write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0,
@@ -321,7 +321,7 @@ def test_released_gguf_logits_match_transformers(name):
     from interop_support import token_draw, torch_logits
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     pretrained = Pretrained.load(REPO, revision=REVISION, gguf_file=name, dtype="float32",
                                  attention_impl="reference", max_seq_len=64)
@@ -544,7 +544,7 @@ def test_a_gemma_or_moe_file_loads_the_model_it_was_converted_from(tmp_path, cas
     from interop_support import clearing_selections, token_draw, torch_logits
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     rng = np.random.default_rng(1607)
     source = write_source(tmp_path, case, rng)

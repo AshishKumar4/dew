@@ -34,6 +34,7 @@ from interop_support import token_draw
 from jax.sharding import PartitionSpec as P
 from reference_error import as_given, assert_as_exact, equations, torch_with_gradients, with_gradients
 
+from _dew_torch.precision import float64, float64_twin
 from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.distributed.placement import Layout
@@ -44,7 +45,6 @@ from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
-from tools.torch_precision import float64, float64_twin
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax

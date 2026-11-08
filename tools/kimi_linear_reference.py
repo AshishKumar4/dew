@@ -57,6 +57,7 @@ answered by its own torch references, its separate gate by `kda_gate_ref`.
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +75,8 @@ from kimi_k3_reference import (
     write_truth,
 )
 from reference_source import config_lookups, hub_modules, record_padding
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
@@ -115,7 +118,7 @@ def matmul_precision() -> str:
     """What each array file records of this run's matmuls (`recorded_matmuls`), fla's triangular
     solve among them. `released_modules` holds fla's autotuned recompute to its 'ieee'
     configurations."""
-    from torch_precision import recorded_matmuls
+    from _dew_torch.precision import recorded_matmuls
 
     return recorded_matmuls(FLA_TRIL_PRECISION=os.environ.get("FLA_TRIL_PRECISION", "ieee"))
 
@@ -249,12 +252,14 @@ def released_model(configuration, modeling, config: dict, tensors: dict[str, tor
 
 def truth(directory: Path) -> dict[str, np.ndarray]:
     """The float64 truth of the Kimi Linear fixture at `directory` (`kimi_k3_reference.float64_truth`): the
-    released model as `patched` changes it, built and run in float64 on the CPU (`torch_precision.float64`),
+    released model as `patched` changes it, built and run in float64 on the CPU
+    (`_dew_torch.precision.float64`),
     fla's kernels answered by its own references at their call boundaries (`fla_float64`), holding the
     fixture's weights, every parameter trained."""
     from fla_float64 import installed
     from safetensors.torch import load_file
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     configuration, modeling = patched()
     config = json.loads((directory / "config.json").read_text())

@@ -133,7 +133,7 @@ def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the
     import torch
     from transformers import SiglipVisionConfig, SiglipVisionModel
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     config = SiglipVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                                 num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,

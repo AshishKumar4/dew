@@ -8,7 +8,7 @@ QDQ leaves that forward bit for bit unchanged. A second fp32 reader keeps
 dense checkpoint tensors in fp32; only its decoded bf16 Linear weights need
 promotion before the fp32 forward. FP8 is read and run directly in fp32.
 The truth is those decoded weights run in float64, including the norm,
-RoPE and softmax pins widened by torch_precision.float64. NVFP4's
+RoPE and softmax pins widened by _dew_torch.precision.float64. NVFP4's
 unrounded fp32 dequantize is recorded too, and its bf16 rounding must equal
 the published decoder. There are no activation quantizers in these files.
 
@@ -25,6 +25,7 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
         tools/nvfp4_storage_reference.py
 """
 
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -36,8 +37,11 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
 from safetensors.torch import save_file
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
+
+from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "storage"
 ARGS = {

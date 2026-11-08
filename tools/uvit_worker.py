@@ -11,8 +11,10 @@ constructor argument, its `<draw>.param.<name>` under U-ViT's state-dict names, 
 shape. OUT gets `<draw>.reference.<leaf>` and `<draw>.truth.<leaf>` in float32 and float64:
 the `output` of U-ViT called as its continuous-time SDE calls it (on the time times 999), and the
 `gradients` of `sum(output * probe)` with respect to the image, the text states and every parameter in
-sorted name order, concatenated. The float64 run is the model's float64 twin (`torch_precision.float64_twin`)
-under `torch_precision.widened`, which widens the sinusoids' float32 `arange` and `.float()`. Attention runs
+sorted name order, concatenated. The float64 run is the model's float64 twin
+(`_dew_torch.precision.float64_twin`)
+under `_dew_torch.precision.widened`, which widens the sinusoids' float32 `arange` and `.float()`. Attention
+runs
 U-ViT's "math" mode: its "flash" mode casts q, k and v to float32.
 """
 
@@ -20,11 +22,14 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import package, published_files
 from reference_worker import drawn, serve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO, COMMIT = "baofff/U-ViT", "ce551708dc9cde9818d2af7d84dfadfeb7bd9034"
 FILES = {
@@ -54,7 +59,7 @@ def walked(model, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]
 
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's output and gradients under its configuration and weights, in float32 and float64."""
-    from torch_precision import float64_twin, widened
+    from _dew_torch.precision import float64_twin, widened
 
     t2i = uvit()
     def answer(inputs):

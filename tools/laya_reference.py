@@ -36,6 +36,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 LAYA_COMMIT = "a4a8921afebfd852bba0000475cfb6ab737a124c"
 LAYA_REPO = "convaiinnovations/laya"
 LAYA_REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"
@@ -127,7 +129,7 @@ def twins(agent, directory: Path):
     """`agent`'s decision model in float32 and its float64 twin (`float64_twin`): the model built again
     inside the widening by Laya's own builder, uninitialised for a checkpoint to fill
     (`common.build_model`), so its inverse frequencies are float64's, the float32 model's weights in it."""
-    from torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     _, common = _laya()
     model = agent.model.float().eval()
@@ -140,7 +142,7 @@ def laid_logits(agent, model, exact) -> tuple[dict, dict]:
     """Every case's layouts and its option logits under `model` in fp32 and `exact` in float64, keyed
     `<layout>/<case>/<id>` (the float64 ones `/f64`), each question laid out as `Agent` lays it out, in
     the sequential and the parallel layout."""
-    from torch_precision import float64
+    from _dew_torch.precision import float64
 
     agent_module, common = _laya()
     tokenizer, config = agent.tok, agent.cfg

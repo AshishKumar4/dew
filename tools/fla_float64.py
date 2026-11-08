@@ -2,7 +2,8 @@
 Triton kernels (fp32 and bf16 only), answered by fla's own published torch references at the same call
 boundary, so the rest of the model runs as released.
 
-A truth installs them with `installed(modeling)` inside `torch_precision.float64()`, which widens the float32
+A truth installs them with `installed(modeling)` inside `_dew_torch.precision.float64()`, which widens the
+float32
 casts fla's references make (`.float()`, `.to(torch.float)`), as it widens the model's own. They answer a
 whole-sequence forward, unpadded or padded, without a cache: a call that carries a cache or a residual is
 refused, as no truth runs one.
@@ -22,10 +23,14 @@ refused, as no truth runs one.
 import contextlib
 import importlib
 import itertools
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch_precision import replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import replaced
 
 
 def sequences(cu_seqlens: torch.Tensor | None, tokens: int) -> list[tuple[int, int]]:

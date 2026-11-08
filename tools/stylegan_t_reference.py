@@ -8,20 +8,23 @@ condition. LADD reshapes the sequence to its 2D grid; at a grid height of one
 a (1, k) kernel is the 1D kernel k, which is what the fixture compares. What
 lands is the inputs, every weight in Flax's layout, the spectral norms'
 `u` vectors before the call, and the logits, in float64: built, drawn and run inside
-tools/torch_precision.py's `float64`, so every float32 pin of the published code is widened too.
+src/_dew_torch/precision.py's `float64`, so every float32 pin of the published code is widened too.
 
     PYTHONPATH=src python tools/stylegan_t_reference.py
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import definitions
 from torch.nn.utils.spectral_norm import SpectralNorm
-from torch_precision import float64
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64
 
 ROOT = "https://raw.githubusercontent.com/autonomousvision/stylegan-t/36ab80ce76237fefe03e65e9b3161c040ae888e3/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "stylegan_t"

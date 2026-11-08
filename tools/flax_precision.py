@@ -1,5 +1,5 @@
 """The one precision context a reference's array code runs its float64 oracles under where a module pins a
-dtype, the counterpart to tools/torch_precision.py's `float64`: Diffusers' Flax modules', MaxText's
+dtype, the counterpart to src/_dew_torch/precision.py's `float64`: Diffusers' Flax modules', MaxText's
 (tools/maxtext_worker.py), and the NumPy of Diffusers' image processor.
 
 A Flax module built at float64 (`dtype=jnp.float64`, its parameters widened, JAX's x64 on) still computes in

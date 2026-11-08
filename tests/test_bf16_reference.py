@@ -119,7 +119,7 @@ def assert_biases_sum_as_torch(name):
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     directory = FIXTURES / name
     vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
@@ -303,7 +303,7 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     text = ("The Cascade Range runs from northern California through Oregon and Washington into "
             "British Columbia, and its volcanoes include Mount Rainier, Mount Hood and Mount St. "

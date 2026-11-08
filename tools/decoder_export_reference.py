@@ -21,6 +21,7 @@ from __future__ import annotations
 import functools
 import json
 import math
+import sys
 import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -40,6 +41,8 @@ from dew.interop.sources import load_shards
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.state import TrainState
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2
@@ -347,12 +350,12 @@ def reference_forward(case: Case, directory: Path, *, wide: bool = False
                       ) -> Callable[[np.ndarray], np.ndarray]:
     """transformers over the exported directory on the eager path, loaded once (`reference_model`), as a
     function of ids: its logits in fp32, or `wide` in float64, the model built and run under
-    `torch_precision.float64`, which widens its float32 pins too."""
+    `_dew_torch.precision.float64`, which widens its float32 pins too."""
     import contextlib
 
     import torch
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     precision = float64 if wide else contextlib.nullcontext
     with precision():
@@ -535,7 +538,7 @@ def _reference_gradients(trip: RoundTrip, *, wide: bool = False):
 
     import torch
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     with float64() if wide else contextlib.nullcontext():
         model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture,
@@ -689,9 +692,9 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, 
     import torch
     from transformers.core_model_loading import revert_weight_conversion
 
+    from _dew_torch.precision import float64
     from dew.objectives.base import Step
     from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
-    from tools.torch_precision import float64
 
     source, case = trip.source, trip.case
     weight = case.mtp_weight

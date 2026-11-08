@@ -6,10 +6,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
+from multimodal_reference import _row_slices, qwen3_vl_processor
 from transformers import Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration
 
 from dew.interop.verify import scatter_weights
-from multimodal_reference import _row_slices, qwen3_vl_processor
 
 
 def main():

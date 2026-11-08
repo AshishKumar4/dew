@@ -6,7 +6,7 @@ its source archive checked against its SHA-256) converts the export with its
 own convert_hf_to_gguf.py to an F32 GGUF, and libllama, built from the same
 source for the CPU, computes the logits of every position of fixed ids with
 an F32 KV cache, flash attention off, on one thread. transformers runs the
-export in float64 (`torch_precision.float64`) for the truth both
+export in float64 (`_dew_torch.precision.float64`) for the truth both
 are measured from.
 
 The decoder is a tiny Llama from the registry with weights on a grid of
@@ -54,6 +54,8 @@ import tarfile
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "llama_cpp"
@@ -253,8 +255,8 @@ def consume(directory: Path, converter_python: str) -> None:
     import transformers
     from transformers import AutoModelForCausalLM
 
+    from _dew_torch.precision import float64
     from tools.reference_source import saved_fixture
-    from tools.torch_precision import float64
 
     source = fetch()
     program = build(source)

@@ -13,11 +13,17 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from safetensors.torch import save_file
-from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, Qwen2Tokenizer, Qwen3_5Config
-from transformers import Qwen3_5MoeTextConfig
 from make_tiny_tokenizer import qwen_byte_tokenizer
 from qwen_mtp_reference import QwenMTP, published_mtp_logits
+from safetensors.torch import save_file
+from transformers import (
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    Qwen2Tokenizer,
+    Qwen3_5Config,
+    Qwen3_5MoeTextConfig,
+)
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 SOURCES = ROOT / "qwen38-source"

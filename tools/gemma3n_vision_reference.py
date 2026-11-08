@@ -25,7 +25,6 @@ from safetensors.numpy import save_file
 from transformers import Gemma3nAudioConfig, Gemma3nConfig, Gemma3nVisionConfig
 from transformers.models.gemma3n.modeling_gemma3n import Gemma3nForConditionalGeneration
 
-
 MODEL_ARGS = {"channel_multiplier": 1 / 64, "stem_size": 8, "msfa_output_resolution": 2}
 SEED = 1729
 LEARNING_RATE = 0.01

@@ -274,9 +274,9 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     from interop_support import token_draw, torch_logits
     from transformers import AutoModelForCausalLM
 
+    from _dew_torch.precision import float64
     from dew.nn.kernels import generation
     from dew.nn.precision import ACCURATE
-    from tools.torch_precision import float64
 
     directory = FIXTURES / "qwen3-tiny"
     ids = np.load(directory / "input_ids.npy")
@@ -1510,7 +1510,7 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     the LM objective's `mtp_weight` trains the step's weights."""
     import torch
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     reference = nemotron_step_source(tmp_path / "ultra-step")
     model, variables = fp32_decoder(tmp_path / "ultra-step")

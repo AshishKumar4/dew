@@ -1,6 +1,6 @@
 """SLOP022: a torch module is never promoted to float64 after its construction, which keeps what its
 constructor computed rounded to float32 (ledger 1601); a truth's twin is built inside
-tools/torch_precision.py's `float64` (ledger 1619)."""
+src/_dew_torch/precision.py's `float64` (ledger 1619)."""
 
 import pytest
 from tool_support import lint_codes
@@ -34,8 +34,8 @@ PROMOTIONS = {
                                         "        self.model.double()", 1),
     "a module of the file's scope, in a function": (LINEAR + "def test():\n    model.double()", 1),
     "built outside float64, promoted inside it": (
-        "from torch_precision import float64\n" + LINEAR + "with float64():\n    model.double()", 1),
-    "a deep copy inside float64": ("import copy\nfrom tools.torch_precision import float64\n" + LINEAR
+        "from _dew_torch.precision import float64\n" + LINEAR + "with float64():\n    model.double()", 1),
+    "a deep copy inside float64": ("import copy\nfrom _dew_torch.precision import float64\n" + LINEAR
                                    + "with float64():\n    twin = copy.deepcopy(model)\n"
                                    "    twin.double()", 1),
     "a class of a module the file is given": (
@@ -53,19 +53,19 @@ PROMOTIONS = {
         "import torch\nfrom transformers import AutoModelForCausalLM\n"
         "model = AutoModelForCausalLM.from_config(config, dtype=torch.float64).double()", 1),
     "built where a condition picks float64, promoted unconditionally": (
-        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\ndef run(wide):\n"
+        "import contextlib\nimport torch\nfrom _dew_torch.precision import float64\ndef run(wide):\n"
         "    with float64() if wide else contextlib.nullcontext():\n"
         "        model = torch.nn.Linear(4, 4)\n    model.double()", 1),
     "built where a condition picks float64, promoted under another": (
-        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "import contextlib\nimport torch\nfrom _dew_torch.precision import float64\n"
         "def run(wide, other):\n    with float64() if wide else contextlib.nullcontext():\n"
         "        model = torch.nn.Linear(4, 4)\n    model = model.double() if other else model", 1),
     "built after an inner stack's float64 has closed": (
-        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "import contextlib\nimport torch\nfrom _dew_torch.precision import float64\n"
         "with contextlib.ExitStack() as outer:\n    with contextlib.ExitStack() as inner:\n"
         "        inner.enter_context(float64())\n    model = torch.nn.Linear(4, 4)\n    model.double()", 1),
     "a factory defined inside float64, called after it": (
-        "import torch\nfrom tools.torch_precision import float64\nwith float64():\n"
+        "import torch\nfrom _dew_torch.precision import float64\nwith float64():\n"
         "    def build():\n        return torch.nn.Linear(4, 4)\nbuild().double()", 1),
     "a helper that moves its module, then promotes it": (
         "import torch\ndef walk(model, device, dtype):\n    model = model.to(device)\n"
@@ -99,21 +99,21 @@ PROMOTIONS = {
                                              "layers = torch.nn.ModuleList([model])\nlayers[0].double()", 0),
     "a tensor": ("import torch\ntorch.zeros(3).to(torch.float64)\n"
                  "torch.nn.Parameter(torch.zeros(3)).double()\ntorch.Tensor.double(values)", 0),
-    "a module built inside float64": ("from tools.torch_precision import float64\nimport torch\n"
+    "a module built inside float64": ("from _dew_torch.precision import float64\nimport torch\n"
                                       "with float64():\n    model = torch.nn.Linear(4, 4)\n"
                                       "    model.double()\nmodel.to(torch.float64)", 0),
     "a module built inside float64 where a condition picks it": (
-        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\ndef run(wide):\n"
+        "import contextlib\nimport torch\nfrom _dew_torch.precision import float64\ndef run(wide):\n"
         "    with float64() if wide else contextlib.nullcontext():\n"
         "        model = torch.nn.Linear(4, 4)\n"
         "        model = model.to(torch.float64) if wide else model", 0),
     "a module read inside float64 entered on a stack": (
-        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "import contextlib\nimport torch\nfrom _dew_torch.precision import float64\n"
         "from diffusers import StableDiffusionPipeline\nwith contextlib.ExitStack() as scope:\n"
         "    scope.enter_context(float64())\n    pipe = StableDiffusionPipeline.from_pretrained(root)\n"
         "    pipe = pipe.to(torch.float64)", 0),
     "a module read before a stack enters float64": (
-        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "import contextlib\nimport torch\nfrom _dew_torch.precision import float64\n"
         "from diffusers import StableDiffusionPipeline\nwith contextlib.ExitStack() as scope:\n"
         "    pipe = StableDiffusionPipeline.from_pretrained(root)\n    scope.enter_context(float64())\n"
         "    pipe = pipe.to(torch.float64)", 1),
@@ -125,7 +125,7 @@ PROMOTIONS = {
                                                   "model.to(dtype)", 0),
     "a loop's target": (LINEAR + "for model in models:\n    model.double()", 0),
     "the shared twin's own build": (
-        "import torch\nfrom tools.torch_precision import float64\ndef float64_twin(model, build=None):\n"
+        "import torch\nfrom _dew_torch.precision import float64\ndef float64_twin(model, build=None):\n"
         "    with float64():\n        twin = build() if build is not None else type(model)(model.config)\n"
         "        twin.to(torch.float64)\n    return twin", 0),
 }

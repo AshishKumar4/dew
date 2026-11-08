@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 class Tape:
@@ -48,7 +52,7 @@ def fixed_draws(base):
     they ask for (a normal as `mean + std * base`), so a reference's density runs on one supplied
     draw."""
     torch = importlib.import_module("torch")
-    from torch_precision import replaced
+    from _dew_torch.precision import replaced
 
     with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * base),
                   (torch, "rand", lambda size, **_: base)):

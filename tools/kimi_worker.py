@@ -21,10 +21,13 @@ import importlib
 import json
 import sys
 from collections.abc import Callable
+from pathlib import Path
 
 import numpy as np
 import torch
 from reference_worker import drawn, serve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 STEPPED_PREFILL = 40
 """The prefill of the cached decode whose shapes `stepped` is scored at, which tests/kimi_support.py's
@@ -53,10 +56,11 @@ def outputs(model: torch.nn.Module, inputs: dict[str, np.ndarray], device: str,
 
 def models(site: str) -> tuple[torch.nn.Module, torch.nn.Module, Callable[[], contextlib.ExitStack]]:
     """`site`'s float32 release and its float64 twin on the CUDA device, and the context its twin runs in
-    (fla's references installed, `torch_precision.float64`)."""
+    (fla's references installed, `_dew_torch.precision.float64`)."""
     from fla_float64 import installed
     from safetensors.torch import load_file
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     tool = importlib.import_module("kimi_k3_reference" if site == "kimi-k3" else "kimi_linear_reference")
     # One import of the modules for both runs: each tool's `truth` builds its twin from the same modules

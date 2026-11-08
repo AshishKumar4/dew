@@ -30,7 +30,9 @@ from block_override_reference import (
 )
 from fetched_fixtures import save
 from reference_source import git_head
-from torch_precision import float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests/fixtures/hf/qwen38-dense-tiny"

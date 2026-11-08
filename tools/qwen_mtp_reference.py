@@ -14,10 +14,16 @@ vLLM's tensor-parallel kernels or scheduler.
 import copy
 
 import torch
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm, Qwen3_5TextRotaryEmbedding
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5DecoderLayer,
+    Qwen3_5RMSNorm,
+    Qwen3_5TextRotaryEmbedding,
+)
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeDecoderLayer
 from transformers.models.qwen3_next.modeling_qwen3_next import (
-    Qwen3NextDecoderLayer, Qwen3NextRMSNorm, Qwen3NextRotaryEmbedding,
+    Qwen3NextDecoderLayer,
+    Qwen3NextRMSNorm,
+    Qwen3NextRotaryEmbedding,
 )
 
 # (decoder layer, norm, rotary, position rows the rotary takes) by model_type.

@@ -6,19 +6,20 @@ The runtime loader consumes only checkpoint/config/tokenizer files afterward.
 """
 import argparse
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 
+import numpy as np
 from flax import serialization
 from flax.traverse_util import flatten_dict
-import numpy as np
 
 
 def convert(directory):
     directory = Path(directory)
+    from safetensors.numpy import load_file
+
     from dew.interop.diffusion import write_flax_component
     from dew.interop.safetensors_io import write_file
-    from safetensors.numpy import load_file
     index = json.loads((directory / "model_index.json").read_text())
     for component in ("unet", "vae", "text_encoder", "text_encoder_2", "safety_checker"):
         folder = directory / component

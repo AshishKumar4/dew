@@ -10,9 +10,9 @@ latent position; the prompt states; the timestep divided by a thousand; the
 (tests/qwen_image_draws.py) it records the prediction at the image's tokens and
 the gradients of the latent, the prompt states and every parameter,
 unmodified, in float32, the reference, and in float64, the truth: on the
-model's float64 twin (`torch_precision.float64_twin`, its rotary and
+model's float64 twin (`_dew_torch.precision.float64_twin`, its rotary and
 sinusoid tables built at float64), the source's float32 pins widened
-(`torch_precision.float64`).
+(`_dew_torch.precision.float64`).
 
 A row padded behind a shorter prompt is recorded as the source's call for
 that prompt alone, which is what each native row reproduces (see
@@ -53,7 +53,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"

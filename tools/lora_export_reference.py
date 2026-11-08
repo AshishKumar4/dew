@@ -20,7 +20,7 @@ float64. Two halves, in two environments, for the pipelines:
   and no other adapter state, and writes tests/fixtures/lora_exports/<case>.npz:
   the inputs, the adapted and the merged (PEFT's `merge_and_unload`,
   Diffusers' `fuse_lora`) outputs in float32 and float64
-  (`torch_precision.float64`) and the output without the adapter.
+  (`_dew_torch.precision.float64`) and the output without the adapter.
 
 The decoders are tests/fixtures/hf/llama-tiny under PEFT's `PeftModel`, in
 the test; the pipelines are the tiny SD (its PyTorch UNet), FLUX and SD3 sources

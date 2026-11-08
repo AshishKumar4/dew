@@ -6,7 +6,7 @@ The GPU reference runs (tools/reference_runs/torch_lm.py) compare whole fine-tun
 their loop at a size a CPU test replays. The committed qwen3-tiny checkpoint trains under transformers for
 STEPS steps on a draw's token rows with the same loss (cross entropy over every shifted target),
 `clip_grad_norm_`, AdamW and optax's warmup-cosine schedule (reference_runs/common.py's `warmup_cosine`),
-twice: read and trained in float64 inside `torch_precision.float64`, the truth (its RMSNorm, softmax and
+twice: read and trained in float64 inside `_dew_torch.precision.float64`, the truth (its RMSNorm, softmax and
 rotary tables widened where Qwen3 pins them to float32), and in float32, the reference.
 
     python tools/lm_steps_worker.py lm-steps    `IN OUT` lines on stdin, each `done`
@@ -25,8 +25,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from reference_worker import drawn, serve
-from torch_precision import float64
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoModelForCausalLM
+
+from _dew_torch.precision import float64
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "reference_runs"))
 from common import warmup_cosine

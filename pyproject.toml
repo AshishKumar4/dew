@@ -339,7 +339,7 @@ max-statements = 75
 
 
 [tool.ruff.lint.isort]
-known-first-party = ["dew"]
+known-first-party = ["dew", "_dew_torch"]
 # conftest sets the lane's environment (lane_environment.configured) before JAX reads it.
 force-to-top = ["lane_environment"]
 # `from x import A as B, C` is one line in this tree; splitting it per alias
@@ -354,7 +354,7 @@ split-on-trailing-comma = false
 # Vendored numeric code is included, not excluded; a checker finding is either
 # a real weakness or a type that is not yet true, and both get fixed rather
 # than silenced. No file list, no ignore comments, no lowered severity.
-include = ["src/dew", "tools/lint_slop.py"]
+include = ["src/dew", "src/_dew_torch", "tools/lint_slop.py"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 # Name the environment, or two people get two counts for the same tree.
@@ -443,4 +443,4 @@ dew = ["py.typed"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["dew*"]
+include = ["dew*", "_dew_torch*"]

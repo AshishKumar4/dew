@@ -55,15 +55,29 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import fed_noise as fed_noise, restore_transformers_names, step_noise as step_noise
 from diffusers.schedulers import (
-    scheduling_ddim, scheduling_ddpm, scheduling_deis_multistep,
-    scheduling_dpmsolver_multistep, scheduling_dpmsolver_sde,
-    scheduling_dpmsolver_singlestep, scheduling_edm_dpmsolver_multistep,
-    scheduling_euler_ancestral_discrete, scheduling_euler_discrete,
-    scheduling_heun_discrete, scheduling_k_dpm_2_ancestral_discrete,
-    scheduling_k_dpm_2_discrete, scheduling_lcm, scheduling_lms_discrete, scheduling_pndm,
-    scheduling_tcd, scheduling_unipc_multistep,
+    scheduling_ddim,
+    scheduling_ddpm,
+    scheduling_deis_multistep,
+    scheduling_dpmsolver_multistep,
+    scheduling_dpmsolver_sde,
+    scheduling_dpmsolver_singlestep,
+    scheduling_edm_dpmsolver_multistep,
+    scheduling_euler_ancestral_discrete,
+    scheduling_euler_discrete,
+    scheduling_heun_discrete,
+    scheduling_k_dpm_2_ancestral_discrete,
+    scheduling_k_dpm_2_discrete,
+    scheduling_lcm,
+    scheduling_lms_discrete,
+    scheduling_pndm,
+    scheduling_tcd,
+    scheduling_unipc_multistep,
+)
+from diffusers_reference_helpers import (
+    fed_noise as fed_noise,
+    restore_transformers_names,
+    step_noise as step_noise,
 )
 from diffusers_wan_reference import float64_scheduler
 from recorded_draws import Tape
@@ -704,7 +718,6 @@ def refused_record() -> dict[str, np.ndarray]:
 
 def main(only: Sequence[str] = ()) -> None:
     import diffusers
-
     from reference_releases import require
 
     require("diffusers")

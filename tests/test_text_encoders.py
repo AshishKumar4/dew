@@ -102,7 +102,7 @@ def reference_clip(source, dtype):
     import torch
     from transformers import CLIPModel as ReferenceCLIP
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     if dtype == torch.float64:
         return float64_twin(reference_clip(source, torch.float32))
@@ -115,7 +115,7 @@ def precision(dtype):
 
     import torch
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     return float64() if dtype == torch.float64 else contextlib.nullcontext()
 

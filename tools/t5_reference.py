@@ -44,11 +44,14 @@ drawn ids (tests/test_t5_encoders.py's `t5_draw`), kept as the evidence check
 import argparse
 import json
 import string
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from transformers import T5Config, T5EncoderModel, T5Tokenizer, UMT5Config, UMT5EncoderModel
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "t5"
 
@@ -133,7 +136,7 @@ def write_tiny(tiny: Path, build=tiny_model) -> None:
 def write_seeds(directory: Path, name: str, reader) -> None:
     """`directory`'s checkpoint recorded over check 1's seeds as `<directory>-seeds.npz` beside it
     (`record_case`): the
-    reference's fp32 encoder and its float64 truth, built and run inside `torch_precision.float64`, on
+    reference's fp32 encoder and its float64 truth, built and run inside `_dew_torch.precision.float64`, on
     each seed's drawn ids, the count planned on Dew's own encoder against its float64 run."""
     import sys
 
@@ -142,8 +145,8 @@ def write_seeds(directory: Path, name: str, reader) -> None:
     sys.path[:0] = [str(FIXTURES.parents[1]), str(Path(__file__).resolve().parent)]
     from recorded_references import provenance, record_case, save
     from test_t5_encoders import t5_draw
-    from torch_precision import float64, float64_twin
 
+    from _dew_torch.precision import float64, float64_twin
     from dew.inputs import T5Text
 
     torch.set_num_threads(1)

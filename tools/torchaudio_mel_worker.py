@@ -12,11 +12,14 @@ dtype it computes in.
 """
 
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 from reference_worker import drawn, serve
-from torch_precision import default_dtype
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import default_dtype
 
 
 def mel(waveform: np.ndarray, dtype) -> np.ndarray:

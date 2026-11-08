@@ -184,7 +184,7 @@ def reference_block_output(block, *, prefill: int | None = None):
 def wide_block(block):
     """`block`'s float64 twin (`float64_twin`): built inside `float64`, so every value its constructor
     computes is float64's, with `block`'s weights."""
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     return float64_twin(block, lambda: Glm5NextTextAttention(block.config, block.layer_idx))
 
@@ -192,7 +192,7 @@ def wide_block(block):
 def float64_block(block):
     """The reference block run in float64, every float32 pin widened (`float64`), as a function of a
     widened draw: the truth check 1 measures both sides from."""
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     wide = wide_block(block)
 
@@ -267,7 +267,7 @@ def torch_gradients(block):
     """The gradients of a readout of `block`'s output into its input and every attention parameter, as
     a function of a draw, by name (the input's 'x'); in float64, every float32 pin widened, where the
     block is."""
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     wide = next(block.parameters()).dtype == torch.float64
     named = {name: parameter.detach().numpy() for name, parameter in block.named_parameters()

@@ -1,7 +1,7 @@
 """SLOP022's reading of a file, for tools/lint_slop.py: a torch module promoted to float64 after its
 construction (ledger 1619). A float64 truth built in float32 and cast afterwards keeps what its
 constructor computed rounded to float32 (a rotary `inv_freq`, Gemma's `embed_scale`; ledger 1601), so a
-truth's twin is built inside tools/torch_precision.py's `float64`, by its `float64_twin`.
+truth's twin is built inside src/_dew_torch/precision.py's `float64`, by its `float64_twin`.
 
 A promotion is `.double()`, `.to(...)` or `.type(...)` at float64 (`torch.float64`, `torch.double`, or a
 name bound only to one, however many names deep) on a module, or the unbound
@@ -48,7 +48,8 @@ READERS = frozenset({"from_pretrained", "from_config", "from_single_file"})
 TENSORS = frozenset({"Parameter", "Buffer", "Size"})
 """Classes whose instances are tensors or shapes, not modules: with every name ending in `Tensor`."""
 
-WIDE = ("torch_precision.float64", "torch_precision.widened", "block_override_reference.oracle_precision")
+WIDE = ("_dew_torch.precision.float64", "_dew_torch.precision.widened",
+        "block_override_reference.oracle_precision")
 """The contexts a module built in computes its constructor's values in float64: the shared ones, and the
 block references' own, which takes float64 the default dtype and widens the float32 constructors
 (`arange`, `tensor`, `zeros`, `ones`, `full` and their `_like`s) a constructor's tables are built by."""
@@ -437,4 +438,4 @@ def message(call: ast.Call) -> str:
     called = f".{call.func.attr}" if isinstance(call.func, ast.Attribute) else _key(call.func)
     return (f"promotes a torch module built in float32 to float64 (`{called}`), which keeps what "
             "its constructor computed rounded to float32 (ledger 1601): build its twin inside "
-            "tools/torch_precision.py's `float64`, by `float64_twin`")
+            "src/_dew_torch/precision.py's `float64`, by `float64_twin`")

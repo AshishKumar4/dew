@@ -75,9 +75,9 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     import torch
     from transformers import AutoModelForCausalLM
 
+    from _dew_torch.precision import float64
     from dew.interop import PretrainedDecoder
     from dew.nn.rope import YarnScaling
-    from tools.torch_precision import float64
 
     source = yarn_source(tmp_path)
     loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')

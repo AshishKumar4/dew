@@ -17,12 +17,15 @@ its x and y.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import definitions, fetched
-from torch_precision import replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import replaced
 
 NANOGPT = "https://raw.githubusercontent.com/karpathy/nanoGPT/3adf61e154c3fe3fca428ad6bc3818b27a3b8291/"
 SHAKESPEARE = ("https://raw.githubusercontent.com/karpathy/char-rnn/6f9487a6fe5b420b7ca9afb0d7c078e37c1d1b4e"

@@ -41,8 +41,9 @@ import numpy as np
 import torch
 from hf_reference import write_released_config
 from reference_source import hub_modules, write_probes
-from torch_precision import float64_twin
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64_twin
 from dew.interop.verify import scatter_weights
 
 REPO, REVISION = 'MiniMaxAI/MiniMax-Text-01', 'a7351bf2bee0e1253919d349f1ad304e6dac13e9'

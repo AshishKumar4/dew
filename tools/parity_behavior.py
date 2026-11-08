@@ -6,8 +6,8 @@ is checked before recording outputs, so a different reference cannot silently
 rewrite the fixture.
 """
 
-from importlib.metadata import distribution
 import json
+from importlib.metadata import distribution
 from pathlib import Path
 
 import numpy as np

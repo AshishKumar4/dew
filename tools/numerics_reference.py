@@ -24,7 +24,7 @@ What lands, beside each fixture's own files:
   the three denoiser forwards in its reference.npz (`bare`, `conditioned`,
   `image_logits`). The float64 run is the truth both precisions are
   measured from, with every float32 pin of the model widened
-  (`torch_precision.float64`). tests/test_bf16_reference.py runs the
+  (`_dew_torch.precision.float64`). tests/test_bf16_reference.py runs the
   denoiser's bfloat16 reference in the test.
 - tests/fixtures/attention_bf16.npz: one head of 512 queries over 512 keys
   of width 64, logits of standard deviation 0.5, through transformers'
@@ -51,9 +51,12 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch_precision import float64
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoModelForCausalLM
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
+
+from _dew_torch.precision import float64
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 GENERATORS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny")

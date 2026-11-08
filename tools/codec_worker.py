@@ -20,6 +20,8 @@ import numpy as np
 import torch
 from reference_worker import drawn, serve
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 CODECS = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs"
 FAMILIES = ("storage", "nvfp4_qdq")
 """The checkpoint families the worker runs: weight-only storage, and NVFP4 with input QDQ."""
@@ -29,8 +31,9 @@ def run(family: str, kind: str, cases: dict[str, np.ndarray]) -> dict[str, np.nd
     """Every draw's logits, in float32 and float64."""
     from compressed_tensors.quantization import QuantizationStatus
     from nvfp4_qdq_reference import quantized_as_published
-    from torch_precision import float64, float64_twin
     from transformers import AutoModelForCausalLM
+
+    from _dew_torch.precision import float64, float64_twin
 
     directory = CODECS / family / kind
     model = AutoModelForCausalLM.from_pretrained(directory, dtype=torch.float32, attn_implementation="eager")

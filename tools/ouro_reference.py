@@ -28,13 +28,16 @@ tests/test_ouro.py read where the remote code cannot run.
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from reference_source import config_lookups, hub_modules, record_padding, torch_generated, write_probes
-from torch_precision import float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64_twin
 
 REPO, REVISION = 'ByteDance/Ouro-1.4B', '574fa66cb8bf5abdc979642d01cf2b79b16bfab1'
 FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'

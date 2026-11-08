@@ -53,9 +53,16 @@ import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 from transformers import (
-    AutoTokenizer, CLIPConfig, CLIPImageProcessorPil, CLIPModel, CLIPTextConfig,
-    CLIPTokenizer, CLIPVisionConfig,
+    AutoTokenizer,
+    CLIPConfig,
+    CLIPImageProcessorPil,
+    CLIPModel,
+    CLIPTextConfig,
+    CLIPTokenizer,
+    CLIPVisionConfig,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_source import recipe_images
@@ -181,7 +188,7 @@ def write_fp64(path: Path) -> None:
         print(np.abs(np.asarray(out.last_hidden_state) - pure["last_hidden_state"]).max())
         PY
     """
-    from torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     tokenizer = AutoTokenizer.from_pretrained(REAL_MODEL)
     model = float64_twin(CLIPModel.from_pretrained(REAL_MODEL, dtype=torch.float32))

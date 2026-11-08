@@ -15,7 +15,7 @@ rather than run in the suite. Two halves, in two environments:
 - The worker (the isolated Qwen-Image environment, tools/diffusers_qwen_image_reference.py's):
   `QwenImage21Pipeline` loads EXPORT whole, each weighted component loads with `output_loading_info` and
   has to report nothing, and the transformer runs the pipeline's own call (`transformer_call`) on each
-  draw's `packed`, `context` and `times` in float32 and in float64 (`torch_precision.float64`), its
+  draw's `packed`, `context` and `times` in float32 and in float64 (`_dew_torch.precision.float64`), its
   `output` packed.
 
 The source's own float32 sinusoid table is kept as published: the float64 run builds its own, so check 1
@@ -35,6 +35,8 @@ import tarfile
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE = ROOT / "tests" / "fixtures" / "qwen_image_source.tar.xz"
@@ -84,7 +86,7 @@ def checked(export: Path):
     import torch
     from diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     index = json.loads((export / "model_index.json").read_text())
     for name, entry in index.items():
@@ -115,7 +117,7 @@ def run(models, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     from diffusers_qwen_image_reference import transformer_call
     from reference_worker import drawn
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     def arm(inputs, model, dtype):
         given = [torch.from_numpy(inputs[key]).to(dtype) for key in ("packed", "context", "times")]

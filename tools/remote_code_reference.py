@@ -74,8 +74,11 @@ import transformers
 from huggingface_hub import hf_hub_download
 from reference_source import config_lookups, record_padding
 from safetensors.torch import load_file, save_file
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoConfig
+
+from _dew_torch.precision import float64, float64_twin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 # NumPy alone, as the release's environment holds no JAX.
@@ -135,7 +138,7 @@ LICENSES = {"lfm3-tiny": "lfm1.0", "lfm3-biased-tiny": "lfm1.0", "lfm3-vl-tiny":
 """The license of each release a recording (`--record`) runs, as its Hub card states it."""
 """Each fixture's release: the Hub repo, the commit its code is read at, the
 files that code is, and the auto class its language model registers as. Each
-release's float64 run is built and run under `torch_precision.float64`, which
+release's float64 run is built and run under `_dew_torch.precision.float64`, which
 widens the pins its code carries (MiMo's router casts its logits with
 `.type(torch.float32)`) and computes the tables its constructor builds (a
 rotary `inv_freq`) in float64."""

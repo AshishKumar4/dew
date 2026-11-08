@@ -16,7 +16,7 @@ truth's sketch, which Dew's float64 token recurrence is held to.
 fla runs at its defaults (an fp32 call's products TF32, as the fast forms' bar is). Packed documents run as
 fla runs them, one flattened row of sequences (`cu_seqlens`), a row's first taking its entering memory
 unless a document starts it. The oracle is fla's own reference, `naive_recurrent_gated_delta_rule` and
-`naive_recurrent_kda` (fla/ops/*/naive.py), on each sequence in torch float64 (`torch_precision.float64`,
+`naive_recurrent_kda` (fla/ops/*/naive.py), on each sequence in torch float64 (`_dew_torch.precision.float64`,
 which widens their fp32 casts) on the GPU, held at every seed to Dew's float64 token recurrence.
 """
 
@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
 GRADIENTS = ("q", "k", "v", "g", "beta", "h0")
@@ -118,7 +120,8 @@ def serve() -> None:
     from fla.ops.kda import chunk_kda
     from fla.ops.kda.naive import naive_recurrent_kda
     from reference_releases import require
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     require("fla")
     from importlib.metadata import version

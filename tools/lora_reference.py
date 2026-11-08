@@ -69,10 +69,10 @@ def _random_b(model, seed: int) -> None:
 
 
 def decoder(out: Path) -> None:
-    from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM
     import transformers
+    from peft import LoraConfig, get_peft_model
     from reference_releases import require
+    from transformers import AutoModelForCausalLM
 
     require("transformers")
 
@@ -138,8 +138,8 @@ def _tiny_sd():
     """The `sd` pipeline of the bundle, in torch, for the duration of the block."""
     import transformers
     from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline, UNet2DConditionModel
-    from transformers import CLIPTextModel, CLIPTokenizer
     from reference_releases import require
+    from transformers import CLIPTextModel, CLIPTokenizer
 
     require("diffusers-pipelines")
     with tempfile.TemporaryDirectory() as extracted:

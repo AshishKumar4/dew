@@ -58,10 +58,7 @@ from transformers.models.deepseek_v2.modeling_deepseek_v2 import DeepseekV2TopkR
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3MoE
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
-from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-    DeepseekV4Experts,
-    DeepseekV4TopKRouter,
-)
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Experts, DeepseekV4TopKRouter
 from transformers.models.mixtral.configuration_mixtral import MixtralConfig
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 

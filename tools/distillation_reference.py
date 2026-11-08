@@ -195,6 +195,7 @@ def main() -> None:
     import jax.numpy as jnp
     import torch
     from flax import linen as nn
+
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     student = CausalTransformer(vocab_size=VOCAB, emb_features=STUDENT["emb_features"],

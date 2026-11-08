@@ -40,8 +40,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_vjp import recorded_vjp
 from reference_releases import RELEASES, require
+from reference_vjp import recorded_vjp
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 COMMON = {"in_channels": 3, "latent_channels": 8, "attention_head_dim": 8,

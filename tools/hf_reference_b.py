@@ -123,34 +123,55 @@ import torch
 import transformers
 from safetensors.numpy import load_file
 from transformers import (
-    DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
-    Gemma3nTextConfig, Gemma4TextConfig, Glm4MoeConfig, Glm4MoeForCausalLM,
-    Glm5NextTextConfig, GlmMoeDsaConfig, GlmMoeDsaForCausalLM,
-    Kimi_K25Config, Kimi_K25ForConditionalGeneration, Llama4TextConfig,
-    Qwen3NextConfig, Qwen3NextForCausalLM,
+    DeepseekV2Config,
+    DeepseekV2ForCausalLM,
+    DeepseekV3Config,
+    DeepseekV3ForCausalLM,
+    Gemma3nTextConfig,
+    Gemma4TextConfig,
+    Glm4MoeConfig,
+    Glm4MoeForCausalLM,
+    Glm5NextTextConfig,
+    GlmMoeDsaConfig,
+    GlmMoeDsaForCausalLM,
+    Kimi_K25Config,
+    Kimi_K25ForConditionalGeneration,
+    Llama4TextConfig,
+    Qwen3NextConfig,
+    Qwen3NextForCausalLM,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.gemma3n.modeling_gemma3n import (
-    Gemma3nForCausalLM, Gemma3nTextAltUp, Gemma3nTextLaurelBlock, Gemma3nTextMLP,
+    Gemma3nForCausalLM,
+    Gemma3nTextAltUp,
+    Gemma3nTextLaurelBlock,
+    Gemma3nTextMLP,
 )
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM, Gemma4TextDecoderLayer
 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeDecoderLayer, Glm4MoeRMSNorm
 from transformers.models.glm5_next.modeling_glm5_next import (
-    Glm5NextPreTrainedModel, Glm5NextTextDecoderLayer, Glm5NextTextModel, Glm5NextTextRMSNorm,
+    Glm5NextPreTrainedModel,
+    Glm5NextTextDecoderLayer,
+    Glm5NextTextModel,
+    Glm5NextTextRMSNorm,
 )
-from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
-    GlmMoeDsaDecoderLayer, GlmMoeDsaRMSNorm,
-)
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import GlmMoeDsaDecoderLayer, GlmMoeDsaRMSNorm
 from transformers.models.llama4.modeling_llama4 import (
-    Llama4ForCausalLM, Llama4TextAttention, Llama4TextMoe, Llama4TextRotaryEmbedding,
+    Llama4ForCausalLM,
+    Llama4TextAttention,
+    Llama4TextMoe,
+    Llama4TextRotaryEmbedding,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deepseek_v4_reference import (
-    DEEPSEEK_V4_SEED, tiny_deepseek_v4, write_deepseek_v4_config, write_deepseek_v4_source,
+    DEEPSEEK_V4_SEED,
+    tiny_deepseek_v4,
+    write_deepseek_v4_config,
     write_deepseek_v4_mtp_reference,
+    write_deepseek_v4_source,
 )
 from gpt_oss_reference import tiny_gpt_oss
 from hf_reference import (
@@ -161,10 +182,11 @@ from hf_reference import (
     write_released_config,
     write_tiny,
 )
-from dew.interop.safetensors_io import write_file
-from dew.interop.verify import BATCH, LENGTH, reference_logits, scatter_weights
 from moe_reference import expert_tensors
 from qwen_mtp_reference import QwenMTP
+
+from dew.interop.safetensors_io import write_file
+from dew.interop.verify import BATCH, LENGTH, reference_logits, scatter_weights
 
 
 def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:
@@ -265,7 +287,8 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
     the released spelling reaches other logits than the saved config did.
     """
     from transformers.conversion_mapping import (
-        get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
+        get_checkpoint_conversion_mapping,
+        register_checkpoint_conversion_mapping,
     )
 
     directory = FIXTURES / name
@@ -802,7 +825,8 @@ def tiny_glm5_next() -> Glm5NextTextForCausalLM:
     reverses the HC/forget-gate renames and conv/expert packing
     (conversion_mapping.py:535-580)."""
     from transformers.conversion_mapping import (
-        get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
+        get_checkpoint_conversion_mapping,
+        register_checkpoint_conversion_mapping,
     )
 
     conversion = get_checkpoint_conversion_mapping("glm5_next")
@@ -1125,8 +1149,9 @@ def write_mirrored_config(name: str, repo: str) -> None:
     """A gated release's config from a mirror that carries it identically
     plus its own marker keys, which are dropped: meta-llama/Llama-4-Scout,
     google/gemma-4-26B-A4B and google/gemma-3n-E2B."""
-    from huggingface_hub import hf_hub_download
     import json
+
+    from huggingface_hub import hf_hub_download
 
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)

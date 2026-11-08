@@ -18,8 +18,6 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from safetensors.numpy import save_file
-
 from gemma.diffusion import _models, _transformer
 from gemma.diffusion.hackable_diffusion_adapter.hd import hd_gemma_network, sft_model
 from gemma.gm.nn.gemma4 import _config, _modules
@@ -28,6 +26,7 @@ from hackable_diffusion.lib.corruption.schedules import LinearDiscreteSchedule
 from hackable_diffusion.lib.jax_helpers import SafeSpan
 from hackable_diffusion.lib.training.discrete_loss import NoWeightDiscreteLoss
 from hackable_diffusion.lib.training.time_sampling import UniformTimeSampler
+from safetensors.numpy import save_file
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/diffusion-gemma-sft"
 SEED = 2

@@ -13,12 +13,15 @@ drawn NCHW images its processor packs (`image_draw`), and its projector over dra
 (`trunk_draw`), each in float32 and float64 over seeds for check 1 (`recorded_references.record_case`).
 """
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 from mimo_reference import FIXTURES, packed_rows, padded, scatter, write
-from torch_precision import float64
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers.models.muse_glimmer.configuration_muse_glimmer import MuseGlimmerVisionConfig
 from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
 from transformers.models.muse_glimmer.modeling_muse_glimmer import (
@@ -27,6 +30,8 @@ from transformers.models.muse_glimmer.modeling_muse_glimmer import (
     MuseGlimmerVisionModel,
     get_vision_pixel_shuffle_index,
 )
+
+from _dew_torch.precision import float64
 
 MUSE_VISION = dict(
     num_hidden_layers=4, hidden_size=32, intermediate_size=48, num_attention_heads=4, hidden_act="gelu",

@@ -17,10 +17,10 @@ import torch
 from interop_support import assert_pads_as, clearing_selections, token_draw, torch_logits
 from reference_error import as_given, assert_as_exact
 
+from _dew_torch.precision import float64, float64_twin
 from dew.interop import Pretrained, parts
 from dew.interop.verify import VerifiedMapping, scatter_weights, verify_mapping
 from tools.remote_code import renamed_module
-from tools.torch_precision import float64, float64_twin
 
 # CI runs this file in tasks of its own beside the other tier-2 files: tier 2's probe runs torch.
 pytestmark = pytest.mark.torchax

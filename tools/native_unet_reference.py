@@ -15,7 +15,6 @@ import jax
 from diffusers import FlaxUNet2DConditionModel
 from native_diffusion_reference_files import convert
 
-
 CASES = {"sd1": (False, (1, 1, 1), 4, 8, False), "sd2": (True, (1, 1, 1), 4, 12, False),
          "sdxl-inpaint": (True, (1, 2, 2), 9, 16, True), "refiner": (True, (1, 2, 2), 4, 8, True)}
 """Each geometry: its linear projections, transformer depths, input channels, prompt-state width, and

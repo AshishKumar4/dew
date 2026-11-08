@@ -35,7 +35,8 @@ import numpy as np
 import torch
 import transformers
 from hf_reference import FIXTURES, transformers_record, write_tiny
-from torch_precision import float64
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers.models.mamba2.configuration_mamba2 import Mamba2Config
 from transformers.models.mamba2.modeling_mamba2 import (
     Mamba2ForCausalLM,
@@ -43,6 +44,8 @@ from transformers.models.mamba2.modeling_mamba2 import (
     mamba2_chunk_scan,
     mamba2_selective_state_update,
 )
+
+from _dew_torch.precision import float64
 
 SSD = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2"
 SEED = 2024
@@ -356,7 +359,7 @@ def write_seeded() -> None:
     stored["provenance"] = provenance(
         f"transformers {transformers.__version__}", transformers_record()["revision"], "cpu",
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
-        truth="transformers reference in torch float64 through tools/torch_precision.py")
+        truth="transformers reference in torch float64 through src/_dew_torch/precision.py")
     destination = SSD / "ssd_seeded.npz"
     written = save(destination, stored, reference=f"transformers {transformers.__version__}",
                    license="Apache-2.0")
@@ -378,7 +381,8 @@ def write_interop() -> None:
     import ssd_support as support
     from recorded_references import provenance, record_case, save
     from reference_error import assert_computes_the_oracle, chain_roundings, widened
-    from torch_precision import float64_twin
+
+    from _dew_torch.precision import float64_twin
 
     tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf",
                                                            revision=support.MAMBA2_130M_HF)
@@ -411,7 +415,7 @@ def write_interop() -> None:
     stored["provenance"] = provenance(
         f"transformers {transformers.__version__}", transformers_record()["revision"], device,
         "PYTHONPATH=src:tests:tools python tools/mamba2_reference.py interop",
-        truth="transformers reference in torch float64 through tools/torch_precision.py")
+        truth="transformers reference in torch float64 through src/_dew_torch/precision.py")
     destination = SSD / "interop_seeded.npz"
     written = save(destination, stored, reference=f"transformers {transformers.__version__}",
                    license="Apache-2.0")

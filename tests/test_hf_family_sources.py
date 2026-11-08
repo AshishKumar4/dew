@@ -31,9 +31,9 @@ from interop_support import (
 )
 from reference_error import as_given, assert_as_exact
 
+from _dew_torch.precision import float64
 from dew.interop import Pretrained
 from tools.reference_source import PAD
-from tools.torch_precision import float64
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -174,7 +174,7 @@ def _reference(directory: Path):
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     def built(dtype):
         return AutoModelForCausalLM.from_pretrained(directory, dtype=dtype, attn_implementation="eager",
@@ -258,7 +258,7 @@ def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarra
     import torch
     from transformers import AutoConfig, AutoModel
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     if untrained is not None:
         assert len(untrained) <= 1
@@ -385,7 +385,7 @@ def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path)
     import torch
     from transformers import AutoModelForImageTextToText
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     directory = respelled(FIXTURES / WRAPPER, tmp_path / WRAPPER, lambda config: {
         **config, "text_config": {**config["text_config"], "max_position_embeddings": CONTEXT,

@@ -13,20 +13,23 @@ import argparse
 import json
 from pathlib import Path
 
+import flax_precision
 import jax
 import jax.numpy as jnp
 import numpy as np
 from diffusers import (
-    FlaxAutoencoderKL, FlaxDDIMScheduler, FlaxUNet2DConditionModel,
-    FlaxStableDiffusionPipeline, FlaxStableDiffusionXLPipeline,
-    FlaxStableDiffusionImg2ImgPipeline, FlaxStableDiffusionInpaintPipeline,
+    FlaxAutoencoderKL,
+    FlaxDDIMScheduler,
+    FlaxStableDiffusionImg2ImgPipeline,
+    FlaxStableDiffusionInpaintPipeline,
+    FlaxStableDiffusionPipeline,
+    FlaxStableDiffusionXLPipeline,
+    FlaxUNet2DConditionModel,
 )
 from PIL import Image
+from reference_releases import require
 from transformers import CLIPTextConfig, CLIPTokenizer, FlaxCLIPTextModel, FlaxCLIPTextModelWithProjection
 from transformers.models.clip.tokenization_clip import bytes_to_unicode
-
-import flax_precision
-from reference_releases import require
 
 
 def build(directory, task):

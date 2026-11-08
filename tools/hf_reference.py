@@ -70,6 +70,7 @@ What lands in tests/fixtures/hf:
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -156,6 +157,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 )
 
 from dew.interop.verify import BATCH, probe_ids, reference_logits, scatter_weights
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 REAL_MODEL = "Qwen/Qwen3-0.6B"
@@ -451,8 +454,9 @@ def write_minimax_m2_recordings() -> None:
     in its directory, which tests/test_hf_decoder_moe.py reads."""
     from recorded_references import record_logits
     from reference_releases import require
-    from torch_precision import float64_twin
     from transformers import FineGrainedFP8Config, MiniMaxM2ForCausalLM
+
+    from _dew_torch.precision import float64_twin
 
     release = require("minimax-m2")["transformers"]
     dequantized = {'quantization_config': FineGrainedFP8Config(dequantize=True)}
@@ -1392,7 +1396,8 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
 
     import transformers
     from recorded_references import record_logits
-    from torch_precision import float64_twin
+
+    from _dew_torch.precision import float64_twin
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     from interop_support import drawn_ids

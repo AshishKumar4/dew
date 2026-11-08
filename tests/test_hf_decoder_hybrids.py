@@ -268,8 +268,8 @@ def qwen3_next_mtp_case():
     from safetensors.torch import load_file
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from _dew_torch.precision import float64
     from tools.qwen_mtp_reference import QwenMTP, published_mtp_logits
-    from tools.torch_precision import float64
 
     config = AutoConfig.from_pretrained(QWEN3_NEXT)
     stored = load_file(str(QWEN3_NEXT / "model.safetensors"))

@@ -27,13 +27,23 @@ import transformers
 from audio_reference import audio_config, perturb, waveforms
 from safetensors.torch import save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
-from transformers import (Gemma3nAudioFeatureExtractor, Gemma3nConfig, Gemma3nProcessor,
-                          Gemma3nVisionConfig, Gemma4AudioFeatureExtractor, Gemma4Config,
-                          Gemma4ImageProcessor, Gemma4Processor, Gemma4TextConfig, Gemma4VideoProcessor,
-                          Gemma4VisionConfig, PreTrainedTokenizerFast, SiglipImageProcessor)
+from transformers import (
+    Gemma3nAudioFeatureExtractor,
+    Gemma3nConfig,
+    Gemma3nProcessor,
+    Gemma3nVisionConfig,
+    Gemma4AudioFeatureExtractor,
+    Gemma4Config,
+    Gemma4ImageProcessor,
+    Gemma4Processor,
+    Gemma4TextConfig,
+    Gemma4VideoProcessor,
+    Gemma4VisionConfig,
+    PreTrainedTokenizerFast,
+    SiglipImageProcessor,
+)
 from transformers.models.gemma3n.modeling_gemma3n import Gemma3nForConditionalGeneration
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForConditionalGeneration
-
 
 SEED = 2718
 WORDS = {0: "<pad>", 1: "</s>", 2: "<s>", 3: "<boi>", 4: "<boa>", 5: "listen", 6: "<unk>", 7: "ok",

@@ -22,7 +22,7 @@ decoding greedily one request at a time with every step's log-probabilities over
 vocabulary (`logprobs=-1`): the sentence `PROBE_TEXT` for `STEPS` tokens, its prompt's rows too
 (`prompt_logprobs=-1`), and `WINDOW` random ids, past the release's 1024-token sliding window,
 for `WINDOW_STEPS`. `probe` gathers every run's tokens. `upstream` runs vLLM's own arithmetic on the
-same tokens, the pull request's model code in float64 (tools/torch_precision.py's `float64`): the
+same tokens, the pull request's model code in float64 (src/_dew_torch/precision.py's `float64`): the
 truth every row is measured against.
 
 One run is a coin flip at a few positions of every bf16 run, vLLM's too: a rounding there moves the
@@ -51,6 +51,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURE = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'dory-1.0-4b'
 PULL = 'vllm-project/vllm#60149 at shan18/vllm 55076950b6c155f384d6766d63563c3bc20a0e3f'
@@ -318,11 +320,12 @@ def model_code(config: dict, tensors: dict, loops: int, mode: str, dtype, tf32: 
 
 def upstream(directory: Path) -> None:
     """vLLM's own model code in float64 on every run's tokens, the truth every row is measured against:
-    `model_code` built and run under tools/torch_precision.py's `float64`, prefilling each prompt and
+    `model_code` built and run under src/_dew_torch/precision.py's `float64`, prefilling each prompt and
     decoding each drawn token as the run's cache mode keeps them, each run's rows over the whole
     vocabulary (`directory/upstream-{run}.npy`)."""
     import torch
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     config, tensors = release()
     probe = np.load(directory / 'probe.npz')
@@ -558,12 +561,13 @@ LOOPS = sorted({loops for loops, _, _ in RUNS})
 
 def invariance(directory: Path) -> None:
     """The evidence each order is an exact symmetry: vLLM's own model code in float64 (`model_code`,
-    under tools/torch_precision.py's `float64`) on the sentence's prompt under every order of every
+    under src/_dew_torch/precision.py's `float64`) on the sentence's prompt under every order of every
     batch (`symmetry`, `permute`), each order's largest distance from the identity's rows over their
     largest magnitude, which float64 rounding alone moves, `invariance-{loops}.npy` `[batches, ORDERS]`
     float64 for each loop count, as many batches as any run is recorded under."""
     import torch
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     config, tensors = release()
     probe = np.load(directory / 'probe.npz')

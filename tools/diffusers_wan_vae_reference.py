@@ -36,8 +36,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import drawn_wan_vae
-from reference_vjp import recorded_vjp
 from reference_releases import RELEASES, require
+from reference_vjp import recorded_vjp
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 CONFIG = {"base_dim": 8, "z_dim": 4, "dim_mult": [1, 2, 2, 2], "num_res_blocks": 2, "attn_scales": [],

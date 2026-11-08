@@ -30,6 +30,8 @@ from transformers import (
 )
 from transformers.models.gemma3.image_processing_pil_gemma3 import Gemma3ImageProcessorPil
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 LEARNING_RATE = 1e-4
 
@@ -411,14 +413,14 @@ def write_gemma4_unified_native() -> None:
 
 def write_float64_truths(references: str, checkpoint: str) -> None:
     """The float64 truth of what `_write_forward_backward` recorded in `references` from the fixture
-    `checkpoint`'s model: its float64 twin (tools/torch_precision.py) over the same stored batch
+    `checkpoint`'s model: its float64 twin (src/_dew_torch/precision.py) over the same stored batch
     encoding, one row at a time: its logits, then its summed next-token loss, pixel gradient and logits
     after one SGD step of LEARNING_RATE, in logits_f64.npy, training_f64.json, pixel_gradient_f64.npy
     and updated_logits_f64.npy. The Dew side's checks hold Dew and the fp32 reference to it
     (tests/test_multimodal_model.py)."""
     from transformers import AutoModelForImageTextToText
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     destination, source = ROOT / references, ROOT / checkpoint
     model = AutoModelForImageTextToText.from_pretrained(source, dtype=torch.float32,

@@ -29,7 +29,7 @@ def checkout(tmp_path: Path) -> Path:
     """A checkout whose main holds one test comparing floats within a tolerance, held by the inventory, with
     main as origin/main, so tools/base_history.sh fetches nothing, and a head branch checked out."""
     root = tmp_path / "checkout"
-    for name in ("src/dew", "tools", "tests", "examples", "site"):
+    for name in ("src/dew", "src/_dew_torch", "tools", "tests", "examples", "site"):
         (root / name).mkdir(parents=True)
     for name in GATE:
         shutil.copy(TOOLS / name, root / "tools" / name)

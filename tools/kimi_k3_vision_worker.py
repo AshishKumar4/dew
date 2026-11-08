@@ -12,7 +12,7 @@ item's projected merge blocks `[h*w/4 * (t if an image), text width]`, the tower
 the language model it imports (`KimiLinearForCausalLM`, whose kernels need fla on a CUDA device), its
 attention eager (`eager_attention`, the vision config's `_attn_implementation`). Two changes, both its
 precision policy: the position table's interpolation (`get_rope_shape`) runs eagerly, not through
-`torch.compile`; and the float64 twin, built and run inside `torch_precision.float64`, reads its rotary
+`torch.compile`; and the float64 twin, built and run inside `_dew_torch.precision.float64`, reads its rotary
 table as the complex128 its widened arange makes, where the release asserts complex64
 (`_apply_rope_input_validation`), its attention's `torch.softmax(..., dtype=torch.float32)` in float64,
 and its RMS norms at the epsilon the float32 run's take (`RMSNorm(eps=None)`, float32's, which a float64
@@ -36,7 +36,9 @@ import numpy as np
 import torch
 from reference_source import ran, selected
 from reference_worker import drawn, serve
-from torch_precision import dtype_widened, float64, replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import dtype_widened, float64, replaced
 
 REPO, REVISION = "moonshotai/Kimi-K3", "f831ab66814297da540d832a5235f8e904f29d06"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf" / "kimi-k3-tiny"

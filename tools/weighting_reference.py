@@ -31,10 +31,13 @@ Run with Torch 2.14.0 CPU and NumPy:
 
 import argparse
 import importlib
+import sys
 from functools import partial
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 RECORDED = FIXTURES / "weighting" / "recorded_weights.npz"
@@ -115,7 +118,8 @@ def guided_diffusion(name: str):
 def weights(module, betas: np.ndarray, mean: str, options: dict, exact: bool) -> np.ndarray:
     """The authors' weight at every step of `betas`, read off `terms["mse"]`, at its own dtype."""
     import torch
-    from torch_precision import replaced
+
+    from _dew_torch.precision import replaced
 
     def keep_float64(array, timesteps, shape):
         result = torch.from_numpy(array)[timesteps]

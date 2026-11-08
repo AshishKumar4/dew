@@ -1868,7 +1868,7 @@
      "runs": "fla"
     }
    ],
-   "note": "The released model built and run in float64 on the CPU under tools/torch_precision.py's float64 context (`truth`), fla's kernels answered at their call boundaries by fla's own torch references (tools/fla_float64.py); no Dew imports."
+   "note": "The released model built and run in float64 on the CPU under src/_dew_torch/precision.py's float64 context (`truth`), fla's kernels answered at their call boundaries by fla's own torch references (tools/fla_float64.py); no Dew imports."
   },
   "hf/kimi-k3-tiny/orders.npz": {
    "tool": "tools/kimi_k3_reference.py",
@@ -1920,7 +1920,7 @@
      "runs": "fla"
     }
    ],
-   "note": "The released model built and run in float64 on the CPU under tools/torch_precision.py's float64 context (`truth`), fla's kernels answered at their call boundaries by fla's own torch references (tools/fla_float64.py); no Dew imports."
+   "note": "The released model built and run in float64 on the CPU under src/_dew_torch/precision.py's float64 context (`truth`), fla's kernels answered at their call boundaries by fla's own torch references (tools/fla_float64.py); no Dew imports."
   },
   "hf/kimi-linear-tiny/orders.npz": {
    "tool": "tools/kimi_linear_reference.py",
@@ -2711,7 +2711,7 @@
      "runs": "src/models vision_transformer and predictor"
     }
    ],
-   "note": "V-JEPA's image-mode encoder and mask-token predictor in its vit construction, narrowed (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-published on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "V-JEPA's image-mode encoder and mask-token predictor in its vit construction, narrowed (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-published on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "jepa/variant.npz": {
    "tool": "tools/venv_reference.py",
@@ -2722,7 +2722,7 @@
      "runs": "src/models vision_transformer and predictor"
     }
    ],
-   "note": "V-JEPA's image-mode encoder and mask-token predictor with the constructors' own LayerNorm epsilon, MLP ratio 2, odd head counts and a two-channel image (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-variant on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
+   "note": "V-JEPA's image-mode encoder and mask-token predictor with the constructors' own LayerNorm epsilon, MLP ratio 2, odd head counts and a two-channel image (tests/test_jepa_source.py CASES), run by tools/vjepa_worker.py jepa-variant on the CPU (torch 2.14.0+cpu, exact GELU) over each seed's drawn weights, images, disjoint context and target patches and cotangents: the context embeddings, the predictions and the gradients of the images and every trainable parameter, in float32 and, under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
   },
   "jit": {
    "tool": "tools/jit_reference.py",
@@ -3269,7 +3269,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "Fetched by its pin (qwen_image_seeds.npz.fetched.json). Check 1's recordings over tests/qwen_image_draws.py's draws, torch 2.14.0+cpu: each transformer case's walk summarized (record_case: the reference's evidence and its float64 truth's sketch), and the prompt encoding and the pipeline walk whole, the float32 reference and the float64 twin's truth (float64_twin, the scheduler's tables widened by float64_scheduler); the twin replaces only the source's sinusoidal frequency rounding (tools/torch_precision.py's float64_twin)."
+   "note": "Fetched by its pin (qwen_image_seeds.npz.fetched.json). Check 1's recordings over tests/qwen_image_draws.py's draws, torch 2.14.0+cpu: each transformer case's walk summarized (record_case: the reference's evidence and its float64 truth's sketch), and the prompt encoding and the pipeline walk whole, the float32 reference and the float64 twin's truth (float64_twin, the scheduler's tables widened by float64_scheduler); the twin replaces only the source's sinusoidal frequency rounding (src/_dew_torch/precision.py's float64_twin)."
   },
   "qwen_image_vae.tar.xz": {
    "tool": "tools/diffusers_qwen_image_vae_reference.py",
@@ -3360,7 +3360,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "Recorded over margin-cleared drawn rows by tools/venv_reference.py's lm-steps site under torch 2.14.0+cpu; torch AdamW and reference_runs/common.py's warmup-cosine schedule, the float64 run inside torch_precision.float64."
+   "note": "Recorded over margin-cleared drawn rows by tools/venv_reference.py's lm-steps site under torch 2.14.0+cpu; torch AdamW and reference_runs/common.py's warmup-cosine schedule, the float64 run inside _dew_torch.precision.float64."
   },
   "repa": {
    "tool": "tools/repa_reference.py",
@@ -3547,7 +3547,7 @@
      "runs": "grouped_topk"
     }
    ],
-   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-kimi on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-kimi on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "router/grouped.npz": {
    "tool": "tools/venv_reference.py",
@@ -3558,7 +3558,7 @@
      "runs": "grouped_topk"
     }
    ],
-   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-grouped on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-grouped on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "router/softmax.npz": {
    "tool": "tools/venv_reference.py",
@@ -3569,7 +3569,7 @@
      "runs": "grouped_topk"
     }
    ],
-   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-softmax on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-softmax on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
   },
   "router/unbiased.npz": {
    "tool": "tools/venv_reference.py",
@@ -3580,7 +3580,7 @@
      "runs": "grouped_topk"
     }
    ],
-   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-unbiased on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "vLLM v0.30.0's grouped_topk (its body extracted from vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py, torch path, sorted top-k) run by tools/vllm_router_worker.py router-unbiased on the CPU (torch 2.14.0+cpu) over each seed's drawn bias and 64 rows of gate logits, each clearing its choices by 1e-5 in float64: each token's weight of every expert in float32 and, under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "schedules/betas.npz": {
    "tool": "tools/beta_schedule_reference.py",
@@ -3670,7 +3670,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside src/_dew_torch/precision.py's float64."
   },
   "t5/tiny-umt5-seeds.npz": {
    "tool": "tools/t5_reference.py",
@@ -3681,7 +3681,7 @@
      "runs": "transformers"
     }
    ],
-   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny-umt5 checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny-umt5 checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside src/_dew_torch/precision.py's float64."
   },
   "tiny_diffusers.tar.xz": {
    "tool": "tools/diffusers_pipeline_reference.py",
@@ -3757,7 +3757,7 @@
      "runs": "libs/uvit_t2i.py UViT and libs/timm.py"
     }
    ],
-   "note": "U-ViT's mscoco configuration narrowed (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-published on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "U-ViT's mscoco configuration narrowed (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-published on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "uvit/variant.npz": {
    "tool": "tools/venv_reference.py",
@@ -3768,7 +3768,7 @@
      "runs": "libs/uvit_t2i.py UViT and libs/timm.py"
     }
    ],
-   "note": "U-ViT with the time MLP on, no output convolution and an odd number of heads (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-variant on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "U-ViT with the time MLP on, no output convolution and an odd number of heads (tests/test_uvit_source.py CASES) run by tools/uvit_worker.py uvit-variant on the CPU (torch 2.14.0+cpu, math attention) over each seed's drawn weights, images, text states, times and cotangent: its output and the gradients of the image, the text and every parameter, in float32 and, its float64 twin under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "v_loss/loss.npz": {
    "tool": "tools/v_loss_reference.py",
@@ -3837,7 +3837,7 @@
      "runs": "WanTransformer3DModel"
     }
    ],
-   "note": "The published tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-published on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "The published tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-published on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "wan/published-bf16.npz": {
    "tool": "tools/venv_reference.py",
@@ -3859,7 +3859,7 @@
      "runs": "WanTransformer3DModel"
     }
    ],
-   "note": "The variant tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-variant on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under torch_precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "The variant tiny Wan transformer of tests/fixtures/wan_transformer.tar.xz run by tools/wan_worker.py wan-variant on the CPU (Diffusers 0.34.0, the cohort that saved it; torch 2.14.0+cpu) over each seed's drawn latents, prompt states and cotangent at the fixture's times: the flow and the gradients of the latents, the prompt states and every parameter, in float32 and, on its float64 twin under _dew_torch.precision.widened, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
   },
   "wan/variant-bf16.npz": {
    "tool": "tools/venv_reference.py",

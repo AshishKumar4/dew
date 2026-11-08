@@ -37,9 +37,8 @@ TEXTS = ["hello world", "  spaced   out\n\tand tabbed  ", "ünïcödé — π≈
 
 def main() -> None:
     import transformers
-    from transformers import AutoTokenizer
-
     from reference_releases import require
+    from transformers import AutoTokenizer
 
     require("transformers")
     record = {"transformers": transformers.__version__, "tokenizers": {}}

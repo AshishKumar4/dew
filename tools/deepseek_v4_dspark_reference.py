@@ -68,6 +68,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deepseek_v41_reference as v41
 from decoder_export_reference import lower_index_ties
@@ -177,7 +179,7 @@ def build(module, seed: int, widen: bool = False):
     """The toy Transformer in fp32, or fp64 when `widen`, with its fp32
     weights drawn and each hash row a fresh permutation of the experts
     truncated to the top-k, so a token takes two distinct experts."""
-    from torch_precision import float64
+    from _dew_torch.precision import float64
 
     torch.manual_seed(seed)
     # Built inside the shared `float64` when widened, so every value its constructor computes is
@@ -261,7 +263,7 @@ def widened_transformers(module):
     transformers adds, `.to(torch.float32)` and the compressors'
     `softmax(dtype=torch.float32)` (modeling_deepseek_v4.py:57, :408, :540,
     :665), each made float64."""
-    from torch_precision import dtype_widened, replaced, widened_to
+    from _dew_torch.precision import dtype_widened, replaced, widened_to
 
     with replaced((torch.Tensor, "to", widened_to(torch.Tensor.to)),
                   (torch.Tensor, "softmax", dtype_widened(torch.Tensor.softmax))), v41.widened(module):

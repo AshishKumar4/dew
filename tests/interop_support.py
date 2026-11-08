@@ -140,11 +140,11 @@ def assert_exported_decoder_follows_transformers(loaded, directory: Path, draw, 
 
 def torch_arms(reference, truth, *, widening=None):
     """Check 1's reference and truth over torch: `reference(*inputs)` and `truth(*inputs)`, each run
-    `as_given` under `torch.no_grad`, the truth inside `widening` (`tools.torch_precision.float64` where
+    `as_given` under `torch.no_grad`, the truth inside `widening` (`_dew_torch.precision.float64` where
     None), their tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly."""
     import torch
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     def as_numpy(out):
         if not isinstance(out, torch.Tensor):
@@ -168,12 +168,12 @@ def torch_arms(reference, truth, *, widening=None):
 def transformers_arms(model, run, *, source=None, twin=None):
     """Check 1's reference and truth over the transformers `model` (`torch_arms`): `run(model, *inputs)` on
     a draw's inputs as torch tensors (integers as int64), by `model` and by the float64 twin
-    (`tools.torch_precision.float64_twin`) of `source`, by default `model`. A narrower `model` (bfloat16)
+    (`_dew_torch.precision.float64_twin`) of `source`, by default `model`. A narrower `model` (bfloat16)
     is measured from its stored weights' truth: `source`, the float32 load. `twin` is the twin itself where
     the reference builds its own (a PEFT model's)."""
     import torch
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     def tensor(value):
         value = np.asarray(value)
@@ -186,7 +186,7 @@ def transformers_arms(model, run, *, source=None, twin=None):
 
 
 def peft_twin(model):
-    """A PEFT model's float64 twin (`tools.torch_precision.float64_twin`): the same base and adapter
+    """A PEFT model's float64 twin (`_dew_torch.precision.float64_twin`): the same base and adapter
     built inside `float64` by transformers' and PEFT's own builders, so every value their constructors
     compute is float64's (the rotary tables' among them), loaded with `model`'s weights, to run inside
     `float64` (`transformers_arms`' `twin`)."""
@@ -196,7 +196,7 @@ def peft_twin(model):
     from peft import get_peft_model
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     def build():
         config = copy.deepcopy(model.get_base_model().config)
@@ -556,7 +556,7 @@ def assert_decodes_as_it_scores(loaded, label: str, *, seeds: int, prefill: int,
 
 def torch_logits(source, precision=None):
     """A transformers causal LM's logits over int ids as float64 numpy, inside `precision` (a context
-    manager factory, `tools.torch_precision.float64` for a float64 twin, whose code's float32 casts it
+    manager factory, `_dew_torch.precision.float64` for a float64 twin, whose code's float32 casts it
     widens), with no gradient."""
     import contextlib
 
@@ -591,7 +591,7 @@ def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seed
     import torch
     from flax.traverse_util import flatten_dict
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     padded = lookup.padding_idx is not None
     assert model.padding_idx == lookup.padding_idx in (pad, None)

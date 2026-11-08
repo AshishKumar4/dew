@@ -35,11 +35,14 @@ fixture's tokenizer.
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 AUDIO_FIXTURE = FIXTURES / "mimo-audio-tiny"
@@ -147,7 +150,7 @@ def write(directory: Path, config: dict, tower: dict, projector: dict, arrays: d
 def write_mimo_vision_tiny() -> None:
     """MiMo ViT: the trunk sequence (the merger's input, caught by a hook) and the merger's output,
     the merger's biases zero as the release stores none."""
-    from torch_precision import float64
+    from _dew_torch.precision import float64
 
     modeling = mimo_module()
     config = SimpleNamespace(**MIMO_VISION)
@@ -214,7 +217,8 @@ def record_mimo_vision() -> None:
     float32 and float64, recorded for check 1 (`record_case`)."""
     from recorded_references import provenance, record_case, save
     from safetensors.torch import load_file
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     modeling = mimo_module()
     config = SimpleNamespace(**MIMO_VISION)
@@ -294,7 +298,8 @@ def record_mimo_audio() -> None:
     30 frames, and each drawn clip's encoded groups, in float32 and float64 (`record_case`, summarized:
     the test's float64 runs are held to the truths' sketches)."""
     from recorded_references import provenance, record_case, save
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     modeling = mimo_module()
     with np.load(AUDIO_FIXTURE / "model.npz") as stored:
@@ -376,7 +381,7 @@ def audio_tokenized(modeling, modules, mels, dtype, bound):
 
 
 def write_mimo_audio_tiny() -> None:
-    from torch_precision import float64
+    from _dew_torch.precision import float64
 
     modeling = mimo_module()
     torch.manual_seed(1234)
@@ -442,8 +447,9 @@ def record_mimo_images() -> None:
     from PIL import Image
     from recorded_references import provenance, record_case, save
     from reference_source import github, loaded
-    from torch_precision import float64
     from transformers import AutoTokenizer
+
+    from _dew_torch.precision import float64
 
     module = loaded("mimo_v2_omni", github("vllm-project/vllm", VLLM_COMMIT, VLLM_PROCESSOR, VLLM_DIGEST))
     directory = FIXTURES / "mimo-v2-vl-tiny"

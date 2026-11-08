@@ -13,9 +13,10 @@ from safetensors.numpy import load_file
 from transformers import DeepseekV4Config, DeepseekV4ForCausalLM
 from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-    DeepseekV4HashRouter, DeepseekV4RMSNorm, DeepseekV4TopKRouter,
+    DeepseekV4HashRouter,
+    DeepseekV4RMSNorm,
+    DeepseekV4TopKRouter,
 )
-
 
 # deepseek-ai/DeepSeek-V4-Flash at toy width. The release's proportions on a
 # hidden width of 32: moe_intermediate_size half the width (16), the query
@@ -290,6 +291,7 @@ def write_deepseek_v4_config(name: str, repo: str) -> None:
     goes unread.
     """
     from hf_reference import FIXTURES, write_config, write_provenance
+
     from dew.interop.verify import reference_logits
 
     directory = FIXTURES / name

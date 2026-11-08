@@ -53,6 +53,7 @@ precision, so its own float64 path is no truth for a summary to check.
 from __future__ import annotations
 
 import math
+import sys
 import types
 from pathlib import Path
 
@@ -61,7 +62,9 @@ import numpy as np
 import torch
 from reference_source import definitions
 from torch.nn.utils.spectral_norm import SpectralNorm
-from torch_precision import float_as, replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float_as, replaced
 
 STYLEGAN_T = ("https://raw.githubusercontent.com/autonomousvision/stylegan-t/"
               "36ab80ce76237fefe03e65e9b3161c040ae888e3/")

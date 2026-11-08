@@ -124,7 +124,7 @@ def contract_run(inputs) -> dict:
 
 def diffusers_contract(*, wide: bool):
     """Diffusers' own VAE over a draw's frames, each encoded as its own image, in float32 or (its float64 twin
-    under `torch_precision.widened`) float64: the latents SD3's img2img pipeline draws and normalizes
+    under `_dew_torch.precision.widened`) float64: the latents SD3's img2img pipeline draws and normalizes
     (`pipeline_stable_diffusion_3_img2img.py:700-702`: `retrieve_latents` of `vae.encode`, its
     `randn_tensor` handed the draw's `noise`, then `(z - shift_factor) * scaling_factor`), the normalized
     mean, and the frames its `vae.decode` makes of that mean taken back SD3's way
@@ -137,7 +137,7 @@ def diffusers_contract(*, wide: bool):
     from diffusers.models.autoencoders import vae as diffusers_vae
     from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import retrieve_latents
 
-    from tools.torch_precision import float64_twin, widened
+    from _dew_torch.precision import float64_twin, widened
 
     model = AutoencoderKL.from_pretrained(FIXTURES / "sd3-tiny").eval()
     model = float64_twin(model) if wide else model

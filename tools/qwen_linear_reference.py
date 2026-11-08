@@ -47,7 +47,8 @@ import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5TextRotaryEmbedding, torch_chunk_gated_delta_rule,
+    Qwen3_5TextRotaryEmbedding,
+    torch_chunk_gated_delta_rule,
     torch_recurrent_gated_delta_rule,
 )
 

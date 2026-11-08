@@ -250,8 +250,8 @@ def published_mtp_arms(loaded):
     from safetensors.torch import load_file
     from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 
+    from _dew_torch.precision import float64
     from tools.qwen_mtp_reference import QwenMTP, published_mtp_logits
-    from tools.torch_precision import float64
 
     config = AutoConfig.from_pretrained(loaded.source)
     config._attn_implementation = "eager"

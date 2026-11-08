@@ -153,7 +153,7 @@ def test_a_vae_encoder_is_as_exact_as_diffusers(batch, backward):
     import torch
     from diffusers import AutoencoderKL
 
-    from tools.torch_precision import float64_twin, widened as widened_torch
+    from _dew_torch.precision import float64_twin, widened as widened_torch
     from tools.vae_encoder_reference import CONFIG, SIZE, walk
 
     with np.load(VAE_ENCODER) as loaded:

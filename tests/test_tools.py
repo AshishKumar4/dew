@@ -2329,7 +2329,7 @@ def test_a_float64_twin_rotates_by_its_whole_complex_table():
     product of its input and the table, which a table cast to a real dtype is not."""
     import torch
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     class Rotation(torch.nn.Module):
         def __init__(self):
@@ -2351,7 +2351,7 @@ def test_a_float64_twin_rotates_by_its_whole_complex_table():
 
 FRESH_DEVICE_CONTEXT = """
 import torch
-from tools.torch_precision import dtype_widened, replaced
+from _dew_torch.precision import dtype_widened, replaced
 
 with replaced((torch, "arange", dtype_widened(torch.arange))):
     with torch.device("meta"):
@@ -2375,11 +2375,11 @@ def test_a_replaced_constructor_leaves_device_contexts_their_own_in_a_fresh_proc
 
 
 def test_a_float64_truth_takes_a_tensors_float32_softmax_in_float64():
-    """A reference's float64 truth (`tools.torch_precision.float64`) widens a softmax pinned to float32,
+    """A reference's float64 truth (`_dew_torch.precision.float64`) widens a softmax pinned to float32,
     the tensor method's as the function's: the softmax it computes is float64's own."""
     import torch
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     logits = torch.tensor([[0.17, -1.32, 0.91, 2.14]], dtype=torch.float64)
     with float64():

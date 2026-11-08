@@ -139,12 +139,12 @@ T5_SMALL_SEEDS = 8
 def test_the_real_checkpoint_matches_the_reference():
     """t5-small's encoder, fp32, from the checkpoint's own safetensors, on par
     with transformers' fp32 over drawn ids (check 1), both measured from
-    transformers' run in float64, built and run inside `torch_precision.float64`.
+    transformers' run in float64, built and run inside `_dew_torch.precision.float64`.
     This is the v1.0 relu feed-forward; the tiny fixture covers gated-gelu."""
     import torch
     from transformers import T5EncoderModel
 
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     repo = "google-t5/t5-small"
     reference_model = T5EncoderModel.from_pretrained(repo, dtype=torch.float32).eval()

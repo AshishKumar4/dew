@@ -9,6 +9,7 @@ import argparse
 import dataclasses
 import functools
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -19,6 +20,8 @@ from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 from dew._accuracy import distance
 from dew.interop import Pretrained
 from dew.sampling.text import Sampling
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 CONTINUATION = 3
 """Greedy tokens each batch continues by, Dew's and the reference's."""
@@ -75,7 +78,7 @@ class Runs:
 
     def truth(self, batch) -> np.ndarray:
         """The batch's logits in float64, on the CPU: the float64 model's (`checkpoint_runs`)."""
-        from tools.torch_precision import float64
+        from _dew_torch.precision import float64
 
         with float64(), torch.no_grad():
             return self.wide_model(**tensors(batch), use_cache=False).logits.double().numpy()
@@ -111,7 +114,7 @@ def checkpoint_runs(checkpoint, revision) -> Runs:
     them, are computed in float64 rather than widened from float32, and every float32 pin in it (norms,
     softmax, a pooler's or standardizer's casts) is widened; its experts, where it has them, run one at a
     time, as Torch's grouped GEMM takes no float64; the fp32 checkpoint's weights load into it exactly."""
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
     reference = AutoModelForImageTextToText.from_pretrained(

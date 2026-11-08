@@ -721,9 +721,9 @@ def test_a_vlms_text_decoder_loads_as_the_family_it_follows(tmp_path, model_type
     from reference_error import as_given, assert_as_exact
     from transformers import AutoConfig, AutoModelForImageTextToText
 
+    from _dew_torch.precision import float64, float64_twin
     from dew.interop import Pretrained
     from dew.interop.verify import scatter_weights
-    from tools.torch_precision import float64, float64_twin
 
     config = AutoConfig.for_model(model_type, image_token_id=255, video_token_id=254,
                                   vision_start_token_id=253, vision_end_token_id=252, **VLM_TEXT[model_type])

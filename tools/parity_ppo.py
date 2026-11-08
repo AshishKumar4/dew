@@ -1,7 +1,7 @@
 """Record PPO actor/critic losses, gradients and GAE using installed pinned verl."""
 
-from importlib.metadata import distribution
 import json
+from importlib.metadata import distribution
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +12,9 @@ REVISION = "d040717b21af2e23e8e789a3e354cff2394ae2de"
 def main() -> None:
     import torch
     from verl.trainer.ppo.core_algos import (
-        compute_gae_advantage_return, compute_policy_loss_vanilla, compute_value_loss,
+        compute_gae_advantage_return,
+        compute_policy_loss_vanilla,
+        compute_value_loss,
     )
     from verl.workers.config.actor import ActorConfig
 
@@ -37,6 +39,7 @@ def main() -> None:
     loss.backward()
     assert current.grad is not None and predicted.grad is not None
     from importlib import import_module
+
     import jax
 
     native = import_module("test_ppo")

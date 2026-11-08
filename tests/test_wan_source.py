@@ -201,7 +201,7 @@ def sources(walk):
     from diffusers import WanPipeline
     from diffusers.schedulers import scheduling_unipc_multistep
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     with pytest.MonkeyPatch.context() as patched:
         patched.syspath_prepend(str(ROOT / "tools"))

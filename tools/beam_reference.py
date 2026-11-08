@@ -32,13 +32,17 @@ raised to the penalty), and the settings.
 from __future__ import annotations
 
 import json
+import sys
 import types
+from pathlib import Path
 
 import numpy as np
 import torch
 import transformers.generation.utils as generation
 from numerics_reference import FIXTURES, decoder, prompts
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64, float64_twin
 
 FAMILIES = ("llama-tiny", "qwen3-tiny")
 WIDTH, NEW_TOKENS = 3, 6

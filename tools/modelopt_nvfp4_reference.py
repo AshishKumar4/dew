@@ -41,6 +41,8 @@ import numpy as np
 import requests
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 # CUDA torch must load before the pinned transformers environment's CPU
 # torch can appear on sys.path. The same kernel then serves both references.
 sys.path.insert(0, str(Path.home() / ".cache/dew/reference-venvs/nvfp4-storage/lib/python3.12/site-packages"))
@@ -136,7 +138,7 @@ def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
 
 
 def tiny(*, mixed: bool = False) -> None:
-    from torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     torch.manual_seed(2049)
     config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=1,

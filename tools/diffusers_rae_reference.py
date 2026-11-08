@@ -65,6 +65,8 @@ import numpy as np
 import torch
 from reference_releases import RELEASES, require
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 DIFFUSERS, TRANSFORMERS = RELEASES["rae"]["diffusers"], RELEASES["rae"]["transformers"]
 DECODER = {"decoder_hidden_size": 64, "decoder_num_hidden_layers": 2, "decoder_num_attention_heads": 4,
            "decoder_intermediate_size": 128}
@@ -171,7 +173,8 @@ def from_published(cls, repo: str, revision: str):
 
 def published(destination: str) -> None:
     from diffusers import AutoencoderRAE
-    from torch_precision import float64, float64_twin
+
+    from _dew_torch.precision import float64, float64_twin
 
     def walk(model, dtype):
         grid = model.config.encoder_input_size // model.config.encoder_patch_size

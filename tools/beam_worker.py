@@ -8,18 +8,21 @@ IN holds each draw's `<draw>.ids` `[prompts, length]`, unpadded. OUT gets, for e
 `SETTINGS` (`case_<i>`), `<draw>.reference.<leaf>` and `<draw>.truth.<leaf>`: every prompt's returned beams'
 scores (`case_<i>`, `sequences_scores`), their generated tokens padded to the budget (`tokens_<i>`) and
 whether each ended on EOS (`ended_<i>`), in float32 and in float64 (the float64 twin built and run inside
-`torch_precision.float64`), under the checkpoint's recorded EOS and pad (its `beam.npz`).
+`_dew_torch.precision.float64`), under the checkpoint's recorded EOS and pad (its `beam.npz`).
 """
 
 import contextlib
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 from beam_reference import SETTINGS, searched
 from numerics_reference import FIXTURES, decoder
 from reference_worker import drawn, serve
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64, float64_twin
 
 
 def run(name: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:

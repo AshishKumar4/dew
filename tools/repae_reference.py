@@ -57,6 +57,7 @@ import copy
 import functools
 import json
 import math
+import sys
 import tarfile
 import types
 from collections import OrderedDict
@@ -73,9 +74,11 @@ from lpips_weights import drawn_weights
 from recorded_draws import Tape, TorchDraws
 from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
-from torch_precision import float_as, replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from torchvision import models
 
+from _dew_torch.precision import float_as, replaced
 from dew.diffusion import presets
 
 REPOSITORY = "https://raw.githubusercontent.com/End2End-Diffusion/REPA-E/2ad4e9f69234c109497fb41d3e5e555de7b4b0de/"

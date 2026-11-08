@@ -20,6 +20,7 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
     PYTHONPATH=src ~/.cache/dew/reference-venvs/nvfp4-storage/bin/python tools/nvfp4_qdq_reference.py
 """
 
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,8 +32,11 @@ from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
 from nvfp4_storage_reference import ARGS, compress
 from safetensors.torch import save_file
-from torch_precision import float64, float64_twin, native
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
+
+from _dew_torch.precision import float64, float64_twin, native
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "nvfp4_qdq"
 

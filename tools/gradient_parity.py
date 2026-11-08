@@ -1,5 +1,5 @@
-"""Measure `dew.interop.verify._GRADIENT_PARITY` and `_LOGITS_PARITY`: how much farther transformers'
-float32 gradient of every parameter, and its float32 logits, are from the float64 truth than Dew's on
+"""Report tier 2's check-1 verdicts (`dew.parity`): whether Dew's float32 gradient of every parameter,
+and its float32 logits, are on par with transformers' own float32 ones from the source's float64 twin, on
 tier 2's probe (`verify.gradient_parity`, `verify.logits_parity`).
 
 The gradients are measured over the causal LM types transformers builds whose every part Dew knows
@@ -8,11 +8,11 @@ the probe's shrunken sizes with the probe's weights (`verify.shrink`, `verify.sc
 assembled from parts, and its gradients compared as the probe compares them. The logits are measured
 over the same types and compositions as the probe compares them, each read as tier 2 reads it: from
 parts, or a type whose attention no part is by the registered family it verifies as (`CONVENTIONS`).
-Prints each one's measures and the largest (`verify._GRADIENT_PARITY` sits orders of magnitude above
-its; `verify._LOGITS_PARITY` is twice the largest over these, the released configs and the tests').
+Prints each one's seeds where check 1 holds both on par, or the leaves it finds not on par.
 
     python tools/gradient_parity.py
 """
+import copy
 import sys
 import tempfile
 from pathlib import Path
@@ -20,6 +20,9 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import widened_config
+from dew import parity
 from dew.interop import decoder_parts, hf_decoders, parts, sources, verify
 from dew.interop.decoder_families import ENTRIES
 from dew.registry import models
@@ -58,10 +61,10 @@ CONVENTIONS = {"seed_oss": "qwen2"}
 """Each type that assembles from no parts by the registered family the probe verifies it as."""
 
 
-def measured(model_type: str, built=None) -> tuple[float, float] | str:
-    """The type's gradient and logits measures (`built` of its shrunken config, transformers' own model
-    where None), the logits read by its `CONVENTIONS` family where it has one, or why it is not one Dew
-    reads."""
+def measured(model_type: str, built=None) -> tuple[int, int] | str:
+    """The seeds check 1 holds the type's gradients and its logits on par over (`built` of its shrunken
+    config, transformers' own model where None), the logits read by its `CONVENTIONS` family where it has
+    one, or why it is not one Dew reads, or the leaves check 1 finds not on par."""
     config = verify.shrink({"model_type": model_type, **FIELDS})
     shrunk = AutoConfig.for_model(model_type, **config)
     reference = (AutoModelForCausalLM.from_config(shrunk, dtype=torch.float32) if built is None
@@ -70,9 +73,9 @@ def measured(model_type: str, built=None) -> tuple[float, float] | str:
     reference.set_attn_implementation("eager")
     # Its eval forward, as the probe runs it: Seed-OSS drops its sublayers' outputs in training.
     reference.eval()
-    ids = verify.probe_ids(shrunk.vocab_size)
-    with torch.no_grad():
-        expected = reference(torch.as_tensor(ids, dtype=torch.long), use_cache=False).logits.numpy()
+    probed = verify._Source(reference, verify.source_twin(
+        reference, lambda: (AutoModelForCausalLM.from_config(widened_config(copy.deepcopy(shrunk)))
+                            if built is None else built(widened_config(copy.deepcopy(shrunk))))))
     if model_type in CONVENTIONS:
         family = next(entry for entry in ENTRIES if CONVENTIONS[model_type] in entry.model_types)
         record = decoder_parts.translate_family_config({**config, "model_type": model_type}, family)[0]
@@ -88,20 +91,22 @@ def measured(model_type: str, built=None) -> tuple[float, float] | str:
         reference.save_pretrained(folder)
         variables = hf_decoders.translate_weights(sources.load_shards(Path(folder)), record, family)
     model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
-    return (verify.gradient_parity(reference, family, record, variables),
-            verify.logits_parity(expected, model, record, variables, ids))
+    try:
+        return (verify.gradient_parity(probed, family, record, variables, f"{model_type}'s gradients"),
+                verify.logits_parity(probed.logits, model, variables, f"{model_type}'s logits"))
+    except parity.GateFailure as failure:
+        return f"not on par: {failure}"
 
 
-def main() -> None:
-    measures = {}
+def main() -> int:
+    failed = []
     for name, (model_type, built) in {**{name: (name, None) for name in TYPES}, **COMPOSITIONS}.items():
         result = measured(model_type, built)
         print(f"{name}: {result}")
-        if isinstance(result, tuple):
-            measures[name] = result
-    for index, kind in enumerate(("gradients", "logits")):
-        worst = max(measures, key=lambda name: measures[name][index])
-        print(f"largest {kind}: {measures[worst][index]:.3f} ({worst}) over {len(measures)} types")
+        if str(result).startswith("not on par"):
+            failed.append(name)
+    print(f"not on par: {failed or 'none'}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

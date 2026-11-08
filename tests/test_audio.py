@@ -66,8 +66,8 @@ def assert_bf16_tower_on_par(path, model, variables, features, real):
     from safetensors.torch import load_file as load_torch
     from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 
+    from _dew_torch.precision import float64_twin, widened
     from tools.audio_reference import audio_config as reference_config
-    from tools.torch_precision import float64_twin, widened
 
     config = reference_config("gemma4")
     config._attn_implementation = "sdpa"
@@ -150,9 +150,9 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
     import torch
     from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 
+    from _dew_torch.precision import float64
     from dew.nn.audio import AudioFeedForward, AudioLightConv, _clippable
     from tools import audio_reference
-    from tools.torch_precision import float64
 
     config = audio_reference.audio_config("gemma4")
     config.hidden_act = "quick_gelu"

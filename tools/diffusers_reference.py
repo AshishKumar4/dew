@@ -43,10 +43,17 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 import numpy as np
 import torch
 from diffusers.schedulers import (
-    scheduling_deis_multistep, scheduling_dpmsolver_multistep, scheduling_dpmsolver_singlestep,
-    scheduling_edm_dpmsolver_multistep, scheduling_k_dpm_2_ancestral_discrete,
-    scheduling_k_dpm_2_discrete, scheduling_lcm, scheduling_lms_discrete, scheduling_pndm,
-    scheduling_tcd, scheduling_unipc_multistep,
+    scheduling_deis_multistep,
+    scheduling_dpmsolver_multistep,
+    scheduling_dpmsolver_singlestep,
+    scheduling_edm_dpmsolver_multistep,
+    scheduling_k_dpm_2_ancestral_discrete,
+    scheduling_k_dpm_2_discrete,
+    scheduling_lcm,
+    scheduling_lms_discrete,
+    scheduling_pndm,
+    scheduling_tcd,
+    scheduling_unipc_multistep,
 )
 from diffusers_reference_helpers import fed_noise as fed_noise, step_noise as step_noise
 

@@ -16,7 +16,7 @@ PyTorch twin alone, and the Flax pipelines themselves cannot be built here.
 
 `flax_unet` is the declared Flax UNet as a JAX function, `unet_predictor` runs the
 declared UNet (Flax or PyTorch) on the host, and `denoiser` a
-declared PyTorch denoiser, in float32 or in float64 (`torch_precision.float64`
+declared PyTorch denoiser, in float32 or in float64 (`_dew_torch.precision.float64`
 for PyTorch, x64 and `flax_precision.float64` for Flax), for a forward the
 caller holds Dew's to by tests/reference_error.py's rule.
 """
@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -35,7 +36,9 @@ import torch
 
 from tools import flax_precision
 from tools.diffusers_reference_helpers import restore_transformers_names
-from tools.torch_precision import float64
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64
 
 # Diffusers' own classes read what Dew wrote, through its pipeline modules.
 restore_transformers_names()

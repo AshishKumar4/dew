@@ -11,7 +11,8 @@ IN holds each draw's `latents` `[B, C, T, H, W]`, `context` `[B, L, D]`, `times`
 cotangent of the flow. OUT gets `<draw>.reference.<leaf>` and `<draw>.truth.<leaf>`: for `wan-CASE`, the
 case's `output` and the `gradients` of `sum(output * probe)` with respect to the latents, the prompt states
 and every parameter by sorted name, concatenated (`diffusers_wan_reference.walk`), in float32 and, on its
-float64 twin under `torch_precision.widened`, in float64; for `wan-bf16-CASE`, the flow alone, the model read
+float64 twin under `_dew_torch.precision.widened`, in float64; for `wan-bf16-CASE`, the flow alone, the model
+read
 in bfloat16 (its time embedder kept in float32, as Diffusers keeps it) and in float64.
 """
 
@@ -23,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_worker import drawn, serve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 ARCHIVE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "wan_transformer.tar.xz"
 
@@ -49,7 +52,7 @@ def run(site: str, directory: Path, cases: dict[str, np.ndarray]) -> dict[str, n
     """Every draw's flow (and gradients), at the site's narrow precision and in float64."""
     from diffusers import WanTransformer3DModel
 
-    from tools.torch_precision import float64_twin, widened
+    from _dew_torch.precision import float64_twin, widened
 
     half = site.startswith("wan-bf16-")
     case = site.removeprefix("wan-bf16-" if half else "wan-")

@@ -34,7 +34,7 @@ pythons	"$PYTHON" tools/armada/ci.py pythons --check
 # pyright runs on Node, whose default heap limit follows the machine's memory: 2,240 MiB on an armada medium
 # container (12 GiB), where checking src/dew ran out of heap. With 8 GiB it passed, the task peaking at 4.3 GiB;
 # 8 GiB also fits GitHub's runner (16 GiB), so both check alike.
-pyright	NODE_OPTIONS=--max-old-space-size=8192 uvx pyright@1.1.406 --pythonpath "$(command -v "$PYTHON")" src/dew
+pyright	NODE_OPTIONS=--max-old-space-size=8192 uvx pyright@1.1.406 --pythonpath "$(command -v "$PYTHON")" src/dew src/_dew_torch
 # Main still holds structural copies (ledger 896-1287, 1309), so a checkout is held to adding none to origin/main's,
 # whose history a shallow checkout fetches first; main holds no text copy, so any fails.
 duplicate-text	"$PYTHON" tools/duplicates.py --reading=text $duplicate_roots

@@ -8,7 +8,7 @@ the timestep it divides by a thousand, and the distilled guidance. Every case
 records the forward, the vector-Jacobian products against a fixed cotangent
 for the latent and the text states, and the gradient of every parameter,
 unmodified, in float32, the reference, and in float64, the truth
-(`torch_precision.float64`: the source's float32 pins widened). Every
+(`_dew_torch.precision.float64`: the source's float32 pins widened). Every
 other walk below is recorded the same two ways.
 
 Every parameter is moved off its initialization, so the RMS norms' scales
@@ -40,7 +40,9 @@ import numpy as np
 import torch
 from diffusers_reference_helpers import flux2_ids, perturb, recording, saved_pipeline, tiny_qwen3_encoder
 from reference_releases import RELEASES
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64, float64_twin
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,

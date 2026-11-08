@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import types
 from pathlib import Path
 
@@ -37,7 +38,9 @@ import jax
 import numpy as np
 import torch
 from reference_source import fetched, stub_torch_utils
-from torch_precision import float64
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64
 
 COMMIT = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm2/{COMMIT}/training/networks_edm2.py"

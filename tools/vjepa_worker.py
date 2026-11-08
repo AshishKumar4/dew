@@ -14,17 +14,20 @@ each image's context patches (`context`), the mask-token predictor's `prediction
 JEPA step calls them, and the `gradients` of `sum(context * probe) + sum(predictions * probe)` with
 respect to the images and every trainable parameter in sorted name order, concatenated. Image-mode
 (`num_frames=1`) models; the blocks run V-JEPA's own exact (erf) GELU, as Dew's JEPA does. The float64
-run is under `torch_precision.widened`, under which the sincos tables are generated in float64 too.
+run is under `_dew_torch.precision.widened`, under which the sincos tables are generated in float64 too.
 """
 
 import importlib
 import sys
 from functools import cache, partial
+from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import package, published_files
 from reference_worker import drawn, serve
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO, COMMIT = "facebookresearch/jepa", "51c59d518fc63c08464af6de585f78ac0c7ed4d5"
 FILES = {
@@ -89,7 +92,7 @@ def walked(encoder, predictor, inputs: dict[str, np.ndarray], dtype) -> dict[str
 
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's outputs and gradients under its configuration and weights, in float32 and float64."""
-    from torch_precision import widened
+    from _dew_torch.precision import widened
 
     def answer(inputs):
         config = {key.removeprefix("config."): value.item() for key, value in inputs.items()

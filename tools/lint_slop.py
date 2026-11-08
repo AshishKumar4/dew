@@ -50,7 +50,7 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP022 is about every file outside `src/<package>`, where the torch
   float64 truths are: a torch module is never promoted to float64 after its
   construction, which keeps what its constructor computed in float32; its
-  twin is built inside tools/torch_precision.py's `float64`
+  twin is built inside src/_dew_torch/precision.py's `float64`
   (`lint_promotions`).
 - SLOP024 is about `src/<package>`: a JAX array is never divided by a literal
   that is no power of two, which XLA computes as a product with the literal's
@@ -2141,9 +2141,11 @@ def checked(file: tuple[Path, str, str]) -> list[Finding]:
 
 
 def default_roots(package: str) -> list[str]:
-    """What the gate reads when it names no roots: the package's source and every script, the site's
-    and the docs' generators and kernel packages among them."""
-    return [f"src/{package}", "tests", "tools", "recipes", "examples", "site", "docs/assets", "kernels"]
+    """What the gate reads when it names no roots: the package's source, the torch-only precision package
+    beside it (`_dew_torch`), and every script, the site's and the docs' generators and kernel packages
+    among them."""
+    return [f"src/{package}", "src/_dew_torch", "tests", "tools", "recipes", "examples", "site",
+            "docs/assets", "kernels"]
 
 
 def main(argv: Sequence[str] | None = None, forked: bool = False) -> int:

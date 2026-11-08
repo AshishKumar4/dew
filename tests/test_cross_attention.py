@@ -126,7 +126,7 @@ def idefics_block(wide: bool):
     from transformers.models.idefics.configuration_idefics import IdeficsConfig
     from transformers.models.idefics.modeling_idefics import IdeficsGatedCrossAttentionLayer
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     @functools.cache
     def built(dtype):

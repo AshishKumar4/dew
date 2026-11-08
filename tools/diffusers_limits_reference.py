@@ -35,15 +35,17 @@ import jax.numpy as jnp
 import mpmath as mp
 import numpy as np
 import torch
+from diffusers.schedulers import (
+    scheduling_deis_multistep,
+    scheduling_dpmsolver_multistep,
+    scheduling_dpmsolver_singlestep,
+)
 from diffusers.schedulers.scheduling_deis_multistep import DEISMultistepScheduler
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from diffusers.schedulers.scheduling_dpmsolver_singlestep import DPMSolverSinglestepScheduler
 from diffusers.schedulers.scheduling_k_dpm_2_ancestral_discrete import KDPM2AncestralDiscreteScheduler
 from diffusers.schedulers.scheduling_k_dpm_2_discrete import KDPM2DiscreteScheduler
 from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
-from diffusers.schedulers import (
-    scheduling_deis_multistep, scheduling_dpmsolver_multistep, scheduling_dpmsolver_singlestep,
-)
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "diffusers"
 START = np.array([[1.2, -0.7]], np.float32)

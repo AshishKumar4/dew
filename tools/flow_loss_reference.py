@@ -25,6 +25,7 @@ lands here too.
 
 from __future__ import annotations
 
+import sys
 import types
 from pathlib import Path
 
@@ -33,7 +34,9 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_loss_weighting_for_sd3
 from reference_source import fetched, selected, simple_statements
-from torch_precision import float_as, replaced
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float_as, replaced
 
 SCRIPT = ("https://raw.githubusercontent.com/huggingface/diffusers/50dea89dc6036e71a00bc3d57ac062a80206d9eb/"
           "examples/dreambooth/train_dreambooth_flux.py")

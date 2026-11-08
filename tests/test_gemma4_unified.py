@@ -27,10 +27,10 @@ from transformers import (
 )
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 
+from _dew_torch.precision import float64
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from tools.multimodal_reference import _row_slices, unified_draw
-from tools.torch_precision import float64
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma4-unified-native-tiny"
 

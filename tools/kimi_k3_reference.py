@@ -42,7 +42,7 @@ experts, SiTU with the release's betas. Like the release, `A_log` is stored
 zero-padded from the KDA heads to the KDA head dim (96 heads to 128 there).
 
 `truth` writes numerics.npz beside reference.npz: the same released model
-built and run in float64 on the CPU under tools/torch_precision.py's
+built and run in float64 on the CPU under src/_dew_torch/precision.py's
 `float64`, holding the fixture's weights, fla's kernels answered at their
 call boundaries by fla's own torch references (tools/fla_float64.py), which
 tests/test_kimi_k3.py measures Dew and the reference from: the logits, the
@@ -64,6 +64,8 @@ import numpy as np
 import torch
 from reference_source import config_lookups, hub_modules, record_padding
 from safetensors.torch import save_file
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO = "moonshotai/Kimi-K3"
 REVISION = "f831ab66814297da540d832a5235f8e904f29d06"
@@ -221,7 +223,8 @@ def matmul_precision() -> str:
     """What each array file records of this run's matmuls (`recorded_matmuls`), fla's intra-chunk
     solve among them."""
     from fla.ops.kda import chunk_intra
-    from torch_precision import recorded_matmuls
+
+    from _dew_torch.precision import recorded_matmuls
 
     solve = chunk_intra.SOLVE_TRIL_DOT_PRECISION
     return recorded_matmuls(**{"the intra-chunk solve": str(getattr(solve, "value", solve))})
@@ -321,11 +324,13 @@ def released_model(configuration, modeling, config: dict, tensors: dict[str, tor
 
 def truth(directory: Path) -> dict[str, np.ndarray]:
     """The float64 truth of the K3 fixture at `directory` (`float64_truth`): the released model built and
-    run in float64 on the CPU (`torch_precision.float64`), fla's kernels answered by its own references at
+    run in float64 on the CPU (`_dew_torch.precision.float64`), fla's kernels answered by its own references
+    at
     their call boundaries (`fla_float64`), holding the fixture's weights."""
     from fla_float64 import installed
     from safetensors.torch import load_file
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     configuration, modeling, linear = remote_modules()
     config = json.loads((directory / "config.json").read_text())
@@ -341,7 +346,8 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
 def float64_truth(model: torch.nn.Module, directory: Path,
                   trainable: Callable[[str], bool]) -> dict[str, np.ndarray]:
     """numerics.npz's arrays for the fixture at `directory`, `model` its released model at float64 holding the
-    fixture's weights, inside `torch_precision.float64`: `step_logits_f64` [rows, steps, vocab], the logits
+    fixture's weights, inside `_dew_torch.precision.float64`: `step_logits_f64` [rows, steps, vocab], the
+    logits
     teacher-forced over `generated` at the positions its greedy decode scored; then over `input_ids`
     `loss_f64`, the mean next-token cross entropy over the targets whose input and target are both valid,
     and `updated_logits_f64` [rows, tokens, vocab], the logits after one SGD step at the fixture's stored

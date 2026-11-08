@@ -26,6 +26,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
@@ -160,7 +162,8 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     cannot run; hf_reference.py `write_logits_recording`'s): each seed's ids, `draw(seed)` (`{"input_ids":
     ids}`, by default tests/interop_support.py `fixture_ids`' in the fixture's shape), the torch causal LM
     `model`'s fp32 eager logits on the CPU and `wide`'s, its float64 twin's
-    (`torch_precision.float64_twin`), inside `torch_precision.float64`, as the leaf `logits`; and with
+    (`_dew_torch.precision.float64_twin`), inside `_dew_torch.precision.float64`, as the leaf `logits`; and
+    with
     `padded`, the fields the reference's padded rows take
     (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
     padded with 0 where the mask is false, at the mask's valid places; and with `extra`, the leaves
@@ -177,7 +180,8 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     its provenance, `reference` at `revision` under `license`, and `details`. Returns the file written."""
     import torch
     from interop_support import fixture_ids
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     mask = None if padded is None else np.asarray(padded["attention_mask"], bool)
     fields = {name: torch.from_numpy(np.asarray(value, np.int64 if name == "position_ids" else bool))

@@ -91,7 +91,7 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     tensors = fixture()
     clip = float(np.median(np.abs(tensors["altup.prediction_coefs.weight"])))
@@ -210,7 +210,7 @@ def reference_decoder(directory, clip, dtype, sparsity=None):
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     config = AutoConfig.from_pretrained(directory)
     config.altup_coef_clip = clip
@@ -255,11 +255,11 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     import optax
     import torch
 
+    from _dew_torch.precision import float64
     from dew.objectives.base import Aux
     from dew.objectives.lm import LMObjective
     from dew.state import TrainState
     from dew.training.transaction import Transaction
-    from tools.torch_precision import float64
 
     loaded, model, clip = clipped_gemma3n()
     params = loaded.variables["params"]
@@ -334,7 +334,7 @@ def test_the_dense_decoders_gradient_is_the_references():
     import optax
     import torch
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     loaded, model, clip = clipped_gemma3n()
     dense = model.clone(activation_sparsity_pattern=(0.0,) * len(model.activation_sparsity_pattern))

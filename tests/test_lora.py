@@ -1316,8 +1316,8 @@ def test_peft_reads_the_adapter_dew_writes_at_dews_logits(name, decoder, tmp_pat
     from peft import PeftModel
     from transformers import AutoModelForCausalLM
 
+    from _dew_torch.precision import float64
     from tools.lora_export_reference import CASES, assert_landed, export_case
-    from tools.torch_precision import float64
 
     _, written = export_case(CASES[name], decoder, tmp_path)
     adapter = LoRA.load(decoder.model, decoder.variables, tmp_path, layouts=decoder.layouts)

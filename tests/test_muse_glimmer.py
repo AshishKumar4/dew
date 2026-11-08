@@ -37,7 +37,7 @@ def checkpoint(tmp_path_factory):
     from transformers.models.muse_glimmer.configuration_muse_glimmer import MuseGlimmerTextConfig
     from transformers.models.muse_glimmer.modeling_muse_glimmer import MuseGlimmerTextModel
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     torch.manual_seed(0)
     config = MuseGlimmerTextConfig(**{key: value for key, value in TEXT.items()
@@ -124,7 +124,7 @@ def wrapper(tmp_path_factory):
     from transformers import MuseGlimmerConfig, MuseGlimmerForConditionalGeneration
     from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
 
-    from tools.torch_precision import float64_twin
+    from _dew_torch.precision import float64_twin
 
     text = {key: value for key, value in TEXT.items() if key not in ("model_type", "architectures")}
     config = MuseGlimmerConfig(text_config=text, vision_config=VISION, image_token_id=IMAGE_TOKEN,
@@ -179,7 +179,7 @@ def wrapper_logits(model, ids, image=None, video=None):
     (`packed_video`); a float64 model run inside `float64`."""
     import contextlib
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     dtype = next(model.parameters()).dtype
     media = {}

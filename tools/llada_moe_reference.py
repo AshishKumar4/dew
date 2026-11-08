@@ -40,7 +40,9 @@ import torch
 from reference_source import config_lookups, record_padding
 from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_classes, released_model
 from safetensors.torch import save_file
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from _dew_torch.precision import float64, float64_twin
 
 RELEASES = {
     "llada-moe-tiny": ("inclusionAI/LLaDA-MoE-7B-A1B-Base", "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",

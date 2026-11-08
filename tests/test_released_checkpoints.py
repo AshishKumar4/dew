@@ -8,7 +8,7 @@ Each numeric comparison holds Dew to transformers by the accuracy gate's
 reference rule (`assert_as_exact_as_the_reference`): Dew's fp32 result as near
 the float64 truth as transformers' fp32 result over the same ids, mask and
 positions, the truth transformers' float64 twin of the same weights
-(`tools.torch_precision.float64_twin`), each logit sized by Dew's own float64
+(`_dew_torch.precision.float64_twin`), each logit sized by Dew's own float64
 terms. No bound is fitted to a measured residual: these checkpoints' residual
 streams carry massive activations (near 19279 for SmolLM2 and 6560 for
 Qwen3), so their fp32 logits round by tens of eps, and the rule scales with
@@ -118,7 +118,7 @@ def wide_logits(model, ids, mask=None, positions=None) -> np.ndarray:
     """`model`'s float64 twin's logits for exactly the ids, mask and positions dew was given, the twin
     released as soon as they are read: a 0.6B model's float64 copy beside the float32 ones is most of
     a CI task's memory."""
-    from tools.torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     twin = float64_twin(model)
     with float64():

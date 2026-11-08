@@ -5,8 +5,8 @@ forward of `PROMPT`, the reference, and its float64 truth.
 The released checkpoint stores its experts in MXFP4, whose values bf16 holds exactly, so the load
 dequantizes them (`Mxfp4Config(dequantize=True)`), as Dew's loader does. The reference computes in the
 bf16 the blocks decode to, on a GPU, its matmuls in fp32 (no TF32). The truth is its float64 twin
-(`torch_precision.float64_twin`), 168 GB, which no GPU holds whole, run on the host inside
-`torch_precision.float64`: a GH200's 480 GB holds it beside the bf16 load. It imports no Dew; an
+(`_dew_torch.precision.float64_twin`), 168 GB, which no GPU holds whole, run on the host inside
+`_dew_torch.precision.float64`: a GH200's 480 GB holds it beside the bf16 load. It imports no Dew; an
 environment of torch, transformers 5.17.0 and accelerate runs it.
 
     python tools/gpt_oss_20b_reference.py OUTPUT.npz
@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 RELEASED = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee")
 """The released GPT OSS 20B and the commit both sides read."""
@@ -62,7 +64,7 @@ def main(destination: str) -> None:
     from transformers import AutoTokenizer
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from torch_precision import float64, float64_twin
+    from _dew_torch.precision import float64, float64_twin
 
     repo, revision = RELEASED
     ids = AutoTokenizer.from_pretrained(repo, revision=revision)(PROMPT, return_tensors="np")["input_ids"]

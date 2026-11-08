@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import sys
 from collections import namedtuple
 from pathlib import Path
 
@@ -35,8 +36,11 @@ import numpy as np
 import torch
 from lpips_weights import drawn_weights
 from reference_source import definitions, verified
-from torch_precision import float64, float64_twin
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from torchvision import models
+
+from _dew_torch.precision import float64, float64_twin
 
 REPAE = "https://raw.githubusercontent.com/End2End-Diffusion/REPA-E/2ad4e9f69234c109497fb41d3e5e555de7b4b0de/"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "lpips"

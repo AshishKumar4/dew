@@ -139,9 +139,8 @@ def flow_walk(scheduler, latent, sigmas):
 
 
 def flow_record(name: str, config: dict) -> dict[str, np.ndarray]:
-    from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
-        FlowMatchEulerDiscreteScheduler)
     from diffusers.pipelines.flux.pipeline_flux import calculate_shift
+    from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
     arrays: dict[str, np.ndarray] = {}
     for steps in FLOW_STEPS:
@@ -291,6 +290,7 @@ def clip_tokenizers(root: Path, count: int = 2):
     never carries a stale one for another family's slot.
     """
     import tarfile
+
     from transformers import CLIPTokenizer
 
     fixture = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "tiny_diffusers.tar.xz"
@@ -324,8 +324,7 @@ def t5_tokenizer():
 def build_pipeline(root: Path, *, t5: bool):
     from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
     from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
-    from transformers import (CLIPTextConfig, CLIPTextModelWithProjection, T5Config,
-                              T5EncoderModel)
+    from transformers import CLIPTextConfig, CLIPTextModelWithProjection, T5Config, T5EncoderModel
 
     directory = root / ("pipeline" if t5 else "pipeline_no_t5")
     tokenizers = clip_tokenizers(directory)

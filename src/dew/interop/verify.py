@@ -30,12 +30,13 @@ fixtures and the load-time check run one reference recipe.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
 import tempfile
 import warnings
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -47,12 +48,13 @@ import jax.numpy as jnp
 import numpy as np
 from flax import traverse_util as flax_traverse
 
-from dew import _records
+from dew import _records, parity as parity_check
 from dew._cache import package_digest
 from dew.interop import decoder_config, decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.nn import precision
 from dew.nn.blocks import padded_row
+from dew.nn.kernels.options import program
 from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
 from dew.registry import models
@@ -108,30 +110,11 @@ _FREQUENCY_FACTORS = frozenset({'long_factor', 'short_factor'})
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoder_parts.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
-# How much farther the source's float32 gradient of any parameter may be from the float64 truth than
-# Dew's own float32 gradient of it is (`gradient_parity`, each parameter's pooled over its elements on
-# the probe's draw), Dew's float32 summed as users' processes sum it (`_users_arithmetic`). Two float32
-# roundings of one gradient put the ratio near one: tools/gradient_parity.py measured 1.03 to 1.37 over
-# the types and compositions that assemble from parts, and the tests' sources reach 1.83 on their smaller
-# leaves, whose few elements make one draw's ratio spread (armada IGGRADPAR, IGP3291). A backward
-# the source's forward does not show (a hook, a custom autograd function) that moves a gradient by a
-# relative r puts it near r / eps. The bound is the geometric middle of the two, eps ** -0.5 (2 ** 11.5,
-# 2896): a draw's rounding spread stays orders of magnitude below it, and any backward that moves a
-# gradient by more than about 3.5e-4 of itself, the square root of eps, is above it.
-_GRADIENT_PARITY = float(np.finfo(np.float32).eps) ** -0.5
-# How much farther the source's float32 logits on the probe may be from the float64 truth than the
-# candidate's, element by element (`logits_parity`: the largest errors' ratio), the candidate's float32 run
-# as users run it (`precision.FP32_SUMS`). Two float32 roundings of one computation measure 0.70 to 1.57
-# (armada IGPAR8): over the released configs tier 2 verifies at their probes' cut depths and widths (Hy3,
-# LFM2.5-230M, LFM2-24B-A2B, Seed-OSS-36B, SmolLM3, Hunyuan-A13B, OLMo 2, GLM-4.7-Flash, StableLM,
-# ERNIE 4.5, Granite 4.1, OLMoE), over tools/gradient_parity.py's types and composition, and over the
-# tests' sources, StableLM's tiny config the largest. The bound is twice the largest. A computation the
-# candidate does not share moves it by its effect over the candidate's own rounding, which grows with the
-# probe as the source's does: logits scaled by 1 + 1e-5 put it at 6.6 to 10.6, by 1 + 1e-4 at 65 to 111,
-# and one logit moved by 1e-4 at 11 to 17 (tools/gradient_parity.py's Seed-OSS, Llama and Qwen3-MoE at
-# logits up to 6.8, armada IGSENS), where a fixed rounding per layer refused Seed-OSS's own rounding at a
-# 2-layer cut of its 64 layers.
-_LOGITS_PARITY = 3.14
+# Tier 2 judges a candidate as every test of Dew against a reference is judged: check 1 (`dew.parity`),
+# Dew's RMS error from the source's float64 twin on par with the source's own float32 one, leaf by leaf,
+# over draws `dew.parity.seeds_for` sizes. Two float32 roundings of one computation pass, and a Dew more
+# exact than the source; a computation Dew does not share, in the forward or in a backward the forward
+# does not show (a hook, a custom autograd function), sets Dew as far from the twin as it moves a value.
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
@@ -239,9 +222,42 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
 
-def probe_ids(vocab_size: int) -> np.ndarray:
-    """Return the fixed BATCH x LENGTH token ids a reference is run on."""
-    return np.random.RandomState(7).randint(0, vocab_size, (BATCH, LENGTH)).astype(np.int32)
+def probe_ids(vocab_size: int, seed: int = 0) -> np.ndarray:
+    """Return the probe's BATCH x LENGTH token ids of draw `seed`, the first the fixed ones a reference
+    is run on."""
+    return np.random.RandomState(7 + seed).randint(0, vocab_size, (BATCH, LENGTH)).astype(np.int32)
+
+
+def twin_logits(twin: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
+    """A source's float64 twin's (`source_twin`) logits over `ids`, run inside `_wide`: the truth tier
+    2's parities measure both arms from."""
+    import torch
+
+    with _wide(), torch.no_grad():
+        out = twin(input_ids=torch.from_numpy(ids).to(twin.device), use_cache=False)
+    return out.logits.to(torch.float64).cpu().numpy()
+
+
+def source_twin(model: PreTrainedModel, build: Callable[[], PreTrainedModel]) -> PreTrainedModel:
+    """`model`'s float64 twin, eager attention and eager experts (torch's grouped product takes no
+    float64): built by `build`, the source's own constructor, inside `_dew_torch.precision.float64`, so
+    its constructor's tables are float64's and whatever its code attaches to what it builds (a hook on
+    a gradient) is attached as it was to `model`, and its weights `model`'s (`float64_twin`). Run it
+    inside `_wide`, under which the float32 pins the source's code carries (a rotary's `.float()`, eager
+    softmax's `dtype=torch.float32`) are widened too."""
+    from _dew_torch.precision import float64_twin
+
+    twin = float64_twin(model, build)
+    twin.set_attn_implementation("eager")
+    twin.set_experts_implementation("eager")
+    return twin
+
+
+def _wide():
+    """The context a float64 twin runs in (`_dew_torch.precision.float64`)."""
+    from _dew_torch.precision import float64
+
+    return float64()
 
 
 def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
@@ -514,12 +530,9 @@ class VerifiedMapping:
     """The registered family the type loads as (a `CONVENTIONS` name)."""
     reference: str
     """The transformers class and release the probe ran."""
-    error: float
-    """How much farther the reference's fp32 logits on the probe are from the float64 truth than Dew's
-    route's (`logits_parity`)."""
-    bound: float
-    """The ratio past which another computation, not rounding, sets the reference apart
-    (`_LOGITS_PARITY`)."""
+    seeds: int
+    """The probe's draws check 1 held Dew's route's fp32 logits on par with the reference's over, each
+    from the reference's float64 twin (`logits_parity`), as `dew.parity.seeds_for` sized them."""
     inert: tuple[str, ...]
     """The config fields the convention does not read, which changed nothing on the probe's shrunken
     instance: a field whose effect starts past a context the probe never reaches (one `shrink` does not
@@ -567,9 +580,9 @@ class VerifiedMapping:
                  if self.family == PARTS else f"as the registered {self.family!r} family")
         warnings.warn(
             f"tier 2: verified mapping: model_type {self.model_type!r} loads {loads}; "
-            f"{self.reference}'s fp32 logits on a random shrunken instance are {self.error:.3g} times as far "
-            f"from the float64 truth as its own (bound {self.bound:.2f}); it does not read the config "
-            f"fields {list(self.inert)}, which changed nothing on that instance",
+            f"its fp32 logits on a random shrunken instance are on par with {self.reference}'s from its "
+            f"float64 twin by check 1 over {self.seeds} draws; it does not read the config fields "
+            f"{list(self.inert)}, which changed nothing on that instance",
             VerifiedMappingWarning, stacklevel=3)
         return record
 
@@ -734,11 +747,11 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
 
 
 def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.Module,
-               record: decoder_parts.DecoderFields, inert: set[str], name: str, expected: np.ndarray,
-               checkpoint: Path, pad: int | None) -> tuple[float, float]:
-    """One candidate against the reference's saved checkpoint: its error and
-    the bound, or `_Mismatch` naming how it differs. `pad` is the row the
-    reference's own table pads (its `padding_idx`, which torch counts from
+               record: decoder_parts.DecoderFields, inert: set[str], name: str, source: _Source,
+               checkpoint: Path, pad: int | None) -> int:
+    """One candidate against the reference's saved checkpoint, `source` the reference and its float64
+    twin: the draws check 1 held its logits on par over, or `_Mismatch` naming how it differs. `pad` is
+    the row the reference's own table pads (its `padding_idx`, which torch counts from
     the table's end where negative), which takes no gradient there (ledger
     1593) and which eval logits do not show, so the candidate pads that row,
     its own id read as its lookup reads it (`padded_row`), or is no reading
@@ -758,56 +771,61 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     except (KeyError, ValueError) as error:
         # A candidate's reading of tensors it does not hold disqualifies that candidate alone.
         raise _Mismatch(f"its tensors do not fill {convention}'s model ({error})") from error
-    parity = logits_parity(expected, model, record, variables, probe_ids(_VOCAB))
-    if not parity <= _LOGITS_PARITY:
-        raise _Mismatch(f"{name}'s fp32 logits on a random shrunken instance are {parity:.3g} times as far "
-                        f"from the float64 truth as {convention}'s, past the {_LOGITS_PARITY:.2f} that tells "
-                        f"rounding from another computation, so its config fields {sorted(inert)} or its "
-                        f"modeling compute something {convention} does not")
-    return parity, _LOGITS_PARITY
+    try:
+        return logits_parity(source.logits, model, variables, f"{convention}'s logits against {name}'s")
+    except parity_check.GateFailure as failure:
+        raise _Mismatch(f"{convention}'s fp32 logits on a random shrunken instance are not on par with "
+                        f"{name}'s from its float64 twin ({failure}), so its config fields {sorted(inert)} "
+                        f"or its modeling compute something {convention} does not") from failure
 
 
-def _users_arithmetic(dtype: str):
+def _users_arithmetic():
     """The precision the parities run Dew's decoder at (`logits_parity`, `gradient_parity`): a float32 run
     as a user's process runs it, its products summed in float32 (`precision.FP32_SUMS`), not in TF32 on a
     GPU nor in float64 as a test process's wide CPU arithmetic sums them
-    (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than users get; the float64
-    truth at the highest precision."""
-    return precision.configured_precision(precision.FP32_SUMS if dtype == 'float32' else 'highest')
+    (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than users get, as check 1's
+    arms run (`_summed_as_run`)."""
+    return precision.configured_precision(precision.FP32_SUMS)
 
 
-def logits_parity(expected: np.ndarray, model: nn.Module, record: decoder_parts.DecoderFields,
-                  variables: Variables, ids: np.ndarray) -> float:
-    """How much farther the source's float32 logits over `ids` (`expected`) are from the float64 truth
-    than the candidate's float32 logits are, element by element: the source's largest error over the
-    candidate's, the candidate's floored at the half ulp float32 carries of the truth's largest logit,
-    the truth the candidate's decoder of the same record and weights in float64, as `gradient_parity`'s.
-    Two float32 roundings of one computation sit near one, the candidate's rounding growing with the
-    probe's depth and width as the source's does; a computation the candidate does not share puts the
-    source as far from the truth as it moves any logit. A non-finite logit on either side is no
-    rounding: infinite. The candidate's float32 runs as a user's process runs it: its products summed in
-    float32 (`precision.FP32_SUMS`), not in TF32 on a GPU, nor in float64 as a test process's wide CPU
-    arithmetic sums them (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than
-    users get and the ratio past what users' rounding reaches."""
+@dataclass(frozen=True)
+class _Source:
+    """The probe's reference at float32 and its float64 twin (`source_twin`), whose runs over each draw
+    the parities judge Dew's against."""
 
-    def logits(dtype: str, network: nn.Module) -> np.ndarray:
-        held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
-        with _users_arithmetic(dtype):
-            return np.asarray(network.apply(held, ids), np.float64)
+    reference: PreTrainedModel
+    twin: PreTrainedModel
 
-    ours = logits('float32', model)
-    with jax.enable_x64(new_val=True):
-        wide = models.build('causal_transformer',
-                            {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
-        truth = logits('float64', wide)
-    expected = np.asarray(expected, np.float64)
-    if not all(np.isfinite(values).all() for values in (expected, ours, truth)):
-        return math.inf
-    eps = float(np.finfo(np.float32).eps)
-    floor = eps / 2 * float(np.abs(truth).max())
-    return float(np.abs(expected - truth).max()) / max(float(np.abs(ours - truth).max()), floor,
-                                                       np.finfo(np.float64).tiny)
+    def logits(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The reference's float32 logits over `ids` and its twin's, as float64."""
+        return (np.asarray(reference_logits(self.reference, ids.astype(np.int64)), np.float64),
+                twin_logits(self.twin, ids.astype(np.int64)))
 
+
+def _judged(draw, label: str) -> int:
+    """Check 1's verdict over `draw` (seed -> Dew's, the source's and the twin's trees), at the seeds
+    `dew.parity.seeds_for` sizes on draws the verdict never sees: those seeds where every leaf is on par,
+    or `dew.parity.GateFailure` naming each leaf that is not, `dew.parity.Inconclusive` one unresolved."""
+    seeds = parity_check.seeds_for(draw, label)
+    parity_check.judge(draw, seeds, label)
+    return seeds
+
+
+def logits_parity(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]], model: nn.Module,
+                  variables: Variables, label: str) -> int:
+    """Dew's float32 logits over the probe's draws of ids (`probe_ids`) on par with the source's from its
+    float64 twin (`_judged`), `source` the two over a draw's ids (`_Source.logits`), Dew's run as a user's
+    process runs it (`_users_arithmetic`)."""
+    held = jax.tree.map(lambda leaf: jnp.asarray(leaf, 'float32'), variables)
+
+    def draw(seed: int):
+        ids = probe_ids(_VOCAB, seed)
+        with _users_arithmetic():
+            ours = np.asarray(model.apply(held, ids), np.float64)
+        theirs, truth = source(ids)
+        return ours, theirs, truth
+
+    return _judged(draw, label)
 
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
@@ -842,59 +860,54 @@ def _as_stored(model: PreTrainedModel, tensors: Mapping[str, np.ndarray]) -> dic
     return {name: tensor.numpy() for name, tensor in stored.items()}
 
 
-def gradient_parity(reference: PreTrainedModel, family: decoder_parts.DecoderFamily,
-                    record: decoder_parts.DecoderFields, variables: Variables) -> float:
-    """How much farther the source's float32 gradient of a parameter is from the float64 truth than
-    Dew's float32 gradient is, the largest over the parameters, each pooled over its elements on the
-    probe's draw (the root of the ratio of their summed squared errors, Dew's floored at the half ulp
-    float32 carries of each element of the truth): the source's eval-mode gradients stored as
-    `save_pretrained` stores its weights (`_as_stored`) and read into Dew's tree as they are
-    (`translate_weights`; a gradient rearranges as its parameter does), the truth
-    Dew's decoder of the same record and weights in float64. Per parameter, so a wrong gradient of a
-    small one is not hidden by another's rounding."""
-    ids = probe_ids(_VOCAB)
-    cotangent = np.random.RandomState(11).standard_normal((BATCH, LENGTH, _VOCAB)).astype(np.float32)
-    _, theirs = _probe_gradients(reference, ids, cotangent, train=False)
-    stored = _as_stored(reference, theirs)
-    their_tree = flax_traverse.flatten_dict(decoders.translate_weights(stored, record, family)['params'])
+def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
+                    record: decoder_parts.DecoderFields, variables: Variables, label: str) -> int:
+    """Dew's float32 gradient of every parameter on par with the source's from its float64 twin's
+    (`_judged`), each parameter its own leaf, so a wrong gradient of a small one is not hidden by
+    another's rounding, over the probe's draws of ids and cotangents. The source's eval-mode gradients,
+    its float32 ones and its twin's, are stored as `save_pretrained` stores its weights (`_as_stored`) and
+    read into Dew's tree as they are (`translate_weights`; a gradient rearranges as its parameter does)."""
+    model = models.build('causal_transformer', {**record, 'dtype': 'float32', 'attention_impl': 'reference'})
+    held = jax.tree.map(lambda leaf: jnp.asarray(leaf, 'float32'), variables)
 
-    def gradient(dtype: str) -> dict:
-        model = models.build('causal_transformer', {**record, 'dtype': dtype, 'attention_impl': 'reference'})
-        held = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), variables)
+    def gradient(params, ids, cotangent):
+        return jax.grad(lambda params: jnp.sum(model.apply({**held, 'params': params}, ids) * cotangent))(
+            params)
 
-        def loss(params) -> jax.Array:
-            logits = model.apply({**held, 'params': params}, jnp.asarray(ids))
-            return jnp.sum(jnp.asarray(logits) * jnp.asarray(cotangent, dtype))
+    compiled = program(gradient, model)
 
-        with _users_arithmetic(dtype):
-            return {path: np.asarray(leaf, np.float64) for path, leaf in
-                    flax_traverse.flatten_dict(jax.grad(loss)(held['params'])).items()}
+    def theirs(network: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, dtype: str) -> dict:
+        _, gradients = _probe_gradients(network, ids, cotangent, train=False)
+        tree = decoders.translate_weights(_as_stored(source.reference, gradients), record, family,
+                                          param_dtype=dtype)
+        return {'/'.join(path): np.asarray(leaf, np.float64)
+                for path, leaf in flax_traverse.flatten_dict(tree['params']).items()}
 
-    ours = gradient('float32')
-    with jax.enable_x64(new_val=True):
-        truth = gradient('float64')
-    if set(ours) != set(their_tree):
-        raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(their_tree))[:4]} apart")
-    eps = float(np.finfo(np.float32).eps)
+    def draw(seed: int):
+        ids = probe_ids(_VOCAB, seed)
+        cotangent = np.random.RandomState(11 + seed).standard_normal((BATCH, LENGTH, _VOCAB)).astype(
+            np.float32)
+        reference = theirs(source.reference, ids, cotangent, 'float32')
+        with _wide(), jax.enable_x64(new_val=True):
+            truth = theirs(source.twin, ids, cotangent.astype(np.float64), 'float64')
+        with _users_arithmetic():
+            ours = {'/'.join(path): np.asarray(leaf, np.float64) for path, leaf in
+                    flax_traverse.flatten_dict(compiled(held['params'], ids, cotangent)).items()}
+        if set(ours) != set(reference):
+            raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(reference))[:4]} apart")
+        return ours, reference, truth
 
-    def parity(path) -> float:
-        truth_leaf = truth[path]
-        source_error = float(np.sum((np.asarray(their_tree[path], np.float64) - truth_leaf) ** 2))
-        dew_error = float(np.sum((ours[path] - truth_leaf) ** 2))
-        # The least error float32 carries for the leaf, a rounding of each element of its truth.
-        floor = (eps / 2) ** 2 * float(np.sum(truth_leaf ** 2))
-        return math.sqrt(source_error / max(dew_error, floor, np.finfo(np.float64).tiny))
-
-    return max(parity(path) for path in ours)
+    return _judged(draw, label)
 
 
-def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decoder_parts.DecoderFamily,
+def _trained(source: _Source, assembly: parts.Assembly, family: decoder_parts.DecoderFamily,
              record: decoder_parts.DecoderFields, name: str) -> None:
     """The training qualification of a decoder assembled from parts, beside the probe's eval logits:
     the source's training forward and gradients, its attention dropout set to zero, are its eval ones
     bitwise (no training-only behavior, a hook or another branch, that Dew's decoder lacks), and
-    its gradients are as near the float64 truth as Dew's (`_GRADIENT_PARITY`: no backward the forward does
-    not show). `_Mismatch` names what differs."""
+    Dew's gradients are on par with its own from its float64 twin (`gradient_parity`: no backward the
+    forward does not show). `_Mismatch` names what differs."""
+    reference = source.reference
     for path, attribute in assembly.dropouts:
         setattr(reference.get_submodule(path), attribute, 0.0)
     ids = probe_ids(_VOCAB)
@@ -907,10 +920,11 @@ def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decod
     with tempfile.TemporaryDirectory() as folder:
         reference.save_pretrained(folder)
         variables = decoders.translate_weights(sources.load_shards(Path(folder)), record, family)
-    parity = gradient_parity(reference, family, record, variables)
-    if not parity <= _GRADIENT_PARITY:
-        raise _Mismatch(f"{name}'s gradients are {parity:.2f} times as far from the float64 truth as Dew's, "
-                        f"past the {_GRADIENT_PARITY:.0f} that tells rounding from another backward")
+    try:
+        gradient_parity(source, family, record, variables, f"Dew's gradients against {name}'s")
+    except parity_check.GateFailure as failure:
+        raise _Mismatch(f"Dew's gradients are not on par with {name}'s from its float64 twin ({failure}), so "
+                        "its backward computes something Dew's does not") from failure
 
 
 def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = None,
@@ -929,8 +943,8 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
     transformers builds its class for the type from `shrink(hf_config)` with
     random weights (`scatter_weights`) and saves it as safetensors; each
     `CONVENTIONS` candidate whose reading takes the real config loads that
-    directory and runs the same ids in fp32. The first whose logits are as
-    near the float64 truth as the reference's, within `_LOGITS_PARITY`
+    directory and runs the same ids in fp32. The first whose logits are on
+    par with the reference's from its float64 twin by check 1
     (`logits_parity`), is the mapping. When several read the config and match,
     the `CONVENTIONS` order is the tie-break: each computed the probe's
     logits, so any of them is sound. With none, the type is `Unmapped`, with
@@ -996,8 +1010,8 @@ def _recorded(key: str) -> VerifiedMapping | None:
     record = _records.record(json.loads(path.read_text()), 'verified mapping')
     return VerifiedMapping(
         _records.text(record['model_type'], 'model_type'), _records.text(record['family'], 'family'),
-        _records.text(record['reference'], 'reference'), _records.number(record['error'], 'error'),
-        _records.number(record['bound'], 'bound'), tuple(_records.strings(record['inert'], 'inert')))
+        _records.text(record['reference'], 'reference'), _records.integer(record['seeds'], 'seeds'),
+        tuple(_records.strings(record['inert'], 'inert')))
 
 
 def _record(key: str, verified: VerifiedMapping) -> None:
@@ -1008,7 +1022,7 @@ def _record(key: str, verified: VerifiedMapping) -> None:
     with _files.staged(directory) as staging:
         (staging / 'mapping.json').write_text(json.dumps({
             'model_type': verified.model_type, 'family': verified.family, 'reference': verified.reference,
-            'error': verified.error, 'bound': verified.bound, 'inert': list(verified.inert)}))
+            'seeds': verified.seeds, 'inert': list(verified.inert)}))
 
 
 def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedMapping | Unmapped:
@@ -1053,10 +1067,14 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         # The probe runs whether or not a candidate is left, so a type no convention computes is
         # one whose shrunken model ran (`Unmapped`), and one whose model does not run is
         # `ProbeUnavailable`, whatever the candidates.
+        from _dew_torch.precision import widened_config
+
         try:
             reference = source.causal_lm(config).float()
             scatter_weights(reference)
-            expected = reference_logits(reference, probe_ids(_VOCAB).astype(np.int64))
+            reference_logits(reference, probe_ids(_VOCAB).astype(np.int64))
+            probed = _Source(reference, source_twin(
+                reference, lambda: source.causal_lm(widened_config(copy.deepcopy(config)))))
         except Exception as error:
             raise _unavailable(model_type, f"{name} does not run its shrunken config "
                                f"({type(error).__name__}: {error})") from error
@@ -1088,15 +1106,15 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             if sized:
                 for convention, family, model, record, inert in sized:
                     try:
-                        error, bound = _agreement(convention, family, model, record, inert, name, expected,
-                                                  Path(scratch), pad)
+                        seeds = _agreement(convention, family, model, record, inert, name, probed,
+                                           Path(scratch), pad)
                         if convention == PARTS:
                             assert assembly is not None
-                            _trained(reference, assembly, family, record, name)
+                            _trained(probed, assembly, family, record, name)
                     except _Mismatch as mismatch:
                         reasons[convention] = str(mismatch)
                         continue
-                    return VerifiedMapping(model_type, convention, name, error, bound, tuple(sorted(inert)))
+                    return VerifiedMapping(model_type, convention, name, seeds, tuple(sorted(inert)))
     return Unmapped(model_type,
                     {name: reasons[name] for name in (PARTS, *dict(CONVENTIONS)) if name in reasons},
                     {**fields, 'model_type': model_type})

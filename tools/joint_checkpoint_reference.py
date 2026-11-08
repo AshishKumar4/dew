@@ -70,6 +70,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
 ROOT = Path(__file__).resolve().parents[1]
 BACKBONE = ROOT / "tests" / "fixtures" / "hf" / "qwen38-dense-tiny"
 OUT = ROOT / "tests" / "fixtures" / "joint_checkpoint" / "tiny"
@@ -98,10 +100,11 @@ def as_upstream(request: dict) -> dict:
 
 def joint_twin(model_class, upstream, backbone, head, head_config: dict):
     """The joint model's float64 truth: the backbone's and the head's each their float64 twin
-    (`torch_precision.float64_twin`), the backbone read from its fixture at float64 and the head built
+    (`_dew_torch.precision.float64_twin`), the backbone read from its fixture at float64 and the head built
     from its config, each holding the float32 model's weights. Run it inside `float64` too."""
-    from torch_precision import float64_twin
     from transformers import Qwen3_5ForConditionalGeneration
+
+    from _dew_torch.precision import float64_twin
 
     wide_backbone = float64_twin(backbone, lambda: Qwen3_5ForConditionalGeneration.from_pretrained(
         BACKBONE, dtype=torch.float64, attn_implementation="eager"))
@@ -111,9 +114,9 @@ def joint_twin(model_class, upstream, backbone, head, head_config: dict):
 
 def main() -> None:
     from safetensors.torch import save_file
-    from torch_precision import float64
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
+    from _dew_torch.precision import float64
     from dew.interop.verify import scatter_weights
 
     upstream, model_class = upstream_module()
@@ -225,7 +228,8 @@ def fla_precision() -> str:
     """What logits_fla.npz records of its run's matmuls (`recorded_matmuls`), fla's two triangular
     solves among them."""
     from fla.ops.gated_delta_rule import chunk_fwd
-    from torch_precision import recorded_matmuls
+
+    from _dew_torch.precision import recorded_matmuls
 
     solve = chunk_fwd.SOLVE_TRIL_DOT_PRECISION
     return recorded_matmuls(FLA_TRIL_PRECISION=os.environ.get("FLA_TRIL_PRECISION", "ieee"),
@@ -251,7 +255,8 @@ def released():
 
 def images() -> None:
     from PIL import Image
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     upstream, processor, _, _, model, exact = released()
     request = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())["quickstart"]
@@ -355,7 +360,8 @@ def parity() -> None:
     from recorded_references import provenance, record_case, save
     from reference_releases import require
     from reference_source import git_head
-    from torch_precision import float64
+
+    from _dew_torch.precision import float64
 
     require("transformers")
     torch.set_num_threads(1)

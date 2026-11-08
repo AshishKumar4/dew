@@ -270,7 +270,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     from reference_error import FACTOR, distance
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from tools.torch_precision import float64
+    from _dew_torch.precision import float64
 
     _, export, _ = imported
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)
