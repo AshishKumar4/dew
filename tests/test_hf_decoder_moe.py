@@ -325,7 +325,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
     released encoder gives an all-zero group (`quantize_mxfp4`): a GPT-OSS whose first expert's groups
     span bytes 0 to 17, one under byte 0 holding 0.5 and -0, and one of signed zeros under byte 200 far
     past them, loads packed (`packed_experts`), the bank holding every value its dense load decodes to the
-    bit, signed zeros included, and exports what its dense load exports."""
+    bit, signed zeros included, and exports the values its dense load exports."""
     from safetensors.numpy import load_file, save_file
 
     from dew.nn.kernels.gemm import NvFp4
@@ -351,9 +351,12 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
     values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
     held = np.asarray(flat_tree(dense.variables["params"])[path], np.float32)
     np.testing.assert_array_equal(values.view(np.uint32), held.view(np.uint32))
+    # An export writes the values back, which the released encoder may state at another scale than the
+    # source's bytes (`test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded`): values, bitwise.
     exported, written = packed.export(), dense.export()
-    for name in (stem + "_blocks", stem + "_scales"):
-        np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(written[name]))
+    np.testing.assert_array_equal(
+        np.asarray(dequantize_mxfp4(exported[stem + "_blocks"], exported[stem + "_scales"])).view(np.uint32),
+        np.asarray(dequantize_mxfp4(written[stem + "_blocks"], written[stem + "_scales"])).view(np.uint32))
 
 
 @pytest.mark.mesh(devices=2)
