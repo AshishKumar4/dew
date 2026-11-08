@@ -50,6 +50,8 @@ from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, loca
 from dew.nn.kernels.options import program
 from dew.nn.kv_cache import (
     gather_cache_rows,
+    offloaded,
+    on_device,
     refuse_unassigned,
     row_axis,
     with_rounding_keys,
@@ -473,7 +475,9 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, d
     cache = initialized("init_cache")
     for method in ("init_mtp_cache",) * bool(depths) + ("init_draft_cache",) * drafter:
         cache.update(initialized(method))
-    return unflatten_dict(cache)
+    held = unflatten_dict(cache)
+    # An offloaded cache's keys and values in host memory, each layer's brought to the device as it runs.
+    return offloaded(held, model.kv_cache) if isinstance(model, Layered) else held
 
 
 def _context(model: nn.Module, params: Variables, updated: Mapping,
@@ -704,8 +708,12 @@ def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: Decoder
 def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array, axis: int = 0) -> jax.Array:
     """`chosen` where `where` holds over its axes from `axis` (a cache leaf's rows, `row_axis`), else
     `otherwise`."""
-    mask = where.reshape(*(1,) * axis, *where.shape, *(1,) * (chosen.ndim - axis - where.ndim))
-    return jnp.where(mask, chosen, otherwise)
+    # Each layer's rows first, a run's bank's layers mapped over, an offloaded cache's keys and values chosen
+    # on the device and back to the host (`on_device`).
+    def selected(kept: jax.Array, picked: jax.Array) -> jax.Array:
+        return jnp.where(where.reshape(*where.shape, *(1,) * (picked.ndim - where.ndim)), picked, kept)
+
+    return on_device(selected, otherwise, chosen, banked=bool(axis))
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):
