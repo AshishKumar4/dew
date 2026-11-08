@@ -171,16 +171,24 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
          group_row_tiles: int | None = None, *, cluster: int = 1) -> int:
     """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
     blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
-    that reads each operand fewest times from the device. The rows' and the columns' blocks balanced
+    that reads each operand fewest times from the device, or a grouped walk's every column tile where
+    the band reaches them. The rows' and the columns' blocks balanced
     (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
     where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
     each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
-    reads once a group. A cluster of `cluster` multiprocessors is one program, its tile `cluster` row
-    tiles (`group_row_tiles` counts a group's clusters' tiles)."""
+    reads once a group. A grouped walk's band that reaches every column tile takes them all, whatever
+    their count: a power of two below it would leave a last band that walks every row tile again (row
+    4053: the H100 grouped forward's three or six column tiles in bands of two or four read its tokens
+    twice, 1.39x CUTLASS's bytes, M-NS-3). A dense walk's stays a power of two: its snake's division by
+    another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44 bytes
+    spilled at a band of three, NS4053-1), which the register model does not see. A cluster of
+    `cluster` multiprocessors is one program, its tile `cluster` row tiles (`group_row_tiles` counts a
+    group's clusters' tiles)."""
     programs, rows = multiprocessors // cluster, block_m * cluster
     balanced = math.sqrt(programs * rows / block_n)
     spanning = programs / group_row_tiles if group_row_tiles else 0.0
-    return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
+    wide = max(1, min(int(max(balanced, spanning)), column_tiles))
+    return column_tiles if group_row_tiles and wide == column_tiles else 1 << (wide.bit_length() - 1)
 
 
 RAISES_HONORED = True
