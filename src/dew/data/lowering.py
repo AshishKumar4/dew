@@ -603,6 +603,53 @@ type Field = Batch | np.ndarray | np.generic | str | bytes | int | float | bool 
 """A record's field, as the steps before a batch leave it."""
 
 
+class _Spread(tuple):
+    """What a run of record stages from an expansion makes of one input in a read's workers (`_PerInput`):
+    its rows and the markers of what the steps after the expansion dropped, in order."""
+
+    __slots__ = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class _PerInput:
+    """A run of record stages from an expansion over one input, by its index among the inputs (`index`), in a
+    read's workers (`_Build.spreads`): `_chained`'s rows and markers, each random stage drawing for each row
+    from its seed, the input's index and the row's place among the input's rows there, the same in any count
+    of workers (`IN_ORDER`). A marker of an input dropped before the run goes on as it is."""
+
+    stages: tuple[RecordStage, ...]
+    seeds: tuple[int | None, ...]
+    unplaced: bool = False
+
+    def __call__(self, index: int, element: Record) -> Record | _Spread:
+        if isinstance(element, Rejected):
+            return element
+        position = _position(element)
+        held: tuple[Record, ...] = (element if position is None else _unplaced(element),)
+        for stage, seed in zip(self.stages, self.seeds, strict=True):
+            held = tuple(made for row, given in enumerate(held) for made in consumed_by(
+                given, functools.partial(_outputs, stage, position, rng=_keyed(seed, index, row))))
+        if position is not None and not self.unplaced:
+            held = tuple(_placed(output, position) for output in held)
+        return _Spread(held)
+
+
+def _keyed(seed: int | None, index: int, row: int) -> np.random.Generator | None:
+    """A spread input's random stage's draws for its `row`th row there (`_PerInput`), from the stage's
+    seed and the input's `index`; none for a stage that draws none."""
+    return None if seed is None else np.random.default_rng((seed, index, row))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Unspread:
+    """An input's spread rows and markers (`_Spread`), in the reading process."""
+
+    max_fan_out: int = 1 << 20
+
+    def flat_map(self, element: Record | _Spread) -> Sequence[Record]:
+        return tuple(element) if isinstance(element, _Spread) else (element,)
+
+
 @dataclasses.dataclass
 class _Grouped:
     """A loading worker's records and the markers of those its steps dropped, a batch's count at a
@@ -1237,14 +1284,28 @@ def _barren_bound(stages: Sequence[Stage], passes: tuple[int, int] | None, ran: 
     return 2 * rows if before and after and rows else None
 
 
-def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool = True) -> int:
+def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, native: bool = True,
+             spread: bool = False) -> int:
     """Where an elastic read's workers hand its rows on (`_InputOrder`), at the latest: before the
     first step that may make its indexed rows a stream (an expansion, a window shuffle, a Grain
     step), which no index reads, and before a random step after one that may drop, which one
     reader keys by its place among the rows kept, not among the inputs with their markers. The
     reading process runs the rest in that order, so its rows and draws are one reader's. Where not
     `native`, a Grain step is run before it, over its indexed rows (a read cut per share's, which
-    hands on after one that makes a stream, `_Build.records`)."""
+    hands on after one that makes a stream, `_Build.records`). A read that `spread`s each input
+    (`_Spread`) runs its expansion and the record steps after it in its workers too, each draw keyed by
+    its input and its row in it, and hands on before the first stage after its expansion that is no
+    record step, or before a window shuffle or a Grain step."""
+    if spread:
+        expanded = False
+        for at, stage in enumerate(stages[start:], start=start):
+            windowed = isinstance(stage, Shuffle) and stage.window is not None
+            pooled = isinstance(stage, _RECORD) and _threads((stage,)) is not None
+            if windowed or pooled or isinstance(stage, Native) or (
+                    expanded and not isinstance(stage, _RECORD)):
+                return at
+            expanded = expanded or isinstance(stage, FlatMap)
+        return len(stages)
     for at, stage in enumerate(stages[start:], start=start):
         windowed = isinstance(stage, Shuffle) and stage.window is not None
         streams = windowed or isinstance(stage, FlatMap) or (native and isinstance(stage, Native))
@@ -1436,6 +1497,13 @@ class _Build:
     @property
     def global_order(self) -> bool:
         return not self.lowering.per_share
+
+    def spreads(self, rows: Rows) -> bool:
+        """Whether its workers run its expansion and the record steps after it over each input (`_PerInput`),
+        handing on each input's rows in its order: a training read cut per share from `IN_ORDER`, over
+        indexed rows."""
+        return (not self.elastic and self.in_order and self.version >= IN_ORDER
+                and isinstance(rows, pygrain.MapDataset))
 
     @property
     def in_order(self) -> bool:
@@ -1810,10 +1878,10 @@ class _Build:
         marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
         marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
-        if self.in_order and carried >= 0:
-            # A read cut per share runs its Grain steps in its workers over its indexed rows, as a read in
-            # none does, and hands on after one that makes a stream (below); an elastic read before it.
-            carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked, native=self.elastic))
+        carried, spreading = self.hand_off(pipeline, consumed, carried, rows, marked=marked)
+        # Where its workers expand each input and whether the reading process counts its inputs as source
+        # examples (`unspread`): None where they spread nothing yet.
+        spread: tuple[int, bool] | None = None
         ran, counting, examples = consumed, _counts_own_rows(pipeline), False
         # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
         passes: tuple[int, int] | None = None
@@ -1827,8 +1895,8 @@ class _Build:
                 # what every worker reads (`_streamed_take`): the workers hand on before either.
                 carried = index
             if index == carried and pool is not None:
-                rows = self.handed(rows, pipeline, partition, pool, carried,
-                                   certain_after=_barren_bound(pipeline.stages, passes, carried))
+                rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
+                                      certain_after=_barren_bound(pipeline.stages, passes, carried))
             if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
@@ -1836,6 +1904,12 @@ class _Build:
             if isinstance(stage, Prefetch) and self.global_order:
                 continue
             if isinstance(stage, Workers) and pool is not None:
+                continue
+            if spreading and isinstance(stage, FlatMap) and index < carried:
+                # The expansion and the record steps after it, to the hand-off, over each input in the
+                # workers; the reading process counts what they hand on (`unspread`).
+                rows, spread, examples, counting, ran = self.spread(
+                    rows, pipeline, partition, index, carried, last, examples=examples, counting=counting)
                 continue
             if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
                 # The corpus's counts are of its source examples (`FlatMap.examples`): a run bounded in
@@ -1878,9 +1952,65 @@ class _Build:
                     stage = Limit(quota)
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
-            rows = self.handed(rows, pipeline, partition, pool, carried,
-                               certain_after=_barren_bound(pipeline.stages, passes, carried))
+            rows = self.handed_on(rows, pipeline, partition, pool, carried, spread,
+                                  certain_after=_barren_bound(pipeline.stages, passes, carried))
         return self.delivered(rows, pipeline, counting=counting, examples=examples)
+
+    def hand_off(self, pipeline: Pipeline, consumed: int, carried: int, rows: Rows, *,
+                 marked: bool) -> tuple[int, bool]:
+        """Where a pooled read's workers hand its rows on, `carried` (`_carried`) at the latest, an in-order
+        read's before what its workers can't read in its order (`_handoff`); and whether they spread each
+        input (`spreads`)."""
+        spreading = self.spreads(rows)
+        if self.in_order and carried >= 0:
+            # A read cut per share runs its Grain steps in its workers over its indexed rows, as a read in
+            # none does, and hands on after one that makes a stream (`records`); an elastic read before it.
+            carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked, native=self.elastic,
+                                            spread=spreading))
+        return carried, spreading
+
+    def spread(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, at: int, carried: int,
+               last: int, *, examples: bool,
+               counting: bool) -> tuple[Rows, tuple[int, bool], bool, bool, int]:
+        """`rows` through the record stages from the expansion at `at` to the hand-off at `carried`, over
+        each input in its workers (`_PerInput`), each random stage's seed its own (`stage_seed`); the
+        spread `handed_on` reads, whether the read counts its examples and its rows (`records`), an
+        objective's expansion counting the source examples it makes rows of (`FlatMap.examples`), and the
+        stage the read goes on from."""
+        stage = pipeline.stages[at]
+        counted = isinstance(stage, FlatMap) and stage.examples and counting
+        examples, counting = (True, _consumes(pipeline)) if counted else (examples, counting)
+        run = tuple(pipeline.stages[at:carried])
+        seeds = tuple(self.stage_seed(pipeline, index, partition) if isinstance(step, RandomMap) else None
+                      for index, step in enumerate(run, start=at))
+        assert isinstance(rows, pygrain.MapDataset), "a spread read's rows are indexed to its expansion"
+        spread = rows.map_with_index(_PerInput(run, seeds, unplaced=at <= last < carried))
+        return spread, (at, counted and not counting), examples, counting, carried
+
+    def handed_on(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, carried: int,
+                  spread: tuple[int, bool] | None, *, certain_after: int | None) -> Rows:
+        """`rows` handed on by its workers at `carried` (`handed`), each spread input as its rows where the
+        workers spread them from the expansion `spread` names (`unspread`)."""
+        rows = self.handed(rows, pipeline, partition, pool, carried, certain_after=certain_after)
+        if spread is None:
+            return rows
+        at, counted_inputs = spread
+        return self.unspread(rows, pipeline, at, carried, counted_inputs, certain_after=certain_after)
+
+    def unspread(self, rows: Rows, pipeline: Pipeline, at: int, carried: int, counted_inputs: bool, *,
+                 certain_after: int | None) -> pygrain.IterDataset:
+        """A spread read's inputs (`_PerInput`) as the reading process reads them: counted as source examples
+        where its expansion is an objective's and the run counts them before it (`counted_inputs`), as a read
+        that expands in the reading process counts them, then as their rows, what the steps from the
+        expansion at `at` to the hand-off at `carried` dropped counted after them as theirs are."""
+        if counted_inputs:
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            rows=_counts_rows(pipeline, at))
+        rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), _Unspread())
+        if any(_drops(stage) for stage in pipeline.stages[at:carried]):
+            rows = Accepted(rows, _name(pipeline), _label(pipeline), certain_after=certain_after,
+                            rows=_counts_rows(pipeline, carried), members=self.counted_members(pipeline))
+        return rows
 
     def delivered(self, rows: Rows, pipeline: Pipeline, *, counting: bool, examples: bool) -> Rows:
         """`rows` as `pipeline` delivers them to its batch, counted where it counts its own (`counting`, of

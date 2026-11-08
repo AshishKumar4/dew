@@ -12,6 +12,7 @@ import atexit
 import dataclasses
 import itertools
 import json
+import os
 import subprocess
 import time
 
@@ -295,6 +296,51 @@ def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers(monkeypatc
     for saved_in, resumed_in in ((2, 4), (4, 0), (0, "auto")):
         head, saved = read(saved_in, 5)
         assert head + read(resumed_in, 7, saved)[0] == whole
+
+
+@dataclasses.dataclass(frozen=True)
+class _Where:
+    """A record step noting the process that ran it."""
+
+    identity = "where@1"
+
+    def __call__(self, record):
+        return {**record, "pid": os.getpid()}
+
+
+def test_a_read_cut_per_share_expands_and_draws_in_its_workers_alike_in_any_count(monkeypatch):
+    """A training read cut per share whose expansion and the random steps after it run in its loading
+    workers (`_PerInput`), each input spread there whole and each draw keyed by its input and its row in it:
+    its batches are those it reads in no workers in one, two, four and the count automatic loading resolves
+    to, a position saved in any count resumes in any other, and the expansion runs in the workers, not the
+    reading process (row 4862: a decision run's expansion and layout held the reading process's
+    interpreter)."""
+    from dew.data import dataset
+    from dew.data.dataset import Host
+
+    monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
+    monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 0.0)
+    expanded = Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().flat_map(_Spread())
+
+    def read(chain, workers, count: int, state=None) -> tuple[list, object]:
+        reader = compile(chain, seed=5, steps=10**6, loading=Loading(workers=workers)).train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            read = listed(reader, count)
+            return read, reader.get_state()
+        finally:
+            reader.close()
+
+    chain = expanded.random_map(_Jittered()).batch(4)
+    whole, _ = read(chain, 0, 12)
+    for workers in (1, 2, 4, "auto"):
+        assert read(chain, workers, 12)[0] == whole
+    for saved_in, resumed_in in ((2, 4), (4, 0), (0, 2)):
+        head, saved = read(chain, saved_in, 5)
+        assert head + read(chain, resumed_in, 7, saved)[0] == whole
+    pids = {int(pid) for batch in read(expanded.map(_Where()).batch(4), 2, 3)[0] for pid in batch["pid"]}
+    assert pids and os.getpid() not in pids
 
 
 @pytest.mark.parametrize("workers", [0, 2])
