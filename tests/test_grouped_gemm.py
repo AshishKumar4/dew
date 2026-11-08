@@ -901,11 +901,12 @@ def _primitives(jaxpr, found: set) -> set:
 
 @runs("sm100")
 @pytest.mark.parametrize("sizes", ["ragged", "one-group", "dense"])
-def test_a_blackwells_bf16_projection_and_its_gradients_on_tcgen05_hold_check_1(sizes):
+def test_a_blackwells_bf16_projection_on_tcgen05_and_its_gradients_hold_check_1(sizes):
     """A Blackwell's bf16 projection (`expert_projection`'s, a dense layer's where no groups are given) with
-    bf16 outputs, so no depth step is summed apart (`product.promoted`) and its forward and both gradients
-    run on tcgen05's launches as a B200 runs them, interpreted: each as exact as XLA's ragged dot from
-    float64, unrouted rows and empty groups included."""
+    bf16 outputs, so no depth step is summed apart (`product.promoted`) and its forward runs on tcgen05's
+    launch as a B200 runs it, interpreted, its gradients on the launches they take there (row 5209: the
+    kernel gradient on no tcgen05 launch yet): each as exact as XLA's ragged dot from float64, unrouted rows
+    and empty groups included."""
     group_sizes = None if sizes == "dense" else jnp.asarray(SIZES[sizes], jnp.int32)
     rows = 200 if sizes == "dense" else sum(SIZES[sizes]) + 9
 
@@ -926,9 +927,10 @@ def test_a_blackwells_bf16_projection_and_its_gradients_on_tcgen05_hold_check_1(
         return with_gradients(lambda x, w: interpreted_projection(x, w, group_sizes, jnp.bfloat16))(x, w, dy)
 
     with generation.assumed("sm100"):
-        # The premise: the launches the forward and both gradients take are tcgen05's.
-        traced = jax.make_jaxpr(on_tcgen05)(*draw(0))
-        assert any(name.startswith("tcgen05") for name in _primitives(traced.jaxpr, set())), sizes
+        # The premise: the forward's launch is tcgen05's.
+        forward = jax.make_jaxpr(lambda x, w: interpreted_projection(x, w, group_sizes, jnp.bfloat16))(
+            *draw(0)[:2])
+        assert any(name.startswith("tcgen05") for name in _primitives(forward.jaxpr, set())), sizes
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
         assert_as_exact(on_tcgen05, jax.jit(with_gradients(projection(jnp.bfloat16))), draw,
                         f"tcgen05 {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
