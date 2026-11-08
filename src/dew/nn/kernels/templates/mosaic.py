@@ -139,8 +139,17 @@ def dependent(entry: Callable, interpret) -> Callable:
     b2b872c91; CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
     (`mosaic_gpu.uses_pdl`) and the runtime launches it with programmatic stream serialization. Interpreted,
     or on a GPU without grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on),
-    `entry` as it is."""
-    if interpreted(interpret) or not generation.gpu_target().architecture.dependent_launch:
+    `entry` as it is. Its body traces knowing whether it runs interpreted (`interpreting`), as every family's
+    products read it."""
+    if interpreted(interpret):
+        def body(*refs):
+            token = _INTERPRETING.set(True)
+            try:
+                entry(*refs)
+            finally:
+                _INTERPRETING.reset(token)
+        return body
+    if not generation.gpu_target().architecture.dependent_launch:
         return entry
 
     def body(*refs):
@@ -149,6 +158,18 @@ def dependent(entry: Callable, interpret) -> Callable:
         plgpu.griddepcontrol_launch_dependents()
 
     return body
+
+
+_INTERPRETING: contextvars.ContextVar[bool] = contextvars.ContextVar("interpreting", default=False)
+"""Whether the launch whose body is tracing runs in Pallas's interpreter (`dependent`, which every launch's
+body passes through)."""
+
+
+def interpreting() -> bool:
+    """Whether the launch whose program is tracing runs in Pallas's interpreter: a family's products issue
+    no instruction the interpreter lacks there (mma.sync's sums, `mosaic_sm80.Mma.products`), whatever a
+    caller states (row 5209's A100 backward: products called with no interpret flag issued mma.sync's)."""
+    return _INTERPRETING.get()
 
 
 _RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
@@ -1279,7 +1300,7 @@ class Issuer[Accumulator](abc.ABC):
     """Whether its products scale each 32 depths of their operands by an E8M0 scale in the instruction (an MX
     product's, `scaled_products`): tcgen05's block-scaled MMA; no other family's products do (row 4519)."""
 
-    def scaled_products(self, acc, lhs, rhs, scales: tuple, interpret: bool):
+    def scaled_products(self, acc, lhs, rhs, scales: tuple):
         """`products` of block-scaled operands (`takes_block_scales`), `scales` the step's two scale slots."""
         raise NotImplementedError(f"{self.name}'s products take no block scales")
 
@@ -1406,11 +1427,10 @@ class Issuer[Accumulator](abc.ABC):
         del products
         return 0
 
-    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+    def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
         `shape` (zero), its value once they are done: a register accumulator's, which a family whose
         accumulator is a ref scopes (wgmma's)."""
-        del interpret
         return issue(self.zeros(shape))
 
     @abc.abstractmethod
@@ -1460,12 +1480,12 @@ class Issuer[Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
         product runs; `interpret`, as `products`' (an instruction no CPU rule lowers computed as its sum)."""
 
     @abc.abstractmethod
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+    def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
     def summed_window(self, block_k: int) -> int:
@@ -1475,18 +1495,18 @@ class Issuer[Accumulator](abc.ABC):
         del block_k
         return 1
 
-    def summed_apart(self, running: jax.Array, lhs, rhs, interpret: bool, scale: Callable | None = None
+    def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:
         """`running` plus `lhs @ rhs` summed apart (exact sums, `templates.product.promoted`): the step's own
         fp32 sum of its products, times `scale(start, columns)` where given (its columns' multiplier from
         `start`: a blockwise-scaled FP8 product's, `mosaic_gpu.gmm`'s `step_scales`), added into `running`
         by an IEEE add."""
         rows, columns = running.shape
-        fresh = self.product(lhs, rhs, (rows, columns), interpret=interpret)
+        fresh = self.product(lhs, rhs, (rows, columns))
         return running + (fresh if scale is None else fresh * scale(0, columns))
 
     @abc.abstractmethod
-    def products(self, acc: Accumulator, lhs, rhs, interpret: bool, *, accumulate: bool = True
+    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True
                  ) -> Accumulator:
         """`acc` with `lhs @ rhs` issued into it in place, both operands in shared memory (a GEMM's step);
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
@@ -1508,7 +1528,7 @@ class Issuer[Accumulator](abc.ABC):
         shared-memory tile) issued into it in place, the pairs `product.terms` gives, smallest first
         (`products`)."""
         for i, j in product.terms(len(left), len(right)):
-            acc = self.products(acc, left[i], right[j], interpret)
+            acc = self.products(acc, left[i], right[j])
         return acc
 
     def apart(self, shape: tuple[int, int], left: tuple, right: tuple, interpret: bool) -> jax.Array:
@@ -1517,13 +1537,13 @@ class Issuer[Accumulator](abc.ABC):
         meet first: a tensor core's accumulation truncates (mma.sync's), so a part accumulated onto a larger
         one loses its last bit where a sum rounds it."""
         def issue(i: int, j: int, acc: Accumulator) -> Accumulator:
-            return self.products(acc, left[i], right[j], interpret)
+            return self.products(acc, left[i], right[j])
 
-        return functools.reduce(jnp.add, (self.summed(shape, functools.partial(issue, i, j), interpret)
+        return functools.reduce(jnp.add, (self.summed(shape, functools.partial(issue, i, j))
                                           for i, j in product.terms(len(left), len(right))))
 
     @abc.abstractmethod
-    def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
+    def register_products(self, acc: Accumulator, parts, rhs) -> Accumulator:
         """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
         registers, `parts` an iterable that may form each as it is taken
         (`attention_algebra.formed_parts`)."""

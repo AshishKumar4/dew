@@ -172,7 +172,7 @@ class Issuer:
                 registered = self._registered(name, lhs)
                 if registered is not None:
                     (right,) = self._operand(rhs, name, lhs, read)
-                    acc = family.register_products(acc, registered, right, interpret)
+                    acc = family.register_products(acc, registered, right)
                 else:
                     left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
                     acc = family.issued(acc, left, right, interpret)
@@ -189,7 +189,7 @@ class Issuer:
             # A sum of blocks is unscaled (`product.Blocks`).
             lhs = None if isinstance(held[-1], product.Blocks) else held[-1][1]
             scaled = lhs if isinstance(lhs, product.Scaled) else None
-            part = family.summed(shape, lambda acc: group(acc, alone=scaled is not None), interpret)
+            part = family.summed(shape, lambda acc: group(acc, alone=scaled is not None))
             if scaled is None:
                 return part
             if self.restored is None:
@@ -255,13 +255,13 @@ class Issuer:
             (right,) = self._operand(rhs, name, lhs)
             if len(registered) <= 2:
                 return family.summed(
-                    shape, lambda acc: family.register_products(acc, registered, right, interpret), interpret)
+                    shape, lambda acc: family.register_products(acc, registered, right))
             # Each part's product its own accumulator, smallest first (`product.terms`), as `Family.apart`.
-            return functools.reduce(jnp.add, (family.registers_product(registered[i], right, interpret)
+            return functools.reduce(jnp.add, (family.registers_product(registered[i], right)
                                               for i, _ in product.terms(len(registered), 1)))
         left = self._operand(lhs, name, rhs)
         right = self._operand(rhs, name, lhs)
         if max(len(left), len(right)) == 2:
-            return family.summed(shape, lambda acc: family.issued(acc, left, right, interpret), interpret)
+            return family.summed(shape, lambda acc: family.issued(acc, left, right, interpret))
         return family.apart(shape, left, right, interpret)
 
