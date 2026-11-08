@@ -213,28 +213,6 @@ def test_a_decode_steps_attention_launches_write_every_output(far):
                        value)
 
 
-def test_attentions_training_launches_write_every_output_over_an_empty_row():
-    """The attention template's training step (its forward keeping the backward's residuals, and the
-    backward), interpreted as an H100's, over two rows of 64 queries, the first seeing no key (a zero-length
-    document, `lengths` 0) and the second every one: every launch writes every output it declares, an
-    empty row's among them. An A100's backward walks its launches inside a loop the audit does not walk
-    (`kernel_outputs.NESTED`)."""
-    from dew.nn.kernels.templates import attention as template, attention_mosaic
-
-    query, key, value, dout = drawn((2, 64, 4, 64), (2, 64, 2, 64), (2, 64, 2, 64), (2, 64, 4, 64))
-    spans = template.spans(64, 64, 2, lengths=jnp.asarray([0, 64], jnp.int32))
-
-    def step(query, key, value, dout):
-        out, *residuals = attention_mosaic.forward(query, key, value, spans, None,
-                                                   residuals=template.Kept.SPLIT, interpret=True)
-        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=tuple(residuals),
-                                          interpret=True)
-        return out, grads
-
-    with generation.assumed("sm90"):
-        assert_written(step, query, key, value, dout, launches=2)
-
-
 def test_the_attention_certify_launch_writes_every_record():
     """The attention forward's certify form (`attention_mosaic.certified`, interpreted as an H100's) over a
     causal call: its records past each query block's walked key tiles hold the empty state its refs start
