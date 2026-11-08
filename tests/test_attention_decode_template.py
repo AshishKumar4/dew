@@ -263,14 +263,15 @@ PAGE = 128
 
 
 @INTERPRETS
-@pytest.mark.parametrize("page", [PAGE, 16])
+@pytest.mark.parametrize(("device", "page"), [("sm90", PAGE), ("sm90", 16), ("sm80", 16)])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
-def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page):
+def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page, device):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
     tile, on par with the reference path over the cache gathered dense (check 1): pages of whole key tiles,
     and pages of 16 keys, the docs' (docs/concepts/inference.md), several to a key tile, each loaded on its
-    own (`mosaic.Pieces`, row 3648)."""
+    own (`mosaic.Pieces`, row 3648), on an H100 and an A100 (each piece's cp.async copy staged at the
+    swizzle its copy tiles, `mosaic_sm80.CpAsync.walk`)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     per_row = KEYS // page
@@ -282,7 +283,7 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
         return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(len(LENGTHS), KEYS, kv_heads, pool.shape[-1])
 
     def ours(query, key_pool, value_pool):
-        with generation.assumed("sm90"):
+        with generation.assumed(device):
             return attention_decode.attend(query, key_pool, value_pool, spans, interpret=True, table=table)
 
     def reference(query, key_pool, value_pool):
@@ -295,7 +296,7 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
                  for stream in streams[1:])
         return query, *pools
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call} {page}",
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call} {page} {device}",
                     seeds=SEEDS)
 
 

@@ -4,9 +4,12 @@ call on each kernel the op serves on par with the reference path.
 Each cell runs `attention.scaled_dot_product_attention` as a model's layer does, its forward and its reverse
 mode in one program, with its kernel named (`implementation`): FlashAttention's (`flash`), tokamax's Triton
 kernel (`triton`), cuDNN's fused attention (`cudnn`) and the template (`template`) on a GPU, splash
-(`tpu`) on a TPU. The output and the gradients of the query, key and value are held to the reference path's
-(check 1) with their float64 terms (`attention_oracle.attention_terms`), as tests/attention_matrix.py holds
-the template's route, whose launch forms that family pins.
+(`tpu`) on a TPU; and the template's forward beside xla's training (`inference`, no implementation's name:
+chosen, `generation.chosen`), whose training step is xla's attention, forward and derivatives, through its
+own seam (`attention.forward_differentiable`'s `primal_alone`). The output and the gradients of the query,
+key and value are held to the reference path's (check 1) with their float64 terms
+(`attention_oracle.attention_terms`), as tests/attention_matrix.py holds the template's route, whose launch
+forms that family pins.
 
 What the op serves is read from its own selector (`attention_kernels.ATTENTION`): the step traced for its
 shapes as the case's generation (a GPU's within an abstract mesh of one of its devices), a call the kernel's
@@ -14,6 +17,9 @@ requirements refuse raising `selection.KernelRefused`, and the route the selecto
 on the device its backend requirement names (`native`: a named `tpu` runs interpreted off a TPU, which is no
 cell of this matrix).
 """
+
+import contextlib
+from typing import get_args
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +41,8 @@ REFERENCE = "reference"
 CHOICES = frozenset({CHOICE})
 """The `generation.CHOICES` entries the cells run (tests/test_kernel_matrix.py's union, row 184)."""
 KERNELS = {CHOICE: frozenset(AXES["attention_kernels"]["kernel"])}
+NAMED = frozenset(get_args(attention.AttentionImpl))
+"""The kernels a call names (`implementation`); any other runs chosen (`generation.chosen`)."""
 """The kernels the cells run under test, by their op's choice (row 4513): each cell asserts its routes take
 its own."""
 
@@ -49,11 +57,13 @@ def _step(case: dict[str, str], kernel: str):
     def step(query, key, value, dout):
         def attended(query, key, value):
             return attention.scaled_dot_product_attention(
-                query, key, value, implementation=kernel, causal=case["mask"] != "full", segment_ids=segments,
+                query, key, value, implementation=kernel if kernel in NAMED else "auto",
+                causal=case["mask"] != "full", segment_ids=segments,
                 max_segments=None if segments is None else DOCUMENTS)
 
-        out, pull = jax.vjp(attended, query, key, value)
-        return (out, *pull(dout.astype(out.dtype)))
+        with contextlib.nullcontext() if kernel in NAMED else generation.chosen(**{CHOICE: kernel}):
+            out, pull = jax.vjp(attended, query, key, value)
+            return (out, *pull(dout.astype(out.dtype)))
 
     return step
 
@@ -104,18 +114,21 @@ CASES = (
     ('sm80', 'flash', '256', 'gqa-8-2', 'documents', 'float16'),
     ('v5e', 'template', '64', 'mha', 'full', 'float16'),
     ('sm80', 'cudnn', '128', 'mha', 'documents', 'bfloat16'),
-    ('v5e', 'tpu', '256', 'mha', 'causal', 'float32'),
-    ('sm80', 'template', '64', 'gqa-8-2', 'causal', 'float32'),
-    ('sm90', 'cudnn', '256', 'gqa-8-2', 'full', 'bfloat16'),
+    ('v5e', 'inference', '256', 'mha', 'causal', 'float32'),
     ('v5e', 'tpu', '64', 'gqa-8-2', 'documents', 'bfloat16'),
-    ('sm90', 'cudnn', '128', 'mha', 'causal', 'float16'),
-    ('sm90', 'template', '128', 'mha', 'documents', 'bfloat16'),
-    ('sm80', 'triton', '64', 'mha', 'causal', 'bfloat16'),
-    ('v5e', 'tpu', '128', 'mha', 'full', 'float16'),
-    ('sm80', 'flash', '128', 'mha', 'full', 'bfloat16'),
-    ('sm90', 'template', '256', 'mha', 'documents', 'float32'),
+    ('sm90', 'cudnn', '128', 'gqa-8-2', 'causal', 'float16'),
+    ('sm90', 'template', '256', 'gqa-8-2', 'full', 'bfloat16'),
+    ('sm80', 'triton', '64', 'mha', 'causal', 'float32'),
+    ('sm90', 'inference', '64', 'gqa-8-2', 'documents', 'bfloat16'),
+    ('sm80', 'template', '128', 'mha', 'documents', 'float32'),
+    ('sm80', 'inference', '128', 'mha', 'full', 'float16'),
+    ('v5e', 'tpu', '128', 'mha', 'causal', 'float16'),
+    ('v5e', 'tpu', '256', 'mha', 'full', 'float32'),
+    ('sm90', 'flash', '128', 'mha', 'full', 'bfloat16'),
     ('sm90', 'triton', '256', 'mha', 'causal', 'bfloat16'),
-    ('sm90', 'cudnn', '64', 'mha', 'causal', 'bfloat16'),
+    ('sm90', 'cudnn', '64', 'mha', 'full', 'bfloat16'),
+    ('sm90', 'cudnn', '256', 'mha', 'causal', 'bfloat16'),
+    ('sm90', 'template', '64', 'mha', 'causal', 'bfloat16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the op serves
 (`kernel_matrix.covering("attention_kernels")`, regenerated where the axes or the op's support change)."""
