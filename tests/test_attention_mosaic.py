@@ -956,9 +956,9 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
 @pytest.mark.parametrize("held", ["keys", "start"])
 def test_a_training_forwards_row_whose_sums_stay_in_range_takes_no_shift_whatever_its_values_reach(held):
     """A training forward's head whose rows see 512 keys, the row's largest magnitude near fp32's largest
-    under a weight near 2^-125 at the row's maximum (`held`: a key's value, its logit 86.5 below the row's
-    peak; or a resumed state's sums, its maximum 97 below it), every other key weighing nothing or holding
-    zeros: its weighted values stay small, so no row shifts (`algebra.row_shift` of its terms at the walk's
+    under a weight near fp32's least normal at the row's maximum (`held`: a key's value, its logit 86.5
+    below the row's peak; or a resumed state's sums, its maximum 120 binades below it), every other key
+    weighing nothing or holding zeros: its weighted values stay small, so no row shifts (`algebra.row_shift` of its terms at the walk's
     maximum, `algebra.Reach`, `algebra.started_reach`), though its count times its largest magnitude passes
     fp32's largest by 2^9, and its small weight is not shifted out of range. Its output is exactly 2^64
     times the call's over its values and sums at 2^-64, which no bound comes near."""
@@ -975,8 +975,8 @@ def test_a_training_forwards_row_whose_sums_stay_in_range_takes_no_shift_whateve
     if held == "keys":
         value = value.at[:, 1, 0].set(3e38)
     query, key, value = (array.astype(jnp.bfloat16) for array in (query, key, value))
-    # Head 0's resumed sums at 2^127 under a maximum 140 binades below its keys' (head 1's at 0, none).
-    m = jnp.zeros((1, 2, queries)).at[:, 0].set(128.0 - 140 * np.log(2.0))
+    # Head 0's resumed sums at 2^127 under a maximum 120 binades below its keys' (head 1's at 0, none).
+    m = jnp.zeros((1, 2, queries)).at[:, 0].set(128.0 - 120 * np.log(2.0))
     acc = jnp.zeros((1, 2, queries, width)).at[:, 0].set(2.0 ** 127 if held == "start" else 0.0)
     tiles = attention_mosaic.Tiles(64, 64, 2, 1, family=WGMMA)
 
