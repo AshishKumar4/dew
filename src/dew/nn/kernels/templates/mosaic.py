@@ -1820,7 +1820,8 @@ class Transport[Allocated, Opened](abc.ABC):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
-               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
+               ahead: Callable | None = None, settled: tuple[int, ...] = ()) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
         compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
@@ -1832,7 +1833,8 @@ class Transport[Allocated, Opened](abc.ABC):
         `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
         reserving its share of reduction scratch (`warpgroup_reduction_scratch`); its first `scalars` operands
         tables of integers its programs read an element at a time (a grouped schedule's), which a GPU reads
-        from global memory and a TPU from its scalar memory."""
+        from global memory and a TPU from its scalar memory; its `settled` operands (indices) read `ahead`
+        of the program's wait for the launch before it, where given (`dependent`)."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -2269,7 +2271,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
-               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0) -> Callable:
+               reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
+               ahead: Callable | None = None, settled: tuple[int, ...] = ()) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
         if cluster > self.cluster:
@@ -2277,7 +2280,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
-                      model_flops=model_flops, resident=resident,
+                      model_flops=model_flops, resident=resident, ahead=ahead, settled=settled,
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=(self.reduction_scratch
