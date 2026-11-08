@@ -13,7 +13,9 @@ from xml.etree import ElementTree
 import numpy as np
 import pytest
 from one_draw import assert_as_exact_as_the_reference
-from reference_error import GateFailure, as_given, assert_as_exact, row_errors
+from reference_error import GateFailure, as_given, assert_as_exact
+
+from dew.parity import row_errors
 
 
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
@@ -207,7 +209,8 @@ def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_lar
     non-finite measure. Each now comes from logs or a scaled sum: the measure is finite, and the row still
     fails."""
     from one_draw import rows_over
-    from reference_error import pooled_zero_rows
+
+    from dew.parity import pooled_zero_rows
 
     truth = np.asarray([[1e-160, 1e-160], [1.0, 1.0]])
     reference = np.asarray([[0.0, 0.0], [1.0, 1.0]])
@@ -241,7 +244,7 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     size by the same arithmetic, so Dew's ordinary rounding there (1e-15) is held by the zero rows' rule
     and not read over the residue's size (ledger 1831); a reference that carries the row still
     measures it."""
-    from reference_error import _paired, leaf_summary
+    from dew.parity import _paired, leaf_summary
 
     # Residue rows whose squares fall below float64's normal range, where a size and an error taken by
     # two arithmetics part by more than a rounding.

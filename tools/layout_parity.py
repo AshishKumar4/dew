@@ -1351,7 +1351,7 @@ def prepared(models: Sequence[str], *, dtype: str, seeds: int | Mapping[str, int
     seeds the reference's first draw alone (`ran`), with the reference's FLOPs, computed into
     `references` where missing; whether every model's is there."""
     sys.path.insert(0, str(REPO / "tests"))
-    from check1_wire import staged_units
+    from dew.parity_stages import staged_units
 
     whole = True
     for model in models:
