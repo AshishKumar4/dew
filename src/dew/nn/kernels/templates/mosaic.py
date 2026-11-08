@@ -2072,7 +2072,11 @@ class Transport[Allocated, Opened](abc.ABC):
         of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
         the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
         `partials` is then a ref a leaf, in its structure. Interpreted (`ready` None), the tile's first
-        program combines, which the interpreter walks after every other (`tail.ordered`)."""
+        program combines, which the interpreter walks after every other (`tail.ordered`). `partials` and
+        `firsts` are a workspace, a slot written only where programs share a tile (none where one program
+        walks it, nor the combining program's own interpreted): refs the launch takes in place (a
+        `lax.empty` ref, `gemm.mosaic_gpu._workspace`), never declared outputs, which would be left
+        partly unwritten (NSNAN-2)."""
         opening = partials if firsts is None else firsts
 
         def left(refs) -> None:
