@@ -16,7 +16,7 @@ import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
 from reference_error import with_gradients
-from test_recurrence_chunk import chunk_on
+from test_recurrence_chunk import chunk_on, formed
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -165,7 +165,9 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
         return
     draws = functools.partial(drawn, dtype, **geometry(case))
     (sample,) = draw(dtype, 0, **geometry(case))
-    if not trained(sample, hooks):
+    # Judged under the forms the call runs (`on_the_mainloop`'s fast ones): an fp32 call's rounding reads the
+    # product precision they set (`recurrence_chunk.fast_rounding`).
+    if not formed('fast', trained)(sample, hooks):
         refuses_its_gradient(compiled(on), *draws(0))
         return
     recomputed, saved = REMATS[remat]

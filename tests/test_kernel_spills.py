@@ -272,8 +272,9 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
 def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
     """A program (`dew.nn.kernels.options.program`) compiled through the reports keys its executables
     as jit does: called under a run's fast attention forms and its accurate ones in turn
-    (`generation.run_precision`), it compiles each form once and each call computes what jit computes
-    under that form."""
+    (`generation.run_precision`), it compiles each form on its first call (a launch that spills there
+    compiled again a step down, as on a GH200) and nothing on its second, and each call computes what jit
+    computes under that form."""
     query = jax.random.normal(jax.random.key(0), (1, 16, 2, 8))
 
     def attend(query):
@@ -281,11 +282,12 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
 
     run = program(attend)
     ran: dict[str, list[jax.Array]] = {"fast": [], "accurate": []}
-    with Compiles("attend") as compiles:
-        for form in ("fast", "accurate", "fast", "accurate"):
-            with generation.run_precision(Numerics(forms=form)):
-                ran[form].append(run(query))
-    assert sum(found.kind == "compiled" for found in compiles.programs) == 2
+    compiled: dict[str, list[int]] = {"fast": [], "accurate": []}
+    for form in ("fast", "accurate", "fast", "accurate"):
+        with generation.run_precision(Numerics(forms=form)), Compiles("attend") as compiles:
+            ran[form].append(run(query))
+        compiled[form].append(sum(found.kind == "compiled" for found in compiles.programs))
+    assert all(first >= 1 and again == 0 for first, again in compiled.values()), compiled
     for form, outputs in ran.items():
         with generation.run_precision(Numerics(forms=form)):
             expected = jax.jit(attend)(query)
@@ -661,12 +663,28 @@ WATERFALL_LISTING = """
 """A copy whose operand ptxas could not prove uniform, issued lane by lane in an elect waterfall (BRA.U.ANY)
 around its R2UR (notes/ptxas-re.md §2: a divergent copy operand)."""
 
-def test_the_sass_rules_find_an_elect_waterfall_around_a_conversion():
-    """The compile gate's SASS rules (row 4071, the kernel challenge's harness/ptxas checks) read nvdisasm's
-    listing of a kernel: an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
-    operand ptxas could not prove uniform; a loop's conversion without a waterfall is none."""
-    (waterfall,) = report.sass_findings_of(WATERFALL_LISTING)
-    assert "waterfall" in waterfall
+DEAD_MMA_LISTING = """
+.text.negated_mosaic_gpu_kernel:
+        /*0570*/                   WARPGROUP.ARRIVE ;
+        /*0580*/                   HGMMA.64x8x16.F16 RZ, gdesc[URZ], RZ, !UPT, gsb0 ;
+        /*0590*/                   WARPGROUP.DEPBAR.LE gsb0, 0x0 ;
+        /*05b0*/                   STS.64 [R3+0x4000], R16 ;
+        /*05c0*/                   EXIT ;
+"""
+"""ptxas 12.9's listing of a negated warpgroup product (row 4346's minimal kernel at base): its four MMAs
+dropped for one writing no register, the stored tile a constant."""
+
+
+@pytest.mark.parametrize(("listing", "found"), [(WATERFALL_LISTING, "waterfall"),
+                                               (DEAD_MMA_LISTING, "warpgroup MMA writing no register")])
+def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
+    """The compile gate's SASS rules read nvdisasm's listing of a kernel (row 4071, the kernel challenge's
+    harness/ptxas checks): an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
+    operand ptxas could not prove uniform, and a warpgroup MMA writing no register (`HGMMA ... RZ`) is what
+    ptxas leaves of products it found never read (row 4346); each is one finding the gate fails, and a loop's
+    conversion with neither is none."""
+    (finding,) = report.sass_findings_of(listing)
+    assert found in finding
     assert report.sass_findings_of(CONVERTING_LISTING) == ()
 
 

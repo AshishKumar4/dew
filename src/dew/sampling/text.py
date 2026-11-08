@@ -301,6 +301,9 @@ class Generation(Generic[ArrayT]):
     ``lengths`` are valid. ``behavior_log_probs`` describes the distribution
     that actually drew each action, after the whole transform chain.
     ``raw_log_probs`` describes the unmodified model policy.
+    ``boundaries``, [B, max_new_tokens, rankings, 2], is each ranking's last
+    score kept and first passed over at each step of a search whose strategy
+    reports them (``Beam(boundaries=True)``), else None.
 
     A request for ``n`` continuations per prompt gives every array
     ``[B * n, ...]`` rows: prompt zero's ``n`` continuations, then prompt
@@ -320,6 +323,7 @@ class Generation(Generic[ArrayT]):
     rows: int | None = struct.field(pytree_node=False, default=None)
     decoder: Callable[[ArrayLike, ArrayLike, int], tuple[str, ...]] | None = struct.field(
         pytree_node=False, default=None)
+    boundaries: ArrayT | None = None
 
     @property
     def prompt_width(self) -> int:
@@ -779,7 +783,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
     return Generation(
         jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,
-        drawn.behavior_log_probs, drawn.raw_log_probs)
+        drawn.behavior_log_probs, drawn.raw_log_probs, boundaries=drawn.boundaries)
 
 
 def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray], max_new_tokens: int,
