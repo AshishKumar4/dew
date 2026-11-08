@@ -195,6 +195,59 @@ def test_the_gpus_partial_gemm_launches_write_every_output(product):
                            lhs, rhs)
 
 
+@pytest.mark.parametrize("far", [False, True], ids=["plain", "a-row-rewalked"])
+def test_a_decode_steps_attention_launches_write_every_output(far):
+    """A decode step through the attention template (`attention_decode.attend`, interpreted as an H100's):
+    its plain launch, its slices' merge, and its masked rewalk into the plain launch's outputs in place,
+    which declares none of its own (a step whose rows need no rewalk, and one whose first row's query is
+    2^16 times a drawn one, past the fold's reach) write every output they declare (M-NS-27's red)."""
+    from dew.nn.kernels.templates import attention as template, attention_decode
+
+    query, key, value = drawn((2, 1, 8, 64), (2, 256, 2, 64), (2, 256, 2, 64))
+    if far:
+        query = query.at[0].multiply(2.0 ** 16)
+    spans = template.spans(1, 256, 2, lengths=jnp.asarray([200, 37], jnp.int32),
+                           starts=jnp.asarray([0, 16], jnp.int32))
+    with generation.assumed("sm90"):
+        assert_written(lambda q, k, v: attention_decode.attend(q, k, v, spans, interpret=True), query, key,
+                       value)
+
+
+@pytest.mark.parametrize("generation_name", ["sm90", "sm80"])
+def test_attentions_training_launches_write_every_output_over_an_empty_row(generation_name):
+    """The attention template's training step (its forward keeping the backward's residuals, and the
+    backward), interpreted as each GPU's, over two rows of 64 queries, the first seeing no key (a zero-length
+    document, `lengths` 0) and the second every one: every launch writes every output it declares, an
+    empty row's among them."""
+    from dew.nn.kernels.templates import attention as template, attention_mosaic
+
+    query, key, value, dout = drawn((2, 64, 4, 64), (2, 64, 2, 64), (2, 64, 2, 64), (2, 64, 4, 64))
+    spans = template.spans(64, 64, 2, lengths=jnp.asarray([0, 64], jnp.int32))
+
+    def step(query, key, value, dout):
+        out, *residuals = attention_mosaic.forward(query, key, value, spans, None,
+                                                   residuals=template.Kept.SPLIT, interpret=True)
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=tuple(residuals),
+                                          interpret=True)
+        return out, grads
+
+    with generation.assumed(generation_name):
+        assert_written(step, query, key, value, dout, launches=2)
+
+
+def test_the_attention_certify_launch_writes_every_record():
+    """The attention forward's certify form (`attention_mosaic.certified`, interpreted as an H100's) over a
+    causal call: its records past each query block's walked key tiles hold the empty state its refs start
+    from, so every output it declares is written."""
+    from dew.nn.kernels.templates import attention as template, attention_mosaic
+
+    query, key, value = drawn((1, 256, 2, 64), (1, 256, 2, 64), (1, 256, 2, 64))
+    spans = template.spans(256, 256, 1, causal=True)
+    with generation.assumed("sm90"):
+        assert_written(lambda q, k, v: attention_mosaic.certified(q, k, v, spans, interpret=True)[1],
+                       query, key, value)
+
+
 def test_an_unwritten_output_is_found():
     """The audit's own check: a launch that leaves its second output's last row unwritten is reported, its
     first output, written whole, is not."""
