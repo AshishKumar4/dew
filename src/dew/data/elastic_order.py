@@ -8,6 +8,7 @@ from __future__ import annotations
 import collections
 import itertools
 from collections.abc import Callable, Mapping, Sequence
+from typing import overload
 
 import grain.python as pygrain
 
@@ -33,6 +34,12 @@ class _Gathered(pygrain.MapDataset):
 
     def __len__(self) -> int:
         return self._groups
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Batch: ...
 
     def __getitem__(self, index):
         if isinstance(index, slice):
