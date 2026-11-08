@@ -85,9 +85,10 @@ BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
                   *(RAISED_FORMS if resources.RAISES_HONORED else ()), "accurate")
 """The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
 where raises hold (`RAISED_FORMS`), and the accurate."""
-WGMMA_FORMS = ("fused-keys-first", "fused-shared-keys", *RAISED_FORMS)
-"""The backward's forms on an H100's layouts alone (`FED`'s fed consumers, its shared keys and dQ), which an
-A100's mma.sync, one warpgroup, takes none of."""
+WGMMA_FORMS = ("fused", "fused-keys-first", "fused-shared-keys", *RAISED_FORMS)
+"""The backward's forms on an H100's layouts alone: its one launch, whose tile of the call forms an A100's
+registers hold at no extent (64 x 64 holds 258 a thread, 32 x 128 in two column halves 258, et-a100bwd2),
+and `FED`'s fed consumers, its shared keys and dQ, which an A100's mma.sync, one warpgroup, takes none of."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
 state or a draw alone."""
@@ -112,15 +113,14 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     producer adding it (`fused-producer-dq`); or the fast form at its derivation's tiles (`derived`)."""
     family = INTERPRETED_ON[_INTERPRETED.get()]
     if family != WGMMA:
-        # An A100's forms: its own layout's two launches or one, the accurate and the derived.
+        # An A100's forms: its own layout's two launches, the accurate and the derived.
         if form in WGMMA_FORMS:
             raise ValueError(f"{form} is an H100's layout's form alone")
         if form in ("accurate", "derived"):
             return form == "accurate", None
         # Its layout's narrow form, as its derivation takes the call forms' (`BackwardTiles.narrow`).
-        return form != "default" and form != "fused", attention_mosaic.BackwardTiles(
-            64, 64, 2, 1, fused=form == "fused", columns=2 if form == "accurate-halves" else 1, family=family,
-            narrow=True)
+        return form != "default", attention_mosaic.BackwardTiles(
+            64, 64, 2, 1, columns=2 if form == "accurate-halves" else 1, family=family, narrow=True)
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family=WGMMA)
     if form == "fused-shared-keys":
