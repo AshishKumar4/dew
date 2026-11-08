@@ -11,7 +11,7 @@ tree (`log2(blocks)` adds): the block is the longest power of two whose path is 
 CPU's own vectorized accumulation (`contraction_block`), read from the CPU's vector lanes and its FMA
 latency. Its partial sums move `depth / block` outputs' bytes, so where the rows are many a product sums
 in float64 instead, each fp32 product exact and the sum rounded once, which moves the operands' bytes
-converted (`_summed` chooses by the bytes each moves). A product's gradients are products too, each summed
+converted (`_shared` chooses by the bytes each moves). A product's gradients are products too, each summed
 over its own contraction (`_matmul`'s reverse pass). On another platform the product is XLA's own
 (`accumulated`'s `platform_dependent`).
 """
@@ -89,6 +89,28 @@ def _tree(parts: jax.Array) -> jax.Array:
 
 
 def _summed(a: jax.Array, b: jax.Array, precision) -> jax.Array:
+    """`_shared`'s sum of `a @ b`, `[batch, rows, depth]` and `[batch, depth, columns]` float32 arrays, over
+    the shares of the depth an Explicit mesh axis splits across devices (a projection's rows, which its
+    matrix's gradient contracts, split over a data axis): each device's share summed as one product
+    (`_shared`), the shares then added across the devices, as the plain product's partials are; a depth no
+    axis splits, one share."""
+    sharding = jax.typeof(a).sharding
+    names = sharding.spec[2] if len(sharding.spec) > 2 else None
+    names = () if names is None else names if isinstance(names, tuple) else (names,)
+    shares = math.prod(sharding.mesh.shape[name] for name in names)
+    if shares == 1:
+        return _shared(a, b, precision)
+    batch, rows, depth = a.shape
+    columns = b.shape[2]
+    # The shares a batch of their own, leading, so each device's lies whole on it.
+    a = jnp.moveaxis(a.reshape(batch, rows, shares, depth // shares), 2, 0).reshape(
+        shares * batch, rows, depth // shares)
+    b = jnp.moveaxis(b.reshape(batch, shares, depth // shares, columns), 1, 0).reshape(
+        shares * batch, depth // shares, columns)
+    return _shared(a, b, precision).reshape(shares, batch, rows, columns).sum(axis=0)
+
+
+def _shared(a: jax.Array, b: jax.Array, precision) -> jax.Array:
     """`a @ b` of `[batch, rows, depth]` and `[batch, depth, columns]` float32 arrays, its products summed
     no worse than a vectorized dot on this CPU sums them, by whichever costs the CPU fewer bytes moved:
     blocked and pairwise (`_blocked`), whose blocks' sums write and read `depth / block` partial outputs,
