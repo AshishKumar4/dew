@@ -809,9 +809,12 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             span = self.chunk_columns(total.shape[1])
             for start in range(0, total.shape[1], span):
                 part = plgpu.async_load_tmem(_columns(partial.ref, start, span), layout=STORED)
-                before = plgpu.async_load_tmem(_columns(total.ref, start, span), layout=STORED)
-                summed_value = jnp.where(first, part, before + part)
-                plgpu.async_store_tmem(_columns(total.ref, start, span), summed_value)
+                into = _columns(total.ref, start, span)
+                # The first window's partial is the sum; a later one's adds onto it (a branch: a scalar
+                # selects no tile in warpgroup semantics, and the sum's columns hold nothing before it).
+                pl.when(first)(lambda into=into, part=part: plgpu.async_store_tmem(into, part))
+                pl.when(~first)(lambda into=into, part=part: plgpu.async_store_tmem(
+                    into, plgpu.async_load_tmem(into, layout=STORED) + part))
         plgpu.commit_tmem()
         plgpu.wait_load_tmem()
 
