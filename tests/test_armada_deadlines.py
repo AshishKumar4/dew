@@ -111,3 +111,37 @@ def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
     [row] = json.loads((tmp_path / "rows.json").read_text())["rows"]
     assert row["kind"] == "nodes" and "its own failure" in row["output"]
     assert "(test_close.py:" not in row["output"]
+
+
+def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_needs(ci, tmp_path):
+    """Dew's base CI run 42382371599 packed tests/test_stacked_blocks.py, which takes over 1,744 s, with four
+    short files into a task of a 1,680 s deadline, and the task was red on it run after run: the plan weighed
+    the file at its old green time, as its row held what its task's wall time gave a file in proportion to its
+    tests' times, none of which the interrupted test had. Past its deadline a task times the file its tests
+    were running in at its own tests' seconds and the wall time no file's tests account for, at least what the
+    file needs; a file that finished, at its tests' own seconds; and a file that never started, at none: its
+    row says `unobserved`, for armada to weigh no plan by, and names its file at 0 in its timings, so armada
+    leaves out of its file timings a file it shares with other rows."""
+    deadline = 8.0
+    written(tmp_path, {"test_first.py": "import time\n\n\ndef test_first():\n    time.sleep(0.5)\n",
+                       "test_stuck.py": "import time\n\n\ndef test_stuck():\n    time.sleep(600)\n",
+                       "test_never.py": "def test_never():\n    pass\n"})
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    began = time.monotonic()
+    ci.task("3.12", ["tests/test_first.py", "tests/test_stuck.py", "tests/test_never.py"], "", out, deadline,
+            cache="off", grace=5.0)
+    wall = time.monotonic() - began
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    first, stuck, never = (rows[f"3.12:tests/test_{name}.py"] for name in ("first", "stuck", "never"))
+    slept = first["tests"]["tests/test_first.py::test_first"]
+    assert {row["kind"] for row in rows.values()} == {"deadline"}
+    assert slept >= 0.5 and first["seconds"] == slept
+    # The file the deadline stopped holds the wall time the finished file's own did not.
+    assert stuck["seconds"] + slept >= deadline
+    assert stuck["timings"] == {"3.12:tests/test_stuck.py": stuck["seconds"]}
+    # The rows claim no more than the task took, and a file that never started none of it.
+    assert sum(row["seconds"] for row in rows.values()) <= wall
+    assert (never["unobserved"], never["seconds"], never["timings"]) == (
+        True, 0.0, {"3.12:tests/test_never.py": 0.0})
+    assert "unobserved" not in first and "unobserved" not in stuck

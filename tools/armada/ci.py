@@ -1681,16 +1681,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
-                   for name in tests}
-    wall = time.monotonic() - began
-    if expired:
-        # The file whose test started last is the one running at the deadline (executed.py logs each visit).
-        stood = followed.visited(followed.log_events(log))
-        shares = deadline_shares(own_seconds, {file_of(case) for case in cases}, wall,
-                                 stood[-1] if stood else None)
-    else:
-        shares = apportioned(own_seconds, wall, len(tests))
+    shares = task_seconds(tests, cases, log, time.monotonic() - began, expired)
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         failed = [(case, kind, node) for case in own for kind in ("failure", "error")
@@ -1747,6 +1738,21 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
     return 0
+
+
+def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: float,
+                 expired: bool) -> dict[str, float]:
+    """Each of `tests`' seconds of its task's `wall` time, by its JUnit `cases`: in proportion to its tests'
+    own times (`apportioned`); where the task ran out of time (`expired`), the file running at its deadline
+    (its executed `log`'s last visit) at least what it needs, and one that never started none
+    (`deadline_shares`)."""
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
+                   for name in tests}
+    if not expired:
+        return apportioned(own_seconds, wall, len(tests))
+    # The file whose test started last is the one running at the deadline (executed.py logs each visit).
+    stood = followed.visited(followed.log_events(log))
+    return deadline_shares(own_seconds, {file_of(case) for case in cases}, wall, stood[-1] if stood else None)
 
 
 def resumed(tests: list[str]) -> dict[str, float]:
