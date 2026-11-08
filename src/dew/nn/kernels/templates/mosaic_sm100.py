@@ -645,7 +645,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         # Its accumulator turns' barriers, filled and drained (`persist`), each rewritten ring's slots'
         # publish barriers (`prepared`), and its tensor memory's address.
         (accumulators,) = self.persist_schedule(consumers, 0).stated()
-        return ((*accumulators.barriers(), *(plgpu.Barrier(num_barriers=stages) for stages in rewrites)),
+        return ((*accumulators.barriers(), *_publish_barriers(rewrites)),
                 resources.TMEM_ADDRESS_BYTES)
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
@@ -753,8 +753,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
         (accumulated,) = roles.scratch(generation.gpu_target())
         # Each ring's slots' rewrites published, a barrier of the ring's own (`prepared`).
-        published = tuple(plgpu.Barrier(num_barriers=stages) for stages in rewrites)
-        pl.run_scoped(scoped, accumulated, *published, *staging, collective_axes="wg")
+        pl.run_scoped(scoped, accumulated, *_publish_barriers(rewrites), *staging, collective_axes="wg")
 
     def _issued(self, rings, issue: Callable, tensor: "Tensor", held: Callable, running: tuple, *,
                 summed: int, interpret: bool, unrolled: bool) -> Callable:
@@ -852,6 +851,12 @@ def _published(ring: mosaic.Ring, masked) -> CommittedRing:
     if isinstance(ring, CommittedRing):
         return dataclasses.replace(ring, full=masked)
     return CommittedRing(smem=ring.smem, full=masked, consumed=ring.consumed)
+
+
+def _publish_barriers(rewrites: tuple[int, ...]) -> tuple:
+    """Each rewritten ring's slots' publish barriers (`Tcgen05Rings.persist`'s `prepared`), by its slot count:
+    the one statement `persist` scopes and its planner prices (`persist_scratch`)."""
+    return tuple(plgpu.Barrier(num_barriers=stages) for stages in rewrites)
 
 
 def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, steps, views, tile,
