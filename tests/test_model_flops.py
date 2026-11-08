@@ -212,6 +212,28 @@ def test_dense_and_attention_equations_use_each_real_length():
     assert attention_flops(np.array([2**32], np.int64), 2, 4, 4, causal=True) == 16.0 * 2**64
 
 
+def test_a_modules_declared_count_is_counted_once_for_each_length_signature():
+    """A module's declared count is kept for the lengths it counted (`dew.nn.flops._declared`): a batch whose
+    rows repeat another's lengths reads the kept count, the module counted again for other lengths, and a
+    count is the module's own (row 4862's host costs)."""
+    calls = []
+
+    @dataclasses.dataclass(frozen=True)
+    class Declared:
+        scale: float
+
+        def model_flops(self, lengths) -> float:
+            calls.append(tuple(np.asarray(lengths).tolist()))
+            return self.scale * float(np.sum(lengths))
+
+    one, other = Declared(2.0), Declared(3.0)
+    assert counted_flops(one, np.array([4, 4])) == counted_flops(one, np.array([4, 4])) == 16.0
+    assert counted_flops(one, np.array([4, 5])) == 18.0
+    assert counted_flops(other, np.array([4, 4])) == 24.0
+    assert counted_flops(one, np.array([4, 4], np.int32)) == 16.0
+    assert calls == [(4, 4), (4, 5), (4, 4), (4, 4)]
+
+
 def test_windowed_and_chunked_attention_do_not_count_unread_pairs():
     lengths = np.array([8], np.int64)
     assert attention_flops(lengths, 2, 4, 4, causal=True, window=4) == 32 * (8 * 4 - 4 * 4 / 2)
