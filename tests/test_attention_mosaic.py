@@ -214,9 +214,11 @@ def interpreted_on(request):
 
 def _device(interpret: bool, target: generation.GpuTarget | None = None):
     """The device a site's launches are sized and run for: interpreted on the CPU, which has no instruction
-    family of its own, `target`'s facts (where None, the GPU the interpreted cell runs as, `INTERPRETED_ON`,
-    `generation.assumed`); the process's own compiled."""
-    return generation.assumed(target or _INTERPRETED.get()) if interpret else contextlib.nullcontext()
+    family of its own, `target`'s facts and bundles, run where the process places them (where None, the GPU
+    the interpreted cell runs as, `INTERPRETED_ON`; `generation.assumed`'s `interpreted`); the process's own
+    compiled."""
+    return (generation.assumed(target or _INTERPRETED.get(), interpreted=True) if interpret
+            else contextlib.nullcontext())
 
 
 def _pinned(forward: attention_mosaic.Tiles | None = None,
