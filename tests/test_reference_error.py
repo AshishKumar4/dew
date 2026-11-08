@@ -13,11 +13,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from check1_wire import CENSUS, staged_units
+from check1_wire import CENSUS
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
-    MOST_SEEDS,
     PARITY,
     REDRAW,
     GateFailure,
@@ -37,6 +36,8 @@ from reference_error import (
 )
 
 from dew.nn.precision import accumulated
+from dew.parity import MOST_SEEDS
+from dew.parity_stages import staged_units
 
 
 @pytest.fixture
@@ -364,7 +365,7 @@ def test_the_tail_tests_floor_is_derived_from_its_faults_at_the_leafs_noise():
     where no fault of FAULTS clears it with power to spare; at a large count over a heavy symmetric noise it
     rises above ½, so equally exact arms whose tails are a little uneven pass, and twice off on a tenth, the
     smallest fault, is still refused there; a fault in the leaf's own noise lowers its floor."""
-    from check1_statistics import LOWER_TAIL, _tail_floor, _tail_sign
+    from dew.parity import LOWER_TAIL, _tail_floor, _tail_sign
 
     rng = np.random.default_rng([2469, 3])
     small = 0.4 * rng.standard_t(3, 1024) / np.sqrt(3)
@@ -429,7 +430,9 @@ def test_the_paired_worst_row_refuses_a_row_far_off_on_some_examples_and_passes_
     example (`_paired_rows`, ledger 2469): equally exact arms, their worst rows' log ratios symmetric however
     wide (a spread of 1.0 and 2.0), pass; Dew ten times the reference's on a fifth of 512 examples of such
     spread is refused at LOWER_TAIL; and two examples past the factor, both Dew's, are no finding."""
-    from reference_error import LOWER_TAIL, ROW_FACTOR, _paired_rows
+    from reference_error import LOWER_TAIL, ROW_FACTOR
+
+    from dew.parity import _paired_rows
 
     rng = np.random.default_rng([2469, 512])
     for spread in (1.0, 2.0):
@@ -818,7 +821,9 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     """`seeds_resolving` over the reference's errors measured apart (a recording's merged shards) gives
     `seeds_for`'s count for the reference compared with itself on the same draws, and refuses a
     recording of too few seeds."""
-    from reference_error import _drawn, seeds_for, seeds_resolving
+    from reference_error import _drawn, seeds_for
+
+    from dew.parity import seeds_resolving
 
     count = seeds_for(_product, _draw, "product")
     draws = _drawn(_product, _product, _draw, range(4 * count))
@@ -1148,7 +1153,9 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     never a pass. Its draws' paired ratios do not pass it either: their log ratios spread past
     QUALIFYING_SPREAD (`_typical_status`, ledger 2469). Fewer seeds than FEWEST_SEEDS are inconclusive
     whatever they read."""
-    from reference_error import _interval, _status, _typical_status
+    from reference_error import _interval
+
+    from dew.parity import _status, _typical_status
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -1204,7 +1211,9 @@ def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusiv
     under PARITY, so the site passes, and its stage is logged, as every judgement's is."""
     import json
 
-    from reference_error import STAGES_LOG, _interval, _pooled, _status
+    from reference_error import STAGES_LOG, _interval, _pooled
+
+    from dew.parity import _status
 
     dew, reference, errors, truth = _set_errors(2.6, 0.1)
     first = np.array([2.6 if seed % 2 == 0 else 0.1 for seed in range(8)])
@@ -1222,7 +1231,7 @@ def test_a_leafs_interval_is_widened_to_hold_its_ratio():
     """A percentile interval that leaves out its own ratio is widened to hold it before any verdict: a
     ratio over PARITY under an interval wholly at or under it is no pass, and a ratio that is not a
     number is inconclusive."""
-    from reference_error import _status
+    from dew.parity import _status
 
     assert _status(1.6, 1.0, 1.4) != "pass"
     assert _status(0.9, 1.1, 1.4) == "pass"
@@ -1456,8 +1465,9 @@ def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do
     pilots alone and declares what the live reference's paired sizing declares on the same draws, its
     lookups never past them. Pilots that leave a seed out of their run, or whose leaves are not the
     verdict's shapes, are refused, and so are a seed past them and a pilot drawn again otherwise."""
-    from reference_error import SIZING_FROM
     from tool_support import load
+
+    from dew.parity import SIZING_FROM
 
     recorder = load("recorded_references")
     draw, evaluate = _tiny_row_recording(_product)
@@ -1531,8 +1541,9 @@ def test_a_recording_read_for_some_of_its_leaves_judges_them_alone():
     leaves' evidence and sketches, its pilots' too, and every entry the recording shares: its reference
     gives those leaves alone, at a verdict seed and a pilot's, and check 1 judges them over it; a leaf the
     recording lacks is refused."""
-    from reference_error import SIZING_FROM
     from tool_support import load
+
+    from dew.parity import SIZING_FROM
 
     recorder = load("recorded_references")
 
@@ -1608,7 +1619,7 @@ def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
 def _recorded_pairs(dew, reference, count: int, missing=()):
     """`dew` and `reference` recorded at `count` pilot seeds from SIZING_FROM on but the `missing` ones,
     each looked up by its seed, with a truth of zero, and the seeds the reference was asked for."""
-    from reference_error import SIZING_FROM
+    from dew.parity import SIZING_FROM
 
     pilots = range(SIZING_FROM, SIZING_FROM + count)
     mine = {seed: dew(seed) for seed in pilots}
@@ -1636,7 +1647,9 @@ def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
     held at its last doubling (16), and no lookup reaches past them. One without pilots is refused, a
     view leaves its reference as it was, a live reference cannot hold pilots, a declaration of pilots
     the recording lacks is refused at once, and a start past the pilots is refused, not unbound."""
-    from reference_error import SIZING_FROM, recorded_pilots
+    from reference_error import recorded_pilots
+
+    from dew.parity import SIZING_FROM
 
     def draw(seed):
         return (np.int64(seed),)
@@ -1913,8 +1926,9 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     block of SKETCH_BLOCK summed from its other end as another host may; a
     truth recomputed far past float64's range is refused, not passed on an infinite bound; and an empty
     leaf's evidence is exact, its reference's dtype kept."""
-    from reference_error import leaf_summary
     from truth_sketch import SKETCH, _sign_bits, sketch_rounding, truth_sketch
+
+    from dew.parity import leaf_summary
 
     rng = np.random.default_rng(7)
     truth = rng.normal(size=4096)
@@ -1939,7 +1953,7 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
     """Compared against, the procedure before check 1's two stages (`_staged(two_stage=False)`) draws
     the second set wherever a leaf's ratio is over PARITY, a value not finite included, and only there:
     an inconclusive leaf is final at its declared seeds."""
-    from reference_error import NO_ZERO_ROWS, _Draws, _staged
+    from dew.parity import NO_ZERO_ROWS, _Draws, _staged
 
     def law(dew):
         def drawn(start, stop):
@@ -2014,7 +2028,9 @@ def test_a_row_of_float64_zero_is_judged_over_the_runs_seeds():
     (`pooled_zero_rows`): one seed's residue far past the reference's own, where the other seeds' are
     alike, passes; Dew ten times the reference's residue on every seed fails, and so does a residue
     where the reference holds the row at exactly zero on every seed."""
-    from reference_error import ROW_FACTOR, pooled_zero_rows
+    from reference_error import ROW_FACTOR
+
+    from dew.parity import pooled_zero_rows
 
     rows = np.asarray([3, 7])
 
@@ -2074,7 +2090,7 @@ def test_a_leaf_in_any_layout_reads_as_its_c_ordered_copy():
     truth's, as its C-ordered copy, bit for bit (`_evidence`, `leaf_summary`): every leaf lies in C order
     beside the others of its width (`_LaidTruths`), so its sums run alike whatever its layout. The leaves
     hold rows of float64 zero and leaves of every rank."""
-    from reference_error import _evidence, _prepared, leaf_summary
+    from dew.parity import _evidence, _prepared, leaf_summary
 
     rng = np.random.default_rng(2201)
     shapes = [(70, 129), (9, 33), (5, 4, 9), (40,), (3, 2, 1), (12, 9), ()]
@@ -2114,8 +2130,9 @@ def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
     """A summarized recording's evidence (`record_case`'s summary), read back as check 1 reads it
     (`indexed_recording`'s reference), is the evidence of the same reference outputs read live
     (`leaf_summary`), bit for bit in every field the recording keeps, its rows of float64 zero included."""
-    from reference_error import leaf_summary
     from tool_support import load
+
+    from dew.parity import leaf_summary
 
     recorder = load("recorded_references")
     _, live = _tiny_row(4)
@@ -2144,7 +2161,7 @@ def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
     """A leaf recorded as each row's RMS distance from its float64 truth (`rows_summary`) reads as the leaf
     whole does (`leaf_summary`): its worst row, the rows its truth sizes zero, their errors and own sizes,
     its finiteness and dtype; and a leaf of no rows is exact, as `leaf_summary` reads one."""
-    from reference_error import _rows_rms, leaf_summary, rows_summary
+    from dew.parity import _rows_rms, leaf_summary, rows_summary
 
     rng = np.random.default_rng(1848)
     truth = rng.standard_normal((6, 8))
@@ -2194,7 +2211,7 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
     its log ratios spread within QUALIFYING_SPREAD, passes at the count it sizes; a Dew twice off on every
     draw is refused by its typical draw; one ten times off on a tenth of its draws, which the typical
     draw's ratio leaves under PARITY, is refused by the spread its fault adds."""
-    from check1_statistics import _interval, _resolves, _typical_status
+    from dew.parity import _interval, _resolves, _typical_status
 
     reference = rounded_apart(1)
     seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
@@ -2227,7 +2244,7 @@ def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_ty
     verdict the pooled ratio leaves inconclusive: a leaf whose first 32 seeds straddle PARITY (Dew's squared
     error 4 and 0.01 by turns, the reference's 1), whose typical draw would pass them, and whose further
     seeds read 4, is over at the second stage."""
-    from reference_error import NO_ZERO_ROWS, _Draws, _staged
+    from dew.parity import NO_ZERO_ROWS, _Draws, _staged
 
     def drawn(start, stop):
         count = stop - start
@@ -2338,9 +2355,9 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
 def test_a_leafs_mean_squared_error_keeps_its_subnormal_value():
     """Two leaves whose errors square below float64's least normal (about 1e-160 and 1e-158 off a truth
     of 1e-145) keep their mean squared errors, as numpy computes them, to the subnormals' spacing: check
-    1's statistics run where float64 keeps a subnormal (`reference_error._computed_here`), so no compiled
+    1's statistics run where float64 keeps a subnormal (`dew.parity._computed_here`), so no compiled
     arithmetic flushes one to zero and reads both at `_missed`'s floor."""
-    from reference_error import leaf_summary
+    from dew.parity import leaf_summary
 
     truth = np.full((4, 8), 1e-145)
     for offset in (1e-160, 1e-158):
@@ -2352,9 +2369,9 @@ def test_a_leafs_mean_squared_error_keeps_its_subnormal_value():
 def test_a_leaf_missing_its_truth_by_a_subnormal_is_never_read_as_exact():
     """A leaf that misses its truth only by values below float64's least normal (1e-310 where the truth
     is zero) is not exact: its mean squared error is above zero, read where float64 keeps a subnormal
-    (`reference_error._computed_here`), so an arm that misses an exact reference is never read as
+    (`dew.parity._computed_here`), so an arm that misses an exact reference is never read as
     exact."""
-    from reference_error import leaf_summary
+    from dew.parity import leaf_summary
 
     truth = np.zeros((4, 8))
     assert leaf_summary(truth, truth).mse == 0.0

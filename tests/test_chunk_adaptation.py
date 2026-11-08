@@ -16,18 +16,9 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying, dataset
-from check1_statistics import GateFailure, Inconclusive
 from flax import linen as nn
 from map_judge import drawing
-from reference_error import (
-    MOST_SEEDS,
-    as_given,
-    assert_as_exact,
-    over_windows,
-    widened,
-    windows,
-    with_gradients,
-)
+from reference_error import as_given, assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.batch import TEXT_KEY
 from dew.nn.activations import _SLOPES, HIDDEN_ACT
@@ -36,6 +27,7 @@ from dew.nn.continuum import ContinuumLevel
 from dew.nn.ngpt import NGPT
 from dew.objectives.lm import LMObjective, Samples
 from dew.objectives.lm.adaptation import CARRIED, ChunkAdaptation, adapted_scores
+from dew.parity import MOST_SEEDS, GateFailure, Inconclusive
 from dew.training import Checkpoints, Trainer
 
 VOCAB = 16

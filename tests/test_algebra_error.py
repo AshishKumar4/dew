@@ -7,11 +7,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from check1_statistics import GateFailure
 from reference_error import assert_as_exact
 
 from dew import algebra
 from dew.algebra.error import choose
+from dew.parity import GateFailure
 
 SHAPE = (8, 16)
 

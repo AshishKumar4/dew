@@ -8,7 +8,7 @@ there, the same for every arm (the element's RMS displacement where every roundi
 in the arithmetic the arms run in, moves its value by a random sign times its bound; tests/
 rounding_bound.py's `rounding_scale`). A leaf's heavy elements (`heavy_masks`) are judged as a leaf of
 their own beside the light rest, each class's worst rows by the gate's factor for its values a row
-(`check1_statistics.row_factor`); that check must decide a pass. An element no rounding reaches (c = 0)
+(`dew.parity.row_factor`); that check must decide a pass. An element no rounding reaches (c = 0)
 must be exact in every arm. Where a computation amplifies its rounding unevenly (an inner step past its
 stable rate), the unweighted pool is the amplified elements' and its interval stays wide; weighed, a fault
 on the well-conditioned rest shows, and one on the amplified elements shows on their own class. A sharded
@@ -22,7 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import summed_as_run, widened
-from check1_statistics import Finding, GateFailure
+
+from dew.parity import Finding, GateFailure
 
 
 def float_leaf(leaf) -> bool:
