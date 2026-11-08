@@ -35,7 +35,7 @@ LEAD = (2, 64)
 WIDTHS = {"narrow": 31, "ragged": 1000, "wide": 4096, "beyond": 16384}
 """The feature width of each value of the `width` axis: a row narrower than a warp, one no power of two
 divides (the masked columns), one whole row of a program (4096), and one past the norm's 8192-feature register
-tile (`NORM_SUPPORTS`' `width`), which only the SiLU product takes."""
+tile, which the norm walks a step of its columns at a time (`norm_swiglu.NARROW_WIDTH`, row 820)."""
 FORMS = {"rms_norm": ("plain", "stream", "gated"), "swiglu": ("apart", "packed")}
 """The forms each op's entries take, by the `op` axis's value."""
 EPSILON = 1e-5
@@ -159,20 +159,21 @@ CASES = (
     ('sm90', 'swiglu', 'apart', 'float16', 'ragged'),
     ('sm80', 'rms_norm', 'stream', 'float16', 'wide'),
     ('sm80', 'swiglu', 'packed', 'bfloat16', 'beyond'),
-    ('sm80', 'rms_norm', 'gated', 'float32', 'ragged'),
-    ('sm90', 'swiglu', 'packed', 'float32', 'wide'),
+    ('sm90', 'rms_norm', 'gated', 'float32', 'beyond'),
     ('sm80', 'swiglu', 'apart', 'float32', 'narrow'),
+    ('sm90', 'swiglu', 'packed', 'float32', 'wide'),
+    ('sm80', 'rms_norm', 'plain', 'float32', 'ragged'),
     ('sm90', 'rms_norm', 'stream', 'bfloat16', 'ragged'),
-    ('sm90', 'rms_norm', 'gated', 'bfloat16', 'wide'),
+    ('sm80', 'rms_norm', 'gated', 'bfloat16', 'wide'),
+    ('sm90', 'rms_norm', 'plain', 'float16', 'beyond'),
     ('sm90', 'rms_norm', 'gated', 'float16', 'narrow'),
-    ('sm90', 'swiglu', 'apart', 'bfloat16', 'beyond'),
-    ('sm80', 'rms_norm', 'plain', 'float16', 'ragged'),
-    ('sm90', 'rms_norm', 'plain', 'float32', 'wide'),
     ('sm90', 'rms_norm', 'stream', 'float32', 'narrow'),
-    ('sm90', 'swiglu', 'packed', 'float16', 'narrow'),
     ('sm90', 'swiglu', 'apart', 'bfloat16', 'wide'),
-    ('sm90', 'swiglu', 'apart', 'float16', 'beyond'),
-    ('sm90', 'swiglu', 'apart', 'float32', 'beyond'),
+    ('sm90', 'swiglu', 'packed', 'float16', 'narrow'),
+    ('sm90', 'rms_norm', 'plain', 'bfloat16', 'wide'),
+    ('sm90', 'rms_norm', 'stream', 'bfloat16', 'beyond'),
+    ('sm90', 'rms_norm', 'gated', 'bfloat16', 'ragged'),
+    ('sm90', 'swiglu', 'apart', 'bfloat16', 'beyond'),
     ('sm90', 'swiglu', 'packed', 'bfloat16', 'ragged'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
