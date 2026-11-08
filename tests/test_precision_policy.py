@@ -759,7 +759,8 @@ def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_st
     (`exact_products`: an algorithm narrowing them; a 16-bit or fp32 query at 'highest' keeps the fused
     routes, which multiply whole); a native recurrence keeps an
     fp32 product whole at 'highest' whatever the forms (`rounds_products`), the ports, whose fp32 products
-    are TF32, take no fp32 call there, and the template takes none under an algorithm that narrows its
+    are TF32 where Triton runs them, take no fp32 call there (off a GPU they interpret, exact under any
+    declaration), and the template takes none under an algorithm that narrows its
     operands, each handing the call to XLA, which computes the declaration; a dilated depthwise
     convolution's exact forms take a declaration of exact products alone, not one narrowing the operands;
     and Muon's iteration multiplies in its fast forms in bfloat16 for a 16-bit compute dtype
@@ -794,8 +795,12 @@ def test_a_routes_declaration_is_the_runs_configured_precision_where_the_call_st
         assert recurrence_chunk.chunk_rounding(delta=True, dtype=jnp.bfloat16)
     with generation.run_precision(Numerics("32-true", forms="accurate", matmul="default")):
         assert not recurrence_chunk.fast_rounding(jnp.bfloat16)
-        assert not any(admits(supports, np.float32) for supports in ports)
-        assert all(admits(supports, jnp.bfloat16) for supports in ports)
+        # Where Triton runs the ports, their fp32 products are TF32; off a GPU they interpret, exact under
+        # any declaration (`recurrence_chunk._port_precision`).
+        with generation.assumed("sm90"):
+            assert not any(admits(supports, np.float32) for supports in ports)
+            assert all(admits(supports, jnp.bfloat16) for supports in ports)
+        assert generation.triton_runs() or all(admits(supports, np.float32) for supports in ports)
         assert admits(recurrence_chunk.TEMPLATE_SUPPORTS, np.float32)
     with generation.run_precision(Numerics("32-true", matmul="TF32_TF32_F32")):
         assert reference_only(query, None, None, force_fp32_for_softmax=True)

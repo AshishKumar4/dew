@@ -752,6 +752,10 @@ class Loader:
     batches: tuple[int, ...] = ()
     """Each phase's batch, of a read of phases (`dew.data.pipeline.Phases`), which every plan of the run's
     step cuts (`dew.training.planning.splits`); none for a read of one batch, `batch`'s."""
+    token_batches: tuple[int | None, ...] = ()
+    """Each phase's token batch, of a read of phases (`batches`), which one update's tokens divide into one
+    accumulation for every phase (`dew.config.TrainerConfig.accumulating`); none for a read of one batch,
+    `batch_tokens`'."""
     stages: tuple[Stage, ...] = ()
     """A read of phases' batches on the step clock, each from the record it starts at (`PhasedStream.stages`),
     which its steps a count of records takes are counted through (`steps_through`); none for one of one

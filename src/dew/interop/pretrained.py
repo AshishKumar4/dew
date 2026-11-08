@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import json
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -21,10 +22,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, NoReturn, Protocol, Self
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.traverse_util import unflatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.typing import DTypeLike
 
 from dew import _records
@@ -42,6 +42,7 @@ from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_bindings import decoder_layouts, reading_layout
+from dew.interop.drawn import extension_drawn, initialized
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -81,7 +82,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.nn.protocols import MediaWrapper
@@ -196,25 +196,6 @@ def on_default_device(variables: Variables) -> Variables:
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=True)
 
 
-def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], bool], key: int | jax.Array, *,
-                     shaped: bool = False) -> Variables:
-    """The variables an extension adds to a source (cross-attention's blocks, DEX's projections and
-    constants): `model`, the source with the extension, drawn from `key` (`request_key`) over a token more
-    than the prediction depths it carries, which each read one further on, and the leaves whose path
-    `selected` takes kept, plain. Only those leave the program, so the source's own draws are dead code to
-    XLA; with `shaped`, a source loaded without its weights, their shapes alone."""
-    from dew.batch import select, thaw
-    from dew.nn.inputs import request_key
-    from dew.nn.protocols import Predicting
-
-    length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
-
-    def drawn(draw: jax.Array) -> Variables:
-        return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))), selected)
-
-    return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
-
-
 @dataclass(frozen=True)
 class Pretrained:
     """A native model with explicit variables and its checkpoint's host processor.
@@ -295,8 +276,9 @@ class Pretrained:
     source's own transformers loader as the source does; read from the source's snapshot, which a
     weights conversion may not be, when the save writes it."""
     fresh: tuple[str, ...] = ()
-    """The modules of `model` drawn fresh beside the loaded weights, by their paths under `params`
-    (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run trains in a fresh group
+    """What of `model` was drawn fresh beside the loaded weights, by its path under `params`: a module
+    (`layers_1/cross_attention`, `with_cross_attention`'s) or a parameter a loaded module gained
+    (`early_exit_gate/kernel`, `with_model`'s), which a run trains in a fresh group
     (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     numerics: Numerics | None = None
     """The numerics the load was asked for (`load(precision=...)`), whose dtypes it computes and stores
@@ -652,6 +634,31 @@ class Pretrained:
                              base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
+    def with_model(self, model: nn.Module, *, key: int | jax.Array) -> Self:
+        """This source with `model` in its model's place, every parameter `model` declares that the source
+        holds none of drawn from its initializer under `key` (`extension_drawn`) and named among what it
+        drew fresh (`fresh`), so a run trains it in its fresh group as it trains a module drawn beside the
+        base: a transformation of a loaded model that gives its loaded modules parameters of their own (a
+        loop's) starts them as a fresh model would. A model that declares none is this source's own; one
+        that declares none of a parameter the source holds is refused, naming it, its weights unread."""
+        from dew.batch import merge, thaw
+        from dew.optim import parameter_name
+
+        held = {("params", *path) for path in flatten_dict(dict(thaw(self.variables).get("params", {})))}
+        declared = thaw(jax.eval_shape(functools.partial(initialized, model), jax.random.key(0)))
+        named = {("params", *path) for path in flatten_dict(dict(declared.get("params", {})))}
+        if held - named:
+            dropped = sorted("/".join(path[1:]) for path in held - named)
+            raise ValueError(f"this {type(model).__name__} reads none of the source's {dropped[:6]}: a "
+                             "model in its place keeps every parameter it holds")
+        if not named - held:
+            return replace(self, model=model)
+        shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
+        added = extension_drawn(model, lambda path: tuple(path) in named - held, key, shaped=shaped)
+        drawn = {parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(added["params"])}
+        return replace(self, model=model, variables=merge(self.variables, added),
+                       fresh=tuple(sorted({*self.fresh, *drawn})))
+
     def with_cross_attention(self, cross: CrossBlocks, *, key: int | jax.Array,
                              frozen: bool = True) -> Self:
         """Return this source with gated cross-attention before the layers `cross` names, each
@@ -678,7 +685,7 @@ class Pretrained:
         if self.model.cross_attention is not None:
             raise ValueError("this bundle already reads a context; attach cross-attention to the source")
         model = self.model.with_cross_attention(cross)
-        blocks = _extension_drawn(model, lambda path: path[0] == "params" and crossing(path), key)
+        blocks = extension_drawn(model, lambda path: path[0] == "params" and crossing(path), key)
         variables = merge(self.variables, blocks)
         # Each block's module, its path under `params` to and with the block's own name.
         added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
@@ -705,7 +712,7 @@ class Pretrained:
             raise TypeError(f"a {type(self.model).__name__} takes no differential extension")
         model = self.model.with_dex(extension)
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
-        added = _extension_drawn(
+        added = extension_drawn(
             model, lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
             or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS), key, shaped=shaped)
         variables = merge(self.variables, added)

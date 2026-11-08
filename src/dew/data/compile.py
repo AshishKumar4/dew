@@ -1325,6 +1325,7 @@ def _compile_phases(
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
     return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
                                token_ends=source.ends if tokens else None, batches=batches, stages=stages,
+                               token_batches=tuple(loaded.batch_tokens for loaded, _ in built),
                                widths=merge_facts(loaded.widths for loaded, _ in built))
 
 
