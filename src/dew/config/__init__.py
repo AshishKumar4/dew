@@ -288,7 +288,7 @@ def trained_modules(objective: Objective[Loss, Effects],
     drawn (`Objective.init`, its shapes alone), and those that are one (a parameter a loaded module
     gained, `Pretrained.with_model`): a tied readout is drawn with none."""
     if not modules:
-        return ()
+        return (), ()
     from dew.batch import unboxed
     from dew.optim import parameter_name
 

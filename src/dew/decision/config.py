@@ -272,8 +272,7 @@ class DecisionRunConfig(DecoderRunConfig):
                                 dtype=dtype, attention_impl=attention_impl,
                                 **self.source_keywords(frozen=frozen))
         if isinstance(start, PretrainedDecision) and self.head is not None:
-            # A head drawn over a decision release's backbone, a finished run's among them: its own head,
-            # layout and calibration set aside, the backbone trains on under the head the run names, its
+            # A head drawn over a release's backbone, its head, layout and calibration set aside, its
             # rows laid out by the release's tokenizer.
             derived["tokenizer"] = start.decision_tokenizer
             start = start.backbone()
