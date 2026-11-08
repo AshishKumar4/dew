@@ -1,6 +1,7 @@
 """What a checkpoint's step records beside its state: the table of every process's data position
 (`gather_positions`, `read_position`) and the step's record of its EMA deltas, control state, rung,
-inference artifact and boxed axes (`step_record`), which a persistent and a local save share."""
+inference artifact, boxed axes and keys' implementations (`step_record`), which a persistent and a local
+save share."""
 
 from __future__ import annotations
 
@@ -9,6 +10,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from dew import _position
@@ -21,12 +23,23 @@ if TYPE_CHECKING:
 
 
 def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSON, artifact: JSON,
-                boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> dict:
+                boxed: Mapping[tuple[str, ...], LogicalAxes] | None, tree: object = None) -> dict:
     """What a persistent and a local save both record of a step: the leaves of each average it stores as
     their differences from their weights, by the average's name, its control state, its rung, its inference
-    artifact and its boxed axes."""
+    artifact, its boxed axes and the implementation of each key its `tree` holds (`key_record`)."""
     return {"deltas": dict(deltas), "control": copy.deepcopy(control or {}), "rung": rung,
-            "artifact": artifact, "boxed": boxed_record(boxed)}
+            "artifact": artifact, "boxed": boxed_record(boxed), "keys": key_record(tree)}
+
+
+def key_record(tree: object) -> dict[str, str]:
+    """Each key's implementation among `tree`'s arrays, by its dtype's name (`key<rbg>`: "rbg"), which a
+    restore types the key's stored data by (`dew.checkpoints._keyed`), as Orbax's array metadata store
+    would, which the handler Dew saves with keeps none of (`dew.checkpoints._types`). An implementation
+    JAX names none of, which no name restores, is left out."""
+    keys = (leaf for leaf in jax.tree.leaves(tree)
+            if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key))
+    impls = {key.dtype.name: jax.random.key_impl(key) for key in keys}
+    return {name: impl for name, impl in impls.items() if isinstance(impl, str)}
 
 
 def boxed_record(boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> list[dict[str, list[str | None]]]:

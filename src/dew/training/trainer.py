@@ -701,8 +701,11 @@ class Trainer(Generic[Loss, Effects]):
             # The rate this run configures, not the one its checkpoint holds.
             state = rates_set(state, lambda held: with_rates(held, config.rates()))
         self._resume_rung(checkpoints.rung(resume))
-        from dew.nn.inputs import request_key
-        state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
+        # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
+        # run's own key's.
+        key = state.key if jax.dtypes.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (
+            jax.random.wrap_key_data(state.key, impl=jax.random.key_impl(self.key)))
+        state = dataclasses.replace(state, key=jax.device_put(key, shardings.key))
         if int(state.window_size) % self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")

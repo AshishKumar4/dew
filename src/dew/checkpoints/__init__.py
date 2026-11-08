@@ -195,13 +195,33 @@ def is_uri(path: str) -> bool:
     return '://' in path
 
 
+REPLICA_SLICE_BYTES = 1 << 20
+"""The least a replica writes of an array whose copies the save's devices hold (Orbax's
+`min_slice_bytes_for_replica_parallel`); a smaller one is written whole by one replica. Orbax's standard
+handler cuts every replicated array across its replicas however small, a slice program each: on eight
+CPU devices an rCM UNet run wrote its frozen teacher in 10.0 s against 2.5 s with slices of at least
+1 MiB, its first save in 11.7 s against 3.6 s, and ran in 119 s against 90 s (row 3512)."""
+
+
+def _types() -> ocp.type_handlers.TypeHandlerRegistry:
+    """Orbax's standard type handlers (`supported_types`), its jax.Array handler cutting no replica's
+    slice below `REPLICA_SLICE_BYTES`. Built through Orbax's public API, that handler keeps no array
+    metadata store, by which alone Orbax types a key it reads, so a step records each key's
+    implementation itself (`key_record`), which a restore types the key's data by (`_keyed`)."""
+    arrays = ocp.type_handlers.ArrayHandler(min_slice_bytes_for_replica_parallel=REPLICA_SLICE_BYTES)
+    return ocp.type_handlers.create_type_handler_registry(*(
+        (kind, arrays if kind is jax.Array else ocp.type_handlers.get_type_handler(kind))
+        for kind in ocp.type_handlers.supported_types()))
+
+
 def _handler(**options) -> ocp.PyTreeCheckpointHandler:
     """Orbax's pytree handler as every save of Dew's takes it: moving its arrays to pinned host memory
     with an explicit copy before it reads them, on every backend whose devices have that memory (a
     CPU's do, as a GPU's), which Orbax leaves to GPUs by default. Its implicit read instead would be
     refused under a steady state's transfer guard (tests/steady_state.py), which Dew's JAX build holds
-    a CPU array's reads to as a GPU's."""
-    return ocp.PyTreeCheckpointHandler(enable_pinned_host_transfer=True, **options)
+    a CPU array's reads to as a GPU's. Its types are Dew's (`_types`) where `options` name none."""
+    return ocp.PyTreeCheckpointHandler(enable_pinned_host_transfer=True,
+                                       **{"type_handler_registry": _types(), **options})
 
 
 ORDERED_DIRECTORIES = AsyncOptions(create_directories_asynchronously=False)
@@ -535,18 +555,38 @@ def _read(want, dtype) -> ocp.ArrayRestoreArgs:
     return ocp.ArrayRestoreArgs(sharding=getattr(want, 'sharding', None), dtype=dtype)
 
 
-def _placed(tree, template):
+def _keyed(leaf, want, keys: Mapping[str, str]):
+    """A key `want` asks for, read (`_read`) as its key data, which no array metadata store types
+    (`_types`): a key of the implementation the step records for `want`'s dtype (`key_record`), or of a
+    concrete `want`'s own; its key data where neither names one (a step an earlier Dew wrote), which
+    `request_key` types."""
+    if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key):
+        return leaf
+    impl = keys.get(want.dtype.name)
+    if impl is None and isinstance(want, jax.Array):
+        impl = jax.random.key_impl(want)
+    return leaf if impl is None else jax.random.wrap_key_data(leaf, impl=impl)
+
+
+def _placed(tree, template, keys: Mapping[str, str]):
     """`tree`'s read leaves as `template` holds them, in its dtypes and
     placements. A concrete template leaf the checkpoint lacks comes back
-    itself, and a key as its key data, which `request_key` types."""
+    itself, and a key as a key of the implementation its step records (`_keyed`)."""
     def placed(leaf, want):
-        if leaf is want or jnp.issubdtype(want.dtype, jax.dtypes.prng_key) or (
-                isinstance(leaf, jax.Array) and leaf.dtype == want.dtype):
+        if jnp.issubdtype(want.dtype, jax.dtypes.prng_key):
+            return _keyed(leaf, want, keys)
+        if leaf is want or (isinstance(leaf, jax.Array) and leaf.dtype == want.dtype):
             return leaf
         value = jnp.asarray(leaf).astype(want.dtype)
         sharding = getattr(want, 'sharding', None)
         return value if sharding is None else jax.device_put(value, sharding)
     return jax.tree.map(placed, tree, template)
+
+
+def _keys(snapshot: _StepFacts) -> Mapping[str, str]:
+    """The implementation of each key a step holds, by its dtype's name (`key_record`); none for a
+    step an earlier Dew wrote."""
+    return (snapshot.custom_metadata or {}).get("keys") or {}
 
 
 def _refuse_reshaped(template, stored, where: str) -> None:
@@ -1359,7 +1399,7 @@ class Checkpoints:
         rankings = () if ranking is None else (ranking,) if isinstance(ranking, Ranking) else ranking
         rules = self._ranked(rankings, scores)
         custom = {
-            **step_record(deltas, control, rung, artifact, boxed),
+            **step_record(deltas, control, rung, artifact, boxed, state_tree),
             "profiles": profile_metadata,
             "rankings": rules,
             "primary": primary or (rankings[0].metric if rankings else None),
@@ -1576,7 +1616,8 @@ class Checkpoints:
                         raise ValueError(f"{path} holds content with digest {found}, not the {digest} the "
                                          f"step recorded for its {name} collection")
                 if template is not None:
-                    tree = _placed(tree, template)
+                    # A stored collection holds no key.
+                    tree = _placed(tree, template, {})
                 values[name] = tree
         return values
 
@@ -1720,7 +1761,7 @@ class Checkpoints:
                 args=ocp.args.PyTreeSave(state_tree),
                 force=True,
                 custom_metadata={
-                    **step_record(deltas, control, rung, artifact, boxed),
+                    **step_record(deltas, control, rung, artifact, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
                     "grid": grid,
@@ -1931,7 +1972,7 @@ class Checkpoints:
         _refuse_reshaped(wanted, metadata, self.source(step))
         restored = self._restored(step, wanted, jax.tree.map(lambda want: _read(want, want.dtype), wanted),
                                   local=from_local)
-        return _placed(dict(restored['rollout']), wanted['rollout'])
+        return _placed(dict(restored['rollout']), wanted['rollout'], _keys(snapshot))
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
@@ -2046,7 +2087,8 @@ class Checkpoints:
             _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
                              in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
                              if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
-            restored = {name: value if name == 'position' else _placed(value, state_tree[name])
+            keys = _keys(snapshot)
+            restored = {name: value if name == 'position' else _placed(value, state_tree[name], keys)
                         for name, value in restored.items()}
             for path, wanted in targets.items():
                 restored = _with(restored, path, self._averages(step, metadata, restored, path, wanted,
@@ -2176,7 +2218,8 @@ class Checkpoints:
             if _at(checked, path) is not None:
                 checked = _with(checked, path, _plane_template(_at(checked, path), planes)[0])
         _refuse_reshaped(checked, metadata, where)
-        return jax.tree.map(_zeros, state_tree), held
+        # A key's zeros typed as its holders' read is (`_placed`), so the replicas recover one key alike.
+        return _placed(jax.tree.map(_zeros, state_tree), state_tree, _keys(snapshot)), held
 
     def _recovered(self, step: int, restored: dict, *, positioned: bool) -> dict:
         """`restored`, local `step` as each process read it, each shard the first holder's where some
