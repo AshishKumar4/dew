@@ -1394,8 +1394,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k)),
                              True))
+        # The fused launch's warpgroups reserve fp16's running scale's reduction scratch too, as it launches
+        # (`reducing`'s `scaled`: `_fused_launch`'s and `_coop_launch`'s).
+        scaled = config.fused and staged_parts(dtype) > 1
         return max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
-            layout, tiles.consumers, self.score_reduces), reduces=reduces))
+            layout, tiles.consumers, self.score_reduces, scaled=scaled), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:
