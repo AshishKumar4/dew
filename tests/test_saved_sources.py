@@ -31,7 +31,8 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     `--source.step latest`) starts from the weights its export does (`dew export`):
     one step from each, alike in every other option, lands every leaf bit for bit alike, and its record
     names the run it started from and the step it read. Its record resumes on a host whose cache lacks
-    the export (another node's, ledger 2774). A step beside a source that is no run is refused."""
+    the export (another node's, ledger 2774). A step beside a source that is no run is refused. A run
+    naming a head of its own over the run draws it over the run's backbone and trains."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     first = decision(tmp_path, drawn=False)
     trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
@@ -60,6 +61,12 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
         released_run(exported, step="latest")
     with pytest.raises(ValueError):
         load_diffusion_source(str(source))
+    # A run naming a head of its own over the Laya release draws it over the release's backbone, its rows
+    # laid out by the release's own tokenizer, which the backbone alone does not hold, and trains.
+    joint = ["head:joint-shape", "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1",
+             "--head.heads", "2", "--head.feedforward", "32"]
+    drawn = started(source, "fresh_head", "--source.step", "latest", *joint)
+    assert int(drawn.step) == 1
 
 
 def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_release(tmp_path, monkeypatch):
