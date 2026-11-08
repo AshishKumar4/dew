@@ -549,6 +549,20 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     return jax.lax.platform_dependent(lhs, rhs, cpu=blocked, default=plain)
 
 
+def projected(product: Callable) -> Callable:
+    """`product`, a layer's projection (a `jax.lax.dot_general`), summed on a CPU as `projection_product`
+    sums it where that takes it: whether or not the GEMM template's dispatch runs it (`gemm.dot_general`,
+    which a wrapper's scope skips: an adapter's, `dew.nn.dense.intercepted`), a layer's projection is
+    summed alike."""
+    def summed(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
+        if not kwargs and (projection := projection_product(
+                product, lhs, rhs, dimension_numbers, precision, preferred_element_type)) is not None:
+            return projection
+        return product(lhs, rhs, dimension_numbers, precision=precision,
+                       preferred_element_type=preferred_element_type, **kwargs)
+    return summed
+
+
 CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
 """The contractions `accumulated` traces once a call (`_contraction`): JAX's own, whose trace states no
 derivative of its own (`_own_backward`) and depends on its operands' types and its arguments alone."""
