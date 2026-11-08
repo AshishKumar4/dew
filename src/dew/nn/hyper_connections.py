@@ -43,6 +43,19 @@ and writes the streams without mixing them:
 
 `down` is `[r, H D]` and `up` `[H D, r]` for the rank `r`; the model's head
 is the read alone, with no inject, and no norm after it.
+
+SenseNova-Loop's mHC (`MHCRouter`, modeling_sensenova_loop.py:86-157 at
+sensenova/SenseNova-Loop-9B-Preview) is the same site at other settings:
+no `scale` (`hc_scaled`), no floor (`hc_eps` 0, where the column-first
+exp-space Sinkhorn is the reference's log-space rows-then-columns one), the
+mix applied as it stands, `streams'[k] = sum_j comb[k, j] streams[j]`
+(`hc_mix_transposed`), the read scaled by `hc_pre_scale`, or no mix at all
+(`hc_fixed_identity`); and its streams span a range of layers (`hc_layers`),
+entered at the first as the stack enters them (`enter_streams`) and collapsed leaving
+the last by the head (`leave_streams`), so a loop over that range enters them on every
+pass. A range the stack ends in leaves through the stack's own collapse, its
+head the model's and its streams what V4's depths read (`ends_stack`); every
+other range's last layer collapses them by a head of its own.
 """
 
 from __future__ import annotations
@@ -86,6 +99,19 @@ class HyperConnections:
     head: str = 'mean'
     single_pass: bool = False
     hc_lowrank: int | None = None
+    hc_scaled: bool = True
+    """Whether a site scales its mixes by its own `scale` `[3]` before its `base`; SenseNova's take
+    none."""
+    hc_mix_transposed: bool = False
+    """Whether stream k reads row k of the mix (`comb @ streams`, SenseNova's) rather than its column."""
+    hc_pre_scale: float = 1.0
+    """The factor on a site's read (SenseNova's `pre_scale`)."""
+    hc_fixed_identity: bool = False
+    """Whether the sites keep each stream as it is, no mix learned (SenseNova's `fixed_identity`)."""
+    hc_layers: tuple[int, int] | None = None
+    """The layers `[first, end)` the streams span, entered as the stack enters them at `first` and
+    collapsed by the head leaving `end - 1` (`enter_streams`, `leave_streams`); None spans the stack,
+    from the embeddings to the final norm."""
 
     def __post_init__(self):
         if self.hc_mult < 1:
@@ -102,6 +128,29 @@ class HyperConnections:
                 self.hc_lowrank is not None and (self.hc_lowrank < 1 or self.single_pass)):
             raise ValueError("Qwen4-Exp's gated residual (hc_lowrank, a rank of one or more) reads its "
                              "streams through its gated head, without Single-Pass, and only it does")
+        if self.hc_eps < 0:
+            raise ValueError(f"hc_eps floors the collapse and the Sinkhorn sums, so it is not negative, got "
+                             f"{self.hc_eps}")
+        if self.hc_layers is not None and not 0 <= self.hc_layers[0] < self.hc_layers[1]:
+            raise ValueError(f"streams over a range of layers span [first, end), first < end, got "
+                             f"{self.hc_layers}")
+
+    @property
+    def mixes(self) -> int:
+        """The mixes a site's `fn` maps the streams to: `pre`, `post` and, unless the mix is fixed, the
+        `H x H` mix."""
+        return (2 + (0 if self.hc_fixed_identity else self.hc_mult)) * self.hc_mult
+
+    def streamed(self, index: int) -> bool:
+        """Whether layer `index` reads and writes the streams."""
+        return self.hc_layers is None or self.hc_layers[0] <= index < self.hc_layers[1]
+
+    def ends_stack(self, num_layers: int, looped: bool) -> bool:
+        """Whether a stack of `num_layers` hands the final norm its streams, collapsed by its own head:
+        streams over the whole stack, or a range through its last layer that no loop runs again. Any
+        other range leaves through its last layer, which hands a later layer, or a later pass, the
+        residual (`leave_streams`)."""
+        return self.hc_layers is None or (self.hc_layers[1] == num_layers and not looped)
 
     @property
     def gated(self) -> bool:
@@ -115,6 +164,32 @@ class Carried(NamedTuple):
 
     streams: jax.Array
     pre: jax.Array
+
+
+def enter_streams(x: jax.Array, spec: HyperConnections) -> jax.Array | Carried:
+    """The residual `[B, S, D]` entering the streams: copied into every one, `[B, S, H, D]`, with
+    Single-Pass's first collapse, the first stream's (`Carried`)."""
+    streams = expand_streams(x, spec.hc_mult)
+    return Carried(streams, first_stream(streams)) if spec.single_pass else streams
+
+
+def carried_parts(residual, spec: HyperConnections) -> tuple[jax.Array, jax.Array | None]:
+    """The streams and, under Single-Pass (`spec.single_pass`), the `pre` the next sublayer collapses them
+    by, from the residual `enter_streams` and the blocks hand on."""
+    if not spec.single_pass:
+        return residual, None
+    streams, pre = residual
+    return streams, pre
+
+
+def leave_streams(residual, spec: HyperConnections, head: HyperHead | GatedResidual | None):
+    """The streams, or Single-Pass's `Carried`, collapsed back to `[B, S, D]` by `spec.head`: the carried
+    `pre`, the learned `head` (V4's, Qwen4-Exp's gated read), or their mean."""
+    streams, pre = carried_parts(residual, spec)
+    if spec.head == 'carried':
+        assert pre is not None
+        return collapse_by(pre, streams)
+    return collapse_streams(streams, head)
 
 
 def expand_streams(x, hc_mult: int):
@@ -164,8 +239,7 @@ class HyperConnection(nn.Module):
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
-        copies = self.spec.hc_mult
-        return {'fn': (copies * self.emb_features, (2 + copies) * copies)}
+        return {'fn': (self.spec.hc_mult * self.emb_features, self.spec.mixes)}
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -183,25 +257,35 @@ class HyperConnection(nn.Module):
 
     def __call__(self, streams):
         pre, post, comb = self.mapping(streams)
-        return post, comb, collapse_by(pre, streams)
+        return post, comb, self.read(pre, streams)
+
+    @nn.nowrap
+    def read(self, pre, streams):
+        """The sublayer's input: the streams collapsed by `pre`, scaled by `hc_pre_scale`."""
+        collapsed = collapse_by(pre, streams)
+        return collapsed if self.spec.hc_pre_scale == 1.0 else collapsed * self.spec.hc_pre_scale
 
     @nn.compact
     def mapping(self, streams):
-        """The site's `(pre, post, comb)` over the streams, all fp32 (`at_least_fp32`)."""
-        hc = self.spec.hc_mult
+        """The site's `(pre, post, comb)` over the streams, all fp32 (`at_least_fp32`); `comb` is laid out
+        as `mix_streams` reads it, `[from, to]`."""
+        spec, hc = self.spec, self.spec.hc_mult
         inputs, mix = self.projections()['fn']
         fn = self.param('fn', nn.initializers.normal(0.02), (mix, inputs), jnp.float32)
         base = self.param('base', nn.initializers.zeros, (mix,), jnp.float32)
-        scale = self.param('scale', nn.initializers.ones, (3,), jnp.float32)
+        scale = (self.param('scale', nn.initializers.ones, (3,), jnp.float32) if spec.hc_scaled
+                 else jnp.ones((3,), jnp.float32))
         mixes = stream_mixes(streams, fn, self.norm_eps)
-        pre = pre_weights(mixes[..., :hc], scale[0], base[:hc], self.spec.hc_eps)
+        pre = pre_weights(mixes[..., :hc], scale[0], base[:hc], spec.hc_eps)
         post = 2 * nn.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
+        if spec.hc_fixed_identity:
+            return pre, post, jnp.broadcast_to(jnp.eye(hc, dtype=post.dtype), (*post.shape, hc))
         logits = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc :].reshape(
             hc, hc
         )
-        comb = sinkhorn(jax.nn.softmax(logits, axis=-1) + self.spec.hc_eps,
-                        self.spec.hc_sinkhorn_iters, self.spec.hc_eps)
-        return pre, post, comb
+        comb = sinkhorn(jax.nn.softmax(logits, axis=-1) + spec.hc_eps, spec.hc_sinkhorn_iters, spec.hc_eps)
+        # SenseNova's mix reads stream k from row k: its transpose is the `[from, to]` mix.
+        return pre, post, jnp.swapaxes(comb, -1, -2) if spec.hc_mix_transposed else comb
 
 
 def stream_mixes(streams, fn, norm_eps: float):

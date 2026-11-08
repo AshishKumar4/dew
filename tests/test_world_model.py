@@ -5,6 +5,7 @@ dynamics model's block-causal reading of time."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+from learning_gate import assert_learns
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.objectives.world_model import Dynamics, shortcut_forcing_loss
@@ -227,6 +228,70 @@ def test_a_tokenizers_patches_are_each_frames_row_major_pixels_whatever_its_lead
     placed[:, :, (r // 4) * 3 + c // 4, ((r % 4) * 4 + c % 4) * 2 + k] = np.asarray(frames)
     np.testing.assert_array_equal(patches, placed)
     np.testing.assert_array_equal(np.asarray(tokenizer._unpatchify(jnp.asarray(patches))), np.asarray(frames))
+
+
+SQUARE_UNITS = 8
+"""The held-out clips the moving squares' reconstruction is judged over: `learning_gate.units_for` of a
+pilot over 64 held-out clips (armada at eab3c68e11), its contrasts' means and spreads 0.495 and 0.015 for
+lighting the squares, 0.5 and 0.0002 for the dark background, 0.124 and 0.003 for the error below the mean
+frame's."""
+
+
+def reconstructed(tokenizer, variables, clips: np.ndarray, mean: np.ndarray) -> dict[str, np.ndarray]:
+    """What `tokenizer` at `variables` reconstructs of held-out `clips` `[clips, frames, H, W, C]` of lit
+    shapes over a dark background (-1 and 1), as the learning gate's contrasts, one a clip, each positive
+    where the clip meets its claim (`learning_gate.assert_learns`): the share of the shapes' pixels it
+    lights (above 0, their midpoint) past one half, the share of the background it leaves dark past one
+    half, and its squared error below that of the `mean` frame of its training clips, the
+    reconstruction of a tokenizer whose latents hold no place, which lights none."""
+    frames = clips.reshape(-1, *clips.shape[2:])
+    rebuilt = np.asarray(jax.jit(tokenizer.apply)(variables, frames)).reshape(clips.shape)
+    lit, shown = rebuilt > 0, clips > 0
+    axes = tuple(range(1, clips.ndim))
+    assert not np.any(mean > 0)
+    return {"lights the shapes": np.sum(lit & shown, axes) / np.sum(shown, axes) - 0.5,
+            "leaves the background dark": np.sum(~lit & ~shown, axes) / np.sum(~shown, axes) - 0.5,
+            "errs less than the mean frame": (np.mean(np.square(mean - clips), axes)
+                                              - np.mean(np.square(rebuilt - clips), axes))}
+
+
+def test_a_tokenizer_reconstructs_the_moving_squares_it_trained_on():
+    """A tokenizer trained on clips of one lit square moving over a dark frame (512 clips of 4 frames of
+    16 by 16 pixels, a 3 by 3 square stepping diagonally and bouncing off the walls) for 3,000 updates of
+    16 clips reconstructs the squares of held-out clips, judged by the learning gate over them, a unit a
+    clip (`reconstructed`): it lights their squares, leaves their background dark and errs less than the
+    mean frame. Its tokens know their places by Dreamer 4's rotary positions (row 4669): by learned
+    vectors alone it lit 68 of 8 clips' 288 square pixels, the mean frame's reconstruction tutorial 12
+    showed at its own scale, where rotary positions light 285 (armada at 29c4ba287c)."""
+    import itertools
+
+    import optax
+
+    from dew.data.dataset import Loader
+    from dew.objectives.world_model import CausalTokenizer, TokenizerObjective
+    from dew.training import Trainer
+
+    def squares(rows, seed):
+        rng = np.random.default_rng(seed)
+        videos = np.full((rows, 4, 16, 16, 1), -1.0, np.float32)
+        for video in videos:
+            place, step = rng.integers(0, 14, 2), rng.choice([-1, 1], 2)
+            for frame in video:
+                frame[place[0]:place[0] + 3, place[1]:place[1] + 3] = 1.0
+                step = np.where((place + step < 0) | (place + step > 13), -step, step)
+                place = place + step
+        return videos
+
+    videos, held = squares(512, 0), squares(SQUARE_UNITS, 1)
+    clips = Loader(train=lambda partition: ({"video": videos[start:start + 16]}
+                                            for start in itertools.cycle(range(0, 512, 16))),
+                   val=None, records=512, batch=16)
+    tokenizer = CausalTokenizer((16, 16, 1), patch=4, width=32, depth=2, heads=2, latents=4, bottleneck=4)
+    state = Trainer(TokenizerObjective(tokenizer), optax.adam(1e-3), key=jax.random.key(0)).fit(
+        clips, steps=3000, log_every=3000)
+    contrasts = reconstructed(tokenizer, state.variables, held, videos.reshape(-1, 16, 16, 1).mean(0))
+    assert_learns(lambda clips: {claim: values[clips] for claim, values in contrasts.items()},
+                  "a tokenizer's moving squares", units=SQUARE_UNITS)
 
 
 def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there():

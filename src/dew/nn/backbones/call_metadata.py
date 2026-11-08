@@ -50,9 +50,6 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
     if pairwise_mask is not None and key_runs is not None:
         raise ValueError("attention_key_runs and attention_pairwise_mask each name a call's whole "
                          "visibility; pass one")
-    if key_valid is not None and pairwise_mask is None and key_runs is None:
-        raise ValueError("attention_key_valid hides keys from a call's own visibility; it requires "
-                         "attention_pairwise_mask or attention_key_runs")
     if model.engram is None and (model.mixture is None or not model.mixture.media_bias):
         media_mask = None
     if decode and coordinates is not None and coordinates.max_segments > 1 and (

@@ -123,13 +123,16 @@ def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_p
     assert 0 < factors < sum(leaf.size for leaf in held)
 
 
+@pytest.mark.parametrize("option", [{"text_only": True}, {"scan_layers": True}],
+                         ids=["text_only", "scan_layers"])
 @pytest.mark.parametrize("kind", ["lm", "diffusion", "jepa"])
-def test_a_kind_that_builds_its_model_fresh_refuses_source_options(kind, tmp_path):
+def test_a_kind_that_builds_its_model_fresh_refuses_source_options(kind, option, tmp_path):
     """`source` says what a run builds of the source it loads, and a run whose model is built from
-    `model` loads none: its source options are refused as it is prepared, not dropped."""
+    `model` loads none: its source options are refused as it is prepared, not dropped, how it would scan
+    a source's layers among them (its model's own `scan_layers` says that)."""
     run = KINDS[kind](tmp_path, drawn=False)
     with pytest.raises(ValueError):
-        dataclasses.replace(run, source=SourceOptions(text_only=True)).prepare()
+        dataclasses.replace(run, source=SourceOptions(**option)).prepare()
 
 
 @pytest.mark.parametrize("kind", ["lm", "decision"])

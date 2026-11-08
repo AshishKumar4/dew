@@ -11,10 +11,8 @@ from test_model_flops import forward_products
 
 from dew.batch import TEXT_KEY
 from dew.diffusion import presets
-from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, Field, InputSpec
-from dew.inputs.condition import ConditionWork
 from dew.inputs.diffusion import DiffusionConditioner, T5Segment
 from dew.inputs.encoders import CharTable, T5Text
 from dew.nn.attention_blocks import Stage
@@ -36,9 +34,10 @@ from dew.nn.backbones.video_dit import VideoDiT
 from dew.nn.backbones.wan import WanBlock, WanTransformer
 from dew.nn.backbones.z_image import ZImageBlock, ZImageTransformer
 from dew.nn.dit import TextContext
-from dew.nn.flops import MissingFlopsCount, patch_lengths
+from dew.nn.flops import ConditionWork, MissingFlopsCount, patch_lengths
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
