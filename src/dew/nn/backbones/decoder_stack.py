@@ -219,10 +219,18 @@ class Loop:
     through the last k passes alone: the passes before them run under
     `stop_gradient` (truncated backpropagation, as Huginn trains), so neither
     they nor the layers before them get a gradient. None trains through
-    every pass. `exit_gate` adds Ouro's hazard head over the whole stack, a
-    biased map of each pass's normed states to one logit, which the decoder
-    sows into its `exits` collection; the decoder's output is always the
-    last pass's.
+    every pass. `exit_gate` adds Ouro's hazard head, a biased map of each
+    pass's exit state, normed, to one logit (the decoder's `early_exit_gate`,
+    drawn at zero where a loaded decoder gains it): a pass's exit state is
+    its output where the block ends the stack, and else the coda run on it,
+    each pass's coda its own (its cache entries too), so any pass reaches the
+    head. The decoder sows each pass's gate logit (`logits`) and its normed
+    exit state (`states`) into its `exits` collection, and its output is the
+    last pass's; with `exit_threshold` it is, token by token, the first
+    pass's whose cumulative exit probability reaches it (Ouro's
+    `early_exit_threshold`, OuroForCausalLM.forward), the last pass's where
+    none does. The probability a pass exits is its hazard `sigmoid(logit)`
+    times the chance no pass before it did; the last pass takes the rest.
 
     `remat` checkpoints each pass of the block, the first included, with one
     Flax lifted checkpoint. Backpropagation keeps each pass's input and
@@ -241,10 +249,24 @@ class Loop:
     block still train through the input every pass after the cut reads, as
     Huginn's prelude does (arXiv 2502.05171, section 3.3).
 
+    With `implicit`, a later pass runs the block at `x = a + θ⊙(h - a)`, `a`
+    the block's input and `h` the state the pass before left, and leaves
+    `block(x) + (a - x)`: the block's own step taken from `a` (the θ-method of
+    an implicit fixed point, a relaxation that reads the last pass's state as
+    far as θ says). θ is the decoder's per-channel `loop_theta`, drawn at zero,
+    so at θ = 0 every later pass leaves the block's output over its input, and
+    a decoder computes what it computes without the loop, whatever its count:
+    a pretrained decoder gains passes without changing what it computes, where
+    a plain repeat moves it. It reads the state as it is (no `step_norm`) and
+    adds its own input back, which `reinject` would add twice.
+
     A decode cache holds one entry per pass and layer. The first pass keeps
     its layers' own names; pass t > 0's layer i is `layers_{L + (t - 1) n + i - first}`,
     L the decoder's layers and n the block's (`PassView`). Over the whole
-    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. With
+    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. Under
+    an exit gate, pass t < T - 1's coda layer j is
+    `layers_{L + (T - 1) n + t c + j - end}` beside them, c the coda's
+    layers, T the steps. With
     `shared_cache` every pass reads and writes its layers' one entry, each
     pass overwriting the step's keys and values the pass before wrote, so
     a step's earlier tokens read the last pass's (Dory's last-loop cache):
@@ -258,6 +280,8 @@ class Loop:
     remat: bool = False
     reinject: bool = False
     shared_cache: bool = False
+    implicit: bool = False
+    exit_threshold: float | None = None
 
     def __post_init__(self):
         if self.steps < 1:
@@ -265,6 +289,9 @@ class Loop:
         if self.reinject and (not self.step_norm or self.exit_gate):
             raise ValueError("a reinjecting loop norms each pass's state (step_norm) and exits at "
                              "the last pass")
+        if self.implicit and (self.step_norm or self.reinject):
+            raise ValueError("an implicit loop reads the last pass's state as it is and adds the block's "
+                             "input back itself: it takes no step_norm and no reinject")
         if self.backprop_steps is not None and not 1 <= self.backprop_steps <= self.steps:
             raise ValueError(f"backprop_steps counts passes trained through, 1 to steps={self.steps}, "
                              f"got {self.backprop_steps}")
@@ -273,8 +300,9 @@ class Loop:
             object.__setattr__(self, "layers", (first, end))
             if not 0 <= first <= end:
                 raise ValueError(f"a loop's block is layers [first, end), first <= end, not {self.layers}")
-            if self.exit_gate:
-                raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
+        if self.exit_threshold is not None and (not self.exit_gate or not 0 < self.exit_threshold <= 1):
+            raise ValueError("an exit threshold is a cumulative probability in (0, 1] over the passes the "
+                             f"exit gate weighs, got {self.exit_threshold} with exit_gate={self.exit_gate}")
 
 
 @dataclasses.dataclass
@@ -285,16 +313,26 @@ class SharedPassView:
     and values over the last pass's, and each recurrent mixer's state, convolution tail and memory
     as the step entered them, so it takes the step's tokens once rather than again after the pass
     before took them. A pass that allocates the cache finds none, so the later ones allocate too and
-    advance nothing (`cache_positions`). The step leaves the cache as its last pass did."""
+    advance nothing (`cache_positions`). The step leaves the cache as its last pass did. The entries of
+    layers outside the block `layers`, [first, end), stay as each pass finds them: the prelude's, and
+    those an exit's coda writes between the passes (`looping.run_loop`)."""
+    layers: tuple[int, int]
     entering: Mapping | None = None
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
         self.entering = variables.get('cache')
         return dict(variables)
 
+    def _apart(self, name: str) -> bool:
+        """Whether `name` is the entry of layers outside the block."""
+        run = group_layers(name)
+        return run is not None and (run.stop <= self.layers[0] or run.start >= self.layers[1])
+
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         rest = {collection: tree for collection, tree in variables.items() if collection != 'cache'}
-        return rest if self.entering is None else {**rest, 'cache': self.entering}
+        cache = {**{name: value for name, value in variables.get('cache', {}).items() if self._apart(name)},
+                 **{name: value for name, value in (self.entering or {}).items() if not self._apart(name)}}
+        return {**rest, 'cache': cache} if cache else rest
 
     @staticmethod
     def outside(variables: Mapping[str, Mapping]) -> dict:
