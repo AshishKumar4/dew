@@ -240,13 +240,15 @@ def _weight(equation, name, params, operands, value):
         return max(abs(int(params["y"])) - 1, 1) * magnitude
     if name == "reduce" and params["computation"] is compensated_add:
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
-        # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u.
+        # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
+        # the pair's halves by it, as the high half's rounding moves the low half by as much.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
         u = _unit(name, params, equation.outvars[0].aval.dtype)
         gamma = (terms - 1) * u / (1 - (terms - 1) * u)
         pair = operands[:len(operands) // 2]
+        total = jnp.abs(sum(jnp.sum(operand, params["dimensions"]) for operand in pair))
         spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
-        return magnitude + gamma * gamma / u * spread
+        return total + gamma * gamma / u * spread
     if name == "reduce" and equation.outvars[0].aval.dtype == jnp.float64:
         # A reduction Dew's wide CPU arithmetic runs in float64 (`dew.nn.precision.widened_reduction`: the
         # chunked head's logsumexp): each combine an elementary function and a sum at most, each rounding
