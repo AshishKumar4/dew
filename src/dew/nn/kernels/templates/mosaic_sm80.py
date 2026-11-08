@@ -49,6 +49,88 @@ def _run(index_map, lo, each: int, step):
     return (rows.table[rows.start + each], *rows.rest)
 
 
+def _gathered_walk(streams, segments, carry, interpret: bool):
+    """`CpAsync.walk` over streams whose step's rows a table gathers (`Pipeline.gathered`), `segments` as
+    `walk`'s: each stream's slots the walk's own, staged at the swizzle its rows' copy tiles
+    (`gathered.swizzled`), a step's rows copied by the warpgroup a row a copy (`gathered.row_copies`), every
+    stream's copies of a step one cp.async group, as `emit_pipeline` loads its own: a step waits for its own
+    group (`plgpu.wait_gmem_to_smem`, the later groups in flight `stages - 2`, a group committed empty where
+    no step remains to load, so the count stays an immediate), then issues the group of the step `stages - 1`
+    ahead into the slot the step before read, once the warpgroup is past those reads (`mosaic.synced`).
+    Interpreted, each row copied by the program's own loads and stores."""
+    from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on the toolkit's rings
+
+    blocks = streams.pipeline.blocks
+    names = tuple(blocks)
+    swizzles = {name: gathered_rows.swizzled(shape, dtype) for name, (shape, dtype) in blocks.items()}
+    for step, lo, hi in segments:
+        if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
+            continue
+        stages = streams.pipeline.stages
+        if isinstance(lo, int) and isinstance(hi, int):
+            stages = min(stages, hi - lo)
+
+        def walked(*slots, step=step, lo=lo, hi=hi, stages=stages, carry=carry):
+            def load(index) -> None:
+                # Step `index`'s rows of every stream into its slot, committed as one group (empty past `hi`).
+                @pl.when(index < hi)
+                def _():
+                    for name, ring in zip(names, slots, strict=True):
+                        ref, index_map = streams.views[name]
+                        rows = index_map(index)
+                        [depth] = rows.rest
+                        height, width = blocks[name][0]
+                        source = ref.at[:, pl.ds(depth * width, width)]
+                        table = rows.table.at[pl.ds(rows.start, height)]
+                        slot = ring.at[lax.rem(index - lo, stages)]
+                        _row_copied(source, table, slot, swizzles[name], interpret)
+
+                if not interpret:
+                    plgpu.inline_mgpu()(gathered_rows.commit_group)()
+
+            for ahead in range(stages - 1):
+                load(lo + ahead)
+
+            def body(index, carried):
+                if stages == 1:
+                    mosaic.synced(interpret)
+                    load(index)
+                if not interpret:
+                    plgpu.wait_gmem_to_smem(max(0, stages - 2))
+                if stages > 1:
+                    # The slot the step before read is the one this step's copies `stages - 1` ahead fill.
+                    mosaic.synced(interpret)
+                    load(index + stages - 1)
+                slot = lax.rem(index - lo, stages)
+                started, accumulators = carried
+                tiles = {name: ring.at[slot] for name, ring in zip(names, slots, strict=True)}
+                return step(index, Slots(tiles), started, accumulators)
+
+            return lax.fori_loop(lo, hi, body, carry)
+
+        carry = pl.run_scoped(walked, *(mosaic.staged((stages, *shape), dtype, swizzles[name])
+                                         for name, (shape, dtype) in blocks.items()))
+    return carry
+
+
+def _row_copied(source, table, slot, swizzle: int, interpret: bool) -> None:
+    """`slot`'s rows (`[height, width]`), row `r` `source`'s row `table[r]`: the warpgroup's cp.async copies
+    (`gathered.row_copies`), issued and not awaited; interpreted, each row loaded and stored."""
+    from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on the toolkit's rings
+
+    if interpret:
+        def copied(row, _):
+            slot[pl.ds(row, 1), :] = source[pl.ds(table[row], 1), :]
+
+        lax.fori_loop(0, slot.shape[0], copied, None)
+        return
+    transforms = mosaic.swizzle_transforms(source.dtype, swizzle)
+    refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(transforms))
+    plgpu.inline_mgpu(arg_types=refs)(
+        lambda ctx, source, rows, slot: gathered_rows.row_copies(source, rows, slot, swizzle=swizzle))(
+            source, table, slot)
+
+
 def _join_swizzle(block: tuple, streams, name: str) -> int:
     """The swizzle a stream's joined tile stages at: its own where it names one, else its copy's."""
     named = streams.pipeline.swizzles.get(name)
@@ -81,14 +163,6 @@ def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     return mosaic.swizzle_transforms(dtype, mosaic.copied_swizzle(shape, dtype))
 
 
-def _swizzle(ref) -> int:
-    """The swizzle, in bytes, a shared-memory operand's rows are staged at: 0 where it is staged plain."""
-    if not isinstance(ref, state_types.TransformedRef):
-        return mosaic.UNSWIZZLED
-    return max((transform.swizzle for transform in ref.transforms
-                if isinstance(transform, plgpu_core.UnswizzleRef)), default=mosaic.UNSWIZZLED)
-
-
 def _depth_granule(ref, axis: int, instruction: int) -> int:
     """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns (no
     narrower slice of a swizzled tile lowers, FS-NARROW-LOWER1)."""
@@ -98,7 +172,7 @@ def _depth_granule(ref, axis: int, instruction: int) -> int:
                      and transform.permutation == (1, 0) for transform in ref.transforms) % 2
     if axis != (0 if transposed else 1):
         return instruction
-    return max(instruction, mosaic.swizzle_columns(ref.dtype, _swizzle(ref)))
+    return max(instruction, mosaic.swizzle_columns(ref.dtype, mosaic.swizzle_of(ref)))
 
 
 class Slots:
@@ -131,6 +205,10 @@ class Pipeline:
     copies: dict = dataclasses.field(default_factory=dict)
     """The copies a stream's step arrives in where more than one (`mosaic.Pieces`, a `Rows` view's runs):
     each copied into a slot of its own, then joined into the stream's one tile a step reads (`walk`)."""
+    gathered: tuple = ()
+    """The streams whose step's rows a table gathers (a `Rows` view of one row a run): the warpgroup's own
+    cp.async copies, a row a copy (`gathered.row_copies`), into slots of the walk's own, in the pipeline's
+    cp.async groups (`_gathered_walk`); a walk gathers every stream or none."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -360,7 +438,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # unchanged (FS-C1-NARROW1-a100).
         instruction = self.fragment_depth(int(rhs.shape[0]))
         lhs_depth = max(_depth_granule(lhs, 1, instruction),
-                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=_swizzle(lhs)))
+                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=mosaic.swizzle_of(lhs)))
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
@@ -462,6 +540,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     stores_through_registers = True
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
+    gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_gathered_walk`)
+    gathers_interpreted = True
 
     pieces_of_views = False  # its pieces are a table's runs (`_run`), a paged call's pages alone
 
@@ -505,8 +585,11 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None):
+                swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
+                gathered: tuple[str, ...] = ()):
         _one(consumers, clustered=bool(multicast))
+        if gathered and set(gathered) != set(blocks):
+            raise NotImplementedError("an A100's walk gathers every stream's rows or none")
         # A stream's pieces each a block of `emit_pipeline`'s own, in whole 8-row tiles, joined by its
         # consumer.
         copies = {name: count for name, count in (copies or {}).items() if count > 1}
@@ -515,7 +598,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             if rows % (count * mosaic.TILE_ROWS):
                 raise ValueError(f"{name}'s {rows} rows arrive in no {count} pieces of whole "
                                  f"{mosaic.TILE_ROWS}-row tiles")
-        return Pipeline(blocks, stages, dict(swizzles or {}), copies)
+        return Pipeline(blocks, stages, dict(swizzles or {}), copies, tuple(gathered))
 
 
     def lifetimes(self, streams: Pipeline, steps: int | None = None) -> tuple[tuple, tuple]:
@@ -577,6 +660,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
         blocks, copies = streams.pipeline.blocks, streams.pipeline.copies
         names = tuple(blocks)
         carry = (start, self.started(shapes, initial))
+        if streams.pipeline.gathered:
+            return _gathered_walk(streams, segments, carry, interpret)
         for step, lo, hi in segments:
             if isinstance(lo, int) and isinstance(hi, int) and hi <= lo:
                 # No steps: the carry and its zero accumulators as they start (`emit_pipeline` takes no

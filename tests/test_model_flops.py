@@ -44,6 +44,7 @@ from dew.nn.flops import (
     delta_flops,
     dense_training_flops,
     projection_flops,
+    ssd_flops,
     traced_flops,
 )
 from dew.nn.gemma4_moe import Gemma4Experts
@@ -750,8 +751,9 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
 
 @pytest.mark.parametrize("kind", ["gdn", "kda", "ssd", "mamba"])
 def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
-    """Three delta MACs (the prediction, the write and the readout of the updated state, `recurrence.update`)
-    and two SSD/Mamba MACs, executed once per real token."""
+    """The model's three delta MACs (the prediction, the write and the readout of the updated state,
+    `delta_flops`) and two SSD/Mamba MACs (`ssd_flops`), once per real token; the delta rule's and the SSD's
+    token path executes one more, the hardware's alone (`written_read`), Mamba's selective scan none."""
     batch, length, heads, key, value = 2, 7, 2, 3, 5
     q = jnp.ones((batch, length, heads, key))
     v = jnp.ones((batch, length, heads, value))
@@ -760,12 +762,16 @@ def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
         g = jnp.zeros((batch, length, heads, key) if kind == "kda" else (batch, length, heads))
         rule = recurrent_delta_rule if kind == "kda" else recurrent_gated_delta_rule
         counted = forward_products(rule, q, q, v, g, beta, state_mac=True)
-        assert counted == 6 * batch * length * heads * key * value
+        tokens = batch * length
+        assert delta_flops(np.full(batch, length), heads, key, value) == 6 * tokens * heads * key * value
+        assert counted == 8 * tokens * heads * key * value
     elif kind == "ssd":
         b = jnp.ones((batch, length, heads, key))
         counted = forward_products(recurrent_ssd, v, beta, jnp.ones((heads,)), b, b,
                                     jnp.ones((heads,)), state_mac=True)
-        assert counted == 4 * batch * length * heads * key * value
+        tokens = batch * length
+        assert ssd_flops(np.full(batch, length), heads, key, value) == 4 * tokens * heads * key * value
+        assert counted == 6 * tokens * heads * key * value
     else:
         channels = 5
         x = jnp.ones((batch, length, channels))
@@ -787,10 +793,26 @@ def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
     compute no outputs over their zero history: the model's count is the
     full traced product count, with no tolerance to hide a missing learned
     projection. A delta rule's token reads its updated state (`recurrence.update`, rows 1859 and 1962),
-    the analytic rule's three state products (`delta_flops`) and no more."""
-    x = jnp.ones((2, 1, 8))
+    the analytic rule's three state products (`delta_flops`), and its token path the hardware's fourth
+    (`written_read`)."""
+    x, lengths = jnp.ones((2, 1, 8)), np.array([1, 1])
     variables = model.init(jax.random.key(202), x)
-    assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
+    executed = forward_products(model.apply, variables, x, state_mac=True)
+    assert model.model_flops(lengths) + written_read(model, lengths) == executed
+
+
+def written_read(model, lengths) -> float:
+    """A delta rule's token path's read of its write apart from the state it updates (`recurrence.update`
+    reads `(g q)^T S + q^T ((beta k) c^T)` as the chunked form does), one product past the model's three
+    (`delta_flops`): the hardware's work alone, as the fused attention backward's recomputed `Q K^T` is (row
+    3948); the SSD's write read apart as well, one past its two (`ssd_flops`); none for another module."""
+    if isinstance(model, Mamba2):
+        return ssd_flops(lengths, model.num_heads, model.state_size, model.head_dim) / 2
+    if isinstance(model, GatedDeltaNet):
+        return delta_flops(lengths, model.num_v_heads, model.head_k_dim, model.head_v_dim) / 3
+    if isinstance(model, KimiDeltaAttention):
+        return delta_flops(lengths, model.num_heads, model.head_dim, model.head_dim) / 3
+    return 0.0
 
 
 @pytest.mark.parametrize("kind", ["sparse", "latent", "gpt_oss", "gemma4"])

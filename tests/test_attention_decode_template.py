@@ -13,11 +13,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_decode
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_decode,
+    bundles,
+)
 
 KEYS = 256
 SEEDS = 8
@@ -114,15 +119,25 @@ def test_a_256_wide_decode_step_whose_split_launch_does_not_fit_is_on_par_interp
                     "template decode 256 wide bfloat16", seeds=SEEDS)
 
 @INTERPRETS
+@pytest.mark.parametrize("page", [None, 4])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
-def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted(call):
+def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted(call, page):
     """A decode step whose first row's query is 2^16 times a drawn one (its folded logits past
     `algebra.FOLD_REACH`, where the fold's rounding moves its weights) and whose second row's is drawn: the
     first row walked again in the natural form by the masked launch (`algebra.walked_launches`), the second
-    kept folded, each on par with the reference path (check 1)."""
+    kept folded, each on par with the reference path (check 1); over a dense cache, and a paged pool of
+    4-key pages, whose rewalk at its own tiles reads them through the one-key table its gather does
+    (`attention_mosaic_forward.paged_reads`)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
+    table = None if page is None else jnp.asarray(
+        np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page), jnp.int32)
+
+    def pooled(cache):
+        # [B, K, KV, D] as pools [KV, P, page, D] holding each row's keys at the pages its table names.
+        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
+        return pages[:, jnp.argsort(table.reshape(-1))]
 
     def draw(seed: int):
         query, key, value, _ = drawn(seed)
@@ -130,10 +145,40 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
 
     def ours(query, key, value):
         with generation.assumed("sm90"):
-            return attention_decode.attend(query, key, value, spans, interpret=True)
+            if table is None:
+                return attention_decode.attend(query, key, value, spans, interpret=True)
+            return attention_decode.attend(query, pooled(key), pooled(value), spans, interpret=True,
+                                           table=table)
 
     assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
-                    f"template decode past the fold's reach {call}", seeds=SEEDS)
+                    f"template decode past the fold's reach {call} {'dense' if page is None else page}",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("far", [False, True], ids=["no-rewalk", "a-row-rewalked"])
+@pytest.mark.parametrize("call", ["one-query", "verify-four"])
+def test_every_output_a_decode_steps_launches_declare_is_written_interpreted(call, far):
+    """Each launch of a decode step writes every output it declares on every path (NSNAN-2): its masked
+    rewalk, whose programs that walk nothing write nothing, rewalks into the plain launch's outputs in place
+    and declares none of its own, a merging walk's unsplit. Under JAX's NaN check (`jax.debug_nans`), which
+    the Mosaic interpreter's unwritten outputs (NaN) trip, a step whose rows need no rewalk and one whose
+    first row's query is 2^16 times a drawn one (past the fold's reach, rewalked natural) run op by op, so
+    the check reads each launch's outputs, their result bit for bit the unchecked run's."""
+    positions, heads, kv_heads = CALLS[call]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    if far:
+        query = query.at[0].multiply(2.0 ** 16)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    unchecked = np.asarray(ours(query, key, value))
+    with jax.debug_nans(new_val=True):
+        checked = np.asarray(ours(query, key, value))
+    assert checked.tobytes() == unchecked.tobytes()
 
 
 @INTERPRETS
@@ -258,20 +303,62 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
                     f"verify block of {drafts} through the route", seeds=SEEDS)
 
 
+def served_small_pages() -> tuple[int, ...]:
+    """The pages fewer than a key tile holds whose decode this GPU's family serves
+    (`attention_mosaic._pages_hold`): 16, 4 and 1 key where its loading warpgroup gathers a tile's rows
+    through the table (`Transport.gathers_rows`); 16 alone, a page of whole 8-row tiles each its own copy,
+    where it loads a block in pieces."""
+    family = bundles.of(generation.device_generation(), jnp.bfloat16)
+    return (16, 4, 1) if family.gathers_rows else (16,)
+
+
+def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
+    """A GPU cell (tests/test_gpu_attention.py): a decode step over a paged pool of `page` keys a page, fewer
+    than its key tile holds, compiled on this GPU, its tiles' rows gathered through the table by the loading
+    warpgroup's cp.async copies (`gathered.Ring`, row 4772), 32 query heads over 8 key heads over 4096 keys
+    in a shuffled table: on par with the reference path over the pool gathered dense (check 1)."""
+    keys, kv_heads = 4096, 8
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+    per_row = keys // page
+    table = jnp.asarray(np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+
+    def gathered(pool):
+        rows = pool[:, table]
+        return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(2, keys, kv_heads, pool.shape[-1])
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (2, 1, 32, 128), jnp.bfloat16)
+        pools = (jax.random.normal(stream, (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
+                 for stream in streams[1:])
+        return (query, *pools)
+
+    def ours(query, key_pool, value_pool):
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+
+    def reference(query, key_pool, value_pool):
+        return template.reference(query, gathered(key_pool), gathered(value_pool), spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"paged decode of {page}-key pages on a GPU",
+                    seeds=SEEDS)
+
+
 PAGE = 128
 """A paged cache's keys a page: whole key tiles of the derived decode launch's."""
 
 
 @INTERPRETS
-@pytest.mark.parametrize(("device", "page"), [("sm90", PAGE), ("sm90", 16), ("sm80", 16)])
+@pytest.mark.parametrize(("device", "page"),
+                         [("sm90", PAGE), ("sm90", 16), ("sm90", 1), ("sm80", 16), ("sm80", 4), ("sm80", 1)])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
 def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page, device):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
     tile, on par with the reference path over the cache gathered dense (check 1): pages of whole key tiles,
-    and pages of 16 keys, the docs' (docs/concepts/inference.md), several to a key tile, each loaded on its
-    own (`mosaic.Pieces`, row 3648), on an H100 and an A100 (each piece's cp.async copy staged at the
-    swizzle its copy tiles, `mosaic_sm80.CpAsync.walk`)."""
+    and pages of 16, 4 and 1 keys, the docs' (docs/concepts/inference.md), several to a key tile, its rows
+    gathered through the table a key at a time (`attention_mosaic_forward.paged_reads`, row 4772): an
+    H100's by its loading warpgroup's ring, an A100's by its one warpgroup's cp.async copies in its
+    pipeline's groups (`mosaic_sm80._gathered_walk`)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     per_row = KEYS // page
@@ -390,6 +477,27 @@ def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.
     totals.append(jnp.zeros_like(totals[0]))
     maximum, total = (jnp.transpose(jnp.stack(x, axis=1), (0, 3, 1, 2)) for x in (maxima, totals))
     return jnp.stack(outs, axis=1), maximum, total
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("page", [16, 4, 1])
+def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100(page):
+    """A decode step over a paged pool of `page` keys a page, fewer than its derived key tile holds, lowered
+    and compiled for an H100 (compile-only, `kernel_compile.lowered_for`): its key tiles' rows gathered
+    through the table by the loading warpgroup's cp.async copies (`gathered.Ring`, row 4772), whatever the
+    page, where pages under 8 keys derived no launch before."""
+    from kernel_compile import lowered_for
+
+    keys, kv_heads, width = 4096, 8, 128
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+    query = jax.ShapeDtypeStruct((2, 1, 32, width), jnp.bfloat16)
+    pool = jax.ShapeDtypeStruct((kv_heads, 2 * keys // page, page, width), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((2, keys // page), jnp.int32)
+
+    def decode(query, key_pool, value_pool, table):
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+
+    assert "mosaic_gpu" in lowered_for(decode, (query, pool, pool, table), "sm90").compile().as_text()
 
 
 @pytest.mark.parametrize("slices", [1, 3, 7])
