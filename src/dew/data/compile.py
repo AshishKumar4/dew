@@ -1408,7 +1408,8 @@ def _training_reader(
             topology={"elastic": True} if build.elastic else {
                 "shares": partition.count,
                 "share": partition.index,
-                "workers": _workers(pipeline, build.loading),
+                # A read in its inputs' order in any count of workers (`_Build.in_order`) names none.
+                **({} if build.in_order else {"workers": _workers(pipeline, build.loading)}),
                 "row_multiple": partition.row_multiple,
                 "cycle_lengths": [
                     stage.cycle_length for stage in _steps(pipeline) if isinstance(stage, Interleave)
