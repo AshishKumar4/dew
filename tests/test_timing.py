@@ -4,11 +4,12 @@ whose arm order reverses each round, beside the reference's A/A arm, writes a ro
 refuses a revision no node could fetch before it starts."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-from tool_support import git, load
+from tool_support import StandInSession, git, load
 
 TIMING = Path(__file__).resolve().parents[1] / "tools/timing.py"
 
@@ -163,4 +164,78 @@ def test_one_window_a_gpu_kind_is_a_timing_job_running_its_kinds_manifest(tmp_pa
     assert (a100["name"], a100["gpu"], a100["kind"], a100["ref"]) == ("W-a100", "a100", "timing", "abc")
     assert "$SESSION/extra/a100.json" in a100["run"] and "$SESSION/extra/h100.json" in h100["run"]
     assert h100["minutes"] > a100["minutes"] >= 15
+
+
+CALLED = '''import os
+import time
+
+import jax.numpy as jnp
+
+
+def built(cell, implementation):
+    pick = {"sin": jnp.sin, "cos": jnp.cos}[implementation]
+
+    def call(x):
+        with open(os.environ["CALLS"], "a") as calls:
+            calls.write(f"{time.time()}\\n")
+        return pick(x)
+
+    return call, (lambda index: (jnp.full((cell["size"],), float(index)),))
+'''
+"""A builder whose every call, a build's and a round's, says when it was made."""
+
+
+def windowed_run(tmp_path: Path, case_extra: dict, session: StandInSession) -> list[float]:
+    """A one-case window run whole in a scratch repository, as a node's session runs a timing job: its
+    $SESSION and $OUT are `session`'s, and a stand-in `ncu` on its PATH says when it ran and whether the window
+    was open (`$PROFILED`). When each call of the case's builder was made, a build's and a round's."""
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    git(repo, "init", "-q")
+    (repo / "src/cells.py").write_text(CALLED)
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "cells")
+    stand_ins = tmp_path / "bin"
+    stand_ins.mkdir()
+    (stand_ins / "ncu").write_text(
+        '#!/bin/sh\necho "$(date +%s.%N) $([ -e "$OUT/window.granted" ] && echo open || echo shut)" '
+        '>> "$PROFILED"\n')
+    (stand_ins / "ncu").chmod(0o755)
+    manifest = {"clock": "wall", "cases": [{
+        "name": "cells", "builder": "cells:built", "cells": [{"size": 8}], "rounds": 2, "repeats": 2,
+        "arms": [{"name": "sin", "tree": None, "implementation": "sin"},
+                 {"name": "cos", "tree": None, "implementation": "cos"}], **case_extra}]}
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    environment = {**os.environ, **session.environment, "CALLS": str(tmp_path / "calls"),
+                   "PROFILED": str(tmp_path / "profiled"),
+                   "PATH": f"{stand_ins}{os.pathsep}{os.environ['PATH']}"}
+    subprocess.run([sys.executable, str(TIMING), "run", str(tmp_path / "manifest.json"), "--out",
+                    str(tmp_path / "out")], cwd=repo, env=environment, check=True)
+    return [float(line) for line in (tmp_path / "calls").read_text().split()]
+
+
+def test_a_window_asks_its_session_for_one_window_around_its_rounds_and_builds_outside_it(tmp_path):
+    """A window run as a node's session runs a timing job builds every arm (each build calls its builder once,
+    the reference's A/A arm's among them) before it asks for its window, and times every round (a warm-up
+    round and two, two calls each, of three arms) inside the one window it asks for, which it has ended by
+    the time it writes its verdict."""
+    with StandInSession(tmp_path) as session:
+        calls = windowed_run(tmp_path, {}, session)
+    assert session.asked == [""] and len(session.granted) == len(session.released) == 1
+    opened, closed = session.granted[0], session.released[0]
+    assert [call < opened for call in calls] == [True] * 3 + [False] * 18
+    assert all(opened <= call <= closed for call in calls[3:])
+    assert (tmp_path / "out/summary.json").is_file() and not (session.out / "window").exists()
+
+
+def test_a_cases_profiles_run_inside_one_more_window(tmp_path):
+    """A case that asks for profiles has them run (Nsight Compute, a stand-in here, a process an arm) after
+    its rounds, all inside a window of their own: the second window the run asks for."""
+    with StandInSession(tmp_path) as session:
+        calls = windowed_run(tmp_path, {"profile": {"kernel": "sin"}}, session)
+    assert session.asked == ["", ""] and len(session.granted) == len(session.released) == 2
+    assert all(session.granted[0] <= call <= session.released[0] for call in calls[3:])
+    profiled = [line.split() for line in (tmp_path / "profiled").read_text().splitlines()]
+    assert [state for _, state in profiled] == ["open", "open"]
+    assert all(session.granted[1] <= float(at) <= session.released[1] for at, _ in profiled)
 
