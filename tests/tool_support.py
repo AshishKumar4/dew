@@ -106,8 +106,9 @@ class StandInSession:
 
     @property
     def environment(self) -> dict[str, str]:
-        """What a job's process is given of its session."""
-        return {"SESSION": str(self.session), "OUT": str(self.out)}
+        """What a job's process is given of its session, as a session gives a measuring job it runs packed,
+        which may ask for windows (`DEW_WINDOW`)."""
+        return {"SESSION": str(self.session), "OUT": str(self.out), "DEW_WINDOW": "1"}
 
     def __enter__(self) -> "StandInSession":
         self.thread.start()

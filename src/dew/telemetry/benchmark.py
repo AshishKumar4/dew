@@ -307,13 +307,14 @@ def exclusive_window(cores: Iterable[int] | None = None) -> Iterator[None]:
     exclusive, locks the GPUs' clocks, pins the job's processes to `cores` and every other process it runs off
     them, and writes `$OUT/window.granted`. This waits for that file and synchronizes the device before it
     runs the block. On exit it synchronizes, removes the request, wakes the session and waits until the
-    session has put all of it back and removed its grant. A session that cannot give the window (a job that
-    holds its GPU for its whole run, cores that are no CPUs of the node or all of them) refuses it, and this
-    raises `WindowRefused`. Without `$SESSION` (a laptop, CI) it does nothing."""
-    session = os.environ.get("SESSION")
-    if session is None:
+    session has put all of it back and removed its grant. A session that cannot give the window (cores that
+    are no CPUs of the node or all of them) refuses it, and this raises `WindowRefused`. It asks only where
+    the session says the job runs packed and may (`DEW_WINDOW`); a job that holds its GPU for its whole run,
+    or runs off a node (a laptop, CI), has the block to itself already, and this does nothing."""
+    if os.environ.get("DEW_WINDOW") != "1":
         yield
         return
+    session = os.environ["SESSION"]
     out = Path(os.environ["OUT"])
     request, granted, refused = out / "window", out / "window.granted", out / "window.refused"
     with contextlib.closing(_Watch(out)) as watch:

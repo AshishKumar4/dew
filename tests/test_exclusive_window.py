@@ -1,6 +1,7 @@
 """`dew.telemetry.benchmark.exclusive_window`: a job's measured region held alone on its node's GPUs by the
 node's session, which a thread of the test plays (`tool_support.StandInSession`: the job's `$SESSION/wake` and
-`$OUT`); a process with no session (a laptop, CI) waits for nothing."""
+`$OUT`, and `DEW_WINDOW`, which a session gives a measuring job it runs packed); any other process waits for
+nothing."""
 
 import threading
 
@@ -93,9 +94,18 @@ def test_a_window_the_session_refuses_raises_and_its_body_never_runs(tmp_path, m
     assert ran == [False] and not (session.out / "window.refused").exists()
 
 
-def test_without_a_session_a_window_waits_for_nothing_and_writes_nothing(tmp_path, monkeypatch):
-    monkeypatch.delenv("SESSION", raising=False)
-    monkeypatch.setenv("OUT", str(tmp_path))
+@pytest.mark.parametrize("session", [False, True])
+def test_a_job_its_session_runs_alone_or_none_runs_waits_for_nothing_and_writes_nothing(
+        tmp_path, monkeypatch, session):
+    """A job its session does not say runs packed (`DEW_WINDOW`), one holding its GPU for its whole run or run
+    by a session older than windows, as a process with no session (a laptop, CI), has its block to itself
+    already."""
+    monkeypatch.delenv("DEW_WINDOW", raising=False)
+    if session:
+        monkeypatch.setenv("SESSION", str(tmp_path / "session"))
+    else:
+        monkeypatch.delenv("SESSION", raising=False)
+    monkeypatch.setenv("OUT", str(tmp_path / "out"))
     with benchmark.exclusive_window(cores=(0,)):
         inside = True
     assert inside and not list(tmp_path.iterdir())
