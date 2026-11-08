@@ -35,7 +35,15 @@ from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader, replayed
-from dew.decision import Choice, DecisionObjective, Example, JointLayout, JointSchemaHead
+from dew.decision import (
+    Choice,
+    DecisionInputs,
+    DecisionModel,
+    DecisionObjective,
+    Example,
+    JointLayout,
+    JointSchemaHead,
+)
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
@@ -717,7 +725,7 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
     """The joint schema head's lexical prior gathers the output table's rows: the head's matrix
     rows times each token's logit gain, which contracted with the final states give Dory's logits.
     Over the release's own tokenizer it trains a step that moves the head and the backbone, and
-    the saved run answers as the live one does."""
+    the saved run answers as the live one does (check 1: the two tasks are two programs)."""
     loaded = load(max_seq_len=1024)
 
     def contracted(ids):
@@ -738,11 +746,39 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
         before, after = started['params'][part], state.variables['params'][part]
         moved = jax.tree.map(lambda old, new: not np.array_equal(old, new), before, after)
         assert any(jax.tree.leaves(moved)), part
-    asked = {'team': INTENT}
-    live = objective.pipeline(state)('charged twice', asked)
-    reloaded = objective.saved_task.from_run(str(tmp_path))('charged twice', asked)
-    for answer, again in zip(live.values(), reloaded.values(), strict=True):
-        np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+    live = objective.pipeline(state)
+    reloaded = objective.saved_task.from_run(str(tmp_path))
+    # The two tasks compile their own programs, placed as each one's weights are: their options' logits
+    # are held by check 1, over drawn states, against the live task in float64.
+    words = sorted({word for example in EXAMPLES for word in example.state.split()})
+    wide = {}
+
+    def scored(task, seed):
+        """The options' logits of a state of three words drawn from the examples', as a call lays it out."""
+        state = ' '.join(np.random.default_rng([0xD07, int(seed)]).choice(words, 3))
+        inputs = DecisionInputs.collate(task.rows([(state, {'team': INTENT})])[0], task.specials.pad)
+        logits = wide.setdefault(id(task), jax.jit(task.model.logits))(task.variables, inputs)
+        return np.asarray(logits)[np.asarray(inputs.options)]
+
+    @as_given
+    def truth(seed):
+        with jax.enable_x64(new_val=True):
+            if 'task' not in wide:
+                model = live.model
+                wide['task'] = dataclasses.replace(
+                    live, model=DecisionModel(model.backbone.clone(dtype=jnp.float64),
+                                              model.head.clone(dtype=jnp.float64)),
+                    variables=widened(live.variables))
+            return scored(wide['task'], seed)
+
+    assert_as_exact(as_given(lambda seed: scored(reloaded, seed)), as_given(lambda seed: scored(live, seed)),
+                    lambda seed: (np.int64(seed),), "the saved run's answers", seeds=SAVED_SEEDS,
+                    truth_fn=truth)
+
+
+SAVED_SEEDS = 128
+"""Check 1's declared seeds for the saved run's answers against the live task's, sized by `seeds_for`
+paired on armada: the two tasks read one trained state's weights."""
 
 
 DORY_FIELDS = ('vocab_size', 'hidden_size', 'num_hidden_layers', 'intermediate_size', 'num_attention_heads',
