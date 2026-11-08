@@ -421,9 +421,9 @@ class Loading:
 
     A training read whose chain names no loading reads with automatic workers
     (`workers="auto"`, `dew.data.compile.compile`), which `resolved` sizes from
-    what it measures: as many workers as the Python a batch takes over the batches
-    the run reads, its stated steps, pays the starts of, at most as many as the
-    host's CPUs and memory hold, else none. In the training process the records' Python holds
+    what it measures: workers where the Python a batch takes over the batches the
+    run reads, its stated steps, pays for their starts, as many as cost the run
+    least, at most as many as the host's CPUs and memory hold, else none. In the training process the records' Python holds
     the interpreter the step's dispatch needs: a decision run's encoding held it
     59% of the run on a GH200, and four workers took its step from 20.9 to
     10.5 ms (row 4862). Workers change no record and no order: a global order's
@@ -474,12 +474,13 @@ class Loading:
         Workers take the read's Python off the training process, whose step's dispatch waits on the
         interpreter it holds (a decision run's encoding: 20.9 against 10.5 ms a step in four workers on
         a GH200, row 4862), and each costs a process's start first, its imports, which Grain starts one
-        after another. As many start as pay for themselves over the run: the mean time a sampled batch
-        takes to make, read in turn with no thread reading ahead, each after the first, which opens the
-        read, times the `batches` the run reads (its planned steps), over a worker's start there
-        (`Host.started`), at most as many as the CPUs and the memory hold. Sized by the CPUs alone, a
-        decision run of 1,500 steps on a GH200 started 64 workers and took 168 s against 100 s in the
-        process. A short run, one whose batches take no Python to speak of, or one whose length nothing
+        after another. They start where they pay for themselves over the run, as many as cost the run
+        least where it waits on them: the square root of the mean time a sampled batch takes to make,
+        read in turn with no thread reading ahead, each after the first, which opens the read, times the
+        `batches` the run reads (its planned steps), over a worker's start there (`Host.started`), at most
+        as many as the CPUs and the memory hold. On a GH200 a decision run of 1,500 steps, 15 ms of
+        Python a batch, took 100 s in the process at 20 ms a step; 64 workers, the CPUs', 168 s at 12.4 ms;
+        13, as many as its Python pays the starts of, 136 s at 11.1 ms. A short run, one whose batches take no Python to speak of, or one whose length nothing
         states (None), which no measure shows they pay for, reads in the process."""
         if self.workers != "auto":
             return self
@@ -506,8 +507,9 @@ class Loading:
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
         workers = 0 if batches is None else max(0, min(cpus, budget // held))
         if workers and batches is not None and (started := host.started) > 0:
-            # The workers whose starts, one after another, the Python of the run's batches pays for.
-            workers = min(workers, int(python * batches // started))
+            # W workers started one after another and then reading P seconds of Python a batch over B
+            # batches cost W * start + B * P / W where the run waits on them, least at W = sqrt(B * P / start).
+            workers = min(workers, math.isqrt(int(python * batches // started)))
         if not workers:
             _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each, on %d "
                       "CPUs", batches, python * 1e3, host.cpus)

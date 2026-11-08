@@ -108,10 +108,11 @@ class _Filled:
 def test_automatic_loading_pays_a_step_that_makes_several_batches_at_once_in_their_mean():
     """Automatic loading weighs the Python a batch takes as the run pays it, over the sampled batches after
     the first: where a step makes four batches' rows at once, 40 ms every fourth batch is 10 ms a batch,
-    though three batches of four take none, and it starts as many workers as that pays the starts of, one
-    after another, at most the CPUs (row 4862: a decision run's packer filled four batches in one of 115
-    ms and served three in about 1 ms each, and the read stayed in the training process; sized by its
-    CPUs, a 1,500-step run started 64 workers and took 168 s against 100 s in the process)."""
+    though three batches of four take none, and it starts as many workers as cost the run least, the
+    square root of the starts that Python pays for, at most the CPUs (row 4862: a decision run's packer
+    filled four batches in one of 115 ms and served three in about 1 ms each, and the read stayed in the
+    training process; sized by its CPUs, a 1,500-step run started 64 workers and took 168 s against 100 s
+    in the process)."""
     from dew.data.dataset import Host
 
     rows = grain.MapDataset.source([{"x": np.zeros(4, np.float32)}] * 64).map_with_index(_Filled())
@@ -122,9 +123,9 @@ def test_automatic_loading_pays_a_step_that_makes_several_batches_at_once_in_the
         sampled = rows.to_iter_dataset(grain.ReadOptions(num_threads=0, prefetch_buffer_size=0))
         return auto.resolved(sampled, reads=1, batches=batches).workers
 
-    # At least 10 ms a batch: a thousand pay for the four CPUs' workers, 310 for three starts of a second
-    # (up to 12.9 ms a batch), 50 for none.
-    assert (resolved(1000), resolved(310), resolved(50)) == (4, 3, 0)
+    # At least 10 ms a batch over starts of a second: 2,500 batches cost least in five workers, which the
+    # four CPUs cap, 500 in two (up to 17.9 ms a batch), and 50 pay for none.
+    assert (resolved(2500), resolved(500), resolved(50)) == (4, 2, 0)
 
 
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
