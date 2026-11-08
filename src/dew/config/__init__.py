@@ -689,11 +689,14 @@ class TrainerConfig:
     """
 
     def accumulating(self, dataset: Loader) -> Self:
-        """This config with the accumulation its token budget sets over `dataset`'s token batches:
-        `update_tokens` a whole number of them. Raises ValueError for a budget over data batched in
-        rows, one no whole number of them, or an accumulation set otherwise."""
+        """This config with the accumulation its token budget sets over `dataset`'s token batches, every
+        phase's alike (`Loader.token_batches`): `update_tokens` a whole number of them. Raises ValueError for
+        rows, no whole number, phases of other token batches or an accumulation set otherwise."""
         if self.update_tokens is None:
             return self
+        if len(set(dataset.token_batches)) > 1:
+            raise ValueError(f"--trainer.update-tokens sets one accumulation; the phases batch "
+                             f"{list(dataset.token_batches)} tokens: batch alike or set the accumulation")
         if dataset.batch_tokens is None or self.update_tokens % dataset.batch_tokens:
             raise ValueError(f"--trainer.update-tokens {self.update_tokens} is no whole number of the data's "
                              f"token batches ({dataset.batch_tokens}); batch the data by tokens "
