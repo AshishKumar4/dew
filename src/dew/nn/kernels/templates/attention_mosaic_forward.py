@@ -712,7 +712,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                         training=False, interpret=interpret, peaks=True, counted=counted,
                         magnitudes=magnitudes)
         if magnitudes is not None:
-            found = (*found[:2], _shifts(algebra.Reach(*found[2:]), hooked))
+            found = (*found[:2], _shifts(form, algebra.Reach(*found[2:]), found[0], hooked))
         # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`, row
         # 2526), each block's split sums side by side, their rows alike.
         launched = [_launch(q, k, values, at_spans, held, None, spec=form, hooks=hooks, tiles=at,
@@ -750,14 +750,12 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             anchors[:, :, :queries], split)
 
 
-def _shifts(reach: algebra.Reach, hooked: _Hooked) -> jax.Array:
-    """Each row's shift (`algebra.row_shift`) from its keys' `reach` (a peak walk's) and its initial state
-    (`hooked.initial`, a resumed partial's sums or a sink's none), which its sums start from: one more term
-    of at most its sums' largest magnitude (its factor to the walk's maximum at most 1)."""
+def _shifts(spec: algebra.Forward, reach: algebra.Reach, peak: jax.Array, hooked: _Hooked) -> jax.Array:
+    """Each row's shift (`algebra.row_shift`) from its keys' `reach` at their maximum `peak` (a peak walk's)
+    and its initial state (`hooked.initial`, a resumed partial's sums or a sink's none), which its sums start
+    from (`algebra.started_reach`)."""
     if hooked.initial is not None:
-        acc = hooked.initial[2]
-        term = jnp.maximum(reach.term, jnp.log2(jnp.max(jnp.abs(acc), axis=-1)))
-        reach = algebra.Reach(term, reach.seen + 1)
+        reach = algebra.started_reach(spec, reach, peak, algebra.resumed(spec, *hooked.initial))
     return algebra.row_shift(reach, 1.0 if hooked.drop is None else hooked.drop.bound)
 
 
