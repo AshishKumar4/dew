@@ -1235,6 +1235,16 @@ def reach_step(spec: Forward, state: Reach, peak: jax.Array, moved: jax.Array, l
     return Reach(jnp.maximum(earlier, term), state.seen + seen.astype(jnp.float32).sum(axis=-1))
 
 
+def started_reach(spec: Forward, reach: Reach, peak: jax.Array, start: Partial) -> Reach:
+    """`reach` at its keys' maximum `peak` joined by the state a walk starts from (`resumed`: its sums, which
+    `anchored` takes to the walk's maximum): every term at that maximum, the larger of the start's and the
+    keys', the start's one more, its sums' largest magnitude at its factor (`carried`)."""
+    m = jnp.maximum(start.m, peak)
+    keys = jnp.where(peak > -jnp.inf, reach.term + spec.naturalized(peak - m) * LOG2E, -jnp.inf)
+    own = jnp.log2(jnp.max(jnp.abs(start.acc), axis=-1)) + spec.naturalized(start.m - m) * LOG2E
+    return Reach(jnp.maximum(keys, own), reach.seen + 1)
+
+
 def row_shift(reach: Reach, bound: float = 1.0) -> jax.Array:
     """The shift a row's anchored walk takes (`Argmax.shift`), `binades_past` its weighted values' bound
     (`Reach` at the row's maximum): each at most its largest term, so their sum at most that many terms as
