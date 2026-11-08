@@ -2081,9 +2081,9 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
                 file, group = parts[fits]
-                # A group cut by the tier's own GPU seconds (DEW_SPLIT_DURATIONS, split.py) is no group any
-                # record's key holds: it reads no cached row, as it writes none, so no earlier cut's row stands for
-                # it beside groups cut afresh (review of b3bcbe0fe).
+                # A group cut by the tier's own GPU seconds (DEW_SPLIT_DURATIONS, split.py) is no group
+                # any record's key holds: it reads no cached row, as it writes none, so no earlier cut's row
+                # stands for it beside groups cut afresh (review of b3bcbe0fe).
                 policy = "off" if group and os.environ.get("DEW_SPLIT_DURATIONS") else cache
                 running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, policy,
                                     session.GRACE, common, environ, None, network)] = fits
