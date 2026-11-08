@@ -110,13 +110,16 @@ def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
-           model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1) -> Callable:
+           model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
+           ahead: Callable | None = None, settled: tuple[int, ...] = ()) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
     (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), its `cost`
-    the hardware's work and `model_flops` the model's share of it (`checked`)."""
+    the hardware's work and `model_flops` the model's share of it, and its `settled` operands those its
+    programs read `ahead` of their wait (`dependent`, `checked`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-    built = launches.kernel(dependent(entry, interpret), name=name or family, out_type=out_type, grid=grid,
+    launched = dependent(entry, interpret, ahead=ahead, settled=settled, scratch=len(scratch))
+    built = launches.kernel(launched, name=name or family, out_type=out_type, grid=grid,
                             grid_names=grid_names, num_threads=warpgroups, thread_name="wg",
                             scratch_types=scratch,
                             compiler_params=compiler_params(approx_math=approx_math, resident=resident,
@@ -124,10 +127,11 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                             interpret=interpreted(interpret),
                             kernel_name=report.named(name), cost_estimate=cost, **clustered)
 
-    return checked(built, name or family, resident, model_flops)
+    return checked(built, name or family, resident, model_flops, settled)
 
 
-def dependent(entry: Callable, interpret) -> Callable:
+def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, settled: tuple[int, ...] = (),
+              scratch: int = 0) -> Callable:
     """`entry` as a dependent launch (programmatic dependent launch, PTX's `griddepcontrol`): it waits for the
     launch before it in its stream to finish and its writes to land (`wait`) before any memory access of its
     own, so it is ordered against any launch as without it, and once its own work is done it lets the next
@@ -139,16 +143,38 @@ def dependent(entry: Callable, interpret) -> Callable:
     b2b872c91; CUTLASS triggers after its mainloop for the same reason). Mosaic marks the launch
     (`mosaic_gpu.uses_pdl`) and the runtime launches it with programmatic stream serialization. Interpreted,
     or on a GPU without grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on),
-    `entry` as it is."""
-    if interpreted(interpret) or not generation.gpu_target().architecture.dependent_launch:
+    `entry` as it is.
+
+    With `ahead`, a program first runs it, once, on the refs of its `settled` operands (indices among the
+    launch's operands) and its `scratch` refs (the body's last), before its wait, and then `entry` on every
+    ref and what `ahead` returned: the reads of operands no launch before it writes (a decode step's
+    weights, loaded once a run) issued under the previous launch's tail, which its other operands' and its
+    outputs' refs, not given to `ahead`, cannot be. The launch declares `settled` on its call (`SETTLED`),
+    and the compile point refuses a program where one is not an input it holds whole
+    (`lowered.unsettled`)."""
+    waits = not interpreted(interpret) and generation.gpu_target().architecture.dependent_launch
+    if ahead is None and not waits:
         return entry
 
     def body(*refs):
-        plgpu.griddepcontrol_wait()
-        entry(*refs)
-        plgpu.griddepcontrol_launch_dependents()
+        own = refs[len(refs) - scratch:]
+        held = None if ahead is None else ahead(*(refs[index] for index in settled), *own)
+        if waits:
+            plgpu.griddepcontrol_wait()
+        if ahead is None:
+            entry(*refs)
+        else:
+            entry(*refs, held)
+        if waits:
+            plgpu.griddepcontrol_launch_dependents()
 
     return body
+
+
+SETTLED = "dew_settled"
+"""The frontend attribute a launch's call declares the operands its programs read ahead of their wait under
+(`dependent`'s `settled`), their indices joined by commas: each must be an input of the program that no
+operation of it produces (`lowered.unsettled`)."""
 
 
 _RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
@@ -156,17 +182,22 @@ _RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", defa
 raise their registers to that residency's share (`roles`)."""
 
 
-def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None) -> Callable:
+def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None,
+            settled: tuple[int, ...] = ()) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
     residency (`_RESIDENT`) under the name `kernel`: a launch built once for every call of its facts checks
     each call's own; and
     refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
     `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's share of the work
     its cost states (the rest its own recomputation), where given, as its custom call's frontend attribute
-    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads."""
+    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads, and the operands it reads ahead of its
+    wait, `settled` (`SETTLED`), which the compile point checks."""
+    stated = {**({} if model_flops is None else {MODEL_FLOPS: str(model_flops)}),
+              **({SETTLED: ",".join(map(str, settled))} if settled else {})}
+
     def launch(*operands):
-        if model_flops is not None:
-            with set_xla_metadata(**{MODEL_FLOPS: str(model_flops)}):
+        if stated:
+            with set_xla_metadata(**stated):
                 return checked_launch(*operands)
         return checked_launch(*operands)
 
