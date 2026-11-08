@@ -37,3 +37,21 @@ def test_fewer_seeds_than_check_one_judges_are_inconclusive_whatever_their_ratio
 
     with pytest.raises(parity.Inconclusive):
         parity.judge(same, parity.FEWEST_SEEDS - 1, "too few")
+
+
+def test_a_site_its_sizing_cannot_resolve_is_inconclusive():
+    """A site whose arms' errors swing by orders of magnitude from draw to draw, apart, resolves no count
+    within the most seeds its sizing may take: Inconclusive, which a caller trying candidates in turn
+    reads as the gate's own finding."""
+    def swinging(seed: int):
+        rng = np.random.default_rng([1305, 7, seed])
+        truth = rng.standard_normal(256)
+        ours, theirs = (truth + np.exp(3 * rng.standard_normal()) * 1e-6 * rng.standard_normal(256)
+                        for _ in range(2))
+        return {"x": ours.astype(np.float32)}, {"x": theirs.astype(np.float32)}, {"x": truth}
+
+    with pytest.raises(parity.Inconclusive):
+        parity.seeds_for(swinging, "swinging", most=parity.FEWEST_SEEDS)
+    # A recording that holds no seeds resolves no count either.
+    with pytest.raises(parity.Inconclusive):
+        parity.seeds_resolving(np.empty((0, 1)), ["x"], "nothing recorded")
