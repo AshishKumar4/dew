@@ -33,6 +33,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
 import tempfile
 import warnings
@@ -124,6 +125,8 @@ _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # exact than the source; a computation Dew does not share, in the forward or in a backward the forward
 # does not show (a hook, a custom autograd function), sets Dew as far from the twin as it moves a value.
 
+
+_log = logging.getLogger(__name__)
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
 """The `auto_map` entries a remote source's verification builds from: its config and its causal LM."""
@@ -983,6 +986,11 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
     recorded = None if key is None else _recorded(key)
     if recorded is not None:
         return replace(recorded, source=held)
+    _log.warning("tier 2: model_type %r is no registered family; verifying which convention computes it "
+                 "against its %s code by check 1 on a shrunken instance, its forward and its backward over "
+                 "drawn inputs: seconds for most types, minutes for a recurrent hybrid's backward on a "
+                 "CPU, done once a type%s.", model_type, 'remote' if source.remote is not None else
+                 "transformers'", ' and recorded' if key is not None else ' (its local code at each load)')
     verdict = _verified(hf_config, source)
     if isinstance(verdict, VerifiedMapping):
         if key is not None:

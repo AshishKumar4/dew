@@ -392,3 +392,24 @@ def test_a_change_to_the_twins_package_verifies_a_mapping_again(tmp_path):
     precision = tmp_path / "_dew_torch" / "precision.py"
     precision.write_text(precision.read_text() + "\n# edited\n")
     assert digest() != before
+
+
+def test_a_first_verification_says_it_runs_and_a_recorded_one_does_not(tmp_path, monkeypatch, caplog):
+    """Verifying a type no registered family reads runs the source and Dew over check 1's draws, which
+    takes minutes for some types on a CPU: the load says so before it starts, once a type, its record
+    read silently by the next load."""
+    import logging
+
+    from dew.interop.verify import verify_mapping
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    source = tmp_path / "source"
+    write_tiny(source, "cwm", sliding_window=4)
+    config = json.loads((source / "config.json").read_text())
+    with caplog.at_level(logging.WARNING, logger="dew.interop.verify"):
+        verify_mapping(config)
+    assert any("tier 2: model_type 'cwm'" in record.getMessage() for record in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="dew.interop.verify"):
+        verify_mapping(config)
+    assert not [record for record in caplog.records if "tier 2: model_type" in record.getMessage()]
