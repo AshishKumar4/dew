@@ -2233,10 +2233,10 @@ def _forward_kernels(op, ba, config) -> dict:
 
 DECODE_GATE = [(generation_name, width, stored) for generation_name in GATED for width in (64, 128)
                for stored in ("bfloat16", "int8", "float32")
-               if stored != "float32" or bundles.of(generation_name, jnp.bfloat16).pieces_of_views]
+               if stored != "float32" or bundles.of(generation_name, jnp.bfloat16).copies_in_pieces]
 """The decode gate's cases: each GPU whose family the mainloop qualifies, both widths, each cache; a float32
-query's parts where its family loads a block's pieces of any view (`mosaic.Transport.pieces_of_views`: not
-cp.async's, where an fp32 decode takes XLA by legality)."""
+query's parts where its family loads a block in pieces (`mosaic.Transport.copies_in_pieces`: not cp.async's,
+where an fp32 decode takes XLA by legality)."""
 
 
 @COMPILES_ON_CPU

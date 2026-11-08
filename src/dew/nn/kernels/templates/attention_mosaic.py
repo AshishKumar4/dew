@@ -633,10 +633,10 @@ class MosaicForward(_Mainloop[Tiles]):
             # 64: 48 bytes on two consumers, 24 on one): the Pallas-Triton mainloop's.
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
-        if self.parts > 1 and (family.feeds_itself or not family.pieces_of_views):
+        if self.parts > 1 and (family.feeds_itself or not family.copies_in_pieces):
             # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
-            # neither a consumer's own ring nor cp.async's pipeline, whose pieces are a table's runs
-            # (`mosaic.Transport.pieces_of_views`), does.
+            # neither a consumer's own ring nor cp.async's pipeline (`mosaic.Transport.copies_in_pieces`)
+            # does.
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
@@ -785,14 +785,9 @@ def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tupl
 
 def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
     """Whether a paged call's key tiles of `tile` keys lie in its pages of `page`: whole tiles a page, each
-    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, its rows gathered
-    through the table where `family` gathers rows (`attention_mosaic_forward.paged_reads`), any page, else
-    each page its own copy into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where it
-    loads a step's block in pieces (`mosaic.Transport.copies_in_pieces`)."""
-    if page % tile == 0:
-        return True
-    return tile % page == 0 and (family.gathers_rows
-                                 or (page % mosaic.TILE_ROWS == 0 and family.copies_in_pieces))
+    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, any page, its rows
+    gathered through the table where `family` gathers rows (`attention_mosaic_forward.paged_reads`)."""
+    return page % tile == 0 or (tile % page == 0 and family.gathers_rows)
 
 
 def streams(query, target: generation.GpuTarget) -> bool:

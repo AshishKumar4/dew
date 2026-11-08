@@ -306,10 +306,9 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
 def served_small_pages() -> tuple[int, ...]:
     """The pages fewer than a key tile holds whose decode this GPU's family serves
     (`attention_mosaic._pages_hold`): 16, 4 and 1 key where its loading warpgroup gathers a tile's rows
-    through the table (`Transport.gathers_rows`); 16 alone, a page of whole 8-row tiles each its own copy,
-    where it loads a block in pieces."""
+    through the table (`Transport.gathers_rows`), none where it does not."""
     family = bundles.of(generation.device_generation(), jnp.bfloat16)
-    return (16, 4, 1) if family.gathers_rows else (16,)
+    return (16, 4, 1) if family.gathers_rows else ()
 
 
 def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
@@ -389,11 +388,12 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
 
 
 QUANTIZED = [(device, page, stored) for stored in ("int8", "float8_e4m3fn")
-             for device, page in (("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 128))
+             for device, page in (("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 16),
+                                  ("sm80", 128))
              if stored == "int8" or device == "sm90"]
-"""The quantized decode's devices, layouts and codes: dense, and pages of 16 keys several to a key tile on an
-H100 (an A100's copies load a step's tile whole, `Transport.copies_in_pieces`), of whole key tiles on an
-A100; FP8 codes where the device converts them (`mosaic.converts`, sm_89 on)."""
+"""The quantized decode's devices, layouts and codes: dense, pages of 16 keys several to a key tile, their
+rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; FP8 codes where the device
+converts them (`mosaic.converts`, sm_89 on)."""
 
 
 @INTERPRETS
