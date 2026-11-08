@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import armada_task, cached, cached_checkout, commit, interpreter, loaded, written
+from armada_support import apart, armada_task, cached, cached_checkout, commit, interpreter, loaded, written
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -786,6 +786,44 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
 
 
+def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their_own(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A GPU tier's long file runs as CI's groups (`<file>#G/N`), each a task of the lane that cuts the
+    tests the file's collection here finds by the seconds the tier's GPUs took them
+    (DEW_SPLIT_DURATIONS), a test they never timed weighing their mean: so each test runs exactly once
+    over the groups, one added since and one renamed since among them, and each group's row holds its
+    own tests' cases (audit, 2026-11-08: the tier named the tests an earlier tier ran, so a new one
+    never ran, and a test named apart read "no evidence ran")."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    names = ("a", "b", "c", "renamed", "added")
+    (tmp_path / "tests/test_long.py").write_text("".join(
+        f"def test_{name}():\n    with open('ran-{name}', 'a') as ran:\n        ran.write('1')\n"
+        for name in names))
+    # The tier's GPU seconds of the tests it ran before: `renamed` was `old`, and `added` is new.
+    weights = tmp_path / "gpu-seconds.json"
+    weights.write_text(json.dumps({f"tests/test_long.py::test_{name}": 30.0
+                                   for name in ("a", "b", "c", "old")}))
+    monkeypatch.setenv("DEW_SPLIT_DURATIONS", str(weights))
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    groups = ["tests/test_long.py#1/2", "tests/test_long.py#2/2"]
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert sorted(rows) == [f"3.12:{group}" for group in groups]
+    assert all(row["exitCode"] == 0 for row in rows.values()), rows
+    assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "1")
+    held = [set(row["tests"]) for row in rows.values()]
+    assert held[0] and held[1] and not held[0] & held[1]
+    assert held[0] | held[1] == {f"tests/test_long.py::test_{name}" for name in names}
+    # Cut by other seconds, the groups run again, each test once more: no row an earlier cut left stands
+    # for one.
+    weights.write_text(json.dumps({"tests/test_long.py::test_a": 300.0}))
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
+
+
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
     """`coverage items` runs the floor's tasks with the test cache off, each writing its data among
     its artifacts; `coverage report` combines them, so a branch one task took and its other branch
@@ -971,6 +1009,46 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     armada_task(ci, monkeypatch, out, census=True)
     assert (tmp_path / "seen").read_text() == "1-1"
     assert stored == kept
+
+
+def test_cis_tools_run_inside_a_recalled_task_read_and_write_none_of_its_progress(tmp_path, monkeypatch,
+                                                                                    cache_worker):
+    """CI's tools these tests run inside an armada task that was itself recalled (its ARMADA_RESUME
+    naming a test its attempt passed, and its ARMADA_ARTIFACTS) set none of their tests aside by it and
+    write none of theirs into it: their task is their own (test_armada_reuse's kept entries read red on a
+    recalled attempt, its 303 planned rows resumed and none recorded)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    passed = json.dumps({"node": "tests/test_resumed.py::test_first", "seconds": 0.001}) + "\n"
+    (outer / "progress.jsonl").write_text(passed)
+    monkeypatch.setenv("ARMADA_RESUME", str(outer))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(outer))
+    ci = loaded(tmp_path, monkeypatch)
+    (tmp_path / "tests/test_resumed.py").write_text(
+        "from pathlib import Path\n"
+        "def test_first():\n"
+        "    with Path('ran').open('a') as ran: ran.write('first')\n")
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    [row] = armada_task(ci, monkeypatch, tmp_path / "verdict.json", policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "ran").read_text() == "first"
+    assert (outer / "progress.jsonl").read_text() == passed
+
+
+def test_a_tasks_progress_keeps_a_test_that_changed_the_environment_naming_its_artifacts(tmp_path):
+    """A task's progress is kept where its session started naming it (ARMADA_ARTIFACTS), whatever a test
+    changes as it runs: one that clears it, as `loaded` does for the CI tools it runs apart, is still the
+    task's progress."""
+    (tmp_path / "test_clearing.py").write_text(
+        "def test_clears(monkeypatch):\n    monkeypatch.delenv('ARMADA_ARTIFACTS')\n")
+    subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "progress",
+                    "test_clearing.py"], cwd=tmp_path, check=True, capture_output=True,
+                   env={**os.environ, "ARMADA_ARTIFACTS": str(tmp_path / "artifacts"),
+                        "PYTHONPATH": str(ROOT / "tools/armada")})
+    progress = (tmp_path / "artifacts" / "progress.jsonl").read_text().splitlines()
+    assert [json.loads(line)["node"] for line in progress] == ["test_clearing.py::test_clears"]
 
 
 def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci, tmp_path, monkeypatch,
@@ -1940,8 +2018,7 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
     module = load("ci", str(tmp_path / "tools/armada"))
     monkeypatch.chdir(tmp_path)
-    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
-        monkeypatch.delenv(name, raising=False)
+    apart(monkeypatch)
     (tmp_path / "tests").mkdir()
     written(tmp_path, {"test_a.py": "def test_a():\n    with open('runs', 'a') as runs: runs.write('x')\n"})
     run = cached_runs(module, tmp_path, monkeypatch, cache_worker)

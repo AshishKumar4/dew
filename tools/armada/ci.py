@@ -5,7 +5,7 @@
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT
     python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
-    python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
+    python3 tools/armada/ci.py gpu-lane --tests="tests/b.py#1/2" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
     python3 tools/armada/ci.py coverage report DIR
@@ -2046,8 +2046,12 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
              deadline: float, network: bool = False) -> int:
-    """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
-    own (`tested`), and write their verdict rows to `out`. With `network`, the network lane: each file's
+    """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
+    (`tested`), and write their verdict rows to `out`: a test file, or one group of one as CI names it
+    (`<file>#G/N`, the Gth of N runs of the tests the file's collection here finds, split.py), whose row is
+    that group's, so every test of a file cut into groups runs once, whatever an earlier run of it held
+    (audit, 2026-11-08: the GPU tier's parts named tests an earlier tier ran, so a new one never ran, and a
+    test named apart read "no evidence ran"). With `network`, the network lane: each file's
     network-marked tests alone, which every other task deselects (`session.SELECTION`), run with the Hub
     open on a node that reaches it, their records on a class of their own (`device_class`), so the test
     cache reruns only those whose inputs changed (the maintainer, 2026-10-25: no CI run reached the published
@@ -2082,14 +2086,18 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
+    # Each test's file and group (`<file>#G/N`; none, a whole file).
+    parts = {name: name.partition("#")[::2] for name in tests}
+
     def needs(name: str) -> dict | None:
-        return recorded(record_key(python, row(python, name, ""), held), token)
+        return recorded(record_key(python, row(python, *parts[name]), held), token)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(tests, pool.map(needs, tests), strict=True))
-    borrowed = borrowed_records([name for name, found in records.items() if found is None], python, held,
-                                token)
-    needed = {name: gpu_needs(records[name] or borrowed.get(name), budget) for name in tests}
+    # A group no run on this class measured borrows its whole file's measure, which holds at least its own.
+    borrowed = borrowed_records(sorted({parts[name][0] for name, found in records.items() if found is None}),
+                                python, held, token)
+    needed = {name: gpu_needs(records[name] or borrowed.get(parts[name][0]), budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
@@ -2109,7 +2117,12 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
-                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
+                file, group = parts[fits]
+                # A group cut by the tier's own GPU seconds (DEW_SPLIT_DURATIONS, split.py) is no group
+                # any record's key holds: it reads no cached row, as it writes none, so no earlier cut's row
+                # stands for it beside groups cut afresh (review of b3bcbe0fe).
+                policy = "off" if group and os.environ.get("DEW_SPLIT_DURATIONS") else cache
+                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, policy,
                                     session.GRACE, common, environ, None, network)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
