@@ -118,9 +118,11 @@ class DecisionRunConfig(DecoderRunConfig):
     looping and LoRA. The trainer's fitting ladder starts here; a policy
     outside `DECODER_REMAT` cannot climb. None keeps the checkpoint's policy."""
     head: JointShape | Letters | None = None
-    """The head over a fresh backbone: the joint schema head, which then reads the joint layout, or
+    """The head drawn over the backbone: the joint schema head, which then reads the joint layout, or
     the letter readout of the backbone's own logits (`Letters`), over lettered rows; None draws
-    Laya's head."""
+    Laya's head over a fresh backbone and reads a decision release's own over its. Over a decision
+    release, a finished run's among them, it is drawn over the release's backbone alone
+    (`PretrainedDecision.backbone`), the release's head, layout and calibration set aside."""
     calibrate: bool = True
     """Fit the task's temperatures on the held-out rows after training."""
     max_len: int | None = None
@@ -270,11 +272,12 @@ class DecisionRunConfig(DecoderRunConfig):
                                 dtype=dtype, attention_impl=attention_impl,
                                 **self.source_keywords(frozen=frozen))
         release = isinstance(start, PretrainedDecision)
+        if release and self.head is not None:
+            # A head drawn over a decision release's backbone, a finished run's among them: its own head,
+            # layout and calibration set aside, the backbone trains on under the head the run names.
+            start, release = start.backbone(), False
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
         blocked = not release and reads_blocks(start.config, self.source.overrides())
-        if release and self.head is not None:
-            raise ValueError("--head draws a head over a fresh backbone; a decision release reads with "
-                             "its own")
         # The backbone's own transformations, a release's as a fresh backbone's: its head and layout
         # stay as the release states them.
         if self.remat is not None:
