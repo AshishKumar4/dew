@@ -35,6 +35,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic_forward,
     attention_mosaic_program,
     attention_portable,
+    attention_quantized,
     attention_triton,
     bundles,
     mosaic_sm90,
@@ -235,15 +236,18 @@ def _pinned(forward: attention_mosaic.Tiles | None = None,
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
                    value_width: int = 128, tiles: attention_mosaic.Tiles | None = None,
                    training: template.Kept = template.Kept.NONE, target: generation.GpuTarget | None = None,
-                   drop: bool = False, query_scale: float = 1.0, sinks: bool = False):
+                   drop: bool = False, query_scale: float = 1.0, sinks: bool = False,
+                   rounds: float | None = None):
     """The forward, or with `training` (what it keeps, `template.Kept`) the training forward's output, over
     the call form `call` of `shape`,
     its query and key heads `width` wide and its value heads `value_width`, at `tiles` (the default when
     None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`), with `sinks` a sink a query
     head (`template.sinks`, the initial state), its queries drawn times `query_scale` (a power of two,
-    exact)."""
+    exact), with `rounds` its weights rounded to a quantized model's codes (`template.Hooks.rounds`)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
     hooks = _dropping(shape) if drop else None
+    if rounds is not None:
+        hooks = template.Hooks(rounds=rounds)
     if sinks:
         hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1],
                                                       value_width))
@@ -1558,6 +1562,17 @@ def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
     of the columns (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's,
     under the interpreter."""
     _check_backward(call, SHAPES["interpreted"], form="fused-shared-keys", interpret=True, width=256)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", CALLS)
+def test_a_quantized_calls_weights_round_at_each_rows_maximum_interpreted(call):
+    """A quantized model's call (`template.Hooks.rounds`, int8's bound, row 4858): the anchored training
+    walk's weights rounded to their codes at each row's maximum in the value product, its denominator the
+    weights themselves, the output on par (check 1) with the reference's, which rounds them so from its whole
+    rows, under the interpreter."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=64,
+                   value_width=64, training=template.Kept.SPLIT, rounds=attention_quantized.BOUND)
 
 
 @INTERPRETS

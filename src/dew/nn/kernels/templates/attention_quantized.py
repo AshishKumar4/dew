@@ -17,6 +17,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
+from dew._cache import unintercepted
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention_route
@@ -151,10 +152,9 @@ def _attend_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
 
 def _attend_backward(saved: tuple, dout: jax.Array) -> tuple:
     """The straight-through gradients (`_straight_through`) of the query, key, value and score parameters;
-    the spans take none. Traced with a quantization provider's interception off (Qwix's, which the forward's
-    call is off by `dew.quantization.UNQUANTIZED`): a backward traced inside a quantized method would have
-    its products quantized again."""
-    from qwix._src import interception
+    the spans take none. Traced with a quantization provider's interception off (`unintercepted`, as the
+    forward's call is by `dew.quantization.UNQUANTIZED`): a backward traced inside a quantized method would
+    have its products quantized again."""
 
     def pulled(saved, dout):
         query, key, value, spans, hooks = saved
@@ -163,12 +163,18 @@ def _attend_backward(saved: tuple, dout: jax.Array) -> tuple:
         d_query, d_key, d_value, d_hooks = pullback(dout)
         return d_query, d_key, d_value, None, d_hooks
 
-    return interception.disable_interceptions(pulled)(saved, dout)
+    return unintercepted(pulled)(saved, dout)
 
 
-attend = contracted("test_a_quantized_attention_holds_its_reverse_orders")(
+_attend = contracted("test_a_quantized_attention_holds_its_reverse_orders")(
     declared_derivative(KernelGlue(), _attending, _attend_forward, _attend_backward))
-"""A quantized model's attention of `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and
-`[B, K, Hk, Dv]` under the visibility `spans` and score `hooks` (no initial state, no draw): the
-template's forward over the codes (`_attending`), Qwix's straight-through backward
+"""The template's forward over the codes (`_attending`), Qwix's straight-through backward
 (`_straight_through`)."""
+
+
+def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks) -> jax.Array:
+    """A quantized model's attention of `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and
+    `[B, K, Hk, Dv]` under the visibility `spans` and score `hooks` (no initial state, no draw), which a
+    quantized model's provider runs with its interception off (`dew.quantization.UNQUANTIZED`): the
+    template forms the rule's codes and scales itself, its walk's products none of the rule's."""
+    return _attend(query, key, value, spans, hooks)
