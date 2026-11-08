@@ -7,6 +7,7 @@ rows past them; and Mosaic GPU's grouped GEMM launches, the class's one gate. `k
 runs each launch alone and reads every output it declares, those its caller slices away too; an element it
 never wrote holds the interpreter's NaN."""
 
+import dataclasses
 import functools
 
 import jax
@@ -159,6 +160,37 @@ def test_the_gpus_grouped_gemm_launches_write_every_output(product):
         else:
             lhs, rhs = drawn((300, 256), (300, 128))
             assert_written(lambda lhs, rhs: mosaic_gpu.tgmm(lhs, rhs, sizes, **options), lhs, rhs)
+
+
+@pytest.mark.parametrize("product", ["balanced gmm", "balanced tgmm", "scattered gmm"])
+def test_the_gpus_partial_gemm_launches_write_every_output(product):
+    """Mosaic GPU's launches whose programs share a tile or store only some rows, interpreted as an H100's,
+    write every output they declare: a dense product and kernel gradient whose last wave is balanced over 8
+    multiprocessors (`mosaic_gpu.balanced_tail`, each tile's partials in a workspace the launch takes in
+    place), and a grouped product scattering its rows, fewer than whole row tiles, through a permutation."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="wgmma")
+    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
+    options = {"tiles": tiles, "out_dtype": jnp.float32, "multiprocessors": 8,
+               "interpret": grouped_matmul.INTERPRETED}
+    with generation.assumed(target):
+        if product == "balanced gmm":
+            lhs, rhs = drawn((1408, 128), (1, 128, 128))
+            assert mosaic_gpu.balanced_tail(tiles, (11, 1), 2, (2, 2), target, 8) is not None
+            assert_written(lambda lhs, rhs: mosaic_gpu.gmm(lhs, rhs, jnp.asarray([1408], jnp.int32),
+                                                           transpose_rhs=False, dense=True, **options), lhs, rhs)
+        elif product == "balanced tgmm":
+            lhs, rhs = drawn((320, 128), (320, 1408))
+            assert mosaic_gpu.balanced_tail(tiles, (1, 11), 5, (2, 2), target, 8) is not None
+            assert_written(lambda lhs, rhs: mosaic_gpu.tgmm(lhs, rhs, jnp.asarray([320], jnp.int32), dense=True,
+                                                            **options), lhs, rhs)
+        else:
+            lhs, rhs = drawn((200, 128), (4, 128, 256))
+            slots = jnp.asarray(np.random.default_rng(2).permutation(200), jnp.int32)
+            assert_written(lambda lhs, rhs: mosaic_gpu.gmm(lhs, rhs, jnp.asarray([70, 0, 69, 51], jnp.int32),
+                                                           transpose_rhs=False, scatter=slots, **options),
+                           lhs, rhs)
 
 
 def test_an_unwritten_output_is_found():
