@@ -344,9 +344,10 @@ def test_calls_compiled_together_run_their_executables_after_and_compile_nothing
     run = program(lambda x: x * 2 + 1)
     other = program(lambda x: jnp.sin(x))
     with Compiles(None) as compiles, compiled_together():
-        shapes = [run(jnp.ones(2)), run(jnp.ones(3)), other(jnp.ones(4))]
+        shapes = [run(jnp.ones(2)), run(jnp.ones(3)), other(jnp.ones(4)), run(jnp.ones(2))]
     assert [(shape.shape, shape.dtype) for shape in shapes] == [((2,), jnp.float32), ((3,), jnp.float32),
-                                                                ((4,), jnp.float32)]
+                                                                ((4,), jnp.float32), ((2,), jnp.float32)]
+    # A call the block lowered already lowers and compiles once.
     assert [program.kind for program in compiles.programs].count("compiled") == 3
     with Compiles(None) as again:
         outputs = [run(jnp.ones(2)), run(jnp.ones(3)), other(jnp.ones(4))]

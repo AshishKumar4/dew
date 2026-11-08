@@ -809,7 +809,9 @@ class Decide(SavedRunTask, InItsForm):
                         ) -> tuple[PassShape, ...]:
         """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
         default), or with `rows`, those the passes over them take, as a server takes them in that order
-        (`planned_shapes`), so a scorer compiles none while it serves; returns the shapes compiled. Each
+        (`planned_shapes`), so a scorer compiles none while it serves; returns the shapes compiled. A
+        call over rows compiles the shapes its passes take as each first comes (`logits`), each in turn;
+        one compiled here first, over the same rows shortest first, compiles them at once. Each
         is a pass of the layout's shortest row at its shape, traced and lowered on the calling thread,
         under every context its caller holds (a mesh, JAX's and Dew's own thread-local settings), which
         the program its serving calls read is keyed by, and compiled by XLA at once with the others
@@ -936,8 +938,6 @@ class Decide(SavedRunTask, InItsForm):
         """
         server = scoring.ScoringServer(self._row_scoring, self.variables)
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
-        # The programs its passes take compiled first, at once, and none other (`compile_scoring`).
-        self.compile_scoring(rows=[rows[index] for index in order])
         futures = {index: server.submit(rows[index]) for index in order}
         server.run()
         return [futures[index].result() for index in range(len(rows))]

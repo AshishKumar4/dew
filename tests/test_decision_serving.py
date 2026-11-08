@@ -288,29 +288,38 @@ def test_a_budget_names_the_lengths_and_window_counts_its_passes_compile(decide)
         for future in futures:
             future.result()
     assert [program for program in compiles.programs if program.kind == "compiled"] == []
+    alone = replace(decide, budget=Budget(options=16, counts=(1, 10 ** 6)))
+    assert {shape.rows for shape in alone.pass_shapes} <= {1, *most.values()}
     for refused in ({"lengths": 0}, {"counts": ()}, {"counts": (0,)}, {"counts": ("some",)}):
         with pytest.raises(ValueError):
             Budget(**refused)
 
 
 def test_a_call_over_known_rows_compiles_the_shapes_its_passes_take_alone(decide):
-    """A call over rows it holds (`Decide.logits`) plans its passes first, as a server takes them
-    (`planned_shapes`), and compiles the programs those passes take, at once and none other: a few short
-    requests take one of the budget's nine shapes, which compiles before the first pass, and the passes
-    compile nothing more."""
+    """A call over rows it holds (`Decide.logits`) compiles the programs its passes take and none other: a
+    few short requests take one of the budget's shapes; compiled first over those rows
+    (`compile_scoring(rows=...)`, the shapes `planned_shapes` gives), all at once, that one alone
+    compiles, and the call then compiles nothing."""
     from dew.decision import Question
     from dew.decision.task import Budget
     from dew.telemetry.compiles import Compiles
 
-    declared = replace(decide, budget=Budget(options=24))
     single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
     questions = {name: Question.from_wire(wire) for name, wire in single["questions"].items()}
-    rows = [row for _ in range(3) for row in declared._encoded(single["state"], questions)]
-    planned = declared.planned_shapes(rows)
-    assert len(planned) == 1 and len(declared.pass_shapes) > 1
-    with Compiles("logits") as compiles:
-        declared.logits(rows)
-    assert len([program for program in compiles.programs if program.kind == "compiled"]) == len(planned)
+
+    def compiled(run) -> int:
+        with Compiles("logits") as compiles:
+            run()
+        return len([program for program in compiles.programs if program.kind == "compiled"])
+
+    lazy = replace(decide, budget=Budget(options=24))
+    rows = [row for _ in range(3) for row in lazy._encoded(single["state"], questions)]
+    planned = lazy.planned_shapes(rows)
+    assert len(planned) == 1 and len(lazy.pass_shapes) > 1
+    assert compiled(lambda: lazy.logits(rows)) == len(planned)
+    ahead = replace(decide, budget=Budget(options=20))
+    assert compiled(lambda: ahead.compile_scoring(rows=rows)) == len(planned)
+    assert compiled(lambda: ahead.logits(rows)) == 0
 
 
 def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decide):
