@@ -191,10 +191,9 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         blocks["values"] = ((parts * block_k, value_width), stored)
     # The logits' product reads the keys transposed.
     swizzles = transposed_swizzles(tiles, "keys")
-    pieces = tiles.block_k // page if page is not None and page < tiles.block_k else 1
-    if pieces == 1 or not family.gathers_rows:
+    if page is None or page >= tiles.block_k:
         return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles,
-                                      copies=dict.fromkeys(blocks, pieces * parts))
+                                      copies=dict.fromkeys(blocks, parts))
     if not interpret or family.gathers_interpreted:
         return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
     # A copy a row of each swizzled tile's columns (`mosaic.Ring.parts`), where no lane-level copy runs.
@@ -203,14 +202,14 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
 
 
-def paged_reads(family: mosaic.Family, table: jax.Array, page: int, block_k: int) -> tuple[jax.Array, int]:
+def paged_reads(table: jax.Array, page: int, block_k: int) -> tuple[jax.Array, int]:
     """A paged call's page table `[B, pages]` and its keys a page as its launch reads a key tile through them
-    (`_paged_views`): where a tile spans several pages and `family` gathers rows (`gathered.Ring`: the loading
-    warpgroup's cp.async copies, one copy a tile whatever the page), a table of one-key pages, each slot's row
-    of the pools (`table[b, s // page] * page + s % page`), so any page that divides the tile takes it, one
-    key a page (a page-1 pool's own); else the table and page as they are (whole tiles a page, or whole pages
-    a tile in pieces, `_pages_hold`)."""
-    if page >= block_k or not family.gathers_rows:
+    (`_paged_views`): where a tile spans several pages, which its family gathers (`gathered.Ring`: the loading
+    warpgroup's cp.async copies, one copy a tile whatever the page; `_pages_hold`), a table of one-key pages,
+    each slot's row of the pools (`table[b, s // page] * page + s % page`), so any page that divides the tile
+    takes it, one key a page (a page-1 pool's own); else the table and page as they are (whole tiles a
+    page)."""
+    if page >= block_k:
         return table, page
     rows = table[:, :, None] * page + jnp.arange(page, dtype=table.dtype)
     return rows.reshape(table.shape[0], -1), 1
@@ -427,7 +426,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     # A paged call's table, its rows' pages whole blocks of the call's, and its pools' page (`_launch`'s
     # `table`).
     paged = (None if call.table is None or call.page is None
-             else paged_reads(family, call.table, call.page, tiles.block_k))
+             else paged_reads(call.table, call.page, tiles.block_k))
 
     def launch(form: algebra.Forward, live: "jax.Array | _Flags | None", into: tuple | None = None
                ) -> "tuple[tuple, jax.Array, jax.Array] | tuple[tuple, None, _Flags]":
