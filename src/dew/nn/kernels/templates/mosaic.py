@@ -126,8 +126,15 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                                                             reduction_scratch=reduction_scratch),
                             interpret=interpreted(interpret),
                             kernel_name=report.named(name), cost_estimate=cost, **clustered)
+    # Its settled operands are checked where its programs read them before their wait (`waits`): a launch
+    # that does not wait is ordered after the one before it, whatever it reads first.
+    return checked(built, name or family, resident, model_flops, settled if waits(interpret) else ())
 
-    return checked(built, name or family, resident, model_flops, settled)
+
+def waits(interpret) -> bool:
+    """Whether a launch runs as a dependent launch, waiting for the one before it (`dependent`): natively, on
+    a GPU with grid dependency control (`generation.Architecture.dependent_launch`, sm_90 on)."""
+    return not interpreted(interpret) and generation.gpu_target().architecture.dependent_launch
 
 
 def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, settled: tuple[int, ...] = (),
@@ -154,8 +161,8 @@ def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, sett
     its call (`SETTLED`), and the compile point refuses a program where one is not an input it holds whole
     (`lowered.unsettled`)."""
     interpreting_ = bool(interpreted(interpret))
-    waits = not interpreting_ and generation.gpu_target().architecture.dependent_launch
-    if ahead is None and not waits and not interpreting_:
+    waiting = waits(interpret)
+    if ahead is None and not waiting and not interpreting_:
         return entry
 
     def body(*refs):
@@ -163,13 +170,13 @@ def dependent(entry: Callable, interpret, *, ahead: Callable | None = None, sett
         try:
             own = refs[len(refs) - scratch:]
             held = None if ahead is None else ahead(*(refs[index] for index in settled), *own)
-            if waits:
+            if waiting:
                 plgpu.griddepcontrol_wait()
             if held is None:
                 entry(*refs)
             else:
                 entry(*refs, held)
-            if waits:
+            if waiting:
                 plgpu.griddepcontrol_launch_dependents()
         finally:
             _INTERPRETING.reset(token)

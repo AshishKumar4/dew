@@ -14,11 +14,12 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import inspect
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
 import numpy as np
@@ -311,8 +312,8 @@ class OuterProgram:
         def traced(*args, **kwargs):
             if not self.settled:
                 return self.function(*args, **kwargs)
-            token = _SETTLED.set(frozenset(id(leaf) for index in self.settled
-                                           for leaf in jax.tree.leaves(args[index])))
+            token = _SETTLED.set(frozenset(id(leaf) for leaf in jax.tree.leaves(
+                self._given(args, kwargs, self.settled))))
             try:
                 return self.function(*args, **kwargs)
             finally:
@@ -380,24 +381,33 @@ class OuterProgram:
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
 
+    def _given(self, args: tuple, kwargs: dict, numbers: tuple[int, ...]) -> dict[str, Any]:
+        """The values a call gives the arguments at positions `numbers`, by name, however the call passes
+        them (positionally or by keyword: the function's signature binds them, as jit's argument inference
+        does, `api_util.infer_argnums_and_argnames`)."""
+        if not numbers:
+            return {}
+        signature = inspect.signature(self.function)
+        bound = signature.bind(*args, **kwargs).arguments
+        names = list(signature.parameters)
+        return {names[number]: bound[names[number]] for number in numbers
+                if number < len(names) and names[number] in bound}
+
     def held(self, args: tuple, kwargs: dict) -> None:
         """A call's arguments held to the settled ones' contract: each array of its `settled` arguments not
         marked waited for (its writer's last launch done, so none of its launches overlaps it) and marked;
-        an array it donates refused where it is marked (`SettledDonated`)."""
-        for index in self.settled:
-            for leaf in jax.tree.leaves(args[index]):
-                if isinstance(leaf, jax.Array) and not _marked(leaf):
-                    jax.block_until_ready(leaf)
-                    _MARKED[id(leaf)] = leaf
+        an array it donates (by position or name, as jit resolves them) refused where it is marked
+        (`SettledDonated`)."""
+        for leaf in jax.tree.leaves(self._given(args, kwargs, self.settled)):
+            if isinstance(leaf, jax.Array) and not _marked(leaf):
+                jax.block_until_ready(leaf)
+                _MARKED[id(leaf)] = leaf
         if not _MARKED:
             return
-        donated = self.arguments.get("donate_argnums", ())
-        donated = (donated,) if isinstance(donated, int) else donated
-        names = self.arguments.get("donate_argnames", ())
-        names = (names,) if isinstance(names, str) else names
-        for path, leaf in jax.tree_util.tree_leaves_with_path(
-                ([args[index] for index in donated if index < len(args)],
-                 {name: kwargs[name] for name in names if name in kwargs})):
+        numbers, _ = api_util.infer_argnums_and_argnames(inspect.signature(self.function),
+                                                         self.arguments.get("donate_argnums"),
+                                                         self.arguments.get("donate_argnames"))
+        for path, leaf in jax.tree_util.tree_leaves_with_path(self._given(args, kwargs, numbers)):
             if isinstance(leaf, jax.Array) and _marked(leaf):
                 raise SettledDonated(f"{self.function.__qualname__} donates its argument "
                                      f"{jax.tree_util.keystr(path)}, which a program reads as settled: "
