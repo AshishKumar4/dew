@@ -15,6 +15,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES
 from reference_error import (
     FACTOR,
+    as_given,
     assert_as_exact,
     assert_rounds_where_the_reference_does,
     chain_roundings,
@@ -294,12 +295,13 @@ def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed)
         # A row at a time on the host (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past
         # a packed job's 8.9 GiB share where main's GPU tier ran them (row 1724,
         # SE-conv1724-a100-fd8508b5a), 8.85 with the arrays on the host alone (SE-conv1724-a100-9419b90c1).
+        # A host loop, so run as given (`as_given`): traced, its NumPy read a tracer (main's GPU tier).
         pieces, gradients = row_truth(x, weights, parts, grads, segments)
         return pieces, gradients[:2]
 
     assert_as_exact(conv(kernel_conv), conv(xla_conv1d), draw,
                     f"{model} {jnp.dtype(dtype).name}{' packed' if packed else ''}",
-                    seeds=TRAINING_SEEDS[model, jnp.dtype(dtype).name, packed], truth_fn=exact)
+                    seeds=TRAINING_SEEDS[model, jnp.dtype(dtype).name, packed], truth_fn=as_given(exact))
 
 
 @pytest.mark.mesh(devices=2)
