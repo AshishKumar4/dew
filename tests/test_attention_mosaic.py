@@ -846,11 +846,11 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
 def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_row_interpreted():
     """A call as many queries as heads, one consumer's tile of them, whose head 0 sees two keys of equal
     logits past the fold's reach over values near bf16's largest: the call walks again unfolded, and head
-    0's rows, whose weighted values overflow, take the guarded walk in that form (`algebra.unfolded`), its
-    residuals in its units. Head 0's output is its values' mean exactly, its one value row (where the
-    reference's fp32 sums overflow); every other head's rows are the plain launch's bits, as where head 0's
-    values do not overflow; and the backward from these residuals gives head 0's values a gradient wherever
-    the reference does, finite where it is."""
+    0's rows, whose weighted values would pass fp32's largest, shift in that walk (`algebra.Argmax.shift`,
+    from the peak walk's reach), their residuals in its units. Head 0's output is its values' mean exactly,
+    its one value row (where the reference's fp32 sums overflow); every other head's rows are the bits they
+    take where head 0's values are ordinary (no row shifts for another's sake); and the backward from these
+    residuals gives head 0's values a gradient wherever the reference does, finite where it is."""
     queries, keys, width = 64, 2, 64
     spans = template.spans(queries, keys, 1)
     streams = jax.random.split(jax.random.key(0), 4)
