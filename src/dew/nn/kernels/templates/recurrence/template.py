@@ -188,8 +188,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop (`chunk_forward.forward`): the
     port's operands and results (`recurrence_chunk.fla_rule`'s), the operands in their common dtype and beta
     with them, the decay and the memory fp32, on one device, by the bundle of its instruction family
-    (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter,
-    `bundles.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
+    (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter, the interpreted
+    target's bundle, `mainloop.issued`). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
     (`mainloop_backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
     (`backward_holds`); it takes no other call's, which raises NotImplementedError as the gradient is traced:
     the delta rule's selector gives a training call it refuses another kernel (`Mosaic.trains`), and a call
@@ -204,8 +204,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     route)."""
 
     dtype = jnp.result_type(query, key, value)
-    device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
-    issuing = family or device or bundles.INTERPRETED
+    device, interpret = mainloop.issued(dtype)
+    issuing = family or device
     query, key, value = (x.astype(dtype) for x in (query, key, value))
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
     # call's own, as the portable math takes it (Mamba-2's fp32 `dt`).
@@ -311,15 +311,15 @@ class Mosaic(base.Template[mainloop.Tiles]):
     @staticmethod
     def launched() -> generation.GpuTarget:
         """The target a call's launches run for: this device's where a bundle claims its family, else the
-        interpreted bundle's generation's (`generation.INTERPRETED_GENERATION`), its multiprocessors
-        unstated: an interpreter runs a launch's programs one after another, no wave of them to fill, so the
+        interpreted target's (`generation.interpreted_target`): an assumed device's as it states it, so an
+        interpreted check of its route derives its tiles; with none assumed, its multiprocessors unstated:
+        an interpreter runs a launch's programs one after another, no wave of them to fill, so the
         derivation takes the widest tiles that hold (`derived`; packed documents' interpreted gradient took
         21 s a draw at the one-wave rule's 16-wide value block and 14 at 32, row 1850)."""
         target = generation.gpu_target()
         if bundle(target) is not None:
             return target
-        interpreted = generation.gpu_target(generation.INTERPRETED_GENERATION)
-        return dataclasses.replace(interpreted, multiprocessors=None)
+        return dataclasses.replace(generation.interpreted_target(), multiprocessors=None)
 
     def _launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
                   backward: bool) -> tuple[mainloop.Launch, ...]:

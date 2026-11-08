@@ -52,7 +52,6 @@ from op_certificates import (
 )
 
 from dew.nn.kernels import recurrence_algebra
-from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
 
 LOG2E = recurrence_algebra.LOG2_E
@@ -676,7 +675,7 @@ def interpreted_lane() -> Lane:
     from certified import lane
 
     return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes,
-                mainloop.block_of(bundles.INTERPRETED))
+                mainloop.block_of(mainloop.issued()[0]))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -816,7 +815,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     scale = k.shape[-1] ** -0.5 if delta else 1.0
     if rounded is None:
         rounded = route_rounding(delta, dtype)
-    family = mainloop.family_of(dtype) or bundles.INTERPRETED
+    family = mainloop.issued(dtype)[0]
     # The parts its operands and passed values take (`chunk_forward.prepared`'s `given` and `held`): one of a
     # 16-bit value; an fp32 one's three, or under the fast forms its family's (`mainloop._fast_parts`).
     wide = jnp.dtype(dtype) == jnp.float32
@@ -1413,7 +1412,6 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
     import jax.numpy as jnp
 
     from dew.nn.kernels import generation, recurrence_chunk, tuning
-    from dew.nn.kernels.templates import bundles
     from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
     q, k, v, _, _, h0 = operands
@@ -1424,7 +1422,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
     scale = run.scale
     rounded = route_rounding(delta, dtype)
-    family = mainloop.family_of(dtype) or bundles.INTERPRETED
+    family = mainloop.issued(dtype)[0]
     interpret = generation.backend() != "gpu"
 
     def route(*x):
@@ -1655,7 +1653,6 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
     import jax.numpy as jnp
 
     from dew.nn.kernels import generation, recurrence_chunk, tuning
-    from dew.nn.kernels.templates import bundles
     from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
 
     q, k, v, _, _, h0 = operands
@@ -1666,7 +1663,7 @@ def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict
     do = jnp.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
     scale, rounded = run.scale, route_rounding(delta=True, dtype=dtype)
-    family = mainloop.family_of(dtype) or bundles.INTERPRETED
+    family = mainloop.issued(dtype)[0]
     interpret = generation.backend() != "gpu"
 
     def route(*x):

@@ -16,7 +16,7 @@ import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
 from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import chunk_on, cotangents, formed, token_by_token
+from test_recurrence_chunk import chunk_on, cotangents, formed, routed, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -34,7 +34,7 @@ from test_recurrence_mosaic import (
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
-from dew.nn.kernels.templates import bundles, mosaic_sm100
+from dew.nn.kernels.templates import bundles, mosaic_sm90, mosaic_sm100
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
@@ -76,13 +76,10 @@ def interpreted_gradient(case: str, dtype: str, remat: str) -> Callable:
     site of its own (its `check1_shards` mark). Whole, these cases took 122 to 225 seconds (train 270's CI on
     66a222273, ledger 2127), 483 to 653 (train 479's on e82eab19a) and 474 (the recomputed one, train 521's
     on e65403fc9); a map task of 80 seeds of the three 256-seed cases took 525 s, one of 15 of the two
-    128-seed cases 159 s (other-shards at 77a98366c), so each case is a site apart."""
+    128-seed cases 159 s (other-shards at 77a98366c), so each case is a site apart, on each route
+    (`routed`)."""
     INTERPRETED_GRADIENT.add((case, dtype, remat))
-
-    def check():
-        the_mosaic_gradient_is_as_exact_as_its_reference(case, DTYPES[dtype], remat)
-
-    return lambda test: functools.update_wrapper(check, test)
+    return routed(lambda: the_mosaic_gradient_is_as_exact_as_its_reference(case, DTYPES[dtype], remat))
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=20)
@@ -209,7 +206,7 @@ def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
                                         bound=hooks.inverse_bound, rounded=True)
         return jax.jit(with_gradients(rule))
 
-    assert_as_exact(on(mosaic_sm100.CHUNKS), on(bundles.INTERPRETED), functools.partial(drawn, dtype,
+    assert_as_exact(on(mosaic_sm100.CHUNKS), on(mosaic_sm90.WGMMA), functools.partial(drawn, dtype,
                     **geometry(case)), f'tcgen05 chunks training, {case}', seeds=8,
                     truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
 
@@ -226,7 +223,7 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
     geometries, whose launches at 128 pass a GPU's resources (`template.chunk_of`'s step down,
     jsf-chunkchoice), so the launches are called as the rule calls them."""
     hooks, dtype = case_hooks(case), jnp.bfloat16
-    bundle = {'wgmma': bundles.INTERPRETED, 'mma.sync': bundles.of('sm80', jnp.bfloat16)}[family]
+    bundle = bundles.of({'wgmma': 'sm90', 'mma.sync': 'sm80'}[family], jnp.bfloat16)
     (sample, _) = drawn(dtype, 0, **geometry(case))
     tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm90'))
     assert tiles is not None
