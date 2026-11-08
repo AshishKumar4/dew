@@ -420,7 +420,7 @@ def test_products_issue_in_place_into_a_carried_accumulator():
 
 def _merged(partials, combine):
     """Each of `partials`' leading slices a program's partial of one tile, merged across the programs by
-    `combine` (`Transport.fixed_up`), interpreted: the tile's first program, walked last, combines them."""
+    `combine` (`Family.fixed_up`), interpreted: the tile's first program, walked last, combines them."""
     from dew.nn.kernels.templates import mosaic_sm90
 
     family = mosaic_sm90.FED  # one warpgroup, no producer
@@ -445,7 +445,7 @@ def _merged(partials, combine):
 @pytest.mark.parametrize("slices", [2, 3, 5, 9])
 @pytest.mark.parametrize("block", [(16, 8), (64, 32), (128, 64)])
 def test_a_tiles_partials_merge_in_the_programs_order_whatever_their_count(block, slices):
-    """Interpreted: the programs' partials of one tile merged across the programs (`Transport.fixed_up`) by
+    """Interpreted: the programs' partials of one tile merged across the programs (`Family.fixed_up`) by
     a merge that neither commutes nor associates, `3 * running + partial`: exactly its fold over the programs
     in order, at tiles whose merger reads one partial at a time or several, and at counts of partials those
     reads do not divide."""
