@@ -553,23 +553,27 @@ def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
     assert refused.value.names == ("wide_logits",)
 
 
-def test_a_blocks_call_stating_its_keys_validity_alone_is_refused():
+def test_a_blocks_call_stating_its_keys_validity_alone_hides_those_keys():
     """A causal attention block called with its keys' validity (`AttentionMetadata.key_valid`) and no
-    pairwise mask or key runs is refused, naming the field: the validity hides keys from a call's own
-    visibility, which the call does not state, so read alone it would hide nothing and the keys it excludes
-    would stay visible (row 4771); beside key runs the same validity is read."""
+    pairwise mask or key runs hides the keys it marks out from every query of the block's own causal
+    visibility (row 4771): bit for bit the call over the pairwise mask they mean, causal and valid, and
+    not the call that states no validity."""
     from dew.nn.mixers.attention import CausalSelfAttention
 
     context = MixerContext(emb_features=64, num_heads=2, num_kv_heads=2, head_dim=32, max_seq_len=8,
                            attention_impl="reference")
     layer = CausalSelfAttention(ctx=context)
-    x = jax.random.normal(jax.random.key(23), (1, 4, 64))
+    x = jax.random.normal(jax.random.key(23), (2, 4, 64))
     variables = layer.init(jax.random.key(22), x)
-    valid = jnp.asarray([[True, False, True, True]])
-    with pytest.raises(ValueError):
-        layer.apply(variables, x, MixerCall(AttentionMetadata(key_valid=valid)))
-    runs = jnp.broadcast_to(jnp.asarray([[0, 4]]), (1, 4, 1, 2))
-    layer.apply(variables, x, MixerCall(AttentionMetadata(key_runs=runs, key_valid=valid)))
+    valid = jnp.asarray([[True, False, True, True], [True, True, True, False]])
+    seen = jnp.tril(jnp.ones((4, 4), bool))[None] & valid[:, None, :]
+
+    def call(**metadata):
+        return np.asarray(layer.apply(variables, x, MixerCall(AttentionMetadata(**metadata))))
+
+    hidden = call(key_valid=valid)
+    assert hidden.tobytes() == call(pairwise_mask=seen).tobytes()
+    assert hidden.tobytes() != call().tobytes()
 
 
 def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary():

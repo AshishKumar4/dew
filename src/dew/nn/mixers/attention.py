@@ -188,11 +188,7 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("a tree call's attention is masked by its key runs, each token's cache and "
                          "ancestors (attention_key_runs)")
     if metadata.pairwise_mask is None and metadata.key_runs is None:
-        # A validity hides keys from a call's own visibility, which a call of neither does not state: read
-        # alone it would hide nothing (row 4771).
-        if metadata.key_valid is not None:
-            raise ValueError("attention_key_valid hides keys from a call's own visibility; it requires "
-                             "attention_pairwise_mask or attention_key_runs")
+        # A validity alone hides its keys from the layer's own visibility (`_masking`), no call's.
         return None
     key_positions, valid = metadata.key_positions, metadata.key_valid
     if key_positions is not None and key_positions.shape != (batch, keys):
@@ -1220,6 +1216,12 @@ class CausalSelfAttention(nn.Module):
             mask, runs, window, key_places, query_places, valid = own
             causal, documents, groups, places = False, None, _Groups(), (
                 key_places if query_places is None else query_places)
+        elif attention_metadata is not None and attention_metadata.key_valid is not None:
+            # The call's keys' validity alone hides the keys it marks out from every query of the layer's own
+            # visibility (row 4771): a mask's keys taken from it (a decode step's or a prefix's, read by the
+            # masked kernel), else read by the kernel beside the rest.
+            mask, valid, implementation = self._key_validity(
+                attention_metadata.key_valid, mask, valid, implementation, masked, B, key.shape[-3])
         if self.ctx.attention_chunk is not None:
             mask = self._chunked(mask, documents, causal, window, valid, runs, groups, places, key_places, S,
                                  key.shape[-3])
@@ -1229,6 +1231,19 @@ class CausalSelfAttention(nn.Module):
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs, query_places)
+
+    def _key_validity(self, key_valid, mask, valid, implementation: AttentionImpl,
+                      masked: Callable[[], AttentionImpl], batch: int, keys: int):
+        """A call's keys' validity `key_valid` `[B, keys]` (`AttentionMetadata.key_valid`) beside the layer's
+        own visibility: the `mask` its keys are taken from where it has one (its kernel the masked one,
+        `masked()`), else joined to the `valid` keys the kernel reads, each only where both are. Returns the
+        mask, the validity and the kernel."""
+        key_valid = jnp.asarray(key_valid)
+        if key_valid.shape != (batch, keys) or key_valid.dtype != jnp.bool_:
+            raise ValueError("attention_key_valid must be boolean [B, keys]")
+        if mask is not None:
+            return mask & key_valid[:, None, None, :], valid, masked()
+        return None, key_valid if valid is None else jnp.asarray(valid, bool) & key_valid, implementation
 
     def _chunked(self, mask, documents, causal, window, valid, runs, groups: _Groups, places, key_places,
                  queries: int, keys: int):
