@@ -22,7 +22,11 @@ import json
 import logging
 import math
 import os
+import statistics
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -320,6 +324,16 @@ SAMPLED_BATCHES = 5
 Grain's own pick samples."""
 
 
+@functools.cache
+def worker_start_seconds() -> float:
+    """How long a loading worker of this process takes to start, measured once: a fresh interpreter of this
+    one's importing what a worker of a read imports to run its steps (Grain and Dew's data lowering), as
+    each worker does before its first record (`Loading.resolved`)."""
+    began = time.perf_counter()
+    subprocess.run([sys.executable, "-c", "import grain.python, dew.data.lowering"], check=True,
+                   capture_output=True)
+    return time.perf_counter() - began
+
 @dataclasses.dataclass(frozen=True)
 class Host:
     """What automatic loading sizes its workers and buffers by (`Loading.resolved`): the CPUs this
@@ -396,17 +410,16 @@ class Loading:
     0.1 s and 0.23 GiB with none.
 
     A training read whose chain names no loading reads with automatic workers
-    (`workers="auto"`, `dew.data.compile.compile`): a worker for each CPU the
-    host's memory holds (`resolved`) where the read is a global order whose
-    stages run Python on its records, its steps, packing or windows
-    (`dew.data.lowering._runs_records`), else none. In the training process the
-    records' Python holds the interpreter the step's dispatch needs: a decision
-    run's encoding held it 59% of the run on a GH200, and four workers took its
-    step from 20.9 to 10.5 ms (row 4862). A read of stored records into batches
-    gains nothing from a process. A read cut per share saves its workers in its
-    position, which a count sized by the host would change, so it reads with
-    none. Workers change no record and no order: a global order's batches are
-    the ones its records' indices make, read in order.
+    (`workers="auto"`, `dew.data.compile.compile`), which `resolved` sizes from
+    what it measures: workers where the Python a batch takes over the batches
+    the run reads is more than a worker's start, as many as the host's CPUs and
+    memory hold, else none. In the training process the records' Python holds
+    the interpreter the step's dispatch needs: a decision run's encoding held it
+    59% of the run on a GH200, and four workers took its step from 20.9 to
+    10.5 ms (row 4862). Workers change no record and no order: a global order's
+    batches are the ones its records' indices make, and a read cut per share
+    hands on its inputs in their order (`dew.data.lowering._Build.in_order`), so
+    its batches and its position are a read in none's.
     """
 
     workers: int | Literal["auto"] = 0
@@ -419,7 +432,8 @@ class Loading:
     """Whether a run reads its chains' leading deterministic steps from the records an earlier run
     made of the same records (`dew.data.cache.automatic_root`), which changes none of them."""
 
-    def resolved(self, records: pygrain.IterDataset, *, reads: int, host: Host | None = None) -> Loading:
+    def resolved(self, records: pygrain.IterDataset, *, reads: int, host: Host | None = None,
+                 batches: int | None = None) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
         by default) from its CPUs and its memory together. The sizing is static: it reads the batches'
         bytes, the CPUs and the memory once, as a read opens, and measures no throughput, so it never
@@ -440,11 +454,32 @@ class Loading:
         than that half holds. `records` are the batches the read makes without workers,
         `SAMPLED_BATCHES` of which are measured; `reads` is how many reads make one: one where the
         order is read by batch, its rows where it streams records. A read that makes no batch reads
-        without workers."""
+        without workers.
+
+        Workers take the read's Python off the training process, whose step's dispatch waits on the
+        interpreter it holds (a decision run's encoding: 20.9 against 10.5 ms a step in four workers on
+        a GH200, row 4862), and each costs a process's start first, its imports. They start where they
+        pay for themselves over the run: where the Python a sampled batch takes in the reading process,
+        each after the first, which opens the read, times the `batches` the run reads (its planned steps)
+        is more than a worker's measured start (`worker_start_seconds`). A short run, or one whose
+        batches take no Python to speak of, reads in the process; a run whose length nothing states
+        (None) reads in workers as its CPUs and memory size them."""
         if self.workers != "auto":
             return self
-        sampled = list(itertools.islice(records, SAMPLED_BATCHES))
+        reading, sampled, seconds = iter(records), [], []
+        for _ in range(SAMPLED_BATCHES):
+            began = time.perf_counter()
+            batch = next(reading, None)
+            if batch is None:
+                break
+            sampled.append(batch)
+            seconds.append(time.perf_counter() - began)
         if not sampled:
+            return dataclasses.replace(self, workers=0)
+        python = statistics.median(seconds[1:] or seconds)
+        if batches is not None and python * batches <= worker_start_seconds():
+            _log.info("automatic loading reads in the process: %d batches of %.2f ms of Python each take "
+                      "less than a worker's start", batches, python * 1e3)
             return dataclasses.replace(self, workers=0)
         host = Host.current() if host is None else host
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))

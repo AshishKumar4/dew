@@ -2090,9 +2090,10 @@ class _Build:
         stream, after = self.batched(pipeline, partition, offset, fill=fill)
         return iter(self.after_batch(stream, after, pipeline, partition))
 
-    def tuned(self, pipeline: Pipeline) -> _Build:
+    def tuned(self, pipeline: Pipeline, *, batches: int | None = None) -> _Build:
         """This build with automatic loading resolved on the whole order from the host's CPUs and
-        memory (`Loading.resolved`), and at most one worker per batch of a pass that ends where
+        memory and, over a run of `batches`, the Python its batches take (`Loading.resolved`), its workers
+        the same rows in any count (`in_order`), and at most one worker per batch of a pass that ends where
         its rows are indexed. A validation pass is read with training's workers, so a pass of
         five batches had one per core, 26 on an H100 host. Each worker past the last batch reads
         nothing, yet starts a process that imports the program and keeps about six pipes open
@@ -2100,18 +2101,16 @@ class _Build:
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-        if loading.workers == "auto" and not (self.global_order and _runs_records(pipeline)):
-            # Workers take a read's per-record Python off the training process (a decision run's
-            # encoding: 2.0x its step's rate on a GH200, row 4862); a read with none they only add
-            # processes to. A read cut per share saves its workers in its position (its topology), which
-            # automatic workers would size by the host, so a resume elsewhere would be refused.
+        if loading.workers == "auto" and not (self.global_order or self.in_order):
+            # A read whose rows are its workers' count's (`in_order`) reads in the process, so its rows and
+            # its position are one host's and another's alike.
             loading = dataclasses.replace(loading, workers=0)
         if loading.workers == "auto":
             # A global order is read by the batch, as an elastic read is, a batch's count of its inputs a
             # group (`_InputOrder`, `_StreamOrder`); any other order by the record (`batch_order`).
             grouped = self.global_order or self.elastic
             with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
-                loading = loading.resolved(sampled, reads=1 if grouped else size)
+                loading = loading.resolved(sampled, reads=1 if grouped else size, batches=batches)
         if loading.worker_count and (not self.training or not self.lowering.endless):
             with _closing(bare.records(pipeline, DataPartition())) as rows:
                 if isinstance(rows, pygrain.MapDataset):
@@ -2266,6 +2265,9 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     otherwise, ahead of reading them; phases are counted by none."""
     if not build.global_order:
         return None
+    # It counts the records it reads by index in the process: the same in any workers, whose automatic
+    # count the read alone resolves (`_Build.tuned`).
+    build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
 
     def passed(pipeline: Pipeline, build: _Build) -> int | None:
         """The records `pipeline` reads up to its first repeat, as the lowering builds them."""
@@ -2431,18 +2433,6 @@ def _weights(mixture: Mixture) -> Sequence[float]:
         [integer(stated["rows"], "rows") for stated in facts],
         [integer(stated["valid_targets"], "valid_targets") for stated in facts],
     )
-
-
-_RECORD_STEPS = (Map, RandomMap, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit, Batched, MapBatch,
-                 Native)
-"""The stages that run Python on each record or batch a read makes (its steps, its packing and windows, a
-handed Grain dataset's own), which loading workers run beside the training process (`_runs_records`)."""
-
-
-def _runs_records(pipeline: Pipeline) -> bool:
-    """Whether `pipeline`'s tree runs Python on its records (`_RECORD_STEPS`), which automatic loading
-    reads in workers (`_Build.tuned`); a read of stored records into batches, none."""
-    return any(isinstance(stage, _RECORD_STEPS) for stage in _steps(pipeline))
 
 
 def _workers(pipeline: Pipeline, loading: Loading) -> int:

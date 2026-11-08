@@ -756,6 +756,7 @@ def compile(
     measured: _Measured | None = None,
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
+    steps: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
@@ -789,7 +790,9 @@ def compile(
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs, version=plan_version)
-    loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
+    # Automatic loading sizes its workers for the run's batches: its `steps`, else an `examples` bound's.
+    batches = steps if steps is not None or examples is None else -(-examples // staged.build.batch)
+    loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
                                    pass_examples=staged.passes, bound_ends=_bound_ends(staged.original))
@@ -1046,6 +1049,7 @@ def _compiled(
     *,
     host: tuple[HostStep, ...],
     resume: Literal["exact", "non-exact"],
+    batches: int | None = None,
 ) -> Loader:
     """The readers of `staged`, each training batch's packed windows laid out
     as `packed` declares them and each validation batch's as its own packs do
@@ -1085,7 +1089,7 @@ def _compiled(
         stores=tuple(store for source in sources for store in _token_stores(source)),
         version=build.version,
     )
-    tuned = build.tuned(train)
+    tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
     build = tuned.pooled(train)
     train_host, device = _batch_steps(train)
@@ -1764,6 +1768,7 @@ def fitted[Entry](
     examples: int | None = None,
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
+    steps: int | None = None,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -1810,7 +1815,8 @@ def fitted[Entry](
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
-                         epochs=epochs if examples is None else None, plan_version=plan_version)
+                         epochs=epochs if examples is None else None, plan_version=plan_version,
+                         steps=steps)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

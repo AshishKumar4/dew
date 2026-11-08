@@ -208,37 +208,37 @@ class _Jittered:
         return {"index": record["index"], "drawn": float(record["index"]) * rng.uniform()}
 
 
-def _workers_started(reader, count: int) -> tuple[list, int]:
-    """The first `count` batches of `reader` (`listed`) and the processes this one had started by then."""
-    import psutil
-
-    read = listed(reader, count)
-    return read, len(psutil.Process().children(recursive=True))
-
-
-def test_a_training_read_naming_no_loading_reads_its_records_python_in_workers_alike(monkeypatch):
-    """A training read whose chain names no loading, a global order whose records a step runs Python on,
-    reads in automatic workers (`dew.data.compile._TRAINING_LOADING`), here two for two CPUs: the batches
-    are the ones the same read makes in the training process (`Loading(workers=0)`), in its order, and a
-    position either saved resumes in the other, on the batches the uninterrupted read goes on to (row
-    4862)."""
+def test_a_training_read_naming_no_loading_reads_in_workers_where_they_pay_for_themselves(monkeypatch):
+    """A training read whose chain names no loading reads in automatic workers (`_TRAINING_LOADING`) where
+    the Python its batches take over the batches the run reads is more than a worker's start
+    (`Loading.resolved`), here two for two CPUs over a run of a million steps, and in the training process
+    over a run of two. In workers its batches are those it reads in the process, in their order, and a
+    position either saved resumes in the other on the batches the uninterrupted read goes on to (row 4862)."""
+    from dew.data import dataset
     from dew.data.dataset import Host
 
     monkeypatch.setattr(Host, "current", classmethod(lambda cls, *args, **kwargs: Host(2, 2**34)))
+    monkeypatch.setattr(dataset, "worker_start_seconds", lambda: 1.0)
+    resolved, sizing = [], dataset.Loading.resolved
+
+    def recorded(self, *args, **kwargs):
+        loading = sizing(self, *args, **kwargs)
+        resolved.append(loading.workers)
+        return loading
+
+    monkeypatch.setattr(dataset.Loading, "resolved", recorded)
     chain = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered()).batch(4)
-    automatic, inline = compile(chain, seed=5), compile(chain, seed=5, loading=Loading(workers=0))
-    reader = automatic.train(DataPartition())
+    short, automatic = compile(chain, seed=5, steps=2), compile(chain, seed=5, steps=10**6)
+    inline = compile(chain, seed=5, loading=Loading(workers=0))
+    assert resolved == [0, 2]
+    reader, whole = automatic.train(DataPartition()), inline.train(DataPartition())
     try:
-        read, started = _workers_started(reader, 12)
-    finally:
-        reader.close()
-    assert started >= 2
-    whole = inline.train(DataPartition())
-    try:
+        read = listed(reader, 12)
         assert read == listed(whole, 12)
     finally:
+        reader.close()
         whole.close()
-    for saved_by, resumed_by in ((automatic, inline), (inline, automatic)):
+    for saved_by, resumed_by in ((automatic, inline), (inline, automatic), (short, automatic)):
         before = saved_by.train(DataPartition())
         try:
             head = listed(before, 5)
@@ -327,18 +327,6 @@ def test_a_position_saved_under_plan_version_10_resumes_as_10_read_it(workers):
         assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == FILE_SHARDS
     finally:
         resumed.close()
-
-
-def test_a_training_read_of_stored_records_reads_in_the_training_process():
-    """A training read that names no loading and runs no Python on its records, stored records shuffled into
-    batches, starts no worker: a process would only copy what the training process reads as fast."""
-    chain = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().batch(4)
-    reader = compile(chain, seed=5).train(DataPartition())
-    try:
-        _, started = _workers_started(reader, 4)
-    finally:
-        reader.close()
-    assert started == 0
 
 
 @pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),
