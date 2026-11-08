@@ -19,9 +19,9 @@ from one_draw import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
+from dew.interop.autoencoders.pretrained import REGISTRATIONS, load_kl_vae
 from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, LatentNormalization, StableDiffusionVAE
 from dew.nn.autoencoders.api import ModuleAutoEncoder
-from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Recorder, Step
 from dew.registry import to_record
@@ -92,7 +92,7 @@ def contract():
 
 @pytest.fixture(scope="module")
 def sd3_tiny():
-    return StableDiffusionVAE(str(FIXTURES / "sd3-tiny"), dtype=jnp.float32)
+    return load_kl_vae(str(FIXTURES / "sd3-tiny"), jnp.float32, revision="bf16", subfolder=None)[0]
 
 
 def test_a_clip_samples_and_normalizes_as_diffusers_does_frame_by_frame(contract, sd3_tiny):
@@ -138,7 +138,7 @@ def _published(kind: str, directory: Path):
     `PretrainedAutoencoder` builds it: by the class the fixture's config names."""
     from interop_support import extract_fixture
 
-    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
 
     archive, inside = ARCHIVES[kind]
     source = extract_fixture(FIXTURE_ROOT / archive, directory) / inside
@@ -316,25 +316,23 @@ def test_a_kl_loader_refuses_another_autoencoders_checkpoint(tmp_path, family):
     standalone one's, is refused by the class its config names, before its tensors meet the KL tree."""
     from interop_support import extract_fixture
 
-    from dew.nn.autoencoders.pretrained import load_kl_vae
 
     source = extract_fixture(Path(__file__).parent / "fixtures" / f"{family}.tar.xz", tmp_path)
     folder = next(path.parent for path in source.rglob("config.json"))
     with pytest.raises(ValueError):
         load_kl_vae(folder, subfolder="")
     with pytest.raises(ValueError):
-        StableDiffusionVAE(str(folder), dtype=jnp.float32)
+        load_kl_vae(str(folder), jnp.float32, revision="bf16", subfolder=None)
 
 
 def test_a_flax_layout_vae_binds_as_its_torch_layout_does(tmp_path):
     """One KL autoencoder's parameters as diffusers' Flax msgpack (the SD1-era layout) and as its torch
     safetensors (the committed sd3-tiny) bind into one tree through the one loader (`load_kl_vae`, which a
-    standalone load and `StableDiffusionVAE` reach): the same parameters, the msgpack's in the dtype it
+    standalone load and a pipeline's reach): the same parameters, the msgpack's in the dtype it
     stores, and the same source layouts, each written back as the torch tensor it reads from, so either
     exports as the torch checkpoint."""
     from flax.serialization import msgpack_serialize
 
-    from dew.nn.autoencoders.pretrained import load_kl_vae
 
     _, torch_params, torch_layouts, _ = load_kl_vae(FIXTURES / "sd3-tiny", jnp.float32, subfolder="")
     shutil.copy(FIXTURES / "sd3-tiny" / "config.json", tmp_path / "config.json")
@@ -348,15 +346,15 @@ def test_a_flax_layout_vae_binds_as_its_torch_layout_does(tmp_path):
 
     assert written(flax_layouts) == written(torch_layouts)
     latent = jax.random.normal(jax.random.key(0), (1, 2, 2, 16))
-    standalone = StableDiffusionVAE(str(tmp_path), dtype=jnp.float32)
+    standalone = load_kl_vae(str(tmp_path), jnp.float32, revision="bf16", subfolder=None)[0]
     np.testing.assert_array_equal(np.asarray(standalone.decode(standalone.params, latent)),
                                   np.asarray(vae.decode(flax_params, latent)))
 
 
 def test_a_kl_config_naming_no_class_is_an_autoencoder_kls():
     """An older AutoencoderKL's config names no class; the KL loaders take it as one."""
-    from dew.nn.autoencoders.api import check_class
-    from dew.nn.autoencoders.vae import PUBLISHED
+    from dew.interop.autoencoders.common import check_class
+    from dew.interop.autoencoders.vae import PUBLISHED
 
     check_class({"block_out_channels": [64]}, PUBLISHED, "an old checkpoint", nameless=True)
     with pytest.raises(ValueError):
@@ -367,7 +365,7 @@ def test_a_local_pipelines_autoencoder_loads_from_its_vae_folder(tmp_path):
     """`load_autoencoder` given a local pipeline's root reads the AutoencoderKL in its `vae/` folder."""
     from interop_support import extract_fixture
 
-    from dew.nn.autoencoders.pretrained import load_autoencoder
+    from dew.interop.autoencoders.pretrained import load_autoencoder
 
     root = extract_fixture(FIXTURE_ROOT / "sd3_source.tar.xz", tmp_path)
     pipeline = next(path.parent.parent for path in root.rglob("vae/config.json"))

@@ -39,9 +39,9 @@ from reference_error import (
 )
 
 from dew.batch import coordinates
-from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
+from dew.nn.inputs import DenoisingCondition
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("square", "rect", "odd", "padded", "acausal", "eps")

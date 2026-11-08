@@ -53,8 +53,6 @@ from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from dew._records import JSON
-    from dew.diffusion.process import DenoisingCondition
-    from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.backbones.decoder_stack import DecoderBank, StackView
     from dew.nn.continuum import HeadTerms, LevelTerms
@@ -62,7 +60,9 @@ if TYPE_CHECKING:
     from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
+    from dew.nn.flops import ConditionWork
     from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.inputs import DenoisingCondition
     from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
     from dew.nn.norms import NormBounds
@@ -599,8 +599,8 @@ class TokenModel(Protocol):
 
 
 class DenoisingModel(Protocol):
-    """A diffusion network's output for `sample` at `time`, given its conditions:
-    arrays, encoded text (`TextContext`) or a process's `DenoisingCondition`."""
+    """A diffusion network's output for `sample` at `time`, given its conditions: arrays, encoded text
+    (`TextContext`) or a denoiser's conditioning inputs (`dew.nn.inputs.DenoisingCondition`)."""
 
     def __call__(self, sample: jax.Array, time: jax.Array, *, train: bool = False,
                  **conditions: ModelKwarg | TextContext | DenoisingCondition) -> jax.Array: ...
@@ -771,7 +771,7 @@ class Scanning(Protocol):
     """A decoder whose like layers, and those repeating one period, can run under flax's scan
     (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
 
-    def with_scanned_layers(self, scanned: bool = True) -> Self: ...
+    def with_scanned_layers(self) -> Self: ...
 
 
 @runtime_checkable

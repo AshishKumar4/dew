@@ -12,10 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.diffusion.process import DenoisingCondition
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
 from dew.nn.backbones.unet_condition import UNet2DCondition
+from dew.nn.inputs import DenoisingCondition
 from dew.sampling.walks import sample
 
 ROWS = 256

@@ -85,7 +85,7 @@ from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.nn.protocols import MediaWrapper
-from dew.nn.sharding import boxed, current_boxes, drawn_axes
+from dew.nn.sharding import boxed, current_boxes
 from dew.objectives.base import SavedTask
 from dew.registry import (
     ModelConfig,
@@ -125,7 +125,6 @@ class Placing(Protocol):
 
     def __call__(self, variables: Variables, model: RefinesLayout | None = None,
                  axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
-
 
 
 def _in_language_model(path: tuple[str, ...]) -> tuple[str, ...]:
@@ -907,7 +906,6 @@ class PretrainedDecoder(Pretrained):
         return _text_generation(self, sampling)
 
 
-
 @dataclass(frozen=True)
 class PretrainedMaskedDecoder(Pretrained):
     """A masked-diffusion decoder (LLaDA, Dream).
@@ -1001,7 +999,6 @@ class PretrainedBlockDecoder(Pretrained):
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
             n=return_sequences(self.config, self.generation_config),
         ))
-
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2006,7 +2003,7 @@ def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | N
                                    placed: Callable[[Variables], Variables], scan: bool = False) -> Loaded:
     """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0, its
     parameters placed as the load places the source's (`placed`), before the load's residency; and its
-    decoder, or a wrapper's language model, scanning its runs or not as `scan` says (`Scanning`), a
+    decoder, or a wrapper's language model, scanning its runs where `scan` says (`Scanning`), a
     field of how the model runs, its stored tree unchanged, as its stack reads the layers through its
     view."""
     from dew.nn.protocols import Scanning
@@ -2051,7 +2048,6 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
                          f"and weights describe, and {' and '.join(selected)} selects another payload; "
                          "load it without fallback")
     return selected
-
 
 
 def _load_settings(precision: Numerics | str | None, dtype: DTypeLike | None,
@@ -2187,20 +2183,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         # A readout released alone reads no backbone to draw it over: placed by its shapes alone.
         return Pretrained(head, placed(variables), None, {}, directory,
                           record_fields(head, type(head)), revision=source.revision)
-    return description.bundle(backbone, head, placed(variables, axes=head_axes(head, backbone)), directory,
-                              description.tokenizer_folder, **description.fields)
-
-
-def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
-    """The axes a readout draws each of its parameters in over `backbone` (`DecisionModel.initialize_head`
-    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by. The backbone's leaves
-    enter as their shapes, a streamed load's unread ones (`SourceLeaf`) among them."""
-    from dew.decision.head import Head
-    from dew.decision.model import DecisionModel
-
-    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), backbone.variables)
-    return drawn_axes(lambda key, variables: DecisionModel(backbone.model, from_record(Head, head))
-                      .initialize_head(key, variables, jnp.zeros((1, 1), jnp.int32)), shapes)
+    return description.bundle(backbone, head, placed(variables, axes=head_source.axes(head, backbone)),
+                              directory, description.tokenizer_folder, **description.fields)
 
 
 def _native_config(config: Mapping[str, object],

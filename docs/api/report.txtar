@@ -825,6 +825,12 @@ dew.inputs.spec.TextCondition
   unconditional: str = ''
   max_length: int | None = None
   revision: str | None = None
+dew.interop.autoencoders.pretrained.PretrainedAutoencoder
+  modelname: str = 'pcuenq/sd-vae-ft-mse-flax'
+  revision: str = 'bf16'
+  dtype: DtypeName = 'bfloat16'
+  latent_shift: float | None = None
+  latent_scale: float | None = None
 dew.lora.LoRA
   rank: int
   modules: tuple[str, ...]
@@ -833,12 +839,6 @@ dew.lora.LoRA
   dropout: float = 0.0
   source: str | None = None
   weight_name: str | None = None
-dew.nn.autoencoders.pretrained.PretrainedAutoencoder
-  modelname: str = 'pcuenq/sd-vae-ft-mse-flax'
-  revision: str = 'bf16'
-  dtype: DtypeName = 'bfloat16'
-  latent_shift: float | None = None
-  latent_scale: float | None = None
 dew.nn.dex.DifferentialExtension
   layers: tuple[tuple[int, tuple[int, ...]], ...]
   lambda_init: float | None = None

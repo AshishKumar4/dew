@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
+from dew.interop.autoencoders.pretrained import load_kl_vae
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vae"
 TINY = FIXTURES / "sd3-tiny"
@@ -41,7 +41,7 @@ def largest_difference(actual, expected) -> float:
 @pytest.fixture(scope="module")
 def autoencoder():
     """The fixture VAE with its own normalization, not the SD1 defaults."""
-    return StableDiffusionVAE(str(TINY), dtype=np.float32)
+    return load_kl_vae(str(TINY), np.float32, revision="bf16", subfolder=None)[0]
 
 
 @pytest.mark.parametrize(("walk", "given", "output", "what"), [
@@ -80,7 +80,8 @@ def test_the_real_sd3_vae_round_trips():
     close in PSNR."""
     import jax.numpy as jnp
 
-    vae = StableDiffusionVAE("chendelong/stable-diffusion-3-medium-vae", dtype=np.float32)
+    vae = load_kl_vae("chendelong/stable-diffusion-3-medium-vae", np.float32, revision="bf16",
+                      subfolder=None)[0]
     assert vae.latent_channels == 16 and vae.downscale_factor == 8
 
     ramp = jnp.linspace(-0.8, 0.8, 64)

@@ -12,32 +12,16 @@ sees.
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping
-from pathlib import Path
-from typing import TYPE_CHECKING
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
 from dew.batch import Variables
-from dew.interop.components import bind_component
 from dew.nn.kernels.options import program
 
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import LatentNormalization, ModuleAutoEncoder, published_source
+from .api import LatentNormalization, ModuleAutoEncoder
 from .kl import AutoencoderKL
-
-if TYPE_CHECKING:
-    from dew.interop.streaming import WeightLayout
-
-STATISTICS = ("bn.running_mean", "bn.running_var", "bn.num_batches_tracked")
-"""The batch norm's buffers: its statistics become the latent normalization,
-and it computes nothing else."""
-
-
-PUBLISHED = ("AutoencoderKLFlux2",)
-"""The `_class_name` a published AutoencoderKLFlux2's config states."""
 
 
 def _folded(model: AutoencoderKL, params, image, key=None, noise=None):
@@ -85,31 +69,3 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
         return 4 * self.model.latent_channels
 
 
-def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-                   subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                   lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
-                   ) -> tuple[Flux2Autoencoder, Variables, tuple[WeightLayout, ...], dict]:
-    """Build a published FLUX.2 VAE, its parameters and their source layouts
-    from `subfolder` of a pipeline directory or Hub repo. The batch norm's
-    running statistics are read from the weights even where `params` are
-    supplied, since they are the latent normalization, not parameters.
-    `lazy` leaves the parameters `SourceLeaf`s for a placement to read
-    (`dew.interop.weights.record_layouts`)."""
-    from dew.interop.safetensors_io import read_weights
-    from dew.nn.autoencoders.vae import _vae_path
-
-    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=True)
-    if tuple(config.get("patch_size", (2, 2))) != (2, 2):
-        raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
-    model = AutoencoderKL.from_diffusers(config, compute)
-    tensors = read_weights(directory)
-    frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
-                                 jnp.float32)
-    return bind_component(
-        directory, "vae", config, model,
-        lambda name, rank: None if name in STATISTICS else _vae_path(name, rank),
-        lambda bound: Flux2Autoencoder(model=model, params=bound, mean=tensors["bn.running_mean"],
-                                       variance=tensors["bn.running_var"],
-                                       epsilon=config.get("batch_norm_eps", 1e-4)),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes,
-        inputs=(frame,), tensors=tensors)

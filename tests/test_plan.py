@@ -605,7 +605,11 @@ def test_a_waiting_window_reports_in_a_run_that_cannot_create_a_process(tmp_path
     """A window that waits (`ProfileWindow.wait`) converts its capture's reports in the run's own process as
     it stops: a fit in a program its sandbox forbids to create processes (the live site's guest policy, a
     seccomp filter on fork and clone, `site/live/container/guest_limits.py`) finishes with its window's
-    reports written, where an exporter's process of its own could not start."""
+    reports written, where an exporter's process of its own could not start. The guest holds a uid of its
+    own, as each of the site's kernels does (`site/live/container/gateway_manager.py`), here a user
+    namespace's, so the policy's 256 threads are its own, beside another process of the test's uid holding
+    300 threads, as a host's neighbouring runs do (row 4869: sharing their uid, its threads failed to start,
+    pthread_create's EAGAIN, and the run aborted)."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import os
     import subprocess
@@ -616,8 +620,13 @@ def test_a_waiting_window_reports_in_a_run_that_cannot_create_a_process(tmp_path
 
     root = Path(dew.__file__).resolve().parents[2]
     script = f"""
-import importlib.util, sys
+import importlib.util, os, sys
 sys.path.insert(0, {str(root / "tests")!r})
+# A uid of its own, mapped to the test's, so the threads the policy counts are this guest's alone.
+uid = os.getuid()
+os.unshare(os.CLONE_NEWUSER)
+with open("/proc/self/uid_map", "w") as handle:
+    handle.write(f"{{uid}} {{uid}} 1\\n")
 import jax, jax.numpy as jnp, numpy as np, optax
 from affine_run import Replaying
 from dew.data.dataset import Loader
@@ -641,8 +650,18 @@ trainer.fit(Loader(lambda partition: rows, None, None, {ROWS}), steps=3)
 """
     source = str(root / "src")
     path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
-    subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
-                   env={**os.environ, "PYTHONPATH": path})
+    # A neighbour of the test's uid holding 300 threads, past the policy's 256 for a uid.
+    neighbour = subprocess.Popen([sys.executable, "-c", "import threading, time, sys\n"
+                                  "for _ in range(300): threading.Thread(target=time.sleep, args=(600,), "
+                                  "daemon=True).start()\nprint(flush=True)\ntime.sleep(600)"],
+                                 stdout=subprocess.PIPE, text=True)
+    try:
+        neighbour.stdout.readline()
+        subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
+                       env={**os.environ, "PYTHONPATH": path})
+    finally:
+        neighbour.kill()
+        neighbour.wait()
     (capture,) = (tmp_path / "trace").glob("capture-*")
     record = json.loads((capture / "manifest.json").read_text())
     assert record["capture_status"] == record["export_status"] == "completed"
