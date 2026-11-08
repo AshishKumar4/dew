@@ -173,7 +173,8 @@ def enable_compilation_cache(path: str):
     `<path>/pallas`, keyed by the installed code and all the lowering reads
     (Dew's JAX build's `jax_pallas_lowering_cache_dir`), so a later process
     reads it back rather than lowering it again; a directory the user named
-    (`JAX_PALLAS_LOWERING_CACHE_DIR`) is theirs.
+    (`JAX_PALLAS_LOWERING_CACHE_DIR`) is theirs. Dew is declared sealed by its source
+    (`JAX_PALLAS_LOWERING_CACHE_SOURCES`), so its kernels holding its own code are kept too.
 
     A run under `--xla_gpu_deterministic_ops` keeps no picks (`keeps_picks`):
     jax 0.11.2's XLA measures nothing there and gives each instruction the
@@ -198,6 +199,12 @@ def enable_compilation_cache(path: str):
     jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
     if 'JAX_PALLAS_LOWERING_CACHE_DIR' not in os.environ:
         jax.config.update('jax_pallas_lowering_cache_dir', os.path.join(path, 'pallas'))
+    # Dew's code a kernel holds as it lowers (an inline_mgpu body, a marked call) is named in that cache by
+    # Dew's source, its whole tree's digest (Dew's JAX build's declared source packages): Dew's code a
+    # lowering runs reads nothing but its arguments, its closure and Dew's code. Without it, a third of
+    # Dew's kernels are lowered afresh in every process (FS-LCACHE-2).
+    declared = {name for name in os.environ.get('JAX_PALLAS_LOWERING_CACHE_SOURCES', '').split(',') if name}
+    os.environ['JAX_PALLAS_LOWERING_CACHE_SOURCES'] = ','.join(sorted(declared | {'dew'}))
     # JAX's defaults skip small and fast compilations; a run's many small programs (its schedule, its
     # metrics, its data's transforms) each compile again on every restart without them, so every
     # program is cached, unless the user named a threshold (JAX_PERSISTENT_CACHE_MIN_*), which is theirs.
