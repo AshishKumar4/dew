@@ -153,6 +153,9 @@ def test_the_attention_kernels_run_on_this_gpu(part):
         *(Cell(f"a verify block of {drafts} through the route is on par",
                functools.partial(decode_template.a_verify_block_through_the_route_is_on_par, drafts))
           for drafts in (4, 8, 16)),
+        *(Cell(f"a paged decode step of {page}-key pages is on par",
+               functools.partial(decode_template.a_paged_decode_step_of_small_pages_is_on_par, page))
+          for page in decode_template.served_small_pages()),
     ], part, KERNEL_PARTS))
 
 

@@ -129,7 +129,8 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     residency holds, `MosaicForward.resident`), but each slice at least twice its ring's stages of key tiles:
     a shorter slice's walk spends its prologue's loads, `stages` tiles, without as many steps of products to
     hide them (ET-DECODE2-h100: 32 slices of one key tile each, at batch 1 over 4096 keys, took 22 us where
-    cuDNN's whole step took 13). Where the family fixes a tile up across programs (`Family.fixes_up`), the
+    cuDNN's whole step took 13). Where the family fixes a tile up across programs (`Family.fixes_up`) and the
+    launch's merge costs less than XLA's (`MERGE_SLICE_SECONDS` a slice against `XLA_MERGE_SECONDS`), the
     launch merges the slices in the last to arrive, the initial state with them (`MosaicForward.merges`);
     elsewhere each slice writes its fp32 state, which XLA merges (`algebra.merged_slices`), at a config
     derived for them."""
@@ -145,20 +146,41 @@ def plan(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, ho
     programs = op.parts * query.shape[0] * query.shape[2] * tiles
     if programs >= processors:
         return Plan(config, 1, merges=False)
-    if not bundle_of(config, query.dtype).fixes_up:
+
+    def sliced(config, op, ba) -> int:
+        # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`,
+        # at most those it holds), none past them: one program past those it holds waits a whole walk for a
+        # slot (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a second wave as
+        # long as the first), and one past those that stream it only lengthens the merge.
+        longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
+        return max(1, min(processors * op.streamed(ba, config, target) // programs, longest))
+
+    slices = sliced(config, op, ba)
+    # The launch merges its slices where its family fixes a tile up across programs and that costs less than
+    # XLA's merge: the last program to arrive reads every slice's state in turn (`MERGE_SLICE_SECONDS` a
+    # slice), XLA's merge a launch of its own over them all (`XLA_MERGE_SECONDS`).
+    merges = (bundle_of(config, query.dtype).fixes_up
+              and slices * MERGE_SLICE_SECONDS < XLA_MERGE_SECONDS)
+    if slices > 1 and not merges:
         walked = None if hooks is None else dataclasses.replace(hooks, initial=None)
         found = _streamed(query, key, value, spans, walked, scale=scale, target=target, table=table,
                           sources=sources, out_dtype=jnp.float32, scales=scales)
         if found is None:
             return Plan(config, 1, merges=False)
         config, op, ba = found
-    longest = math.ceil(spans.keys / config.block_k) // (2 * config.stages)
-    # The most slices whose programs keep the device's stream in flight at once (`MosaicForward.streamed`, at
-    # most those it holds), none past them: one program past those it holds waits a whole walk for a slot
-    # (ceil(132 / 8) = 17 slices of one row's 8 key heads is 136 programs, 4 of them a second wave as long as
-    # the first), and one past those that stream it only lengthens the merge.
-    slices = max(1, min(processors * op.streamed(ba, config, target) // programs, longest))
-    return Plan(config, slices, merges=slices > 1 and bundle_of(config, query.dtype).fixes_up)
+        slices = sliced(config, op, ba)
+    return Plan(config, slices, merges=slices > 1 and merges)
+
+
+MERGE_SLICE_SECONDS = 0.49e-6
+"""What a launch's merge costs a slice (`plan`): its last program reads each slice's fp32 state in turn, a
+dependent round trip each; at 32768 keys 64 wide, 49 slices merged in the launch took 56 us where the same
+split took 28 and its natural launch 4 (M-DD-12, W90-gh200 at 8081e8a10d4): 24 us, 0.49 a slice."""
+
+XLA_MERGE_SECONDS = 14.6e-6
+"""What XLA's merge of a call's slices costs (`algebra.merged_slices`, `plan`): a launch of its own over every
+slice's state, beside the fp32 states the slices write; at 4096 keys 128 wide, 16 slices merged by XLA took
+64.4 to 70.4 us where the launch's own merge took 57.6 (M-DD-12): its 16 slices' 7.8 us and 6.8 more."""
 
 
 def _streamed(query, key, value, spans: KeySpans, hooks: Hooks | None, *, scale: float | None,
