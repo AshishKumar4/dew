@@ -1717,6 +1717,9 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 def staged_at(index, slots):
                     # The step of its group's the program walks, from its first (`start`).
                     index = index + start
+                    if family.rewrites_in_persist:
+                        # The stage rewritten by its family's own role (`rewritten`).
+                        return slots['ring_0'].transpose((1, 0)), slots['ring_1']
                     if k_major:
                         # Its depth rows of the rows' block and the cotangent's block read transposed: whole
                         # steps of one group, nothing to rewrite.
@@ -1747,10 +1750,23 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                 lambda value: store(0, value, o_gmem.at[g_i], place),
                                 firsts=workspace.at[:, 1, wg])
 
+            def rewritten(tile, index, slots):
+                # A step's neighbouring groups' rows zeroed in both stages, whole (`_zero_neighbours_of`).
+                g_i, _, _, steps, start, *_ = tile
+                rows_stage, cotangent_stage = slots['ring_0'], slots['ring_1']
+                widths = [(stage, mosaic.swizzle_columns(stage.dtype, mosaic.SWIZZLE_BYTES))
+                          for stage in (rows_stage, cotangent_stage)]
+                shares = [(stage.at[:, pl.ds(column, width)], None) for stage, width in widths
+                          for column in range(0, stage.shape[1], width)]
+                _zero_neighbours_of(family, shares, index + start, starts_gmem[g_i], ends_gmem[g_i], steps,
+                                    block_k, aligned_skip=True)
+
             walks = (g * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
+            rewrite = {'prepared': rewritten} if family.rewrites_in_persist and not k_major else {}
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
-                           in_flight=family.in_flight, accumulators=(part,))
+                           in_flight=family.in_flight, accumulators=(part,),
+                           **_summed(family, tiles, exact_sums), **rewrite)
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
@@ -1758,9 +1774,11 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                              **_tgmm_gathered(tables, allocations.blocks, bool(interpret))))
 
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
+    # A family rewriting the stage in a role of its own runs it beside the consumers (`rewritten`).
+    roles = consumers + (family.rewrites_in_persist and not k_major)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
-                           consumers=consumers, interpret=interpret, approx_math=False, name="dew_tgmm",
+                           consumers=roles, interpret=interpret, approx_math=False, name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     present = tuple(table for table in tables if table is not None)
@@ -1925,6 +1943,9 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
     (`tgmm`'s `step_scales`); with a `window` of several steps (`mosaic.Issuer.summed_window`), the
     tensor cores' sum of each window's steps added at its end, the last window's however short. A tile of
     no steps is zero."""
+    if exact_sums and family.sums_in_persist:
+        # Its persist sums the windows itself (`_summed`): the steps walked plainly.
+        exact_sums = False
     if exact_sums and scaling is None and window > 1:
         def windowed_step(index, slots, running, accumulators):
             (fresh,) = accumulators

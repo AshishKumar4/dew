@@ -1323,6 +1323,11 @@ class Issuer[Accumulator](abc.ABC):
     the first in a consumer's registers (`column_registers`); where not (tcgen05's, whose accumulators stay
     in tensor memory, read out in chunks), its two products run apart."""
 
+    rewrites_in_persist: bool = False
+    """Whether its persistent walk rewrites a step's slots in a role of its own before the products read them
+    (`persist`'s `prepared`: a kernel gradient's neighbouring groups' rows zeroed), its consumers issuing no
+    product a rewrite could precede."""
+
     sums_in_persist: bool = False
     """Whether its persistent walk sums an exactly summed launch's steps a window at a time itself
     (`persist`'s `summed`), each window's products in an accumulator of their own promoted into the running

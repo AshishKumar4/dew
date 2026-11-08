@@ -768,12 +768,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         where its register model counts what they hold (a paired product's epilogue over its two
         accumulators alone every family's counts, `registers`); a step that prepares its operands (a
         prologue's rewrite, a consumer's own share of the rows' stage, an exactly summed step's product
-        apart, but where its persistent walk sums the windows itself: `sums_in_persist`) where its consumers
-        issue their products."""
+        apart, but where its persistent walk sums the windows itself, `sums_in_persist`, or rewrites the
+        stage in a role of its own, `rewrites_in_persist`) where its consumers issue their products."""
         dtype = ba.arguments['tokens'].dtype
         hooked = ba.arguments['hooks'] != NO_HOOKS and not _pair_alone(ba, family)
         summed = bool(ba.arguments.get('exact_sums'))
-        prepared = (ba.arguments['hooks'].prologue is not None or self.STAGED_ROWS
+        prepared = (ba.arguments['hooks'].prologue is not None
+                    or (self.STAGED_ROWS and not family.rewrites_in_persist)
                     or (summed and not family.sums_in_persist))
         # Gathered rows (`gmm_call`'s `gather`) are a ring family's producer's gather, no prologue rewriting
         # them (`mosaic_gpu._gather_refused`).

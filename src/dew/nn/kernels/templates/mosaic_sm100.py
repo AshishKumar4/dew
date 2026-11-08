@@ -565,6 +565,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     sums_in_persist = True  # each window's partial promoted by the epilogue warpgroup (`persist`'s `summed`)
 
+    rewrites_in_persist = True  # a rewriting warpgroup between the loads and the products (`prepared`)
+
     def summed_window(self, block_k: int) -> int:
         # A window is `product.SUMMED_DEPTH` deep, its in-order adds no deeper than mma.sync's window's.
         from dew.nn.kernels.templates import product
@@ -622,8 +624,15 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = (), summed: int = 0) -> None:
-        """`mosaic.Family.persist`. With `summed`, an exactly summed launch's (`exact_sums`): each tile's
+                unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
+                prepared: Callable | None = None) -> None:
+        """`mosaic.Family.persist`. With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots
+        before its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role
+        of its own past the consumers (`warpgroups`: the launch's consumers one more): it waits for each
+        step's loads, rewrites them, publishes them to the tensor cores and arrives at the step's `masked`
+        barrier, which the product warp waits for in the loads' place (a ring of three parties: the
+        producer's loads, the rewrite, the products). With `summed`, an exactly summed launch's
+        (`exact_sums`): each tile's
         steps `summed` at a time, a window, each window's products into a turn's partials of their own (its
         first product not accumulating), which the epilogue warpgroup promotes into the tile's running sums
         in tensor memory (`promoted`: each chunk of the partial and the running sum out, an IEEE add, the
@@ -640,13 +649,19 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         for ring in rings.values():
             ring.initialized()
         staging = self.output_staging(outputs, consumers)
+        stages = min(ring.stages for ring in rings.values())
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
 
         def windows(steps):
             return 1 if not summed else (steps + summed - 1) // summed
 
-        def scoped(tmem, done, read, *smems):
+        def scoped(tmem, done, read, *rest):
+            # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
+            # slot's `masked` barrier in its loads' place.
+            masked, smems = (rest[0], rest[1:]) if prepared is not None else (None, rest)
+            issued = rings if prepared is None else {name: dataclasses.replace(ring, full=masked)
+                                                     for name, ring in rings.items()}
             def turn_of(done_turns) -> mosaic.Turn:
                 return mosaic.Turn.of(done_turns, self.turns)
 
@@ -662,7 +677,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             # An exactly summed tile's running sums: the columns past the turns'.
             running = at_columns(self.turns * width) if summed else ()
 
-            products = self._issued(rings, issue, turn_of, held, running, read, done, summed=summed,
+            products = self._issued(issued, issue, turn_of, held, running, read, done, summed=summed,
                                     interpret=interpret, unrolled=unrolled)
 
             def promoted(turn: mosaic.Turn, first) -> None:
@@ -719,10 +734,17 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
                 mosaic.drained(read, computed, self.turns)
 
-            self.roles_of(((consumers, epilogue),), load=load, products=issue_all)
+            def rewrite(index):
+                del index
+                persistent.tiled(tiles, schedule, functools.partial(_rewritten, rings, masked, prepared),
+                                 axis=axis)
 
+            table = ((consumers, epilogue),) + (((1, rewrite),) if prepared is not None else ())
+            self.roles_of(table, load=load, products=issue_all)
+
+        masked = () if prepared is None else (plgpu.Barrier(num_barriers=stages),)
         pl.run_scoped(scoped, plgpu.TMEM((self.rows, (self.turns + bool(summed)) * width), jnp.float32),
-                      *self.persist_scratch(consumers)[0], *staging, collective_axes="wg")
+                      *self.persist_scratch(consumers)[0], *masked, *staging, collective_axes="wg")
 
 
     def _issued(self, rings, issue: Callable, turn_of: Callable, held: Callable, running: tuple, read,
@@ -789,6 +811,25 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
 RINGS = Tcgen05Rings()
 """The tcgen05 bundle (`bundles.of` on sm100 and sm103)."""
+
+
+def _rewritten(rings: dict, masked, prepared: Callable, counter, active, steps, views, tile, done) -> None:
+    """A rewriting role's visit of a persistent tile (`Tcgen05Rings.persist`'s `prepared`): each of its steps'
+    slots, once loaded, rewritten (`prepared(tile, index, slots)`), published to the tensor cores and the
+    step's `masked` barrier arrived at; none where the tile streams nothing."""
+    del views, done
+
+    @pl.when(active)
+    def _():
+        def step(index, carry):
+            turn = mosaic.Turn.of(counter + index, min(ring.stages for ring in rings.values()))
+            slots = {name: ring.acquire(turn) for name, ring in rings.items()}
+            prepared(tile, index, slots)
+            plgpu.commit_smem()
+            plgpu.barrier_arrive(masked.at[mosaic.opaque(turn.slot)])
+            return carry
+
+        lax.fori_loop(0, steps, step, None)
 
 
 def _issuing(load: Callable[[], None], products: Callable[[], None]) -> None:
