@@ -297,6 +297,38 @@ def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers(monkeypatc
         assert head + read(resumed_in, 7, saved)[0] == whole
 
 
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_position_saved_under_plan_version_10_resumes_as_10_read_it(workers):
+    """A per-share read saved under plan version 10, in no workers or in two, which each read every
+    second input, resumes under this Dew's version (`IN_ORDER`) as 10 read it, in the workers its position
+    names (`_PerShare.resumed_at`): on the batches 10's read goes on to, bit for bit, and its positions name
+    10 still."""
+    from dew.data.plan import FILE_SHARDS, IN_ORDER
+
+    chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
+             .flat_map(_Spread()).batch(4))
+    earlier = compile(chain, seed=5, loading=Loading(workers=workers), plan_version=FILE_SHARDS)
+    now = compile(chain, seed=5)
+    assert earlier.plan.version == FILE_SHARDS and now.plan.version == IN_ORDER
+    reader = earlier.train(DataPartition())
+    try:
+        whole = listed(reader, 12)
+    finally:
+        reader.close()
+    reader = earlier.train(DataPartition())
+    try:
+        head, saved = listed(reader, 5), reader.get_state()
+    finally:
+        reader.close()
+    resumed = now.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert head + listed(resumed, 7) == whole
+        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == FILE_SHARDS
+    finally:
+        resumed.close()
+
+
 def test_a_training_read_of_stored_records_reads_in_the_training_process():
     """A training read that names no loading and runs no Python on its records, stored records shuffled into
     batches, starts no worker: a process would only copy what the training process reads as fast."""

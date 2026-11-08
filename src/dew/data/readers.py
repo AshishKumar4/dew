@@ -14,7 +14,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew import _position
-from dew._records import record
+from dew._records import integer, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
@@ -31,7 +31,7 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import COUNTERS, Plan, earlier_position
+from dew.data.plan import COUNTERS, FILE_SHARDS, IN_ORDER, Plan, earlier_position
 from dew.data.shared import SharedMapping
 from dew.data.storage import MIRRORED, PositionText, carried_mirrors, mirror_metrics
 
@@ -203,6 +203,10 @@ class _PublishedCounts:
         self.published = _Published(state, retired=retired)
 
 
+type Opener = Callable[[], pygrain.DatasetIterator[Batch]]
+"""What opens a reader's Grain iterator (`_PerShare`)."""
+
+
 class _PerShare(Forwarding):
     """Lazy Grain reader with owner-published positions and counters."""
 
@@ -227,8 +231,12 @@ class _PerShare(Forwarding):
         stop_seconds: float,
         endless: bool = True,
         replicated: bool = False,
+        saved_as: Callable[[int, int], tuple[Opener, Plan]] | None = None,
     ):
         self._open, self._plan = open_reader, plan
+        # The reader and plan of a position saved under another version this lowering reads by
+        # (`resumed_at`), in the workers it names.
+        self._saved_as = saved_as
         self._resume: Literal["exact", "non-exact"] = resume
         self._stop_seconds = stop_seconds
         self._endless = endless
@@ -298,6 +306,7 @@ class _PerShare(Forwarding):
                 "the saved position is an elastic read's, and this read is per share; resume it with "
                 ".elastic() on the chain")
         decoded = record(json.loads(state), "saved per-share position") if held is None else held
+        self.resumed_at(decoded)
         # The saved position's one translation (`earlier_position`), then its check.
         written, iterator = earlier_position(decoded, self._plan)
         self._plan.check(written, resume=self._resume)
@@ -305,6 +314,21 @@ class _PerShare(Forwarding):
         self.close()
         self._saved = saved
         self._statistics.publish(None)
+
+    def resumed_at(self, decoded: Mapping[str, object]) -> None:
+        """Read on as the saved position `decoded` was read, where its plan's version is one this lowering
+        reads by besides its own (`IN_ORDER` and the version before it, `FILE_SHARDS`, whose plans are one
+        plan read in two ways): its share in the workers it names, its order as that version reads it.
+        A run saved under 10 resumes as 10 read it, and goes on under 10."""
+        saved = record(decoded.get("dew_data_plan", {}), "saved data plan")
+        version = saved.get("version")
+        if self._saved_as is None or version == self._plan.version or {version, self._plan.version} != {
+                FILE_SHARDS, IN_ORDER}:
+            return
+        topology = record(saved.get("topology", {}), "saved data plan topology")
+        workers = integer(topology.get("workers", 0), "saved per-share workers")
+        self._open, self._plan = self._saved_as(integer(version, "saved plan version"), workers)
+        self._plan_record = SharedMapping.of(self._plan.record())
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it

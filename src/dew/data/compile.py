@@ -137,7 +137,7 @@ from dew.data.pipeline import (
     with_stores,
 )
 from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
-from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
+from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import (
     Read,
     Rows,
@@ -1402,27 +1402,39 @@ def _training_reader(
     else:
         if build.elastic:
             _refuse_inelastic(pipeline)
-        own_plan = dataclasses.replace(
-            plan,
-            # An elastic read's order is one reader's at any count, its position every reader's.
-            topology={"elastic": True} if build.elastic else {
-                "shares": partition.count,
-                "share": partition.index,
-                # A read in its inputs' order in any count of workers (`_Build.in_order`) names none.
-                **({} if build.in_order else {"workers": _workers(pipeline, build.loading)}),
-                "row_multiple": partition.row_multiple,
-                "cycle_lengths": [
-                    stage.cycle_length for stage in _steps(pipeline) if isinstance(stage, Interleave)
-                ],
-                # Where a read that drops records reads in workers of each corpus's own (`pooled`),
-                # each worker's position is that corpus's, saved in that many.
-                **({} if build.pool is None else {"pools": build.pools(pipeline)}),
-            },
-        )
+
+        def per_share(chosen: _Build) -> tuple[Opener, Plan]:
+            """The reader `chosen` opens over this share and the plan its positions name."""
+            return functools.partial(chosen.batches, pipeline, partition), dataclasses.replace(
+                plan, version=chosen.version,
+                # An elastic read's order is one reader's at any count, its position every reader's.
+                topology={"elastic": True} if chosen.elastic else {
+                    "shares": partition.count,
+                    "share": partition.index,
+                    # A read in its inputs' order in any count of workers (`_Build.in_order`) names none.
+                    **({} if chosen.in_order else {"workers": _workers(pipeline, chosen.loading)}),
+                    "row_multiple": partition.row_multiple,
+                    "cycle_lengths": [
+                        stage.cycle_length for stage in _steps(pipeline) if isinstance(stage, Interleave)
+                    ],
+                    # Where a read that drops records reads in workers of each corpus's own (`pooled`),
+                    # each worker's position is that corpus's, saved in that many.
+                    **({} if chosen.pool is None else {"pools": chosen.pools(pipeline)}),
+                })
+
+        def saved_as(version: int, workers: int) -> tuple[Opener, Plan]:
+            """This share read as a position saved under plan `version` reads, in the `workers` it names:
+            this build at that version, its workers pooled again (`_Build.pooled`)."""
+            loading = dataclasses.replace(build.loading, workers=workers)
+            return per_share(dataclasses.replace(build, version=version, loading=loading, pool=None
+                                                 ).pooled(pipeline))
+
+        opener, own_plan = per_share(build)
         opened = _PerShare(
-            functools.partial(build.batches, pipeline, partition),
+            opener,
             own_plan,
             resume,
+            saved_as=saved_as,
             stop_seconds=build.loading.stop_seconds,
             endless=build.lowering.endless,
             replicated=build.elastic,
