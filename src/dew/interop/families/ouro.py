@@ -9,9 +9,11 @@ the two around the MLP `post_attention_layernorm` and
 `post_attention_layernorm_2`.
 
 OuroForCausalLM exits where the cumulative exit probability first reaches
-`early_exit_threshold`. At 1.0 that is the last pass, unless an earlier
-hazard rounds to 1 in floating point; the decoder here always reads the last
-pass, so another threshold, or an `early_exit_step` before the last, is refused.
+`early_exit_threshold`, which the decoder's loop does too (`Loop.exit_threshold`).
+At 1.0 that is the last pass, unless an earlier hazard rounds to 1 in floating
+point, and the decoder reads the last pass. A stated `early_exit_step` comes
+before the threshold, as it does in OuroForCausalLM.forward: the last step reads
+the last pass whatever the threshold, and one before it is refused.
 """
 
 from collections.abc import Mapping
@@ -57,23 +59,27 @@ def _ouro_window(hf_config: Mapping[str, object], used: set[str], record: Decode
 
 
 def _ouro_loop(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    """The universal transformer's passes, its decoder reading the last (an early exit at threshold 1.0,
-    the last step)."""
+    """The universal transformer's passes, its decoder exiting each token where its cumulative exit
+    probability reaches `early_exit_threshold`, the last pass at 1.0 or where `early_exit_step` names it,
+    which comes first."""
     used.update(('total_ut_steps', 'early_exit_threshold', 'early_exit_step'))
     steps = _records.integer(hf_config.get('total_ut_steps', 4), 'total_ut_steps')
-    threshold = hf_config.get('early_exit_threshold', 1.0)
-    if threshold is not None and _records.number(threshold, 'early_exit_threshold') != 1.0:
-        refuse(f'early_exit_threshold {threshold!r}', 'the decoder reads the last pass, which 1.0 exits at')
+    stated = hf_config.get('early_exit_threshold', 1.0)
+    threshold = None if stated is None else _records.number(stated, 'early_exit_threshold')
     exit_step = hf_config.get('early_exit_step')
     if exit_step is not None and _records.integer(exit_step, 'early_exit_step') != steps - 1:
-        refuse(f'early_exit_step {exit_step!r}', f'the decoder reads the last pass, step {steps - 1}')
-    record['loop'] = {'steps': steps, 'exit_gate': True}
+        refuse(f'early_exit_step {exit_step!r}',
+               f'the decoder reads the pass its threshold exits at, or the last, step {steps - 1}')
+    last = exit_step is not None or threshold in (None, 1.0)
+    record['loop'] = {'steps': steps, 'exit_gate': True, 'exit_threshold': None if last else threshold}
     return record
 
 
 def _ouro_loop_written(model: CausalTransformer) -> Mapping[str, object]:
     assert model.loop is not None
-    return {'total_ut_steps': model.loop.steps, 'early_exit_threshold': 1.0}
+    threshold = model.loop.exit_threshold
+    return {'total_ut_steps': model.loop.steps,
+            'early_exit_threshold': 1.0 if threshold is None else threshold}
 
 
 OURO_CONFIG = ConfigLayout(

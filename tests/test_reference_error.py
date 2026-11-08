@@ -2320,3 +2320,29 @@ def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
             null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
     else:
         null_runs(arm, draw, label, seeds=8, runs=1, truth_fn=truth)
+
+
+def test_a_leafs_mean_squared_error_keeps_its_subnormal_value():
+    """Two leaves whose errors square below float64's least normal (about 1e-160 and 1e-158 off a truth
+    of 1e-145) keep their mean squared errors, as numpy computes them, to the subnormals' spacing: check
+    1's statistics run where float64 keeps a subnormal (`reference_error._computed_here`), so no compiled
+    arithmetic flushes one to zero and reads both at `_missed`'s floor."""
+    from reference_error import leaf_summary
+
+    truth = np.full((4, 8), 1e-145)
+    for offset in (1e-160, 1e-158):
+        expected = np.mean(np.square((truth + offset) - truth))
+        assert expected > np.nextafter(0.0, 1.0)
+        assert abs(leaf_summary(truth + offset, truth).mse - expected) <= 2 * np.spacing(expected)
+
+
+def test_a_leaf_missing_its_truth_by_a_subnormal_is_never_read_as_exact():
+    """A leaf that misses its truth only by values below float64's least normal (1e-310 where the truth
+    is zero) is not exact: its mean squared error is above zero, read where float64 keeps a subnormal
+    (`reference_error._computed_here`), so an arm that misses an exact reference is never read as
+    exact."""
+    from reference_error import leaf_summary
+
+    truth = np.zeros((4, 8))
+    assert leaf_summary(truth, truth).mse == 0.0
+    assert leaf_summary(np.full((4, 8), 1e-310), truth).mse > 0.0

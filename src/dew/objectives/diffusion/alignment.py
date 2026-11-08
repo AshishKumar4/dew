@@ -130,8 +130,8 @@ class Alignment:
         if self.source is None:
             raise ValueError(f"the alignment's encoder takes its weights from the starting tree's "
                              f"{REPRESENTATION!r}, which holds none, or from a source; name one")
+        from dew.interop.autoencoders.rae import load_dinov2
         from dew.interop.sources import SourceReference
-        from dew.nn.autoencoders.rae import load_dinov2
 
         reference = SourceReference.parse(self.source)
         module, params, _ = load_dinov2(reference.name, revision=reference.revision,

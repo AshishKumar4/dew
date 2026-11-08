@@ -120,13 +120,14 @@ def shown(log: float) -> str:
     return f"{float(np.exp(np.minimum(log, LOG_LARGEST))):.3e}"
 
 
-def _scaled_rms(rows) -> np.ndarray:
+def _scaled_rms(rows, xp=np):
     """Each row's root mean square of finite values, the row scaled by its largest first, so no square
-    overflows (row 1628): zero for a row of zeros."""
-    rows = np.abs(np.asarray(rows, np.float64))
-    largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
-    scale = np.where(largest > 0, largest, 1.0)
-    return scale[:, 0] * np.sqrt(np.mean(np.square(rows / scale), axis=1))
+    overflows (row 1628): zero for a row of zeros. In numpy, or in `xp` (jax.numpy, inside check 1's
+    programs on a GPU, `reference_error._computed_here`)."""
+    rows = xp.abs(xp.asarray(rows, xp.float64))
+    largest = xp.max(rows, axis=1, keepdims=True) if rows.shape[1] else xp.zeros((len(rows), 1))
+    scale = xp.where(largest > 0, largest, 1.0)
+    return scale[:, 0] * xp.sqrt(xp.mean(xp.square(rows / scale), axis=1))
 
 
 def log_sum(values) -> float:

@@ -1,4 +1,5 @@
-"""A published autoencoder, built as its own config names it."""
+"""A published autoencoder, built as its own config names it: the loader of each class a release's config
+names (`LOADERS`), and the run configuration's `PretrainedAutoencoder`."""
 from __future__ import annotations
 
 import dataclasses
@@ -10,19 +11,28 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
+import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
 from dew.batch import Variables
+from dew.interop.components import bind_component
+from dew.nn.autoencoders.api import AutoEncoder, LatentNormalization
+from dew.nn.autoencoders.dc_ae import DCAutoencoder
+from dew.nn.autoencoders.flux2 import Flux2Autoencoder
+from dew.nn.autoencoders.qwen_image import QwenImageAutoencoder
+from dew.nn.autoencoders.rae import RAEAutoencoder
+from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
+from dew.nn.autoencoders.wan import WanAutoencoder
 from dew.registry import DtypeName
 
 from . import dc_ae, flux2, qwen_image, rae, wan
-from .api import AutoEncoder, LatentNormalization, bound_autoencoder, published_source
-from .dc_ae import DCAutoencoder, load_dc_ae
-from .flux2 import Flux2Autoencoder, load_flux2_vae
-from .qwen_image import QwenImageAutoencoder, load_qwen_image_vae
-from .rae import RAEAutoencoder, load_rae
-from .sd_vae import StableDiffusionVAE, published
+from .common import published_source
+from .dc_ae import load_dc_ae
+from .flux2 import load_flux2_vae
+from .kl import published_kl
+from .qwen_image import load_qwen_image_vae
+from .rae import load_rae
 from .vae import (
     FLAX_REVISIONS,
     FLAX_WEIGHTS,
@@ -32,7 +42,7 @@ from .vae import (
     flax_vae,
     located_vae,
 )
-from .wan import WanAutoencoder, load_wan_vae
+from .wan import load_wan_vae
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -75,12 +85,14 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
         weights = TORCH_WEIGHTS
     if weights == FLAX_WEIGHTS and params is None:
         params, shapes = flax_vae(directory / FLAX_WEIGHTS)
-    model, shift, scale = published(config, compute)
-    return bound_autoencoder(
-        directory, config, model, _vae_path,
-        lambda bound: StableDiffusionVAE(str(name_or_dir), dtype=compute, params=bound, model=model,
-                                         latent_shift=shift, latent_scale=scale),
-        params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes)
+    model, shift, scale = published_kl(config, compute)
+    image = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
+                                 jnp.float32)
+    return bind_component(
+        directory, "vae", config, model, _vae_path,
+        lambda bound: StableDiffusionVAE(model, bound, dtype=compute, latent_shift=shift, latent_scale=scale),
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,),
+        shapes=shapes)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -196,8 +208,8 @@ class PretrainedAutoencoder:
     """A published autoencoder for latent diffusion.
 
     It is the class the checkpoint's config names, one of
-    `dew.nn.autoencoders.pretrained.LOADERS`, or a Stable Diffusion
-    AutoencoderKL (`dew.nn.autoencoders.pretrained.load_autoencoder`).
+    `LOADERS`, or a Stable Diffusion
+    AutoencoderKL (`load_autoencoder`).
     """
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"

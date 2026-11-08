@@ -448,7 +448,7 @@ def test_a_distilled_inpainting_step_reads_no_draw_of_its_attempt():
     from flax import linen as nn
     from test_autoencoder import tiny_vae
 
-    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.inputs import DenoisingCondition
     from dew.objectives.diffusion import DiffusionObjective, GuidanceDistillationObjective
 
     @dataclass(frozen=True, eq=False)

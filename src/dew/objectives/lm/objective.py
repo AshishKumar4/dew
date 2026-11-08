@@ -68,6 +68,7 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
+from dew.nn.backbones.looping import exit_log_distribution
 from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
@@ -87,6 +88,7 @@ from dew.nn.protocols import (
     DecoderTraining,
     Lacks,
     LayerStates,
+    Looped,
     PositionCapacity,
     SteppedFeedForward,
     SteppedInContext,
@@ -439,7 +441,9 @@ class Scores(NamedTuple):
     `[B, seq_len, vocab]` logits the losses were scored from, where
     `token_scores` was asked for them, else None. `moved` is how far a
     continuum level that a run carries moved in context (`Adapted.moved`), else
-    None.
+    None. `exits` is a looped decoder's per-pass losses `[B, seq_len]`, the last
+    pass's `losses`, and its exit gate's logits `[B, seq_len, 1]`, where
+    `token_scores` was asked for them, else None.
     """
 
     losses: jax.Array
@@ -456,6 +460,7 @@ class Scores(NamedTuple):
     logits: jax.Array | None = None
     inspected: dict | None = None
     moved: Mapping | None = None
+    exits: tuple[tuple[jax.Array, ...], tuple[jax.Array, ...]] | None = None
 
 
 def _refuse_stacked(collections: Sequence[str], *, depths: bool, layers: Sequence[int], routes,
@@ -519,6 +524,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     prefix: int | Literal["prompt"] | None = None
     """The prefix run's blocks (`LMObjective`): a document's first tokens, or its prompt; None is causal."""
+
+    exit_entropy: float | None = None
+    """The exit objective's entropy weight (`LMObjective`), under which the head scores every pass of a looped
+    decoder; None scores its last pass alone."""
 
     mtp_weight: float | None = None
     """The multi-token prediction depths' weight (`LMObjective`); None trains none."""
@@ -655,7 +664,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             raise MissingFlopsCount(missing)
         crossed = self._context_flops(model, batch)
         lengths = self._prediction_lengths(batch)
-        count = counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths) + crossed
+        heads = self._head_passes(model) * model.logits_flops(lengths)
+        count = counted_flops(model, self.real_lengths(batch)) + heads + crossed
         return count + (model.prediction_flops(self.real_lengths(batch),
                                                prediction_lengths=self._prediction_rows(model, batch))
                         if self.mtp_weight else 0)
@@ -674,14 +684,16 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 raise MissingFlopsCount("a frozen trunk's prediction depths have no frozen training count")
             # Every trunk and head matrix frozen: its forward and its input's gradient, no weight's; so
             # too a block's reads through its layer's own matrices (`CrossBlocks.held_flops`).
-            trunk, head = counted_flops(model, lengths), model.logits_flops(targets)
+            trunk = counted_flops(model, lengths)
+            head = self._head_passes(model) * model.logits_flops(targets)
             return (frozen_training_flops(trunk, parameter_flops(model, lengths))
                     + frozen_training_flops(head, head)
                     + frozen_training_flops(crossed, self._context_flops(model, batch, held=True)))
         if not isinstance(model, CountedLogitsTraining):
             return super().training_flops(model, batch)
         # Every cross-attention matrix trains: its forward, its input's gradient and its own.
-        count = model.training_flops(lengths) + model.logits_training_flops(targets) + 3 * crossed
+        heads = self._head_passes(model) * model.logits_training_flops(targets)
+        count = model.training_flops(lengths) + heads + 3 * crossed
         if self.mtp_weight:
             if not isinstance(model, CountedPredictionTraining):
                 raise MissingFlopsCount(f"{type(model).__name__} has no prediction_training_flops "
@@ -689,6 +701,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             count += model.prediction_training_flops(
                 lengths, prediction_lengths=self._prediction_rows(model, batch))
         return count
+
+    def _head_passes(self, model) -> int:
+        """How many passes' states the head scores: each pass's under the exit objective (`exit_entropy`),
+        the last's alone otherwise."""
+        loop = model.loop if self.exit_entropy is not None and isinstance(model, Looped) else None
+        return 1 if loop is None else loop.steps
 
     def _prediction_rows(self, model: CountedPredictions,
                           batch: Batch) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -809,7 +827,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                      indexer: bool = False, layers: Sequence[int] = (), watched: bool = False,
                      routes: tuple[jax.Array | Mapping[str, jax.Array], jax.Array | None] | None = None,
                      predict: bool | None = None, z_loss: float | None = None, logits: bool = False,
-                     progress: Progress = END, rows: jax.Array | None = None):
+                     progress: Progress = END, rows: jax.Array | None = None, exits: bool = False):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -877,6 +895,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
+        opened = [*opened, 'exits'] if exits else opened
         adaptation = self.adaptation
         if adaptation is not None and adaptation.layers:
             # The decoder's own blocks step chunk by chunk through its cache, which runs the trunk itself.
@@ -919,8 +938,22 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                     kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
             depth_scores = self._depth_scores(params, states, targets, prepared, roles, losses.dtype, table,
                                               rows)
+        passes = self._exit_scores(params, gathered, targets, losses) if exits else None
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
-                      whole, inspected, moved)
+                      whole, inspected, moved, passes)
+
+    def _exit_scores(self, params, gathered, targets, losses):
+        """A looped decoder's per-pass losses, each earlier pass's states as its forward gathered them
+        (`Looped.exit_passes`) through the head as the last pass's go (`_head_scores`), the last pass's
+        `losses`, beside every pass's exit-gate logit."""
+        states, logits = self._looped().exit_passes(gathered)
+        earlier = tuple(self.head_terms(self.model, params, state, targets, predict=False)[0]
+                        for state in states)
+        return (*earlier, losses), logits
+
+    def _looped(self) -> Looped:
+        """The model as the looped decoder the exit objective weighs (`Looped`)."""
+        return self._as(Looped, "runs no loop (dew.nn.protocols.Looped), which the exit objective weighs")
 
     def _target_weights(self, prepared, roles, dtype, rows):
         """Each target's weight in the loss (`_row_weights`), a filled row's (`rows`) at nothing, so a fused
@@ -1008,9 +1041,13 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     def _layer_states(self) -> LayerStates:
         """The model as the reader of its layers' states that a request for `layers` needs."""
-        if not isinstance(self.model, LayerStates):
-            raise TypeError(f"{type(self.model).__name__} keeps no layer states "
-                            "(dew.nn.protocols.LayerStates), which reading named layers needs")
+        return self._as(LayerStates, "keeps no layer states (dew.nn.protocols.LayerStates), which reading "
+                        "named layers needs")
+
+    def _as[P](self, protocol: type[P], refusal: str) -> P:
+        """The model as `protocol` names it, or a TypeError saying it is not one (`refusal`)."""
+        if not isinstance(self.model, protocol):
+            raise TypeError(f"{type(self.model).__name__} {refusal}")
         return self.model
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
@@ -1233,6 +1270,22 @@ class LMObjective(TokenScorer):
     keeps the logits from drifting away from normalised log
     probabilities. Zero adds nothing.
 
+    `exit_entropy` β trains a looped decoder's exit gate as Ouro does (arXiv
+    2510.25741): each token's loss is its cross entropy at each pass weighted
+    by the probability it exits there (`looping.exit_log_distribution`, from the
+    gate's hazards, the last pass taking the rest), less β times that
+    distribution's entropy. Every pass's states are scored through the head
+    as the last pass's are, the gate's hazards and the passes' states all
+    taking the gradient. The loss is that expected cross entropy less the
+    entropy term, plus a `z_loss` on the last pass's logits, and validation's
+    loss is the same term, as it is the z-loss's and the depths' too: one loss
+    the run trains and validates, its parts reported beside it. `ce` stays the
+    last pass's cross entropy, the decoder's output, and `exit_ce` and
+    `exit_entropy` report the expectation and the entropy, the first
+    comparable across β where the loss is not. None trains the
+    last pass alone, as any decoder trains; it needs the model's loop to
+    gate its exits (`Loop.exit_gate`).
+
     `prefix` trains a prefix run: the blocks a layer that reads blocks sees whole
     (`AttentionMixer.bidirectional_blocks`). Each document's first `prefix` tokens, or with "prompt" its
     tokens before the first assistant token (a chat row's roles), form one block, and each token of a block
@@ -1278,6 +1331,7 @@ class LMObjective(TokenScorer):
         loss_role: Role | None = None,
         prefix: int | Literal["prompt"] | None = None,
         mtp_weight: float | None = None,
+        exit_entropy: float | None = None,
         z_loss: float = 0.0,
         indexer: IndexerTraining | None = None,
         token_accuracy: bool = True,
@@ -1295,6 +1349,14 @@ class LMObjective(TokenScorer):
                              "blocks beyond its own source, so mtp_weight is refused with prefix")
         self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
+        if exit_entropy is not None:
+            looped = self.model
+            loop = looped.loop if isinstance(looped, Looped) else None
+            if loop is None or not loop.exit_gate or not 0 <= exit_entropy < float("inf"):
+                raise ValueError("exit_entropy weighs the entropy of a looped decoder's exit distribution: a "
+                                 "finite nonnegative weight on a loop that gates its exits, got "
+                                 f"{exit_entropy}")
+        self.exit_entropy = exit_entropy
         if adaptation is not None:
             # The model as its protocol names it, apart from `self.model`, which stays a module.
             stepped: object = self.model
@@ -1314,7 +1376,7 @@ class LMObjective(TokenScorer):
         self.indexer = indexer
         self.phase = _phase_filter(self.model, indexer, {
             "balance": balance, "mtp_weight": mtp_weight, "loss_role": loss_role,
-            "z_loss": z_loss or None})
+            "z_loss": z_loss or None, "exit_entropy": exit_entropy})
         self.ema = EMASpec.constant(ema_decay)
 
     @property
@@ -1528,8 +1590,9 @@ class LMObjective(TokenScorer):
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             watched=step.watched is not None,
-            z_loss=self.z_loss if summed else None, logits=logits, predict=predict, rows=rows)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _ = scores
+            z_loss=self.z_loss if summed and self.exit_entropy is None else None, logits=logits,
+            predict=predict, rows=rows, exits=self.exit_entropy is not None)
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _, _, passes = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
         def shares(values: jax.Array, counts: jax.Array) -> jax.Array:
@@ -1545,6 +1608,20 @@ class LMObjective(TokenScorer):
         reported = {"ce": ce, "perplexity": jnp.exp(ce)}
         if correct is not None:
             reported["token_accuracy"], _ = self.accuracy(correct, batch, weights).mean()
+        if passes is not None:
+            # Ouro's exit objective in the cross entropy's place, over the same counted targets.
+            pass_losses, gates = passes
+            # From the log probabilities, so a hazard that rounds to one leaves every gradient finite.
+            log_chances = exit_log_distribution(gates).astype(width)
+            chances = jnp.exp(log_chances)
+            expected = jnp.sum(chances * jnp.stack(pass_losses).astype(width), axis=0)
+            entropy = -jnp.sum(chances * log_chances, axis=0)
+            term = expected - jnp.asarray(self.exit_entropy, width) * entropy
+            units = shares(term, weights)
+            prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
+            reported["exit_ce"], _ = Ratio(self.row_mean(expected, batch, weights=weights).total, mass).mean()
+            reported["exit_entropy"], _ = Ratio(self.row_mean(entropy, batch, weights=weights).total,
+                                                mass).mean()
         if self.z_loss:
             # PaLM's auxiliary over the same counted targets as the cross
             # entropy, so one Ratio carries both.

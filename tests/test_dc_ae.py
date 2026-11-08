@@ -31,7 +31,8 @@ from interop_support import (
 )
 from safetensors.numpy import load_file, save_file
 
-from dew.nn.autoencoders.dc_ae import DCAE, load_dc_ae
+from dew.interop.autoencoders.dc_ae import load_dc_ae
+from dew.nn.autoencoders.dc_ae import DCAE
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
@@ -127,8 +128,8 @@ def test_a_missing_tensor_is_refused(source, tmp_path):
 def test_a_run_trains_behind_the_dc_ae_its_checkpoint_names(source, tmp_path):
     """`PretrainedAutoencoder` reads the checkpoint's own config: a DC-AE
     builds as one, and a run's saved params bind without the weights."""
+    from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
     from dew.nn.autoencoders.dc_ae import DCAutoencoder
-    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 
     shutil.copytree(source / "conv", tmp_path / "dc-ae")
     spec = PretrainedAutoencoder(modelname=str(tmp_path / "dc-ae"), dtype="float32", latent_scale=0.5)
@@ -155,7 +156,7 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     from dew.config.diffusion import DiffusionRunConfig
     from dew.data.dataset import Loader
     from dew.inputs import TextCondition
-    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
     from dew.registry import ModelConfig
     from dew.sampling import Euler
     from dew.training import Trainer
