@@ -664,7 +664,8 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
     shards through its own process's mirror, and the run's statistics count each of those opens and their
     bytes beside the reading process's own (row 4339), each worker's counters carried by the position it
     hands the reader. Automatic loading reads in workers over a run long enough to pay for them, which
-    the read states (`steps`)."""
+    the read states (`steps`), but a stream cut per share, which it reads in the process: its batches would
+    be its workers' count's (`dew.data.lowering._Build.in_order`)."""
     from dew.data import Loading
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
@@ -682,7 +683,8 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
     finally:
         reader.close()
     workers_did = _workers_counters(tmp_path / "observed")
-    assert workers_did["data/mirror/misses"] > 0
+    in_workers = not (workers == "auto" and read == "streamed" and not elastic)
+    assert (workers_did["data/mirror/misses"] > 0) == in_workers
     own = mirror_metrics()
     assert {name: statistics[name] for name in COUNTED} == {name: own[name] + workers_did[name]
                                                             for name in COUNTED}

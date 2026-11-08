@@ -419,7 +419,10 @@ class Loading:
     10.5 ms (row 4862). Workers change no record and no order: a global order's
     batches are the ones its records' indices make, and a read cut per share
     hands on its inputs in their order (`dew.data.lowering._Build.in_order`), so
-    its batches and its position are a read in none's.
+    its batches and its position are a read in none's. A stream cut per share,
+    which its workers would read each in shards of its own, its batches their
+    count's, reads in the process under automatic loading; a count it names
+    reads it in that many.
     """
 
     workers: int | Literal["auto"] = 0
