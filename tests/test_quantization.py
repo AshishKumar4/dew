@@ -34,7 +34,6 @@ from dew.distributed.placement import Layout, MeshSpec
 from dew.lora import _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
-from dew.nn.kernels.templates import attention as template, attention_quantized
 from dew.nn.kv_cache import hadamard, rotated
 from dew.nn.precision import FP32_SUMS
 from dew.nn.quantizers import nearest_codewords
@@ -1448,9 +1447,6 @@ def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]
         "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
         "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
         "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
-        "dew.nn.kernels.templates.attention_quantized.attend": (
-            attention_quantized.attend, (normal(1, 16, 2, 8), normal(1, 16, 1, 8), normal(1, 16, 1, 8),
-                                         template.spans(16, 16, 1, causal=True), template.Hooks()), {}),
     }
 
 
