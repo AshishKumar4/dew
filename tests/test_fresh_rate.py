@@ -143,6 +143,12 @@ def test_a_parameter_a_loaded_module_gains_starts_at_its_draw_and_trains_in_the_
     assert {"/".join(path) for path, label in labels.items() if label == "fresh"} == set(gated.fresh)
     with pytest.raises(ValueError):
         gated.with_model(source.model, key=3)
+    # A source a LoRA adapter froze holds its base weights apart, as its model declares them: in its place
+    # it is its own.
+    from dew.lora import LoRA
+
+    adapted = source.adapt(LoRA(rank=2, modules=("q_proj",)), key=1)
+    assert adapted.with_model(adapted.model, key=3).variables is adapted.variables
 
 
 def groups(root, name: str) -> tuple[ParamGroup, ...]:

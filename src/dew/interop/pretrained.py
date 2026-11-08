@@ -645,7 +645,7 @@ class Pretrained:
         from dew.optim import parameter_name
 
         held = {("params", *path) for path in flatten_dict(dict(thaw(self.variables).get("params", {})))}
-        declared = jax.eval_shape(functools.partial(initialized, model), jax.random.key(0))
+        declared = thaw(jax.eval_shape(functools.partial(initialized, model), jax.random.key(0)))
         named = {("params", *path) for path in flatten_dict(dict(declared.get("params", {})))}
         if held - named:
             dropped = sorted("/".join(path[1:]) for path in held - named)
