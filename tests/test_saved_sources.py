@@ -98,7 +98,9 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     reloads answering as the run's task serves its written weights, bit for bit; the second run trains
     on from the first's final weights, head and backbone, its record names the run and step it read, and
     its task loads and answers (a run from a finished chat-format run, which the export's Laya-only
-    layout refused: "Laya's layout is a MarkerLayout over a Hugging Face tokenizer", row 4310)."""
+    layout refused: "Laya's layout is a MarkerLayout over a Hugging Face tokenizer", row 4310); and a
+    third, naming a head of its own, draws it fresh over the first's backbone and trains (it was refused:
+    "a decision release reads with its own")."""
     from run_kinds import QWEN_TINY
 
     from dew.decision import Choice, Decide
@@ -135,6 +137,20 @@ def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, m
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "second"))
     assert recorded.pretrained == str(source) and recorded.source.step == SavedRun.pinned(str(source)).step
     answer = Decide.from_run(str(tmp_path / "runs" / "second"))("charged twice", {"team": team})["team"]
+    assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
+    # A run naming a head of its own over the finished run draws it fresh over the run's backbone, its
+    # head, layout and calibration set aside: it starts from the run's backbone and from the head a run
+    # drawing the same head over the base draws (row 4310's run-from-run, a fresh head).
+    fresh = ["--pretrained", str(source), "--source.step", "latest", *joint[2:]]
+    drawn = DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)).prepare().objective
+    over_base = DecisionRunConfig.cli(joint, default=decision(tmp_path, drawn=False)).prepare().objective
+    started = drawn.init(jax.random.key(0))
+    leaves_alike(started["params"]["backbone"], state.variables["params"]["backbone"])
+    leaves_alike(started["params"]["head"], over_base.init(jax.random.key(0))["params"]["head"])
+    third, _ = trained(DecisionRunConfig.cli(fresh, default=decision(tmp_path, drawn=False)), tmp_path,
+                       "third", trainer={"checkpoint_final": True})
+    assert int(third.step) == 1
+    answer = Decide.from_run(str(tmp_path / "runs" / "third"))("charged twice", {"team": team})["team"]
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
