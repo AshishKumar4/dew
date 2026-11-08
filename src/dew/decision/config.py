@@ -271,11 +271,13 @@ class DecisionRunConfig(DecoderRunConfig):
         start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                 dtype=dtype, attention_impl=attention_impl,
                                 **self.source_keywords(frozen=frozen))
-        release = isinstance(start, PretrainedDecision)
-        if release and self.head is not None:
+        if isinstance(start, PretrainedDecision) and self.head is not None:
             # A head drawn over a decision release's backbone, a finished run's among them: its own head,
-            # layout and calibration set aside, the backbone trains on under the head the run names.
-            start, release = start.backbone(), False
+            # layout and calibration set aside, the backbone trains on under the head the run names, its
+            # rows laid out by the release's tokenizer.
+            derived["tokenizer"] = start.decision_tokenizer
+            start = start.backbone()
+        release = isinstance(start, PretrainedDecision)
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
         blocked = not release and reads_blocks(start.config, self.source.overrides())
         # The backbone's own transformations, a release's as a fresh backbone's: its head and layout

@@ -282,10 +282,11 @@ def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
     return from_record(tuple[ParamGroup, ...], groups)
 
 
-def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
-    """Those of `modules`, paths under `params` of a module or a parameter, that are or hold a parameter
-    `objective` trains, as its tree is drawn (`Objective.init`, its shapes alone): a tied readout is drawn
-    with none."""
+def trained_modules(objective: Objective[Loss, Effects],
+                    modules: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree is
+    drawn (`Objective.init`, its shapes alone), and those that are one (a parameter a loaded module
+    gained, `Pretrained.with_model`): a tied readout is drawn with none."""
     if not modules:
         return ()
     from dew.batch import unboxed
@@ -293,8 +294,8 @@ def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str])
 
     trained = unboxed(abstract(lambda: objective.init(jax.random.key(0))))["params"]
     names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
-    return tuple(module for module in modules
-                 if any(name == module or name.startswith(f"{module}/") for name in names))
+    return (tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names)),
+            tuple(module for module in modules if module in names))
 
 
 def _best_argument():
@@ -2095,11 +2096,11 @@ class RunConfig:
                 if recorded is not None:
                     return to_record(recorded, tuple[ParamGroup, ...])
             groups = named or self.optim.fresh_groups()
-            modules = trained_modules(objective, objective.fresh_modules()) if any(
-                group.fresh for group in groups) else ()
-            if not named and not modules:
+            modules, leaves = trained_modules(objective, objective.fresh_modules()) if any(
+                group.fresh for group in groups) else ((), ())
+            if not named and not modules and not leaves:
                 return to_record((), tuple[ParamGroup, ...])
-            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules)
+            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
             return to_record(claimed.param_groups, tuple[ParamGroup, ...])
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
         return self.optim if groups == self.optim.param_groups else dataclasses.replace(
