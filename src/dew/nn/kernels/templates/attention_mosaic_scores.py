@@ -126,7 +126,7 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
     family = walk.program.family
     (q_slot, do_slot), (keys, values) = slots, resident
     held = keys.transpose((1, 0))
-    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held, walk.interpret)
+    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held)
          if walk.scaled else family.product(q_slot, held, shape))
     dp = family.product(do_slot, values.transpose((1, 0)), shape)
 

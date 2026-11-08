@@ -1062,13 +1062,12 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
         # accumulator in place (`Family.issued`: a term's own accumulator read before the next serializes
         # wgmma's, ptxas C7512), the partner's turn once they are in.
         keys = program.parted(slots["keys"], tiles.block_k)
-        s = family.summed(shape, lambda acc: family.issued(acc, q.refs, keys.T.refs, interpret=interpret),
-                          interpret=interpret)
+        s = family.summed(shape, lambda acc: family.issued(acc, q.refs, keys.T.refs, interpret=interpret))
         if turn is not None:
             turn()
     else:
         keys = slots["keys"] if codes is None else codes.keys(slots["keys"])
-        s = family.product(q, keys.transpose((1, 0)), shape, turn, interpret=interpret)
+        s = family.product(q, keys.transpose((1, 0)), shape, turn)
     slots.release("keys")
     k_first = index * tiles.block_k
     if codes is not None:
@@ -1175,7 +1174,7 @@ def _dot(family: mosaic.Family, interpret: bool, lhs: jax.Array, rhs) -> jax.Arr
     family's, or with an fp32 call's parts their terms' (`_parted_products`)."""
     if isinstance(rhs, operands.Parts):
         return _parted_products(family, None, None, lhs, rhs, interpret, shape=(lhs.shape[0], rhs.shape[1]))
-    return family.registers_product(lhs, rhs, interpret)
+    return family.registers_product(lhs, rhs)
 
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
@@ -1565,7 +1564,7 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
     state, arg, own, others_total = algebra.anchored(spec, start, known)
 
     def dot(lhs, rhs):
-        return family.registers_product(lhs, rhs, interpret)
+        return family.registers_product(lhs, rhs)
 
     def step(index, slots, carry, accumulators):
         total, own, others_total = carry

@@ -131,7 +131,7 @@ def _multiplying(family, lhs: str, rhs: str, interpret):
     def step(index, slots, carry, accumulators):
         del index
         (acc,) = accumulators
-        return carry, (family.products(acc, slots[lhs], slots[rhs], interpret),)
+        return carry, (family.products(acc, slots[lhs], slots[rhs]),)
 
     return step
 
@@ -169,7 +169,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
                 (acc,) = accumulators
                 block, rows = slots['p'], slots['x']
                 product = family.products(acc, block.at[:, pl.ds(wg * share, share)],
-                                          rows.at[pl.ds(wg * share, share)], interpret)
+                                          rows.at[pl.ds(wg * share, share)])
                 return carry, (product,)
 
             return family.walk(feed, ((step, first, first + FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
@@ -663,10 +663,10 @@ def _relayed_products(q, k, v, *, interpret):
             def products():
                 for at in range(3):
                     plgpu.barrier_wait(loaded.at[at], parity=0)
-                family.products(s, q_smem, k_smem, interpret)
+                family.products(s, q_smem, k_smem)
                 scored.committed(first)
                 plgpu.barrier_wait(weighed.barriers.at[0], parity=0)
-                family.products(o, p, v_smem, interpret)
+                family.products(o, p, v_smem)
                 summed.committed(first)
 
             family.roles_of(((1, relay),), load=load, products=products)
@@ -946,9 +946,8 @@ def _chained(a, b, c, *, m_warps: int, interpret: bool):
                 mosaic.copied(source, staged)
             mosaic.synced(interpret)
             issuer = family.relaying(relay)
-            first = issuer.product(plgpu.load(a_smem, optimized=False), b_smem, (rows, RELAYED),
-                                   interpret=interpret)
-            out = issuer.product(first.astype(jnp.bfloat16), c_smem, (rows, RELAYED), interpret=interpret)
+            first = issuer.product(plgpu.load(a_smem, optimized=False), b_smem, (rows, RELAYED))
+            out = issuer.product(first.astype(jnp.bfloat16), c_smem, (rows, RELAYED))
             plgpu.store(out_smem, out, optimized=False)
             mosaic.synced(interpret)
             mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
@@ -991,15 +990,14 @@ def _negated(a, b, *, path: str, interpret: bool):
                 plgpu.commit_smem()
             mosaic.synced(interpret)
             if path == "product":
-                value = family.product(a_smem, b_smem, shape, interpret=interpret)
+                value = family.product(a_smem, b_smem, shape)
             elif path == "summed":
-                value = family.summed(shape, lambda acc: family.products(acc, a_smem, b_smem, interpret),
-                                      interpret)
+                value = family.summed(shape, lambda acc: family.products(acc, a_smem, b_smem))
             else:
                 def step(index, carry, accumulators):
                     del index
                     (acc,) = accumulators
-                    acc = family.products(acc, a_smem, b_smem, interpret, accumulate=False)
+                    acc = family.products(acc, a_smem, b_smem, accumulate=False)
                     if path == "read":
                         # Stored where it is read, inside the walk.
                         plgpu.store(out_smem, -family.read(acc), optimized=False)
@@ -1175,9 +1173,9 @@ def _chunks_products(x, w, *, interpret):
             def step(index, slots, carry, accumulators):
                 del index
                 held, ones = family.tile_of(slots['x']), jnp.ones((rows, columns), jnp.float32)
-                ss_gmem[...] = family.product(slots['x'], slots['w'], (rows, columns), interpret=interpret)
-                staged_gmem[...] = family.registers_product(held, slots['w'], interpret)
-                carried_gmem[...] = family.register_products(ones, (held,), slots['w'], interpret)
+                ss_gmem[...] = family.product(slots['x'], slots['w'], (rows, columns))
+                staged_gmem[...] = family.registers_product(held, slots['w'])
+                carried_gmem[...] = family.register_products(ones, (held,), slots['w'])
                 return carry, accumulators
 
             family.roles(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
