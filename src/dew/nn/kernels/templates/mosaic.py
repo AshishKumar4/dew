@@ -37,7 +37,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import across, product, report, resources
+from dew.nn.kernels.templates import across, persistent, product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -325,52 +325,6 @@ def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
         pl.when(index == role)(built)
 
 
-def unwalked(family: "Family") -> Callable:
-    """A walk of no steps (`Family.persist`'s, where a tile streams nothing): its carry and accumulators as
-    they start."""
-    def walk(step, start, shapes, *, initial=None):
-        del step
-        return start, family.started(shapes, initial)
-
-    return walk
-
-
-def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: str) -> tuple[jax.Array, ...]:
-    """A persistent kernel's tiles (`Family.persist`'s): the grid `tiles` spread over the launch's programs
-    along `axis`, each tile's `schedule(index)`, `(active, steps, views, tile)`, visited as `visit(counter,
-    active, steps, views, tile, done)` at the step its streams are at across the tiles (`counter`: the steps
-    of the active tiles before it) and its turn round accumulators a tile takes whole (`done`: the active
-    tiles before it). Returns both past the last tile."""
-    @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=(jnp.int32(0), jnp.int32(0)))
-    def ended(loop: plgpu.NDLoopInfo, carry):  # nd_loop passes its carry by this name
-        counter, done = carry
-        active, steps, views, tile = schedule(loop.index)
-        visit(counter, active, steps, views, tile, done)
-        return counter + jnp.where(active, steps, 0), done + jnp.where(active, 1, 0)
-
-    return ended
-
-
-def consumed(family: "Family", tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
-             store: Callable, index, walking: Callable, *, axis: str) -> jax.Array:
-    """Consumer role `index`'s tiles of a persistent kernel (`tiled`'s), issued and finished in turn
-    (`Family.persist`'s `issue` and `finish`): each tile's accumulators `issue(index, tile, walk,
-    active=...)`, `walk` its steps' (`walking(counter, active, steps, views)`, built where the tile is
-    visited) where it streams any, a walk of none (`unwalked`) where not, then `finish(index, tile, accs,
-    store, active=...)`. Returns the counter past the last tile."""
-    def visit(counter, active, steps, views, tile, done):
-        del done
-        walk = walking(counter, active, steps, views)
-
-        def run(walk, *, active: bool):
-            finish(index, tile, issue(index, tile, walk, active=active), store, active=active)
-
-        pl.when(active)(lambda: run(walk, active=True))
-        pl.when(~active)(lambda: run(unwalked(family), active=False))
-
-    return tiled(tiles, schedule, visit, axis=axis)[0]
-
-
 class Pieces(tuple):
     """A step's tile loaded as several copies (`viewed`, `Ring.load`): its block's rows in as many equal
     parts, each a view of its own, in order (a `Rows` step's runs)."""
@@ -424,8 +378,8 @@ def viewed(view: tuple, block: tuple, step):
 
 
 def loads(rings: dict, counter, active, steps, views: dict, tile, done) -> None:
-    """A producer's loads of one persistent tile (`tiled`'s visit): each of its steps' blocks into its
-    stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
+    """A producer's loads of one persistent tile (`persistent.tiled`'s visit): each of its steps' blocks
+    into its stream's ring at the step the rings are at (`counter`), none where it streams nothing."""
     del tile, done
 
     @pl.loop(0, jnp.where(active, steps, 0))
@@ -2323,7 +2277,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         staging = self.output_staging(outputs, consumers)
 
         def producer():
-            loaded, _ = tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
+            loaded, _ = persistent.tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
             for ring in rings.values():
                 ring.drain(loaded)
 
@@ -2347,7 +2301,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 return self._tile_walk(rings, counter, jnp.where(active, steps, 0), views, index,
                                        interpret=interpret, in_flight=in_flight, unrolled=unrolled)
 
-            ended = consumed(self, tiles, schedule, issue, finish, store, index, walking, axis=axis)
+            ended = persistent.consumed(self, tiles, schedule, issue, finish, store, index, walking,
+                                        axis=axis)
             self._ended(rings, ended, index)
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
