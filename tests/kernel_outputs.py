@@ -96,22 +96,22 @@ def _while(equation, values: list, found: list) -> list:
 
 def _scan(equation, values: list, found: list) -> list:
     """A `scan` run step by step, each step's launches run alone (`_evaluated`), its stacked outputs
-    stacked as the scan stacks them."""
+    stacked as the scan stacks them; its operands and results split as JAX's own scan splits them
+    (`ft_in`, `ft_out`)."""
     params = equation.params
-    consts, carried = params["num_consts"], params["num_carry"]
     body, closed = _closed(params["jaxpr"])
-    fixed, carry, xs = values[:consts], values[consts:consts + carried], values[consts + carried:]
+    fixed, carry, xs = (list(part) for part in params["ft_in"].update(values).unpack())
     steps = range(params["length"] - 1, -1, -1) if params["reverse"] else range(params["length"])
     ys = []
     for step in steps:
         outs = _evaluated(body, closed, [*fixed, *carry, *(x[step] for x in xs)], found)
-        carry, y = outs[:carried], outs[carried:]
+        carry, y = (list(part) for part in params["ft_out"].update(outs).unpack())
         ys.append(y)
     if params["reverse"]:
         ys.reverse()
     stacked = [jax.numpy.stack(column) for column in zip(*ys, strict=True)] if ys else [
         jax.numpy.zeros((0, *variable.aval.shape[1:]), variable.aval.dtype)
-        for variable in equation.outvars[carried:]]
+        for variable in equation.outvars[len(carry):]]
     return [*carry, *stacked]
 
 
