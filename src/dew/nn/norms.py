@@ -109,14 +109,15 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     reads the two addends once and writes the sum beside the norm, and its
     reverse adds the stream's own cotangent to the norm's in the same pass.
     XLA's add and norm are the portable path and the oracle. `activation`
-    (None for none) runs on the norm before its last cast, on XLA's path.
+    (None for none) runs on the norm before its last cast, in the kernel where
+    it is elementwise (`norm_swiglu.elementwise`), else on XLA's path.
     `weight_first` as `rms_normalized`'s.
     """
     if weight_first and scale_after_cast and scale is not None:
         raise ValueError("a weight folded into the inverse (weight_first) multiplies before any cast; "
                          "scale_after_cast multiplies after one")
     chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
-                                    axes=axes, activated=activation is not None)
+                                    axes=axes, epilogue=activation)
     def portable(x, branch, scale):
         stream = x if branch is None else x + branch
         return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
@@ -124,7 +125,8 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
 
     if chosen == 'pallas':
         return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                           portable, axes=axes, weight_first=weight_first)
+                                           portable, axes=axes, weight_first=weight_first,
+                                           epilogue=activation)
     return portable(x, branch, scale)
 
 

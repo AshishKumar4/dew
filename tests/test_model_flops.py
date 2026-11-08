@@ -50,7 +50,7 @@ from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels.generation import assumed, gpu_target
+from dew.nn.kernels.generation import assumed, chosen, gpu_target
 from dew.nn.kernels.recurrence_chunk import recurrent_delta_rule
 from dew.nn.linear import GatedDeltaNet, recurrent_gated_delta_rule
 from dew.nn.mixer_base import MixerContext
@@ -547,10 +547,13 @@ def forward_products(function, *operands, state_mac: bool = False):
     hide a missing Dense. Noncausal, unpadded fixtures make attention's
     logical product equal its executed product; chunked recurrence model
     FLOPs instead follow their documented algorithm-independent formula.
-    The forward is traced on its reference path, as on a CPU, on every
-    device: a GPU's kernels are custom calls, whose products no jaxpr shows.
+    The forward is traced as on a CPU, on every device, its attention on
+    the reference path (`generation.chosen`): a GPU's kernels are custom
+    calls, whose products no jaxpr shows, and the attention template's
+    plain-JAX walk, which a CPU runs for a call of key validity, pads the
+    call to whole blocks, products beyond its own.
     """
-    with assumed("cpu"):
+    with assumed("cpu"), chosen(attention="reference"):
         traced = jax.make_jaxpr(function)(*operands)
     return float(jaxpr_products(traced, state_mac=state_mac))
 

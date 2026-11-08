@@ -12,6 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from dew.nn.programs import on_host
+
 
 @dataclasses.dataclass(frozen=True)
 class Tail:
@@ -96,7 +98,9 @@ def balanced(tiles: int, steps: int, programs: int, traffic: Traffic, *,
         return None
     iterations = tail * steps
     candidate = Tail(waves, iterations, min(programs, iterations), steps)
-    with jax.ensure_compile_time_eval():
+    # The tail's tiles walked on this host (`programs.on_host`), whatever mesh a step's trace holds: a
+    # compile-only GPU's devices run nothing here.
+    with on_host():
         rows, columns = (np.asarray(axis) for axis in planar_snake(
             jnp.arange(waves * programs, tiles, dtype=jnp.int32), traffic.grid, 1, traffic.band))
     shared = _rounds(candidate, rows, columns, traffic) + handoff_steps * traffic.step_seconds

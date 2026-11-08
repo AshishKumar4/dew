@@ -66,6 +66,12 @@ def fewer_rows(family: mosaic.Family) -> tuple[int, ...]:
                  if family.role_rows % rows == 0 and family.specialized(rows, rows) != family)
 
 
+def scopes_products(family: mosaic.Family) -> bool:
+    """Whether `family`'s issuer keeps its products' accumulators in scratch a launch scopes
+    (`Issuer.product_scratch`: tcgen05's chunks')."""
+    return bool(family.product_scratch(1, (family.rows,)))
+
+
 def qualified(family: mosaic.Family) -> bool:
     """Whether the attention mainloop runs on `family`: one whose consumers issue their products
     (`Family.issues_in_consumers`), whose walk's softmax and its rescales run between them in the registers
@@ -78,8 +84,9 @@ def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
     """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype`: the
     shared registry's (`bundles.of`) where attention is qualified on it (`qualified`); None elsewhere, whose
     calls another mainloop takes by legality."""
-    # Every launch of the mainloop is written against the family's seams, a TPU core's among them (`tpu`).
-    family = None if generation_name is None else bundles.of(generation_name, dtype, tpu=True)
+    # Every launch of the mainloop is written against the family's seams, a TPU core's among them (`tpu`),
+    # and scopes its issuer's product scratch (`scoped`: tcgen05's chunks, `Family.scoped`'s `products`).
+    family = None if generation_name is None else bundles.of(generation_name, dtype, scoped=True, tpu=True)
     return family if family is not None and qualified(family) else None
 
 
@@ -90,7 +97,7 @@ def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tupl
     device has, by the share of its rows they fill), where its family is qualified (`qualified`)."""
     if generation_name is None:
         return ()
-    return tuple(family for family in bundles.layouts(generation_name, dtype, rows, tpu=True)
+    return tuple(family for family in bundles.layouts(generation_name, dtype, rows, scoped=True, tpu=True)
                  if qualified(family))
 
 
@@ -112,7 +119,8 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     it."""
     # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
     found = {family.name: family
-             for family in bundles.layouts(generation.gpu_target().generation, dtype, 1, tpu=True)}
+             for family in bundles.layouts(generation.gpu_target().generation, dtype, 1, scoped=True,
+                                           tpu=True)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
@@ -367,17 +375,20 @@ DROPPING = Refusal('dropout_places',
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
-def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True
-           ) -> resources.Scope:
+def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
+                 products: tuple | None = None) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
-    walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), with the algebra's
-    reductions' scratch where it `reduces` (a launch reducing its scores, weights or cotangents across
-    warps) and its `reducing_warpgroups`' scratch (`resources.Scope`)."""
+    walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
+    where its `products` take one (`Family.product_held`, its tensor memory's addresses
+    `Issuer.product_addresses`), with the algebra's reductions' scratch where it `reduces` (a launch reducing
+    its scores, weights or cotangents across warps) and its `reducing_warpgroups`' scratch
+    (`resources.Scope`)."""
     scoped, streams, *after = allocations
     held, walks = family.lifetimes(streams)
-    return resources.Scope(program=(scoped, *held), walks=walks,
+    return resources.Scope(program=(scoped, *family.product_held(products), *held), walks=walks,
                            after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
-                           reduces=reduces, reducing_warpgroups=reducing_warpgroups)
+                           reduces=reduces, reducing_warpgroups=reducing_warpgroups,
+                           addresses=family.product_addresses(products))
 
 
 def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:

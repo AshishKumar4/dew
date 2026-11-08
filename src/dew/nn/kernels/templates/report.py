@@ -533,14 +533,19 @@ def refused_alone(lowered: jax.stages.Lowered) -> dict[str, int]:
     its operands the module's parameters and its results the module's, compiled by `lowered`'s own backend
     for one of its devices (a compile-only device's too). A kernel alone that compiles, or that XLA refuses
     for another reason, is none of them."""
+    import jaxlib.xla_client as xla_client
     from jax._src import compiler
-    from jax._src.lib import xla_client
+    from jax._src.interpreters import pxla
     from jax._src.lib.mlir.dialects import func
 
-    # The compile's own backend and devices (JAX's lowering holds them; `Lowered` states neither).
+    # The compile's own backend and devices: a jit's lowering holds them (`pxla.MeshComputation`); `Lowered`
+    # states neither.
     lowering = lowered._lowering
+    if not isinstance(lowering, pxla.MeshComputation) or lowering._device_list is None:
+        raise TypeError(f"kernels are refused alone from a jit's lowering over its devices, not "
+                        f"{type(lowering).__name__}")
     backend, device = lowering.compile_args["backend"], next(iter(lowering._device_list))
-    module = lowered.compiler_ir("stablehlo")
+    module = lowering.stablehlo()
     calls = []
 
     def walk(operation) -> None:

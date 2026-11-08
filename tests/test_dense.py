@@ -16,7 +16,8 @@ from flax import linen as nn
 from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn.conv import Conv
-from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dense import Dense, DenseGeneral, _accumulated_dot_general
+from dew.nn.kernels import gemm
 from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
 from dew.quantization import Quantization, quantize_for_serving
 
@@ -73,10 +74,13 @@ CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
 def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
     """Flax's parameters bit for bit, but for a batched kernel, which draws each batch member alone
     (`test_a_batched_kernel_draws_each_member_at_its_own_fan_in`), and with flax's parameters, its
-    biases zero, flax's output where both sum their fp32 products as XLA does (`FP32_SUMS`): each pair
-    drawn or computed in one program (ledger 3178)."""
+    biases zero, flax's output where both sum their fp32 products alike (`FP32_SUMS`): a layer naming no
+    product of its own sums a CPU's fp32 products blocked and pairwise (`dew.nn.pairwise`, row 4863), so
+    flax's is given Dew's plain product; each pair drawn or computed in one program (ledger 3178)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
+    if isinstance(theirs, nn.Dense | nn.DenseGeneral) and theirs.dot_general is None:
+        theirs = theirs.clone(dot_general=gemm.dot_general(_accumulated_dot_general))
     variables, drawn = jax.jit(lambda key: [layer.init(key, x) for layer in (theirs, mine)])(
         jax.random.key(0))
     if getattr(theirs, "batch_dims", ()):

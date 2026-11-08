@@ -591,12 +591,12 @@ read where it lies (`Layered`)."""
 
 
 class Layered(struct.PyTreeNode):
-    """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` and the
-    layer read, which the GEMM template reads where it lies (`gemm.gemm`'s `layer`) rather than as a
-    slice copied out a layer at a time (1.2 GB a layer at Qwen3-30B-A3B's experts, half a decode step on
-    an H100)."""
+    """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` (or a
+    packed load's stacked NVFP4 banks, `gemm.NvFp4.layer`) and the layer read, which the GEMM template
+    reads where it lies (`gemm.gemm`'s `layer`) rather than as a slice copied out a layer at a time (1.2 GB
+    a layer at Qwen3-30B-A3B's experts, half a decode step on an H100)."""
 
-    stack: jax.Array
+    stack: "jax.Array | gemm.NvFp4"
     layer: jax.Array
 
     @property
@@ -703,9 +703,6 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, grou
     """
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
     packed = isinstance(stack, gemm.NvFp4)
-    if packed and layer is not None:
-        raise ValueError("a packed expert bank (`gemm.NvFp4`) is read whole, never as a scanned stack's "
-                         "layer")
     tokens, rows = (x.tokens, x.rows) if isinstance(x, Gathered) else (x, None)
     compute = canonicalize_dtype(tokens, _held(stack), *(() if bias is None else (bias,)), dtype=dtype)
     # The run's low-precision recipe takes the experts' product where their role takes it, the matrices'
@@ -935,7 +932,7 @@ def _stored(run, x, indices, parameters, input_weights):
     return run(x, indices, parameters, input_weights)
 
 
-def expert_compute_dtype(x: jax.Array, *parameters: jax.Array, dtype: Dtype | None) -> Dtype:
+def expert_compute_dtype(x: jax.Array, *parameters: "jax.Array | gemm.NvFp4", dtype: Dtype | None) -> Dtype:
     """The dtype an expert layer computes in: `dtype` when the model names
     one, else flax's promotion of the stream and the parameters, except that
     16-bit parameters are never widened. A wider stream then rounds to them

@@ -515,6 +515,33 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     return _summed_wide(product, preferred_element_type, *operands)
 
 
+def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
+                       preferred_element_type) -> jax.Array | None:
+    """A layer's projection (`product`, its own `jax.lax.dot_general`, as `gemm.dot_general` takes a layer's
+    product past the template) of float32 operands into float32, summed as a vectorized dot sums it where a
+    CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other platform;
+    None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`), a
+    library intercepts it (Qwix's), its declared algorithm narrows the operands (`exact_products`: its own
+    product keeps the declaration), or its dtypes are others. A layer's projections alone: a product the
+    algebra derives or a mixer forms (attention's `dP` and `D`, whose sums cancel bit for bit on a one-key
+    row) keeps XLA's sum."""
+    from dew.nn import pairwise
+
+    if (_sums_in_float64(lhs, rhs) or _intercepted() or not exact_products(precision, jnp.float32)
+            or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
+            or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
+                       for operand in (lhs, rhs))):
+        return None
+
+    def plain(lhs, rhs):
+        return product(lhs, rhs, dimension_numbers, precision=precision,
+                       preferred_element_type=preferred_element_type)
+
+    blocked = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=dimension_numbers,
+                                precision=precision)
+    return jax.lax.platform_dependent(lhs, rhs, cpu=blocked, default=plain)
+
+
 CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
 """The contractions `accumulated` traces once a call (`_contraction`): JAX's own, whose trace states no
 derivative of its own (`_own_backward`) and depends on its operands' types and its arguments alone."""

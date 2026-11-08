@@ -450,9 +450,11 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
                 row=INHERENT, kind='measured'),
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
                 "a gradient the template's fast backward does not take (`mainloop_backward."
-                "fast_backward_form`): fp32 operands under the accurate forms, an fp16 call without the "
-                "delta rule, a decay a key dimension without it; or launches past the device's registers or "
-                "shared memory at the call's tiles (`template.backward_holds`)", row='ledger 1294'),
+                "fast_backward_form`): fp32 operands in three bf16 parts (under the accurate forms, or "
+                "without the delta rule under either, `chunk_rounding`: their training the portable math's "
+                "until the template's fp32 backward, row 2076), an fp16 call without the delta rule, a decay "
+                "a key dimension without it; or launches past the device's registers or shared memory at the "
+                "call's tiles (`template.backward_holds`)", row='ledger 1294'),
     Requirement('precision', lambda case: exact_products(None, case.dtype),
                 "a dot algorithm the run declares that narrows the operands' products (TF32's, bf16 parts of "
                 "an fp32 product), which the template's whole products (its accurate parts, or a 16-bit "
@@ -564,10 +566,21 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
                             else state.astype(work), *varying)
 
-    def walking_one(operands, h):
-        # Each chunk's values that read no memory at once; the memory alone in sequence; then each chunk's
-        # outputs from the memory entering it, at once. Each chunk's entering memory kept, the adjoint's one
-        # checkpoint a chunk.
+    outputs, final = _walk(forms, width, recomputed_memory())(operands, entering)
+    out = outputs.reshape(*outputs.shape[:2], -1, columns)
+    return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
+
+
+def _walk(forms, width: int, recomputed: bool):
+    """`xla_mainloop`'s walk over every row's and head's chunks (`[rows, heads, chunks, C, ...]` operands and
+    the memory entering), by the token update's derived `forms` (`dew.algebra.scan`): each chunk's values
+    that read no memory at once, the memory alone in sequence, then each chunk's outputs from the memory
+    entering it at once; its derivative the token update's replayed per chunk (algebra.md §6.9), each chunk's
+    adjoint from the memory entering it. That memory is the backward's one checkpoint a chunk, kept but where
+    the block's remat rung recomputes the delta rule's memory (`recomputed`, `recomputed_memory`, read as the
+    call is traced: a scan differentiates its body's custom rules after the block's trace has left it), where
+    the adjoint forms it again, as the port and the template drop theirs."""
+    def entered(operands, h):
         prepared = jax.vmap(forms.prepare)(operands)
 
         def one(carried, chunk):
@@ -577,7 +590,11 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         empty = forms.init({})[0]
         decayed = varying_like(jnp.zeros((width,), empty.dtype), *jax.tree.leaves(operands))
         carried, entering = jax.lax.scan(one, (decayed, h), prepared)
-        return (jax.vmap(forms.mapped)(prepared, entering), carried[1]), entering[1]
+        return prepared, entering, carried[1]
+
+    def walking_one(operands, h):
+        prepared, entering, last = entered(operands, h)
+        return (jax.vmap(forms.mapped)(prepared, entering), last), None if recomputed else entering[1]
 
     def replayed_one(operands, h):
         # The walk token by token (`Derived.replay`), the derivative's arithmetic at every order.
@@ -589,8 +606,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         return outputs, h
 
     def adjoint_one(operands, h, entering, d_outputs, d_final):
-        # Each chunk's adjoint (`Derived.backward`) from the memory entering it, the chunks in reverse.
-        del h
+        if entering is None:
+            entering = entered(operands, h)[1][1]
 
         def one(d_h, chunk):
             chunk, h, d_out = chunk
@@ -611,12 +628,9 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         whole = jax.tree.leaves(({**operands, **d_operands}, d_h))
         return tuple(whole[index] for index in live)
 
-    # The forms' walk for the value, its derivative the token update's replayed per chunk (algebra.md §6.9).
-    walk = generation.linear_tangent(each(walking_one), adjoint, each(replayed_one), kind=Protected(),
-                                     live_cotangents=True)
-    outputs, final = walk(operands, entering)
-    out = outputs.reshape(*outputs.shape[:2], -1, columns)
-    return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
+    return contracted("test_the_chunked_delta_rule_holds_every_order")(
+        generation.linear_tangent(each(walking_one), adjoint, each(replayed_one), kind=Protected(),
+                                  live_cotangents=True))
 
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
@@ -1131,13 +1145,12 @@ def chunk_rounding(delta: bool, dtype) -> bool:
     forms' numbers (`fast_rounding`): the delta rule's alone, whose bar is fla's (TF32 products in an fp32
     call). A form without the delta rule has no port, its bar the portable math at full fp32: an fp32 call's
     two bf16 parts put its training step 30 to 69 times the portable math's distance from float64 on every
-    leaf, interpreted and on a GH200 alike (row 184's write gate cell, jsf-cellcpu, M-JS-9), so it takes
-    three; a 16-bit call's rounded numbers are mamba_ssm's, the SSD's, which its scan's route alone asks
-    (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between launches
-    in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned keys
-    (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9). Rounded for an fp32 call
-    alone, the write gate's forward was 71 to 77 times the portable math's distance from float64 again
-    (test_recurrence_mosaic's hooks12, interpreted at base 95e84b495dc)."""
+    leaf, interpreted and on a GH200 alike (row 184's write gate cell, jsf-cellcpu, M-JS-9), and its forward
+    57 to 77 times (test_recurrence_mosaic's hooks7, hooks12 and hooks26 and the step-gated packed cell), so
+    it takes three; a 16-bit call's rounded numbers are mamba_ssm's, the SSD's, which its scan's route alone
+    asks (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between
+    launches in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned
+    keys (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9)."""
     return fast_rounding(dtype) and delta
 
 

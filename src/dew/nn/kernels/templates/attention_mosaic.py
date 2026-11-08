@@ -50,6 +50,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _plain_forward,
     _trained_forward,
     certified_walk,
+    forward_products,
     guarded_columns,
     guarded_tiles,
 )
@@ -74,6 +75,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     query_swizzle,
     reducing,
     refused,
+    scopes_products,
     split_queries,
     stagings,
     varying_slopes,
@@ -594,7 +596,8 @@ class MosaicForward(_Mainloop[Tiles]):
         # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
         guarded = algebra.headroom(_computed(ba)) and ba.arguments.get("residuals") is not Kept.SPLIT
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
-            family, config.consumers, self.score_reduces or self.output_mod is not None, guarded=guarded)))
+            family, config.consumers, self.score_reduces or self.output_mod is not None, guarded=guarded),
+            products=forward_products(config, value_width, query.dtype, parts=self.parts)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
                   columns: int | None = None) -> int | None:
@@ -742,6 +745,14 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         phases.append([logits] * 2 + [bits])
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
+    if scopes_products(family):
+        # Its products read back from tensor memory in its layout and converted to the walk's, both live
+        # at once (tcgen05's chunks, `Tcgen05ChunksIssuer.summed`): the logits a second time in each phase
+        # holding them, and the weighted values' product beside the sums it adds into (a B200's 64 x 64
+        # forward on three consumers, width 64, priced 126 of 160 and spilled 20 bytes; 64 x 128 132 and
+        # 184, et-h1need).
+        phases = [[*phase, logits] for phase in phases]
+        phases.append([(block_q, value_width, jnp.float32)] * 2)
     depth = value_width if width is None else width
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
                          (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow,
@@ -750,7 +761,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
-    return max(resources.live_registers(family, carried, *phases, *products), scored) + rows
+    return max(resources.live_registers(family, carried, *phases, *products), scored) + rows + (
+        family.product_control)
 
 
 def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tuple, width: int) -> int:
@@ -888,18 +900,18 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
               *, scale: float | None = None, natural: bool = NATURAL, interpret: bool = False):
     """The forward's certify form at the tiles its call derives (`MosaicForward.derived`), its walk the plain
-    one (no P·V a step late): `certified_walk`'s output and its state after each key tile. Off in
-    production; tests/attention_witness.py holds each state to one step's enclosure of the one before. A call
-    no config holds raises the reason the forward declines it (`MosaicForward.declined`: an unqualified
-    family's, or the device's block and registers)."""
+    one (no P·V a step late): those tiles, and `certified_walk`'s output and its state after each of their key
+    tiles. Off in production; tests/attention_witness.py holds each state to one step's enclosure of the one
+    before. A call no config holds raises the reason the forward declines it (`MosaicForward.declined`: an
+    unqualified family's, or the device's block and registers)."""
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
     ba = op.bind(*args, residuals=Kept.NONE, interpret=interpret)
     target = generation.gpu_target()
     config = op.derived(ba, target)
     if config is None:
         raise ValueError(f"the Mosaic forward declines the call: {op.declined(ba, target)}")
-    return certified_walk(query, key, value, spans, hooks or Hooks(), scale=op.scale, natural=op.natural,
-                          tiles=config, interpret=interpret)
+    return config, certified_walk(query, key, value, spans, hooks or Hooks(), scale=op.scale,
+                                  natural=op.natural, tiles=config, interpret=interpret)
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
@@ -1174,6 +1186,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dkv_family = found.get(config.dkv.family)
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
             return False
+        # The backward's launches scope no issuer's product scratch (tcgen05's chunks'); row 4839's
+        # tensor-memory backward is their tcgen05 form. A family the device has no bundle of (a pin of an
+        # H100's wgmma on an A100) is not read here: the mainloop's legality refuses it (`_Mainloop.legal`).
+        scoped = [found[tiles.family] for tiles in (config, config.dkv) if tiles.family in found]
+        if any(map(scopes_products, scoped)):
+            return False
         keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
                 keys_first and not ((split_queries(dkv_family)
@@ -1320,9 +1338,13 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # Fewer rows a consumer for a call with no score hook: a hook's parameters and pullback tiles laid out
         # at a role's rows, sliced at fewer, fail to lower (an A100's accurate dQ under a temperature at 32 x
         # 32: "slice size (32) ... divisible by the tile size (64)", acchook3; FS-A100CHECK1d's row-indexed).
-        for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
-            walks = extents if rows is None else functools.partial(_sides, rows)
-            for columns in (1, 2, 4):
+        # Whole columns at fewer rows before a column split at the role's: a split recomputes each step's
+        # score products once a share, where fewer rows keep the work and halve the tile (an A100's
+        # bf16 backward 128 wide at 32 x 32 whole took 0.82 to 0.88 of 64 x 64 in two shares, 1 x 8192
+        # causal 36.1 against 41.7 ms; M-ET-29b, W91-a100).
+        for columns in (1, 2, 4):
+            for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
+                walks = extents if rows is None else functools.partial(_sides, rows)
                 for staged in (False, True):
                     def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
                               ) -> BackwardTiles:

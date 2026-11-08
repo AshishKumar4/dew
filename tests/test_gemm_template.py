@@ -886,6 +886,21 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
 
 
+def test_a_band_that_reaches_every_column_tile_takes_them_all():
+    """`resources.band`: a wave spanning each group's row tiles whole reads a band as wide as the columns
+    allow, and where that reaches every column tile it takes them all, three or six of them, so no last
+    band walks the rows again (row 4053: the H100 grouped forward read its tokens twice, M-NS-3); below
+    them, and on a dense walk, a power of two."""
+    # Qwen3-30B-A3B's gate forward on an H100: 132 multiprocessors in pairs, 256-row cluster tiles, about
+    # two a group (65,536 rows over 128 experts).
+    for columns in (3, 6):
+        assert resources.band(132, 128, 128, columns, 2, cluster=2) == columns
+    assert resources.band(132, 128, 128, 64, 2, cluster=2) == 32
+    assert resources.band(132, 128, 128, 64) == 8
+    # A dense walk's three column tiles stay a power of two.
+    assert resources.band(132, 128, 256, 3) == 2
+
+
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "traced"])
 @pytest.mark.parametrize("minor_dim", [0, 1])
 @pytest.mark.parametrize(("major", "minor", "width"),
