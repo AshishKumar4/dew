@@ -87,8 +87,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     products_overlap = True
     in_flight = 1
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, interpret: bool = False) -> jax.Array:
-        del interpret  # wgmma lowers interpreted
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
 
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
@@ -99,12 +98,14 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+    def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
+        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
-    def products(self, acc, lhs, rhs, interpret: bool, *, accumulate: bool = True):
+    def products(self, acc, lhs, rhs, *, accumulate: bool = True):
+        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
         mosaic.committed()
         if interpret:
             fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
@@ -121,7 +122,8 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
         value = acc if isinstance(acc, jax.Array) else plgpu.wgmma_accumulator_load(acc, wait_n=pending)
         return super().read(value, first=first, columns=columns)
 
-    def register_products(self, acc, parts, rhs, interpret: bool):
+    def register_products(self, acc, parts, rhs):
+        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
         for formed in parts:
             part = mosaic.unscaled_part(formed)
             mosaic.committed()
@@ -131,9 +133,10 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
                 plgpu.wgmma(acc, part, rhs)
         return acc
 
-    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+    def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         """`Family.summed` into a scoped warpgroup accumulator: reading it (`acc_ref[...]`) waits on the
         products `issue` issued into it, so the value is theirs once they are done."""
+        interpret = mosaic.interpreting()  # the launch's (`mosaic.interpreting`)
         if interpret:
             return issue(self.zeros(shape))
 
@@ -154,11 +157,11 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         if interpret:
-            return self.register_products(scale(acc), parts, rhs, interpret)
+            return self.register_products(scale(acc), parts, rhs)
         # The accumulator's value read once its products are done, scaled, stored back.
         plgpu.wgmma_wait(0)
         acc[...] = scale(acc[...])
-        return self.register_products(acc, parts, rhs, interpret)
+        return self.register_products(acc, parts, rhs)
 
     def settled(self, pending: int = 0) -> None:
         plgpu.wgmma_wait(pending)
