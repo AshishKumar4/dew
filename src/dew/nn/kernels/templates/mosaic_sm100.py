@@ -30,7 +30,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm90, resources
+from dew.nn.kernels.templates import mosaic, mosaic_sm90, persistent, resources
 from dew.nn.kernels.templates.mosaic import Ref
 
 ISSUE, READ = 0, 1
@@ -466,7 +466,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
     def started(self, shapes: tuple, initial: tuple | None = None) -> tuple:
         # A walk's accumulators are the tensor memory its persist gives it (`initial`, each an `Accumulator`);
-        # a tile that walks no step has none, its chunks zeros (`mosaic.unwalked`).
+        # a tile that walks no step has none, its chunks zeros (`persistent.unwalked`).
         if initial is not None:
             if tuple(acc.shape for acc in initial) != tuple(shapes):
                 given = [acc.shape for acc in initial]
@@ -628,7 +628,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         first product not accumulating), which the epilogue warpgroup promotes into the tile's running sums
         in tensor memory (`promoted`: each chunk of the partial and the running sum out, an IEEE add, the
         sum back) once their commit arrives, freeing the turn for the window after next; the tile's store
-        reads the running sums. Each window is a turn (`mosaic.tiled`'s `turns`), so the products of a
+        reads the running sums. Each window is a turn (`persistent.tiled`'s `turns`), so the products of a
         window run while the epilogue promotes the one before."""
         if not accumulators:
             raise ValueError(f"{self._HOME}: a persistent launch states their shapes (`accumulators`)")
@@ -703,19 +703,20 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                         if not summed:
                             plgpu.barrier_arrive(read.at[turn.slot])
 
-                    pl.when(~active)(lambda: finish(index, tile, issue(index, tile, mosaic.unwalked(self),
+                    pl.when(~active)(lambda: finish(index, tile, issue(index, tile, persistent.unwalked(self),
                                                                        active=False), store, active=False))
 
-                mosaic.tiled(tiles, schedule, visit, axis=axis, turns=windows)
+                persistent.tiled(tiles, schedule, visit, axis=axis, turns=windows)
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
             def load():
-                loaded, _ = mosaic.tiled(tiles, schedule, functools.partial(mosaic.loads, rings), axis=axis)
+                loads = functools.partial(mosaic.loads, rings)
+                loaded, _ = persistent.tiled(tiles, schedule, loads, axis=axis)
                 for ring in rings.values():
                     ring.drain(loaded)
 
             def issue_all():
-                _, computed = mosaic.tiled(tiles, schedule, products, axis=axis, turns=windows)
+                _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
                 mosaic.drained(read, computed, self.turns)
 
             self.roles_of(((consumers, epilogue),), load=load, products=issue_all)
@@ -726,7 +727,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     def _issued(self, rings, issue: Callable, turn_of: Callable, held: Callable, running: tuple, read,
                 done, *, summed: int, interpret: bool, unrolled: bool) -> Callable:
-        """`persist`'s product warp's visit of a tile (`mosaic.tiled`'s): each active tile's windows (its
+        """`persist`'s product warp's visit of a tile (`persistent.tiled`'s): each active tile's windows (its
         steps, where not `summed`) into a turn's accumulators once the window `turns` back has been read out
         of them, each window then a commit the epilogue waits on."""
         def products(counter, active, steps, views, tile, done_turns):

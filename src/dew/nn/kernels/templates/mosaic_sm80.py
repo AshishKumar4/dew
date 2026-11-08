@@ -22,7 +22,7 @@ from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import mosaic, product, report, resources
+from dew.nn.kernels.templates import mosaic, persistent, product, report, resources
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -649,7 +649,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             return walk
 
-        mosaic.consumed(self, tiles, schedule, issue, finish, store, 0, walking, axis=axis)
+        persistent.consumed(self, tiles, schedule, issue, finish, store, 0, walking, axis=axis)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,

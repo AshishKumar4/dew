@@ -20,7 +20,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import mosaic, persistent
 
 STAGES = 2
 """The slots a stream's ring holds: a step's blocks arrive while the step before it multiplies (Pallas
@@ -336,7 +336,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
                     finish(0, tile, issue(0, tile, walk, active=active), store, active=active)
 
                 pl.when(active)(lambda: run_tile(walk, active=True))
-                pl.when(~active)(lambda: run_tile(mosaic.unwalked(self), active=False))
+                pl.when(~active)(lambda: run_tile(persistent.unwalked(self), active=False))
                 return carry
 
             lax.fori_loop(0, (total - program + programs - 1) // programs, visit, 0)
