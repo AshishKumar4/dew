@@ -21,7 +21,6 @@ from dew.nn.precision import (
     float32_dot_general,
     float32_einsum,
     float32_matmul,
-    projection_product,
 )
 
 pytestmark = pytest.mark.skipif(jax.default_backend() != "cpu", reason="the policy is the CPU's")
@@ -323,17 +322,15 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     def choices(found) -> int:
         return sum(equation.primitive.name == "platform_index" for equation in found)
 
-    # The platform choices a library makes of its float32 contractions alone (row 4863): those of the same
-    # layer with no bias, whose gradient sums no bias, and the product's own as a projection's.
-    unbiased = Dense(2, use_bias=False)
-    products = choices(traced(jax.grad(lambda params: jnp.sum(unbiased.apply({"params": params}, lhs))),
-                              unbiased.init(jax.random.key(0), lhs)["params"]))
-    numbers = (((1,), (0,)), ((), ()))
-    projected = choices(traced(
-        lambda a, b: projection_product(jax.lax.dot_general, a, b, numbers, None, None), lhs, rhs))
+    def contractions(found) -> int:
+        # A float32 contraction's platform choice: a conditional one of whose branches is a product.
+        return sum(equation.primitive.name == "cond"
+                   and any(inner.primitive.name == "dot_general" for branch in equation.params["branches"]
+                           for inner in equations(branch))
+                   for equation in found)
 
     sites = {
-        "product": traced(lambda a, b: float32_dot_general(a, b, numbers), lhs, rhs),
+        "product": traced(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))), lhs, rhs),
         "bias": traced(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, lhs))),
                        variables["params"]),
         "logsumexp": traced(lambda states, table: chunked_cross_entropy(
@@ -343,7 +340,8 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         if wide:
             assert choices(found), name
         else:
-            assert choices(found) == {"bias": products, "product": projected}.get(name, 0), name
+            # A library's platform choices are its float32 contractions' alone (row 4863).
+            assert choices(found) == contractions(found), name
         # Four rows of three: the product's few rows sum blocked and pairwise in float32 (`pairwise._summed`).
         assert float64(found) == wide, name
     # A float64 division is the plain division under either setting.

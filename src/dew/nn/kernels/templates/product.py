@@ -11,7 +11,8 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.precision import asks_default_precision, exact_products, projection_product
+from dew.nn.pairwise import pairwise_dot_general
+from dew.nn.precision import asks_default_precision, exact_products, products_dtype
 
 HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The 16-bit dtypes the kernels multiply exactly."""
@@ -99,9 +100,9 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
     `jax.enable_x64` for its own ops; the kernels' refusal of x64 (`declared`) is their int32 offsets'.
     An FP8 product is its codes' in bfloat16, each exact there, accumulated in fp32: the FP8 contract's
     reference arm, the dequantized product with fp32 sums (testing.md, FP8 products). Any other product is
-    `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are exact, and a float32 one's sum
-    the CPU's vectorized dot's where Dew's contractions take it (`precision.projection_product`), so the
-    mainloop's sums and the declaration's around them sum alike."""
+    `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are exact, and a float32 one's
+    summed as the CPU's vectorized dot sums it (`pairwise.pairwise_dot_general`, as every float32 contraction
+    `precision.accumulated` sums), so a mainloop's sums and the fp32 references they are held to sum alike."""
     if product.compute in EIGHT:
         return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,
                                    preferred_element_type=jnp.float32)
@@ -110,9 +111,8 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
             wide = jax.lax.dot_general(lhs.astype(jnp.float64), rhs.astype(jnp.float64), dimension_numbers,
                                        preferred_element_type=jnp.float64)
             return wide.astype(jnp.float32)
-    paired = projection_product(jax.lax.dot_general, lhs, rhs, dimension_numbers, None, jnp.float32)
-    if paired is not None:
-        return paired
+    if products_dtype(lhs, rhs) == jnp.dtype(jnp.float32):
+        return pairwise_dot_general(lhs, rhs, dimension_numbers)
     return jax.lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32)
 
 
