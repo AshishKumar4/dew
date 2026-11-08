@@ -1294,7 +1294,7 @@ def _chunks_products(x, w, *, interpret):
                 return carry, accumulators
 
             family.scheduled(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
-                         lambda: family.stream(rings, views, 0, 1))
+                              lambda: family.stream(rings, views, 0, 1))
 
         # The issuer's scratch, its staged left operand's tile among it (`Family.scoped`'s `products`).
         family.scoped(scope, streams=allocated, products=(1, (columns,), ((CHUNK_DEPTH, jnp.bfloat16),)))
