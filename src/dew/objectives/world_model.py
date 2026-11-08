@@ -242,7 +242,16 @@ class Dynamics(nn.Module):
     tokenizer latents regrouped into `spatial` tokens, with one action token a step (a learned
     embedding plus a projection of `action_size` actions, none for unlabeled video) and one shortcut
     token, the embeddings of its signal level's and step size's grid indices at `levels` levels
-    (`K_max` = 2 ** (levels - 1)), predicting each frame's clean latents."""
+    (`K_max` = 2 ** (levels - 1)), predicting each frame's clean latents.
+
+    `positions` is how its tokens know where they are. "rotary", Dreamer 4's (Section 3.2), rotates every
+    attention's queries and keys by each token's frame and its place in the frame (the action token, the
+    shortcut token, then the spatial ones), beside the learned vectors each adds. "learned" is the
+    learned vectors alone, the dynamics models were saved with before row 4802: started at 0.02 against
+    the latents' unit scale, they left a frame's tokens no way to tell their past's apart, and a model
+    trained on clips whose latents shift a place a frame forecast from its context no better than from
+    noise (a teacher-forced error of 1.06 from a clean context, 1.15 from noise, against the mean
+    frame's 0.84; the same vectors started at 1.0, 0.54 and 1.30)."""
 
     latents: int = 16
     bottleneck: int = 8
@@ -253,6 +262,7 @@ class Dynamics(nn.Module):
     heads: int = 4
     levels: int = 7
     frames: int = 32
+    positions: Literal["rotary", "learned"] = "rotary"
 
     @property
     def k_max(self) -> int:
@@ -284,9 +294,20 @@ class Dynamics(nn.Module):
         tokens = tokens + times[:frames, None]
         tokens = tokens.reshape(batch, frames * per_frame, self.width)
         time = jnp.repeat(jnp.arange(frames), per_frame)
-        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}")
+        rotary = self.positions == "rotary"
+        head = self.width // self.heads
+        if rotary and head < 4:
+            raise ValueError(f"a dynamics model's two-axis rotary turns a pair of channels or more for each "
+                             f"axis, and its heads are {head} wide; make width // heads at least 4")
+        # The frames' channels, a whole number of pairs, and the places' the rest, as near halves as they
+        # split (`CausalTokenizer`'s).
+        channels = 2 * ((head + 2) // 4)
+        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}",
+                         rotary_axes=(channels, head - channels) if rotary else None)
                   for index in range(self.depth)]
-        tokens = _attended(blocks, tokens, time[:, None] >= time[None, :])
+        places = jnp.stack([time, jnp.tile(jnp.arange(per_frame), frames)], -1).astype(jnp.float32)
+        tokens = _attended(blocks, tokens, time[:, None] >= time[None, :],
+                           positions=places if rotary else None)
         spatial_out = tokens.reshape(batch, frames, per_frame, -1)[:, :, 2:]
         out = nn.Dense(grouped.shape[-1])(nn.RMSNorm(epsilon=RMS_EPSILON)(spatial_out))
         return out.reshape(noisy.shape)
