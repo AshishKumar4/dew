@@ -508,15 +508,13 @@ def _launched(hooks: Hooks, operands: Step, *, dtype):
     (`templates.recurrence.step`), interpreted off a GPU, on each shard of the rows (`manual_map`): a launch
     left to the partitioner gathers its operands to every device; a one-tap conv's token taken as a scale
     first."""
-    from .templates import bundles
     from .templates.recurrence import mainloop, step as template
 
     given = read(hooks, operands)
     if hooks.conv is not None and given['held'].shape[1] == 0:
         return _one_tap(hooks, hooks.conv, operands, given, dtype)
-    family = mainloop.family_of(jnp.float32)
-    launch = functools.partial(template.step, hooks, dtype=dtype, family=family or bundles.INTERPRETED,
-                               interpret=family is None)
+    family, interpret = mainloop.issued(jnp.float32)
+    launch = functools.partial(template.step, hooks, dtype=dtype, family=family, interpret=interpret)
     batch, heads, _, width = operands.state.shape
     rows, _ = grouped_heads((batch, 1, heads, width), 1)
     names = [field.name for field in dataclasses.fields(Step) if getattr(operands, field.name) is not None]
