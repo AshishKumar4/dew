@@ -366,3 +366,29 @@ def test_a_convention_turns_the_ramp_its_source_turns_past_the_original_context(
         assert isinstance(verified, Unmapped)
     else:
         assert isinstance(verified, VerifiedMapping) and verified.family != "parts"
+
+
+def test_a_change_to_the_twins_package_verifies_a_mapping_again(tmp_path):
+    """A verified mapping is kept under the digest of the code that verified it (`package_digest`), the
+    float64 twins' torch-only package (`_dew_torch`) among it: an edit there alone, which changes the
+    truth a candidate was held to, names another record, so the mapping is verified again."""
+    import os
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[1] / "src"
+    for name in ("dew", "_dew_torch"):
+        shutil.copytree(source / name, tmp_path / name, ignore=shutil.ignore_patterns("__pycache__"))
+
+    def digest() -> str:
+        return subprocess.run(
+            [sys.executable, "-c", "from dew._cache import package_digest; print(package_digest())"],
+            env={**os.environ, "PYTHONPATH": str(tmp_path), "JAX_PLATFORMS": "cpu"}, check=True,
+            capture_output=True, text=True).stdout.strip()
+
+    before = digest()
+    precision = tmp_path / "_dew_torch" / "precision.py"
+    precision.write_text(precision.read_text() + "\n# edited\n")
+    assert digest() != before

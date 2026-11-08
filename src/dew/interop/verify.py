@@ -54,7 +54,7 @@ from dew.interop import decoder_config, decoder_parts, hf_decoders as decoders, 
 from dew.interop.decoder_families import ENTRIES
 from dew.nn import precision
 from dew.nn.blocks import padded_row
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
 from dew.registry import models
@@ -874,7 +874,8 @@ def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
         return jax.grad(lambda params: jnp.sum(model.apply({**held, 'params': params}, ids) * cotangent))(
             params)
 
-    compiled = program(gradient, model)
+    # Held by this qualification alone, which a closure over its probe's arrays is (`owned_program`).
+    compiled = owned_program(gradient, model)
 
     def theirs(network: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, dtype: str) -> dict:
         _, gradients = _probe_gradients(network, ids, cotangent, train=False)

@@ -35,14 +35,16 @@ implementation."""
 
 @functools.cache
 def package_digest() -> str:
-    """The digest of Dew's own implementation, every source file of `dew` by its path and contents, the
+    """The digest of Dew's own implementation, every source file of `dew` and of the torch-only package
+    beside it (`_dew_torch`, whose float64 twins tier 2 verifies by) by its path and contents, the
     release's version (`VERSION_FILE`) not read: what a cache of what Dew's code computed keys on, so that any
     change of that code computes it again and a release computes nothing again. Read once a process."""
     package = Path(__file__).parent
     digest = hashlib.sha256()
-    for path in sorted(package.rglob("*.py")):
-        if path.relative_to(package) != Path(VERSION_FILE):
-            digest.update(str(path.relative_to(package)).encode() + b"\0" + path.read_bytes())
+    for root in (package, package.parent / "_dew_torch"):
+        for path in sorted(root.rglob("*.py")):
+            if path.relative_to(package.parent) != Path(package.name, VERSION_FILE):
+                digest.update(str(path.relative_to(package.parent)).encode() + b"\0" + path.read_bytes())
     return digest.hexdigest()
 
 
