@@ -15,7 +15,7 @@ import sys
 
 import numpy as np
 import torch
-from reference_worker import serve
+from reference_worker import drawn, serve
 from torch_precision import default_dtype
 
 
@@ -32,11 +32,8 @@ def mel(waveform: np.ndarray, dtype) -> np.ndarray:
 
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's log mel frames, in float32 and float64."""
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        out[f"{name}.reference.mel"] = mel(cases[f"{name}.waveform"], torch.float32)
-        out[f"{name}.truth.mel"] = mel(cases[f"{name}.waveform"], torch.float64)
-    return out
+    return drawn(cases, lambda inputs: ({"mel": mel(inputs["waveform"], torch.float32)},
+                                        {"mel": mel(inputs["waveform"], torch.float64)}))
 
 
 if __name__ == "__main__":

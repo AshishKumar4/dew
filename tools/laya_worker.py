@@ -19,7 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from laya_reference import FIXTURES, _laya, laid_logits, twins
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 TINY = FIXTURES / "tiny"
 LAYOUTS = ("sequential", "parallel")
@@ -29,22 +29,23 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every case's logits by layout, under its weights, in float32 and float64."""
     agent_module, _ = _laya()
     agent = agent_module.Agent(str(TINY), device="cpu")
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        prefix = f"{name}.param."
-        weights = {key.removeprefix(prefix): torch.from_numpy(np.asarray(value))
-                   for key, value in cases.items() if key.startswith(prefix)}
+    def answer(inputs):
+        weights = {key.removeprefix("param."): torch.from_numpy(np.asarray(value))
+                   for key, value in inputs.items() if key.startswith("param.")}
         # The action head and the temperature buffer, which no option logit reads (dew.decision.laya's
         # `_UNREAD`), keep the tiny checkpoint's.
         missing, unexpected = agent.model.load_state_dict(weights, strict=False)
         if unexpected or {name for name in missing if not name.startswith(("act_head.", "temperature"))}:
             raise ValueError(f"the drawn weights do not fit Laya's model: {missing}, {unexpected}")
         _, logits = laid_logits(agent, *twins(agent, Path(TINY)))
-        for layout in LAYOUTS:
-            keys = sorted(key for key in logits if key.startswith(f"{layout}/") and not key.endswith("/f64"))
-            out[f"{name}.reference.{layout}"] = np.concatenate([logits[key] for key in keys])
-            out[f"{name}.truth.{layout}"] = np.concatenate([logits[f"{key}/f64"] for key in keys])
-    return out
+        keys = {layout: sorted(key for key in logits
+                               if key.startswith(f"{layout}/") and not key.endswith("/f64"))
+                for layout in LAYOUTS}
+        return ({layout: np.concatenate([logits[key] for key in held]) for layout, held in keys.items()},
+                {layout: np.concatenate([logits[f"{key}/f64"] for key in held])
+                 for layout, held in keys.items()})
+
+    return drawn(cases, answer)
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ from collections.abc import Callable
 
 import numpy as np
 import torch
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 STEPPED_PREFILL = 40
 """The prefill of the cached decode whose shapes `stepped` is scored at, which tests/kimi_support.py's
@@ -87,15 +87,12 @@ def main() -> None:
     stepped = site == "kimi-k3"
 
     def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        out = {}
-        for name in sorted({key.split(".", 1)[0] for key in cases}):
-            inputs = {key: cases[f"{name}.{key}"] for key in ("input_ids", "attention_mask")}
-            out |= {f"{name}.reference.{leaf}": value
-                    for leaf, value in outputs(narrow, inputs, "cuda", stepped).items()}
+        def answer(inputs):
+            reference = outputs(narrow, inputs, "cuda", stepped)
             with wide_context():
-                out |= {f"{name}.truth.{leaf}": value
-                        for leaf, value in outputs(wide, inputs, "cuda", stepped).items()}
-        return out
+                return reference, outputs(wide, inputs, "cuda", stepped)
+
+        return drawn(cases, answer)
 
     serve(run)
 

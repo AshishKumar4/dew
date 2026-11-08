@@ -700,13 +700,70 @@ def test_an_elastic_read_whose_map_rejects_records_reads_one_readers_order(count
         assert all(ident % 2 for ident, *_ in whole)
 
 
-def test_an_elastic_read_refuses_a_batch_ramp_before_it_reads():
-    """A batch ramp cuts its steps out of a global record count, which an elastic read's position,
-    its order's, is not: an elastic read under a ramp is refused where the ramp opens it, not where
-    its first save or restore would find no record count (row 1913)."""
-    loader = ramped(compile(stream(), loading=READ, seed=3), Ramp(start=4, increment=4, samples=64))
-    with pytest.raises(TypeError):
-        loader.train(DataPartition(0, 2))
+@pytest.mark.parametrize(("saved", "resumed"), [(1, 2), (2, 4), (4, 2)])
+def test_a_ramped_elastic_read_reads_one_readers_steps_and_resumes_on_another_count(saved, resumed):
+    """A batch ramp over an elastic read hands every reader its share of the steps one reader's ramp cuts
+    from the read's one order, every count-th record of each, and its position, the read's beside the
+    ramp's, is every reader's and resumes on another count of readers there, mid-batch of the read (row
+    1913: an elastic read under a ramp was refused where the ramp opened it)."""
+    ramp = Ramp(start=4, increment=4, samples=16)
+
+    def ramped_reader(index, count):
+        return ramped(compile(stream(), loading=READ, seed=3), ramp).train(DataPartition(index, count))
+
+    whole = [rows(batch) for batch in listed(ramped_reader(0, 1), 7)]
+    assert {len(step) for step in whole[:3]} == {4} and len(whole[-1]) == BATCH
+    shares = [ramped_reader(index, saved) for index in range(saved)]
+    # Three steps of four records: the read's second batch half handed over.
+    for step in range(3):
+        held = [rows(next(share)) for share in shares]
+        assert [row for index in range(saved) for row in held[index]] == [
+            whole[step][at] for index in range(saved) for at in range(index, len(whole[step]), saved)]
+    states = {share.get_state() for share in shares}
+    assert len(states) == 1
+    (state,) = states
+    assert _position.translates(state)
+    again = [ramped_reader(index, resumed) for index in range(resumed)]
+    for share in again:
+        share.set_state(state)
+    for step in range(3, 7):
+        held = [rows(next(share)) for share in again]
+        assert [row for index in range(resumed) for row in held[index]] == [
+            whole[step][at] for index in range(resumed) for at in range(index, len(whole[step]), resumed)]
+
+
+@pytest.mark.parametrize("count", [2, 4])
+def test_a_ramped_elastic_read_that_keeps_its_short_last_batch_cuts_it_alike_on_every_reader(count):
+    """A ramp over an elastic read that ends keeping its short last batch cuts it alike on every reader: each
+    step's shares, interleaved, are one reader's step, its real records and the marks of its repeats
+    (`VALID_ROWS`) place by place, to the last step, so every reader ends at the same step (row 4811: such a
+    ramp was refused, each reader holding its own share of the batch's real records)."""
+    ramp = Ramp(start=4, increment=4, samples=16)
+
+    def steps(index, readers):
+        # One pass (a training read without a repeat reads on without end) of the odd ids of 60, a filter's,
+        # so the read's position is its order's (`elastic`), no record count.
+        chain = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(60)))).repeat(1)
+                 .filter(odd).batch(BATCH, drop_remainder=False).elastic())
+        return list(ramped(compile(chain, loading=READ, seed=3), ramp).train(DataPartition(index, readers)))
+
+    def places(batch):
+        valid = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
+        return [int(row) if real else None for row, real in zip(batch["id"], valid, strict=True)]
+
+    whole = [places(batch) for batch in steps(0, 1)]
+    # The ramp's steps: 4 records at first, its stages growing to the read's batch.
+    assert [len(step) for step in whole[:3]] == [4, 4, 4] and len(whole[-1]) == BATCH
+    one = (Pipeline(Memory(({"id": np.int64(1)},))).repeat(1).filter(odd)
+           .batch(BATCH, drop_remainder=False).elastic())
+    opened = ramped(compile(one, loading=READ, seed=3), ramp).train(DataPartition(0, count))
+    assert _position.ramped(opened.get_state()) is not None
+    shares = [[places(batch) for batch in steps(index, count)] for index in range(count)]
+    assert {len(share) for share in shares} == {len(whole)}
+    assert sorted(row for step in whole for row in step if row is not None) == list(range(1, 60, 2))
+    for at, step in enumerate(whole):
+        assert [step[place] for place in range(len(step))] == [
+            shares[place % count][at][place // count] for place in range(len(step))]
 
 
 @dataclasses.dataclass(frozen=True)

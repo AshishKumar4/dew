@@ -31,10 +31,27 @@ from compressed_tensors.quantization.utils.helpers import generate_gparam
 from compressed_tensors_mxfp4_reference import TIES
 from nvfp4_storage_reference import ARGS, compress
 from safetensors.torch import save_file
-from torch_precision import float64, float64_twin
+from torch_precision import float64, float64_twin, native
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "nvfp4_qdq"
+
+
+def quantize_wide(module, value, base_name, args):
+    """compressed-tensors' `forward_quantize` in a float64 model: the quantizer as published (`native`), its
+    codes and scales computed in float32 from its input and stored global, its result widened."""
+    overall = module.input_global_scale
+    with native():
+        module.input_global_scale = torch.nn.Parameter(overall.float(), requires_grad=False)
+        try:
+            return forward_quantize(module, value.float(), base_name, args).double()
+        finally:
+            module.input_global_scale = overall
+
+
+def quantized_as_published():
+    """The block's compressed-tensors input QDQ as published inside a float64 run (`quantize_wide`)."""
+    return patch("compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide)
 
 
 def checkpoint(e4m3: bool) -> None:
@@ -118,20 +135,7 @@ def checkpoint(e4m3: bool) -> None:
     for module in exact.modules():
         if hasattr(module, "quantization_status"):
             module.quantization_status = QuantizationStatus.COMPRESSED
-    direct_float = torch.Tensor.float
-
-    def quantize_wide(module, value, base_name, args):
-        # The quantizer defines the discrete function in fp32. Its stored
-        # globals must stay fp32 even though the surrounding model widens.
-        overall = module.input_global_scale
-        module.input_global_scale = torch.nn.Parameter(direct_float(overall), requires_grad=False)
-        try:
-            return forward_quantize(module, direct_float(value), base_name, args).double()
-        finally:
-            module.input_global_scale = overall
-
-    with float64(), torch.no_grad(), patch(
-            "compressed_tensors.quantization.lifecycle.forward.forward_quantize", quantize_wide):
+    with float64(), torch.no_grad(), quantized_as_published():
         arrays["logits_f64"] = exact(ids, use_cache=False).logits.numpy()
     for module in model.modules():
         module.quantization_enabled = False

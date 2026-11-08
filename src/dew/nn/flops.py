@@ -6,8 +6,12 @@ The trainer multiplies these forward counts by three for forward/backward
 MFU. Rematerialization belongs only to the separate HLO hardware count.
 """
 
+import collections
 import math
+import threading
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Self
 
 import numpy as np
 from flax import linen as nn
@@ -47,23 +51,80 @@ def patch_lengths(sample_shape: Sequence[int], patch: Sequence[int], rows: int) 
     return np.full((rows,), count, np.int64)
 
 
+COUNTED = 256
+"""The counts a process keeps of the modules and length signatures it last counted (`_declared`): a run's
+batches repeat a few signatures, a packed window's rows filling it alike, so each is counted once."""
+
+_counts: collections.OrderedDict[tuple[str, int, bytes], tuple[object, float]] = collections.OrderedDict()
+_counting = threading.Lock()
+
+
+def _declared(kind: str, module: Counted | CountedParameters, lengths: np.ndarray,
+              count: Callable[[np.ndarray], float]) -> float:
+    """`count(lengths)`, a module's declared work, kept for the module and the lengths' signature (their
+    dtype, shape and values) among the last `COUNTED`: a module is immutable and its count a function of
+    the lengths alone, and the module is held beside its count so no other takes its identity while the
+    count is kept. A batch's host steps count its work before its step (`dew.training.model_flops`)."""
+    held = np.asarray(lengths)
+    key = (kind, id(module), held.dtype.str.encode() + repr(held.shape).encode() + held.tobytes())
+    with _counting:
+        kept = _counts.get(key)
+        if kept is not None:
+            _counts.move_to_end(key)
+            return kept[1]
+    counted = float(count(held))
+    with _counting:
+        _counts[key] = (module, counted)
+        while len(_counts) > COUNTED:
+            _counts.popitem(last=False)
+    return counted
+
+
 def counted_flops(module: nn.Module | Counted, lengths: np.ndarray) -> float:
-    """Read a module's declaration, or refuse by name; never read its HLO."""
+    """Read a module's declaration, or refuse by name; never read its HLO. Kept for the lengths'
+    signature (`_declared`)."""
     if not isinstance(module, Counted):
         raise MissingFlopsCount(f"{type(module).__name__} has no model_flops(lengths); "
                                 "cannot report train/mfu")
-    count = float(module.model_flops(lengths))
+    count = _declared("model", module, lengths, module.model_flops)
     if not math.isfinite(count) or count < 0:
         raise ValueError(f"{type(module).__name__}.model_flops returned {count}, "
                          "not finite nonnegative FLOPs")
     return count
 
 
+@dataclass(frozen=True)
+class ConditionWork:
+    """A condition encoder's forward FLOPs and the sequence its denoiser reads.
+
+    The output lengths may differ from encoded input (system prompts
+    cropped, CLIP and T5 concatenated, or visible zero tokens retained).
+    Keeping both under the encoder makes its geometry the encode contract.
+    """
+
+    flops: float
+    lengths: np.ndarray
+    spans: np.ndarray
+    features: int
+    pooled_features: int | None = None
+    time_ids: int | None = None
+
+    @classmethod
+    def of_tokens(cls, tower: Counted, tokens: Mapping[str, np.ndarray], features: int) -> Self:
+        """The work of a `tower` that reads each row's unmasked `tokens` and hands its denoiser the
+        whole fixed-length sequence, `features` wide: its FLOPs over the real tokens, their lengths,
+        and spans of the token budget."""
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return cls(counted_flops(tower, lengths), lengths, spans, features)
+
+
 def parameter_flops(module: nn.Module | CountedParameters, lengths: np.ndarray) -> float:
-    """The declared learned-matrix contribution; no inference from parameter names."""
+    """The declared learned-matrix contribution; no inference from parameter names. Kept for the
+    lengths' signature (`_declared`)."""
     if not isinstance(module, CountedParameters):
         raise MissingFlopsCount(f"{type(module).__name__} has no parameter_flops for PEFT training work")
-    return float(module.parameter_flops(lengths))
+    return _declared("parameters", module, lengths, module.parameter_flops)
 
 
 def projection_flops(lengths: np.ndarray, inputs: int, outputs: int) -> float:

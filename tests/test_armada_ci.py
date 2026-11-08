@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import armada_task, cached, cached_checkout, commit, interpreter, loaded, written
+from armada_support import apart, armada_task, cached, cached_checkout, commit, interpreter, loaded, written
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -133,6 +133,33 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
             "tests/test_config.py", "tests/test_light.py", "tests/test_measured.py", "tests/test_heavy.py",
             "tests/test_new.py"}
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
+
+
+def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name_and_weight(ci, tmp_path,
+                                                                                           monkeypatch):
+    """Armada keeps a task's recorded use under the key its entry states (its `keyOf`), so a task the next
+    plan cuts again from new timings, under a new name and weight, packs on what it used and not on its
+    class's estimate (2026-11-07: no record of a task matched the next plan's, a quarter of each container's
+    CPU used): one key for one task's rows across plans, a key for each of a plan's tasks, and another for
+    the same rows run another way (the cache off), whose use is its own."""
+    for name in ("test_heavy", "test_light", "test_measured"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
+         "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0}))
+
+    def keys(timings: dict) -> dict[tuple[str, ...], tuple[str, float]]:
+        return {tuple(entry["rows"]): (entry["key"], entry["weight"])
+                for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"}
+
+    before = keys({"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
+    after = keys({"files": {"3.12:tests/test_measured.py": 45.0, "3.12:tests/test_light.py": 20.0}})
+    assert set(before) == set(after) and len({key for key, _ in before.values()}) == len(before)
+    assert {rows: key for rows, (key, _) in before.items()} == {rows: key for rows, (key, _) in after.items()}
+    assert any(before[rows][1] != after[rows][1] for rows in before)
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    cold = keys({"files": {"3.12:tests/test_measured.py": 40.0, "3.12:tests/test_light.py": 30.0}})
+    assert set(cold) == set(before) and all(cold[rows][0] != before[rows][0] for rows in before)
 
 
 def test_the_newest_pythons_collection_is_planned_within_the_target_at_the_slowest_rate_it_ran_at(
@@ -692,36 +719,29 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
         ci, tmp_path, monkeypatch, cache_worker):
     """A lane on a class no run has measured borrows each file's share from another GPU class's last
     measured peak (the largest any class holds), so its files run side by side as a measured lane's do,
-    not each alone. A file red under a borrowed share because its memory ran out runs once more, alone,
-    with the lane's whole share, and its row says so (interference) with that first failure; one whose
-    first failure is its own (an assertion, whatever its message names) stays red, run once. The lane
+    not each alone. A file red under a borrowed share is red, run once, whatever its failure: its memory
+    running out as much as an assertion (owner, 2026-11-07: a red under sharing is a red). The lane
     records this class's own measurement, so the next lane on it reads its own, not the borrowed one. A
     file no class measured runs alone, as every unmeasured one does where the Worker does not list its
     records."""
     url, stored, _ = cache_worker
     names, source = gpu_lane_at(tmp_path, monkeypatch, url, 4), LANE_TEST
-    # Out of memory on any share but the whole: run again alone, its second row green, the first failure kept
-    # in its row. And one whose first failure is its own (an assertion): red, run once, whatever share.
+    # Out of memory on any share but the whole, and an assertion's miss on any: each red, run once. And
+    # one out of memory whose borrowed measurement already reached the whole share, run with it.
     (tmp_path / "tests/test_tight.py").write_text(
         source + "    if share != '0.5':\n"
                  "        raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 9.0GiB')\n")
     (tmp_path / "tests/test_wrong.py").write_text(
         source + "    assert share == '0.5', 'an accuracy miss, not RESOURCE_EXHAUSTED: out of memory'\n")
-    # A block past the GPU's shared memory is no device memory a larger share gives: red, run once. And one
-    # out of memory whose borrowed measurement already reached the whole share: red, run once, as it ran.
-    (tmp_path / "tests/test_shared.py").write_text(
-        source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Shared memory size limit exceeded: 300000')\n")
     (tmp_path / "tests/test_whole.py").write_text(
         source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 90.0GiB')\n")
     (tmp_path / "tests/test_new.py").write_text(source)
-    every = [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
-             "tests/test_whole.py", "tests/test_new.py"]
+    every = [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_whole.py", "tests/test_new.py"]
     interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
     # Another class measured 4 GiB for each file but the new one; a third, smaller peaks for some.
     for other, peak in (("NVIDIA-H100-80GB-HBM3-x86", 4), ("NVIDIA-A10-x86", 2)):
-        for name in [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
-                     "tests/test_whole.py"]:
+        for name in [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_whole.py"]:
             at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), other)
             whole = 64 if name == "tests/test_whole.py" else peak
             stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
@@ -738,19 +758,13 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     assert [share for share, *_ in first] == [borrowed] * len(names), "the largest class's 4 GiB and headroom"
     assert overlapping(first) >= 2, "borrowed shares pack as measured ones do"
     assert [share for share, *_ in ran("test_new")] == ["0.5"], "measured on no class: alone, the whole share"
-    assert [share for share, *_ in ran("test_tight")] == [borrowed, "0.5"]
-    tight = rows["3.12:tests/test_tight.py"]
-    assert tight["exitCode"] == 0 and "borrowed from NVIDIA-H100-80GB-HBM3-x86" in tight["interference"]
-    assert "RESOURCE_EXHAUSTED" in tight["interference"]
-    wrong = rows["3.12:tests/test_wrong.py"]
-    assert wrong["exitCode"] == 1 and "an accuracy miss" in wrong["output"] and "interference" not in wrong
-    assert [share for share, *_ in ran("test_wrong")] == [borrowed], "its own failure: red, run once"
-    for stem in ("test_shared", "test_whole"):
+    for stem, said in (("test_tight", "RESOURCE_EXHAUSTED"), ("test_wrong", "an accuracy miss"),
+                       ("test_whole", "RESOURCE_EXHAUSTED")):
         found = rows[f"3.12:tests/{stem}.py"]
-        assert found["exitCode"] == 1 and len(ran(stem)) == 1, f"{stem}: red, run once"
-        assert "interference" not in found
+        assert found["exitCode"] == 1 and said in found["output"], stem
+        assert len(ran(stem)) == 1, f"{stem}: red, run once"
+    assert ran("test_tight")[0][0] == borrowed
     assert ran("test_whole")[0][0] == "0.5", "its borrowed measurement already reached the whole share"
-    assert all("interference" not in row for name, row in rows.items() if name != "3.12:tests/test_tight.py")
     # A Worker that does not list its records: nothing is borrowed, and an unmeasured file runs alone.
     (tmp_path / "tests/test_listless.py").write_text(source)
     for other in ("NVIDIA-H100-80GB-HBM3-x86",):
@@ -767,10 +781,47 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     assert ci.gpu_lane("3.12", ["tests/test_listless.py"], out, cache="off", processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_listless")] == ["0.5"]
     monkeypatch.setattr(ci.r2.Store, "keys", listing)
-    # This class's own records now: the next lane reads them, the tight file alone as its own last run was.
+    # This class's own records now: the next lane reads them, the tight file's red run's, not the borrowed.
     assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache="off", processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
-    assert "interference" not in json.loads(out.read_text())["rows"][0]
+
+
+def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their_own(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A GPU tier's long file runs as CI's groups (`<file>#G/N`), each a task of the lane that cuts the
+    tests the file's collection here finds by the seconds the tier's GPUs took them
+    (DEW_SPLIT_DURATIONS), a test they never timed weighing their mean: so each test runs exactly once
+    over the groups, one added since and one renamed since among them, and each group's row holds its
+    own tests' cases (audit, 2026-11-08: the tier named the tests an earlier tier ran, so a new one
+    never ran, and a test named apart read "no evidence ran")."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    names = ("a", "b", "c", "renamed", "added")
+    (tmp_path / "tests/test_long.py").write_text("".join(
+        f"def test_{name}():\n    with open('ran-{name}', 'a') as ran:\n        ran.write('1')\n"
+        for name in names))
+    # The tier's GPU seconds of the tests it ran before: `renamed` was `old`, and `added` is new.
+    weights = tmp_path / "gpu-seconds.json"
+    weights.write_text(json.dumps({f"tests/test_long.py::test_{name}": 30.0
+                                   for name in ("a", "b", "c", "old")}))
+    monkeypatch.setenv("DEW_SPLIT_DURATIONS", str(weights))
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    groups = ["tests/test_long.py#1/2", "tests/test_long.py#2/2"]
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert sorted(rows) == [f"3.12:{group}" for group in groups]
+    assert all(row["exitCode"] == 0 for row in rows.values()), rows
+    assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "1")
+    held = [set(row["tests"]) for row in rows.values()]
+    assert held[0] and held[1] and not held[0] & held[1]
+    assert held[0] | held[1] == {f"tests/test_long.py::test_{name}" for name in names}
+    # Cut by other seconds, the groups run again, each test once more: no row an earlier cut left stands
+    # for one.
+    weights.write_text(json.dumps({"tests/test_long.py::test_a": 300.0}))
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
 
 
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
@@ -924,6 +975,46 @@ def test_a_census_task_runs_its_tests_under_the_census_and_records_no_row(ci, tm
     armada_task(ci, monkeypatch, out, census=True)
     assert (tmp_path / "seen").read_text() == "1-1"
     assert stored == kept
+
+
+def test_cis_tools_run_inside_a_recalled_task_read_and_write_none_of_its_progress(tmp_path, monkeypatch,
+                                                                                    cache_worker):
+    """CI's tools these tests run inside an armada task that was itself recalled (its ARMADA_RESUME
+    naming a test its attempt passed, and its ARMADA_ARTIFACTS) set none of their tests aside by it and
+    write none of theirs into it: their task is their own (test_armada_reuse's kept entries read red on a
+    recalled attempt, its 303 planned rows resumed and none recorded)."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    passed = json.dumps({"node": "tests/test_resumed.py::test_first", "seconds": 0.001}) + "\n"
+    (outer / "progress.jsonl").write_text(passed)
+    monkeypatch.setenv("ARMADA_RESUME", str(outer))
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(outer))
+    ci = loaded(tmp_path, monkeypatch)
+    (tmp_path / "tests/test_resumed.py").write_text(
+        "from pathlib import Path\n"
+        "def test_first():\n"
+        "    with Path('ran').open('a') as ran: ran.write('first')\n")
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    [row] = armada_task(ci, monkeypatch, tmp_path / "verdict.json", policy="off")
+    assert row["exitCode"] == 0, row["output"]
+    assert (tmp_path / "ran").read_text() == "first"
+    assert (outer / "progress.jsonl").read_text() == passed
+
+
+def test_a_tasks_progress_keeps_a_test_that_changed_the_environment_naming_its_artifacts(tmp_path):
+    """A task's progress is kept where its session started naming it (ARMADA_ARTIFACTS), whatever a test
+    changes as it runs: one that clears it, as `loaded` does for the CI tools it runs apart, is still the
+    task's progress."""
+    (tmp_path / "test_clearing.py").write_text(
+        "def test_clears(monkeypatch):\n    monkeypatch.delenv('ARMADA_ARTIFACTS')\n")
+    subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-p", "progress",
+                    "test_clearing.py"], cwd=tmp_path, check=True, capture_output=True,
+                   env={**os.environ, "ARMADA_ARTIFACTS": str(tmp_path / "artifacts"),
+                        "PYTHONPATH": str(ROOT / "tools/armada")})
+    progress = (tmp_path / "artifacts" / "progress.jsonl").read_text().splitlines()
+    assert [json.loads(line)["node"] for line in progress] == ["test_clearing.py::test_clears"]
 
 
 def test_a_task_the_fleet_recalled_goes_on_from_the_tests_its_attempt_passed(ci, tmp_path, monkeypatch,
@@ -1893,8 +1984,7 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
     module = load("ci", str(tmp_path / "tools/armada"))
     monkeypatch.chdir(tmp_path)
-    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
-        monkeypatch.delenv(name, raising=False)
+    apart(monkeypatch)
     (tmp_path / "tests").mkdir()
     written(tmp_path, {"test_a.py": "def test_a():\n    with open('runs', 'a') as runs: runs.write('x')\n"})
     run = cached_runs(module, tmp_path, monkeypatch, cache_worker)

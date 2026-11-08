@@ -20,6 +20,11 @@ A run's model is one such record, `ModelConfig`: the model's class, the fields
 the run gives it, the defaults it took and the wrappers it was made in. A
 component built around parameters (an encoder, an autoencoder) records the view
 it is rebuilt from (`Recorded`), and its class is found back by `component`.
+
+The tables are the one list of every kind, each typed by its members' base, which
+this module names under TYPE_CHECKING alone: it imports no feature package as it
+runs (tests/test_imports.py), and so sits beside the foundation modules without
+being one of them (row 4266).
 """
 
 from __future__ import annotations

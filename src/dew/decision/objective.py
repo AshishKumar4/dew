@@ -145,6 +145,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         """Each packed row's own length, not its window's."""
         return _rows(batch, self.spans_in_context)[0]
 
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each window's packed rows' lengths summed (`real_lengths`, the default's count): the tokens a
+        row of its holds, each a segment's above padding's 0, counted across the batch at once."""
+        return np.count_nonzero(np.asarray(batch["segments"]) > 0, axis=-1).astype(np.int64)
+
     def row_tokens(self, batch: Batch) -> int | None:
         """Each window's width, read from its shape: the most its packed rows' lengths sum to, which a
         window's `scored_tokens` counts. A run with a token budget or cadence bounds its committed tokens

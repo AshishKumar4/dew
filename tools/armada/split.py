@@ -10,11 +10,14 @@ setup one weight (`session.SHARED_SETUP`), into N runs of consecutive tests whos
 heaviest is as light as N runs can be. This keeps the Gth run and deselects
 the rest, after CI's own selection (`session.SELECTION`), and writes each file
 the record does not wholly name to DEW_UNRECORDED, whose group's row is kept
-with no key (ci.py's `record`).
+with no key (ci.py's `record`). A GPU tier's groups weigh the seconds its GPUs
+took instead (DEW_SPLIT_DURATIONS, a record of the same shape dew-ops' maintier
+writes), which no key hashes: each of their files is unrecorded.
 """
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 from session import DURATIONS, cut
@@ -30,14 +33,16 @@ def pytest_collection_modifyitems(config, items):
     if group is None:
         return
     index, count = (int(part) for part in group.split("/"))
-    recorded = json.loads(DURATIONS.read_text()) if DURATIONS.is_file() else {}
+    weights = os.environ.get("DEW_SPLIT_DURATIONS")
+    durations = Path(weights) if weights else DURATIONS
+    recorded = json.loads(durations.read_text()) if durations.is_file() else {}
     nodes = sorted(item.nodeid for item in items)
     known = [recorded[node] for node in nodes if node in recorded]
     mean = sum(known) / len(known) if known else 1.0
     kept_nodes = set(cut(nodes, [recorded.get(node, mean) for node in nodes], count, recorded)[index - 1])
     if unrecorded := os.environ.get("DEW_UNRECORDED"):
         with open(unrecorded, "w") as out:
-            json.dump(sorted({node.split("::")[0] for node in nodes if node not in recorded}), out)
+            json.dump(sorted({node.split("::")[0] for node in nodes if weights or node not in recorded}), out)
     kept = {id(item) for item in items if item.nodeid in kept_nodes}
     config.hook.pytest_deselected(items=[item for item in items if id(item) not in kept])
     items[:] = [item for item in items if id(item) in kept]
