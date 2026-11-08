@@ -78,12 +78,13 @@ def lint_codes(lint: ModuleType, root: Path, parts: tuple[str, ...], body: str) 
 
 
 class StandInSession:
-    """A node session's side of a measurement window, as a job meets it: `$SESSION` (the directory holding `wake`,
-    the FIFO a session reads) and `$OUT` (its job's directory, where the job writes `window` and the session answers
-    `window.granted`). A thread plays the session and reads each wake. A request is granted once `grants` is set,
-    or answered in its words by `refusal`. A window its job ended is acknowledged (its grant removed) once `acks` is
-    set, after `on_release` has run. Both events are set to begin with; a test clears one to hold the session back.
-    `asked` is each request's text, `granted` and `released` when each happened."""
+    """A node session's side of a measurement window, as a job meets it: `$SESSION` (the directory holding
+    `wake`, the FIFO a session reads) and `$OUT` (its job's directory, where the job writes `window` and the
+    session answers `window.granted`). A thread plays the session and reads each wake. A request is granted
+    once `grants` is set, or answered in its words by `refusal`. A window its job ended is acknowledged (its
+    grant removed) once `acks` is set, after `on_release` has run. Both events are set to begin with; a test
+    clears one to hold the session back. `asked` is each request's text, `granted` and `released` when each
+    happened."""
 
     def __init__(self, root: Path):
         self.session = root / "session"
@@ -127,7 +128,9 @@ class StandInSession:
                 self.asked.append(request.read_text())
                 if self.refusal is not None:
                     request.unlink()
-                    (self.out / "window.refused").write_text(self.refusal)
+                    written = self.out / ".window.refused"
+                    written.write_text(self.refusal)
+                    written.replace(self.out / "window.refused")
                     continue
                 self.grants.wait()
                 self.granted.append(time.time())

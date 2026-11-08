@@ -187,8 +187,8 @@ def built(cell, implementation):
 
 def windowed_run(tmp_path: Path, case_extra: dict, session: StandInSession) -> list[float]:
     """A one-case window run whole in a scratch repository, as a node's session runs a timing job: its
-    $SESSION and $OUT are `session`'s, and a stand-in `ncu` on its PATH says when it ran and whether the window
-    was open (`$PROFILED`). When each call of the case's builder was made, a build's and a round's."""
+    $SESSION and $OUT are `session`'s, and a stand-in `ncu` on its PATH says when it ran and whether the
+    window was open (`$PROFILED`). When each call of the case's builder was made, a build's and a round's."""
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     git(repo, "init", "-q")

@@ -2,8 +2,10 @@
 calls with, `carried`, which times calls that carry a state from one to the next, `benchmark`,
 which lays out many calls' timings as a table, and `compared`, which reads two calls against each
 other by their paired ratio; a GPU call's own kernels' device time, as CUPTI reads it
-(`device_time`), which the kernel tuner and the kernel benchmarks read; and the process's resident
-memory as the kernel reports it (`resident_memory`), which the memory benchmarks read.
+(`device_time`), which the kernel tuner and the kernel benchmarks read; the process's resident
+memory as the kernel reports it (`resident_memory`), which the memory benchmarks read; and
+`exclusive_window`, which holds a job's measured region alone on its node's GPUs where a node's
+session runs the job.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -15,13 +17,17 @@ timed, a jitted function bound to its inputs: nothing is jitted here.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import dataclasses
 import html
 import math
+import os
+import select
 import statistics
 import time
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from fractions import Fraction
+from pathlib import Path
 from typing import NamedTuple
 
 import jax
@@ -247,6 +253,91 @@ def device_time() -> Iterator[DeviceTime]:
         session._detach()
 
 
+class WindowRefused(RuntimeError):
+    """The node's session cannot give the window a job asked for (`exclusive_window`), and says why."""
+
+
+IN_CREATE, IN_DELETE, IN_MOVED_TO = 0x100, 0x200, 0x80
+"""Linux's inotify events for a file made, removed or renamed into a watched directory (`sys/inotify.h`)."""
+
+
+def _synchronize() -> None:
+    """Every device of this process done with the work dispatched to it: each array still held, and one more
+    computation on each device, which a GPU runs after the work queued before it on its one compute stream, so
+    work whose output was dropped is waited for as well."""
+    jax.block_until_ready([array for array in jax.live_arrays()
+                           if not any(shard.data.is_deleted() for shard in array.addressable_shards)])
+    jax.block_until_ready([jax.device_put(0.0, device) + 0.0 for device in jax.local_devices()])
+
+
+def _wake(session: str) -> None:
+    """A byte to the session's wake FIFO, which has the session read its jobs' windows again."""
+    with open(Path(session) / "wake", "wb") as wake:
+        wake.write(b"x")
+
+
+class _Watch:
+    """The files of a directory another process writes, watched by inotify so that a wait on one is woken by
+    the change, not repeated until it shows."""
+
+    def __init__(self, directory: Path):
+        libc = ctypes.CDLL(None, use_errno=True)
+        self.fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0 or libc.inotify_add_watch(self.fd, os.fsencode(directory),
+                                                 IN_CREATE | IN_DELETE | IN_MOVED_TO) < 0:
+            raise OSError(ctypes.get_errno(), f"inotify cannot watch {directory}")
+
+    def until(self, done: Callable[[], bool]) -> None:
+        """Waits until `done()` holds, looking again at each change to the directory. The watch is made before
+        the first look, so no change is missed."""
+        while not done():
+            select.select([self.fd], [], [])
+            os.read(self.fd, 4096)
+
+    def close(self) -> None:
+        os.close(self.fd)
+
+
+@contextlib.contextmanager
+def exclusive_window(cores: Iterable[int] | None = None) -> Iterator[None]:
+    """The block of a job a node's session runs that is measured alone on the node's GPUs, which the job holds
+    exclusively only for the block, not for its whole run. The job writes its request (`$OUT/window`, naming
+    `cores`, the CPU cores it measures on, if it names any) and wakes the session (`$SESSION/wake`). The
+    session admits no other job from then. Once nothing else runs on the GPUs it makes the job's GPU lock
+    exclusive, locks the GPUs' clocks, pins the job's processes to `cores` and every other process it runs off
+    them, and writes `$OUT/window.granted`. This waits for that file and synchronizes the device before it
+    runs the block. On exit it synchronizes, removes the request, wakes the session and waits until the
+    session has put all of it back and removed its grant. A session that cannot give the window (a job that
+    holds its GPU for its whole run, cores that are no CPUs of the node or all of them) refuses it, and this
+    raises `WindowRefused`. Without `$SESSION` (a laptop, CI) it does nothing."""
+    session = os.environ.get("SESSION")
+    if session is None:
+        yield
+        return
+    out = Path(os.environ["OUT"])
+    request, granted, refused = out / "window", out / "window.granted", out / "window.refused"
+    with contextlib.closing(_Watch(out)) as watch:
+        written = out / "window.part"
+        written.write_text(",".join(str(core) for core in sorted(cores or ())))
+        written.replace(request)
+        _wake(session)
+        watch.until(lambda: granted.exists() or refused.exists())
+        if not granted.exists():
+            reason = refused.read_text().strip()
+            refused.unlink()
+            raise WindowRefused(reason)
+        try:
+            _synchronize()
+            yield
+        finally:
+            try:
+                _synchronize()
+            finally:
+                request.unlink()
+                _wake(session)
+                watch.until(lambda: not granted.exists())
+
+
 def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
                calls: int = 1) -> list[float]:
     """Seconds per call of `fn(*args)`, one sample a synchronized group of
@@ -410,4 +501,5 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
 
 
 __all__ = ["EVICTION_BYTES", "Benchmark", "Comparison", "CuptiHeld", "DeviceTime", "KernelTime", "NoKernels",
-           "behind", "benchmark", "carried", "compared", "device_time", "eviction", "samples"]
+           "WindowRefused", "behind", "benchmark", "carried", "compared", "device_time", "eviction",
+           "exclusive_window", "samples"]
