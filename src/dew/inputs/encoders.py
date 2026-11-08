@@ -23,15 +23,8 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew.batch import FROZEN, Variables
-from dew.inputs.condition import ConditionEncoder, ConditionWork
-from dew.nn.blocks import table_rows
-from dew.nn.dit import TextContext
-from dew.nn.sharding import drawn_axes
-from dew.nn.text_checkpoints import DEFAULT_MODEL, DEFAULT_T5_MODEL
-from dew.nn.text_encoders import (
-    CLIPTextTransformer,
-    CLIPTowerOutput,
-    T5EncoderTransformer,
+from dew.inputs.condition import ConditionEncoder
+from dew.interop.text_encoders import (
     _t5_path,
     _text_path,
     bind_text_tower,
@@ -39,6 +32,12 @@ from dew.nn.text_encoders import (
     translate_config,
     translate_t5_config,
 )
+from dew.nn.blocks import table_rows
+from dew.nn.dit import TextContext
+from dew.nn.flops import ConditionWork
+from dew.nn.sharding import drawn_axes
+from dew.nn.text_checkpoints import DEFAULT_MODEL, DEFAULT_T5_MODEL
+from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
 from dew.registry import dtype_name, resolve_dtype
 
 if TYPE_CHECKING:

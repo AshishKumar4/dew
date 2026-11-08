@@ -97,7 +97,10 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
     draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can call
     again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
-    hands `draw` to `indexed_recording` as `inputs_of`. With `summary`, the recording keeps no outputs
+    hands `draw` to `indexed_recording` as `inputs_of`. Where `evaluate` gives a third dict, the leaves the
+    reference made that Dew replays (an engine's sampled ids, its kept support, its routes), the recording
+    keeps them whole as `<label>.replayed.<leaf>`, and Dew's run and the test's take them beside the draw's
+    inputs: the comparison is of the replay. With `summary`, the recording keeps no outputs
     at all: per seed and leaf, the reference's evidence check 1 reads (`leaf_summary`: its mean squared
     error from its truth, its worst sized row, its errors on the truth's rows of zero, finiteness) and
     its truth's sketch
@@ -117,13 +120,16 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     print(f"{label}: starting with {planned} seeds", flush=True)
     # Each seed drawn once, as the sizing reads it: a paired sizing reads its pilots from SIZING_FROM, which a
     # run of every seed below it would draw too.
-    records = {}
+    records, replayed = {}, set()
 
     def record(seed):
         if seed not in records:
             inputs = draw(seed)
-            reference, truth = evaluate(inputs)
-            records[seed] = (inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth))
+            reference, truth, *made = evaluate(inputs)
+            made = jax.tree.map(np.asarray, made[0] if made else {})
+            replayed.update(made)
+            records[seed] = ({**inputs, **made}, jax.tree.map(np.asarray, reference),
+                             jax.tree.map(np.asarray, truth))
         return records[seed]
 
     def ensure(count):
@@ -153,9 +159,14 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
         if kind == "input" and not store_inputs:
             continue
         for name in kept_records[0][index]:
-            result[f"{label}.{kind}.{name}"] = np.stack([entry[index][name] for entry in kept_records])
+            stored = "replayed" if kind == "input" and name in replayed else kind
+            result[f"{label}.{stored}.{name}"] = np.stack([entry[index][name] for entry in kept_records])
+    for name in replayed if not store_inputs else ():
+        result[f"{label}.replayed.{name}"] = np.stack([entry[0][name] for entry in kept_records])
     if not store_inputs:
-        result[f"{label}.input_digest"] = np.asarray([input_digest(entry[0]) for entry in kept_records])
+        result[f"{label}.input_digest"] = np.asarray([
+            input_digest({name: value for name, value in entry[0].items() if name not in replayed})
+            for entry in kept_records])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result

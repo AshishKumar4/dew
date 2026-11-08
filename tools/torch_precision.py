@@ -113,8 +113,29 @@ def widened():
 @contextlib.contextmanager
 def widened_softmax():
     """`softmax(..., dtype=torch.float32)`, the pin transformers' eager attention and routers carry, in
-    float64."""
-    with replaced((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax))):
+    float64: the function's and the tensor method's (DiffusionGemma's self-conditioning calls
+    `logits.softmax(..., dtype=torch.float32)`, which put its float64 truth 1.4e-7 from float64)."""
+    with replaced((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax)),
+                  (torch.Tensor, "softmax", dtype_widened(torch.Tensor.softmax))):
+        yield
+
+
+NATIVE = (*((torch.Tensor, name, inspect.getattr_static(torch.Tensor, name))
+             for name in ("float", "to", "type", "softmax")),
+          *((torch, name, getattr(torch, name))
+            for name in ("arange", "linspace", "tensor", "full", "zeros", "ones", "empty")),
+          (torch.nn.functional, "softmax", torch.nn.functional.softmax))
+"""torch's own casts, constructors and softmax, as the process imported them: every one `float64` replaces."""
+
+
+@contextlib.contextmanager
+def native():
+    """torch as published within the block, inside `float64`: its own casts, constructors and softmax
+    (`NATIVE`), float32 the default dtype. A discrete function a reference defines in float32, a
+    quantizer's codes and scales, runs so inside the float64 truth, as widening it would change it
+    (compressed-tensors' input QDQ cast its codes and restored its scales through a widened `Tensor.to`,
+    1.6e-7 RMS from Dew's float64 run, ledger 4741); its caller widens what it returns."""
+    with replaced(*NATIVE), default_dtype(torch.float32):
         yield
 
 

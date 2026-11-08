@@ -39,7 +39,7 @@ from ..mlp import GatedMLP
 from .joint import JointAttention, layer_norm
 
 if TYPE_CHECKING:
-    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.inputs import DenoisingCondition
 
 MULTIPLE = 32
 """Each stream's padded length is a multiple of this."""

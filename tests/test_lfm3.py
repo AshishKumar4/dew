@@ -218,7 +218,8 @@ def test_an_lfm3_vl_trunk_read_or_built_resolves_its_defaults_and_cadence_one_wa
     that depth (two convolutions, then attention and convolution in turn), as one built directly at any
     depth has; a cadence it states is kept, and one of another length or an unknown kind is refused as
     the config is read."""
-    from dew.nn.vision.lfm3 import Lfm3VlVision, translate_lfm3_vl_vision_config
+    from dew.interop.towers.lfm3 import translate_lfm3_vl_vision_config
+    from dew.nn.vision.lfm3 import Lfm3VlVision
     from dew.registry import towers
 
     read = translate_lfm3_vl_vision_config({"vision_config": {"num_hidden_layers": 6}})

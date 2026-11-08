@@ -18,8 +18,9 @@ from flax.core import freeze, unfreeze
 from model_support import moved
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 
+from dew.interop.autoencoders.vae import translate_vae_weights
 from dew.nn.attention_blocks import Stage
-from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
+from dew.nn.autoencoders.vae import FlaxEncoder
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.joint import DoubleStreamBlock, JointAttention
 from dew.nn.backbones.mmdit import SimpleMMDiT

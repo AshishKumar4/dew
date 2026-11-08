@@ -1,6 +1,6 @@
-"""What every condition encoder is (`ConditionEncoder`) and the work it does (`ConditionWork`), apart
-from the encoders themselves (`dew.inputs.encoders`), so a spec of a model's inputs, a protocol or a
-model reads the contract without the towers.
+"""What every condition encoder is (`ConditionEncoder`), apart from the encoders themselves
+(`dew.inputs.encoders`), so a spec of a model's inputs reads the contract without the towers. The work an
+encoder does, which a model reads, is the model's own type (`dew.nn.flops.ConditionWork`).
 
 `ConditionEncoder.bound(record)` rebuilds an encoder from a run's record, the
 registry's `{"class": ..., "fields": ...}` whose fields `recorded_fields` wrote.
@@ -11,7 +11,6 @@ from __future__ import annotations
 import dataclasses
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Generic, Self
 
 import numpy as np
@@ -19,8 +18,6 @@ from typing_extensions import TypeVar
 
 from dew import _records
 from dew.batch import Variables
-from dew.nn.flops import counted_flops
-from dew.nn.protocols import Counted
 from dew.registry import component, to_record
 
 Raw = TypeVar("Raw")
@@ -30,32 +27,6 @@ Encoded = TypeVar("Encoded", default=object)
 """The conditioning value a modality's encoder produces: a `TextContext`, a
 `DenoisingCondition`, an array. An encoder that leaves it unstated promises
 its callers nothing about the value beyond what it hands the model."""
-
-
-@dataclass(frozen=True)
-class ConditionWork:
-    """A condition encoder's forward FLOPs and the sequence its denoiser reads.
-
-    The output lengths may differ from encoded input (system prompts
-    cropped, CLIP and T5 concatenated, or visible zero tokens retained).
-    Keeping both under the encoder makes its geometry the encode contract.
-    """
-
-    flops: float
-    lengths: np.ndarray
-    spans: np.ndarray
-    features: int
-    pooled_features: int | None = None
-    time_ids: int | None = None
-
-    @classmethod
-    def of_tokens(cls, tower: Counted, tokens: Mapping[str, np.ndarray], features: int) -> Self:
-        """The work of a `tower` that reads each row's unmasked `tokens` and hands its denoiser the
-        whole fixed-length sequence, `features` wide: its FLOPs over the real tokens, their lengths,
-        and spans of the token budget."""
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return cls(counted_flops(tower, lengths), lengths, spans, features)
 
 
 class ConditionEncoder(ABC, Generic[Raw, Encoded]):

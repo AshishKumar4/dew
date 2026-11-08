@@ -56,6 +56,41 @@ class Tokens(grain.MapTransform):
                 "valid": np.arange(self.max_length) < row["length"]}
 
 
+def test_phases_state_each_token_batch_which_one_update_s_tokens_divide_alike():
+    """Phases batched by tokens compile to a loader stating each phase's token batch (`Loader.token_batches`),
+    on the step clock and the token clock alike, which a run's tokens an update divide into one accumulation
+    for every phase (`TrainerConfig.accumulating`): phases of 64 and 64 tokens accumulate two of them to 128,
+    and phases of 64 then 32, which one accumulation would pool into updates of 128 then 64 tokens, are
+    refused, as phases batched in rows are; phases of other batches with no tokens an update compile and
+    train their own (row 4885)."""
+    from dew.config import TrainerConfig
+    from dew.data import phases, schedule
+
+    rows = [{"id": np.int32(index + 1), "length": np.int32(3 + index % 12)} for index in range(32)]
+    chain = Memory(rows).map(Tokens()).repeat()
+    budget = TrainerConfig(update_tokens=128, steps=4)
+
+    def compiled(first, second):
+        stepped = compile(phases((chain.batch(tokens=first), 2), (chain.batch(tokens=second), None)),
+                          read="memory", loading=READ)
+        clocked = compile(schedule([(chain.batch(tokens=first), 256), (chain.batch(tokens=second), None)]),
+                          read="memory", loading=READ)
+        return stepped, clocked
+
+    for loader in compiled(64, 64):
+        assert loader.token_batches == (64, 64)
+        assert budget.accumulating(loader).accumulation == 2
+    for loader in compiled(64, 32):
+        assert loader.token_batches == (64, 32)
+        with pytest.raises(ValueError):
+            budget.accumulating(loader)
+        assert TrainerConfig(steps=4).accumulating(loader).accumulation == 1
+    rowed = compile(phases((chain.batch(4), 2), (chain.batch(8), None)), read="memory", loading=READ)
+    assert rowed.token_batches == (None, None)
+    with pytest.raises(ValueError):
+        budget.accumulating(rowed)
+
+
 @pytest.mark.parametrize("entry", ["validation", "iterate"])
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_finite_token_budget_keeps_its_geometry_and_every_real_row(entry, read):

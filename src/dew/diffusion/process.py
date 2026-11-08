@@ -7,42 +7,12 @@ from dataclasses import dataclass, field, replace
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn, struct
+from flax import linen as nn
 
 from dew.batch import Variables
 from dew.diffusion.schedules import NoiseScheduler, expand
 from dew.diffusion.transforms import PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates
-
-
-@struct.dataclass
-class DenoisingCondition:
-    """Text conditioning in the form the published model families read it.
-
-    - `context` holds the token states.
-    - `pooled` is a pooled vector.
-    - `time_ids` are the size and crop ids that the XL towers add.
-    - `guidance` is the distilled guidance value, which a guidance-embedded
-      transformer takes as a model input instead of running two guided
-      branches.
-    - `mask` is the `[B, tokens]` mask of the real token states in a
-      right-padded `context`, read by a family that excludes padded keys.
-    """
-
-    context: jax.Array
-    pooled: jax.Array | None = None
-    time_ids: jax.Array | None = None
-    guidance: jax.Array | None = None
-    mask: jax.Array | None = None
-
-    def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
-        """Return this conditioning with `given`'s distilled guidance value.
-
-        The guidance value belongs to the row and not to its caption, so a
-        dropped or unconditional caption keeps the guidance scale the
-        checkpoint samples at.
-        """
-        return replace(self, guidance=given.guidance)
-
+from dew.nn.inputs import DenoisingCondition
 
 # One conditioning keyword's value: the record a text encoder produced, or the
 # array a spatial condition adds beside it.
@@ -267,4 +237,4 @@ class Denoiser:
         return (output[:batch], output[batch:]), sown
 
 
-__all__ = ["Denoiser", "DenoisingCondition", "Process", "aligned_conditions"]
+__all__ = ["Denoiser", "Process", "aligned_conditions"]
