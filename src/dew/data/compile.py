@@ -1423,7 +1423,7 @@ def _training_reader(
                     ],
                     # Where a read that drops records reads in workers of each corpus's own (`pooled`),
                     # each worker's position is that corpus's, saved in that many.
-                    **({} if chosen.pool is None else {"pools": chosen.pools(pipeline)}),
+                    **({} if chosen.pool is None or chosen.in_order else {"pools": chosen.pools(pipeline)}),
                 })
 
         def saved_as(version: int, workers: int) -> tuple[Opener, Plan]:

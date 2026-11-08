@@ -663,7 +663,8 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
     """A store read through Dew's mirror by loading workers, per share or elastically: each worker opens its
     shards through its own process's mirror, and the run's statistics count each of those opens and their
     bytes beside the reading process's own (row 4339), each worker's counters carried by the position it
-    hands the reader."""
+    hands the reader. Automatic loading reads in workers over a run long enough to pay for them, which
+    the read states (`steps`)."""
     from dew.data import Loading
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
@@ -671,7 +672,7 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
 
     (tmp_path / "observed").mkdir()
     chain = _mirrored_store(tmp_path).repeat(1).batch(1)
-    loader = compile(chain.elastic() if elastic else chain, read=read,
+    loader = compile(chain.elastic() if elastic else chain, read=read, steps=10**9,
                      loading=Loading(workers=workers, max_workers=2, threads=1, read_buffer=1,
                                      worker_buffer=1, cache=False))
     reader = loader.train(DataPartition())

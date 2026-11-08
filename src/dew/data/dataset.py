@@ -477,10 +477,6 @@ class Loading:
         if not sampled:
             return dataclasses.replace(self, workers=0)
         python = statistics.median(seconds[1:] or seconds)
-        if batches is None or python * batches <= worker_start_seconds():
-            _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each take "
-                      "less than a worker's start", batches, python * 1e3)
-            return dataclasses.replace(self, workers=0)
         host = Host.current() if host is None else host
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)
@@ -491,6 +487,10 @@ class Loading:
         read_buffer = min(self.read_buffer, budget // read)
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
         workers = max(0, min(cpus, budget // held))
+        if workers and (batches is None or python * batches <= worker_start_seconds()):
+            _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each take "
+                      "less than a worker's start", batches, python * 1e3)
+            workers = 0
         _log.info("automatic loading reads in %d workers holding %d reads ahead, sized for %d CPUs and "
                   "%.2f GiB", workers, read_buffer, host.cpus, budget / 2**30)
         return dataclasses.replace(self, workers=workers, read_buffer=read_buffer)

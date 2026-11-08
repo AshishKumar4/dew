@@ -19,10 +19,29 @@ type Grouping = Callable[[], Callable[[Sequence], Batch]]
 """What makes a worker's group of inputs one element (`lowering._Grouped`): called once a read opens."""
 
 
-READ_GROUPS = 1 << 50
-"""The most groups an in-order read opens at once (`_InputOrder`): an endless order's rows, `sys.maxsize`
-as Grain's repeat states them, overflow Grain's batch, which counts its groups through a float; 2**50 is
-exact there and past any run's reach."""
+class _Gathered(pygrain.MapDataset):
+    """`rows`' inputs from `start` on in groups of `size` consecutive ones, each gathered by index and
+    grouped (`grouping`), the last group the inputs that remain: Grain's batch of a map, which a Grain
+    step that drops inputs (a filter's, read as None) refuses to follow, read input by input. An endless
+    order, which Grain's repeat states as `sys.maxsize` inputs, holds as many groups as that counts."""
+
+    def __init__(self, rows: pygrain.MapDataset, start: int, size: int, grouping: Grouping):
+        super().__init__(rows)
+        self._rows, self._start, self._size, self._grouping = rows, start, size, grouping
+        self._groups = -(-max(len(rows) - start, 0) // size)
+
+    def __len__(self) -> int:
+        return self._groups
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        first = self._start + index * self._size
+        last = min(first + self._size, len(self._rows))
+        return self._grouping([self._rows[at] for at in range(first, last)])
+
+    def __str__(self) -> str:
+        return f"_Gathered(start={self._start}, size={self._size})"
 
 
 class _InputOrder(pygrain.IterDataset):
@@ -51,11 +70,8 @@ class _InputOrderIterator(pygrain.DatasetIterator):
         if self._reads is None:
             ordered = self._ordered
             # Each group a dataset element of its own, so the workers' slices of them, every W-th,
-            # interleave back into the inputs' order. An endless order, which Grain's repeat states as
-            # `sys.maxsize` rows, is read as far as Grain's batch counts groups exactly (`READ_GROUPS`).
-            stop = min(len(ordered.rows), self._next + ordered.size * READ_GROUPS)
-            groups = ordered.rows[self._next:stop].batch(ordered.size, drop_remainder=False,
-                                                         batch_fn=ordered.grouping())
+            # interleave back into the inputs' order.
+            groups = _Gathered(ordered.rows, self._next, ordered.size, ordered.grouping())
             self._reads = iter(ordered.read(groups))
             self._reads.start_prefetch()
         return self._reads
