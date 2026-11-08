@@ -567,6 +567,12 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     rewrites_in_persist = True  # a rewriting warpgroup between the loads and the products (`prepared`)
 
+    @property
+    def rewriting(self) -> mosaic.Issuer:
+        """The layouts a rewriting warpgroup reads a stage's tiles in (`persist`'s `prepared`): wgmma's, whose
+        64-row tiles a swizzled stage loads natively; tcgen05's own is tensor memory's 128 lanes."""
+        return mosaic_sm90.WGMMA
+
     def summed_window(self, block_k: int) -> int:
         # A window is `product.SUMMED_DEPTH` deep, its in-order adds no deeper than mma.sync's window's.
         from dew.nn.kernels.templates import product
