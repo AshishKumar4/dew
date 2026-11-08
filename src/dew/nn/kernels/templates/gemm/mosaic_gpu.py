@@ -154,9 +154,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
       loads, its consumers holding the program's entry registers (`fed.ConsumerFed`).
-    - Shape: the tile loading its operands fewest times a FLOP within its consumers' registers: an
-      accumulator of `resources.held_area` elements A reads them 1/rows + 1/columns times a FLOP, least at
-      rows = columns = sqrt(A). So the rows are sqrt(A) in whole roles (no more than the call's, below;
+    - Shape: the balanced tile within its consumers' registers: an accumulator of `resources.held_area`
+      elements A reads its operands 1/rows + 1/columns times a FLOP, least at rows = columns = sqrt(A),
+      which whole roles and the family's widths come near rather than reach. So the rows are sqrt(A) in
+      whole roles (no more than the call's, below;
       `_balanced_side`); the columns the widest dividing the call's width in its column unit, at most the
       family's one product's (`Family.widest_product`), that A holds at those rows; the rows then the most
       its registers hold at those columns (`resources.held_rows`). mma.sync's one consumer so takes 128 x
