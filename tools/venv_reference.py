@@ -45,6 +45,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
                    "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
                    "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")},
+         "vllm-replay": {"test": "test_engine_replay", "worker": "vllm_replay_worker.py", "device": "cuda",
+                         "reference": ("vllm-project/vllm 0.30.0 (its CUDA 12.9 build) with "
+                                       "huggingface/transformers 5.16.1"),
+                         "license": "Apache-2.0", "distribution": ("vllm", "0.30.0+cu129"), "host": True,
+                         "outputs": True},
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
                   "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c",
                   "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
@@ -155,7 +160,10 @@ def recording(site: str, python: str, source: str | None, given=None) -> dict[st
         def evaluate(inputs):
             answer = worker.ask({f"case.{key}": value for key, value in inputs.items()})
             reference, truth = arms(answer, "case.")
-            return tuple({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth))
+            # The leaves the reference made that Dew replays (`record_case`), where the worker gives any.
+            replayed = {leaf.removeprefix("case.replayed."): value for leaf, value in answer.items()
+                        if leaf.startswith("case.replayed.")}
+            return (*({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth)), replayed)
 
         narrow = getattr(jnp, known.get("narrow", "float32"))
         dew = ((lambda inputs: run(narrow, inputs)) if known.get("host")
