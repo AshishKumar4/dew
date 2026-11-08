@@ -1691,8 +1691,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # A stall's stacks whole, then the end of what pytest wrote.
                      "output": "\n".join(red + ([dump[:12000]] if dump else [])
                                          + ([output[-12000:]] if red else [])),
-                     # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
-                     # `exhausted` reads.
+                     # Its first failed test's exception as pytest gave it ("RuntimeError: ...").
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if node.split("::", 1)[0] == name},
@@ -1971,25 +1970,9 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
-EXHAUSTED = re.compile(r"(?:[\w.]+\.)?(?:XlaRuntimeError|JaxRuntimeError|RuntimeError|OutOfMemoryError): "
-                       r"(?:RESOURCE_EXHAUSTED: (?:Out of memory|Failed to allocate)\b"
-                       r"|CUDA_ERROR_OUT_OF_MEMORY\b|CUDA (?:error: )?out of memory)")
-"""An exception that is the GPU's device memory running out, as pytest gives it: XLA's runtime error whose
-status is RESOURCE_EXHAUSTED for an allocation (out of memory, or a failed allocation), or the CUDA driver's
-out-of-memory error, raised as such. A block past the GPU's own resources (XLA's RESOURCE_EXHAUSTED for a
-shared memory size limit, as `dew.nn.kernels.tuning` reads it) is none, as no larger share helps it; nor is an
-assertion, whatever its message says."""
-
-
-def exhausted(failure: str | None) -> bool:
-    """Whether a red row's first failed test raised the GPU's memory running out (`EXHAUSTED`, its exception's
-    start), which a smaller share than the file needs causes, rather than failed on its own."""
-    return failure is not None and EXHAUSTED.match(failure) is not None
-
-
-def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, tuple[str, dict]]:
-    """For each of `names`, test files no run on class `held` measured, the class and last record of
-    the whole file on another class whose run measured its GPU peak, the one that holds the most
+def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, dict]:
+    """For each of `names`, test files no run on class `held` measured, the last record of the whole
+    file on another class whose run measured its GPU peak, the one that holds the most
     (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
     One no class measured is absent, as every one is where the Worker does not list its records. Its run on
     `held` records its own, which every later lane reads."""
@@ -2008,20 +1991,19 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     keys = [key for key in every
             if (parts := key_parts(key))[0] != held and parts[2] == "whole" and parts[1] in wanted]
 
-    def read(key: str) -> tuple[str, str, dict | None]:
-        kind, name, _ = key_parts(key)
-        return name, kind, recorded(f"{prefix}{key}", token)
+    def read(key: str) -> tuple[str, dict | None]:
+        return key_parts(key)[1], recorded(f"{prefix}{key}", token)
 
     def holds(found: dict) -> float:
         return gpu_needs(found, float("inf"))[1]
 
-    borrowed: dict[str, tuple[str, dict]] = {}
+    borrowed: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, kind, found in pool.map(read, keys):
+        for name, found in pool.map(read, keys):
             if found is None or found.get("depends") is None or found.get("peak") is None:
                 continue
-            if name not in borrowed or holds(found) > holds(borrowed[name][1]):
-                borrowed[name] = (kind, found)
+            if name not in borrowed or holds(found) > holds(borrowed[name]):
+                borrowed[name] = found
     return borrowed
 
 
@@ -2040,9 +2022,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     most `processes` at once. A file that runs out of a measured share is red: it took more than
     its last run, whose peak its next run is given. A file no run on this class measured borrows its
     share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
-    a class packs its files as a measured one does; one red under a borrowed share whose first failure is
-    its memory running out (`exhausted`) runs once more, alone, with the lane's whole share, as that red is
-    the borrowed share's; one whose first failure is any other is red, run once. A file
+    a class packs its files as a measured one does; one red under it is red, run once, as every red is
+    (owner, 2026-11-07: a red under sharing is a red), and its measured peak is the next lane's. A file
     given the lane's whole share (measured on no class, measured that large, or with a child the lane
     did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
     it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
@@ -2071,57 +2052,33 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
         records = dict(zip(tests, pool.map(needs, tests), strict=True))
     borrowed = borrowed_records([name for name, found in records.items() if found is None], python, held,
                                 token)
-    needed = {name: gpu_needs(records[name] or (borrowed[name][1] if name in borrowed else None), budget)
-              for name in tests}
+    needed = {name: gpu_needs(records[name] or borrowed.get(name), budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
-    def run(names: list[str]) -> None:
-        waiting = sorted(names, key=lambda name: -holds[name])
-        running: dict[concurrent.futures.Future, str] = {}
-        with concurrent.futures.ThreadPoolExecutor(processes) as pool:
-            while waiting or running:
-                free = budget - sum(holds[name] for name in running.values())
-                fits = next((name for name in waiting if holds[name] <= free), None)
-                if fits is not None and len(running) < processes:
-                    waiting.remove(fits)
-                    # Its pool taken at its first op, or grown where it holds the whole share, as this lane
-                    # says whatever its own environment does: a GPU node's session grows every job's pool.
-                    environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
-                               "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
-                               "OMP_NUM_THREADS": threads}
-                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
-                                        session.GRACE, common, environ, None, network)] = fits
-                    continue
-                done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
-                for future in done:
-                    future.result()
-                    del running[future]
-
-    run(tests)
-    # Red under a share another class measured, its first failure an allocation's (`exhausted`): that red is
-    # the borrowed share's, not the file's, and the file runs again alone with the lane's whole share, its row
-    # saying so with the first failure, as packed work run again alone is interference. Any other first
-    # failure (an assertion, an accuracy miss, an illegal address) is the file's: its red stands, run once.
-    again: dict[str, str] = {}
-    for name in borrowed:
-        failures = [verdict.get("first_failure")
-                    for verdict in json.loads(verdicts[name].read_text())["rows"] if verdict["exitCode"] != 0]
-        # Below the whole budget only: a file that already had it would run again as it ran.
-        if failures and exhausted(failures[0]) and shares[name] < budget:
-            again[name] = (f"red under a share of {shares[name] / 2 ** 30:.1f} GiB borrowed from "
-                           f"{borrowed[name][0]}'s measurement, out of memory ({failures[0]}); run again "
-                           "alone with the lane's whole share")
-    for name in again:
-        shares[name] = holds[name] = budget
-    run(list(again))
-    for name, interference in again.items():
-        rows = json.loads(verdicts[name].read_text())["rows"]
-        verdicts[name].write_text(json.dumps({"rows": [{**verdict, "interference": interference}
-                                                       for verdict in rows]}))
+    waiting = sorted(tests, key=lambda name: -holds[name])
+    running: dict[concurrent.futures.Future, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+        while waiting or running:
+            free = budget - sum(holds[name] for name in running.values())
+            fits = next((name for name in waiting if holds[name] <= free), None)
+            if fits is not None and len(running) < processes:
+                waiting.remove(fits)
+                # Its pool taken at its first op, or grown where it holds the whole share, as this lane
+                # says whatever its own environment does: a GPU node's session grows every job's pool.
+                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
+                           "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
+                           "OMP_NUM_THREADS": threads}
+                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
+                                    session.GRACE, common, environ, None, network)] = fits
+                continue
+            done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                future.result()
+                del running[future]
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
     return 0
