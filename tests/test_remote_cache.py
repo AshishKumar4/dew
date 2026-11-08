@@ -576,20 +576,47 @@ def test_a_tasks_switches_of_bundle_list_the_cache_directory_once_and_each_keeps
         assert held == ({f"jit_{index}-1", "jit_restored-1"} if index == 0 else {f"jit_{index}-1"}), file
 
 
-def test_a_bundle_the_cap_cut_short_is_sent_once(cache_worker, tmp_path, monkeypatch):
-    """Two programs that together pass `MAX_BYTES`: the bundle carries the first, is sent once, and is
-    not sent again by a later close or the drain while its tests compile nothing new."""
+def test_a_bundle_past_the_bound_keeps_every_program_in_chunks_each_sent_once(cache_worker, tmp_path,
+                                                                             monkeypatch):
+    """Two programs that together pass `MAX_BYTES`: the bundle keeps both, a chunk each, each sent once
+    and not again by a later close or the drain while its tests compile nothing new; the next process
+    restores both (2026-11-08: a bundle at the bound dropped what passed it, compiled afresh every run)."""
     url, stored, seen = cache_worker
     monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
-    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache = remote_cache.RemoteCache(tmp_path / "first", url, "token", "jax/cpu")
     cache.opened("tests/big.py")
-    compiled(tmp_path, "jit_a-1", b"a" * 600)
-    compiled(tmp_path, "jit_b-1", b"b" * 600)
+    compiled(tmp_path / "first", "jit_a-1", b"a" * 600)
+    compiled(tmp_path / "first", "jit_b-1", b"b" * 600)
     cache.closed("tests/big.py")
     cache.closed("tests/big.py")
     cache.drain()
-    assert [key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/big.py"])] == ["jit_a-1"]
-    assert seen.count("/jax/cpu/bundles/tests/big.py") == 2  # its GET, and one PUT
+    bundle, rest = "/jax/cpu/bundles/tests/big.py", "/jax/cpu/bundles/tests/big.py/=1"
+    assert [[key for key, _ in remote_cache.unpacked(stored[at])] for at in (bundle, rest)] == [["jit_a-1"],
+                                                                                              ["jit_b-1"]]
+    assert seen.count(bundle) == 2 and seen.count(rest) == 1  # its GET and one PUT; one PUT
+    after = remote_cache.RemoteCache(tmp_path / "next", url, "token", "jax/cpu")
+    after.opened("tests/big.py")
+    assert programs(tmp_path / "next") == {"jit_a-1": b"a" * 600, "jit_b-1": b"b" * 600}
+
+
+def test_a_bundle_that_grows_sends_the_chunks_it_changed_alone(cache_worker, tmp_path, monkeypatch):
+    """A file's next run that compiles one more program sends the chunk it lands in, the chunks before it
+    left as the Worker holds them."""
+    url, stored, seen = cache_worker
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
+    first = remote_cache.RemoteCache(tmp_path / "first", url, "token", "jax/cpu")
+    first.opened("tests/grows.py")
+    compiled(tmp_path / "first", "jit_a-1", b"a" * 600)
+    compiled(tmp_path / "first", "jit_b-1", b"b" * 600)
+    first.drain()
+    seen.clear()
+    after = remote_cache.RemoteCache(tmp_path / "next", url, "token", "jax/cpu")
+    after.opened("tests/grows.py")
+    compiled(tmp_path / "next", "jit_c-1", b"c" * 100)
+    after.drain()
+    rest = "/jax/cpu/bundles/tests/grows.py/=1"
+    assert [key for key, _ in remote_cache.unpacked(stored[rest])] == ["jit_b-1", "jit_c-1"]
+    assert seen.count("/jax/cpu/bundles/tests/grows.py") == 1 and seen.count(rest) == 2  # GETs; one PUT
 
 
 def test_a_program_whose_key_fills_a_file_name_round_trips(cache_worker, tmp_path):
