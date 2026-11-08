@@ -319,18 +319,19 @@ def test_a_source_computing_the_candidates_own_float32_as_users_run_it_is_on_par
     family = next(entry for entry in ENTRIES if "llama" in entry.model_types)
     record = decoder_parts.translate_family_config(tiny_config("llama").to_dict(), family)[0]
     model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
-    variables = model.init(jax.random.key(0), verify.probe_ids(record["vocab_size"]))
     wide = models.build("causal_transformer", {**record, "dtype": "float64", "attention_impl": "reference"})
 
-    def users(ids):
+    def users(seed):
+        drawn = model.init(jax.random.key(seed), verify.probe_ids(record["vocab_size"]))
+        ids = verify.probe_ids(record["vocab_size"], seed)
         with jax.default_matmul_precision(FP32_SUMS):
-            theirs = np.asarray(model.apply(variables, ids), np.float64)
+            theirs = np.asarray(model.apply(drawn, ids), np.float64)
         with jax.enable_x64(new_val=True):
-            widened = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
+            widened = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), drawn)
             truth = np.asarray(wide.apply(widened, ids))
-        return theirs, truth
+        return drawn, ids, theirs, truth
 
-    seeds = verify.logits_parity(users, model, variables, "the candidate against itself")
+    seeds = verify.logits_parity(users, model, "the candidate against itself")
     assert seeds >= parity.FEWEST_SEEDS
 
 
