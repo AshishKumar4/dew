@@ -396,12 +396,17 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     held home rises at least half of it (`saved_export_worker.resident_growth`): at one shard, the 5 GB
     default, the writer held the whole release, which tracemalloc did not see (ledger 3794). Both read
     the one release. `dew export` to a destination they share writes it once
-    likewise, the tensors one process's export writes."""
+    likewise, the tensors one process's export writes.
+
+    The release is sixteen layers deep, 67 MB, its tensors a megabyte at most: the pages a host's
+    allocators keep from the tensors it read and freed, a few of its largest under contention (glibc's
+    arenas, XLA's CPU allocator), stay under a sixth of it on armada at its worst (twelve busy processes
+    beside the pool, two malloc arenas: row 4868), where at four layers, 17 MB, they reached past half."""
     from dew._cli.main import main
     from dew.registry import ModelConfig
 
     run = dataclasses.replace(lm(tmp_path, drawn=False), model=ModelConfig(
-        "causal_transformer", {"emb_features": 256, "num_layers": 4, "num_heads": 4, "dtype": "float32"}))
+        "causal_transformer", {"emb_features": 256, "num_layers": 16, "num_heads": 4, "dtype": "float32"}))
     trained(run, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "shared_cache"))
