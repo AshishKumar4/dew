@@ -130,6 +130,7 @@ from .decoder_block import (
     decoder_norm,
     feedforward_factories,
     remat_record,
+    residual_normed,
 )
 from .decoder_fields import refuse_unbuildable, settle_fields, softmax_attention_layers
 from .decoder_stack import (
@@ -1691,7 +1692,8 @@ class CausalTransformer(LinearProducts):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = constrain(x if self.ngpt is not None or not self.final_norm else self.norm(x), RESIDUAL)
+        normed = self.ngpt is None and self.final_norm
+        hidden = constrain(residual_normed(self.norm, x) if normed else x, RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in at least fp32 scores
