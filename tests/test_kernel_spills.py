@@ -356,6 +356,14 @@ def test_calls_compiled_together_run_their_executables_after_and_compile_nothing
     assert [program for program in again.programs if program.kind in ("compiled", "lowered")] == []
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 3.0))
     np.testing.assert_array_equal(outputs[2], jnp.sin(jnp.ones(4)))
+    # A block within another is the outer one's: its call compiles once, as the outer block ends, and
+    # waits on nothing.
+    nested = program(lambda x: x - 1)
+    with Compiles(None) as joined, compiled_together():
+        nested(jnp.ones(5))
+        with compiled_together():
+            nested(jnp.ones(5))
+    assert [program.kind for program in joined.programs].count("compiled") == 1
 
 
 @jax.tree_util.register_dataclass

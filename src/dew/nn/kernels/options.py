@@ -250,11 +250,15 @@ def compiled_together() -> Iterator[None]:
     own, a spill's refusal relowered here) and kept by its program under its call's key, so the same
     call after the block runs it, compiling nothing: a scoring task's programs compiled before its
     passes (`dew.decision.task.Decide.compile_scoring`). Each call's compile is its program's as `_kept`
-    reserves it, so a call of a key another thread compiles waits for that compile, and a call of a key
-    this block already lowered lowers it once. A block that raises compiles nothing, and a compile that
-    fails fails every call waiting for it, the program keeping none of them."""
+    reserves it, and a call of a key this block already lowered lowers it once; a block waits on no
+    compile it does not own (a key another thread reserved answers its call's traced shapes), and a block
+    within another is the outer one's, so no two blocks wait on each other. A block that raises compiles
+    nothing, and a compile that fails fails every call waiting for it, the program keeping none of them."""
     from dew.nn.kernels.templates import report
 
+    if _TOGETHER.get() is not None:
+        yield
+        return
     lowerings: dict[tuple[int, Hashable], _Lowering] = {}
     token = _TOGETHER.set(lowerings)
     try:
@@ -432,7 +436,9 @@ class OuterProgram:
                     self._ready.pop(self._executables.popitem(last=False)[0], None)
             self._executables.move_to_end(key)
         if not owner:
-            return shapes_of(pending.result().out_info)
+            # Another's compile, done or not: its shapes as the call traces, none waited for.
+            return shapes_of(pending.result().out_info if pending.done() and pending.exception() is None
+                             else self.trace(*args, **kwargs).out_info)
         try:
             lowered = self.lower(*args, **kwargs)
         except BaseException as failure:
