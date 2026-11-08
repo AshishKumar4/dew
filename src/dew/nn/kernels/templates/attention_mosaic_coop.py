@@ -57,6 +57,23 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     return scoped, family.streams(blocks, stages, consumers)
 
 
+def _share_scores(walk: _Backward, share: int, resident: tuple, rows_of, coords_of, whole, index, slots, *,
+                  masked: bool | None, whole_operands: bool = False) -> tuple:
+    """Consumer `share`'s scores of query tile `index` over its share of the resident keys and values
+    (`_tile_scores`, `[bq, bk / consumers]`, `whole_operands` as it takes them), and the shares it reads
+    and writes: its keys' `pl.ds` of the block, its columns' of the head, and the tile's first query."""
+    k_smem, v_smem = resident
+    tiles, consumers = walk.program.tiles, walk.consumers
+    keys, columns = tiles.block_k // consumers, k_smem.shape[-1] // consumers
+    q_first = index * tiles.block_q
+    own = pl.ds(share * keys, keys)
+    coords = coords_of(q_first, read=walk.places_read(masked=masked))
+    scores = _tile_scores(walk, (slots["queries"], slots["douts"]), (k_smem.at[own], v_smem.at[own]),
+                          rows_of(q_first), coords, whole(index), (tiles.block_q, keys), masked=masked,
+                          whole_operands=whole_operands)
+    return scores, own, pl.ds(share * columns, columns), q_first
+
+
 def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of, coords_of, whole, add_dq,
                exchange: mosaic.Exchange, index, slots, carry, accumulators, *, masked: bool | None = None):
     """Consumer `share`'s query tile `index` over the program's resident keys and values (`resident`):
@@ -68,25 +85,20 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     reads of the last tile's done, awaited only past this tile's products and softmax), then, once every
     consumer's are published, its share of the head's columns of dV, dK and dQ over every key of the block
     (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`), and the block released."""
-    k_smem, v_smem = resident
-    family, tiles, consumers = walk.program.family, walk.program.tiles, walk.consumers
-    keys, columns = tiles.block_k // consumers, k_smem.shape[-1] // consumers
+    k_smem = resident[0]
+    family, tiles = walk.program.family, walk.program.tiles
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
-    q_first = index * tiles.block_q
-    own = pl.ds(share * keys, keys)
-    coords = coords_of(q_first, read=walk.places_read(masked=masked))
-    narrowed, part = _tile_scores(walk, (q_slot, do_slot), (k_smem.at[own], v_smem.at[own]), rows_of(q_first),
-                                  coords, whole(index), (tiles.block_q, keys), masked=masked)
+    (narrowed, part), own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole,
+                                                         index, slots, masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
     exchange.claim()
     family.staged(narrowed, weights_ref.at[:, own])
     family.staged(part, cotangents_ref.at[:, own])
     exchange.publish()
-    mine = pl.ds(share * columns, columns)
     dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine])
     dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine])
-    add_dq(q_first, family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, columns)))
+    add_dq(q_first, family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, mine.size)))
     exchange.release()
     return carry, (dk_acc, dv_acc)
 
@@ -102,16 +114,12 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
     takes dV's and dK's accumulators to the new scale (`algebra.running_shift`) before their parts'
     products issue into them, and takes the tile's dQ, both cotangent parts over its columns of the keys,
     back by the cotangents' scale (`algebra.running_restored`) before its add."""
-    k_smem, v_smem = resident
+    k_smem = resident[0]
     family, tiles, consumers = walk.program.family, walk.program.tiles, walk.consumers
-    keys, columns = tiles.block_k // consumers, k_smem.shape[-1] // consumers
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
-    q_first = index * tiles.block_q
-    own = pl.ds(share * keys, keys)
-    coords = coords_of(q_first, read=walk.places_read(masked=masked))
-    operands = _tile_scores(walk, (q_slot, do_slot), (k_smem.at[own], v_smem.at[own]), rows_of(q_first),
-                            coords, whole(index), (tiles.block_q, keys), masked=masked, whole_operands=True)
+    operands, own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole, index,
+                                                 slots, masked=masked, whole_operands=True)
     exchange.claim()
     for operand, left in enumerate(operands):
         exponent = jnp.full((tiles.block_q,), algebra.tile_exponent(left), jnp.float32)
@@ -124,7 +132,6 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
         for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
             family.staged(part, exchanged.at[2 * operand + offset, :, own])
     exchange.publish()
-    mine = pl.ds(share * columns, columns)
     issued = []
     for operand, (acc, rhs) in enumerate(((dv_acc, do_slot.at[:, mine]), (dk_acc, q_slot.at[:, mine]))):
         shift = algebra.running_shift(carry[operand], joined[operand])
@@ -134,7 +141,7 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
         for offset in range(2):
             acc = family.products(acc, exchanged.at[2 * operand + offset].transpose((1, 0)), rhs)
         issued.append(acc)
-    shape = (tiles.block_q, columns)
+    shape = (tiles.block_q, mine.size)
     dq = (family.product(exchanged.at[2], k_smem.at[:, mine], shape)
           + family.product(exchanged.at[3], k_smem.at[:, mine], shape))
     add_dq(q_first, algebra.running_restored(dq, joined[1]))
