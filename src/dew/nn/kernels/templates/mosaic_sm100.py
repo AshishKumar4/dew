@@ -751,7 +751,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
             # The rewrite a role beside the epilogue's, before the issuing warpgroup (`prepared`).
             rewriting = {"rewrite": rewrite} if prepared is not None else {}
-            roles = (mosaic.Role("epilogue", consumers), *(mosaic.Role(name, 1) for name in rewriting), *ISSUING)
+            roles = (mosaic.Role("epilogue", consumers), *(mosaic.Role(name, 1) for name in rewriting),
+                     *ISSUING)
             mosaic.Schedule(roles).run(epilogue=epilogue, load=load, mma=issue_all, **rewriting)
 
         # Each ring's slots' rewrites published, a barrier of the ring's own (a wait of the product warp's
