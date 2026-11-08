@@ -449,11 +449,10 @@ def taken_prefetched(directory: Path, key: str) -> dict | None:
     """The record of bundle `key` a prepare fetched into `directory` (`prefetch`), removed as it is read:
     `chunks` and `borrowed`; None where none is."""
     path = prefetched_path(directory, key)
-    try:
-        record = json.loads(path.read_text())
-    except FileNotFoundError:
+    if not path.is_file():
         return None
-    path.unlink(missing_ok=True)
+    record = json.loads(path.read_text())
+    path.unlink()
     return record
 
 
