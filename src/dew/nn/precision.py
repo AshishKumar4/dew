@@ -387,12 +387,19 @@ def products_dtype(*operands) -> jnp.dtype | None:
     return jnp.result_type(*dtypes)
 
 
-def _intercepted() -> bool:
-    """Whether this thread traces a quantized model's method, whose products Qwix owns
-    (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+def products_quantized() -> bool:
+    """Whether a quantized model's rule owns the products the module calling forms: in the trace of a
+    quantized model's method (`dew._cache.QUANTIZED_TRACE`, which jit's cache keys on), a Qwix rule matching
+    `dot_general` at that module (`qwix.pallas.get_current_rule`, Qwix's query for code that runs its own
+    products). A module its rules leave alone forms the plain model's products, summed as the plain model
+    sums them."""
     from dew._cache import QUANTIZED_TRACE
 
-    return QUANTIZED_TRACE.value is not None
+    if QUANTIZED_TRACE.value is None:
+        return False
+    from qwix import pallas as qwix_pallas
+
+    return qwix_pallas.get_current_rule("dot_general") is not None
 
 
 _OWN_DERIVATIVES = (core.primitives.custom_vjp_call_p, core.primitives.custom_jvp_call_p)
@@ -432,9 +439,9 @@ def wide_cpu_arithmetic() -> bool:
 def _sums_in_float64(*operands) -> bool:
     """Whether a CPU sums these operands' products in float64 (`accumulated`): in a process running wide
     CPU arithmetic (`WIDE_CPU_ARITHMETIC`), float32 arrays, in no scope that states fp32 sums
-    (`FP32_SUMS`), outside a quantized model's trace (`_intercepted`)."""
+    (`FP32_SUMS`), but where a quantized model's rule owns them (`products_quantized`)."""
     return (wide_cpu_arithmetic() and jax.config.jax_default_matmul_precision != FP32_SUMS
-            and not _intercepted()
+            and not products_quantized()
             and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
             and products_dtype(*operands) == jnp.dtype(jnp.float32))
 
@@ -527,7 +534,7 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     row) keeps XLA's sum."""
     from dew.nn import pairwise
 
-    if (_sums_in_float64(lhs, rhs) or _intercepted() or not exact_products(precision, jnp.float32)
+    if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
             or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
             or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
                        for operand in (lhs, rhs))):
@@ -1238,7 +1245,7 @@ def compensates_loops() -> bool:
     from dew.nn.kernels.generation import backend
 
     return (wide_cpu_arithmetic() and backend() == "cpu"
-            and jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted())
+            and jax.config.jax_default_matmul_precision != FP32_SUMS and not products_quantized())
 
 
 def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
