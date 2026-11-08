@@ -31,9 +31,17 @@ with CI's selection, and writes a verdict row for each. A row is red on a
 failed or erroring test, on a test skipped because its import failed (a file
 CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
-every row it holds is red, so a hang is graded, with what pytest reports as
-it is interrupted, rather than leaving the task without a verdict. A check-1
-site too long for one task, marked check1_shards(seeds, per_task) on its test
+every row it holds is red (`kind` "deadline"), so a hang is graded, with what
+pytest reports as it is interrupted, rather than leaving the task without a
+verdict. Its rows' seconds, which armada times the next plan by, are what the
+task knows of each file (`deadline_shares`): the file its tests were running
+at the deadline, the one whose test started last, carries its own tests'
+seconds and the task's wall time no file's tests account for, at least what
+the file needs, so the next plan cuts it finer; a file that finished its tests'
+own seconds; and a file that never started has none: its row says
+`"unobserved": true`, with `seconds` 0 and no `timings`, which armada weighs
+no plan by. A check-1 site too long for one task, marked check1_shards(seeds,
+per_task) on its test
 (`sites`), runs apart from its file's tasks as armada's map and judge
 (`site_entries`): map tasks of per_task of its seeds each, or fewer where their
 measured seconds put a task past the group target (`cut_draws`), which draw them into
@@ -1385,6 +1393,20 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
     return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
 
 
+def deadline_shares(own_seconds: Mapping[str, float], reported: Container[str], wall: float,
+                    running: str | None) -> dict[str, float]:
+    """The seconds of the rows of a task that ran out of time, of the files that have any, by file: one that
+    `reported` tests, its tests' own seconds, and the file `running` at the deadline, the one whose test
+    started last (`followed.visited`), its own and all of the task's `wall` time no file's tests account for
+    (its imports and its collection, and the test the interrupt stopped, which pytest's report gives no
+    time), so its row holds at least what the file needs. A file that reported none and was not running never
+    started, and has none: absent. `apportioned` split the wall time, the interrupted test's included, over
+    the files that finished, in proportion to their tests' times, or evenly where none finished."""
+    unaccounted = max(wall - sum(own_seconds.values()), 0.0)
+    return {name: own + (unaccounted if name == running else 0.0) for name, own in own_seconds.items()
+            if name == running or name in reported}
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
          release: str = "", census: bool = False) -> int:
@@ -1394,8 +1416,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
     the plan weighs a file by what it costs a container (its import, its collection, the
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
-    at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
-    file goes there (`coverage_items`)."""
+    at 300 seconds ran a median of 392. A task that ran out of time times its rows otherwise
+    (`deadline_shares`): the file its tests were running in at least what it needs, a file that never
+    started none. With `coverage`, pytest runs under coverage.py, whose data file goes there
+    (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
@@ -1658,7 +1682,14 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     ran = []
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
-    shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
+    wall = time.monotonic() - began
+    if expired:
+        # The file whose test started last is the one running at the deadline (executed.py logs each visit).
+        stood = followed.visited(followed.log_events(log))
+        shares = deadline_shares(own_seconds, {file_of(case) for case in cases}, wall,
+                                 stood[-1] if stood else None)
+    else:
+        shares = apportioned(own_seconds, wall, len(tests))
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         failed = [(case, kind, node) for case in own for kind in ("failure", "error")
@@ -1684,7 +1715,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                                                       for case, _, _ in failed)
         cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
                  else red_as("nodes", nodes))
-        seconds = shares[name]
+        # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
+        # row is `unobserved`, and armada weighs no plan by it.
+        unobserved = name not in shares
+        seconds = shares.get(name, 0.0)
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
@@ -1693,13 +1727,16 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                          + ([output[-12000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ...").
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
+                     # Where the task ran out of time, a file that never started: no seconds to time it by.
+                     **({"unobserved": True} if unobserved else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if node.split("::", 1)[0] == name},
                                **{node_of(case): float(case.get("time") or 0) for case in own}},
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-                     "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
+                     "timings": {} if unobserved else {row(python, name, group if site else ""): seconds},
+                     **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
     if (coverage is None and not release and not (environ and check1_wire().CENSUS in environ)
