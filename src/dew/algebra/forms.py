@@ -200,6 +200,27 @@ PLACEMENTS = frozenset({"reshard", "sharding_constraint", "mesh_cast"})
 the identity where a walk's tiles are traced (`evaluated_inline`)."""
 
 
+def _platform_default(equation: jcore.JaxprEqn,
+                      producers: Mapping[jcore.Var, jcore.JaxprEqn]) -> jcore.ClosedJaxpr | None:
+    """The branch a choice by the platform a program lowers for (`lax.platform_dependent`: a `cond` on a
+    `platform_index`, `producers` mapping each value to its equation) takes on a platform it names no branch
+    for, its default; None for any other equation, or a choice without one. Read so in Dew's own programs
+    alone (a form's walk, a declaration recognition traces), where each choice computes one function on every
+    branch, which differ in rounding, order or implementation alone: a depthwise convolution's Triton or lax
+    form (dew.nn.conv), a TPU's barrier or none, a CPU's float64 sums, blocked sums and exact bf16 products
+    (dew.nn.precision), the same bf16 bits through a CUDA cast, an S5 scan scanned or chunked (dew.nn.ssm),
+    and a kernel or its portable fallback (dew.nn.kernels.gemm). A program's own choices may compute
+    different functions, and stay as written."""
+    if equation.primitive.name != "cond" or not equation.invars:
+        return None
+    index = equation.invars[0]
+    chooser = producers.get(index) if isinstance(index, jcore.Var) else None
+    if chooser is None or chooser.primitive.name != "platform_index":
+        return None
+    platforms = chooser.params["platforms"]
+    return equation.params["branches"][platforms.index(None)] if None in platforms else None
+
+
 def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
     """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`) and each
     placement its operand (`PLACEMENTS`)."""
@@ -212,11 +233,7 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
     env.update(zip(jaxpr.invars, values, strict=True))
     producers = {out: equation for equation in jaxpr.eqns for out in equation.outvars}
     for equation in jaxpr.eqns:
-        branches = equation.params.get("branches") if equation.primitive.name == "cond" else None
-        index = equation.invars[0] if equation.invars else None
-        chooser = producers.get(index) if branches and isinstance(index, jcore.Var) else None
-        if branches and chooser is not None and chooser.primitive.name == "platform_index":
-            default = branches[-1]
+        if (default := _platform_default(equation, producers)) is not None:
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
         elif (called := programs.called(equation)) is not None:

@@ -635,12 +635,18 @@ its cell on the device declares measured fastest. Two surfaces override that pic
 
 ```python
 import dew
+import jax
+import jax.numpy as jnp
 from dew.nn.norms import RMSNorm
 
-with dew.kernels.use(attention="xla", rms_norm="pallas"):
-    loss = step(params, batch)     # traced in the block: these ops run the named kernels
+norm = RMSNorm()
+x = jnp.ones((2, 8))
+params = norm.init(jax.random.key(0), x)
 
-norm = RMSNorm(implementation="xla")   # one layer's own kernel
+with dew.kernels.use(attention="xla", rms_norm="xla"):
+    y = jax.jit(norm.apply)(params, x)     # traced in the block: these ops run the named kernels
+
+layer = RMSNorm(implementation="xla")      # one layer's own kernel
 ```
 
 `dew.kernels.use(**choices)` is a block: every call traced inside it runs the kernel the block names for

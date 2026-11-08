@@ -591,7 +591,7 @@ def rewalked_form(spec: Forward) -> Forward:
 
 
 def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[jax.Array, O, O], O], *,
-                          masked: bool = False, in_place: bool = False) -> O:
+                          in_place: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
     streams them, so no program walks again): `launch(form, live)` runs the call in `form`, plain where
     `live` is None, else with its rows `live` shifting (`guarded`), and returns its outputs, each row's
@@ -602,42 +602,35 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
     passes `FOLD_REACH` folded, guarded as the call's form is; under headroom, the rows whose weighted values
     overflowed. Ordinary inputs take the one plain launch, their cost unchanged but for these checks.
 
-    `masked` (a spans call's, whose launch walks only its live rows' keys, every other row's none:
-    `launch(form, live)`'s program over its rows' spans) takes one more launch every time, no branch: a
-    branch's predicate is read on the host before its launch may run, a decode step's round trip (row 1978:
-    0.280 ms wall against 0.015 on the device), where a launch of empty walks costs its prologue. It walks
-    in the natural form (`unfolded`) the rows the fold's reach passes `FOLD_REACH` a row (`reached`) and
-    those whose weighted values overflowed, guarded as that form is, and `kept` takes each of its outputs
-    (its rows' finished maxima and denominators too) at those rows: the fold's plain launch costs its
-    exponential's two instructions an element where the natural form's costs about sixty
-    (ET-DECSASS-h100, ET-FOLDED-h100: Qwen3-8B's decode at 32 rows of 32768 keys, 1.35 ms folded against
-    2.11 natural, the H100's bandwidth floor 1.28).
-
-    `in_place` walks so, masked, every call, its rewalk written into the plain launch's outputs held in refs
-    (`launch(form, live, into=refs)`: the launch writes its rows `live` and leaves every other row's bits),
-    no rare walk and no `kept` over them, which the masked launch selected over them every call; its empty
-    launch costs its prologue.
+    `in_place` (a masked walk's, whose launch walks only its live rows' keys, every other row's none:
+    `launch(form, live, into=refs)`'s program over its rows' spans) takes one more launch every time, no
+    branch: a branch's predicate is read on the host before its launch may run, a decode step's round trip
+    (row 1978: 0.280 ms wall against 0.015 on the device), where a launch of empty walks costs its prologue.
+    It walks in the natural form (`unfolded`) the rows the fold's reach passes `FOLD_REACH` a row (`reached`)
+    and those whose weighted values overflowed, guarded as that form is, its rewalk written into the plain
+    launch's outputs held in refs (the launch writes its rows `live` and leaves every other row's bits, and
+    gives no output of its own, which its programs that walk nothing would leave unwritten), no `kept` over
+    them: the fold's plain launch costs its exponential's two instructions an element where the natural
+    form's costs about sixty (ET-DECSASS-h100, ET-FOLDED-h100: Qwen3-8B's decode at 32 rows of 32768 keys,
+    1.35 ms folded against 2.11 natural, the H100's bandwidth floor 1.28).
 
     Elsewhere each rare walk is a loop of at most one trip (`once`), which takes the plain launch's outputs
     as its carry in their own buffer: a branch's common side copied them into its result every call
     (ET-MEMCPY-h100: the output and its rows, 45 us of Qwen3-8B's causal forward on an H100; a training
     forward's split sums besides)."""
-    if masked or in_place:
+    if in_place:
         plain = launch(spec, None)
         outputs = plain[0]
         if not (spec.reaches or spec.headroom):
             return outputs
         # A launch whose programs state its rows' rewalk flags themselves (`rewalks`) gives them in its
-        # overflows' place and no maxima, and rewalks in place: no array operation between the launches
-        # (ET-DPROF-h100: the two fusions forming them took 6.3 us of a batch-1 decode step's 30.7).
-        if plain[1] is None or in_place:
-            live, form = ((plain[2], rewalked_form(spec)) if plain[1] is None
-                          else rewalks(spec, plain[1], plain[2]))
-            held = jax.tree.map(jax.new_ref, outputs)
-            launch(form, live, into=held)
-            return jax.tree.map(jax.freeze, held)
-        live, form = rewalks(spec, plain[1], plain[2])
-        return kept(live, launch(form, live)[0], outputs)
+        # overflows' place and no maxima: no array operation between the launches (ET-DPROF-h100: the two
+        # fusions forming them took 6.3 us of a batch-1 decode step's 30.7).
+        live, form = ((plain[2], rewalked_form(spec)) if plain[1] is None
+                      else rewalks(spec, plain[1], plain[2]))
+        held = jax.tree.map(jax.new_ref, outputs)
+        launch(form, live, into=held)
+        return jax.tree.map(jax.freeze, held)
 
     def plain_launch(form: Forward) -> tuple[O, jax.Array, jax.Array]:
         launched = launch(form, None)
