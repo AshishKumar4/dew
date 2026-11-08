@@ -152,9 +152,8 @@ def _attend_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
 
 def _attend_backward(saved: tuple, dout: jax.Array) -> tuple:
     """The straight-through gradients (`_straight_through`) of the query, key, value and score parameters;
-    the spans take none. Traced with a quantization provider's interception off (`unintercepted`, as the
-    forward's call is by `dew.quantization.UNQUANTIZED`): a backward traced inside a quantized method would
-    have its products quantized again."""
+    the spans take none. Traced where the derivative is taken, with any quantization provider's interception
+    off too (`attend`'s)."""
 
     def pulled(saved, dout):
         query, key, value, spans, hooks = saved
@@ -174,7 +173,8 @@ _attend = contracted("test_a_quantized_attention_holds_its_reverse_orders")(
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks) -> jax.Array:
     """A quantized model's attention of `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and
-    `[B, K, Hk, Dv]` under the visibility `spans` and score `hooks` (no initial state, no draw), which a
-    quantized model's provider runs with its interception off (`dew.quantization.UNQUANTIZED`): the
-    template forms the rule's codes and scales itself, its walk's products none of the rule's."""
-    return _attend(query, key, value, spans, hooks)
+    `[B, K, Hk, Dv]` under the visibility `spans` and score `hooks` (no initial state, no draw), forward and
+    backward traced with any quantization provider's interception off (`unintercepted`): the template forms
+    the rule's codes and scales itself, its walk's products none of the rule's, under Dew's wrapper and a
+    provider built by hand alike."""
+    return unintercepted(_attend)(query, key, value, spans, hooks)
