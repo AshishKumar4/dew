@@ -17,7 +17,12 @@ from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_decode
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_decode,
+    bundles,
+)
 
 KEYS = 256
 SEEDS = 8
@@ -296,6 +301,15 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
 
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), draw,
                     f"verify block of {drafts} through the route", seeds=SEEDS)
+
+
+def served_small_pages() -> tuple[int, ...]:
+    """The pages fewer than a key tile holds whose decode this GPU's family serves
+    (`attention_mosaic._pages_hold`): 16, 4 and 1 key where its loading warpgroup gathers a tile's rows
+    through the table (`Transport.gathers_rows`); 16 alone, a page of whole 8-row tiles each its own copy,
+    where it loads a block in pieces (an A100's cp.async, whose gathered rows are row 4772's A100 half)."""
+    family = bundles.of(generation.device_generation(), jnp.bfloat16)
+    return (16, 4, 1) if family.gathers_rows else (16,)
 
 
 def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
