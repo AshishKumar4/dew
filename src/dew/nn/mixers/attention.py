@@ -690,9 +690,9 @@ class CausalSelfAttention(nn.Module):
             key = self.k_norm(key)
         key = key.reshape(batch, length, self.ctx.num_kv_heads, self.ctx.head_dim)
         if self.ctx.qk_norm and not whole and not self.qk_norm_after_rotary:
-            key = self.k_norm(key)
+            key = self.k_norm(key, axes=KV_HEADS)
         if self.ctx.v_norm:
-            value = self.values_norm(value)
+            value = self.values_norm(value, axes=KV_HEADS)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
     def _placed_query(self, query, rotary_positions, places, uncached):
@@ -713,7 +713,7 @@ class CausalSelfAttention(nn.Module):
                      else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
             if self.qk_norm_after_rotary:
                 turned = rotate(self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs)
-                query = self.q_norm(turned)
+                query = self.q_norm(turned, axes=HEADS)
                 if ratio is not None:
                     query = scaled(query, ratio)
             else:
@@ -871,7 +871,7 @@ class CausalSelfAttention(nn.Module):
             if freqs_cos is not None and freqs_sin is not None:
                 key = rotate(self._turned(key), freqs_cos, freqs_sin, pairs=self.rotary_pairs)
             if self.qk_norm_after_rotary:
-                key = self.k_norm(key)
+                key = self.k_norm(key, axes=KV_HEADS)
             if self.ctx.ngpt is not None:
                 query, key = self._ngpt_rotated(self.ctx.ngpt, query, key)
             if kv_store is not None and self.ctx.kv_store_key is not None:
@@ -945,7 +945,7 @@ class CausalSelfAttention(nn.Module):
             gate = checkpoint_name(self.gate_proj(x), 'output_gate')
             gate = gate.reshape(B, S, self.ctx.num_heads, -1)
         if self.ctx.qk_norm and not self._whole_norm and not self.qk_norm_after_rotary:
-            query = self.q_norm(query)
+            query = self.q_norm(query, axes=HEADS)
         # o_proj's sum returns to the residual placement in the block.
         return constrain(query, HEADS), gate, projected_kv
 
@@ -968,7 +968,7 @@ class CausalSelfAttention(nn.Module):
         query, gate, _ = self._query(x)
         if self.qk_norm_after_rotary:
             # Normed where a rotation would have turned it, before its scale, as the layer's own call.
-            query = self.q_norm(query)
+            query = self.q_norm(query, axes=HEADS)
         if self.ctx.attention_scale is not None:
             query = scaled(query, self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
         return query, gate
@@ -987,7 +987,7 @@ class CausalSelfAttention(nn.Module):
         key, value = self._projected_kv(context, self._whole_norm, projected)
         if self.qk_norm_after_rotary:
             # Normed where a rotation would have turned them, as the layer's own keys.
-            key = constrain(self.k_norm(key), KV_HEADS)
+            key = constrain(self.k_norm(key, axes=KV_HEADS), KV_HEADS)
         return key, value
 
     def attend_context(self, query, gate, key, value, *, lengths, queries=None, segments=None,
