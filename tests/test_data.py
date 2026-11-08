@@ -226,18 +226,20 @@ def test_a_training_read_in_automatic_workers_reads_in_them_where_they_pay_for_t
     rows = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered())
     chain = rows.batch(4)
 
-    def processes(steps: int) -> set[int]:
+    def processes(steps: int, loading: Loading | None = auto) -> set[int]:
         # The processes that ran the read's steps: the training process's, or its workers'.
         where = rows.map(_Where()).batch(4)
-        reader = compile(where, seed=5, steps=steps, loading=auto).train(DataPartition())
+        reader = compile(where, seed=5, steps=steps, loading=loading).train(DataPartition())
         try:
-            return {int(pid) for batch in listed(reader, 3) for pid in batch["pid"]}
+            return {int(pid) for batch in listed(reader, 8) for pid in batch["pid"]}
         finally:
             reader.close()
 
     assert processes(2) == {os.getpid()}
     workers = processes(10**6)
     assert len(workers) == 2 and os.getpid() not in workers
+    # A chain that names no loading reads in as many processes as automatic loading sized for this host.
+    assert len(processes(10**6, None)) == len(processes(10**6, Loading(workers="auto")))
     short = compile(chain, seed=5, steps=2, loading=auto)
     automatic = compile(chain, seed=5, steps=10**6, loading=auto)
     inline = compile(chain, seed=5, loading=Loading(workers=0))
