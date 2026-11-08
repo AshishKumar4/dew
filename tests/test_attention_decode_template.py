@@ -348,8 +348,8 @@ PAGE = 128
 
 
 @INTERPRETS
-@pytest.mark.parametrize(("device", "page"), [("sm90", PAGE), ("sm90", 16), ("sm90", 1), ("sm80", 16), ("sm80", 4),
-                                             ("sm80", 1)])
+@pytest.mark.parametrize(("device", "page"),
+                         [("sm90", PAGE), ("sm90", 16), ("sm90", 1), ("sm80", 16), ("sm80", 4), ("sm80", 1)])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
 def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page, device):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
