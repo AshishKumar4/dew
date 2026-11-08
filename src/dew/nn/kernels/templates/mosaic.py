@@ -1744,8 +1744,12 @@ class Transport[Allocated, Opened](abc.ABC):
     gathers_rows: bool = False
     """Whether the warpgroup loading its rings gathers a step's rows from a table (a gathered stream's `Rows`
     of one row: `gathered.Ring`, its threads' cp.async copies; a ring family's producer, or a consumer that
-    feeds its rings); where not (mma.sync's pipeline, whose `emit_pipeline` loads them), a gathered call is
-    not its launch's."""
+    feeds its rings; mma.sync's one warpgroup beside its pipeline, `mosaic_sm80._gathered_walk`)."""
+
+    gathers_interpreted: bool = False
+    """Whether its gathered streams copy their rows interpreted too (mma.sync's walk, row by row); where not
+    (a ring's lane-level copies), an interpreted launch reads a gathered stream's tile a row a piece
+    (`Ring.parts`)."""
 
     copies_vectors: bool = True
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a

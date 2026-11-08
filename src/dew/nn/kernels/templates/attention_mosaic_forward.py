@@ -197,7 +197,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     if pieces == 1 or not family.gathers_rows:
         return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles,
                                       copies=dict.fromkeys(blocks, pieces * parts))
-    if not interpret:
+    if not interpret or family.gathers_interpreted:
         return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
     # A copy a row of each swizzled tile's columns (`mosaic.Ring.parts`), where no lane-level copy runs.
     unit = {name: mosaic.swizzle_columns(stored, swizzles.get(name, mosaic.SWIZZLE_BYTES)) for name in blocks}

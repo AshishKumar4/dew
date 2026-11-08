@@ -141,11 +141,30 @@ def barriers_initialized(barriers, stages: int) -> None:
 
 
 def gathered_copies(source, rows, slot, barrier, *, swizzle: int) -> None:
-    """The producer warpgroup's cp.async copies of the slot's rows (`Ring.load`): row `r` of
-    `slot` (`[height, width]`, 8-row tiles at `swizzle` bytes) row `rows[r]` of `source` (`[tokens, width]`,
-    the step's columns of the tokens), each thread its 16-byte pieces in the tiled copy's layout
-    (`tiled_copy_smem_gmem_layout`, as Mosaic GPU's own cp.async copy of a tile places them), then the
-    copies tracked at `barrier` and the warpgroup's one arrival there once every thread has issued its own."""
+    """The producer warpgroup's cp.async copies of the slot's rows (`Ring.load`, `row_copies`), tracked at
+    `barrier` and the warpgroup's one arrival there once every thread has issued its own."""
+    row_copies(source, rows, slot, swizzle=swizzle)
+    tracked = barrier_of(barrier)
+    # cp.async.mbarrier.arrive is no arrival: it holds the phase open until this thread's copies land.
+    mgpu_nvvm.cp_async_mbarrier_arrive(tracked.get_ptr())
+    mgpu_utils.warpgroup_barrier()
+    tracked.arrive(predicate=mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARPGROUP))
+
+
+def commit_group(ctx) -> None:
+    """The thread's cp.async copies issued since its last group committed as one (`plgpu.inline_mgpu`'s
+    body, `ctx` its launch context): what `plgpu.wait_gmem_to_smem` counts, as Mosaic GPU's own cp.async
+    copies commit theirs (`LaunchContext.async_copy`)."""
+    del ctx
+    mgpu_nvvm.cp_async_commit_group()
+
+
+def row_copies(source, rows, slot, *, swizzle: int) -> None:
+    """A warpgroup's cp.async copies of a slot's rows, a row a copy: row `r` of `slot` (`[height, width]`,
+    8-row tiles at `swizzle` bytes) row `rows[r]` of `source` (`[tokens, width]`, the step's columns of the
+    tokens), each thread its 16-byte pieces in the tiled copy's layout (`tiled_copy_smem_gmem_layout`, as
+    Mosaic GPU's own cp.async copy of a tile places them), issued and not awaited: a ring's tracked at its
+    load barrier (`gathered_copies`), an A100 pipeline's in its cp.async groups (`mosaic_sm80.CpAsync`)."""
     i32, i64 = mgpu_ir.IntegerType.get_signless(32), mgpu_ir.IntegerType.get_signless(64)
     index = mgpu_ir.IndexType.get()
     element = mgpu_ir.MemRefType(source.type).element_type
@@ -177,11 +196,6 @@ def gathered_copies(source, rows, slot, barrier, *, swizzle: int) -> None:
                                  mgpu_arith.muli(column, mgpu_utils.c(column_stride, i64)))
         mgpu_nvvm.cp_async_shared_global(smem_ptr, mgpu_utils.getelementptr(base, [offset], gep), width_bytes,
                                          mgpu_nvvm.LoadCacheModifierKind.CG)
-    tracked = barrier_of(barrier)
-    # cp.async.mbarrier.arrive is no arrival: it holds the phase open until this thread's copies land.
-    mgpu_nvvm.cp_async_mbarrier_arrive(tracked.get_ptr())
-    mgpu_utils.warpgroup_barrier()
-    tracked.arrive(predicate=mgpu_utils.single_thread_predicate(mgpu_utils.ThreadSubset.WARPGROUP))
 
 
 def tma_rows(ctx, source, rows, slot, barrier, column, *, swizzle: int) -> None:
