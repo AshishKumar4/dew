@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_portable,
     bodies,
+    handoffs,
     mosaic,
     mosaic_sm100,
     resources,
@@ -48,7 +49,7 @@ from dew.nn.kernels.templates.mosaic_sm100 import ISSUING, RINGS, STORED, TCGEN0
 
 CHUNK = 32
 """The output accumulator's columns the correction rescales at a time."""
-SCHEDULE = mosaic.Schedule((mosaic.Role("softmax"), mosaic.Role("correction"), *ISSUING))
+SCHEDULE = handoffs.Schedule((handoffs.Role("softmax"), handoffs.Role("correction"), *ISSUING))
 """A program's roles: the softmax's warpgroup and the correction's, then the issuing one's load and product
 warps."""
 PART = 16

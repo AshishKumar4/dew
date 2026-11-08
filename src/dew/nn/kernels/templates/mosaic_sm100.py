@@ -30,12 +30,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic, mosaic_sm90, persistent, resources
+from dew.nn.kernels.templates import handoffs, mosaic, mosaic_sm90, persistent, resources
 from dew.nn.kernels.templates.mosaic import Ref
 
-ISSUING = (mosaic.Role("load", warp=True, weight=0), mosaic.Role("mma", warp=True, weight=0))
-"""The issuing warpgroup's roles after a template's own (`mosaic.Schedule`'s warp roles): its load warp's TMA
-copies and its product warp's MMAs."""
+ISSUING = (handoffs.Role("load", warp=True, weight=0), handoffs.Role("mma", warp=True, weight=0))
+"""The issuing warpgroup's roles after a template's own (`handoffs.Schedule`'s warp roles): its load warp's
+TMA copies and its product warp's MMAs."""
 TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 """A tile's register layout as tensor memory loads it natively (a thread a row)."""
 STORED = plgpu.Layout.TCGEN05
@@ -110,7 +110,7 @@ class Tcgen05:
                interpret, name: str | None = None, topology: Topology = SINGLE,
                warpgroups: int = WARPGROUPS) -> Callable:
         """`entry` as a program of `warpgroups` warpgroups (axis 'wg', `WARPGROUPS` by default: a template
-        whose roles are more, `mosaic.Schedule`'s), its kernel named `name`, `grid` the clusters of
+        whose roles are more, `handoffs.Schedule`'s), its kernel named `name`, `grid` the clusters of
         `topology`'s CTAs (one each without a pair)."""
         return mosaic.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                              warpgroups=warpgroups, family=Tcgen05.name, scratch=scratch,
@@ -179,7 +179,7 @@ def accumulator_columns(rows: int, columns_: int):
 class Signals:
     """`count` one-phase-a-turn barriers between a program's roles, a turn's slot its remainder (`Signal`):
     tensor-core ordered where a product's commit arrives at it or a role's tensor-memory stores precede its
-    arrival (`tensor_core`), else a load's; `arrivals` arrive at a turn (`mosaic.HandOff`'s producer's)."""
+    arrival (`tensor_core`), else a load's; `arrivals` arrive at a turn (`handoffs.HandOff`'s producer's)."""
     count: int = 1
     tensor_core: bool = True
     arrivals: int = 1
@@ -231,7 +231,7 @@ class Accumulators:
     each, which the producing role arrives at (the product warp's commit once a turn's products are issued),
     and a read barrier each, which the roles that give the turn back arrive at (`released`: the reading
     warpgroups once they have read it out); both tensor-core ordered, their counts stated by the roles that
-    fill and give back the ring (`mosaic.HandOff`, `arrived`). A turn is a counter round the ring; its
+    fill and give back the ring (`handoffs.HandOff`, `arrived`). A turn is a counter round the ring; its
     accumulator is the turn's remainder. Over a pair of CTAs (`topology`) each holds its rows' accumulators,
     allocated together, and an accumulator is free once both CTAs have read theirs out (its read barrier
     the cluster's)."""
@@ -630,13 +630,14 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 else gathered.Committed(**scoped) for name, scoped in allocated.items()}
 
     def persist_schedule(self, consumers: int, width: int, *, summed: bool = False,
-                         rewrites: bool = False) -> mosaic.Schedule:
+                         rewrites: bool = False) -> handoffs.Schedule:
         """A persistent walk's roles: its `consumers` epilogue warpgroups, a rewriting warpgroup where its
         steps' slots are rewritten (`persist`'s `prepared`), and the issuing warpgroup's warps; and its
         accumulator turns (`turns` of `width` columns, `Accumulators`, their running sums past them where
         exactly `summed`), which the product warp fills and the epilogue gives back."""
-        rewriting = (mosaic.Role("rewrite", 1),) if rewrites else ()
-        return mosaic.Schedule((mosaic.Role("epilogue", consumers), *rewriting, *ISSUING), (mosaic.HandOff(
+        rewriting = (handoffs.Role("rewrite", 1),) if rewrites else ()
+        roles = (handoffs.Role("epilogue", consumers), *rewriting, *ISSUING)
+        return handoffs.Schedule(roles, (handoffs.HandOff(
             "accumulators", Accumulators(self.turns, self.rows, width, running=summed), "mma",
             ("epilogue",)),))
 

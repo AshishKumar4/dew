@@ -232,14 +232,15 @@ def raised_registers(consumers: int, programs: int = 1, producer: int | None = N
 
 
 def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | None = None) -> tuple[int, ...]:
-    """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg (`mosaic.Schedule`'s
-    roles), `programs` programs held by a multiprocessor at once: a warpgroup of weight 0 lowers to `floor`
-    (`producer_floor`), and the rest of the program's launch pool is shared among the others by weight, in
-    setmaxnreg's steps and at most `raise_ceiling`, a share past the ceiling given back to the rest. The pool
-    is what the program launches with (`entry_registers`), which setmaxnreg moves between a program's warps
-    and never past ("The total number of registers allocated to all warps in the CTA cannot exceed the
-    initial CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a thread, so they
-    hold 104, where the multiprocessor's share would ask 112 and wait for registers no warp gives back."""
+    """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg
+    (`handoffs.Schedule`'s roles), `programs` programs held by a multiprocessor at once: a warpgroup of weight
+    0 lowers to `floor` (`producer_floor`), and the rest of the program's launch pool is shared among the
+    others by weight, in setmaxnreg's steps and at most `raise_ceiling`, a share past the ceiling given back
+    to the rest. The pool is what the program launches with (`entry_registers`), which setmaxnreg moves
+    between a program's warps and never past ("The total number of registers allocated to all warps in the CTA
+    cannot exceed the initial CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a
+    thread, so they hold 104, where the multiprocessor's share would ask 112 and wait for registers no warp
+    gives back."""
     floor = producer_floor() if floor is None else floor
     step, ceiling = facts().raises().step, raise_ceiling()
     pool = (entry_registers(len(weights), programs) * len(weights) - floor * weights.count(0)) * THREADS
