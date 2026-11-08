@@ -132,7 +132,9 @@ def _recognizing(jaxpr: jcore.Jaxpr, index: fusion.Index, held: frozenset[int],
     claimed: set[int] = set(held)
     for family in families:
         for place, equation in enumerate(jaxpr.eqns):
-            if place in claimed or not _holds(equation, family.anchor):
+            # An anchor makes the value its region is read around: a launch writing refs in place, its body
+            # binding the anchor's primitive, makes none (an in-place rewalk, `attention_mosaic_forward`).
+            if place in claimed or not equation.outvars or not _holds(equation, family.anchor):
                 continue
             spans = [(candidate, places) for candidate in family.candidates(index, place)
                      if (places := _between(index, candidate.operands, candidate.outputs)) is not None
