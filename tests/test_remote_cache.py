@@ -647,6 +647,41 @@ def test_a_bundle_fetched_ahead_is_restored_with_no_request_and_grows_as_one_fet
     assert seen.count(key) == 0
 
 
+def test_a_recut_group_fetched_ahead_restores_its_overlapping_groups_programs_with_no_request(
+        cache_worker, tmp_path):
+    """A tier's group recut by its GPU seconds has no bundle of its own: a prepare's fetch (`prefetch`)
+    seeds its file's other cuts' programs it overlaps, as a run's own open would (`siblings`), and the run
+    restores them with no request and writes its own bundle under its own cut (2026-11-08: dc4c223ad's
+    A100 tier fetched 0 programs ahead for each of its 30 recut groups)."""
+    url, stored, seen = cache_worker
+    stored["/jax/gpu/bundles/tests/split.py/1-of-2"] = remote_cache.packed([("jit_front-1", b"f")])
+    stored["/jax/gpu/bundles/tests/split.py/2-of-2"] = remote_cache.packed([("jit_back-1", b"b")])
+    group = remote_cache.bundle("tests/split.py", "1/3", None)
+    assert remote_cache.prefetch(tmp_path, url, "token", "jax/gpu", [group]) == 1
+    seen.clear()
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu")
+    cache.opened(group)
+    assert [path for path in seen if "/bundles/" in path] == [] and set(programs(tmp_path)) == {"jit_front-1"}
+    cache.closed(group)
+    cache.drain()
+    assert [key for key, _ in remote_cache.unpacked(stored["/jax/gpu/bundles/tests/split.py/1-of-3"])] == [
+        "jit_front-1"]
+
+
+def test_a_bundle_fetched_ahead_stands_for_one_run_alone(cache_worker, tmp_path):
+    """The run a prepare fetched a bundle for restores it with no request; a later run on the same node's
+    directory, which no prepare fetched for, asks the Worker for it again, so it reads what the first run
+    wrote back rather than what the prepare saw."""
+    url, stored, seen = cache_worker
+    stored["/jax/gpu/bundles/tests/again.py"] = remote_cache.packed([("jit_a-1", b"a")])
+    remote_cache.prefetch(tmp_path, url, "token", "jax/gpu", ["tests/again.py"])
+    seen.clear()
+    remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu").opened("tests/again.py")
+    assert seen.count("/jax/gpu/bundles/tests/again.py") == 0
+    remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu").opened("tests/again.py")
+    assert seen.count("/jax/gpu/bundles/tests/again.py") == 1
+
+
 def test_a_program_whose_key_fills_a_file_name_round_trips(cache_worker, tmp_path):
     """A key as long as JAX makes one for a long function's name (`jit_` and the name, `-` and a
     SHA-256 in hex), whose `-cache` file's name is 236 bytes, reaches the local cache from its bundle."""
