@@ -1203,3 +1203,102 @@ def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product
     np.testing.assert_array_equal(ss, expected)
     np.testing.assert_array_equal(staged, expected)
     np.testing.assert_array_equal(carried, expected + 1)
+
+
+def _read_ahead(interpret):
+    """A launch adding its first operand, read ahead of its wait (`bodies.dependent`'s `ahead`, `settled`),
+    to its second, read after it."""
+    def ahead(weights_ref):
+        return weights_ref[...]
+
+    def entry(weights_ref, x_ref, o_ref, weights):
+        del weights_ref
+        o_ref[...] = x_ref[...] + weights
+
+    return mosaic.kernel(entry, out_type=jax.ShapeDtypeStruct((128, 64), jnp.float32), grid=(1,),
+                         grid_names=("tile",), warpgroups=1, interpret=interpret, family="read_ahead",
+                         ahead=ahead, settled=(0,))
+
+
+def test_a_launch_reads_ahead_of_its_wait_only_what_its_program_takes_whole():
+    """A launch reading an operand ahead of its wait (`bodies.dependent`'s `settled`) lowered for an H100: the
+    compile point takes it where the operand is the program's input, through a nested program's call and a
+    loop that hands it back each trip unchanged (`lowered.unsettled`), and refuses it where the program
+    produces the operand or a loop's trip changes it, before compiling (`report.compiled`)."""
+    from dew.nn.kernels import lowered as lowered_module
+    from dew.nn.kernels.templates import report
+
+    weights = jax.ShapeDtypeStruct((128, 64), jnp.float32)
+
+    def looped(changed):
+        def run(weights, x):
+            def trip(_, carried):
+                weights, x = carried
+                return (weights * 2.0 if changed else weights), launch(weights, x)
+            return jax.lax.fori_loop(0, 3, trip, (weights, x))[1]
+        return run
+
+    programs = {"input": lambda weights, x: launch(weights, x),
+                "nested": lambda weights, x: jax.jit(launch)(weights, x),
+                "loop": looped(changed=False),
+                "produced": lambda weights, x: launch(weights * 2.0, x),
+                "loop changed": looped(changed=True)}
+    found = {}
+    with generation.assumed("sm90"):
+        # Built for a Hopper, whose launches wait for the one before them (`bodies.waits`).
+        launch = _read_ahead(interpret=False)
+        for name, program in programs.items():
+            lowered = jax.jit(program).trace(weights, weights).lower(lowering_platforms=("cuda",))
+            found[name] = lowered_module.unsettled(lowered)
+            if found[name]:
+                with pytest.raises(lowered_module.Unsettled):
+                    report.compiled(lowered, relower=lambda lowered=lowered: lowered)
+    assert {name for name, unsettled in found.items() if unsettled} == {"produced", "loop changed"}, found
+
+
+@INTERPRETS
+def test_a_launch_runs_what_it_reads_ahead_of_its_wait_once_and_hands_it_on():
+    """Interpreted, a launch reading its first operand ahead of its wait (`bodies.dependent`'s `ahead`) adds
+    it to its second, as the program's sum does."""
+    rng = np.random.default_rng(3601)
+    weights, x = (jnp.asarray(rng.standard_normal((128, 64)), jnp.float32) for _ in range(2))
+    launched = jax.jit(_read_ahead(interpret=True))(weights, x)
+    np.testing.assert_array_equal(np.asarray(launched), np.asarray(weights + x))
+
+
+def test_a_programs_settled_arguments_are_read_as_such_and_never_donated():
+    """A program declaring an argument settled (`options.program`'s `settled`, a server's loaded weights)
+    knows its value as such while it traces (`options.settled`), and the others not; a program donating an
+    array one has read as settled refuses it (`SettledDonated`) until it is unsettled (`options.unsettle`),
+    whether called or fetched."""
+    from dew.nn.kernels import options
+
+    seen = {}
+
+    def step(weights, x):
+        seen.update(weights=options.settled(weights), x=options.settled(x))
+        return x @ weights
+
+    weights, x = jnp.eye(4, dtype=jnp.float32), jnp.ones((2, 4), jnp.float32)
+    served = options.program(step, settled=(0,))
+    np.testing.assert_array_equal(np.asarray(served(weights, x)), np.asarray(x))
+    assert seen == {"weights": True, "x": False}
+    synced = options.program(lambda weights: weights * 2.0, donate_argnums=0)
+    with pytest.raises(options.SettledDonated):
+        synced(weights)
+    with pytest.raises(options.SettledDonated):
+        options.Fetched(synced)(weights)
+    # Donated however the call passes it: by keyword only, or among variadic arguments.
+    def by_name(*, weights):
+        return weights * 2.0
+
+    def variadic(*arrays):
+        return arrays[1] * 2.0
+
+    with pytest.raises(options.SettledDonated):
+        options.program(by_name, donate_argnames="weights")(weights=weights)
+    with pytest.raises(options.SettledDonated):
+        options.program(variadic, donate_argnums=1)(x, weights)
+    options.unsettle(weights)
+    doubled = synced(weights)
+    np.testing.assert_array_equal(np.asarray(served(doubled, x)), np.asarray(x * 2.0))
