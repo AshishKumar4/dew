@@ -734,6 +734,30 @@ def test_a_periodic_one_stage_state_goes_back_onto_its_layers_for_a_run_that_doe
         np.testing.assert_array_equal(mine, theirs)
 
 
+@pytest.mark.mesh(devices=8)
+def test_a_frozen_base_scanned_under_a_rung_that_recomputes_named_residuals_keeps_the_rest():
+    """Under rung 1 (`all_but_delta_memory`, a block that recomputes its delta memory alone and keeps every
+    other value), a one-stage scan that reads a frozen base's rows (`decoder_stack._rows_recomputed`) keeps
+    what the rung keeps for its backward, more than the full rung recomputing the whole layer: where it
+    recomputed the whole layer, the cheapest rung cost what the dearest does in time and held no more."""
+    held = {}
+    for rung in ("all_but_delta_memory", "full"):
+        model = decoder(scan_layers=True, remat=rung)
+        base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+        adapter = LoRA(rank=2, modules=("q_proj",)).apply(model, base, key=1)
+        run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
+        run.validate(steps=1)
+        state, _, _ = run.place()
+        variables = jax.device_get(state.variables)
+        ids = jnp.asarray(token_rows(VOCAB, 2, SEQ)["text"])
+
+        def loss(params, variables=variables, model=adapter.model, ids=ids):
+            return jnp.mean(model.apply({**variables, "params": params}, ids) ** 2)
+        compiled = jax.jit(jax.grad(loss)).lower(variables["params"]).compile()
+        held[rung] = compiled.memory_analysis().temp_size_in_bytes
+    assert held["all_but_delta_memory"] > held["full"], held
+
+
 ROWS_SEEDS = 8
 """Check 1's declared seeds for a frozen base read where it lies against one stacked each step."""
 

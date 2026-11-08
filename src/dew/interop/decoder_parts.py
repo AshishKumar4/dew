@@ -1274,6 +1274,17 @@ def _hyper(config: Config, slots: Mapping[str, str]) -> bool:
     return config.get('hyper_connections') is not None
 
 
+def _routed_rows(config: Config, slots: Mapping[str, str]) -> bool:
+    """Whether the decoder's mHC sites are SenseNova-Loop's routers (`MHCRouter`), which mix the streams
+    as their mix stands (`HyperConnections.hc_mix_transposed`) and store a weight and a bias alone."""
+    streams = config.get('hyper_connections')
+    return isinstance(streams, Mapping) and bool(streams.get('hc_mix_transposed'))
+
+
+def _mixed_columns(config: Config, slots: Mapping[str, str]) -> bool:
+    return not _routed_rows(config, slots)
+
+
 def _linear_layer(config: Config, slots: Mapping[str, str]) -> bool:
     return layer_type(config, slots['layer']) == 'linear_attention'
 
@@ -1348,7 +1359,12 @@ LAYER_ROUTES = Table(
     # mHC's residual mapping around each sublayer, in the reference's own layout
     # (modeling_deepseek_v4.py:902-913).
     in_layer('{module}.{part}', '{module}/{part}',
-             {'module': one_of('attn_hc', 'ffn_hc'), 'part': one_of(*_V4_HC)}),
+             {'module': one_of('attn_hc', 'ffn_hc'), 'part': one_of(*_V4_HC)}, when=_mixed_columns),
+    # SenseNova-Loop's routers around each sublayer, a weight and a bias, under the streams' own range
+    # (modeling_sensenova_loop.py:86-102, 370-371).
+    *(route for theirs, ours in (('mhc_attn', 'attn_hc'), ('mhc_ffn', 'ffn_hc'))
+      for route in (in_layer(f'{theirs}.weight', f'{ours}/fn', when=_routed_rows),
+                    in_layer(f'{theirs}.bias', f'{ours}/base', when=_routed_rows))),
     # One tensor an expert, stacked by `_stack_experts`; the dense shared experts beside them, one MLP
     # however many the config counts.
     in_layer('mlp.experts.{expert}.{projection}.weight', 'mlp/experts/{expert}/{projection}/kernel',

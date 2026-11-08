@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import json
 import logging
 import os
@@ -22,10 +23,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, NoReturn, Protocol, Self
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.traverse_util import flatten_dict
 from jax.typing import DTypeLike
 
 from dew import _records
@@ -38,11 +38,21 @@ from dew.inference.images import TextToImage
 from dew.inference.loading import place
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import InputSpec
-from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, unread, verify
+from dew.interop import (
+    decoder_parts,
+    gguf,
+    hf_decoders as decoders,
+    mamba2,
+    quantized_loads,
+    sources,
+    unread,
+    verify,
+)
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_bindings import decoder_layouts, reading_layout
+from dew.interop.drawn import extension_drawn, initialized
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -52,6 +62,7 @@ from dew.interop.generation_config import (
     pad_id,
     read_generation_config,
     return_sequences,
+    source_cache,
     source_decoding,
 )
 from dew.interop.layouts import CROSSING_UNWRITTEN, Unwritable
@@ -83,11 +94,10 @@ from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.kernels.gemm import NvFp4
-from dew.nn.kernels.options import owned_program
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.nn.protocols import MediaWrapper
-from dew.nn.sharding import boxed, current_boxes, drawn_axes
+from dew.nn.sharding import boxed, current_boxes
 from dew.objectives.base import SavedTask
 from dew.registry import (
     ModelConfig,
@@ -129,7 +139,6 @@ class Placing(Protocol):
 
     def __call__(self, variables: Variables, model: RefinesLayout | None = None,
                  axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None) -> Variables: ...
-
 
 
 def _in_language_model(path: tuple[str, ...]) -> tuple[str, ...]:
@@ -199,25 +208,6 @@ def on_default_device(variables: Variables) -> Variables:
     # outlives its device copy.
     return placed_leaves(variables, lambda _, leaf: jax.device_put(leaf)
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=True)
-
-
-def _extension_drawn(model: nn.Module, selected: Callable[[tuple[str, ...]], bool], key: int | jax.Array, *,
-                     shaped: bool = False) -> Variables:
-    """The variables an extension adds to a source (cross-attention's blocks, DEX's projections and
-    constants): `model`, the source with the extension, drawn from `key` (`request_key`) over a token more
-    than the prediction depths it carries, which each read one further on, and the leaves whose path
-    `selected` takes kept, plain. Only those leave the program, so the source's own draws are dead code to
-    XLA; with `shaped`, a source loaded without its weights, their shapes alone."""
-    from dew.batch import select, thaw
-    from dew.nn.inputs import request_key
-    from dew.nn.protocols import Predicting
-
-    length = 1 + (model.num_nextn_predict_layers if isinstance(model, Predicting) else 0)
-
-    def drawn(draw: jax.Array) -> Variables:
-        return select(thaw(unboxed(model.init(draw, jnp.zeros((1, length), jnp.int32)))), selected)
-
-    return jax.eval_shape(drawn, request_key(key)) if shaped else owned_program(drawn)(request_key(key))
 
 
 @dataclass(frozen=True)
@@ -300,8 +290,9 @@ class Pretrained:
     source's own transformers loader as the source does; read from the source's snapshot, which a
     weights conversion may not be, when the save writes it."""
     fresh: tuple[str, ...] = ()
-    """The modules of `model` drawn fresh beside the loaded weights, by their paths under `params`
-    (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run trains in a fresh group
+    """What of `model` was drawn fresh beside the loaded weights, by its path under `params`: a module
+    (`layers_1/cross_attention`, `with_cross_attention`'s) or a parameter a loaded module gained
+    (`early_exit_gate/kernel`, `with_model`'s), which a run trains in a fresh group
     (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     numerics: Numerics | None = None
     """The numerics the load was asked for (`load(precision=...)`), whose dtypes it computes and stores
@@ -563,15 +554,12 @@ class Pretrained:
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
-        `packed_experts` serves an MXFP4 source's routed experts as their codes (row 4516): each bank
-        whose depth is whole NVFP4 stages and whose group powers one tensor scale an expert spans
-        (`codecs.mxfp4_tensor_powers`) is held packed (`dew.nn.kernels.gemm.NvFp4`, exactly its MXFP4
-        values) in the `QUANTIZATION` collection under its matrix's name, which the expert layers read
-        (`dew.quantization.expert_matrix`) and an export decodes (`decoded_expert_banks`); one that is
-        not stays dense, named in the load's log. A bank is a registered dataclass, so a mesh places its
-        leaves by its dense matrix's axes and a scan stacks and slices each as it does a dense matrix
-        (`scan_layers`). Refused beside another source format.
-        A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
+        `packed_experts` serves an MXFP4 source's routed experts as their codes (row 4516,
+        `quantized_loads.packed_banks`): each bank one tensor scale an expert holds is packed
+        (`dew.nn.kernels.gemm.NvFp4`, exactly its MXFP4 values) in the `QUANTIZATION` collection, which
+        the expert layers read and an export decodes, placed and scanned as its dense matrix; one that is
+        not stays dense, named in the load's log. Refused beside another source format. A saved Dew run
+        loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
         name_or_dir, trust_remote_code = released_source(name_or_dir, trust_remote_code, step=step, ema=ema,
                                                          mesh=mesh, layout=layout)
@@ -667,6 +655,31 @@ class Pretrained:
                              base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
+    def with_model(self, model: nn.Module, *, key: int | jax.Array) -> Self:
+        """This source with `model` in its model's place, every parameter `model` declares that the source
+        holds none of drawn from its initializer under `key` (`extension_drawn`) and named among what it
+        drew fresh (`fresh`), so a run trains it in its fresh group as it trains a module drawn beside the
+        base: a transformation of a loaded model that gives its loaded modules parameters of their own (a
+        loop's) starts them as a fresh model would. A model that declares none is this source's own; one
+        that declares none of a parameter the source holds is refused, naming it, its weights unread."""
+        from dew.batch import merge, thaw
+        from dew.optim import parameter_name
+
+        held = {("params", *path) for path in flatten_dict(dict(thaw(self.variables).get("params", {})))}
+        declared = thaw(jax.eval_shape(functools.partial(initialized, model), jax.random.key(0)))
+        named = {("params", *path) for path in flatten_dict(dict(declared.get("params", {})))}
+        if held - named:
+            dropped = sorted("/".join(path[1:]) for path in held - named)
+            raise ValueError(f"this {type(model).__name__} reads none of the source's {dropped[:6]}: a "
+                             "model in its place keeps every parameter it holds")
+        if not named - held:
+            return replace(self, model=model)
+        shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
+        added = extension_drawn(model, lambda path: tuple(path) in named - held, key, shaped=shaped)
+        drawn = {parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(added["params"])}
+        return replace(self, model=model, variables=merge(self.variables, added),
+                       fresh=tuple(sorted({*self.fresh, *drawn})))
+
     def with_cross_attention(self, cross: CrossBlocks, *, key: int | jax.Array,
                              frozen: bool = True) -> Self:
         """Return this source with gated cross-attention before the layers `cross` names, each
@@ -693,7 +706,7 @@ class Pretrained:
         if self.model.cross_attention is not None:
             raise ValueError("this bundle already reads a context; attach cross-attention to the source")
         model = self.model.with_cross_attention(cross)
-        blocks = _extension_drawn(model, lambda path: path[0] == "params" and crossing(path), key)
+        blocks = extension_drawn(model, lambda path: path[0] == "params" and crossing(path), key)
         variables = merge(self.variables, blocks)
         # Each block's module, its path under `params` to and with the block's own name.
         added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
@@ -720,7 +733,7 @@ class Pretrained:
             raise TypeError(f"a {type(self.model).__name__} takes no differential extension")
         model = self.model.with_dex(extension)
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
-        added = _extension_drawn(
+        added = extension_drawn(
             model, lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
             or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS), key, shaped=shaped)
         variables = merge(self.variables, added)
@@ -925,7 +938,6 @@ class PretrainedDecoder(Pretrained):
         return _text_generation(self, sampling)
 
 
-
 @dataclass(frozen=True)
 class PretrainedMaskedDecoder(Pretrained):
     """A masked-diffusion decoder (LLaDA, Dream).
@@ -1019,7 +1031,6 @@ class PretrainedBlockDecoder(Pretrained):
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
             n=return_sequences(self.config, self.generation_config),
         ))
-
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1145,7 +1156,7 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
     policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
                                                sampling)
     return loaded.formed(TextGeneration(
-        loaded.model,
+        source_cache(loaded.config, loaded.generation_config, loaded.model),
         loaded.variables,
         loaded.text_processor,
         policy,
@@ -1712,68 +1723,6 @@ def _language_model_tensors(tensors: Mapping[str, unread.Stored], record: decode
                        lambda local: tensors[names[local]])
 
 
-def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[WeightLayout, ...],
-                        config: Mapping[str, object], grid: Mapping[str, unread.Stored]
-                        ) -> tuple[nn.Module, Variables]:
-    """Write each stored input scale into the `QUANTIZATION` variables of every Linear its source
-    weight binds, and return the model computing under them.
-
-    A source weight split along its outputs (Phi-3's fused `qkv_proj`, `gate_up_proj`) binds one
-    Linear a member, each reading the fused projection's one input, so each takes its scale. An
-    expert stack's members read their own tokens, and a split along the inputs reads parts of the
-    input, which one stored scale does not quantize; those are refused before returning a model
-    with the wrong activation forward. Every stored scale must bind a Linear.
-    """
-    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputKind, InputQuantization, InputQuantizer
-
-    codec = source_quantization(config)
-    if codec is None or codec.input_scale_dtype is None:
-        return model, variables
-    sites: dict[tuple[str, ...], tuple[InputKind, unread.Stored]] = {}
-    consumed: set[str] = set()
-    for layout in layouts:
-        part = layout.name.removesuffix('.weight') + codec.input_suffix
-        if part not in grid:
-            continue
-        # A kernel leaf is [inputs, outputs]: a split on its last axis splits the outputs.
-        if (any(path[-1] != 'kernel' for path in layout.paths) or layout.expert_index is not None
-                or layout.concatenate not in (None, -1)):
-            raise ValueError(f"{layout.name} needs its input QDQ per expert or input part, "
-                             "which one stored input scale does not quantize")
-        consumed.add(part)
-        scale = unread.held(grid[part])
-        if scale.dtype != np.float32 or scale.size != 1:
-            raise ValueError(f"{part} must be one float32 stored global scale, "
-                             f"got {scale.dtype} {scale.shape}")
-        kind: InputKind = 'fp8' if codec.input_kind(layout.name) == 'fp8' else 'nvfp4'
-        if unread.valued(scale):
-            value = float(scale.reshape(()))
-            quantizer = (InputQuantizer.fp8(value) if kind == 'fp8' else
-                         InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
-                                              format=codec.input_format))
-            stored = np.asarray(quantizer.scale)
-        else:
-            # A load without its weights holds the scale's shape and dtype; its value is checked on load.
-            stored = scale.reshape(())
-        for path in layout.paths:
-            site = path[1:-1]
-            # A fused tensor and an equal member stored beside it bind one Linear twice: they must
-            # quantize its input alike, or one calibration would be silently dropped.
-            held_kind, held_scale = sites.setdefault(site, (kind, stored))
-            agrees = held_kind == kind and unread.equal(held_scale, stored)
-            if not agrees:
-                raise ValueError(f"{layout.name}'s input quantizer and another stored for "
-                                 f"{'/'.join(site)} disagree; one Linear takes one")
-    unbound = {name for name in grid if name.endswith(codec.input_suffix)} - consumed
-    if unbound:
-        raise ValueError(f"input scales {sorted(unbound)} bind no Linear; an unbound scale would "
-                         "drop its QDQ")
-    scheme = InputQuantization(codec.input_scale_dtype == 'float8_e4m3fn', codec.input_format,
-                               tuple(sorted(('/'.join(path), kind) for path, (kind, _) in sites.items())))
-    held = unflatten_dict({(*path, INPUT_SCALES[kind]): scale for path, (kind, scale) in sites.items()})
-    return scheme.apply(model), {**variables, QUANTIZATION: held}
-
-
 class _Built(NamedTuple):
     """A decoder source built and bound: the model, its variables, the
     record it was translated to, what it was built from, the source
@@ -2026,7 +1975,7 @@ def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | N
                                    placed: Callable[[Variables], Variables], scan: bool = False) -> Loaded:
     """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0, its
     parameters placed as the load places the source's (`placed`), before the load's residency; and its
-    decoder, or a wrapper's language model, scanning its runs or not as `scan` says (`Scanning`), a
+    decoder, or a wrapper's language model, scanning its runs where `scan` says (`Scanning`), a
     field of how the model runs, its stored tree unchanged, as its stack reads the layers through its
     view."""
     from dew.nn.protocols import Scanning
@@ -2071,7 +2020,6 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
                          f"and weights describe, and {' and '.join(selected)} selects another payload; "
                          "load it without fallback")
     return selected
-
 
 
 def _load_settings(precision: Numerics | str | None, dtype: DTypeLike | None,
@@ -2207,20 +2155,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         # A readout released alone reads no backbone to draw it over: placed by its shapes alone.
         return Pretrained(head, placed(variables), None, {}, directory,
                           record_fields(head, type(head)), revision=source.revision)
-    return description.bundle(backbone, head, placed(variables, axes=head_axes(head, backbone)), directory,
-                              description.tokenizer_folder, **description.fields)
-
-
-def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
-    """The axes a readout draws each of its parameters in over `backbone` (`DecisionModel.initialize_head`
-    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by. The backbone's leaves
-    enter as their shapes, a streamed load's unread ones (`SourceLeaf`) among them."""
-    from dew.decision.head import Head
-    from dew.decision.model import DecisionModel
-
-    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), backbone.variables)
-    return drawn_axes(lambda key, variables: DecisionModel(backbone.model, from_record(Head, head))
-                      .initialize_head(key, variables, jnp.zeros((1, 1), jnp.int32)), shapes)
+    return description.bundle(backbone, head, placed(variables, axes=head_source.axes(head, backbone)),
+                              directory, description.tokenizer_folder, **description.fields)
 
 
 def _native_config(config: Mapping[str, object],
@@ -2298,22 +2234,23 @@ def _translated(config: Mapping[str, object],
                 attention_impl: AttentionImpl, max_seq_len: int | None, streaming: bool,
                 packed_experts: bool = False) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
-    weights decoded, or its expert banks held packed (`packed_experts`, `_packed_banks`), the decoder,
-    media wrapper or DiffusionGemma translated and checked against its tree, and any stored input scales
-    bound. No processor, generation config or bundle is built."""
+    weights decoded, or its expert banks held packed (`packed_experts`, `quantized_loads.packed_banks`),
+    the decoder, media wrapper or DiffusionGemma translated and checked against its tree, and any stored
+    input scales bound. No processor, generation config or bundle is built."""
     banks: dict[str, NvFp4] = {}
     placing, given = streaming, tensors
     if packed_experts:
-        tensors, banks = _packed_banks(tensors, config)
+        tensors, banks = quantized_loads.packed_banks(tensors, config)
         # Its leaves translated as views read when placed, as a streaming load's: the banks' unread leaves
-        # are replaced before any is read (`_with_banks`), the rest read below where the load places none.
+        # are replaced before any is read (`quantized_loads.with_banks`), the rest read below where the
+        # load places none.
         streaming = streaming or bool(banks)
     tensors, quantized_tensors, scale_dtype, grid, checked, stored = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=isinstance(route, WrapperRoute))
     if banks:
-        # The banks are the source's quantized weights too (MXFP4's, `_packed_banks`), which an export
-        # writes back as it stored them.
+        # The banks are the source's quantized weights too (MXFP4's, `quantized_loads.packed_banks`),
+        # which an export writes back as it stored them.
         from dew.interop.codecs import MXFP4 as codec
 
         specs = tensor_specs(given)
@@ -2344,8 +2281,9 @@ def _translated(config: Mapping[str, object],
                 config, tensors, directory, route, dtype=dtype, attention_impl=attention_impl,
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
                 quantized=source_quantization(config) is not None, checked=checked)
-    model, variables = _input_quantization(built.model, built.variables, built.layouts, config, grid)
-    variables = _with_banks(variables, built.layouts, banks)
+    model, variables = quantized_loads.input_quantization(built.model, built.variables, built.layouts, config,
+                                                          grid)
+    variables = quantized_loads.with_banks(variables, built.layouts, banks)
     if banks and not placing:
         from dew.interop.streaming import SourceLeaf
 
@@ -2353,91 +2291,6 @@ def _translated(config: Mapping[str, object],
                                  variables, is_leaf=lambda leaf: isinstance(leaf, NvFp4))
     return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid,
                        stored)
-
-
-def _bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables: Variables
-               ) -> dict[tuple[str, ...], tuple[str | None, ...]]:
-    """`table` (a model's drawn axes, `decoder_axes`) with each packed bank's leaves (`_with_banks`) at its
-    dense matrix's axes as the bank lays them out (`quantization.expert_leaf_axes`), by their fields' paths
-    (`dew.nn.sharding.parameter_path`), as placement reads a leaf's."""
-    from dew.quantization import QUANTIZATION, expert_leaf_axes
-
-    banks = {path: bank for path, bank in flatten_dict(
-        dict(variables.get(QUANTIZATION, {})), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()
-        if isinstance(bank, NvFp4)}
-    held = dict(table)
-    for path, bank in banks.items():
-        dense = table.get(("params", *path))
-        if dense is None:
-            continue
-        names = [member.name for member in dataclasses.fields(bank)]
-        for name, axes in zip(names, expert_leaf_axes(bank, dense), strict=True):
-            held[(QUANTIZATION, *path, name)] = axes
-    return held
-
-
-def _packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, object]
-                  ) -> tuple[dict[str, unread.Stored], dict[str, NvFp4]]:
-    """`tensors` with each MXFP4 expert bank a load serves packed (`Pretrained.load`'s `packed_experts`)
-    taken out of the source's decoding, and those banks by their source names (`dew.nn.kernels.gemm.NvFp4`,
-    built on the host, exactly the MXFP4 values: `codecs.mxfp4_as_nvfp4`). In each one's place an unread
-    leaf of its decoded shape and dtype, which the decoder's translation binds as it binds a load without
-    weights (`unread.Unread`), and `_with_banks` replaces. A bank whose depth is no whole NVFP4 stages
-    (`gemm.NVFP4_STAGE`), whose experts' group powers span past one tensor scale's reach
-    (`mxfp4_tensor_powers` None), or that holds no experts (a 2-D weight's blocks), is decoded as the source
-    states it, and named in the load's log, once a load; another source format is refused."""
-    from dew.interop import codecs
-    from dew.nn.kernels.gemm import NVFP4_STAGE
-
-    quantization = source_quantization(config)
-    if quantization is None or quantization is not codecs.MXFP4:
-        raise ValueError("packed_experts serves an MXFP4 source's expert banks (gpt-oss's quant_method "
-                         f"mxfp4); this source's quantization is {config.get('quantization_config')!r}")
-    tensors, banks = dict(tensors), {}
-    for name in quantization.names(tensors):
-        blocks, scales = (tensors[name + suffix] for suffix in codecs.MXFP4_SUFFIXES)
-        powers = None
-        if len(blocks.shape) != 4:
-            reason = "it holds no experts"
-        elif blocks.shape[2] * codecs.GROUP % NVFP4_STAGE:
-            reason = f"its depth {blocks.shape[2] * codecs.GROUP} is no whole {NVFP4_STAGE}-deep stages"
-        else:
-            powers = codecs.mxfp4_tensor_powers(scales)
-            reason = "its experts' group powers span past one tensor scale's reach"
-        if powers is None:
-            _log.warning("packed_experts: %s stays dense: %s", name, reason)
-            continue
-        experts, outputs, groups, _ = blocks.shape
-        banks[name] = NvFp4.of(*codecs.mxfp4_as_nvfp4(blocks, scales, powers))
-        for suffix in codecs.MXFP4_SUFFIXES:
-            del tensors[name + suffix]
-        tensors[name] = unread.Unread((experts, groups * codecs.GROUP, outputs), np.dtype(np.float32))
-    return tensors, banks
-
-
-def _with_banks(variables: Variables, layouts: tuple[WeightLayout, ...], banks: Mapping[str, NvFp4]
-                ) -> Variables:
-    """`variables` with each packed bank (`_packed_banks`) in `QUANTIZATION` under the path its source name's
-    layout binds, the unread leaf there taken out of `params`: a bank its layout reads as it stands, one
-    path, untransposed, uncut, whole (gpt-oss's experts), the expert layers read it so
-    (`dew.quantization.expert_matrix`); any other binding is refused."""
-    if not banks:
-        return variables
-    from dew.quantization import QUANTIZATION
-
-    params = dict(flatten_dict(dict(variables["params"])))
-    held = dict(flatten_dict(dict(variables.get(QUANTIZATION, {}))))
-    bound = {layout.name: layout for layout in layouts}
-    for name, bank in banks.items():
-        layout = bound.get(name)
-        if layout is None or len(layout.paths) != 1 or layout.paths[0][0] != "params" or (
-                layout.transpose or layout.concatenate is not None or layout.expert_index is not None):
-            raise ValueError(f"{name} binds {None if layout is None else layout.paths}, which a packed bank "
-                             "does not take: it holds a whole [experts, in, out] matrix at one path")
-        path = layout.paths[0][1:]
-        del params[path]
-        held[path] = bank
-    return {**variables, "params": unflatten_dict(params), QUANTIZATION: unflatten_dict(held)}
 
 
 def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping[str, object], Variables]:
@@ -2607,7 +2460,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        return kind(model, placed(variables, axes=_bank_axes(decoder_parts.decoder_axes(model), variables)),
+        axes = quantized_loads.bank_axes(decoder_parts.decoder_axes(model), variables)
+        return kind(model, placed(variables, axes=axes),
                     processor, config,
                     directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,

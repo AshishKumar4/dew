@@ -183,6 +183,7 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("a tree call's attention is masked by its key runs, each token's cache and "
                          "ancestors (attention_key_runs)")
     if metadata.pairwise_mask is None and metadata.key_runs is None:
+        # A validity alone hides its keys from the layer's own visibility (`_masking`), no call's.
         return None
     key_positions, valid = metadata.key_positions, metadata.key_valid
     if key_positions is not None and key_positions.shape != (batch, keys):
@@ -1182,24 +1183,9 @@ class CausalSelfAttention(nn.Module):
             if rotation is not None:
                 query = rotated(query, rotation)
         elif append is not None:
-            key, value = append(key, value)
-            query = append.query(query)
-            history = {**self._kept_groups(append, attention_metadata),
-                       DOCUMENTS: append.documents(segment_ids)}
-            if S == 1:
-                # A step reads its own document's keys alone, as the cache numbers it (`KVCache.documents`):
-                # one naming none continues its row's last, so a row prefilled packed reads that document,
-                # never an earlier one, whatever the caller passes.
-                (mask, starts), causal = self._decode_masks(
-                    positions, B, key.shape[-3], cached_validity(self, key.shape[-3]), history), False
-                cursor = mask
-            else:  # several tokens appended after the keys their rows held
-                documents, causal, window = self._cached_call(positions, history,
-                                                              cached_validity(self, key.shape[-3]),
-                                                              named=segment_ids is not None)
-            key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
-            if kv_store is not None and self.ctx.kv_store_key is not None:
-                kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places, history)
+            (query, key, value, history, key_places, mask, starts, cursor, documents, causal,
+             window) = self._appended(query, key, value, positions, places, append, kv_store, segment_ids,
+                                      attention_metadata, (causal, window))
         elif segment_ids is not None:
             # Attention stays inside each packed document. The ids travel to
             # the kernel beside the causal flag and the window: splash compares
@@ -1228,6 +1214,12 @@ class CausalSelfAttention(nn.Module):
             mask, runs, window, key_places, query_places, valid = own
             causal, documents, groups, places = False, None, _Groups(), (
                 key_places if query_places is None else query_places)
+        elif attention_metadata is not None and attention_metadata.key_valid is not None:
+            # The call's keys' validity alone hides the keys it marks out from every query of the layer's own
+            # visibility (row 4771): a mask's keys taken from it (a decode step's or a prefix's, read by the
+            # masked kernel), else read by the kernel beside the rest.
+            mask, valid, implementation = self._key_validity(
+                attention_metadata.key_valid, mask, valid, implementation, masked, B, key.shape[-3])
         if self.ctx.attention_chunk is not None:
             mask = self._chunked(mask, documents, causal, window, valid, runs, groups, places, key_places, S,
                                  key.shape[-3])
@@ -1241,6 +1233,47 @@ class CausalSelfAttention(nn.Module):
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs, query_places)
+
+    def _appended(self, query, key, value, positions, places, append, kv_store, segment_ids,
+                  attention_metadata: AttentionMetadata | None, visibility: tuple):
+        """A cached call's keys and values with the cache's joined (`append`), the history they keep, their
+        places, and what the call reads of them: a decode step's mask and starts (the mask its cursor too),
+        or several tokens' documents, causality and window over the keys their rows held, each else as
+        `visibility` `(causal, window)` gives it; the joined keys stashed for a sharing layer."""
+        B, S = query.shape[:2]
+        causal, window = visibility
+        mask = starts = cursor = documents = None
+        key, value = append(key, value)
+        query = append.query(query)
+        history = {**self._kept_groups(append, attention_metadata), DOCUMENTS: append.documents(segment_ids)}
+        if S == 1:
+            # A step reads its own document's keys alone, as the cache numbers it (`KVCache.documents`): one
+            # naming none continues its row's last, so a row prefilled packed reads that document, never an
+            # earlier one, whatever the caller passes.
+            (mask, starts), causal = self._decode_masks(
+                positions, B, key.shape[-3], cached_validity(self, key.shape[-3]), history), False
+            cursor = mask
+        else:  # several tokens appended after the keys their rows held
+            documents, causal, window = self._cached_call(positions, history,
+                                                          cached_validity(self, key.shape[-3]),
+                                                          named=segment_ids is not None)
+        key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
+        if kv_store is not None and self.ctx.kv_store_key is not None:
+            kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places, history)
+        return query, key, value, history, key_places, mask, starts, cursor, documents, causal, window
+
+    def _key_validity(self, key_valid, mask, valid, implementation: AttentionImpl,
+                      masked: Callable[[], AttentionImpl], batch: int, keys: int):
+        """A call's keys' validity `key_valid` `[B, keys]` (`AttentionMetadata.key_valid`) beside the layer's
+        own visibility: the `mask` its keys are taken from where it has one (its kernel the masked one,
+        `masked()`), else joined to the `valid` keys the kernel reads, each only where both are. Returns the
+        mask, the validity and the kernel."""
+        key_valid = jnp.asarray(key_valid)
+        if key_valid.shape != (batch, keys) or key_valid.dtype != jnp.bool_:
+            raise ValueError("attention_key_valid must be boolean [B, keys]")
+        if mask is not None:
+            return mask & key_valid[:, None, None, :], valid, masked()
+        return None, key_valid if valid is None else jnp.asarray(valid, bool) & key_valid, implementation
 
     def _chunked(self, mask, documents, causal, window, valid, runs, groups: _Groups, places, key_places,
                  queries: int, keys: int):
