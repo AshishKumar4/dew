@@ -2402,7 +2402,7 @@ def _packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
         elif blocks.shape[2] * codecs.GROUP % NVFP4_STAGE:
             reason = f"its depth {blocks.shape[2] * codecs.GROUP} is no whole {NVFP4_STAGE}-deep stages"
         else:
-            powers = codecs.mxfp4_tensor_powers(scales)
+            powers = codecs.mxfp4_tensor_powers(blocks, scales)
             reason = "its experts' group powers span past one tensor scale's reach"
         if powers is None:
             _log.warning("packed_experts: %s stays dense: %s", name, reason)
