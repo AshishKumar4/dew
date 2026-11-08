@@ -210,3 +210,25 @@ def test_an_unwritten_output_is_found():
 
     found = launched_outputs(launch, jnp.ones((4, 8), jnp.float32))
     assert [line.split(" output ")[1] for line in unwritten(found)] == ["1 (4, 8): 8 unwritten"]
+
+
+def test_a_launch_inside_a_loop_or_a_branch_is_run_trip_by_trip():
+    """The audit runs a loop's trips and a branch's chosen body as the program does (`kernel_outputs.LOOPS`),
+    each launch inside run alone: a launch leaving its last row unwritten found in a scan's every step, a
+    while loop's every trip and a cond's taken branch."""
+    from jax.experimental import pallas as pl
+
+    def kernel(x_ref, o_ref):
+        o_ref[:3] = x_ref[:3]
+
+    def launch(x):
+        return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 8), jnp.float32), interpret=True)(x)
+
+    x = jnp.ones((4, 8), jnp.float32)
+    programs = {"scan": lambda x: jax.lax.scan(lambda c, _: (launch(c), None), x, length=3)[0],
+                "while": lambda x: jax.lax.fori_loop(0, 2, lambda _, c: launch(c), x),
+                "cond": lambda x: jax.lax.cond(True, launch, lambda x: x, x)}
+    trips = {"scan": 3, "while": 2, "cond": 1}
+    for name, program in programs.items():
+        found = launched_outputs(program, x)
+        assert len(found) == trips[name] and len(unwritten(found)) == trips[name], name
