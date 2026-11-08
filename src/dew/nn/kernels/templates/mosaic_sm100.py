@@ -666,7 +666,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
             # slot's `masked` barrier in its loads' place.
             count = len(rings) if prepared is not None else 0
-            masked, smems = dict(zip(rings, rest[:count], strict=True)), rest[count:]
+            masked = dict(zip(rings, rest[:count], strict=True)) if count else {}
+            smems = rest[count:]
             issued = rings if prepared is None else {name: dataclasses.replace(ring, full=masked[name])
                                                      for name, ring in rings.items()}
             def turn_of(done_turns) -> mosaic.Turn:
@@ -825,7 +826,8 @@ RINGS = Tcgen05Rings()
 """The tcgen05 bundle (`bundles.of` on sm100 and sm103)."""
 
 
-def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, steps, views, tile, done) -> None:
+def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, steps, views, tile,
+               done) -> None:
     """A rewriting role's visit of a persistent tile (`Tcgen05Rings.persist`'s `prepared`): each of its steps'
     slots, once loaded, rewritten (`prepared(tile, index, slots)`), published to the tensor cores and each
     ring's `masked` barrier of the step arrived at; none where the tile streams nothing."""
