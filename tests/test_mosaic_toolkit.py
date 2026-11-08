@@ -1275,3 +1275,63 @@ def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product
     np.testing.assert_array_equal(ss, expected)
     np.testing.assert_array_equal(staged, expected)
     np.testing.assert_array_equal(carried, expected + 1)
+
+
+def _read_ahead(interpret):
+    """A launch adding its first operand, read ahead of its wait (`mosaic.dependent`'s `ahead`, `settled`),
+    to its second, read after it."""
+    def ahead(weights_ref):
+        return weights_ref[...]
+
+    def entry(weights_ref, x_ref, o_ref, weights):
+        del weights_ref
+        o_ref[...] = x_ref[...] + weights
+
+    return mosaic.kernel(entry, out_type=jax.ShapeDtypeStruct((128, 64), jnp.float32), grid=(1,),
+                         grid_names=("tile",), warpgroups=1, interpret=interpret, family="read_ahead",
+                         ahead=ahead, settled=(0,))
+
+
+def test_a_launch_reads_ahead_of_its_wait_only_what_its_program_takes_whole():
+    """A launch reading an operand ahead of its wait (`mosaic.dependent`'s `settled`) lowered for an H100: the
+    compile point takes it where the operand is the program's input, through a nested program's call and a
+    loop that hands it back each trip unchanged (`lowered.unsettled`), and refuses it where the program
+    produces the operand or a loop's trip changes it, before compiling (`report.compiled`)."""
+    from dew.nn.kernels import lowered as lowered_module
+    from dew.nn.kernels.templates import report
+
+    weights = jax.ShapeDtypeStruct((128, 64), jnp.float32)
+    launch = _read_ahead(interpret=False)
+
+    def looped(changed):
+        def run(weights, x):
+            def trip(_, carried):
+                weights, x = carried
+                return (weights * 2.0 if changed else weights), launch(weights, x)
+            return jax.lax.fori_loop(0, 3, trip, (weights, x))[1]
+        return run
+
+    programs = {"input": lambda weights, x: launch(weights, x),
+                "nested": lambda weights, x: jax.jit(launch)(weights, x),
+                "loop": looped(changed=False),
+                "produced": lambda weights, x: launch(weights * 2.0, x),
+                "loop changed": looped(changed=True)}
+    found = {}
+    with generation.assumed("sm90"):
+        for name, program in programs.items():
+            lowered = jax.jit(program).trace(weights, weights).lower(lowering_platforms=("cuda",))
+            found[name] = lowered_module.unsettled(lowered)
+            if found[name]:
+                with pytest.raises(lowered_module.Unsettled):
+                    report.compiled(lowered, relower=lambda lowered=lowered: lowered)
+    assert {name for name, unsettled in found.items() if unsettled} == {"produced", "loop changed"}, found
+
+
+@INTERPRETS
+def test_a_launch_runs_what_it_reads_ahead_of_its_wait_once_and_hands_it_on():
+    """Interpreted, a launch reading its first operand ahead of its wait (`mosaic.dependent`'s `ahead`) adds
+    it to its second, as the program's sum does."""
+    rng = np.random.default_rng(3601)
+    weights, x = (jnp.asarray(rng.standard_normal((128, 64)), jnp.float32) for _ in range(2))
+    launched = jax.jit(_read_ahead(interpret=True))(weights, x)
+    np.testing.assert_array_equal(np.asarray(launched), np.asarray(weights + x))
