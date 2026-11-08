@@ -478,8 +478,10 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     together (512 of them, drawn past every run's seeds)."""
     import numpy as np
     from arm_arithmetic import unrewritten
-    from check1_wire import staged_units
-    from reference_error import NO_ZERO_ROWS, _drawn, _Draws, _staged
+    from reference_error import _drawn
+
+    from dew.parity import NO_ZERO_ROWS, _Draws, _staged
+    from dew.parity_stages import staged_units
 
     # The same draws under either procedure, so their verdicts compare run by run.
     rng = np.random.default_rng([chunk, int(ratio * 1000), seeds])
@@ -523,8 +525,10 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int, ampli
     least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
     the first fails), whose high quantiles calibrate NARROW_FACTORS."""
     import numpy as np
-    from check1_wire import staged_units
-    from reference_error import NO_ZERO_ROWS, _Draws, _largest_share, _staged, _verdict
+    from reference_error import _verdict
+
+    from dew.parity import NO_ZERO_ROWS, _Draws, _largest_share, _staged
+    from dew.parity_stages import staged_units
 
     rng = np.random.default_rng([0x5A, width, rows, seeds, chunk, int(amplified) + 2 * int(shared)]
                                 + ([] if steepest == 24 else [steepest]))

@@ -678,7 +678,7 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
     """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
     redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
     the last draw a windowed check reads, and none past it."""
-    from check1_wire import staged_units
+    from dew.parity_stages import staged_units
 
     tool = load("layout_parity")
     _, reference = tool.model_case("jepa", "float32", {}, {})

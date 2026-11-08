@@ -133,10 +133,11 @@ from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
+@functools.cache
 def _loaded(path: Path):
-    """The module at `path`, loaded by its path: this file runs as a script and is loaded by the tests, and
-    puts nothing on sys.path. Its neighbours here, and the gate's standard-library contract the plan shares
-    (tests/check1_wire.py)."""
+    """The module at `path`, loaded once by its path: this file runs as a script and is loaded by the tests,
+    and puts nothing on sys.path. Its neighbours here, and the gate's standard-library contract the plan
+    shares (tests/check1_wire.py, and src/dew/parity_stages.py's units, `PARITY_STAGES`)."""
     spec = importlib.util.spec_from_file_location(f"armada_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -148,10 +149,11 @@ HERE = Path(__file__).resolve().parent
 @functools.cache
 def check1_wire():
     """Check 1's map and judge contract, its one owner (tests/check1_wire.py): what runs a site's test as a
-    map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask for its later map tasks (LATER), its
-    stages log (STAGES) and the units its stages draw (`staged_units`). Loaded where a plan shards a site,
-    so a checkout of the harness alone (a page generator's scratch copy) imports this file."""
+    map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask for its later map tasks (LATER) and its
+    stages log (STAGES). Loaded where a plan shards a site, so a checkout of the harness alone (a page
+    generator's scratch copy) imports this file."""
     return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+PARITY_STAGES = HERE.parents[1] / "src" / "dew" / "parity_stages.py"
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
 coverage_report = _loaded(HERE / "coverage_report.py")
@@ -973,8 +975,8 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
             declared = counts[session.SHARDS[kind]]
-            units = check1_wire().staged_units(declared) if kind == "check1_shards" else declared
-            weighed = check1_wire().staged_units(counts.get("conditioning", 0))
+            units = _loaded(PARITY_STAGES).staged_units(declared) if kind == "check1_shards" else declared
+            weighed = _loaded(PARITY_STAGES).staged_units(counts.get("conditioning", 0))
             found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
