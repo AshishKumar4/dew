@@ -872,7 +872,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
         def scope(stages: int) -> resources.Scope:
             staged = dataclasses.replace(config, stages=stages)
-            return self._allocations(ba, staged, family).scope(family, staged, steps)
+            return self._allocations(ba, staged, family).scope(family, staged, steps,
+                                                               rewritten=self.rewritten(family))
 
         shared = resources.program_shared(generation.shared_budget(generation.gpu_target()), config.programs)
         most = shared // ((config.block_m + config.block_n) * config.block_k)
