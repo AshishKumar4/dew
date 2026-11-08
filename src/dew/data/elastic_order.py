@@ -19,6 +19,12 @@ type Grouping = Callable[[], Callable[[Sequence], Batch]]
 """What makes a worker's group of inputs one element (`lowering._Grouped`): called once a read opens."""
 
 
+READ_GROUPS = 1 << 50
+"""The most groups an in-order read opens at once (`_InputOrder`): an endless order's rows, `sys.maxsize`
+as Grain's repeat states them, overflow Grain's batch, which counts its groups through a float; 2**50 is
+exact there and past any run's reach."""
+
+
 class _InputOrder(pygrain.IterDataset):
     """An elastic read's indexed rows read in its loading workers (`_Build.handed`), in the inputs'
     order whatever their count: groups of `size` consecutive inputs (`lowering._Grouped`), group k read by
@@ -45,9 +51,11 @@ class _InputOrderIterator(pygrain.DatasetIterator):
         if self._reads is None:
             ordered = self._ordered
             # Each group a dataset element of its own, so the workers' slices of them, every W-th,
-            # interleave back into the inputs' order.
-            groups = ordered.rows[self._next:].batch(ordered.size, drop_remainder=False,
-                                                     batch_fn=ordered.grouping())
+            # interleave back into the inputs' order. An endless order, which Grain's repeat states as
+            # `sys.maxsize` rows, is read as far as Grain's batch counts groups exactly (`READ_GROUPS`).
+            stop = min(len(ordered.rows), self._next + ordered.size * READ_GROUPS)
+            groups = ordered.rows[self._next:stop].batch(ordered.size, drop_remainder=False,
+                                                         batch_fn=ordered.grouping())
             self._reads = iter(ordered.read(groups))
             self._reads.start_prefetch()
         return self._reads
