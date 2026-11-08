@@ -576,17 +576,25 @@ def test_a_tasks_switches_of_bundle_list_the_cache_directory_once_and_each_keeps
         assert held == ({f"jit_{index}-1", "jit_restored-1"} if index == 0 else {f"jit_{index}-1"}), file
 
 
+def past_the_bound(cache_worker, tmp_path: Path, monkeypatch, file: str) -> remote_cache.RemoteCache:
+    """A cache in `tmp_path`/first, under a bound of 1000 bytes, whose `file`'s tests compiled two programs of
+    600 bytes, together past it: its bundle holds them in two chunks once the cache closes the file."""
+    url, _, _ = cache_worker
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
+    cache = remote_cache.RemoteCache(tmp_path / "first", url, "token", "jax/cpu")
+    cache.opened(file)
+    compiled(tmp_path / "first", "jit_a-1", b"a" * 600)
+    compiled(tmp_path / "first", "jit_b-1", b"b" * 600)
+    return cache
+
+
 def test_a_bundle_past_the_bound_keeps_every_program_in_chunks_each_sent_once(cache_worker, tmp_path,
                                                                              monkeypatch):
     """Two programs that together pass `MAX_BYTES`: the bundle keeps both, a chunk each, each sent once
     and not again by a later close or the drain while its tests compile nothing new; the next process
     restores both (2026-11-08: a bundle at the bound dropped what passed it, compiled afresh every run)."""
     url, stored, seen = cache_worker
-    monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
-    cache = remote_cache.RemoteCache(tmp_path / "first", url, "token", "jax/cpu")
-    cache.opened("tests/big.py")
-    compiled(tmp_path / "first", "jit_a-1", b"a" * 600)
-    compiled(tmp_path / "first", "jit_b-1", b"b" * 600)
+    cache = past_the_bound(cache_worker, tmp_path, monkeypatch, "tests/big.py")
     cache.closed("tests/big.py")
     cache.closed("tests/big.py")
     cache.drain()
@@ -603,12 +611,7 @@ def test_a_bundle_that_grows_sends_the_chunks_it_changed_alone(cache_worker, tmp
     """A file's next run that compiles one more program sends the chunk it lands in, the chunks before it
     left as the Worker holds them."""
     url, stored, seen = cache_worker
-    monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
-    first = remote_cache.RemoteCache(tmp_path / "first", url, "token", "jax/cpu")
-    first.opened("tests/grows.py")
-    compiled(tmp_path / "first", "jit_a-1", b"a" * 600)
-    compiled(tmp_path / "first", "jit_b-1", b"b" * 600)
-    first.drain()
+    past_the_bound(cache_worker, tmp_path, monkeypatch, "tests/grows.py").drain()
     seen.clear()
     after = remote_cache.RemoteCache(tmp_path / "next", url, "token", "jax/cpu")
     after.opened("tests/grows.py")
