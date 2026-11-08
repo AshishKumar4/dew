@@ -177,17 +177,13 @@ def test_the_state_reads_the_other_stream_after_it_and_that_stream_reads_no_stat
     assert not np.array_equal(first[:before], moved[:before])
 
 
-QWEN = LLAMA.parent / "qwen38-dense-tiny"
-"""A multimodal checkpoint, its towers beside its text decoder, whose layers are Gated DeltaNet and
-attention."""
-
-
 def test_a_multimodal_backbones_row_in_streams_reads_as_its_text_decoders():
-    """A row in two streams over a multimodal checkpoint reads its key runs through the language model, as
-    the checkpoint's text decoder loaded alone (`text_only`) reads them: the backbone's final states of a
-    joint row, bit for bit, the towers reading no media."""
+    """A row in two streams over a multimodal checkpoint (Gemma 3's, its vision tower beside its text
+    decoder) reads its key runs through the language model, as the checkpoint's text decoder loaded alone
+    (`text_only`) reads them: the backbone's final states of a joint row, bit for bit, the tower reading
+    no media."""
     def states(text_only: bool) -> np.ndarray:
-        source = Pretrained.load(QWEN, dtype="float32", attention_impl="reference", max_seq_len=1024,
+        source = Pretrained.load(GEMMA, dtype="float32", attention_impl="reference", max_seq_len=1024,
                                  text_only=text_only)
         width, _ = DecisionModel.head_size(source.model)
         head = JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
