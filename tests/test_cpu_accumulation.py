@@ -21,6 +21,7 @@ from dew.nn.precision import (
     float32_dot_general,
     float32_einsum,
     float32_matmul,
+    projection_product,
 )
 
 pytestmark = pytest.mark.skipif(jax.default_backend() != "cpu", reason="the policy is the CPU's")
@@ -293,9 +294,10 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
     no float64 beside a float32 computation, and no platform choice (ledger 3197: a bias's gradient
-    included); but a layer's float32 projection, which a library's CPU sums no worse than a vectorized dot
-    (`dew.nn.pairwise`, row 4863: its platform choice, and a batch's float64 sum, are the library's own).
-    Each is traced afresh, as a process with either setting traces it."""
+    included); but a float32 contraction, a layer's projection or any other, which a library's CPU sums
+    no worse than a vectorized dot (`dew.nn.pairwise`, row 4863: its platform choice, and a batch's
+    float64 sum, are the library's own). Each is traced afresh, as a process with either setting traces
+    it."""
     from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -321,14 +323,17 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     def choices(found) -> int:
         return sum(equation.primitive.name == "platform_index" for equation in found)
 
-    # The platform choices a library's layer makes of its projections alone (row 4863): those of the same
-    # layer with no bias, whose gradient sums no bias.
+    # The platform choices a library makes of its float32 contractions alone (row 4863): those of the same
+    # layer with no bias, whose gradient sums no bias, and the product's own as a projection's.
     unbiased = Dense(2, use_bias=False)
     products = choices(traced(jax.grad(lambda params: jnp.sum(unbiased.apply({"params": params}, lhs))),
                               unbiased.init(jax.random.key(0), lhs)["params"]))
+    numbers = (((1,), (0,)), ((), ()))
+    projected = choices(traced(
+        lambda a, b: projection_product(jax.lax.dot_general, a, b, numbers, None, None), lhs, rhs))
 
     sites = {
-        "product": traced(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))), lhs, rhs),
+        "product": traced(lambda a, b: float32_dot_general(a, b, numbers), lhs, rhs),
         "bias": traced(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, lhs))),
                        variables["params"]),
         "logsumexp": traced(lambda states, table: chunked_cross_entropy(
@@ -338,7 +343,7 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         if wide:
             assert choices(found), name
         else:
-            assert choices(found) == {"bias": products}.get(name, 0), name
+            assert choices(found) == {"bias": products, "product": projected}.get(name, 0), name
         # Four rows of three: the product's few rows sum blocked and pairwise in float32 (`pairwise._summed`).
         assert float64(found) == wide, name
     # A float64 division is the plain division under either setting.

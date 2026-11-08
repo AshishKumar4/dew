@@ -73,9 +73,8 @@ def test_a_rows_product_is_its_own_whatever_rows_share_its_call():
 
 def test_a_layers_projection_and_every_accumulated_contraction_sum_as_a_vectorized_dot():
     """A layer's projection (`gemm.dot_general`, a Dense's product past the template) and every float32
-    contraction `accumulated` sums (`float32_dot_general`, a mixer's `float32_einsum`) take the CPU's
-    vectorized-dot sum; a product the algebra derives (`chained`: attention's `dP` and `D`, whose sums
-    cancel bit for bit on a one-key row only where both sum alike) keeps XLA's."""
+    contraction `accumulated` sums (`float32_dot_general`, a product the algebra derives, a mixer's
+    `float32_einsum`) take the CPU's vectorized-dot sum: one order for sums that cancel each other."""
     numbers = (((1,), (0,)), ((), ()))
     operands = (jnp.ones((4, 96), jnp.float32), jnp.ones((96, 8), jnp.float32))
 
@@ -95,7 +94,6 @@ def test_a_layers_projection_and_every_accumulated_contraction_sum_as_a_vectoriz
         assert chooses(lambda a, b: gemm.dot_general(precision.float32_dot_general)(a, b, numbers))
         assert chooses(lambda a, b: precision.float32_dot_general(a, b, numbers))
         assert chooses(lambda a, b: precision.float32_einsum("rd,dc->rc", a, b))
-        assert not chooses(lambda a, b: precision.float32_dot_general(a, b, numbers, chained=True))
 
 
 def test_a_mixers_einsum_on_a_cpu_is_the_pairwise_product():
