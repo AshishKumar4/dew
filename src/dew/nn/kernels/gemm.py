@@ -49,7 +49,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import declared
-from dew.nn.precision import at_least_fp32, projection_product, refuse_recipe
+from dew.nn.precision import at_least_fp32, projected, refuse_recipe
 from dew.nn.sharding import explicit_spec, seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -1305,11 +1305,8 @@ def dot_general(xla):
                 product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return product.reshape(*lhs.shape[:-1], rhs.shape[1])
         # A CPU sums a layer's float32 projection as a vectorized dot does (row 4863).
-        if not kwargs and (projected := projection_product(
-                xla, lhs, rhs, dimension_numbers, precision, preferred_element_type)) is not None:
-            return projected
-        return xla(lhs, rhs, dimension_numbers, precision=precision,
-                   preferred_element_type=preferred_element_type, **kwargs)
+        return projected(xla)(lhs, rhs, dimension_numbers, precision=precision,
+                              preferred_element_type=preferred_element_type, **kwargs)
 
     return product
 

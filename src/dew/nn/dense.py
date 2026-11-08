@@ -35,7 +35,7 @@ from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent
 from .kernels import gemm
-from .precision import accumulated, biased, float32_dot_general, refuse_recipe
+from .precision import accumulated, biased, float32_dot_general, projected, refuse_recipe
 from .sharding import declared
 
 QWIX = importlib.util.find_spec("qwix") is not None
@@ -70,17 +70,22 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
         return layer.dot_general_cls()
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     plain = layer.dot_general in (None, float32_dot_general)
-    if intercepted():
-        refuse_recipe("a wrapper's product (an adapter's, a quantizer's)")
-    return gemm.dot_general(product) if plain and not intercepted() else product
+    if not intercepted():
+        return gemm.dot_general(product) if plain else product
+    refuse_recipe("a wrapper's product (an adapter's, a quantizer's)")
+    # A wrapper's scope skips the template, not the projection's CPU sum, which a quantizer's rule
+    # matching the layer owns (`precision.projected`).
+    return projected(product) if plain else product
 
 
 def plain_product():
     """The product a plain `Dense` multiplies by (`_product` of a layer naming no product of its own):
     the GEMM template's where a launch takes it, else lax's with its fp32 sum taken in float64 on a CPU
-    under Dew's tests, and lax's alone where a wrapper owns the products (`intercepted`). A product read
+    under Dew's tests, and lax's, its CPU sum a layer's projection's (`precision.projected`), where a
+    wrapper's scope takes the products past the template (`intercepted`). A product read
     apart from its layer, as a vocabulary head's table reads `project_out` (`Projection`), takes it."""
-    return _accumulated_dot_general if intercepted() else gemm.dot_general(_accumulated_dot_general)
+    plain = _accumulated_dot_general
+    return projected(plain) if intercepted() else gemm.dot_general(plain)
 
 
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,

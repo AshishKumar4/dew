@@ -176,17 +176,29 @@ def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight()
         qmodel.apply(variables, ids)
 
 
+NOTHING_SEEDS = 8
+"""Check 1's declared seeds for a pattern that matches nothing against the unquantized model, sized by
+`seeds_for` on armada."""
+
+
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
-    """A narrowed pattern is selective: a regex no module path matches runs
-    the fp32 numerics bitwise, as the unquantized model sums them where Qwix
-    owns its products (`FP32_SUMS`). A pattern that matched everything would
-    move the logits here, so the equality fails it."""
+    """A narrowed pattern is selective: a regex no module path matches leaves every product the fp32 one,
+    so the quantized model's logits are on par with the unquantized model's (check 1, against its float64
+    forward), where a pattern that matched everything moves them by int8's rounding, far past it. The two
+    are two programs: Qwix owns the quantized model's products, which a CPU sums as XLA's dot does, where
+    the unquantized model's projections sum pairwise there (`precision.projection_product`)."""
+    from float64_terms import float64_forward
+
     pytest.importorskip("qwix")
-    model, qmodel, variables, ids = quantized_forward(
-        Quantization(patterns=(".*does_not_exist.*",)))
-    with jax.default_matmul_precision(FP32_SUMS):
-        plain = model.apply(variables, ids)
-    assert float(jnp.max(jnp.abs(qmodel.apply(variables, ids) - plain))) == 0.0
+    model, qmodel, variables, _ = quantized_forward(Quantization(patterns=(".*does_not_exist.*",)))
+
+    def draw(seed):
+        return (np.random.default_rng([0x5E1, seed]).integers(0, VOCAB, (BATCH, SEQ_LEN)).astype(np.int32),)
+
+    assert_as_exact(jax.jit(lambda ids: qmodel.apply(variables, ids)),
+                    jax.jit(lambda ids: model.apply(variables, ids)), draw, "a pattern that matches nothing",
+                    seeds=NOTHING_SEEDS,
+                    truth_fn=as_given(lambda ids: float64_forward(model, variables, ids)[0]))
 
 
 def test_an_int8_trunk_trains_down():
