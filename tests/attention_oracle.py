@@ -170,7 +170,10 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
     gradient's terms, a fifth, are those logit sizes before the scale and the
     cap, their squares summed over the rows and heads the bias shares. A
     `score` of the scaled logits in the cap's place (`float64_weights`) carries
-    them through its slope, as the cap's."""
+    them through its slope, as the cap's. With `sinks`, their gradients' terms
+    are last: each sink a logit beside the keys whose value is zero, its
+    gradient's terms its share's sizes, a logit's as above with no product,
+    their squares summed over the rows and queries of its head."""
     with jax.enable_x64(new_val=True):
         q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
@@ -183,8 +186,8 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         out = jnp.einsum('bhqk,bkhd->bqhd', weights, values)
         delta = jnp.einsum('bqhd,bqhd->bhq', out, dout)[..., None]
         # dP's and delta's terms' squares, summed: the difference's, carried.
-        energy = (jnp.einsum('bqhd,bkhd->bhqk', dout ** 2, values ** 2)
-                  + jnp.einsum('bqhd,bqhd->bhq', out ** 2, dout ** 2)[..., None])
+        delta_energy = jnp.einsum('bqhd,bqhd->bhq', out ** 2, dout ** 2)[..., None]
+        energy = jnp.einsum('bqhd,bkhd->bhqk', dout ** 2, values ** 2) + delta_energy
         bias_sizes = jnp.maximum(jnp.abs(weights * (products - delta)), weights * jnp.sqrt(energy))
         logit_sizes = bias_sizes / np.sqrt(width)
         if softcap is not None:
@@ -203,6 +206,10 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         if shared is not None:
             axes = tuple(axis for axis in (0, 1) if shared.shape[axis] == 1 and bias_sizes.shape[axis] > 1)
             squares = (*squares, (bias_sizes ** 2).sum(axis=axes, keepdims=True))
+        if sunk is not None:
+            share = 1 - weights.sum(-1, keepdims=True)
+            sink_sizes = jnp.maximum(jnp.abs(share * delta), share * jnp.sqrt(delta_energy))
+            squares = (*squares, (sink_sizes ** 2).sum(axis=(0, 2, 3)))
         return [np.sqrt(np.asarray(x)) for x in squares]
 
 
