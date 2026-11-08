@@ -1299,7 +1299,6 @@ def test_a_launch_reads_ahead_of_its_wait_only_what_its_program_takes_whole():
     from dew.nn.kernels.templates import report
 
     weights = jax.ShapeDtypeStruct((128, 64), jnp.float32)
-    launch = _read_ahead(interpret=False)
 
     def looped(changed):
         def run(weights, x):
@@ -1316,6 +1315,8 @@ def test_a_launch_reads_ahead_of_its_wait_only_what_its_program_takes_whole():
                 "loop changed": looped(changed=True)}
     found = {}
     with generation.assumed("sm90"):
+        # Built for a Hopper, whose launches wait for the one before them (`bodies.waits`).
+        launch = _read_ahead(interpret=False)
         for name, program in programs.items():
             lowered = jax.jit(program).trace(weights, weights).lower(lowering_platforms=("cuda",))
             found[name] = lowered_module.unsettled(lowered)
