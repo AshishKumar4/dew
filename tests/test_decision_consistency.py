@@ -438,6 +438,7 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
     backbone scores over the windows' tokens, a row each, as its documents (`LMObjective`, its head tiled),
     every token after a row's first scored, none on the padding (row 4742)."""
     from dew.batch import coordinates, part
+    from dew.nn.flops import counted_flops
     from dew.objectives.lm.objective import LMObjective
 
     backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len)
@@ -468,3 +469,7 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
     assert np.array_equal(np.asarray(term.mass), np.asarray(scored.mass))
     # Each row's tokens after its first are scored, a row to a window: none on the padding.
     assert int(np.asarray(term.mass)) == int(np.sum(segments > 0)) - len(segments)
+    # The second pass is the run's work too: the backbone's pass over the rows, once more.
+    again = counted_flops(backbone, plain.real_lengths(batch))
+    assert weighted.model_flops(None, batch) == plain.model_flops(None, batch) + again
+    assert weighted.training_flops(None, batch) > plain.training_flops(None, batch)
