@@ -55,11 +55,11 @@ COUNTED = 256
 """The counts a process keeps of the modules and length signatures it last counted (`_declared`): a run's
 batches repeat a few signatures, a packed window's rows filling it alike, so each is counted once."""
 
-_counts: collections.OrderedDict[tuple[str, int, bytes], tuple[nn.Module, float]] = collections.OrderedDict()
+_counts: collections.OrderedDict[tuple[str, int, bytes], tuple[object, float]] = collections.OrderedDict()
 _counting = threading.Lock()
 
 
-def _declared(kind: str, module: nn.Module, lengths: np.ndarray,
+def _declared(kind: str, module: Counted | CountedParameters, lengths: np.ndarray,
               count: Callable[[np.ndarray], float]) -> float:
     """`count(lengths)`, a module's declared work, kept for the module and the lengths' signature (their
     dtype, shape and values) among the last `COUNTED`: a module is immutable and its count a function of
