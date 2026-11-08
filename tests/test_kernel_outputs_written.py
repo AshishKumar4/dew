@@ -167,7 +167,7 @@ def test_the_gpus_partial_gemm_launches_write_every_output(product):
     """Mosaic GPU's launches whose programs share a tile or store only some rows, interpreted as an H100's,
     write every output they declare: a dense product and kernel gradient whose last wave is balanced over 8
     multiprocessors (`mosaic_gpu.balanced_tail`, each tile's partials in a workspace the launch takes in
-    place), and a grouped product scattering its rows, fewer than whole row tiles, through a permutation."""
+    place), and a grouped product scattering its rows, not whole 8-row stores, through a permutation."""
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
     tiles = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, family="wgmma")
@@ -186,8 +186,9 @@ def test_the_gpus_partial_gemm_launches_write_every_output(product):
             assert_written(lambda lhs, rhs: mosaic_gpu.tgmm(lhs, rhs, jnp.asarray([320], jnp.int32), dense=True,
                                                             **options), lhs, rhs)
         else:
-            lhs, rhs = drawn((200, 128), (4, 128, 256))
-            slots = jnp.asarray(np.random.default_rng(2).permutation(200), jnp.int32)
+            # 203 rows, which the scattered product pads to whole 8-row stores (`Scattered`'s -1 entries).
+            lhs, rhs = drawn((203, 128), (4, 128, 256))
+            slots = jnp.asarray(np.random.default_rng(2).permutation(203), jnp.int32)
             assert_written(lambda lhs, rhs: mosaic_gpu.gmm(lhs, rhs, jnp.asarray([70, 0, 69, 51], jnp.int32),
                                                            transpose_rhs=False, scatter=slots, **options),
                            lhs, rhs)
