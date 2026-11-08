@@ -778,7 +778,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         hooked = ba.arguments['hooks'] != NO_HOOKS and not _pair_alone(ba, family)
         summed = bool(ba.arguments.get('exact_sums'))
         prepared = (ba.arguments['hooks'].prologue is not None
-                    or (self.STAGED_ROWS and not self.rewritten(family))
+                    or (self.STAGED_ROWS and not self.rewritten(ba, family))
                     or (summed and not family.sums_in_persist))
         # Gathered rows (`gmm_call`'s `gather`) are a ring family's producer's gather, no prologue rewriting
         # them (`mosaic_gpu._gather_refused`).
@@ -873,7 +873,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         def scope(stages: int) -> resources.Scope:
             staged = dataclasses.replace(config, stages=stages)
             return self._allocations(ba, staged, family).scope(family, staged, steps,
-                                                               rewritten=self.rewritten(family))
+                                                               rewritten=self.rewritten(ba, family))
 
         shared = resources.program_shared(generation.shared_budget(generation.gpu_target()), config.programs)
         most = shared // ((config.block_m + config.block_n) * config.block_k)
@@ -882,12 +882,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             most = min(most, max(2, steps))
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
-        roles = config.warpgroups + self.rewritten(family)
+        roles = config.warpgroups + self.rewritten(ba, family)
         return resources.Launch(scope, roles, self.registers(ba, config), most=most, tile=launched)
 
-    def rewritten(self, family: mosaic.Family) -> bool:
-        """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`)."""
-        return self.STAGED_ROWS and not self.K_MAJOR and family.rewrites_in_persist
+    def rewritten(self, ba, family: mosaic.Family) -> bool:
+        """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
+        own loads' rows, never rows its tables gather (`mosaic_gpu.tgmm`'s `gather`, which a consumer's
+        cp.async gather stages: the fed rings')."""
+        tabled = ba.arguments.get('gather') is not None or ba.arguments.get('scatter') is not None
+        return self.STAGED_ROWS and not self.K_MAJOR and family.rewrites_in_persist and not tabled
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
