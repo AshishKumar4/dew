@@ -20,11 +20,21 @@ def loaded(tmp_path: Path, monkeypatch):
     progress named, and recorded none)."""
     module = load("ci", "tools/armada")
     monkeypatch.chdir(tmp_path)
-    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE",
-                 "ARMADA_ARTIFACTS", "ARMADA_RESUME"):
-        monkeypatch.delenv(name, raising=False)
+    apart(monkeypatch)
     (tmp_path / "tests").mkdir()
     return module
+
+
+APART = ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE",
+         "ARMADA_ARTIFACTS", "ARMADA_RESUME")
+"""What CI's environment names that these tests' runs of its tools must not see (`apart`)."""
+
+
+def apart(monkeypatch) -> None:
+    """The environment these tests' runs of CI's tools see: no shared test cache, and none of the armada task
+    the tests run in (`loaded`)."""
+    for name in APART:
+        monkeypatch.delenv(name, raising=False)
 
 
 def interpreter(root: Path, version: str) -> None:
