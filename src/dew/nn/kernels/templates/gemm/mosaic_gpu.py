@@ -801,8 +801,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          block_scaled=mx_scales is not None)
                 step = _met(step, tiles.raster, meetings, tile[-1], wg, programs=multiprocessors,
                             walks=grid[0] * grid[1])
-                # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
-                return _walked_products(family, walk, step, part, len(matrices), exact_sums)
+                # The unrouted rows, and a slot past the last tile, multiply nothing: zeros. A family whose
+                # persist sums the windows itself walks the steps plainly (`summed` below).
+                return _walked_products(family, walk, step, part, len(matrices),
+                                        exact_sums and not family.sums_in_persist)
 
             def finish(wg, tile, accs, store, *, active):
                 if tail is not None and not active:
@@ -814,10 +816,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                               partials=None if tail is None else (workspace, ready))
 
             walks = (tiles.splits * grid[0] * grid[1],) if tail is None else (tail.segments, multiprocessors)
+            summed = ({'summed': family.summed_window(tiles.block_k)}
+                      if exact_sums and family.sums_in_persist else {})
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, exact_sums),
-                           accumulators=(part,) * len(matrices))
+                           accumulators=(part,) * len(matrices), **summed)
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
