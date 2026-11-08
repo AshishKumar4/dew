@@ -5,7 +5,7 @@
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT
     python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
-    python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
+    python3 tools/armada/ci.py gpu-lane --tests="tests/b.py#1/2" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
     python3 tools/armada/ci.py coverage report DIR
@@ -31,9 +31,18 @@ with CI's selection, and writes a verdict row for each. A row is red on a
 failed or erroring test, on a test skipped because its import failed (a file
 CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
-every row it holds is red, so a hang is graded, with what pytest reports as
-it is interrupted, rather than leaving the task without a verdict. A check-1
-site too long for one task, marked check1_shards(seeds, per_task) on its test
+every row it holds is red (`kind` "deadline"), so a hang is graded, with what
+pytest reports as it is interrupted, rather than leaving the task without a
+verdict. Its rows' seconds, which armada times the next plan by, are what the
+task knows of each file (`deadline_shares`): the file its tests were running
+at the deadline, the one whose test started last, carries its own tests'
+seconds and the task's wall time no file's tests account for, at least what
+the file needs, so the next plan cuts it finer; a file that finished its tests'
+own seconds; and a file that never started has none: its row says
+`"unobserved": true`, with `seconds` 0, and armada weighs no plan by it (its
+`timings` still name its file, at 0, so a file it shares with other rows is not
+timed by those alone). A check-1 site too long for one task, marked
+check1_shards(seeds, per_task) on its test
 (`sites`), runs apart from its file's tasks as armada's map and judge
 (`site_entries`): map tasks of per_task of its seeds each, or fewer where their
 measured seconds put a task past the group target (`cut_draws`), which draw them into
@@ -103,7 +112,6 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 import argparse
 import ast
 import concurrent.futures
-import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -125,10 +133,11 @@ from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
 
+@functools.cache
 def _loaded(path: Path):
-    """The module at `path`, loaded by its path: this file runs as a script and is loaded by the tests, and
-    puts nothing on sys.path. Its neighbours here, and the gate's standard-library contract the plan shares
-    (tests/check1_wire.py)."""
+    """The module at `path`, loaded once by its path: this file runs as a script and is loaded by the tests,
+    and puts nothing on sys.path. Its neighbours here, and the gate's standard-library contract the plan
+    shares (tests/check1_wire.py, and src/dew/parity_stages.py's units, `PARITY_STAGES`)."""
     spec = importlib.util.spec_from_file_location(f"armada_{path.stem}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -140,10 +149,11 @@ HERE = Path(__file__).resolve().parent
 @functools.cache
 def check1_wire():
     """Check 1's map and judge contract, its one owner (tests/check1_wire.py): what runs a site's test as a
-    map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask for its later map tasks (LATER), its
-    stages log (STAGES) and the units its stages draw (`staged_units`). Loaded where a plan shards a site,
-    so a checkout of the harness alone (a page generator's scratch copy) imports this file."""
+    map task (DRAWS, RECORDS), as their judge (POOL), a judge's ask for its later map tasks (LATER) and its
+    stages log (STAGES). Loaded where a plan shards a site, so a checkout of the harness alone (a page
+    generator's scratch copy) imports this file."""
     return _loaded(HERE.parents[1] / "tests" / "check1_wire.py")
+PARITY_STAGES = HERE.parents[1] / "src" / "dew" / "parity_stages.py"
 child_groups = _loaded(HERE / "child_groups.py")
 session = _loaded(HERE / "session.py")
 coverage_report = _loaded(HERE / "coverage_report.py")
@@ -965,8 +975,8 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
                 and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
             declared = counts[session.SHARDS[kind]]
-            units = check1_wire().staged_units(declared) if kind == "check1_shards" else declared
-            weighed = check1_wire().staged_units(counts.get("conditioning", 0))
+            units = _loaded(PARITY_STAGES).staged_units(declared) if kind == "check1_shards" else declared
+            weighed = _loaded(PARITY_STAGES).staged_units(counts.get("conditioning", 0))
             found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
@@ -1201,7 +1211,22 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.
     rest = [] if cells == "1" else [name for name in every if name not in NEWEST_FILES]
     collecting = collect_entries(rest, timings, target)
-    return entries + [{**entry, **stamped} for entry in collecting]
+    return keyed(entries + [{**entry, **stamped} for entry in collecting])
+
+
+def keyed(entries: list[dict]) -> list[dict]:
+    """`entries`, each with the `key` armada keeps its recorded use under (its `keyOf`): the rows it runs (a
+    site's judge by its name), whether it was kept (it looks its rows up and runs none) and how it runs them
+    (the cache's policy, the whole suite's cells, the census's compiles, each its own use), never an entry's
+    name or weight, which each plan cuts anew. A task that recurs then packs on what it used, not on its
+    class's estimate (2026-11-07: no record of a task ever matched the next plan's, and each container's
+    CPU was about a quarter used). Hashed: a kept task's entry, which travels whole as one environment
+    string, holds up to `KEPT_BYTES` of row names already."""
+    def key(entry: dict) -> str:
+        identity = {"rows": entry.get("rows") or [entry["name"]], "kept": KEPT_AT in entry["tests"],
+                    **{field: entry.get(field) for field in ("cache", "whole", "census")}}
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    return [{**entry, "key": key(entry)} for entry in entries]
 
 
 def collect_entries(names: list[str], timings: dict, target: float) -> list[dict]:
@@ -1371,6 +1396,20 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
     return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
 
 
+def deadline_shares(own_seconds: Mapping[str, float], reported: Container[str], wall: float,
+                    running: str | None) -> dict[str, float]:
+    """The seconds of the rows of a task that ran out of time, of the files that have any, by file: one that
+    `reported` tests, its tests' own seconds, and the file `running` at the deadline, the one whose test
+    started last (`followed.visited`), its own and all of the task's `wall` time no file's tests account for
+    (its imports and its collection, and the test the interrupt stopped, which pytest's report gives no
+    time), so its row holds at least what the file needs. A file that reported none and was not running never
+    started, and has none: absent. `apportioned` split the wall time, the interrupted test's included, over
+    the files that finished, in proportion to their tests' times, or evenly where none finished."""
+    unaccounted = max(wall - sum(own_seconds.values()), 0.0)
+    return {name: own + (unaccounted if name == running else 0.0) for name, own in own_seconds.items()
+            if name == running or name in reported}
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
          release: str = "", census: bool = False) -> int:
@@ -1380,8 +1419,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
     the plan weighs a file by what it costs a container (its import, its collection, the
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
-    at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
-    file goes there (`coverage_items`)."""
+    at 300 seconds ran a median of 392. A task that ran out of time times its rows otherwise
+    (`deadline_shares`): the file its tests were running in at least what it needs, a file that never
+    started none. With `coverage`, pytest runs under coverage.py, whose data file goes there
+    (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them; the rows its plan kept read
     # where it found their green runs (`kept_of`), a heavy file's kept groups each its own, and run where
     # their green run is not found there.
@@ -1507,39 +1548,39 @@ def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
     has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
-    durations record does not wholly name (split.py); and where its stacks are dumped at its deadline, its
-    process id beside them (executed.py)."""
-    log, collection, report, unrecorded, stacks = (out.with_name(f"{out.name}.{suffix}") for suffix in (
-        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "stacks"))
-    for stale in (report, log, collection, unrecorded, stacks, stacks.with_name(f"{stacks.name}.pid")):
+    durations record does not wholly name (split.py); and its process id, whose stacks are read at its
+    deadline (executed.py, `dumped`)."""
+    log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in (
+        "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid"))
+    for stale in (report, log, collection, unrecorded, pid):
         stale.unlink(missing_ok=True)
     shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
-    return log, collection, report, unrecorded, stacks
+    return log, collection, report, unrecorded, pid
 
 
-DUMP_SECONDS = 2.0
-"""How long a task past its deadline gives its pytest's dump of its stacks before the interrupt, which would
-unwind the frames the dump walks (a dump the interrupt overtook ended its process in a segmentation fault);
-faulthandler writes one in milliseconds."""
+DUMP_SECONDS = 10.0
+"""How long py-spy gets to read a stalled pytest's stacks (`dumped`): it stops the process and reads every
+thread's frames out of its memory, in under a second for a test's threads (0.14 s on armada, 2026-11-07)."""
 
 
-def dumped(done: subprocess.Popen, stacks: Path) -> str:
-    """Every thread's stack of a task's pytest past its deadline, as faulthandler wrote them to `stacks`
-    (executed.py): SIGUSR2 sent to pytest itself, the id executed.py wrote beside them once it registered
-    the dump, and `DUMP_SECONDS` for it, which ends early where pytest ends; none where pytest never
-    registered it."""
-    pid = stacks.with_name(f"{stacks.name}.pid")
+def dumped(pid: Path, spy: Path) -> str:
+    """Every thread's stack of a task's pytest past its deadline, its Python frames and the native ones under
+    them, read from outside it by `spy` (py-spy, the task environment's) while it is stopped: nothing runs
+    in the stalled process, so one stalled in the interpreter, or in native code holding the GIL or not (an
+    XLA compile, a wait on a device, a collective), says where it stood alike (row 4828). pytest's id is the
+    one executed.py wrote to `pid` as it loaded; none where it never loaded."""
     if not pid.is_file():
         return ""
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(int(pid.read_text()), signal.SIGUSR2)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        done.wait(DUMP_SECONDS)
-    return stacks.read_text(errors="replace")
+    try:
+        read = subprocess.run([str(spy), "dump", "--native", "--pid", pid.read_text()],
+                              capture_output=True, text=True, timeout=DUMP_SECONDS)
+    except subprocess.TimeoutExpired:
+        return f"py-spy read no stacks of pytest in {DUMP_SECONDS:.0f} s"
+    return read.stdout or f"py-spy read no stacks of pytest: {read.stderr.strip()}"
 
 
 def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
-               stacks: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
+               pid: Path, spy: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
     """A task's pytest `command` run to its `deadline`: its exit code, output, whether it passed the deadline,
     its threads' stacks then (`dumped`), the data files it opened (`watched`), none where its group
     outlived the kill, and the checkout's files it wrote (`watched.changed`). pytest leads its own process
@@ -1567,7 +1608,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
         done.wait(deadline)
     except subprocess.TimeoutExpired:
         # Every thread's stack as pytest stands at its deadline, before the interrupt below.
-        expired, dump = True, dumped(done, stacks)
+        expired, dump = True, dumped(pid, spy)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
@@ -1613,7 +1654,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    log, collection, report, unrecorded, stacks = task_files(out)
+    log, collection, report, unrecorded, pid = task_files(out)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["coverage", "run"]
@@ -1629,20 +1670,20 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     command = [*session.pytest_command(run, tests, split, release), *(["-p", "progress"] if resumes else [])]
     environment = session.pytest_environment({**environ, **site_environment(site),
                                               "DEW_EXECUTED_LOG": str(log), "DEW_COLLECTED": str(collection),
-                                              "DEW_UNRECORDED": str(unrecorded), "DEW_STACKS": str(stacks),
+                                              "DEW_UNRECORDED": str(unrecorded), "DEW_PYTEST_PID": str(pid),
+                                              "DEW_STACKS_READER": str(os.getpid()),
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    returncode, output, expired, dump, opened, wrote = ran_pytest(command, environment, deadline, grace,
-                                                                  stacks)
+    # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`dumped`).
+    returncode, output, expired, dump, opened, wrote = ran_pytest(command, environment, deadline, grace, pid,
+                                                                  Path(f".venv-{python}/bin/py-spy"))
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
-                   for name in tests}
-    shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
+    shares = task_seconds(tests, cases, log, time.monotonic() - began, expired)
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         failed = [(case, kind, node) for case in own for kind in ("failure", "error")
@@ -1668,16 +1709,20 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                                                       for case, _, _ in failed)
         cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
                  else red_as("nodes", nodes))
-        seconds = shares[name]
+        # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
+        # row is `unobserved`, and armada weighs no plan by it.
+        unobserved = name not in shares
+        seconds = shares.get(name, 0.0)
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
                      # A stall's stacks whole, then the end of what pytest wrote.
                      "output": "\n".join(red + ([dump[:12000]] if dump else [])
                                          + ([output[-12000:]] if red else [])),
-                     # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
-                     # `exhausted` reads.
+                     # Its first failed test's exception as pytest gave it ("RuntimeError: ...").
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
+                     # Where the task ran out of time, a file that never started: no seconds to time it by.
+                     **({"unobserved": True} if unobserved else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if node.split("::", 1)[0] == name},
                                **{node_of(case): float(case.get("time") or 0) for case in own}},
@@ -1695,6 +1740,21 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
     return 0
+
+
+def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: float,
+                 expired: bool) -> dict[str, float]:
+    """Each of `tests`' seconds of its task's `wall` time, by its JUnit `cases`: in proportion to its tests'
+    own times (`apportioned`); where the task ran out of time (`expired`), the file running at its deadline
+    (its executed `log`'s last visit) at least what it needs, and one that never started none
+    (`deadline_shares`)."""
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
+                   for name in tests}
+    if not expired:
+        return apportioned(own_seconds, wall, len(tests))
+    # The file whose test started last is the one running at the deadline (executed.py logs each visit).
+    stood = followed.visited(followed.log_events(log))
+    return deadline_shares(own_seconds, {file_of(case) for case in cases}, wall, stood[-1] if stood else None)
 
 
 def resumed(tests: list[str]) -> dict[str, float]:
@@ -1955,25 +2015,9 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
-EXHAUSTED = re.compile(r"(?:[\w.]+\.)?(?:XlaRuntimeError|JaxRuntimeError|RuntimeError|OutOfMemoryError): "
-                       r"(?:RESOURCE_EXHAUSTED: (?:Out of memory|Failed to allocate)\b"
-                       r"|CUDA_ERROR_OUT_OF_MEMORY\b|CUDA (?:error: )?out of memory)")
-"""An exception that is the GPU's device memory running out, as pytest gives it: XLA's runtime error whose
-status is RESOURCE_EXHAUSTED for an allocation (out of memory, or a failed allocation), or the CUDA driver's
-out-of-memory error, raised as such. A block past the GPU's own resources (XLA's RESOURCE_EXHAUSTED for a
-shared memory size limit, as `dew.nn.kernels.tuning` reads it) is none, as no larger share helps it; nor is an
-assertion, whatever its message says."""
-
-
-def exhausted(failure: str | None) -> bool:
-    """Whether a red row's first failed test raised the GPU's memory running out (`EXHAUSTED`, its exception's
-    start), which a smaller share than the file needs causes, rather than failed on its own."""
-    return failure is not None and EXHAUSTED.match(failure) is not None
-
-
-def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, tuple[str, dict]]:
-    """For each of `names`, test files no run on class `held` measured, the class and last record of
-    the whole file on another class whose run measured its GPU peak, the one that holds the most
+def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, dict]:
+    """For each of `names`, test files no run on class `held` measured, the last record of the whole
+    file on another class whose run measured its GPU peak, the one that holds the most
     (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
     One no class measured is absent, as every one is where the Worker does not list its records. Its run on
     `held` records its own, which every later lane reads."""
@@ -1992,27 +2036,30 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     keys = [key for key in every
             if (parts := key_parts(key))[0] != held and parts[2] == "whole" and parts[1] in wanted]
 
-    def read(key: str) -> tuple[str, str, dict | None]:
-        kind, name, _ = key_parts(key)
-        return name, kind, recorded(f"{prefix}{key}", token)
+    def read(key: str) -> tuple[str, dict | None]:
+        return key_parts(key)[1], recorded(f"{prefix}{key}", token)
 
     def holds(found: dict) -> float:
         return gpu_needs(found, float("inf"))[1]
 
-    borrowed: dict[str, tuple[str, dict]] = {}
+    borrowed: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, kind, found in pool.map(read, keys):
+        for name, found in pool.map(read, keys):
             if found is None or found.get("depends") is None or found.get("peak") is None:
                 continue
-            if name not in borrowed or holds(found) > holds(borrowed[name][1]):
-                borrowed[name] = (kind, found)
+            if name not in borrowed or holds(found) > holds(borrowed[name]):
+                borrowed[name] = found
     return borrowed
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
              deadline: float, network: bool = False) -> int:
-    """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
-    own (`tested`), and write their verdict rows to `out`. With `network`, the network lane: each file's
+    """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
+    (`tested`), and write their verdict rows to `out`: a test file, or one group of one as CI names it
+    (`<file>#G/N`, the Gth of N runs of the tests the file's collection here finds, split.py), whose row is
+    that group's, so every test of a file cut into groups runs once, whatever an earlier run of it held
+    (audit, 2026-11-08: the GPU tier's parts named tests an earlier tier ran, so a new one never ran, and a
+    test named apart read "no evidence ran"). With `network`, the network lane: each file's
     network-marked tests alone, which every other task deselects (`session.SELECTION`), run with the Hub
     open on a node that reaches it, their records on a class of their own (`device_class`), so the test
     cache reruns only those whose inputs changed (the maintainer, 2026-10-25: no CI run reached the published
@@ -2024,9 +2071,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     most `processes` at once. A file that runs out of a measured share is red: it took more than
     its last run, whose peak its next run is given. A file no run on this class measured borrows its
     share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
-    a class packs its files as a measured one does; one red under a borrowed share whose first failure is
-    its memory running out (`exhausted`) runs once more, alone, with the lane's whole share, as that red is
-    the borrowed share's; one whose first failure is any other is red, run once. A file
+    a class packs its files as a measured one does; one red under it is red, run once, as every red is
+    (owner, 2026-11-07: a red under sharing is a red), and its measured peak is the next lane's. A file
     given the lane's whole share (measured on no class, measured that large, or with a child the lane
     did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
     it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
@@ -2048,64 +2094,49 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
+    # Each test's file and group (`<file>#G/N`; none, a whole file).
+    parts = {name: name.partition("#")[::2] for name in tests}
+
     def needs(name: str) -> dict | None:
-        return recorded(record_key(python, row(python, name, ""), held), token)
+        return recorded(record_key(python, row(python, *parts[name]), held), token)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(tests, pool.map(needs, tests), strict=True))
-    borrowed = borrowed_records([name for name, found in records.items() if found is None], python, held,
-                                token)
-    needed = {name: gpu_needs(records[name] or (borrowed[name][1] if name in borrowed else None), budget)
-              for name in tests}
+    # A group no run on this class measured borrows its whole file's measure, which holds at least its own.
+    borrowed = borrowed_records(sorted({parts[name][0] for name, found in records.items() if found is None}),
+                                python, held, token)
+    needed = {name: gpu_needs(records[name] or borrowed.get(parts[name][0]), budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
-    def run(names: list[str]) -> None:
-        waiting = sorted(names, key=lambda name: -holds[name])
-        running: dict[concurrent.futures.Future, str] = {}
-        with concurrent.futures.ThreadPoolExecutor(processes) as pool:
-            while waiting or running:
-                free = budget - sum(holds[name] for name in running.values())
-                fits = next((name for name in waiting if holds[name] <= free), None)
-                if fits is not None and len(running) < processes:
-                    waiting.remove(fits)
-                    # Its pool taken at its first op, or grown where it holds the whole share, as this lane
-                    # says whatever its own environment does: a GPU node's session grows every job's pool.
-                    environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
-                               "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
-                               "OMP_NUM_THREADS": threads}
-                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache,
-                                        session.GRACE, common, environ, None, network)] = fits
-                    continue
-                done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
-                for future in done:
-                    future.result()
-                    del running[future]
-
-    run(tests)
-    # Red under a share another class measured, its first failure an allocation's (`exhausted`): that red is
-    # the borrowed share's, not the file's, and the file runs again alone with the lane's whole share, its row
-    # saying so with the first failure, as packed work run again alone is interference. Any other first
-    # failure (an assertion, an accuracy miss, an illegal address) is the file's: its red stands, run once.
-    again: dict[str, str] = {}
-    for name in borrowed:
-        failures = [verdict.get("first_failure")
-                    for verdict in json.loads(verdicts[name].read_text())["rows"] if verdict["exitCode"] != 0]
-        # Below the whole budget only: a file that already had it would run again as it ran.
-        if failures and exhausted(failures[0]) and shares[name] < budget:
-            again[name] = (f"red under a share of {shares[name] / 2 ** 30:.1f} GiB borrowed from "
-                           f"{borrowed[name][0]}'s measurement, out of memory ({failures[0]}); run again "
-                           "alone with the lane's whole share")
-    for name in again:
-        shares[name] = holds[name] = budget
-    run(list(again))
-    for name, interference in again.items():
-        rows = json.loads(verdicts[name].read_text())["rows"]
-        verdicts[name].write_text(json.dumps({"rows": [{**verdict, "interference": interference}
-                                                       for verdict in rows]}))
+    waiting = sorted(tests, key=lambda name: -holds[name])
+    running: dict[concurrent.futures.Future, str] = {}
+    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+        while waiting or running:
+            free = budget - sum(holds[name] for name in running.values())
+            fits = next((name for name in waiting if holds[name] <= free), None)
+            if fits is not None and len(running) < processes:
+                waiting.remove(fits)
+                # Its pool taken at its first op, or grown where it holds the whole share, as this lane
+                # says whatever its own environment does: a GPU node's session grows every job's pool.
+                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
+                           "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
+                           "OMP_NUM_THREADS": threads}
+                file, group = parts[fits]
+                # A group cut by the tier's own GPU seconds (DEW_SPLIT_DURATIONS, split.py) is no group
+                # any record's key holds: it reads no cached row, as it writes none, so no earlier cut's row
+                # stands for it beside groups cut afresh (review of b3bcbe0fe).
+                policy = "off" if group and os.environ.get("DEW_SPLIT_DURATIONS") else cache
+                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, policy,
+                                    session.GRACE, common, environ, None, network)] = fits
+                continue
+            done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                future.result()
+                del running[future]
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
     return 0

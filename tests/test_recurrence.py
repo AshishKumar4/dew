@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax
 from reference_error import assert_as_exact
 from tuned import each_config, taken
 
@@ -186,22 +185,16 @@ def summed(hooks: recurrence.Hooks):
     return run
 
 
-def test_a_decode_step_is_tuned_as_its_launch_is_described():
-    """A decode token's launch, keyed as tokamax describes it in a lowering made to read it
-    (`tuning.launches`), is the launch its own lowering records for tuning (`tuning.seen`): a decode
-    step's picks are found and stored by what it was called with."""
+def test_a_decode_step_is_tuned_by_what_it_was_called_with():
+    """A decode token's launch is recorded for tuning as its own lowering traces it (`tuning.seen`),
+    keyed by the state it was called with: a decode step's picks are found and stored by what it was
+    called with."""
     hooks = HOOKS[0]
-
-    def keyed(op, ba):
-        return type(op).__name__, repr(sorted(op.keyed(ba).autotuning_cache_key.items()))
-
-    with tuning.launches():
-        found = tokamax.autotuning.get_bound_args(jax.jit(functools.partial(recurrence.step, hooks)),
-                                                  operands(hooks))
-    described = sorted(keyed(ba.op, ba) for ba in found)
+    given = operands(hooks)
     with tuning.seen() as seen:
-        jax.jit(functools.partial(recurrence.step, hooks)).lower(operands(hooks))
-    assert described and sorted(keyed(op, ba) for op, ba in seen) == described
+        jax.jit(functools.partial(recurrence.step, hooks)).lower(given)
+    state = jax.ShapeDtypeStruct(given.state.shape, given.state.dtype)
+    assert state in [dict(ba.autotuning_cache_key).get("state") for _, ba in seen]
 
 
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)

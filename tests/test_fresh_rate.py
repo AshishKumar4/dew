@@ -6,6 +6,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 from test_optim import assert_updates_as
@@ -109,6 +110,45 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     assert {label for path, label in labels.items() if path[0] != "head" and not crossing(path)} == {"base"}
     assert decision(variables=None).fresh_modules() == ()
     assert decision(variables=declared.init(jax.random.key(0))).fresh_modules() == ()
+
+
+def test_a_parameter_a_loaded_module_gains_starts_at_its_draw_and_trains_in_the_fresh_group():
+    """A loaded decoder whose modules gain parameters of their own, an exit gate a loop gives it
+    (`Pretrained.with_model`), starts each at its initializer's draw, the loaded weights as they were, and
+    names each by its path among what it drew fresh (`Pretrained.fresh`): a fresh group claims that
+    parameter alone, by its own path, as it claims a fresh module's (`OptimConfig.with_fresh`), and the
+    loaded parameters stay in the base group. A model that gains none keeps the source's tree; one that
+    drops a parameter the source holds is refused."""
+    from flax.core.meta import unbox
+    from flax.traverse_util import flatten_dict
+    from test_decision_context import LLAMA
+
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+    from dew.nn.inputs import request_key
+
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    gated = source.with_model(dataclasses.replace(source.model, loop=Loop(steps=2, exit_gate=True)), key=3)
+    assert gated.fresh == ("early_exit_gate/bias", "early_exit_gate/kernel")
+    drawn = flatten_dict(unbox(gated.model.init(request_key(3), jnp.zeros((1, 1), jnp.int32)))["params"])
+    held = flatten_dict(gated.variables["params"])
+    for path in (("early_exit_gate", "kernel"), ("early_exit_gate", "bias")):
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(drawn[path]))
+    for path, leaf in flatten_dict(source.variables["params"]).items():
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(leaf))
+    once = source.with_model(dataclasses.replace(source.model, loop=Loop(steps=2)), key=3)
+    assert once.fresh == () and once.variables is source.variables
+    claimed = OptimConfig(param_groups=(FRESH, BASE)).with_fresh((), gated.fresh).param_groups
+    labels = labelled(claimed, gated.variables["params"])
+    assert {"/".join(path) for path, label in labels.items() if label == "fresh"} == set(gated.fresh)
+    with pytest.raises(ValueError):
+        gated.with_model(source.model, key=3)
+    # A source a LoRA adapter froze holds its base weights apart, as its model declares them: in its place
+    # it is its own.
+    from dew.lora import LoRA
+
+    adapted = source.adapt(LoRA(rank=2, modules=("q_proj",)), key=1)
+    assert adapted.with_model(adapted.model, key=3).variables is adapted.variables
 
 
 def groups(root, name: str) -> tuple[ParamGroup, ...]:

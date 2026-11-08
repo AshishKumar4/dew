@@ -166,7 +166,6 @@ def stored_layers(model, variables: Variables, *, banks: bool = False) -> Variab
             return isinstance(node, Mapping) and any(len(group_layers(name) or ()) > 1 for name in node)
     else:
         return variables
-    stages = stage_count(variables)
     stored = dict(variables)
     for site in sites:
         def layered(node, view=site.view):

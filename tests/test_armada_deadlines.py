@@ -42,51 +42,22 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
         "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
 
 
-def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path):
-    """A task interrupted at its deadline reports its pytest's every thread as it stood then, a stall before
-    any test ran included, which pytest's own report of an interrupt cannot give (2026-11-03: a group stalled
-    28 minutes in a read with no deadline during collection, its row saying only that no tests ran)."""
-    interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_stalls.py": "import time\n\n\ndef stalled_reading():\n    time.sleep(60)\n\n\n"
-                                         "stalled_reading()\n\n\ndef test_never():\n    pass\n"})
-    ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 3.0, cache="off", grace=5.0)
-    [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
-    assert interrupted["kind"] == "deadline"
-    # faulthandler's dump: each thread's frames, most recent call first, the stalled one's among them.
-    assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
-
-
-def test_a_stack_dump_asked_over_and_over_never_kills_a_pytest_whose_threads_run(ci, tmp_path):
-    """The dump a task asks of its pytest past its deadline (executed.py's SIGUSR2) never kills it, however a
-    running thread's frames change under it: asked three thousand times over threads recursing as a test runs,
-    the run passes and its stacks are written (CPython issue 116008: faulthandler's native handler walked the
-    other threads' frames without the GIL; 2026-11-07, a group of interpreted kernels past its deadline died
-    of a segmentation fault with no report)."""
-    interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_busy.py": (
-        "import os, subprocess, sys, threading, time\n\n\n"
-        "def deep(n):\n    a, b, c = 1, 2, 3\n    if n:\n        deep(n - 1)\n\n\n"
-        "def test_busy():\n"
-        "    stop = threading.Event()\n\n"
-        "    def work():\n"
-        "        while not stop.is_set():\n"
-        "            deep(123)\n"
-        "    workers = [threading.Thread(target=work) for _ in range(4)]\n"
-        "    for worker in workers:\n"
-        "        worker.start()\n"
-        "    # The dump asked from outside the process, as a task's deadline asks it, over and over.\n"
-        "    asking = ('import os, signal, sys, time\\nfor _ in range(3000):\\n'\n"
-        "              '    os.kill(int(sys.argv[1]), signal.SIGUSR2)\\n    time.sleep(0.001)\\n')\n"
-        "    sender = subprocess.Popen([sys.executable, '-c', asking, str(os.getpid())])\n"
-        "    while sender.poll() is None:\n"
-        "        time.sleep(0.05)\n"
-        "    stop.set()\n"
-        "    for worker in workers:\n"
-        "        worker.join()\n")})
-    ci.task("3.12", ["tests/test_busy.py"], "", tmp_path / "rows.json", 120.0, cache="off", grace=5.0)
-    [row] = json.loads((tmp_path / "rows.json").read_text())["rows"]
-    assert row["exitCode"] == 0, row["output"][-3000:]
-    assert "(most recent call first)" in (tmp_path / "rows.json.stacks").read_text()
+STALLS = {
+    "in the interpreter": ("import time\n\n\ndef stalled_reading():\n    time.sleep(60)\n\n\n"
+                           "stalled_reading()\n", "stalled_reading"),
+    # A mutex its own thread locks again waits in the kernel for good, and no signal wakes it: through
+    # ctypes.CDLL without the GIL, as an XLA compile or a wait on a device holds a thread; through PyDLL
+    # holding it, which no thread of the process can then take (row 4828).
+    "in native code": ("import ctypes\n\nlibc = ctypes.CDLL(None)\nheld = ctypes.create_string_buffer(64)\n"
+                       "libc.pthread_mutex_lock(held)\n\n\n"
+                       "def stalled_natively():\n    libc.pthread_mutex_lock(held)\n\n\n"
+                       "stalled_natively()\n", "stalled_natively"),
+    "in native code holding the GIL": (
+        "import ctypes\n\nlibc = ctypes.PyDLL(None)\nheld = ctypes.create_string_buffer(64)\n"
+        "libc.pthread_mutex_lock(held)\n\n\n"
+        "def stalled_holding_the_gil():\n    libc.pthread_mutex_lock(held)\n\n\n"
+        "stalled_holding_the_gil()\n", "stalled_holding_the_gil")}
+"""A stall at collection, by where its thread waits, and the function it waits in."""
 
 
 def wheel(root: Path) -> Path:
@@ -107,19 +78,25 @@ def wheel(root: Path) -> Path:
     return path
 
 
-def test_a_release_checks_task_past_its_deadline_says_where_its_pytest_was(ci, tmp_path):
-    """A release check's pytest runs under `uv run`, which stands between the task and pytest: the stacks are
-    still pytest's own as it stood at the deadline, the stalled call among them, taken from pytest itself
-    before the interrupt reaches it, never through the launcher, which would pass the signal on after the
-    interrupt had begun unwinding the stall, or not at all."""
+@pytest.mark.parametrize("launched", [False, True], ids=["pytest", "a release check's"])
+@pytest.mark.parametrize("stall", STALLS)
+def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path, stall, launched):
+    """A task interrupted at its deadline reports its pytest's every thread as it stood then, its Python
+    frames and the native ones under them, a stall before any test ran included, which pytest's own report
+    of an interrupt cannot give (2026-11-03: a group stalled 28 minutes in a read with no deadline during
+    collection, its row saying only that no tests ran): a thread stalled in the interpreter, or in native
+    code holding the GIL or not (an XLA compile, a wait on a device, a collective), read from outside the
+    process. A release check's pytest runs under `uv run`, which stands between the task and pytest: the
+    stacks are still pytest's own."""
+    source, stalled = STALLS[stall]
     interpreter(tmp_path, "3.12")
-    written(tmp_path, {"test_stalls.py": "import time\n\n\ndef stalled_reading():\n    time.sleep(60)\n\n\n"
-                                         "stalled_reading()\n\n\ndef test_never():\n    pass\n"})
-    ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 10.0, cache="off", grace=5.0,
-            release=str(wheel(tmp_path)))
+    written(tmp_path, {"test_stalls.py": f"{source}\n\ndef test_never():\n    pass\n"})
+    ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 10.0 if launched else 3.0,
+            cache="off", grace=5.0, release=str(wheel(tmp_path)) if launched else "")
     [interrupted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
     assert interrupted["kind"] == "deadline"
-    assert "(most recent call first)" in interrupted["output"] and "stalled_reading" in interrupted["output"]
+    # py-spy's frame of the stalled function, by its file and line.
+    assert f"{stalled} (test_stalls.py:" in interrupted["output"]
 
 
 def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
@@ -133,4 +110,38 @@ def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
     ci.task("3.12", ["tests/test_close.py"], "", tmp_path / "rows.json", 10.0, cache="off")
     [row] = json.loads((tmp_path / "rows.json").read_text())["rows"]
     assert row["kind"] == "nodes" and "its own failure" in row["output"]
-    assert "(most recent call first)" not in row["output"]
+    assert "(test_close.py:" not in row["output"]
+
+
+def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_needs(ci, tmp_path):
+    """Dew's base CI run 42382371599 packed tests/test_stacked_blocks.py, which takes over 1,744 s, with four
+    short files into a task of a 1,680 s deadline, and the task was red on it run after run: the plan weighed
+    the file at its old green time, as its row held what its task's wall time gave a file in proportion to its
+    tests' times, none of which the interrupted test had. Past its deadline a task times the file its tests
+    were running in at its own tests' seconds and the wall time no file's tests account for, at least what the
+    file needs; a file that finished, at its tests' own seconds; and a file that never started, at none: its
+    row says `unobserved`, for armada to weigh no plan by, and names its file at 0 in its timings, so armada
+    leaves out of its file timings a file it shares with other rows."""
+    deadline = 8.0
+    written(tmp_path, {"test_first.py": "import time\n\n\ndef test_first():\n    time.sleep(0.5)\n",
+                       "test_stuck.py": "import time\n\n\ndef test_stuck():\n    time.sleep(600)\n",
+                       "test_never.py": "def test_never():\n    pass\n"})
+    interpreter(tmp_path, "3.12")
+    out = tmp_path / "verdict.json"
+    began = time.monotonic()
+    ci.task("3.12", ["tests/test_first.py", "tests/test_stuck.py", "tests/test_never.py"], "", out, deadline,
+            cache="off", grace=5.0)
+    wall = time.monotonic() - began
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    first, stuck, never = (rows[f"3.12:tests/test_{name}.py"] for name in ("first", "stuck", "never"))
+    slept = first["tests"]["tests/test_first.py::test_first"]
+    assert {row["kind"] for row in rows.values()} == {"deadline"}
+    assert slept >= 0.5 and first["seconds"] == slept
+    # The file the deadline stopped holds the wall time the finished file's own did not.
+    assert stuck["seconds"] + slept >= deadline
+    assert stuck["timings"] == {"3.12:tests/test_stuck.py": stuck["seconds"]}
+    # The rows claim no more than the task took, and a file that never started none of it.
+    assert sum(row["seconds"] for row in rows.values()) <= wall
+    assert (never["unobserved"], never["seconds"], never["timings"]) == (
+        True, 0.0, {"3.12:tests/test_never.py": 0.0})
+    assert "unobserved" not in first and "unobserved" not in stuck

@@ -65,6 +65,11 @@ class HeadComponent:
         """Build the readout against the backbone's output contract."""
         raise NotImplementedError
 
+    def axes(self, head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+        """The axes `head` draws each of its parameters in over `backbone`: the table a loaded readout is
+        placed by, which the readout's own model states."""
+        raise NotImplementedError
+
 
 @dataclass(frozen=True)
 class CompositeSource:

@@ -19,8 +19,8 @@ import pytest
 from interop_support import extract_fixture, packed, unpacked
 from reference_error import as_given, assert_as_exact
 
-from dew.diffusion.process import DenoisingCondition
 from dew.interop import Pretrained
+from dew.nn.inputs import DenoisingCondition
 from tools.torch_precision import float64
 
 PUBLISHED = ("DDUF/tiny-flux-dev-pipe-dduf", "fluxpipeline.dduf", "4fa81aa2c667f7f09ea7f2913be771e6f927dcd9")

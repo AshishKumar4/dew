@@ -314,10 +314,10 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
 def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(recorded, forms, stated,
                                                                              tmp_path):
     """A Muon run saved while its options named the Newton-Schulz precision by a matmul level loads with
-    that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own in their
-    fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
-    2753), a run saved before its trainer held a precision policy accurate by its `attention_form`
-    among them; tensorfloat32 and float32 their algorithms, whose Muon builds."""
+    that level's dot algorithm (`dew.config.earlier.earlier_newton_schulz`): bfloat16 the run's numerics'
+    own in their fast forms, none stated, and stated where the run's forms are accurate, whose own is
+    float32 (row 2753), a run saved before its trainer held a precision policy accurate by its
+    `attention_form` among them; tensorfloat32 and float32 their algorithms, whose Muon builds."""
     from run_kinds import lm
 
     from dew.config import RunConfig

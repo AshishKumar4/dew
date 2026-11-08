@@ -34,10 +34,13 @@ from ..hyper_connections import (
     HyperConnection,
     HyperConnections,
     HyperHead,
-    collapse_by,
+    carried_parts,
     collapse_streams,
+    enter_streams,
     gated_write,
+    leave_streams,
     mix_streams,
+    stream_head,
 )
 from ..inputs import (
     FEEDFORWARD_ROUTES,
@@ -688,6 +691,10 @@ class DecoderBlock(nn.Module):
     altup: AltUp | None = None  # Gemma 3n's stack of residual copies
     laurel_rank: int | None = None  # Gemma 3n's learned augmented residual
     hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams
+    streams_at_ends: tuple[bool, bool] = (False, False)
+    """Whether the block enters the streams from the plain residual it receives (copies of it) and
+    whether it leaves them collapsed by their mean, the ends of streams over a range of layers
+    (`HyperConnections.hc_layers`, `LayerSpec.streams`)."""
     hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
@@ -771,6 +778,9 @@ class DecoderBlock(nn.Module):
             site = (GatedResidual if self.hyper_connections.gated else HyperConnection)(
                 self.hyper_connections, self.emb_features, parent=None)
             count += (1 + (self.feedforward is not None)) * site.parameter_flops(lengths)
+            if self._leaving_head:
+                count += counter(stream_head(self.hyper_connections, self.emb_features,
+                                             self._stated_eps("mHC's collapse head"), parent=None), lengths)
         if self.residual_site is not None:
             count += DepthAttention(self.emb_features, parent=None).depth_parameter_flops(
                 lengths, self.residual_sources)
@@ -796,6 +806,17 @@ class DecoderBlock(nn.Module):
         else:
             self.attn_hc = HyperConnection(**sites, name='attn_hc')
             self.ffn_hc = HyperConnection(**sites, name='ffn_hc')
+        if self._leaving_head:
+            # The range's last layer collapses the streams by the head the stack's end would.
+            self.hc_head = stream_head(spec, self.emb_features, self._stated_eps("mHC's collapse head"),
+                                       name='hc_head')
+
+    @property
+    def _leaving_head(self) -> bool:
+        """Whether the block leaves the streams by a learned head (`HyperConnections.head`, V4's or
+        Qwen4-Exp's), which it holds as `hc_head`."""
+        spec = self.hyper_connections
+        return spec is not None and self.streams_at_ends[1] and spec.head in ('weighted', 'gated')
 
     def _stated_eps(self, where: str) -> float:
         """The block's epsilon for a part of it that states one (`where`, the attention residuals'
@@ -1097,7 +1118,9 @@ class DecoderBlock(nn.Module):
     def _enter(self, residual, train: bool, attention_metadata, decode: bool = False) -> _BlockState:
         """The residual the block received, as the state its sublayers read."""
         if self.hyper_connections is not None:
-            streams, pre = residual if self.hyper_connections.single_pass else (residual, None)
+            if self.streams_at_ends[0]:
+                residual = enter_streams(residual, self.hyper_connections)
+            streams, pre = carried_parts(residual, self.hyper_connections)
             if self.engram is not None:
                 if attention_metadata is None or attention_metadata.engram_ids is None:
                     raise ValueError("an engram layer reads the bucket ids the model hashes into "
@@ -1115,6 +1138,8 @@ class DecoderBlock(nn.Module):
             return _Depth(residual[:, :, :-1], residual[:, :, -1], self.residual_site.finished)
         predictions = None if self.altup is None else self.altup_layer.predict(residual, train=train)
         x = residual if self.altup is None or predictions is None else predictions[self.altup.active_idx]
+        if self.prediction_site == 'input':
+            self._record_prediction(x[:, :, None])
         # The residual stream sits where the batch does, before and after
         # each sublayer: fsdp gathers weights rather than sum partial
         # products, and a row-parallel projection's sum scatters back.
@@ -1131,12 +1156,13 @@ class DecoderBlock(nn.Module):
             if spec.gated:
                 read, injection = (self.attn_gated if site == "attention" else self.ffn_gated)(state.streams)
                 return state, read, injection
-            pre, post, comb = (self.attn_hc if site == "attention" else self.ffn_hc).mapping(state.streams)
+            mapped = self.attn_hc if site == "attention" else self.ffn_hc
+            pre, post, comb = mapped.mapping(state.streams)
             # Under Single-Pass, a site collapses by the `pre` the site before
             # it computed and hands its own on (V4.1 inference/model.py:968-994).
             by = state.pre if spec.single_pass else pre
             return (_Streams(state.streams, pre if spec.single_pass else None),
-                    collapse_by(by, state.streams), (post, comb))
+                    mapped.read(by, state.streams), (post, comb))
         site_spec = self.residual_site
         assert site_spec is not None
         if site == "mlp":
@@ -1210,10 +1236,13 @@ class DecoderBlock(nn.Module):
                 # V4-Flash-0731's DSpark reads each target layer's output
                 # (V4-Flash-0731 inference/model.py:918-921).
                 self._record_prediction(state.streams)
-            if not spec.single_pass:
-                return state.streams
-            assert state.pre is not None
-            return Carried(state.streams, state.pre)
+            carried = state.streams
+            if spec.single_pass:
+                assert state.pre is not None
+                carried = Carried(state.streams, state.pre)
+            if self.streams_at_ends[1]:
+                return leave_streams(carried, spec, self.hc_head if self._leaving_head else None)
+            return carried
         if isinstance(state, _Depth):
             return jnp.concatenate([state.blocks, state.partial[:, :, None]], axis=2)
         x = state.x
@@ -1232,11 +1261,15 @@ class DecoderBlock(nn.Module):
             x = x + self._per_layer_residual(x, embeddings)
         if self.wiring.layer_scalar:
             x = x * self.output_scalar.astype(x.dtype)
+        if self.prediction_site == 'output':
+            self._record_prediction(x[:, :, None])
         return x
 
     def _record_prediction(self, streams):
         """Sow a DSpark target layer's streams averaged over the copies, when
-        the caller collects `prediction_inputs`."""
+        the caller collects `prediction_inputs`: a layer outside streams over a
+        range of layers (`HyperConnections.hc_layers`) its residual, the mean of
+        its one copy."""
         if (self.prediction_target and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
             mean = jnp.mean(streams, axis=2)

@@ -23,14 +23,16 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post60; a release sorts below it, so an
+    # first build with every fix is post67; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The CUDA and PJRT plugins the
-    # cuda12 and cuda13 extras name are Dew's builds of its native code,
-    # post45's, which post46's to post60's Python fixes left as it was. A bump runs the GPU
+    # cuda12 and cuda13 extras name are Dew's builds of its native code, and
+    # differ by machine: post67's on x86_64, post45's on aarch64 (the comment
+    # above the extras), which post46's to post66's Python fixes left as it
+    # was. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post60,<0.12.1",
+    "jax>=0.12.0.1.post67,<0.12.1",
     # optax.contrib.MuonDimensionNumbers, which dew.newton_schulz types, is 0.2.6's.
     "optax>=0.2.6",
     "orbax-checkpoint>=0.12.4",
@@ -117,11 +119,23 @@ dew = "dew._cli.main:main"
 # The CUDA plugin and its PJRT plugin (where Mosaic GPU compiles a kernel's PTX) are Dew's builds of the
 # release jax posts, with Mosaic GPU's fixes (docs/installation.md), which only Dew's package index serves;
 # jaxlib is the release's own. Named here, not through jax's own `cuda12` extra, which pins the release's
-# plugins (jaxlib's version).
-cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda12-pjrt==0.12.0.1.post45", "jaxlib==0.12.0.1",
+# plugins (jaxlib's version). They differ by machine: x86_64's are post67's, aarch64's stay post45's until
+# post67's are built (ledger row 5211). aarch64 therefore remains affected by the assembly-target defect
+# post67 fixes, for any process that compiles for more than one GPU target: Mosaic GPU assembles every
+# object's PTX for the first compile's capability in the process, so a later compile for a GPU of another
+# capability fails in ptxas ('SM version specified by .target is higher than default SM version assumed')
+# or assembles for the wrong one. Each GPU lock resolves for every machine at once, carrying each machine's
+# pins under its markers (tools/lock_environment.sh).
+cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post67; platform_machine == 'x86_64'",
+          "jax-cuda12-plugin[with-cuda]==0.12.0.1.post45; platform_machine == 'aarch64'",
+          "jax-cuda12-pjrt==0.12.0.1.post67; platform_machine == 'x86_64'",
+          "jax-cuda12-pjrt==0.12.0.1.post45; platform_machine == 'aarch64'", "jaxlib==0.12.0.1",
           "dew-flash-attn-cu12~=0.3.7; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu12~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
-cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post45", "jax-cuda13-pjrt==0.12.0.1.post45", "jaxlib==0.12.0.1",
+cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post67; platform_machine == 'x86_64'",
+          "jax-cuda13-plugin[with-cuda]==0.12.0.1.post45; platform_machine == 'aarch64'",
+          "jax-cuda13-pjrt==0.12.0.1.post67; platform_machine == 'x86_64'",
+          "jax-cuda13-pjrt==0.12.0.1.post45; platform_machine == 'aarch64'", "jaxlib==0.12.0.1",
           "dew-flash-attn-cu13~=0.3.7; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu13~=0.1.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 tpu = ["libtpu==0.0.50.*", "requests"]
@@ -154,6 +168,9 @@ test = [
     # declare flatbuffers. This version wrote the committed export fixture.
     "flatbuffers==25.12.19",
     "pytest-xdist",
+    # tools/armada/ci.py reads a pytest stalled past its deadline from outside it, every thread's Python
+    # frames and the native ones under them, a thread holding the GIL in native code included (`dumped`).
+    "py-spy",
     # Property, metamorphic and fuzz tests (docs/design/testing.md), under tests/conftest.py's
     # derandomized profile.
     "hypothesis",
@@ -284,8 +301,8 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15
 # compile through too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no
 # accelerator: locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
 # (tools/lock_environment.sh).
-kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "jax-cuda12-pjrt==0.12.0.1.post45; sys_platform == 'linux' and platform_machine == 'x86_64'",
+kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post67; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "jax-cuda12-pjrt==0.12.0.1.post67; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]

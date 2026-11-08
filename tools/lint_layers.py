@@ -55,6 +55,16 @@ LAYERS: Mapping[str, Contract] = {
         ("dew.objectives",), (), ("dew.training", "dew.config", "dew.checkpoints", "dew._cli")),
     "only the reinforcement-learning packages import dew.rl": Contract(
         ("dew",), ("dew.rl", "dew.objectives.rl"), ("dew.rl",)),
+    # A model computes; where a release stores its tensors and config is dew.interop's (row 4264).
+    "models import no weight interop": Contract(("dew.nn",), (), ("dew.interop",)),
+    # A model's inputs are its own types (`dew.nn.inputs`, `dew.nn.flops`), which the diffusion process and
+    # the condition encoders read; a release's preprocessing is interop's (row 4265). Quantized arithmetic is
+    # the next of that row's crossings to settle.
+    "models import no diffusion, conditioning or data module": Contract(
+        ("dew.nn",), (), ("dew.diffusion", "dew.inputs", "dew.data")),
+    # A readout's source states its own axes (`HeadComponent.axes`), so a release's reader names no task
+    # (row 4269).
+    "interop imports no decision module": Contract(("dew.interop",), (), ("dew.decision",)),
 }
 """The contracts, by name. Each holds on main; a layer whose crossings are still open joins when its owner
 settles them (rows 4264-4270, records/themes.md's RT07)."""

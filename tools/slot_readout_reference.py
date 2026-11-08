@@ -126,7 +126,7 @@ def main():
     if args.seeds is None or args.seeds <= 0:
         parser.error("seeds must be positive")
     sys.path.insert(0, str(ROOT / "tests"))
-    from check1_wire import REDRAW, staged_units
+    from dew.parity_stages import REDRAW, staged_units
 
     require_reference_transformers()
     torch.set_num_threads(1)

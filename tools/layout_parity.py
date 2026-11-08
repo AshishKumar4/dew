@@ -67,7 +67,6 @@ inconclusive, repeats work or fails in any other way.
 
 from __future__ import annotations
 
-import collections
 import dataclasses
 import functools
 import hashlib
@@ -979,10 +978,9 @@ class Judge:
         self.case, self.references, self.label = case, references, label
         self._arm: Arm | None = None
         self._anchor: Anchor | None = None
+        self._reference: tuple[int, Drawn] | None = None
         self._batches: dict[int, int] = {}
         self._selections: tuple[Any, Callable] | None = None
-        self._ahead: collections.OrderedDict[int, Any] = collections.OrderedDict()
-        self._pool: Any = None
 
     def batch_seed(self, seed: int) -> int:
         """The seed of the batch the gate's draw `seed` takes: itself, or for a selecting model the
@@ -1038,54 +1036,20 @@ class Judge:
         so a run of prepared draws compiles no reference."""
         return self.references.noted("flops", self.case, lambda: self.arm.compiled["flops_per_device"])
 
-    AHEAD = 8
-    """How many draws past the one read the reference and the anchor run ahead (`ahead`)."""
-
-    def ahead(self, seed: int) -> None:
-        """Draw `seed`'s reference and float64 anchor, and the `AHEAD` draws' after it, on two threads
-        beside the caller, which runs a layout's draw meanwhile: each of a draw's three programs keeps
-        about half of a CI task's four cores busy, so the three together run in about half the time.
-        The pairs are held in the order they were last asked for, the least recently asked dropped past
-        twice `AHEAD` once it has finished, so a pending draw is never dropped and recomputed; each
-        layout of a model restarts its draws at 0 and finds the earlier layout's pairs still held, or
-        held by `references`."""
-        import concurrent.futures
-
-        import jax
-
-        if self._pool is None:
-            self._pool = concurrent.futures.ThreadPoolExecutor(2)
-
-        def both(at: int) -> tuple[Drawn, Drawn]:
-            with jax.enable_x64(new_val=True):
-                reference = self._drawn_reference(at)
-                return reference, self._drawn_anchor(at, reference.record)
-
-        for at in range(seed, seed + self.AHEAD + 1):
-            if at in self._ahead:
-                self._ahead.move_to_end(at)
-            else:
-                self._ahead[at] = self._pool.submit(both, at)
-        finished = [at for at, pair in self._ahead.items() if pair.done()]
-        for at in finished[:max(0, len(self._ahead) - 2 * self.AHEAD)]:
-            del self._ahead[at]
-
-    def _from_ahead(self, seed: int, anchor: bool) -> Drawn:
-        """Draw `seed`'s reference, or its anchor where `anchor`: ahead (`ahead`) where it runs there,
-        else drawn here."""
-        if seed in self._ahead:
-            return self._ahead[seed].result()[anchor]
-        return self._drawn_anchor(seed) if anchor else self._drawn_reference(seed)
-
     def reference(self, seed: int) -> Drawn:
-        return self._from_ahead(seed, anchor=False)
+        return self._drawn_reference(seed)
 
     def anchor(self, seed: int) -> Drawn:
-        return self._from_ahead(seed, anchor=True)
+        return self._drawn_anchor(seed)
 
     def _drawn_reference(self, seed: int) -> Drawn:
-        chosen = self.batch_seed(seed)
-        return self.references.held("reference", self.case, chosen, lambda: self.arm(chosen))
+        """Draw `seed`'s reference, the last seed's held: check 1 asks a seed's anchor, reference and
+        layouts' coupling of it in turn, and `References.held` keeps it on disk only where asked to."""
+        if self._reference is None or self._reference[0] != seed:
+            chosen = self.batch_seed(seed)
+            self._reference = (seed, self.references.held("reference", self.case, chosen,
+                                                         lambda: self.arm(chosen)))
+        return self._reference[1]
 
     def _drawn_anchor(self, seed: int, witnessed: Witnessed | None = None) -> Drawn:
         """Draw `seed`'s float64 anchor from `witnessed`, the reference's record of that draw (drawn
@@ -1275,7 +1239,6 @@ def judged(model: str, name: str, arm: Arm, judge: Judge, seeds: int, window: in
 
     @dew_programs
     def layout(seed):
-        judge.ahead(int(seed))
         drawn = arm(judge.batch_seed(int(seed)))
         coupled(judge.reference(int(seed)).record, drawn.record, f"{label}, draw {int(seed)}")
         return drawn.leaves()
@@ -1290,9 +1253,7 @@ def judged(model: str, name: str, arm: Arm, judge: Judge, seeds: int, window: in
                     else (np.arange(seed * window, (seed + 1) * window),))
 
         def read(drawn):
-            # Whichever arm check 1 reads first starts the draws ahead (`Judge.ahead`).
             def of(seed):
-                judge.ahead(int(seed))
                 return drawn(int(seed)).leaves()
             return of
 
@@ -1390,7 +1351,7 @@ def prepared(models: Sequence[str], *, dtype: str, seeds: int | Mapping[str, int
     seeds the reference's first draw alone (`ran`), with the reference's FLOPs, computed into
     `references` where missing; whether every model's is there."""
     sys.path.insert(0, str(REPO / "tests"))
-    from check1_wire import staged_units
+    from dew.parity_stages import staged_units
 
     whole = True
     for model in models:

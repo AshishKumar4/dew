@@ -30,7 +30,6 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
-from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.condition import ConditionEncoder
@@ -43,7 +42,7 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import DenoisingCondition, ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective

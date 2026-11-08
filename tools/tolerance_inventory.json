@@ -62,11 +62,11 @@
    "lane": "Training"
   },
   "tests/test_autoencoder.py": {
-   "comparisons": 6,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_beam_search.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_behavior_correction.py": {
@@ -74,7 +74,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_bf16_reference.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_block_diffusion.py": {
@@ -210,7 +210,7 @@
    "lane": "Training"
   },
   "tests/test_engine_replay.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_eval_harness.py": {
@@ -233,20 +233,12 @@
    "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_flaxdiff_family_source.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_flow_matching.py": {
    "comparisons": 1,
    "lane": "Training"
   },
-  "tests/test_flux2_source.py": {
-   "comparisons": 6,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_flux_source.py": {
-   "comparisons": 8,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_gate_findings.py": {
@@ -534,7 +526,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_source.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {
@@ -554,7 +546,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_reference_runs.py": {
-   "comparisons": 4,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {
@@ -673,10 +665,6 @@
    "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_wan_source.py": {
-   "comparisons": 11,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_wan_vae.py": {
    "comparisons": 9,
    "lane": "Models, Serving & RL"
@@ -729,10 +717,6 @@
    "comparisons": 3,
    "lane": "Training"
   },
-  "tools/flaxdiff_family_reference.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tools/gated_product_reference.py": {
    "comparisons": 1,
    "lane": "Kernels"
@@ -760,10 +744,6 @@
   "tools/stopping_reference.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tools/vllm_replay_reference.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
   }
  }
 }

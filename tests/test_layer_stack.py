@@ -521,13 +521,17 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
                     truth_fn=truth)
 
 
+ONE_STAGE_SEEDS = 8
+"""Check 1's declared seeds for a one-stage state's stack read in place against the per-layer store."""
+
+
 def test_a_one_stage_state_holds_a_scanned_stack_as_its_scan_reads_it():
     """On one stage a scanned decoder's stage-local state (`stage_sites` at one stage, `StackView.
     stage_form`) holds each run as the scan reads it, a periodic run stacked by position of its period,
     under the one stage's index: the stack reads it in place, its logits and its parameters' gradient,
-    which comes back in the same form, the per-layer store's bit for bit, and its program holds no stacked
-    copy of the run beside it, as a per-layer store's restacked every step does (row 4098). Its layers
-    come back as they were stored (`layer_form`, `stored_layers`)."""
+    which comes back in the same form, on par with the per-layer store's (check 1), and its program holds
+    no stacked copy of the run beside it, as a per-layer store's restacked every step does (row 4098). Its
+    layers come back as they were stored (`layer_form`, `stored_layers`)."""
     model = hybrid(3, scan_layers=True)
     ids = jax.random.randint(jax.random.key(1), (2, 10), 0, VOCAB)
     params = nn.unbox(model.init(jax.random.key(0), ids))["params"]
@@ -544,10 +548,23 @@ def test_a_one_stage_state_holds_a_scanned_stack_as_its_scan_reads_it():
 
     same(site.view.layer_form(staged, array_rows), params)
     same(stored_layers(model, {"params": staged})["params"], params)
-    apply = jax.jit(model.apply)
-    same(apply({"params": staged}, ids), apply({"params": params}, ids))
     gradient = jax.jit(jax.grad(lambda params: jnp.mean(model.apply({"params": params}, ids) ** 2)))
-    same(site.view.layer_form(gradient(staged), array_rows), gradient(params))
+
+    def read(model, held, *, stage: bool):
+        def run(ids):
+            logits, back = jax.vjp(lambda params: model.apply({"params": params}, ids), held)
+            grads = back(jnp.ones_like(logits) / logits.size)[0]
+            return logits, site.view.layer_form(grads, array_rows) if stage else grads
+        return jax.jit(run)
+
+    def draw(seed):
+        return (jax.random.randint(jax.random.key(seed), ids.shape, 0, VOCAB),)
+
+    # Two programs, the stage form read in place and the per-layer store restacked: on par (check 1).
+    wide = model.clone(dtype=jnp.float64)
+    assert_as_exact(read(model, staged, stage=True), read(model, params, stage=False), draw,
+                    "a one-stage state's stack", seeds=ONE_STAGE_SEEDS,
+                    truth_fn=read(wide, float64_held(params), stage=False))
     run = sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(staged["stages"]))
     staged_temporaries, layered_temporaries = (
         gradient.lower(tree).compile().memory_analysis().temp_size_in_bytes for tree in (staged, params))

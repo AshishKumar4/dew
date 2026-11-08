@@ -167,7 +167,9 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     would compute in JAX); passed `as_given` it runs as given. A window loop of a given arm is
     classified by that arm, so its Dew partner compiles with the fusions as it does without windows.
     A paired sizing of one function against itself stays paired, its draws from SIZING_FROM on."""
-    from reference_error import SIZING_FROM, _arms, as_given, assert_as_exact, over_windows, seeds_for
+    from reference_error import _arms, as_given, assert_as_exact, over_windows, seeds_for
+
+    from dew.parity import SIZING_FROM
 
     def dew(x):
         return jnp.asarray(x) * 2

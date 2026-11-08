@@ -2021,6 +2021,8 @@ class _Run:
     sequences: jax.Array
     laid: Callable
     unlaid: Callable
+    h0: jax.Array | None = None
+    """Each row's initial memory `[B * HV * Dk, Dv]` fp32, as the states launch takes it."""
 
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
@@ -2119,4 +2121,4 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
                                       call, tiles)
         final = final.reshape(batch, heads, width, columns)[:, :, :key_width, :value_width]
     return _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta, a, w, keys,
-                scores, h, corrected, final, taken, sequences, laid, unlaid)
+                scores, h, corrected, final, taken, sequences, laid, unlaid, h0=h0.reshape(-1, columns))

@@ -439,9 +439,12 @@ def _key_pairs_staged(call: Call, keys: int) -> tuple:
     landing."""
     parted = _parted(call)
     # Where the call's pairs do not factor (`Call.factored`), a key block's keys and separated prefix below a
-    # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads).
-    padded = () if call.factored else (plgpu.SMEM((3, algebra.SUB + CHUNK, keys), jnp.float32),
-                                       plgpu.SMEM((CHUNK + algebra.SUB, keys), jnp.float32))
+    # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads), stated
+    # plain as the forward's are (`mosaic.plain`): unstated, layout inference tiled them, and the reads at
+    # row offsets no tiling divides took other rows on every GPU, Kimi delta attention's gradients 1e4 times
+    # their size where its pairs do not factor, its interpreted run right (row 5194).
+    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),
+                                       mosaic.plain((CHUNK + algebra.SUB, keys), jnp.float32))
     staging = ([staging_tiles(parted, (CHUNK, keys))[0] for _ in range(2)],
                [staging_tiles(parted, (CHUNK, CHUNK))[0] for _ in range(2)],
                plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32), *padded)
@@ -458,6 +461,19 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
     return Held(carried=[f32(CHUNK, 1)], phases=(
         [f32(CHUNK, keys)] * 8 + masks(CHUNK, keys) + [f32(CHUNK, keys)] * 5 + masks(CHUNK, keys)
         + held_tile(parted, CHUNK, keys) + fragments(call, (parted, CHUNK, CHUNK), (parted, CHUNK, keys)),))
+
+
+def _first_decays(dg, run, dh0):
+    """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales, as
+    fla_kda's port takes it (`fla_kda.first_decay_grad`): `<h0, dh0>` over the values for a sequence that
+    begins its row, exactly zero for any other, which starts from no memory. Cumulated from its chunk's end,
+    that token's gradient is every term of its chunk, which cancel to fp32's residue where the memory is
+    zero: rows of float64 zero 1.5e-7 from it against fla's 3.3e-9 (row 5194, M-JS-26-a100)."""
+    shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.batch, -1)
+    first, sizes, row, begins = (run.sequences[:, i] for i in range(4))
+    value = jnp.where((begins == 1)[:, None], shared[row], 0.0)
+    index = jnp.where(sizes > 0, first * CHUNK, run.call.rows)
+    return dg.at[index].set(value.astype(dg.dtype), mode="drop")
 
 
 def gradients(run, laid_do, dht, tiles) -> tuple:
@@ -492,6 +508,7 @@ def gradients(run, laid_do, dht, tiles) -> tuple:
     last = tuple(x.reshape(call.chunks, CHUNK, heads * width)[:, -1] for x in (run.hi, run.lo))
     terms = terms.at[:, -1].add(decayed.sum(0).reshape(call.chunks, -1) * algebra.raised(*last))
     dg = jnp.flip(jnp.cumsum(jnp.flip(terms, 1), 1), 1).reshape(rows, heads * width)
+    dg = _first_decays(dg, run, dh0)
 
     def keyed(x):
         """A value head's gradient `[R, HV * Dk]` summed onto its key head's `[R, H * Dk]`."""

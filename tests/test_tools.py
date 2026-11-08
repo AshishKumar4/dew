@@ -678,7 +678,7 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
     """A prepare run with a window of two draws keeps both draws of every check-1 seed and of its
     redraw's (`REDRAW`): a run reading those references finds the reference and the float64 anchor of
     the last draw a windowed check reads, and none past it."""
-    from check1_wire import staged_units
+    from dew.parity_stages import staged_units
 
     tool = load("layout_parity")
     _, reference = tool.model_case("jepa", "float32", {}, {})
@@ -691,36 +691,6 @@ def test_prepared_windows_hold_every_draw_a_windowed_run_reads():
         read.anchor(last)  # read where it is kept: a run of layouts that misses a draw is refused
         with pytest.raises(FileNotFoundError):
             read.reference(last + 1)
-
-
-def test_a_judges_draws_ahead_keep_every_pending_draw_and_only_the_window():
-    """A judge's draws ahead are held in the order they were last asked for and let go only once
-    finished: while every draw is still pending, asking past twice `AHEAD` drops none, so each later
-    read waits on the draw already submitted rather than drawing it again, and a later layout restarting
-    at draw 0 finds it held (ledgers 2166, 2167)."""
-    import threading
-
-    tool = load("layout_parity")
-    _, reference = tool.model_case("jepa", "float32", {}, {})
-    with jax.enable_x64(new_val=True):
-        judge = tool.Judge(reference, tool.References(), "jepa")
-        released, drawn = threading.Event(), []
-
-        def held(seed, draw=judge._drawn_reference):
-            drawn.append(seed)
-            released.wait()
-            return draw(seed)
-
-        judge._drawn_reference = held
-        for seed in range(0, 3 * judge.AHEAD, judge.AHEAD):
-            judge.ahead(seed)  # every draw submitted is still pending
-        submitted = dict(judge._ahead)
-        judge.ahead(0)  # a later layout restarting at draw 0
-        assert all(judge._ahead.get(at) is pair for at, pair in submitted.items()), sorted(judge._ahead)
-        released.set()
-        for seed in range(3 * judge.AHEAD):
-            judge.reference(seed)
-        assert len(drawn) == len(set(drawn)), sorted(drawn)
 
 
 def test_layout_parity_fails_a_run_with_an_inconclusive_row():
@@ -2402,3 +2372,18 @@ def test_a_replaced_constructor_leaves_device_contexts_their_own_in_a_fresh_proc
                           text=True, check=False)
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.split() == ["meta", "torch.float64", "meta", "torch.int64"]
+
+
+def test_a_float64_truth_takes_a_tensors_float32_softmax_in_float64():
+    """A reference's float64 truth (`tools.torch_precision.float64`) widens a softmax pinned to float32,
+    the tensor method's as the function's: the softmax it computes is float64's own."""
+    import torch
+
+    from tools.torch_precision import float64
+
+    logits = torch.tensor([[0.17, -1.32, 0.91, 2.14]], dtype=torch.float64)
+    with float64():
+        widened = {"method": logits.softmax(dim=-1, dtype=torch.float32),
+                   "function": torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)}
+    for name, softmax in widened.items():
+        np.testing.assert_array_equal(softmax.numpy(), logits.softmax(dim=-1).numpy(), err_msg=name)

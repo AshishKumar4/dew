@@ -28,17 +28,19 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 from dew.nn.protocols import StagedStacks
 
+from .. import in_backward
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
 from ..kv_cache import cache_at_layer, cache_from_layer
 from ..mla import INDEXER_COLLECTION
 from ..moe import BANKED_EXPERTS, ROUTER_COLLECTION, at_iteration, experts_apart, holds_experts
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
-from .decoder_block import DecoderBlock, RematPolicy
+from .decoder_block import REMAT_POLICIES, DecoderBlock, RematPolicy
 from .layer_names import array_rows, group_layers, group_name, stage_count
 from .layer_plan import LayerSpec, run_period
 
@@ -177,11 +179,13 @@ def _rows_read(tree, index: jax.Array):
 
 def _rows_recomputed(remat: RematPolicy | None) -> Callable[..., bool]:
     """What a scanned run's body that reads rows keeps for the backward: what its layer's own remat keeps
-    (`remat`: everything where it has none, `RematPolicy.checkpoint_policy` otherwise, nothing where that is
-    None), but never the rows it read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from
-    the iteration's index. JAX 0.12's `save_anything_except_these_names` saves every value, the names it is
-    given among them, which kept each iteration's rows among the scan's residuals (row 4751)."""
-    layer = ((lambda *_, **__: True) if remat is None
+    (`remat`: everything where it runs no remat, which a block that recomputes named residuals alone does
+    too, recomputing them itself (`RematPolicy.recompute`, `DecoderBlock.__call__`);
+    `RematPolicy.checkpoint_policy` otherwise, nothing where that is None, the full rung), but never the rows
+    it read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from the iteration's index.
+    JAX 0.12's `save_anything_except_these_names` saves every value, the names it is given among them, which
+    kept each iteration's rows among the scan's residuals (row 4751)."""
+    layer = ((lambda *_, **__: True) if remat is None or remat.recompute
              else remat.checkpoint_policy() or jax.checkpoint_policies.nothing_saveable)
 
     def policy(primitive: jax.extend.core.Primitive, *avals, **params) -> bool:
@@ -215,10 +219,18 @@ class Loop:
     through the last k passes alone: the passes before them run under
     `stop_gradient` (truncated backpropagation, as Huginn trains), so neither
     they nor the layers before them get a gradient. None trains through
-    every pass. `exit_gate` adds Ouro's hazard head over the whole stack, a
-    biased map of each pass's normed states to one logit, which the decoder
-    sows into its `exits` collection; the decoder's output is always the
-    last pass's.
+    every pass. `exit_gate` adds Ouro's hazard head, a biased map of each
+    pass's exit state, normed, to one logit (the decoder's `early_exit_gate`,
+    drawn at zero where a loaded decoder gains it): a pass's exit state is
+    its output where the block ends the stack, and else the coda run on it,
+    each pass's coda its own (its cache entries too), so any pass reaches the
+    head. The decoder sows each pass's gate logit (`logits`) and its normed
+    exit state (`states`) into its `exits` collection, and its output is the
+    last pass's; with `exit_threshold` it is, token by token, the first
+    pass's whose cumulative exit probability reaches it (Ouro's
+    `early_exit_threshold`, OuroForCausalLM.forward), the last pass's where
+    none does. The probability a pass exits is its hazard `sigmoid(logit)`
+    times the chance no pass before it did; the last pass takes the rest.
 
     `remat` checkpoints each pass of the block, the first included, with one
     Flax lifted checkpoint. Backpropagation keeps each pass's input and
@@ -237,10 +249,24 @@ class Loop:
     block still train through the input every pass after the cut reads, as
     Huginn's prelude does (arXiv 2502.05171, section 3.3).
 
+    With `implicit`, a later pass runs the block at `x = a + θ⊙(h - a)`, `a`
+    the block's input and `h` the state the pass before left, and leaves
+    `block(x) + (a - x)`: the block's own step taken from `a` (the θ-method of
+    an implicit fixed point, a relaxation that reads the last pass's state as
+    far as θ says). θ is the decoder's per-channel `loop_theta`, drawn at zero,
+    so at θ = 0 every later pass leaves the block's output over its input, and
+    a decoder computes what it computes without the loop, whatever its count:
+    a pretrained decoder gains passes without changing what it computes, where
+    a plain repeat moves it. It reads the state as it is (no `step_norm`) and
+    adds its own input back, which `reinject` would add twice.
+
     A decode cache holds one entry per pass and layer. The first pass keeps
     its layers' own names; pass t > 0's layer i is `layers_{L + (t - 1) n + i - first}`,
     L the decoder's layers and n the block's (`PassView`). Over the whole
-    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. With
+    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. Under
+    an exit gate, pass t < T - 1's coda layer j is
+    `layers_{L + (T - 1) n + t c + j - end}` beside them, c the coda's
+    layers, T the steps. With
     `shared_cache` every pass reads and writes its layers' one entry, each
     pass overwriting the step's keys and values the pass before wrote, so
     a step's earlier tokens read the last pass's (Dory's last-loop cache):
@@ -254,6 +280,8 @@ class Loop:
     remat: bool = False
     reinject: bool = False
     shared_cache: bool = False
+    implicit: bool = False
+    exit_threshold: float | None = None
 
     def __post_init__(self):
         if self.steps < 1:
@@ -261,6 +289,9 @@ class Loop:
         if self.reinject and (not self.step_norm or self.exit_gate):
             raise ValueError("a reinjecting loop norms each pass's state (step_norm) and exits at "
                              "the last pass")
+        if self.implicit and (self.step_norm or self.reinject):
+            raise ValueError("an implicit loop reads the last pass's state as it is and adds the block's "
+                             "input back itself: it takes no step_norm and no reinject")
         if self.backprop_steps is not None and not 1 <= self.backprop_steps <= self.steps:
             raise ValueError(f"backprop_steps counts passes trained through, 1 to steps={self.steps}, "
                              f"got {self.backprop_steps}")
@@ -269,8 +300,9 @@ class Loop:
             object.__setattr__(self, "layers", (first, end))
             if not 0 <= first <= end:
                 raise ValueError(f"a loop's block is layers [first, end), first <= end, not {self.layers}")
-            if self.exit_gate:
-                raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
+        if self.exit_threshold is not None and (not self.exit_gate or not 0 < self.exit_threshold <= 1):
+            raise ValueError("an exit threshold is a cumulative probability in (0, 1] over the passes the "
+                             f"exit gate weighs, got {self.exit_threshold} with exit_gate={self.exit_gate}")
 
 
 @dataclasses.dataclass
@@ -281,16 +313,26 @@ class SharedPassView:
     and values over the last pass's, and each recurrent mixer's state, convolution tail and memory
     as the step entered them, so it takes the step's tokens once rather than again after the pass
     before took them. A pass that allocates the cache finds none, so the later ones allocate too and
-    advance nothing (`cache_positions`). The step leaves the cache as its last pass did."""
+    advance nothing (`cache_positions`). The step leaves the cache as its last pass did. The entries of
+    layers outside the block `layers`, [first, end), stay as each pass finds them: the prelude's, and
+    those an exit's coda writes between the passes (`looping.run_loop`)."""
+    layers: tuple[int, int]
     entering: Mapping | None = None
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
         self.entering = variables.get('cache')
         return dict(variables)
 
+    def _apart(self, name: str) -> bool:
+        """Whether `name` is the entry of layers outside the block."""
+        run = group_layers(name)
+        return run is not None and (run.stop <= self.layers[0] or run.start >= self.layers[1])
+
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         rest = {collection: tree for collection, tree in variables.items() if collection != 'cache'}
-        return rest if self.entering is None else {**rest, 'cache': self.entering}
+        cache = {**{name: value for name, value in variables.get('cache', {}).items() if self._apart(name)},
+                 **{name: value for name, value in (self.entering or {}).items() if not self._apart(name)}}
+        return {**rest, 'cache': cache} if cache else rest
 
     @staticmethod
     def outside(variables: Mapping[str, Mapping]) -> dict:
@@ -402,6 +444,9 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
             if store is not None:
                 store.update(written)
+        elif _updates_in_backward(run, run.specs if periodic else (specs[first],), train=train,
+                                  decode=decode, fetching=fetching, store=store, inputs=inputs):
+            x = _updated_in_backward(run, x, attention_metadata=attention_metadata, remat=remat)
         else:
             # A longer run's layers share keys or own them, so they only read the store: a provider
             # is always a run of one (`run_stack`).
@@ -438,6 +483,60 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
                            length=repeats, metadata_params={nn.PARTITION_NAME: None})(
                 run, x, jnp.arange(repeats))
     return x
+
+
+def _updates_in_backward(run: nn.Module, specs: Sequence[LayerSpec], *, train: bool, decode: bool,
+                         fetching: bool, store, inputs) -> bool:
+    """Whether a scanned run updates in its backward (`dew.nn.in_backward`): inside a step's plan, a
+    training forward of a run of like layers, or of a period's layers repeated, that holds its parameters
+    as the plan's state does, writes nothing but its output (no cache, routing statistics or probes:
+    `WRITTEN`), reads no store, per-layer input or host bank, routes no layer (`specs`), and runs under no
+    interceptor (an adapter's, a quantizer's), whose scope a layer applied on its own would leave."""
+    current = in_backward.plan()
+    if current is None or not train or decode or fetching or store is not None:
+        return False
+    if inputs is not None or any(spec.routed or spec.hash_routed for spec in specs) or INTERCEPTED.value:
+        return False
+    if QUANTIZED_TRACE.value is not None:
+        return False
+    held = run.variables
+    if LAYER_ROWS in held or any(name not in held for name in (*current.moments, in_backward.NORMS)):
+        return False
+    return not any(run.is_mutable_collection(name) for name in (*WRITTEN, "intermediates"))
+
+
+_KEPT_WITHOUT_A_RUNG = REMAT_POLICIES['minimal_with_scan_and_conv']
+"""What a run updating in its backward keeps of a layer whose block names no rung: every named residual
+(its attention's, its scan's and conv's, its MLP's), recomputing the values between them as XLA's fusions
+of a layer at a time do, so its stacked residuals hold no more than that loop's (row 4098)."""
+
+
+def _updated_in_backward(run: nn.Module, x, *, attention_metadata, remat: RematPolicy | None):
+    """A scanned run as `dew.nn.in_backward.scanned_run` computes it: each layer the run's own module
+    applied on its row of the run's weights, its dropout drawn from a key of its own split from the run's,
+    under the layer's rung, or where it names none what a layer at a time keeps (`_KEPT_WITHOUT_A_RUNG`).
+    Its masks are this program's own, as a stack's a layer at a time and its scan's each are: Linen's scan
+    splits the run's key below the scope's own fold, which no public form reads."""
+    held = run.variables
+    current = in_backward.plan()
+    assert current is not None
+    weights = held["params"]
+    count = jax.tree.leaves(weights)[0].shape[0]
+    keys = jax.random.split(run.make_rng("dropout"), count) if run.has_rng("dropout") else None
+    alone = run.clone(parent=None)
+
+    def applied(weights_i, carry, key, metadata):
+        rngs = None if key is None else {"dropout": key}
+        return alone.apply({"params": weights_i}, carry, train=True, decode=False, kv_store=None,
+                           per_layer_input=None, attention_metadata=metadata, rngs=rngs)
+
+    layer = applied if remat is not None else jax.checkpoint(
+        applied, policy=_KEPT_WITHOUT_A_RUNG.checkpoint_policy(), prevent_cse=False)
+
+    return in_backward.scanned_run(
+        run.path, layer, weights, held.get(in_backward.MASTERS),
+        {name: held[name] for name in current.moments}, in_backward.norms_of(held[in_backward.NORMS]), x,
+        keys, (attention_metadata,))
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
@@ -789,6 +888,42 @@ def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> No
 
 
 @dataclasses.dataclass(frozen=True)
+class _Stacked:
+    """A group of stored layers a `StackView` stacks into one leaf: its `keys` below `stages` (a run's inside
+    name, and a periodic run's position after it), its stored `layers` in their rows' order, and the leading
+    dimensions they fill in a stage-local state (`staged`, `StackView.staged_shape`, a periodic position's
+    `[stages, repeats]`) and in a scan's form (`stacked`, `StackView.stacked_shape`, a position's
+    `[repeats]`)."""
+
+    keys: tuple[str, ...]
+    layers: list[str]
+    staged: tuple[int, ...]
+    stacked: tuple[int, ...]
+
+
+def _placed(tree: dict, keys: tuple[str, ...], value) -> None:
+    """`value` placed in `tree` under the nested `keys`."""
+    *above, last = keys
+    for key in above:
+        tree = tree.setdefault(key, {})
+    tree[last] = value
+
+
+def _popped(tree: dict, keys: tuple[str, ...]):
+    """The value under the nested `keys` taken out of `tree`, an emptied run's entry with it."""
+    name, *below = keys
+    if not below:
+        return tree.pop(name)
+    run = dict(tree[name])
+    value = _popped(run, tuple(below))
+    if run:
+        tree[name] = run
+    else:
+        del tree[name]
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
 class StackView:
     """Converts the layer stack's variables between their stored layout and the one its loops read.
 
@@ -918,42 +1053,40 @@ class StackView:
                 if (name := self._inside_name(first, count, prefix)) is not None
                 and (period := self._period(first, count)) > 1]
 
+    def _stacked_groups(self) -> list[_Stacked]:
+        """Every group of stored layers the view stacks into one leaf, named run and periodic position
+        alike (`_Stacked`), the one enumeration each of the view's forms reads."""
+        return [_Stacked((name,), layers, self.staged_shape(count), self.stacked_shape(count))
+                for name, layers, count in self._named_runs()] + [
+            _Stacked((name, f'{prefix}{offset}'), layers, (self.stages, len(layers)), (len(layers),))
+            for name, prefix, positions in self._periodic_runs() for offset, layers in enumerate(positions)]
+
     def holds(self, tree: Mapping) -> bool:
         """Whether `tree`, a collection's subtree where the stack is stored, holds some run of the view,
         on its stored layers or stacked by stage (`stage_form`)."""
         staged = tree.get('stages', {})
-        runs = [(name, layers) for name, layers, _ in self._named_runs()] + [
-            (name, [layer for position in positions for layer in position])
-            for name, _, positions in self._periodic_runs()]
-        return any(name in staged or any(layer in tree for layer in layers) for name, layers in runs)
+        return any(group.keys[0] in staged or any(layer in tree for layer in group.layers)
+                   for group in self._stacked_groups())
 
     def splits(self, tree: Mapping) -> bool:
-        """Whether `tree` holds some of a run's stored layers and not the others, as a collection
-        that keeps part of a stack (layers frozen by index) does."""
-        return any(0 < sum(layer in tree for layer in layers) < len(layers)
-                   for _, layers, _ in self._named_runs())
+        """Whether `tree` holds some of a group's stored layers and not the others (`_stacked_groups`), as
+        a collection that keeps part of a stack (layers frozen by index) does."""
+        return any(0 < sum(layer in tree for layer in group.layers) < len(group.layers)
+                   for group in self._stacked_groups())
 
     def run_layers(self, name: str) -> tuple[list[str], int] | None:
         """The stored layers of the run named `name` inside, in `stage_form`'s order, and how many
         layers of it each stage runs; None where no run has that name."""
-        return next(((layers, count) for run, layers, count in self._named_runs() if run == name), None)
+        return next(((group.layers, len(group.layers) // self.stages) for group in self._stacked_groups()
+                     if group.keys == (name,)), None)
 
     def staged_layers(self, keys: Sequence[str]) -> tuple[list[str], int, int] | None:
         """The stored layers a stage-local leaf stacks, in its rows' order, where `keys` are the names
         below `stages` on its path: a run's inside name, and on one stage a periodic run's position after
-        it (`_stacked_positions`); how many of its leading dimensions stack them (`staged_shape`), and how
+        it (`_stacked_groups`); how many of its leading dimensions stack them (`staged_shape`), and how
         many of `keys` name the run. None where they name no run."""
-        if not keys:
-            return None
-        held = self.run_layers(keys[0])
-        if held is not None:
-            layers, count = held
-            return layers, len(self.staged_shape(count)), 1
-        for name, prefix, positions in self._periodic_runs():
-            offset = keys[1].removeprefix(prefix) if name == keys[0] and len(keys) > 1 else ''
-            if offset.isdigit() and int(offset) < len(positions):
-                return positions[int(offset)], 2, 2
-        return None
+        return next(((group.layers, len(group.staged), len(group.keys)) for group in self._stacked_groups()
+                     if tuple(keys[:len(group.keys)]) == group.keys), None)
 
     @staticmethod
     def layer_structures(variables: Mapping[str, Mapping], layers: int) -> tuple[tuple, ...]:
@@ -1032,7 +1165,7 @@ class StackView:
 
     def unstack(self, variables: Mapping[str, Mapping]) -> dict:
         outside = {}
-        runs = {name for name, _, _ in self._named_runs()} | {name for name, _, _ in self._periodic_runs()}
+        runs = {group.keys[0] for group in self._stacked_groups()}
         for collection, tree in variables.items():
             if self.stages == 1 and collection in self.staged:
                 held = {name: with_stacked_axes(jax.tree.map(lambda leaf: leaf[None], value), 1)
@@ -1063,8 +1196,7 @@ class StackView:
         their shapes or their shardings alike. On one stage that is the scan's own form, a periodic run
         stacked by position of its period (`_stacked_periods`), which the scan reads in place."""
         tree = dict(tree)
-        runs = {**self._stacked_runs(collection, tree, stack, staged=True),
-                **self._stacked_positions(collection, tree, stack)}
+        runs = self._stacked_runs(collection, tree, stack, staged=True)
         if runs:
             tree['stages'] = {**tree.get('stages', {}), **runs}
         return tree
@@ -1076,26 +1208,13 @@ class StackView:
         tree = dict(tree)
         staged = self.stages > 1 or 'stages' in tree
         held = dict(tree.pop('stages', {})) if staged else tree
-        for name, prefix, positions in self._periodic_runs():
-            if name not in held:
+        for group in self._stacked_groups():
+            name, *below = group.keys
+            if name not in held or not all(key in held[name] for key in below):
                 continue
-            run = held.pop(name)
-            for offset, layers in enumerate(positions):
-                position = run.get(f'{prefix}{offset}')
-                if position is None:
-                    continue
-                shape = (self.stages, len(layers)) if staged else (len(layers),)
-                leaves, structure = jax.tree_util.tree_flatten_with_path(position)
-                rows = [tuple(cut(path, leaf, shape)) for path, leaf in leaves]
-                for index, layer in enumerate(layers):
-                    tree[layer] = with_unstacked_axes(structure.unflatten([cuts[index] for cuts in rows]),
-                                                      len(shape))
-        for name, layers, count in self._named_runs():
-            if name not in held:
-                continue
-            shape = self.staged_shape(count) if staged else self.stacked_shape(count)
+            shape = group.staged if staged else group.stacked
 
-            def rows_of(path, leaf, shape=shape, layers=layers):
+            def rows_of(path, leaf, shape=shape, layers=group.layers):
                 rows = tuple(cut(path, leaf, shape))
                 if len(rows) != len(layers):
                     raise ValueError(f"{jax.tree_util.keystr(path)} of shape {np.shape(leaf)} under a run "
@@ -1104,9 +1223,9 @@ class StackView:
                 return rows
             # Each layer's tree rebuilt from its rows of every leaf, the run's own structure kept: a
             # tuple the run's tree holds (an optimizer's state) is a node, not a leaf's rows.
-            leaves, structure = jax.tree_util.tree_flatten_with_path(held.pop(name))
+            leaves, structure = jax.tree_util.tree_flatten_with_path(_popped(held, group.keys))
             rows = [rows_of(path, leaf) for path, leaf in leaves]
-            for index, layer in enumerate(layers):
+            for index, layer in enumerate(group.layers):
                 tree[layer] = with_unstacked_axes(structure.unflatten([cuts[index] for cuts in rows]),
                                                   len(shape))
         if held is not tree and held:
@@ -1115,61 +1234,37 @@ class StackView:
 
     def _stacked_runs[Leaf](self, collection: str, tree: dict, stack: RowStack[Leaf], *,
                             staged: bool = False) -> dict:
-        """Pop each run `tree` holds out of it, its rows stacked by `stack` (`stage_form`), by the
-        run's inside name. A collection holding some of a run's layers and not the others is
-        refused, and so are layers whose structures differ (`_refuse_unlike`)."""
-        runs = {}
-        for name, layers, count in self._named_runs():
-            held = [layer in tree for layer in layers]
+        """Pop each group `tree` holds out of it (`_stacked_groups`), its rows stacked by `stack`, nested
+        under its keys: in a stage-local state's form (`staged`, `stage_form`) every group, a periodic run's
+        by position; in the scan's own form the runs stacked whole, a periodic run's positions stacked by
+        `_stacked_periods`. A collection holding some of a group's layers and not the others is refused, and
+        so are layers whose structures differ (`_refuse_unlike`)."""
+        runs: dict = {}
+        for group in self._stacked_groups():
+            if not staged and len(group.keys) > 1:
+                continue
+            held = [layer in tree for layer in group.layers]
             if not any(held):
                 continue
             if not all(held):
                 raise ValueError(
-                    f"collection {collection!r} holds some of the layers {sorted(layers)} and not "
+                    f"collection {collection!r} holds some of the layers {sorted(group.layers)} and not "
                     "the others; a run reads every one of its layers or none")
-            _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
-            shape = self.staged_shape(count) if staged else self.stacked_shape(count)
-            runs[name] = with_stacked_axes(jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape),
-                                                        *[tree.pop(layer) for layer in layers]), len(shape))
-        return runs
-
-    def _stacked_positions[Leaf](self, collection: str, tree: dict, stack: RowStack[Leaf]) -> dict:
-        """Pop each periodic run `tree` holds out of it (`_periodic_runs`), each position of its period
-        stacked by `stack` over its repeats, by the run's inside name: `stage_form`'s periodic runs on one
-        stage, as `_stacked_periods` stacks them for the scan."""
-        runs = {}
-        for name, prefix, positions in self._periodic_runs():
-            stacked = {}
-            for offset, layers in enumerate(positions):
-                held = [layer in tree for layer in layers]
-                if not any(held):
-                    continue
-                if not all(held):
-                    raise ValueError(
-                        f"collection {collection!r} holds some of the layers {sorted(layers)} and not "
-                        "the others; a run reads every one of its layers or none")
-                _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
-                shape = (self.stages, len(layers))
-                rows = [tree.pop(layer) for layer in layers]
-                stacked[f'{prefix}{offset}'] = with_stacked_axes(
-                    jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape), *rows), len(shape))
-            if stacked:
-                runs[name] = stacked
+            _refuse_unlike(collection, [tree[layer] for layer in group.layers], group.layers)
+            shape = group.staged if staged else group.stacked
+            rows = [tree.pop(layer) for layer in group.layers]
+            stacked = jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape), *rows)
+            _placed(runs, group.keys, with_stacked_axes(stacked, len(shape)))
         return runs
 
     def _rowed_runs(self, collection: str, tree: Mapping) -> tuple[dict, dict]:
         """`tree` without the stored layers of its runs, and those layers held as rows by run name (`_rowed`),
         a periodic run's by position of its period, as the scan reads them a row an iteration."""
         tree, runs = dict(tree), {}
-        for name, layers, _ in self._named_runs():
-            held = self._stacked(collection, tree, [[layer] for layer in layers])
+        for group in self._stacked_groups():
+            held = self._stacked(collection, tree, [[layer] for layer in group.layers])
             if held is not None:
-                runs[name] = _rowed(held)
-        for name, prefix, positions in self._periodic_runs():
-            rows = {f'{prefix}{offset}': _rowed(held) for offset, layers in enumerate(positions)
-                    if (held := self._stacked(collection, tree, [[layer] for layer in layers])) is not None}
-            if rows:
-                runs[name] = rows
+                _placed(runs, group.keys, _rowed(held))
         return tree, runs
 
     def _stacked_periods(self, collection: str, tree: dict) -> None:
@@ -1177,30 +1272,24 @@ class StackView:
         under the name the period's stage gives its layer, below the run's inside name, as its scanned
         body reads them; a position whose layers keep nothing in the collection (a layer with no cache)
         is left out of it."""
-        for first, count, prefix in self._runs():
-            name = self._inside_name(first, count, prefix)
-            if name is None or (period := self._period(first, count)) == 1:
+        for group in self._stacked_groups():
+            if len(group.keys) == 1:
                 continue
-            stacked = {f'{prefix}{offset}': position[0]
-                       for offset, layers in enumerate(self._positions(first, count, period, prefix))
-                       if (position := self._stacked(collection, tree, [layers])) is not None}
-            if stacked:
-                tree[name] = stacked
+            position = self._stacked(collection, tree, [group.layers])
+            if position is not None:
+                _placed(tree, group.keys, position[0])
 
     def _unstacked_periods(self, tree: dict) -> dict:
         """`tree` with each periodic run back on its stored layers (`_stacked_periods`'s inverse)."""
-        for first, count, prefix in self._runs():
-            name = self._inside_name(first, count, prefix)
-            if name is None or (period := self._period(first, count)) == 1 or name not in tree:
+        for group in self._stacked_groups():
+            name, *below = group.keys
+            if not below or name not in tree or below[0] not in tree[name]:
                 continue
-            view = tree.pop(name)
-            for offset, layers in enumerate(self._positions(first, count, period, prefix)):
-                if f'{prefix}{offset}' not in view:
-                    continue
-                for repeat, layer in enumerate(layers):
-                    # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
-                    row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
-                    tree[layer] = with_unstacked_axes(jax.tree.map(row, view[f'{prefix}{offset}']), 1)
+            view = _popped(tree, group.keys)
+            for repeat, layer in enumerate(group.layers):
+                # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
+                row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
+                tree[layer] = with_unstacked_axes(jax.tree.map(row, view), 1)
         return tree
 
     def stored_layer(self, tree: Mapping, layer: int, part: str, prefix: str = 'layers_'):

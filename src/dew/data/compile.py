@@ -74,6 +74,7 @@ from dew.data.dataset import (
     PhasedStream,
     Reader,
     Records,
+    phase_stages,
     rows_of,
     take_batch,
 )
@@ -1287,15 +1288,11 @@ def _compile_phases(
         # and again with the ends of the phases before it once the run reaches them (`opened`).
         ends = [end for _, end in staged if end is not None]
         phase = staged_at(index, {} if tokens else consumed_by([phase for phase, _ in staged], ends))
-        # One batch for every phase: a phase's end on the step clock is its steps in the first phase's
-        # rows (`until * batch`), which phases of other batches would misplace, and the token clock's
-        # phases are held to it alike until each phase's own steps count toward its end (row 4812).
-        if staged and phase.build.batch != staged[0][0].build.batch:
-            raise ValueError(f"phase {index} reads batches of {phase.build.batch} rows and phase 0 of "
-                             f"{staged[0][0].build.batch}; a phase's end is counted in the first phase's "
-                             "batch, so batch every phase alike, or ramp the batch the run steps "
-                             "(`dew.data.dataset.ramped`, a run config's trainer.batch_ramp)")
-        staged.append((phase, None if tokens or until is None else until * phase.build.batch))
+        # A phase on the step clock ends at its step's record: the records of the phases before it, and its
+        # own steps in its own rows (row 4812).
+        before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
+        staged.append((phase, None if tokens or until is None
+                       else before + (until - started) * phase.build.batch))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
@@ -1324,7 +1321,13 @@ def _compile_phases(
             return built[index][0]
         return _compiled(staged_at(index, consumed), packed, host=host, resume=resume, batches=planned(index))
 
+    batches = tuple(phase.build.batch for phase, _ in staged)
+    stages = () if tokens else phase_stages(batches, (0, *(end for _, end in staged[:-1] if end is not None)))
+
     def training(partition: DataPartition) -> Iterator[Batch]:
+        if not tokens:
+            _updates_aligned(source.ends, batches, partition.window)
+
         def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
             opened_reader = opened(index, ends).train(partition)
             if not isinstance(opened_reader, GlobalReader):
@@ -1334,12 +1337,25 @@ def _compile_phases(
             return opened_reader
 
         phases = [(functools.partial(global_reader, index), end) for index, (_, end) in enumerate(built)]
-        return PhasedStream(phases, loading.stop_seconds, tokens=source.ends if tokens else None)
+        return PhasedStream(phases, loading.stop_seconds, batches=batches, stages=stages,
+                            tokens=source.ends if tokens else None)
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
     return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
-                               token_ends=source.ends if tokens else None,
+                               token_ends=source.ends if tokens else None, batches=batches, stages=stages,
+                               token_batches=tuple(loaded.batch_tokens for loaded, _ in built),
                                widths=merge_facts(loaded.widths for loaded, _ in built))
+
+
+def _updates_aligned(ends: Sequence[int | None], batches: Sequence[int], window: int = 1) -> None:
+    """Refuse phases on the step clock where one whose batch differs from the one before it begins inside
+    an update of `window` steps (`DataPartition.window`): an update pools one batch's microbatches, so the
+    run would drop the part of the update read in the batch before it (`Trainer._staged`)."""
+    for index, (until, batch, after) in enumerate(zip(ends, batches, batches[1:], strict=False)):
+        if after != batch and until is not None and until % window:
+            raise ValueError(f"phase {index + 1} reads batches of {after} rows after phase {index}'s "
+                             f"{batch}, from step {until}, inside an update of {window} steps, which pools "
+                             f"one batch's microbatches; end phase {index} at a multiple of {window} steps")
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:

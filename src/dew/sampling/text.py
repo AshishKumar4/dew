@@ -50,6 +50,8 @@ from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, loca
 from dew.nn.kernels.options import program
 from dew.nn.kv_cache import (
     gather_cache_rows,
+    offloaded,
+    on_device,
     refuse_unassigned,
     row_axis,
     with_rounding_keys,
@@ -301,6 +303,9 @@ class Generation(Generic[ArrayT]):
     ``lengths`` are valid. ``behavior_log_probs`` describes the distribution
     that actually drew each action, after the whole transform chain.
     ``raw_log_probs`` describes the unmodified model policy.
+    ``boundaries``, [B, max_new_tokens, rankings, 2], is each ranking's last
+    score kept and first passed over at each step of a search whose strategy
+    reports them (``Beam(boundaries=True)``), else None.
 
     A request for ``n`` continuations per prompt gives every array
     ``[B * n, ...]`` rows: prompt zero's ``n`` continuations, then prompt
@@ -320,6 +325,7 @@ class Generation(Generic[ArrayT]):
     rows: int | None = struct.field(pytree_node=False, default=None)
     decoder: Callable[[ArrayLike, ArrayLike, int], tuple[str, ...]] | None = struct.field(
         pytree_node=False, default=None)
+    boundaries: ArrayT | None = None
 
     @property
     def prompt_width(self) -> int:
@@ -469,7 +475,9 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, d
     cache = initialized("init_cache")
     for method in ("init_mtp_cache",) * bool(depths) + ("init_draft_cache",) * drafter:
         cache.update(initialized(method))
-    return unflatten_dict(cache)
+    held = unflatten_dict(cache)
+    # An offloaded cache's keys and values in host memory, each layer's brought to the device as it runs.
+    return offloaded(held, model.kv_cache) if isinstance(model, Layered) else held
 
 
 def _context(model: nn.Module, params: Variables, updated: Mapping,
@@ -700,8 +708,12 @@ def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: Decoder
 def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array, axis: int = 0) -> jax.Array:
     """`chosen` where `where` holds over its axes from `axis` (a cache leaf's rows, `row_axis`), else
     `otherwise`."""
-    mask = where.reshape(*(1,) * axis, *where.shape, *(1,) * (chosen.ndim - axis - where.ndim))
-    return jnp.where(mask, chosen, otherwise)
+    # Each layer's rows first, a run's bank's layers mapped over, an offloaded cache's keys and values chosen
+    # on the device and back to the host (`on_device`).
+    def selected(kept: jax.Array, picked: jax.Array) -> jax.Array:
+        return jnp.where(where.reshape(*where.shape, *(1,) * (picked.ndim - where.ndim)), picked, kept)
+
+    return on_device(selected, otherwise, chosen, banked=bool(axis))
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):
@@ -779,7 +791,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
     return Generation(
         jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,
-        drawn.behavior_log_probs, drawn.raw_log_probs)
+        drawn.behavior_log_probs, drawn.raw_log_probs, boundaries=drawn.boundaries)
 
 
 def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray], max_new_tokens: int,

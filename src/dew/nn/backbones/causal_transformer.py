@@ -25,7 +25,7 @@ block, and that is where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, Literal, Self
 
 import jax
@@ -75,15 +75,7 @@ from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
 from ..flops import counted_flops, parameter_flops
 from ..gemma3n import AltUp, clamped_predictions, rescale_to
-from ..hyper_connections import (
-    Carried,
-    HyperConnections,
-    collapse_by,
-    collapse_streams,
-    expand_streams,
-    first_stream,
-    stream_head,
-)
+from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
 from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
@@ -106,6 +98,7 @@ from ..precision import (
 from ..progress import Progress
 from ..protocols import (
     BoundedNorm,
+    ExitPasses,
     OutputTable,
     Projection,
     ProjectionGroup,
@@ -147,7 +140,7 @@ from .decoder_stack import (
     stored_by_stage,
 )
 from .layer_names import group_layers, layer_index
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, run_period, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_streams, run_period, scan_groups
 from .looping import run_loop
 
 _INTERMEDIATES = "intermediates"
@@ -683,15 +676,20 @@ class CausalTransformer(LinearProducts):
     def stored_view(self, store: Variables) -> StackView:
         """How `store` holds this decoder's layer stack (`bank_sites`), as a decoder bound to its shapes
         plans its runs (`SteppedFeedForward`)."""
+        return self._view_of(store, lambda module: StackView(module.groups))
+
+    @nn.nowrap
+    def _view_of(self, store: Variables, read: Callable[[Self], StackView]) -> StackView:
+        """`read` of this decoder bound to `store`'s shapes: through the model's own `apply`, which an
+        adapted model runs under its interceptor, so its runs split where its adapter's targets do
+        (`scanned_like`), as its forward splits them. The view comes back as `read` returns it: Flax types
+        `apply`'s result as anything or a pair."""
         if self.scope is not None:
-            return StackView(self.groups)
-        # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
-        # split where its adapter's targets do (`scanned_like`).
-        view = self.apply(jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
-            method=lambda module: StackView(module.groups))
-        if not isinstance(view, StackView):
-            raise TypeError(f"expected the stack's view from the model, got {type(view).__name__}")
+            return read(self)
+        views: list[StackView] = []
+        shapes = jax.tree.map(lambda x: jax.ShapeDtypeStruct(jnp.shape(x), jnp.result_type(x)), store)
+        self.apply(shapes, method=lambda module: views.append(read(module)))
+        (view,) = views
         return view
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
@@ -876,9 +874,9 @@ class CausalTransformer(LinearProducts):
                 projection(projections[f'altup_unembed_projections_{index}'][1],
                            name=f'altup_unembed_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
-        if self.hyper_connections is not None and self.hyper_connections.head in ('weighted', 'gated'):
-            self.hc_head = stream_head(self.hyper_connections, self.emb_features, self.norm_eps,
-                                       name='hc_head')
+        hc = self.hyper_connections
+        if hc is not None and self.streams_end_stack and hc.head in ('weighted', 'gated'):
+            self.hc_head = stream_head(hc, self.emb_features, self.norm_eps, name='hc_head')
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
                                              name='output_res')
@@ -886,11 +884,16 @@ class CausalTransformer(LinearProducts):
             self.engram_hashes = EngramHashes(spec=self.engram, vocab_size=self.vocab_size,
                                               name='engram_hashes')
         self._final_norm()
+        if self.loop is not None and self.loop.implicit:
+            # Per channel, as a norm's scale: no logical axes, placed whole (`Layout.min_shard`).
+            self.loop_theta = self.param('loop_theta', nn.initializers.zeros, (self.emb_features,),
+                                         jnp.float32)
         if self.loop is not None and self.loop.exit_gate:
+            # Drawn at zero, every pass's hazard a half, where a loaded decoder gains the gate
+            # (`Pretrained.with_model`); Ouro's release stores its own.
             self.early_exit_gate = Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
-                name='early_exit_gate', **normal_kernel(self.initializer_range),
-                dot_general=float32_dot_general)
+                name='early_exit_gate', kernel_init=nn.initializers.zeros, dot_general=float32_dot_general)
         if not self.tie_embeddings:
             self.lm_head = Dense(
                 features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
@@ -948,7 +951,8 @@ class CausalTransformer(LinearProducts):
                 prediction_target=(index if self.dspark is not None and index in self.dspark.target_layers
                                    else None),
                 attention_norm=index > 0 or self.first_attention_norm,
-                dex=None if self.dex is None else self.dex.layer(index))
+                dex=None if self.dex is None else self.dex.layer(index),
+                streams=layer_streams(self.hyper_connections, index, self.num_layers, self.loop is not None))
             for index, layer_type in enumerate(types))
 
     @nn.nowrap
@@ -1005,7 +1009,8 @@ class CausalTransformer(LinearProducts):
             parallel=parallel if spec.routed else None,
             altup=self.altup,
             laurel_rank=self.laurel_rank,
-            hyper_connections=self.hyper_connections,
+            hyper_connections=None if spec.streams is None else self.hyper_connections,
+            streams_at_ends=(False, False) if spec.streams is None else spec.streams,
             residual_site=spec.residual_site,
             dropout_rate=self.dropout_rate,
             remat=self.remat,
@@ -1135,14 +1140,20 @@ class CausalTransformer(LinearProducts):
             # copy: [num_inputs, B, S, D].
             return jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
         hc, depth = self.hyper_connections, self.attention_residuals
-        if hc is not None:
+        if hc is not None and hc.hc_layers is None:
             # The embeddings copied into every residual stream: [B, S, hc_mult, D].
-            streams = expand_streams(x, hc.hc_mult)
-            return Carried(streams, first_stream(streams)) if hc.single_pass else streams
+            return enter_streams(x, hc)
         if depth is not None:
             # The embeddings as the first partial sum after empty blocks: [B, S, blocks + 1, D].
             return jnp.pad(x[:, :, None], ((0, 0), (0, 0), (depth.blocks(self.num_layers), 0), (0, 0)))
         return x
+
+    @property
+    def streams_end_stack(self) -> bool:
+        """Whether the stack hands the final norm mHC's streams, which its own head collapses
+        (`HyperConnections.ends_stack`)."""
+        hc = self.hyper_connections
+        return hc is not None and hc.ends_stack(self.num_layers, self.loop is not None)
 
     def _collapse(self, residual):
         """The last block's residual back to `[B, S, D]` for the final norm,
@@ -1157,13 +1168,10 @@ class CausalTransformer(LinearProducts):
                                for project, copy in zip(self.altup_unembed_projections, x[1:], strict=True)]
             x = jnp.mean(jnp.stack(copies), axis=0)
         streams = x
+        # Streams over a range of layers the stack does not end in left it plain (`leave_streams`).
         hc = self.hyper_connections
-        if hc is not None and hc.head == 'carried':
-            assert isinstance(x, Carried)
-            x = collapse_by(x.pre, x.streams)
-        elif hc is not None:
-            x = collapse_streams(x.streams if isinstance(x, Carried) else x,
-                                 self.hc_head if hc.head in ('weighted', 'gated') else None)
+        if hc is not None and self.streams_end_stack:
+            x = leave_streams(x, hc, self.hc_head if hc.head in ('weighted', 'gated') else None)
         if self.attention_residuals is not None:
             # Every block is finished after the last layer, so the whole state,
             # the blocks and the last partial, is what the output site mixes
@@ -1671,14 +1679,9 @@ class CausalTransformer(LinearProducts):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = constrain(x if self.ngpt is not None or not self.final_norm else self.norm(x), RESIDUAL)
+        hidden = constrain(self.output_states(x), RESIDUAL)
         self._gate_exit(hidden)
-        if self.logits_scaling != 1.0:
-            # (h W) / s is (h / s) W: dividing the states in at least fp32 scores
-            # every head that contracts them, the chunked losses' included, as
-            # lm-engine's logits * (1 / m_width) does; a float64 model's stay float64.
-            wide = at_least_fp32(hidden.dtype)
-            hidden = hidden.astype(wide) / jnp.asarray(self.logits_scaling, wide)
+        hidden = self.head_states(hidden)
         # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
@@ -1693,12 +1696,37 @@ class CausalTransformer(LinearProducts):
         return run_loop(self, x, **stack)
 
     def _gate_exit(self, normed):
-        """Sow the exit gate's logit for a pass's normed states into `exits`."""
+        """Sow the exit gate's logit for the output's states into `exits`, after each earlier pass's."""
         if self.loop is None or not self.loop.exit_gate:
             return
         logit = self.early_exit_gate(normed)
         if not self.is_initializing():
             self.sow('exits', 'logits', logit)
+
+    def output_states(self, x):
+        """The stack's output `x` as the head and the exit gate read it (`normed_output`)."""
+        return self.norm(x) if self.normed_output else x
+
+    @property
+    def normed_output(self) -> bool:
+        """Whether the head reads the stack's output through the final norm: not nGPT's normalized stream."""
+        return self.ngpt is None and self.final_norm
+
+    @nn.nowrap
+    def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses:
+        """What a forward with `exits` open gathered (`Looped`): a loop of one pass has no earlier pass."""
+        exits = collections['exits']
+        return tuple(exits.get('states', ())), tuple(exits['logits'])
+
+    def head_states(self, normed):
+        """The states the head reads from the final norm's `normed`: divided by `logits_scaling`, in at
+        least fp32, where it is not 1."""
+        if self.logits_scaling == 1.0:
+            return normed
+        # (h W) / s is (h / s) W: dividing the states in at least fp32 scores every head that contracts
+        # them, the chunked losses' included, as lm-engine's logits * (1 / m_width) does.
+        wide = at_least_fp32(normed.dtype)
+        return normed.astype(wide) / jnp.asarray(self.logits_scaling, wide)
 
     def stack(self, x, *, train: bool, decode: bool, per_layer_input, attention_metadata=None,
               span: tuple[int, int] | None = None):
@@ -1816,7 +1844,11 @@ class CausalTransformer(LinearProducts):
                 f"layer, which a store already banked by run cannot be reshaped "
                 f"into; {list(banked)} arrived banked. Place the weights per layer "
                 f"for a pipeline, or run the stack whole")
-        if isinstance(x, Carried):
+        split = split_stages(self.specs, stages)
+        hc = self.hyper_connections
+        if hc is not None and hc.single_pass and any(
+                spec.streams is not None for spec in self.specs[split.prefix:self.num_layers - split.suffix]):
+            # The streams of the layers the stages repeat; a range the layers around them hold stays out.
             raise ValueError(
                 "Single-Pass mHC carries each sublayer's collapse beside the streams, "
                 "which the pipeline's microbatch buffers do not hold; run the stack whole")
@@ -1827,7 +1859,7 @@ class CausalTransformer(LinearProducts):
             # loop creates (the routers' sowing) comes out per iteration.
             broadcast=tuple(name for name, tree in self.variables.items() if tree),
             staged=stored_by_stage(self.variables), batch_axis=batch_axis)
-        return view, split_stages(self.specs, stages)
+        return view, split
 
     def _one_stage_runs(self, first: int, end: int, *, banked: bool = False
                         ) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
@@ -1865,16 +1897,7 @@ class CausalTransformer(LinearProducts):
         # scanning would (its periods among them): read as that stack's, it goes back onto its layers.
         held = 'stages' in dict(dict(store).get('params', {}))
         model = self.clone(scan_layers=True) if stages == 1 and held and not self.scan_layers else self
-        if model.scope is not None:
-            view = model.stage_view(stages)
-        else:
-            # Through the model's own `apply`, which an adapted model runs under its interceptor, so its runs
-            # split where its adapter's targets do (`scanned_like`), as its forward splits them.
-            view = model.apply(jax.tree.map(
-                lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store),
-                method=lambda module: module.stage_view(stages))
-            if not isinstance(view, StackView):
-                raise TypeError(f"expected the stack's view from the model, got {type(view).__name__}")
+        view = model._view_of(store, lambda module: module.stage_view(stages))
         if stages == 1 and not (model.scan_layers and any(count > 1 for _, count in view.groups)):
             return ()
         return (DecoderBank((), view),)
@@ -2179,27 +2202,27 @@ class CausalTransformer(LinearProducts):
 
     @nn.nowrap
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
-                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None:
-        """This model with its loop run `steps` times (None keeps its count), over the
-        block `layers` where given (None keeps its block). `backprop_steps`
-        sets how many final passes train through, and `remat` checkpoints
-        each pass; None keeps the loop's own value for either.
+                    backprop_steps: int | None = None, remat: bool | None = None,
+                    implicit: bool | None = None, exit_gate: bool | None = None,
+                    exit_threshold: float | None = None) -> Self | None:
+        """This model with its loop run `steps` times (None keeps its count), over the block `layers`
+        where given (None keeps its block). `backprop_steps` sets how many final passes train through,
+        `remat` checkpoints each pass, `implicit` takes each later pass by the θ-method, and `exit_gate`
+        and `exit_threshold` weigh and take each pass's exit (`Loop`); None keeps the loop's own value.
 
         A model with no loop gains one over `layers`, with no norm between its
-        passes, so one pass computes the model as it was; None when it has no
-        loop and the two do not both say what to add."""
+        passes, so one pass computes the model as it was, and every count does
+        where it is implicit; None when it has no loop and the two do not both
+        say what to add."""
+        stated = {'backprop_steps': backprop_steps, 'remat': remat, 'implicit': implicit,
+                  'exit_gate': exit_gate, 'exit_threshold': exit_threshold}
+        options = {name: value for name, value in stated.items() if value is not None}
         if self.loop is None:
             if steps is None or layers is None:
                 return None
-            return self.clone(loop=Loop(steps, step_norm=False, layers=layers,
-                                        backprop_steps=backprop_steps, remat=remat or False))
+            return self.clone(loop=Loop(steps, step_norm=False, layers=layers, **options))
         return self.clone(loop=dataclasses.replace(self.loop, steps=steps or self.loop.steps,
-                                                   layers=layers or self.loop.layers,
-                                                   backprop_steps=(self.loop.backprop_steps
-                                                                   if backprop_steps is None
-                                                                   else backprop_steps),
-                                                   remat=self.loop.remat if remat is None else remat))
-
+                                                   layers=layers or self.loop.layers, **options))
     @nn.nowrap
     def projected(self, params, *, updated: bool):
         """`ProjectsParameters`: before a training step's update, every AltUp layer's prediction
@@ -2234,10 +2257,9 @@ class CausalTransformer(LinearProducts):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def with_scanned_layers(self, scanned: bool = True) -> Self:
-        """This decoder running its like and periodic runs under the scan (`scan_layers`), or a layer at a
-        time where not `scanned`."""
-        return self.clone(scan_layers=scanned)
+    def with_scanned_layers(self) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
+        return self.clone(scan_layers=True)
 
     @nn.nowrap
     def reads_progress(self) -> bool:

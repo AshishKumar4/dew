@@ -243,7 +243,7 @@ Every numerical acceptance in Dew goes through one gate, with no tolerance of it
 
 The algebra engine plugs into the same gate. A compile-time rule is admitted by its rounding class and held to the gate's contract for that class. The gate runs every reference arm and float64 truth with `passes(on=False)` and the candidate as users run it, the pass on (`tests/arm_arithmetic.py`, `unrewritten`), so a program compared with its unrewritten self passes one function as both arms. The spec's error-aware extraction, the cheapest candidate whose measured check-1 error meets the policy, exists as `dew.algebra.error.choose`, with only tests calling it. It is meant for the dev-time generator, which is parked.
 
-*Where it lives: `dew.nn.precision` (`Numerics`, `Dtypes`, `ACCURATE`, `numerics_of`), `generation.run_precision`, `tests/reference_error.py` (`assert_as_exact`), `tests/check1_statistics.py`, `tests/certified.py` (`assert_certified`), `docs/design/testing.md`.*
+*Where it lives: `dew.nn.precision` (`Numerics`, `Dtypes`, `ACCURATE`, `numerics_of`), `generation.run_precision`, `tests/reference_error.py` (`assert_as_exact`), `src/dew/parity.py`, `tests/certified.py` (`assert_certified`), `docs/design/testing.md`.*
 
 ## Shared contracts
 

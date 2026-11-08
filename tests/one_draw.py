@@ -7,7 +7,9 @@ rows' sizes and errors, and the gate's findings, are reference_error's; its site
 import math
 
 import numpy as np
-import reference_error as gate
+
+from dew import parity as gate
+from dew._accuracy import distance, within
 
 
 def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tuple[str, float, str]]:
@@ -15,7 +17,7 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
     reference's (`gate.row_errors`): its worst row over its own size against the
     reference's worst, at least `floor` (an order floor in the rows' units),
     and each row of size zero, a sum that cancels exactly before anything its
-    terms see (a query that keeps one key), against the reference's gate.distance
+    terms see (a query that keeps one key), against the reference's distance
     on that same row, which is all the evidence such a row has: where the
     reference is exactly the float64 zero, Dew must be too. Each as `(rule,
     measure, message)`, a `gate.Finding`'s rule, measure and message (RULES)."""
@@ -30,9 +32,9 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
         allowed = max(their_row, float(gate.log_over(floor, 1.0)))
         if not row <= math.log(gate.ROW_FACTOR) + allowed:
             over.append(("row", row - allowed,
-                         f"the worst row is {gate.shown(row)} from float64 over its size, the reference's "
-                         f"{gate.shown(their_row)}, allowed "
-                         f"{gate.shown(math.log(gate.ROW_FACTOR) + allowed)}"))
+                         f"the worst row is {gate._shown(row)} from float64 over its size, the reference's "
+                         f"{gate._shown(their_row)}, allowed "
+                         f"{gate._shown(math.log(gate.ROW_FACTOR) + allowed)}"))
     zero = ~sized & ~(mine <= gate.ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])
@@ -44,16 +46,16 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
 
 
 def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
-    """Dew gate.within gate.FACTOR times the reference's RMS gate.distance from float64, and
-    its rows gate.within gate.ROW_FACTOR times the reference's (`rows_over`), each
+    """Dew within gate.FACTOR times the reference's RMS distance from float64, and
+    its rows within gate.ROW_FACTOR times the reference's (`rows_over`), each
     sized by its float64 `terms` where they are given (`float64_terms`)."""
-    mine, theirs = gate.distance(dew, truth), gate.distance(reference, truth)
+    mine, theirs = distance(dew, truth), distance(reference, truth)
     if not (math.isfinite(mine) and math.isfinite(theirs)):
         raise gate.GateFailure([gate.Finding(
             label, "not finite", 1, f"{label}: a value of dew, the reference or float64 is not finite (dew "
             f"{mine:.3e} and the reference {theirs:.3e} from float64)")])
     if not theirs > 0:
-        # No measure: Dew's own gate.distance from float64 is what a change can make worse, and none at all
+        # No measure: Dew's own distance from float64 is what a change can make worse, and none at all
         # is a site that cannot be judged (`no measure`), never a pass.
         if mine > 0:
             raise gate.GateFailure([gate.Finding(
@@ -63,7 +65,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
             label, "no measure", 0.0,
             f"{label}: the reference and dew both equal float64, so the site measures nothing")])
     found = []
-    if not gate.within(mine, gate.FACTOR * theirs):
+    if not within(mine, gate.FACTOR * theirs):
         found.append(("pooled", gate.log_ratio(mine, theirs), f"dew is {mine:.3e} from float64 (rms), the "
                       f"reference {theirs:.3e} (ratio {mine / theirs:.2f}, allowed {gate.FACTOR})"))
     # Every rule's findings at once, so a change that eases one rule and breaks another shows both.
@@ -75,7 +77,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:
-    """An unchanged computation has no larger float64 gate.distance than its source."""
-    mine, theirs = gate.distance(dew, truth), gate.distance(reference, truth)
-    assert gate.within(mine, theirs), (
+    """An unchanged computation has no larger float64 distance than its source."""
+    mine, theirs = distance(dew, truth), distance(reference, truth)
+    assert within(mine, theirs), (
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")

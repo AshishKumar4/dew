@@ -625,11 +625,12 @@ SIGNS = {True: "gaussian", False: "same sign"}
 
 def cell(check, *args) -> Cell:
     """`check` on `args` as one cell of the flow, labelled by its name and arguments, run under the
-    generation among them (`gpu_flow.Cell`)."""
+    generation among them (`gpu_flow.Cell`), its kernels Mosaic GPU's but where it forces Triton's (every
+    other check certifies the Mosaic GPU template's)."""
     shown = [SIGNS[arg] if isinstance(arg, bool) else getattr(arg, "__name__", str(arg)) for arg in args]
     generation = next((arg for arg in args if arg in GENERATIONS), None)
     return Cell(f"{check.__name__.replace('_', ' ')}: {' '.join(shown)}", functools.partial(check, *args),
-                generation)
+                generation, mosaic="triton" not in args)
 
 
 def test_the_native_kernels_certify_on_this_gpu():

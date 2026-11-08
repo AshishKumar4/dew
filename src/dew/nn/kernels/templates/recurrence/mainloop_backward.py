@@ -63,7 +63,8 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
     delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
-    (the accurate forms) take none. A decay a key dimension's form takes either pair factoring its layer's
+    (the accurate forms, or a form without the delta rule on its route, `recurrence_chunk.chunk_rounding`)
+    take none. A decay a key dimension's form takes either pair factoring its layer's
     floor gives (`algebra.factored_range`, `algebra.key_diagonal_pairs_back`)."""
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
@@ -575,11 +576,6 @@ def _query_key_split(call: Call) -> int:
         _, scope, _, _ = shared_allocation(call, tiles, (), _query_key_landing(call, call.value_width // vq))
         return resources.shared_bytes(call.family, scope(1))
 
-    if not call.interpret:
-        # Compiled, a split's weights' gradient lands zero, interpreted right (an fp32 call's at a 32-wide
-        # split on an H100, dw-split-h100-7ac824e06, row 4346): the whole row, or past the block's shared
-        # memory no fast backward (`template.backward_holds`), the call's training the port's.
-        return call.value_width
     budget = generation.shared_budget(call.target)
     return next((vq for vq in whole_blocks(call.value_width, call.block) if streamed(vq) <= budget),
                 call.block)
@@ -592,12 +588,13 @@ def _gradient_stored(call: Call, kind: str, block: int, grad, *, weights: Sequen
     and keys' ('dq', 'dk') to `sums[kind]` summed over the key head's value heads in fp32, stored at the
     first (`first`) and added at the rest (`Family.added`: a TMA reduction, or whole rows through
     registers), each through its launch's landing tiles. A value split's (`apart`) weights' gradient is its
-    split's own part of it, fp32, which XLA adds."""
+    split's own part of it, fp32, which XLA adds, stored as the queries' and keys' split sums are, through
+    their landing tile (M-JS-8, row 4346)."""
     del block
     family = call.family
     if kind == "dw":
         if apart:
-            family.stored([grad], weights, smem=landing["weights"])
+            family.stored([grad], weights, smem=landing["sums"])
             return
         pieces = product.formed(grad.astype(jnp.float32), call.held.parts) if call.held.parts > 1 else (grad,)
         family.stored([piece.astype(call.held.stored) for piece in pieces], weights, smem=landing["weights"])
@@ -641,11 +638,13 @@ def _query_key_held(call: Call) -> Held:
 
 
 def _query_key_landing(call: Call, splits: int) -> dict:
-    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule (fp32
-    where there are two splits or more) and the queries' and keys' sums."""
+    """`_query_key`'s stores' tiles at `splits` value splits: the weights' gradient with the delta rule, its
+    own where a launch takes whole rows (a split's lands through the sums', `_gradient_stored`), and the
+    queries' and keys' sums."""
     held = dataclasses.replace(call.held, rows=call.rows)
-    weights = held.landing(CHUNK, call.block) if splits == 1 else ((CHUNK, call.block), jnp.float32)
-    return {**({"weights": weights} if call.delta else {}), "sums": ((CHUNK, call.block), jnp.float32)}
+    own = call.delta and splits == 1
+    return {**({"weights": held.landing(CHUNK, call.block)} if own else {}),
+            "sums": ((CHUNK, call.block), jnp.float32)}
 
 
 def _query_key_launched(call: Call, vq: int) -> tuple[dict, tuple]:

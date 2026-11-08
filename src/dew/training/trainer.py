@@ -268,9 +268,10 @@ class Trainer(Generic[Loss, Effects]):
         lowers the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
         step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
-        config. It measures Dew's own launches (`KernelOp`: the kernel templates,
-        `attention_impl="template"`); tokamax's flash kernel (`attention_impl="triton"`) runs at tokamax's
-        heuristic config, which it does not measure. `record` makes each step return in its metrics what each
+        config. It measures each of Dew's own launches that declares variants to time (`KernelOp`: the
+        kernel templates, `attention_impl="template"`, the norms, SwiGLU and decode attention); tokamax's
+        flash kernel (`attention_impl="triton"`) runs at tokamax's heuristic config, which it does not
+        measure. `record` makes each step return in its metrics what each
         evaluation, replays too, sampled or passed as a boundary (`taken_record`). `links` states an axis's
         `Link` by name in place of measuring it (`_links`). `param_dtype`, a dtype's name, stores the
         parameters the run draws fresh, as Flax's `param_dtype` (`dew.state.drawn_in`); None keeps each
@@ -455,8 +456,11 @@ class Trainer(Generic[Loss, Effects]):
         return self._key
 
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
-        """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
+        """Take `loader`'s device steps, prefetch and clock (`clocked`), and the batches its steps read, each
+        phase's (`Loader.batches`), which every split a plan takes cuts (`splits`), as fit and compile-ahead
+        do."""
         self._device, self._prefetch = loader.device, prefetch
+        self._rows = loader.batches or (loader.batch,)
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
                                  custom_progress=self.step is not None and progress)
@@ -697,8 +701,11 @@ class Trainer(Generic[Loss, Effects]):
             # The rate this run configures, not the one its checkpoint holds.
             state = rates_set(state, lambda held: with_rates(held, config.rates()))
         self._resume_rung(checkpoints.rung(resume))
-        from dew.nn.inputs import request_key
-        state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
+        # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
+        # run's own key's.
+        key = state.key if jnp.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (
+            jax.random.wrap_key_data(state.key, impl=jax.random.key_impl(self.key)))
+        state = dataclasses.replace(state, key=jax.device_put(key, shardings.key))
         if int(state.window_size) % self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         self._display.note(f"Resumed from step {resume} in {checkpoints.source(resume)}")
@@ -1587,15 +1594,17 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
+            stages = run.source.stages if isinstance(run.source, RampedStream | PhasedStream) else ()
+            self._ramp = stages if isinstance(run.source, RampedStream) else ()
             # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
-            # ramp's here, a schedule's as each begins (`_scheduled`); the step lays its window out there.
+            # ramp's and phases' of other batches here (`PhasedStream.stages`), a schedule's as each begins
+            # (`_scheduled`); the step lays its window out there.
             self._stage_starts = frozenset(accumulate((after.records - stage.records) // stage.batch
-                                                      for stage, after in pairwise(self._ramp)))
+                                                      for stage, after in pairwise(stages)))
             if self._ramp:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
-            self._rows = (plan.dataset.batch,)
+
             run.partition = partition
             run.train = self._prefetched(plan, run, run.source, position)
             run.source = None  # Lifetime transferred to the prefetch worker.

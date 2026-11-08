@@ -1,10 +1,13 @@
-"""Source-file loading for tools exercised by several test suites, and git in a test's scratch repository."""
+"""Source-file loading for tools exercised by several test suites, git in a test's scratch repository, and a
+node session's side of a measurement window."""
 
 import importlib.util
 import os
 import subprocess
 import sys
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
@@ -72,3 +75,70 @@ def lint_module(lint: ModuleType, root: Path, parts: tuple[str, ...], body: str)
 def lint_codes(lint: ModuleType, root: Path, parts: tuple[str, ...], body: str) -> list[str]:
     """The codes `lint` reports for `body` written at `parts` under `root` (`lint_module`)."""
     return [finding.code for finding in lint.check(lint_module(lint, root, parts, body))]
+
+
+class StandInSession:
+    """A node session's side of a measurement window, as a job meets it: `$SESSION` (the directory holding
+    `wake`, the FIFO a session reads) and `$OUT` (its job's directory, where the job writes `window` and the
+    session answers `window.granted`). A thread plays the session and reads each wake. A request is granted
+    once `grants` is set, or answered in its words by `refusal`. A window its job ended is acknowledged (its
+    grant removed) once `acks` is set, after `on_release` has run. Both events are set to begin with; a test
+    clears one to hold the session back. `asked` is each request's text, `granted` and `released` when each
+    happened."""
+
+    def __init__(self, root: Path):
+        self.session = root / "session"
+        self.out = self.session / "out"
+        self.out.mkdir(parents=True)
+        os.mkfifo(self.session / "wake")
+        # Opened to read and write, as a session opens it: a write never waits for a reader.
+        self.wake = os.open(self.session / "wake", os.O_RDWR)
+        self.asked: list[str] = []
+        self.granted: list[float] = []
+        self.released: list[float] = []
+        self.grants, self.acks = threading.Event(), threading.Event()
+        self.grants.set()
+        self.acks.set()
+        self.refusal: str | None = None
+        self.on_release: Callable[[], None] | None = None
+        self.closing = False
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+
+    @property
+    def environment(self) -> dict[str, str]:
+        """What a job's process is given of its session, as a session gives a measuring job it runs packed,
+        which may ask for windows (`DEW_WINDOW`)."""
+        return {"SESSION": str(self.session), "OUT": str(self.out), "DEW_WINDOW": "1"}
+
+    def __enter__(self) -> "StandInSession":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_) -> None:
+        self.closing = True
+        self.grants.set()
+        self.acks.set()
+        os.write(self.wake, b"x")
+        self.thread.join(10)
+        os.close(self.wake)
+
+    def serve(self) -> None:
+        request, granted = self.out / "window", self.out / "window.granted"
+        while os.read(self.wake, 1) and not self.closing:
+            if request.exists() and not granted.exists():
+                self.asked.append(request.read_text())
+                if self.refusal is not None:
+                    request.unlink()
+                    written = self.out / ".window.refused"
+                    written.write_text(self.refusal)
+                    written.replace(self.out / "window.refused")
+                    continue
+                self.grants.wait()
+                self.granted.append(time.time())
+                granted.touch()
+            elif granted.exists() and not request.exists():
+                self.released.append(time.time())
+                if self.on_release is not None:
+                    self.on_release()
+                self.acks.wait()
+                granted.unlink()
