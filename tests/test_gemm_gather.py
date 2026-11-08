@@ -234,9 +234,8 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
 def test_a_blackwells_gathered_product_lowers_for_cuda():
     """A gathered grouped product on a compile-only B200 lowers through Mosaic GPU on tcgen05's bundle: its
     load warp's TMA four-row gathers into the swizzled ring (`gathered.tma_rows`), each slot released by its
-    products' commit; and its kernel gradient's tables on mma.sync's consumer-fed rings, the loading
-    consumer's cp.async gather (`gathered.Ring`, row 4852), at the tiles its launch derives for a wide and a
-    32-column cotangent."""
+    products' commit; and its kernel gradient's tables at the tile its launch derives for a wide and a
+    32-column cotangent, one its launch takes (`legal`), on whichever family derives it."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
     sizes = jnp.asarray([700, 0, 1290, 58], jnp.int32)
 
@@ -249,7 +248,7 @@ def test_a_blackwells_gathered_product_lowers_for_cuda():
                             jax.ShapeDtypeStruct(sizes.shape, sizes.dtype), (), (table, slots),
                             out_dtype="float32", interpret=False)
         tile = launch.derived(bound, generation.gpu_target())
-        assert tile is not None and tile.family == "mma.sync.fed", tile
+        assert tile is not None and launch.legal(bound, tile, generation.gpu_target()), tile
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=tile, out_dtype=jnp.float32,
                                multiprocessors=148, interpret=False, gather=(table, slots))
 

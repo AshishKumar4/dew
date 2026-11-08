@@ -38,6 +38,7 @@ from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_portable,
+    bodies,
     mosaic,
     mosaic_sm100,
     resources,
@@ -411,7 +412,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
         kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type,
                           rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
-        interpret=mosaic.interpreted(interpret), warpgroups=WARPGROUPS,
+        interpret=bodies.interpreted(interpret), warpgroups=WARPGROUPS,
         # A name a form (the default's fold and its natural rewalk compile apart).
         name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)
