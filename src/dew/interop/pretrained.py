@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import json
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -668,7 +669,7 @@ class Pretrained:
         from dew.batch import merge, thaw
 
         held = {("params", *path) for path in flatten_dict(dict(thaw(self.variables).get("params", {})))}
-        declared = jax.eval_shape(_initialized, model, jax.random.key(0))
+        declared = jax.eval_shape(functools.partial(_initialized, model), jax.random.key(0))
         missing = {("params", *path) for path in flatten_dict(dict(declared.get("params", {})))} - held
         if not missing:
             return replace(self, model=model)
