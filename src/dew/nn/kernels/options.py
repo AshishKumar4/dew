@@ -405,11 +405,10 @@ class OuterProgram:
 
     def executable(self, *args, **kwargs) -> jax.stages.Compiled:
         """The executable a call with these arguments runs, compiled at the first: called with the dynamic
-        arguments alone, as a caller that calls it every step does, building no dispatch key. A program
-        with settled arguments is called whole (`held`), which an executable's caller would skip."""
-        if self.settled:
-            raise ValueError(f"{self.function.__qualname__} reads settled arguments, which its calls hold "
-                             "(`held`): call the program, or its `Fetched`")
+        arguments alone, as a caller that calls it every step does, building no dispatch key. These
+        arguments held to the settled ones' contract (`held`); a caller running the executable again holds
+        each call's (`Fetched`)."""
+        self.held(args, kwargs)
         key, _, _ = self._keyed(args, kwargs)
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
@@ -563,12 +562,12 @@ class Fetched:
         self._executables: dict[Hashable, jax.stages.Compiled] = {}
 
     def __call__(self, *args, **kwargs):
-        self.program.held(args, kwargs)
         context = jax_config.trace_context()
         executable = self._executables.get(context)
         if executable is None:
-            key, _, _ = self.program._keyed(args, kwargs)
-            executable = self._executables[context] = self.program._kept(key, args, kwargs)
+            executable = self._executables[context] = self.program.executable(*args, **kwargs)
+        else:
+            self.program.held(args, kwargs)
         return executable(*args, **kwargs)
 
 
