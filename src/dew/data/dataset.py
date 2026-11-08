@@ -479,11 +479,11 @@ class Loading:
         least where it waits on them, the count beside the square root of the mean time a sampled batch
         takes to make, read in turn with no thread reading ahead, each after the first, which opens the
         read, times the `batches` the run reads (its planned steps), over a worker's start there
-        (`Host.started`), at most as many as the CPUs and the memory hold. On a GH200 a decision run of 1,500 steps, 15 ms of
-        Python a batch, took 100 s in the process at 20 ms a step; 64 workers, the CPUs', 168 s at 12.4 ms;
-        13, as many as its Python pays the starts of, 136 s at 11.1 ms. A short run, one whose batches
-        take no Python to speak of, or one whose length nothing states (None), which no measure shows
-        they pay for, reads in the process."""
+        (`Host.started`), at most as many as the CPUs and the memory hold. On a GH200 a decision run of
+        1,500 steps, 15 ms of Python a batch, took 100 s in the process at 20 ms a step; 64 workers, the
+        CPUs', 168 s at 12.4 ms; 13, as many as its Python pays the starts of, 136 s at 11.1 ms. A short
+        run, one whose batches take no Python to speak of, or one whose length nothing states (None),
+        which no measure shows they pay for, reads in the process."""
         if self.workers != "auto":
             return self
         reading, sampled, seconds = iter(records), [], []
