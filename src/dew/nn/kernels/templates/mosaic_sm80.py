@@ -541,6 +541,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     gathers_rows = True  # its one warpgroup's cp.async copies gather a step's rows (`_gathered_walk`)
+    gathers_alone = False  # its walk gathers every stream's rows or none (`streams`)
     gathers_interpreted = True
 
     pieces_of_views = False  # its pieces are a table's runs (`_run`), a paged call's pages alone
