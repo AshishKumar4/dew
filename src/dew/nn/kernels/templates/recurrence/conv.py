@@ -156,37 +156,30 @@ class _Piece:
         return short_conv.preactivation(window, self.taps, self.bias)
 
 
-def _named(kernel: str, first: int, width: int) -> str:
-    """A piece's launch's name, which its call's location carries (`lowered.kernel_calls`): its kernel's and
-    its channels'. A call's pieces are each a module of its own (`first` static), which a profile and the
-    compile gate tell apart by name (`kernel_compile.kernel_modules`)."""
-    return f"{kernel}_{first}_{width}"
+def _named(kernel: str, parts: tuple) -> str:
+    """A launch's name, which its call's location carries (`lowered.kernel_calls`): its kernel's and its
+    pieces' widths, a normalised piece's marked."""
+    return kernel + "_" + "_".join(f"{width}{'n' if head else ''}" for width, head in parts)
 
 
-STATIC = ("first", "width", "head", "lanes_", "activation", "eps", "dtype", "family", "interpret")
-"""A piece's launch's static arguments (`tuning.lowered_once`): its channels, its norm and activation, its
-output's dtype, its bundle; every other argument an array or None. Lowered once a configuration: a model's
-layers' identical convs were each lowered again (two Mamba layers six Mosaic calls to one's four,
-jsf-r06p)."""
-
-
-@tuning.lowered_once(STATIC)
-def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: int | None, lanes_: int,
-            activation: bool, eps: float, dtype, family: mosaic.Family, interpret: bool = False):
-    """A piece's output `[B, T, width]` of `x`'s channels `first` to `first + width`, convolved by `taps`
-    `[C, K]` plus `bias`, activated and, with a `head`, l2-normalised over each head; `lanes_` channels a
-    program (`lanes`)."""
+@tuning.lowered_once(("parts", "activation", "eps", "dtype", "family", "interpret"))
+def forward(x, taps, bias, valid, documents, *, parts: tuple, activation: bool, eps: float, dtype,
+            family: mosaic.Family, interpret: bool = False):
+    """Every piece's output in one launch, `[B, T, width]` each of `parts` (each `(width, head)` in channel
+    order): `x`'s channels convolved by `taps` `[C, K]` plus `bias`, activated and, a piece with a `head`,
+    l2-normalised over each head, each program's channels its piece's (`lanes`). Lowered once a configuration
+    (`tuning.lowered_once`): a model's layers' identical convs were each lowered again (two Mamba layers six
+    Mosaic calls to one's four, jsf-r06p). A launch a piece, a decode token's conv took three, 10.1 us on an
+    H100 against the Triton conv's one at 4.8 (M-JS-25)."""
     rows, length, _ = x.shape
-    count, tokens = taps.shape[1], _tokens(length)
-    unrolled, group = _unrolled(tokens), _group(head, lanes_)
+    count, tokens, lanes_ = taps.shape[1], _tokens(length), lanes(parts)
+    unrolled = _unrolled(tokens)
     operands = [x, taps.T, bias, valid, documents]
+    bounds = [(first // lanes_, (first + width) // lanes_, first, head)
+              for first, width, head in pieces(parts)]
 
-    def entry(*refs):
-        *given, out_ref, exchanged = refs
-        given = iter(given)
-        piece = _Piece([next(given) if operand is not None else None for operand in operands], first=first,
-                       local=lax.axis_index("channels") * lanes_, length=length, count=count,
-                       tokens=tokens, lanes_=lanes_)
+    def walk(piece: _Piece, out_ref, exchanged, head: int | None):
+        group = _group(head, lanes_)
 
         def turn(i, held):
             first_token = piece.start + i * unrolled
@@ -204,12 +197,24 @@ def forward(x, taps, bias, valid, documents, *, first: int, width: int, head: in
         lax.fori_loop(0, tokens // unrolled, turn,
                       [piece.read(piece.start - count + 1 + j) for j in range(count - 1)])
 
-    name = _named("short_conv", first, width)
-    launched = mosaic.kernel(entry, out_type=jax.ShapeDtypeStruct((rows, length, width), dtype),
-                             grid=(rows, pl.cdiv(length, tokens), width // lanes_),
+    def entry(*refs):
+        *given, exchanged = refs
+        given, out_refs = given[:-len(parts)], given[-len(parts):]
+        given = iter(given)
+        found = [next(given) if operand is not None else None for operand in operands]
+        program = lax.axis_index("channels")
+        for (lo, hi, first, head), out_ref in zip(bounds, out_refs, strict=True):
+            @pl.when((program >= lo) & (program < hi))
+            def _(lo=lo, first=first, head=head, out_ref=out_ref):
+                walk(_Piece(found, first=first, local=(program - lo) * lanes_, length=length, count=count,
+                            tokens=tokens, lanes_=lanes_), out_ref, exchanged, head)
+
+    out_type = tuple(jax.ShapeDtypeStruct((rows, length, width), dtype) for width, _ in parts)
+    grid = (rows, pl.cdiv(length, tokens), x.shape[-1] // lanes_)
+    launched = mosaic.kernel(entry, out_type=out_type, grid=grid,
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
-                             family=family.name, name=name, scratch=(scan.scratch(),))
-    return launched(*(operand for operand in operands if operand is not None))
+                             family=family.name, name=_named("short_conv", parts), scratch=(scan.scratch(),))
+    return tuple(launched(*(operand for operand in operands if operand is not None)))
 
 
 @tuning.lowered_once(("parts", "activation", "eps", "family", "interpret"))
@@ -244,10 +249,10 @@ def backward(x, taps, bias, valid, documents, dys, *, parts: tuple, activation: 
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
     out_type = (jax.ShapeDtypeStruct((rows, length, channels), x.dtype), f32((rows, blocks, count, channels)),
                 f32((rows, blocks, channels)))
-    name = "short_conv_backward_" + "_".join(f"{width}{'n' if head else ''}" for width, head in parts)
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, blocks, channels // lanes_),
                              grid_names=("rows", "tokens", "channels"), warpgroups=1, interpret=interpret,
-                             family=family.name, name=name, scratch=(scan.scratch(),))
+                             family=family.name, name=_named("short_conv_backward", parts),
+                             scratch=(scan.scratch(),))
     dx, dw, db = launched(*(operand for operand in operands if operand is not None), *dys)
     return dx, jnp.sum(dw, axis=(0, 1)), jnp.sum(db, axis=(0, 1))
 
