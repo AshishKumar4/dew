@@ -1427,6 +1427,12 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                                      epilogue_axes, dtypes, several=several, summed_as=summed_as or dtypes,
                                      transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu,
                                      precision=precision, dense=dense), scatter)
+        if not callable(launch) and (gather is not None or scatter is not None):
+            # No launch reads the rows where they lie or writes them at their slots (mma.sync's bundle
+            # gathers none, row 5213): the rows gathered first and the outputs put at their slots after, the
+            # grouped launches taking the rows between, never XLA's ragged dot over every group's matrix.
+            return scattered(kernel(lhs if gather is None else lhs[gather], rhs, group_sizes, prologue_arrays,
+                                    epilogue_arrays, paired, first, None, None, interpret=interpret), scatter)
         if not callable(launch):
             return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather,
                             scatter)

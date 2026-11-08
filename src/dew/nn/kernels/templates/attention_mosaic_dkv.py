@@ -324,10 +324,10 @@ def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_sm
             def issue(acc):
                 for other in range(consumers):
                     keys = k_smem.at[other].at[:, share]
-                    acc = family.products(acc, staged.at[other].transpose((1, 0)), keys, walk.interpret)
+                    acc = family.products(acc, staged.at[other].transpose((1, 0)), keys)
                 return acc
 
-            dq = family.summed((rows, columns), issue, walk.interpret)
+            dq = family.summed((rows, columns), issue)
             if box is None:
                 _dq_added(walk, dq_ref, out_stage, place, index, q_first, dq, columns=share)
             else:
