@@ -116,7 +116,10 @@ class Budget:
     Each shape is a program, compiled before a server's first pass (`ScoringServer.from_task`), minutes
     each for a large backbone. Fewer shapes compile fewer programs and pad passes differently: one length
     (the layout's window) often wastes less than several, as first-fit packs many short rows into a long
-    window, whose attention costs about its rows where its route skips the masked blocks between them.
+    window, whose attention costs about its rows where its route skips the masked blocks between them:
+    on a GH200 a 2,048-wide, 8-layer decoder's forward over 10 rows of 29,659 tokens took 540 ms in one
+    32,768-token window and in four of 8,192 alike (attention "auto"), where XLA's, which masks a window
+    whole, ran out of memory at 32,768 (TD-SCORE-window).
     """
 
     tokens: int = 16384
