@@ -64,7 +64,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     # A run naming a head of its own over the Laya release draws it over the release's backbone, its rows
     # laid out by the release's own tokenizer, which the backbone alone does not hold, and trains.
     joint = ["head:joint-shape", "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1",
-             "--head.heads", "2", "--head.feedforward", "32"]
+             "--head.heads", "2", "--head.feedforward", "32", "--max-len", "768"]
     drawn = started(source, "fresh_head", "--source.step", "latest", *joint)
     assert int(drawn.step) == 1
 

@@ -26,8 +26,8 @@ def test_a_fresh_group_claims_the_fresh_modules_ahead_of_its_own_patterns():
     one before the run names them."""
     grouped = OptimConfig(learning_rate=RATE, param_groups=(
         dataclasses.replace(FRESH, patterns=("head/*",)), BASE)).with_fresh(("layers_1/cross_attention",))
-    claimed = ("layers_1/cross_attention", "layers_1/cross_attention/*", "head/*")
-    assert grouped.param_groups == (dataclasses.replace(FRESH, patterns=claimed, fresh=False), BASE)
+    assert grouped.param_groups == (
+        dataclasses.replace(FRESH, patterns=("layers_1/cross_attention/*", "head/*"), fresh=False), BASE)
     plain = OptimConfig(learning_rate=RATE, param_groups=(BASE,))
     assert plain.with_fresh(("layers_1/cross_attention",)) == plain
     claiming = OptimConfig(learning_rate=RATE, param_groups=(FRESH, BASE))
