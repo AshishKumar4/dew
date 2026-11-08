@@ -109,7 +109,7 @@ def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype
         return out_type
     if peaks:
         # Its rows' maxima and anchor keys, and their reach where it reads the keys' magnitudes (`shifts`:
-        # `algebra.Reach`'s largest magnitude and count of keys seen).
+        # `algebra.Reach`'s largest weighted value term and count of keys seen).
         rows_type = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
         return (rows_type, jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
                 *((rows_type, rows_type) if shifts else ()))
@@ -698,9 +698,9 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
     value_width = value.shape[3]
-    # Each key's largest value magnitude, which its rows' shifts read (`_Read.magnitudes`).
-    magnitudes = (jnp.swapaxes(jnp.max(jnp.abs(v), axis=-1).astype(jnp.float32), 1, 2) if spec.headroom
-                  else None)
+    # Each key's largest value magnitude as its log2, which its rows' shifts read (`_Read.magnitudes`).
+    magnitudes = (jnp.swapaxes(jnp.log2(jnp.max(jnp.abs(v), axis=-1).astype(jnp.float32)), 1, 2)
+                  if spec.headroom else None)
 
     def launch(form: algebra.Forward, live: jax.Array | None):
         assert live is None, "the training walk shifts its rows in its one walk: none walks again"
@@ -756,7 +756,8 @@ def _shifts(reach: algebra.Reach, hooked: _Hooked) -> jax.Array:
     of at most its sums' largest magnitude (its factor to the walk's maximum at most 1)."""
     if hooked.initial is not None:
         acc = hooked.initial[2]
-        reach = algebra.Reach(jnp.maximum(reach.largest, jnp.max(jnp.abs(acc), axis=-1)), reach.seen + 1)
+        term = jnp.maximum(reach.term, jnp.log2(jnp.max(jnp.abs(acc), axis=-1)))
+        reach = algebra.Reach(term, reach.seen + 1)
     return algebra.row_shift(reach, 1.0 if hooked.drop is None else hooked.drop.bound)
 
 
@@ -767,11 +768,6 @@ def _whole(array: jax.Array, parts: int) -> jax.Array:
     if parts == 1:
         return array
     return jnp.sum(array.astype(jnp.float32).reshape(parts, -1, *array.shape[1:]), axis=0)
-
-
-def _widened(array: jax.Array, width: int) -> jax.Array:
-    """`array` with its last axis padded to `width`, as this mainloop's launch stages values (`_columns`)."""
-    return jnp.pad(array, ((0, 0),) * (array.ndim - 1) + ((0, width - array.shape[-1]),))
 
 
 def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -858,9 +854,9 @@ class _Read(NamedTuple):
     a row block (`Family.fixed_up`), never declared outputs, which would be left partly unwritten
     (NSNAN-2)."""
     magnitudes: jax.Array | None = None
-    """A peak walk's keys' value magnitudes `[B, KV, Kp]` fp32, each key's largest over its columns, from
-    which its rows' shifts are read (`_peak_consumer`, `algebra.row_shift`), where its values can carry a
-    training walk's sums past fp32's largest."""
+    """A peak walk's keys' value magnitudes `[B, KV, Kp]` fp32, each key's largest over its columns as its
+    log2, from which its rows' shifts are read (`_peak_consumer`, `algebra.row_shift`), where its values
+    can carry a training walk's sums past fp32's largest."""
     kept: jax.Array | None = None
     """The rows a launch `into` the plain launch's outputs writes (`[B, H, S·Qp]` int32, nonzero at a row it
     keeps): the rows it walks, the plain launch's bits at every other row."""
@@ -1604,7 +1600,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     `algebra.anchored`), over the key tiles it reads through the family's key stream, the logits under the
     score hook as the training walk forms them (`_scored`), stored through the row stages to `peak_views`;
     with its keys' value `magnitudes` (`_Read.magnitudes`), each row's reach besides (`algebra.reach_step`:
-    its keys' largest magnitude and their count, from which the training walk's shift is formed,
+    its keys' largest weighted value term and their count, from which the training walk's shift is formed,
     `algebra.row_shift`). Its turns on the tensor cores and the slots its partner alone reads are the
     training walk's own (`_consumer`)."""
     family, tiles = program.family, program.tiles
@@ -1625,13 +1621,14 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
         if magnitudes is None:
             return (found, arg[1]), accumulators
         tile = family.columns_of(magnitudes.at[row, kv_head, pl.ds(index * tiles.block_k, tiles.block_k)])
-        return (found, algebra.reach_step(arg[1], logits, tile)), accumulators
+        reach = algebra.reach_step(spec, arg[1], arg[0].peak, found.peak, logits, tile)
+        return (found, reach), accumulators
 
     row, _, kv_head = place
     # Its rows' reach (`algebra.Reach`), which only a walk reading the keys' magnitudes moves.
     start = (algebra.Argmax(family.full((tiles.block_q,), -jnp.inf),
                             family.full((tiles.block_q,), 0, jnp.int32)),
-             algebra.Reach(family.zeros((tiles.block_q,)), family.zeros((tiles.block_q,))))
+             algebra.Reach(family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,))))
     walked, _ = family.walk_own(
         streams, views, (lo, hi), streamed, consumer,
         lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), start, (), interpret,
@@ -1639,7 +1636,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
         between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     arg, reach = walked
-    rows = (arg.peak,) if magnitudes is None else (arg.peak, reach.largest, reach.seen)
+    rows = (arg.peak,) if magnitudes is None else (arg.peak, reach.term, reach.seen)
     family.stored(tuple(map(family.as_row, rows)), (peak_views[0], *peak_views[2:]), smem=row_smem)
     family.stored((family.as_row(arg.key),), (peak_views[1],), smem=keys_smem)
 
@@ -1704,10 +1701,10 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     layout, each block's rows one contiguous slab. A peak walk
     (`peaks`) reads the keys alone and gives each row's keys' largest logit `[B, H, Qp]` fp32 in the walk's
     units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`), and with the keys' value `magnitudes`
-    (`_Read.magnitudes`) each row's reach, its keys' largest magnitude and their count `[B, H, Qp]` fp32
-    each (`algebra.Reach`), from which a training walk's `anchors` carry its shift (`algebra.Argmax.shift`).
-    With `finishes`, the output's launch also gives its rows' finished maxima and denominators `[2, B, H,
-    Qp]` fp32 (`Output`, `algebra.finish`).
+    (`_Read.magnitudes`) each row's reach, its keys' largest weighted value term and their count `[B, H,
+    Qp]` fp32 each (`algebra.Reach`), from which a training walk's `anchors` carry its shift
+    (`algebra.Argmax.shift`). With `finishes`, the output's launch also gives its rows' finished maxima
+    and denominators `[2, B, H, Qp]` fp32 (`Output`, `algebra.finish`).
     Its kernel is built once for every call of its static facts (`_launched`, `tuning.lowered_once`): a
     model's layers alike lower one. With `splits` (an inference launch's, no initial state), each query
     tile's keys are cut into that many slices (`_Program.splits`), each a program of its own, and every

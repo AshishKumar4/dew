@@ -805,7 +805,13 @@ def needed(total: jax.Array, reach: jax.Array, bound: float = 1.0) -> jax.Array:
     many binades as that product passes it by (log2 rounded up, so the bound holds whatever their
     rounding). A dropping call's draw multiplies each weight by at most `bound`, which counts in the log
     rather than in a product: `reach * bound` may itself pass fp32's largest."""
-    log = jnp.log2(total) + jnp.log2(reach)
+    return binades_past(jnp.log2(total) + jnp.log2(reach), bound)
+
+
+def binades_past(log: jax.Array, bound: float = 1.0) -> jax.Array:
+    """`needed`'s shift of a row whose weighted values are at most `2^log` before a dropping call's draw
+    multiplies a weight by at most `bound`: none below `2^HEADROOM`, else the binades past it (rounded up),
+    and none where `log` is no number (a row that sees no key)."""
     if bound != 1.0:
         log = log + math.log2(bound)
     binades = jnp.ceil(log) - HEADROOM
@@ -1206,34 +1212,38 @@ class Argmax(NamedTuple):
 
 
 class Reach(NamedTuple):
-    """What a row's keys weigh at most, before its walk (`reach_step`): the largest value magnitude among the
-    keys it sees, `largest` `[bq]`, and how many it sees, `seen` `[bq]` fp32, the most its denominator can be
-    (each weight at most 1 at the anchored walk's maximum)."""
+    """What a row's keys weigh at most, before its walk (`reach_step`): the largest of the keys' weighted
+    value magnitudes it sees, each key's weight at the row's maximum so far times its values' largest
+    magnitude, as its log2, `term` `[bq]` (-inf before a key), and how many keys it sees, `seen` `[bq]`
+    fp32."""
 
-    largest: jax.Array
+    term: jax.Array
     seen: jax.Array
 
 
-def no_reach(rows: int) -> Reach:
-    """`Reach` before any key."""
-    return Reach(jnp.zeros((rows,), jnp.float32), jnp.zeros((rows,), jnp.float32))
-
-
-def reach_step(state: Reach, logits: jax.Array, magnitudes: jax.Array) -> Reach:
-    """`Reach` after a tile's logits (-inf where a row does not see a key) and its keys' value magnitudes
-    `magnitudes` `[bk]`: a key the row does not see (padding, another document) adds nothing."""
+def reach_step(spec: Forward, state: Reach, peak: jax.Array, moved: jax.Array, logits: jax.Array,
+               magnitudes: jax.Array) -> Reach:
+    """`Reach` after a tile's logits (-inf where a row does not see a key), from the row's maximum `peak`
+    before it to `moved` after it (`argmax`'s), and its keys' value magnitudes as their log2, `magnitudes`
+    `[bk]`: each key's term its weight's binades at `moved` (`Forward.power`'s exponent, of the difference
+    the walk weighs, `weights`) plus its magnitude's, the earlier keys' taken from `peak` to `moved`; a key
+    the row does not see (padding, another document) adds nothing."""
     seen = logits > -jnp.inf
-    largest = jnp.where(seen, across(magnitudes, logits), 0.0).max(axis=-1)
-    return Reach(jnp.maximum(state.largest, largest), state.seen + seen.astype(jnp.float32).sum(axis=-1))
+    binades = spec.naturalized(logits - expand(moved, logits)) * LOG2E
+    term = jnp.where(seen, binades + across(magnitudes, logits), -jnp.inf).max(axis=-1)
+    earlier = jnp.where(peak > -jnp.inf, state.term + spec.naturalized(peak - moved) * LOG2E, -jnp.inf)
+    return Reach(jnp.maximum(earlier, term), state.seen + seen.astype(jnp.float32).sum(axis=-1))
 
 
 def row_shift(reach: Reach, bound: float = 1.0) -> jax.Array:
-    """The shift a row's anchored walk takes (`Argmax.shift`), `needed` of its keys' count and their largest
-    value magnitude (`Reach`): its weighted values are at most their sum of weights, at most the count, times
-    that magnitude, so `2^-shift` keeps them within `2^HEADROOM`; `bound`, a dropping call's draw's largest
-    multiplier. A row that sees no key takes none. At most 31 + 128 + log2(bound) - HEADROOM binades (2^31
-    keys of fp32's largest), within `exact_power2`'s exponents."""
-    return needed(jnp.maximum(reach.seen, 1.0), reach.largest, bound)
+    """The shift a row's anchored walk takes (`Argmax.shift`), `binades_past` its weighted values' bound
+    (`Reach` at the row's maximum): each at most its largest term, so their sum at most that many terms as
+    it has keys, and `2^-shift` keeps it within `2^HEADROOM`; `bound`, a dropping call's draw's largest
+    multiplier. A row whose largest term is below `2^HEADROOM` over its keys' count takes none, so a weight
+    of its own is never shifted below fp32's range where its sums did not need it; nor does a row that
+    sees no key. At most 31 + 128 + log2(bound) - HEADROOM binades (2^31 keys at fp32's largest), within
+    `exact_power2`'s exponents."""
+    return binades_past(jnp.log2(jnp.maximum(reach.seen, 1.0)) + reach.term, bound)
 
 
 def no_argmax(rows: int, dropping: bool = False) -> Argmax:
