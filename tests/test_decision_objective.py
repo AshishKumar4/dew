@@ -41,7 +41,7 @@ from dew.decision.model import DecisionModel
 from dew.decision.task import usage_of
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import joined
+from dew.objectives.base import Objective, joined
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -275,6 +275,10 @@ def test_a_decision_window_states_the_most_tokens_its_rows_score_from_its_shape(
         width = objective.row_tokens(batch)
         assert width == batch["tokens"].shape[-1]
         assert 0 < objective.scored_tokens(batch).max() <= width
+        # The windows counted at once are the default's count, each window's packed rows summed
+        # (`Objective.scored_tokens`, a row at a time).
+        each = Objective.scored_tokens(objective, batch)
+        np.testing.assert_array_equal(objective.scored_tokens(batch), each)
 
 
 def test_a_decision_reads_a_native_encoders_states_with_no_method_that_forwards_to_it():
