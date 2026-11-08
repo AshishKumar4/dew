@@ -619,6 +619,31 @@ def test_a_bundle_that_grows_sends_the_chunks_it_changed_alone(cache_worker, tmp
     assert seen.count("/jax/cpu/bundles/tests/grows.py") == 1 and seen.count(rest) == 2  # GETs; one PUT
 
 
+def test_a_bundle_fetched_ahead_is_restored_with_no_request_and_grows_as_one_fetched_would(
+        cache_worker, tmp_path, monkeypatch):
+    """A prepare's fetch (`prefetch`, on the node's CPU before its run takes the GPU) writes every chunk of a
+    file's bundle into the run's cache directory and names it there: the run's process restores the bundle
+    with no request to the Worker and sends nothing back while its tests compile nothing new; a program
+    they compile goes up in the chunk it lands in, as a fetched bundle's would (Main, 2026-11-08)."""
+    url, stored, seen = cache_worker
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
+    key = "/jax/gpu/bundles/tests/ahead.py"
+    stored[key] = remote_cache.packed([("jit_a-1", b"a" * 600)])
+    stored[f"{key}/=1"] = remote_cache.packed([("jit_b-1", b"b" * 600)])
+    assert remote_cache.prefetch(tmp_path, url, "token", "jax/gpu", ["tests/ahead.py"]) == 2
+    seen.clear()
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu")
+    cache.opened("tests/ahead.py")
+    cache.closed("tests/ahead.py")
+    assert [path for path in seen if "/bundles/" in path] == []
+    assert programs(tmp_path) == {"jit_a-1": b"a" * 600, "jit_b-1": b"b" * 600}
+    compiled(tmp_path, "jit_c-1", b"c" * 100)
+    cache.closed("tests/ahead.py")
+    cache.drain()
+    assert [found for found, _ in remote_cache.unpacked(stored[f"{key}/=1"])] == ["jit_b-1", "jit_c-1"]
+    assert seen.count(key) == 0
+
+
 def test_a_program_whose_key_fills_a_file_name_round_trips(cache_worker, tmp_path):
     """A key as long as JAX makes one for a long function's name (`jit_` and the name, `-` and a
     SHA-256 in hex), whose `-cache` file's name is 236 bytes, reaches the local cache from its bundle."""
