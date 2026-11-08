@@ -44,7 +44,7 @@ from jax.extend import core as jax_core
 from dew import _cache
 from dew.algebra import bits
 from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_derivative, declared_tangent
-from dew.nn.kernels import generation, grouped_matmul, options, selection
+from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
@@ -1463,13 +1463,10 @@ def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, 
                                  prologue_dtypes=_dtypes(prologue, lhs, before_sides),
                                  epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
     product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
-    # A matrix its program states settled (`options.settled`: a decode step's loaded weights) a launch may
-    # read ahead of its wait; a cast of it the program forms is not.
     call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
                                    None if paired is None else paired.astype(lhs.dtype), first, gather,
                                    scatter, out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
-                                   interpret=interpret, promoted=product.promoted, dense=dense,
-                                   settled=rhs.dtype == lhs.dtype and options.settled(rhs))
+                                   interpret=interpret, promoted=product.promoted, dense=dense)
     return call, product
 
 
