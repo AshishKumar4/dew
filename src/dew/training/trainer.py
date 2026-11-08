@@ -456,8 +456,11 @@ class Trainer(Generic[Loss, Effects]):
         return self._key
 
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
-        """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
+        """Take `loader`'s device steps, prefetch and clock (`clocked`), and the batches its steps read, each
+        phase's (`Loader.batches`), which every split a plan takes cuts (`splits`), as fit and compile-ahead
+        do."""
         self._device, self._prefetch = loader.device, prefetch
+        self._rows = loader.batches or (loader.batch,)
         progress = self._config is not None and self._config.reads_progress()
         self._examples = clocked(examples, steps, bound_ends=loader.bound_ends,
                                  custom_progress=self.step is not None and progress)
@@ -1588,15 +1591,17 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
+            stages = run.source.stages if isinstance(run.source, RampedStream | PhasedStream) else ()
+            self._ramp = stages if isinstance(run.source, RampedStream) else ()
             # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
-            # ramp's here, a schedule's as each begins (`_scheduled`); the step lays its window out there.
+            # ramp's and phases' of other batches here (`PhasedStream.stages`), a schedule's as each begins
+            # (`_scheduled`); the step lays its window out there.
             self._stage_starts = frozenset(accumulate((after.records - stage.records) // stage.batch
-                                                      for stage, after in pairwise(self._ramp)))
+                                                      for stage, after in pairwise(stages)))
             if self._ramp:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
-            self._rows = (plan.dataset.batch,)
+
             run.partition = partition
             run.train = self._prefetched(plan, run, run.source, position)
             run.source = None  # Lifetime transferred to the prefetch worker.

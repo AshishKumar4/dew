@@ -62,6 +62,9 @@ LAYERS: Mapping[str, Contract] = {
     # the next of that row's crossings to settle.
     "models import no diffusion, conditioning or data module": Contract(
         ("dew.nn",), (), ("dew.diffusion", "dew.inputs", "dew.data")),
+    # A readout's source states its own axes (`HeadComponent.axes`), so a release's reader names no task
+    # (row 4269).
+    "interop imports no decision module": Contract(("dew.interop",), (), ("dew.decision",)),
 }
 """The contracts, by name. Each holds on main; a layer whose crossings are still open joins when its owner
 settles them (rows 4264-4270, records/themes.md's RT07)."""
