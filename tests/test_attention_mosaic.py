@@ -2177,20 +2177,23 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
 
 @COMPILES_ON_CPU
+@pytest.mark.parametrize("page", [16, 4, 1])
 @pytest.mark.parametrize("generation_name", GATED)
-def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name):
-    """A decode step over a paged cache of 16-key pages (`attention_decode.attend` over pools `[KV, P, 16,
-    D]` and a table), 16 rows of 4096 keys, 32 query heads over 8 key heads 64 wide, its key tile of several
-    pages, each its own copy (`mosaic.Pieces`): lowered and compiled by ptxas for `generation_name` on this
-    CPU, every launch within its shared memory and spilling nothing (`mosaic_failures`). An A100's pieces
-    each a cp.async copy of 16 rows, which its copy layout tiles at 64 bytes and not at the 128 a 64-wide
-    row allows (M-DD-10's paged cells, W64-a100: 'Number of tiles is not a multiple of 4')."""
+def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, page):
+    """A decode step over a paged cache of `page`-key pages (`attention_decode.attend` over pools `[KV, P,
+    page, D]` and a table), 16 rows of 4096 keys, 32 query heads over 8 key heads 64 wide, its key tile of
+    several pages, its rows gathered through the table (`attention_mosaic_forward.paged_reads`): lowered and
+    compiled by ptxas for `generation_name` on this CPU, every launch within its shared memory and spilling
+    nothing (`mosaic_failures`). An A100's rows its one warpgroup's cp.async copies a row a copy in its
+    pipeline's groups (`mosaic_sm80._gathered_walk`; its 16-key pages were each a copy of their own,
+    M-DD-10's W64-a100: 'Number of tiles is not a multiple of 4'; its 4- and 1-key pages refused, row
+    4772)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     from dew.nn.kernels.templates import attention_decode
 
-    rows, keys, page, width = 16, 4096, 16, 64
+    rows, keys, width = 16, 4096, 64
     query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.bfloat16)
     pool = jax.ShapeDtypeStruct((8, rows * keys // page, page, width), jnp.bfloat16)
     table = jax.ShapeDtypeStruct((rows, keys // page), jnp.int32)

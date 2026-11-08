@@ -307,7 +307,7 @@ def served_small_pages() -> tuple[int, ...]:
     """The pages fewer than a key tile holds whose decode this GPU's family serves
     (`attention_mosaic._pages_hold`): 16, 4 and 1 key where its loading warpgroup gathers a tile's rows
     through the table (`Transport.gathers_rows`); 16 alone, a page of whole 8-row tiles each its own copy,
-    where it loads a block in pieces (an A100's cp.async, whose gathered rows are row 4772's A100 half)."""
+    where it loads a block in pieces."""
     family = bundles.of(generation.device_generation(), jnp.bfloat16)
     return (16, 4, 1) if family.gathers_rows else (16,)
 
@@ -348,16 +348,17 @@ PAGE = 128
 
 
 @INTERPRETS
-@pytest.mark.parametrize(("device", "page"), [("sm90", PAGE), ("sm90", 16), ("sm90", 1), ("sm80", 16)])
+@pytest.mark.parametrize(("device", "page"), [("sm90", PAGE), ("sm90", 16), ("sm90", 1), ("sm80", 16), ("sm80", 4),
+                                             ("sm80", 1)])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
 def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page, device):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
     tile, on par with the reference path over the cache gathered dense (check 1): pages of whole key tiles,
-    and pages of 16 keys, the docs' (docs/concepts/inference.md), and of one, several to a key tile: on an
-    H100 its rows gathered through the table a key at a time (`attention_mosaic_forward.paged_reads`, row
-    4772); on an A100 each page its own cp.async copy, staged at the swizzle its copy tiles
-    (`mosaic_sm80.CpAsync.walk`)."""
+    and pages of 16, 4 and 1 keys, the docs' (docs/concepts/inference.md), several to a key tile, its rows
+    gathered through the table a key at a time (`attention_mosaic_forward.paged_reads`, row 4772): an
+    H100's by its loading warpgroup's ring, an A100's by its one warpgroup's cp.async copies in its
+    pipeline's groups (`mosaic_sm80._gathered_walk`)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     per_row = KEYS // page
