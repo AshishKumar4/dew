@@ -618,7 +618,9 @@ def test_a_host_distillation_steps_as_the_device_layout_does():
             batch = {"text": jnp.asarray(text)}
             compiled[:] = compiled or [trainer.compile(state, batch)]
             state, loss, *_ = compiled[0](state, batch)
-            return {"loss": np.asarray(loss), "student": jax.device_get(state.variables["params"])}
+            # A device layout's step holds the scan's run stacked (`StageLocal`); stored, the logical state.
+            stored = trainer.stored(state)
+            return {"loss": np.asarray(loss), "student": jax.device_get(stored.variables["params"])}
         return run, objective
 
     start = jax.device_get(
