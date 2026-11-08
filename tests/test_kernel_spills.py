@@ -334,6 +334,29 @@ def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
 
 
+def test_calls_compiled_together_run_their_executables_after_and_compile_nothing_more():
+    """Calls of programs within `compiled_together` answer with their results' shapes and run nothing,
+    each traced on this thread; as the block ends each is compiled, all at once, and kept by its program,
+    so the same calls after it compile nothing and answer as a call compiled alone does; a call whose
+    executable the program keeps lowers nothing again within a block."""
+    from dew.nn.kernels.options import compiled_together
+
+    run = program(lambda x: x * 2 + 1)
+    other = program(lambda x: jnp.sin(x))
+    with Compiles(None) as compiles, compiled_together():
+        shapes = [run(jnp.ones(2)), run(jnp.ones(3)), other(jnp.ones(4))]
+    assert [(shape.shape, shape.dtype) for shape in shapes] == [((2,), jnp.float32), ((3,), jnp.float32),
+                                                                ((4,), jnp.float32)]
+    assert [program.kind for program in compiles.programs].count("compiled") == 3
+    with Compiles(None) as again:
+        outputs = [run(jnp.ones(2)), run(jnp.ones(3)), other(jnp.ones(4))]
+        with compiled_together():
+            run(jnp.ones(2))
+    assert [program for program in again.programs if program.kind in ("compiled", "lowered")] == []
+    np.testing.assert_array_equal(outputs[1], jnp.full(3, 3.0))
+    np.testing.assert_array_equal(outputs[2], jnp.sin(jnp.ones(4)))
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass
 class Slots:

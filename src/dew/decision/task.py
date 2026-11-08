@@ -12,7 +12,7 @@ import threading
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, Self, overload
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Self, overload
 
 import jax
 import jax.numpy as jnp
@@ -24,7 +24,7 @@ from PIL import Image
 from dew import _records
 from dew._files import write_atomically
 from dew._records import JSON, json_value, record
-from dew.batch import Variables
+from dew.batch import Batch, Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
@@ -85,7 +85,7 @@ from dew.mesh import batch_axes
 from dew.nn.attention import AttentionImpl
 from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import compiled_together, program
 from dew.objectives.base import Metric, Objective, joined
 
 if TYPE_CHECKING:
@@ -104,13 +104,19 @@ TASK_FILE = "decide.json"
 
 @dataclass(frozen=True)
 class Budget:
-    """How much one forward pass may hold: at most `tokens` tokens in at most `rows` windows.
+    """How much one forward pass may hold, at most `tokens` tokens in at most `rows` windows, and the
+    pass shapes a task compiles: windows of `lengths` lengths, each at the window `counts` it names.
 
     Laya's `predict_items` uses 16384 and 256. A pass packs its rows into a
     few windows of one of a few lengths, declared once (`Decide.pass_shapes`),
     each window's question slots its bounds' (`Layout.bounds`), and its
     options to `options` where it is declared, so every pass shares one of a
     few programs, compiled up front (`Decide.compile_scoring`).
+
+    Each shape is a program, compiled before a server's first pass (`ScoringServer.from_task`), minutes
+    each for a large backbone. Fewer shapes compile fewer programs and pad passes differently: one length
+    (the layout's window) often wastes less than several, as first-fit packs many short rows into a long
+    window, whose attention costs about its rows where its route skips the masked blocks between them.
     """
 
     tokens: int = 16384
@@ -119,6 +125,24 @@ class Budget:
     """The options every question of a pass pads to, the run's widest (training's own static width);
     None rounds each pass's widest up to a power of two, a program for each, compiled as it comes. A
     request of more widens its pass, compiling it."""
+    lengths: int = 4
+    """The window lengths a pass may take, longest first: the layout's window and its halvings, as many
+    as this names and none shorter than the layout's shortest row (`dew.inference.tasks.length_ladder`);
+    1 is the layout's window alone."""
+    counts: tuple[int | Literal["powers", "most"], ...] = ("powers", "most")
+    """The window counts a pass of each length may take: "most", as many as `tokens` and `rows` allow;
+    "powers", the powers of 8 below that most (1, 8, 64, ...); or a count of its own, at most that most.
+    A pass takes the fewest declared that hold its rows, its rows placed over the largest (`PassPlan`):
+    the default is a lone request's one window, the powers of 8 and the most; ("most",) one program a
+    length, (1, "most") a lone request's pass beside it."""
+
+    def __post_init__(self) -> None:
+        if self.lengths < 1:
+            raise ValueError(f"a pass takes windows of a length or more, not {self.lengths}")
+        if not self.counts or any(not (count in ("powers", "most") or (isinstance(count, int) and count >= 1))
+                                  for count in self.counts):
+            raise ValueError(f"a budget's window counts are 'powers', 'most' or a count of 1 or more, and "
+                             f"name one or more; got {self.counts!r}")
 
 
 @dataclass(frozen=True)
@@ -700,17 +724,24 @@ class Decide(SavedRunTask, InItsForm):
 
     @functools.cached_property
     def pass_shapes(self) -> tuple[PassShape, ...]:
-        """The shapes a text pass packs its rows into, declared once: windows of the layout's length
-        and its halvings (`dew.inference.tasks.length_ladder`), each at a few window counts, one (a lone
-        request's pass), the powers of 8 below the most the budget's tokens and rows allow, and that
-        most; each window's question slots a run's window's of that length (`DecisionObjective.bounds`),
-        its options the budget's (`Budget`). Where the budget declares its options, each shape is one
-        program, which `compile_scoring` compiles."""
+        """The shapes a text pass packs its rows into, declared once by the budget (`Budget.lengths`,
+        `Budget.counts`): windows of the layout's length and its halvings
+        (`dew.inference.tasks.length_ladder`), each at its window counts, by default one (a lone request's
+        pass), the powers of 8 below the most the budget's tokens and rows allow, and that most; each
+        window's question slots a run's window's of that length (`DecisionObjective.bounds`), its options
+        the budget's (`Budget`). Where the budget declares its options, each shape is one program, which
+        `compile_scoring` compiles."""
         shapes = []
         for length, bounds in self._bounds.items():
             most = max(1, min(self.budget.rows, self.budget.tokens // length))
-            counts = sorted({*(8 ** power for power in range(math.floor(math.log(most, 8)) + 1)), most})
-            shapes.extend(PassShape(length, count, bounds.questions, self.budget.options) for count in counts)
+            counts = set()
+            for count in self.budget.counts:
+                if count == "powers":
+                    counts.update(8 ** power for power in range(math.floor(math.log(most, 8)) + 1))
+                else:
+                    counts.add(most if count == "most" else min(count, most))
+            shapes.extend(PassShape(length, count, bounds.questions, self.budget.options)
+                          for count in sorted(counts))
         return tuple(shapes)
 
     def _shape(self, rows: Sequence[Encoded]) -> PassShape:
@@ -760,7 +791,8 @@ class Decide(SavedRunTask, InItsForm):
         return {length: replace(self.layout, max_len=length).bounds(
             self.tokenizer, self.specials, held, segments, None if held is None else max(length, held))
             if length >= shortest and counted else Bounds(1, 1, None)
-            for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens))}
+            for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens),
+                                        self.budget.lengths)}
 
     @functools.cached_property
     def _packs(self) -> dict[tuple[int, int], Pack]:
@@ -773,14 +805,16 @@ class Decide(SavedRunTask, InItsForm):
                     None if held is None else max(shape.length, held), trained=False), bins=shape.rows)
             for shape in self.pass_shapes}
 
-    def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
+    def compile_scoring(self, variables: Variables | None = None, rows: Sequence[Encoded] | None = None
+                        ) -> tuple[PassShape, ...]:
         """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
-        default), by one pass of the layout's shortest row at each shape that holds it, so a scorer
-        compiles none while it serves; returns the shapes compiled. Each pass runs on the calling thread,
+        default), or with `rows`, those the passes over them take, as a server takes them in that order
+        (`planned_shapes`), so a scorer compiles none while it serves; returns the shapes compiled. Each
+        is a pass of the layout's shortest row at its shape, traced and lowered on the calling thread,
         under every context its caller holds (a mesh, JAX's and Dew's own thread-local settings), which
-        the program its serving calls read is keyed by: a worker thread holds none of them. Where the
-        budget declares no options (`Budget`), a pass's own decide its program, which it compiles as it
-        comes, and none is compiled here."""
+        the program its serving calls read is keyed by, and compiled by XLA at once with the others
+        (`dew.nn.kernels.options.compiled_together`). Where the budget declares no options (`Budget`), a
+        pass's own decide its program, which it compiles as it comes, and none is compiled here."""
         if self.budget.options is None:
             return ()
         mesh = mesh_of(self.variables if variables is None else variables)
@@ -789,12 +823,31 @@ class Decide(SavedRunTask, InItsForm):
         # context, too small for it, and those shapes compile on their first pass.
         fits_context = self.context_length is None or all(
             len(row.context or ()) <= self.context_length for row in self._probe)
-        held = tuple(shape for shape in self.pass_shapes
+        shapes = self.pass_shapes if rows is None else self.planned_shapes(rows)
+        held = tuple(shape for shape in shapes
                      if fits_context and shape.length >= max(len(row.tokens) for row in self._probe))
-        with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
+        with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh), compiled_together():
             for shape in held:
-                self._pass(self._probe, variables, shape)
+                self._forwarded(self._probe, variables, shape)
         return held
+
+    def planned_shapes(self, rows: Sequence[Encoded]) -> tuple[PassShape, ...]:
+        """The shapes the passes over `rows` take, in a server's order (`dew.inference.scoring.
+        ScoringServer`): each pass growing over them while its plan holds them (`planned`), a row it
+        refuses opening the next, and a row no plan holds a pass of its own; each shape once, in
+        `pass_shapes`' order."""
+        taken: set[PassShape] = set()
+        passing: list[Encoded] = []
+        plan = self.planned()
+        for row in rows:
+            if not plan.add(row) and passing:
+                taken.add(self._shape(passing))
+                passing, plan = [], self.planned()
+                plan.add(row)
+            passing.append(row)
+        if passing:
+            taken.add(self._shape(passing))
+        return tuple(shape for shape in self.pass_shapes if shape in taken)
 
     @functools.cached_property
     def _probe(self) -> list[Encoded]:
@@ -883,6 +936,8 @@ class Decide(SavedRunTask, InItsForm):
         """
         server = scoring.ScoringServer(self._row_scoring, self.variables)
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
+        # The programs its passes take compiled first, at once, and none other (`compile_scoring`).
+        self.compile_scoring(rows=[rows[index] for index in order])
         futures = {index: server.submit(rows[index]) for index in order}
         server.run()
         return [futures[index].result() for index in range(len(rows))]
@@ -900,6 +955,20 @@ class Decide(SavedRunTask, InItsForm):
         (`dew.decision.rows.PackedRows`, `laid_out`), so each row attends its own tokens alone and is
         scored as it is alone, the windows placed on the weights' mesh (`RowPlan`). A server's pass counts
         its tokens in `counted` (`PassTokens`), the windows the mesh computes among them."""
+        logits, windows, batch, plan = self._forwarded(rows, variables, shape, counted)
+        logits = plan.host(logits)
+        found: list[np.ndarray] = [np.empty(0)] * len(rows)
+        for window, (_, standing) in enumerate(windows):
+            owners = np.asarray(batch["question_rows"][window])
+            for order, index in enumerate(standing, start=1):
+                found[index] = logits[window, np.flatnonzero(owners == order)]
+        return found
+
+    def _forwarded(self, rows: Sequence[Encoded], variables: Variables | None = None,
+                   shape: PassShape | None = None, counted: "PassTokens | None" = None
+                   ) -> tuple[jax.Array, list[tuple[Batch, tuple[int, ...]]], Batch, RowPlan]:
+        """`_pass`'s forward over `rows`, before its logits are read: the logits on the weights' mesh,
+        each window's rows (`first_fit_windows`), the windows' fields and their plan."""
         from dew.data.packing import first_fit_windows
         from dew.decision.rows import PackedRows, model_row
 
@@ -929,13 +998,7 @@ class Decide(SavedRunTask, InItsForm):
         plan = RowPlan.over(mesh_of(held), shape.rows)
         if counted is not None:
             counted.add(shape, plan.count, rows)
-        logits = plan.host(self._forward(held, plan.place(plan.pad(padded))))
-        found: list[np.ndarray] = [np.empty(0)] * len(rows)
-        for window, (_, standing) in enumerate(windows):
-            owners = np.asarray(batch["question_rows"][window])
-            for order, index in enumerate(standing, start=1):
-                found[index] = logits[window, np.flatnonzero(owners == order)]
-        return found
+        return self._forward(held, plan.place(plan.pad(padded))), windows, batch, plan
 
     @traced_in_its_form
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,

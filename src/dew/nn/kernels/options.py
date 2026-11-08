@@ -217,6 +217,41 @@ def collecting() -> Iterator[dict[str, jax.stages.Compiled]]:
         yield collected
     finally:
         _COLLECTED.reset(token)
+
+
+type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered]]
+"""The relowerings a spill made of a call (`OuterProgram.compiled`'s), each with the jit it traced by."""
+
+type Lowering = tuple[OuterProgram, Hashable, jax.stages.Lowered, tuple, dict, Relowered]
+"""A call lowered within `compiled_together`: its program, the key its executable is kept by
+(`OuterProgram._keyed`), its lowering, its arguments, and the relowerings a spill made of it."""
+
+_TOGETHER: contextvars.ContextVar[list[Lowering] | None] = contextvars.ContextVar(
+    "dew_programs_compiled_together", default=None)
+
+
+@contextlib.contextmanager
+def compiled_together() -> Iterator[None]:
+    """Within the block, a call of a program through Dew's compile point (`OuterProgram`) answers with its
+    results' shapes (`shapes_of`), running nothing, and one whose executable the program keeps none of is
+    traced and lowered on this thread, under its contexts, as the call would be; as the block ends,
+    every lowering is compiled at once (`report.compiled_at_once`: XLA's compiles in threads of their
+    own, a spill's refusal relowered here) and kept by its program under its call's key, so the same
+    call after the block runs it, compiling nothing: a scoring task's programs compiled before its
+    passes (`dew.decision.task.Decide.compile_scoring`). A block that raises compiles nothing."""
+    from dew.nn.kernels.templates import report
+
+    lowerings: list[Lowering] = []
+    token = _TOGETHER.set(lowerings)
+    try:
+        yield
+    finally:
+        _TOGETHER.reset(token)
+    executables = report.compiled_at_once([
+        (lowered, None, functools.partial(program._relowered, args, kwargs, relowered))
+        for program, _, lowered, args, kwargs, relowered in lowerings])
+    for (program, key, *_, relowered), executable in zip(lowerings, executables, strict=True):
+        program._keep(key, executable, relowered)
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
 
@@ -316,6 +351,16 @@ class OuterProgram:
         if _COLLECTED.get() is not None:
             return shapes_of(self.compiled(*args, **kwargs).out_info)
         key, dynamic, named = self._keyed(args, kwargs)
+        if (together := _TOGETHER.get()) is not None:
+            if (ready := self._ready.get(key)) is not None:
+                return shapes_of(ready.out_info)
+            lowered = self.lower(*args, **kwargs)
+            # A program compiled ahead for this target runs as it was compiled (`taking`).
+            if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
+                self._keep(key, ahead(), [])
+            else:
+                together.append((self, key, lowered, args, kwargs, []))
+            return shapes_of(lowered.out_info)
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
 
@@ -349,6 +394,27 @@ class OuterProgram:
                     self._executables.pop(key, None)
                 pending.set_exception(error)
         return pending.result()
+
+    def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
+        """A call's program traced afresh past a spill's refused config (`compiled`'s `relower`), on the
+        thread that keeps it (`compiled_together`)."""
+        fresh = self._jitted()
+        relowering = self._traced(fresh, args, kwargs).lower()
+        relowered.append((fresh, relowering))
+        return relowering
+
+    def _keep(self, key: Hashable, executable: jax.stages.Compiled, relowered: Relowered) -> None:
+        """Keep `executable`, compiled for a call keyed `key` (`compiled_together`), as `_kept` keeps the
+        one it compiles; later calls trace as its last relowering did."""
+        if relowered:
+            self.jitted = relowered[-1][0]
+        done: Future[jax.stages.Compiled] = Future()
+        done.set_result(executable)
+        with self._compiling:
+            self._executables[key] = done
+            self._ready[key] = executable
+            if len(self._executables) > self.CACHED:
+                self._ready.pop(self._executables.popitem(last=False)[0], None)
 
     def compiled(self, *args, **kwargs) -> jax.stages.Compiled:
         """The program over these arguments compiled through the kernel templates' reports, lowered
