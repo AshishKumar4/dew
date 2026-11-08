@@ -47,6 +47,7 @@ background thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 import contextlib
 import importlib.util
 import itertools
+import json
 import logging
 import os
 import queue
@@ -220,9 +221,10 @@ class RemoteCache:
             try:
                 for key, value in entries:
                     keys.append(key)
-                    # One the directory had already (another file's tests compiled it meanwhile) stays
-                    # among the programs the current file's run gained.
-                    if self._seeded(key, value):
+                    # One the directory had already (another file's tests compiled it meanwhile, or a
+                    # prepare fetched it, its value None) stays among the programs the current file's
+                    # run gained.
+                    if value is not None and self._seeded(key, value):
                         new += 1
                         self.seen.add(key)
                 # Another cut's programs: fetched for this group, which holds none of them yet, so
@@ -242,11 +244,16 @@ class RemoteCache:
         with self.lock:
             self.programs_fetched += new
 
-    def _fetched(self, file: str) -> list[tuple[str, bytes]]:
+    def _fetched(self, file: str) -> list[tuple[str, bytes | None]]:
         """The entries of `file`'s bundle on the Worker, each of its chunks in turn up to the first it
         lacks; none where it has none or the remote was given up. An answer counts as one only once its
-        programs are in the directory (`opened`)."""
-        entries: list[tuple[str, bytes]] = []
+        programs are in the directory (`opened`). A bundle a prepare fetched into the directory already
+        (`prefetch`) is its programs' keys alone, no value to write, with no request."""
+        if (held := read_prefetched(self.directory).get(self._key(file))) is not None:
+            with self.state:
+                self.chunked[file] = held
+            return [(key, None) for keys in held for key in keys]
+        entries: list[tuple[str, bytes | None]] = []
         chunks: list[list[str]] = []
         for index in range(CHUNKS):
             if self.given_up:  # checked as each request is made
@@ -297,22 +304,7 @@ class RemoteCache:
         return entries
 
     def _seeded(self, key: str, value: bytes) -> bool:
-        """`value` as program `key`'s file, written to a name of its own beside the directory's programs (its
-        STAGING, which the watch does not see, so a restored program is one event, not two) and linked in
-        whole, so a reader sees all of it or none; False, writing nothing, where the directory has it
-        already."""
-        staging = self.directory / STAGING
-        staging.mkdir(exist_ok=True)
-        handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=staging)
-        try:
-            with os.fdopen(handle, "wb") as written:
-                written.write(value)
-            os.link(staged, self.directory / f"{key}{SUFFIX}")
-        except FileExistsError:
-            return False
-        finally:
-            os.unlink(staged)
-        return True
+        return seeded(self.directory, key, value)
 
     def closed(self, file: str) -> None:
         """Bundle `file` written back, where its tests compiled a program it lacked: the programs fetched
@@ -410,6 +402,65 @@ def bundle(node: str, group: str | None, worker: str | None) -> str:
     return "/".join([node.split("::")[0], *(part for part in parts if part)])
 
 
+def seeded(directory: Path, key: str, value: bytes) -> bool:
+    """`value` as program `key`'s file, written to a name of its own beside the directory's programs (its
+    STAGING, which the watch does not see, so a restored program is one event, not two) and linked in
+    whole, so a reader sees all of it or none; False, writing nothing, where the directory has it
+    already."""
+    staging = directory / STAGING
+    staging.mkdir(exist_ok=True)
+    handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=staging)
+    try:
+        with os.fdopen(handle, "wb") as written:
+            written.write(value)
+        os.link(staged, directory / f"{key}{SUFFIX}")
+    except FileExistsError:
+        return False
+    finally:
+        os.unlink(staged)
+    return True
+
+
+PREFETCHED = ".prefetched.json"
+"""In a cache directory, the bundles a prepare fetched into it (`prefetch`): each chunk's programs by the
+bundle's key on the Worker, which a run's `opened` restores from the directory with no request."""
+
+
+def read_prefetched(directory: Path) -> dict[str, list[list[str]]]:
+    """The bundles fetched into `directory` ahead (`PREFETCHED`); none where nothing was."""
+    path = directory / PREFETCHED
+    return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def prefetch(directory: Path, url: str, token: str, prefix: str, bundles: list[str]) -> int:
+    """`bundles` (each a test file's in its partition, `bundle`) fetched from the Worker into `directory`,
+    each chunk of each, and named in its PREFETCHED, so a run on a GPU that opens them finds them there and
+    asks nothing (Main, 2026-11-08: a cold on-demand A100 started each part's files fetching them as they
+    ran): the programs written. A remote that cannot be reached stops it where it is, the bundles fetched so
+    far named, and the run fetches the rest itself."""
+    store = r2.Store(url, token, "dew-ci-xla-cache", TIMEOUT_SECONDS)
+    directory.mkdir(parents=True, exist_ok=True)
+    held, written = read_prefetched(directory), 0
+    try:
+        for name in bundles:
+            key, chunks = f"{prefix.strip('/')}/bundles/{name}", []
+            for index in range(CHUNKS):
+                body = store.get(chunk(key, index), limit=MAX_BYTES)
+                if body is None:
+                    break
+                entries = unpacked(body)
+                written += sum(seeded(directory, program, value) for program, value in entries)
+                chunks.append([program for program, _ in entries])
+            if chunks:
+                held[key] = chunks
+    except UNREACHABLE as error:
+        logger.warning("the shared XLA cache is unreachable (%s); the run fetches the rest", error)
+    staged = directory / f"{PREFETCHED}.partial"
+    staged.write_text(json.dumps(held))
+    staged.replace(directory / PREFETCHED)
+    return written
+
+
 def chunk(key: str, index: int) -> str:
     """The Worker's key of chunk `index` of the bundle at `key`: the first is the bundle's own, so a
     bundle within one chunk is where it always was; each next is `<key>/=<index>`, which no split
@@ -450,8 +501,10 @@ def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
     return entries
 
 
-def prefix() -> str:
-    """The bundles' leading parts: what a cached executable is only valid for beside JAX's own key,
+def prefix(kind: str | None = None, backend: str | None = None) -> str:
+    """The bundles' leading parts (the device's `kind` and the `backend` this process's first device's, or
+    those a prepare names for its node's GPU, which it cannot see): what a cached executable is only valid
+    for beside JAX's own key,
     and the device's kind, whose programs are another file's on another GPU. jax's own version is
     not among them: JAX's key holds the program and jaxlib's version
     (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it
@@ -464,8 +517,9 @@ def prefix() -> str:
     import jax
     import jaxlib
 
-    kind = "".join(character if character.isalnum() else "-" for character in jax.devices()[0].device_kind)
-    backend = jax.default_backend()
+    kind = "".join(character if character.isalnum() else "-"
+                   for character in (kind or jax.devices()[0].device_kind))
+    backend = backend or jax.default_backend()
     minor = f"py{sys.version_info.major}.{sys.version_info.minor}"
     return f"jaxlib{jaxlib.__version__}/{backend}/{minor}/{kind}/{HOST.cpu_class()}"
 
@@ -505,3 +559,28 @@ def install_from_environment() -> RemoteCache | None:
     if not requested():
         return None
     return install(os.environ["DEW_XLA_CACHE_URL"], os.environ["DEW_XLA_CACHE_TOKEN"])
+
+
+def main(arguments: list[str]) -> int:
+    """`python tests/remote_cache.py prefetch GENERATION TOPOLOGY ITEM...`: a GPU job's prepare, on its node's
+    CPU, fetching the bundles of each of its run's items (a test file, or a group of one as CI names it,
+    `<file>#G/N`) into the cache directory its run reads (`dew._cache.default_compilation_cache_dir`), keyed
+    for the node's GPU as its serialized TOPOLOGY names it (`dew.training.ahead.host_gpus`)."""
+    command, generation, topology, *items = arguments
+    if command != "prefetch" or not requested():
+        raise SystemExit("usage: remote_cache.py prefetch GENERATION TOPOLOGY ITEM..., with "
+                         "DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN set")
+    from dew._cache import default_compilation_cache_dir
+    from dew.training.ahead import host_gpus
+
+    [device] = host_gpus(generation, topology, 1)
+    bundles = [bundle(file, group or None, None)
+               for file, _, group in (item.partition("#") for item in items)]
+    written = prefetch(Path(default_compilation_cache_dir()), os.environ["DEW_XLA_CACHE_URL"],
+                       os.environ["DEW_XLA_CACHE_TOKEN"], prefix(device.device_kind, "gpu"), bundles)
+    print(f"shared XLA cache: {written} programs fetched ahead for {len(bundles)} bundles")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
