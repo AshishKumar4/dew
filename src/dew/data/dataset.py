@@ -319,9 +319,11 @@ again. 32 workers of a 100-record pipeline held 7.07 GiB resident against 0.23 G
 two cores of a shared workstation (`Loading`), 219 MiB each."""
 
 
-SAMPLED_BATCHES = 5
-"""The batches automatic loading measures to size its buffers (`Loading.resolved`), as many as
-Grain's own pick samples."""
+SAMPLED_BATCHES = 9
+"""The batches automatic loading measures to size its buffers and its workers (`Loading.resolved`): the
+first, which opens the read, and eight after it, over which a step that makes several batches' rows at
+once is paid (a decision run's packer filled four batches in one of 115 ms and served three in about
+1 ms each)."""
 
 
 @functools.cache
@@ -472,8 +474,8 @@ class Loading:
         Workers take the read's Python off the training process, whose step's dispatch waits on the
         interpreter it holds (a decision run's encoding: 20.9 against 10.5 ms a step in four workers on
         a GH200, row 4862), and each costs a process's start first, its imports. They start where they
-        pay for themselves over the run: where the time a sampled batch takes to make, read in turn with
-        no thread reading ahead, each after the first, which opens the read, times the `batches` the run
+        pay for themselves over the run: where the mean time a sampled batch takes to make, read in turn
+        with no thread reading ahead, each after the first, which opens the read, times the `batches` the run
         reads (its planned steps) is more than a worker's start there (`Host.started`). A
         short run, one whose batches take no Python to speak of, or one whose length nothing states
         (None), which no measure shows they pay for, reads in the process."""
@@ -489,7 +491,8 @@ class Loading:
             seconds.append(time.perf_counter() - began)
         if not sampled:
             return dataclasses.replace(self, workers=0)
-        python = statistics.median(seconds[1:] or seconds)
+        # Their mean, which a step making several batches at once is paid in, as the run pays it.
+        python = statistics.fmean(seconds[1:] or seconds)
         host = Host.current() if self.host is None else self.host
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)

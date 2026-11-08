@@ -3,6 +3,7 @@ each bounded by its cgroup's limits, read through the one cgroup reader a tool l
 
 import json
 import os
+import time
 
 import grain.python as grain
 import numpy as np
@@ -92,6 +93,29 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
         "                  any(name.split('.')[0] == 'dew' for name in sys.modules)]))\n")
     done = subprocess.run([sys.executable, "-I", "-c", program], capture_output=True, text=True, check=True)
     assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], False]
+
+
+class _Filled:
+    """A step that makes four batches' rows at once: every fourth row takes 40 ms, the rest none, as a
+    packer fills its bins."""
+
+    def __call__(self, index: int, row):
+        if index % 4 == 0:
+            time.sleep(0.04)
+        return row
+
+
+def test_automatic_loading_pays_a_step_that_makes_several_batches_at_once_in_their_mean():
+    """Automatic loading weighs the Python a batch takes as the run pays it, over the sampled batches after
+    the first: where a step makes four batches' rows at once, 40 ms every fourth batch is 10 ms a batch,
+    which over a thousand batches pays for a worker's start of a second, though three batches of four
+    take none (row 4862: a decision run's packer filled four batches in one of 115 ms and served three in
+    about 1 ms each, and the read stayed in the training process)."""
+    from dew.data.dataset import Host
+
+    rows = grain.MapDataset.source([{"x": np.zeros(4, np.float32)}] * 64).map_with_index(_Filled())
+    auto = Loading(workers="auto", host=Host(4, 2**40, worker_start=1.0))
+    assert auto.resolved(rows.to_iter_dataset(), reads=1, batches=1000).workers == 4
 
 
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
