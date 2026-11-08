@@ -1640,6 +1640,19 @@ class Issuer[Accumulator](abc.ABC):
         return plgpu.layout_cast(value, self.layout)
 
 
+MERGED_REGISTERS = 64
+"""The registers a thread of a merging role holds the partials it reads ahead of combining them in
+(`Transport.fixed_up`): as many partials as fit, at least one, a partial's registers its leaves' bytes over
+the role's threads (a 16-row decode's at 64 columns 9, a GEMM's 128 x 128 fp32 tile 128). One partial read at
+a time waited each read behind the last one's combine, 0.49 us a slice (a 16-row decode's 49, M-DD-12)."""
+
+
+def _selected(predicate, taken, other):
+    """`taken` where `predicate` holds, else `other`, leaf by leaf: a splat predicate's select, which keeps
+    each leaf in its own layout (an implicit broadcast lowers in no warpgroup semantics)."""
+    return jax.tree.map(lambda one, two: jnp.where(jnp.full(one.shape, predicate), one, two), taken, other)
+
+
 class Transport[Allocated, Opened](abc.ABC):
     """An execution policy (design §6): who loads a program's operands and how (`streams`, `opened`,
     `lifetimes`, `stream` the producer's, `fed` the consumers' own, `walk` and `passed` the consumer's),
@@ -2039,7 +2052,8 @@ class Transport[Allocated, Opened](abc.ABC):
         balanced tail's program first in one tile having left its partial of the tile before in its own
         slot), and the program that arrives last at the tile's counter (`arrived`, on `ready`'s semaphore
         of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
-        whichever arrives last, and stores it (`store`). No program waits on another, which the GPU may
+        whichever arrives last, and stores it (`store`), reading as many partials as `MERGED_REGISTERS` holds
+        before combining them, so their reads wait together. No program waits on another, which the GPU may
         never have scheduled (row 4732). `combine(running, partial)` is the algebra's merge of two partials
         of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
         the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
@@ -2060,9 +2074,21 @@ class Transport[Allocated, Opened](abc.ABC):
             # The partials' structure read off the running value's: a ref may itself be a tree.
             return jax.tree.map(lambda _, ref: plgpu.load(ref.at[other], optimized=False), summed, refs)
 
+        held = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(summed))
+        ahead = max(1, MERGED_REGISTERS * 4 * resources.THREADS // held)  # a register's four bytes
+
         def combined(running) -> None:
-            store(lax.fori_loop(first + 1, gathered,
-                                lambda other, running: combine(running, read(partials, other)), running))
+            def merged(chunk, running):
+                # A chunk's partials read before any is combined, a read past the last partial reading the
+                # last again, left out of the sum: the order stays the programs'.
+                start = first + 1 + chunk * ahead
+                reads = [read(partials, jnp.minimum(start + i, gathered - 1)) for i in range(ahead)]
+                running = combine(running, reads[0])
+                for i, partial in enumerate(reads[1:], 1):
+                    running = _selected(start + i < gathered, combine(running, partial), running)
+                return running
+
+            store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
 
         if ready is None:
             pl.when(program != first)(lambda: left(partials))
@@ -2075,13 +2101,8 @@ class Transport[Allocated, Opened](abc.ABC):
             pl.when(program != first)(lambda: left(partials))
             pl.when(program == first)(lambda: left(opening))
             last = across.arrived(ready.at[gathered - 1], gathered - first)
-            # The first program's partial its own value where it arrives last, read back where another
-            # does, a splat predicate's select keeping the running value in the merger's own layout
-            # (an implicit broadcast lowers in no warpgroup semantics).
-            first_partial = jax.tree.map(
-                lambda own, left: jnp.where(jnp.full(own.shape, program == first), own, left), summed,
-                read(opening, first))
-            pl.when(last == 1)(lambda: combined(first_partial))
+            # The first program's partial its own value where it arrives last, read back where another does.
+            pl.when(last == 1)(lambda: combined(_selected(program == first, summed, read(opening, first))))
 
 
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):
