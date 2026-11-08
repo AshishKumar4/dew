@@ -156,17 +156,18 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       loads, its consumers holding the program's entry registers (`fed.ConsumerFed`).
     - Shape: the tile loading its operands fewest times a FLOP within its consumers' registers: an
       accumulator of `resources.held_area` elements A reads them 1/rows + 1/columns times a FLOP, least at
-      rows = columns = sqrt(A). So the rows are sqrt(A) in whole roles (no more than the call's, below);
-      the columns the widest dividing the call's width in its column unit, at most the family's one
-      product's (`Family.widest_product`), that A holds at those rows; the rows then the most its
-      registers hold at those columns (`resources.held_rows`). mma.sync's one consumer so takes 128 x 128
-      where it took 64 x 256, whose four warps, splitting its rows, each read the columns' block whole:
+      rows = columns = sqrt(A). So the rows are sqrt(A) in whole roles (no more than the call's, below;
+      `_balanced_side`); the columns the widest dividing the call's width in its column unit, at most the
+      family's one product's (`Family.widest_product`), that A holds at those rows; the rows then the most
+      its registers hold at those columns (`resources.held_rows`). mma.sync's one consumer so takes 128 x
+      128 where it took 64 x 256, whose four warps, splitting its rows, each read the columns' block whole:
       1.7x the shared memory a FLOP (SHAPE1-a100: 0.887 of its time). A tile its registers or a block
-      cannot stage busy (`holds`, `resources.tile_registers`) gives way to the next narrower or shorter one.
-    - Consumers: of the counts the family takes (`Family.consumers`), a warpgroup each, the one whose tile
-      reads its operands least (`_reads`: a share's fragment loads where the products read registers, then
-      the tile's reads a FLOP), the most on a tie; one where rows a tile must divide (not grouped) take no
-      whole role for each, or where a group averages fewer rows than one role (grouped).
+      cannot stage busy at its balanced rows (`holds`, `resources.tile_registers`) gives way to the next
+      narrower one, and where none does, to shorter rows.
+    - Consumers: the most the family takes (`Family.consumers`, at most `CONSUMERS`), a warpgroup each,
+      whose cooperative tile holds each consumer's registers, so its balanced side and its reads a FLOP are
+      at least one consumer's; one where rows a tile must divide (not grouped) take no whole role for each,
+      where a group averages fewer rows than one role (grouped), or where no cooperative tile holds.
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
       consumers (`Family.programs`) and whose share of its shared memory (`resources.program_shared`) holds
       a tile, one at least; a wave is all of them.
@@ -214,16 +215,25 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         held_tile = functools.partial(_held_tile, role=role, steps=steps, busy=busy, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
                                       target=target, programs=programs)
-        # The width whose tile reads its operands fewest times a FLOP (1/rows + 1/columns), the wider on a
-        # tie, among those staging deep enough to stay busy where any does. mma.sync's one consumer at
+        # The balanced tile: the widest width the area holds at the balanced rows (`_held_widths`), its
+        # rows the most its registers hold there and its stages keep busy, rows short of that balance (the
+        # width's held rows, or the balanced side where it holds more) giving way to the next narrower
+        # width, so a tile keeps its rows and narrows rather than shortening. mma.sync's one consumer at
         # Qwen3-8B's gate/up so takes 128 x 128, its 192-wide tile's rows shortened to 64 by its stages
-        # (0.016 against 0.021 reads a FLOP; 64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's
-        # 1.10-1.14, FSA100POST32).
-        held = [held_tile(block_n, held_rows)
-                for block_n, held_rows in _held_widths(layouts, consumers, columns, role, most_rows)]
-        busy_tiles = [tile for tile, staged in held if tile is not None and staged]
-        tiles = busy_tiles or [tile for tile, _ in held if tile is not None]
-        return min(tiles, key=lambda tile: (1 / tile.block_m + 1 / tile.block_n, -tile.block_n), default=None)
+        # (64 x 192 ran 1.21-1.30x XLA's time against 128 x 128's 1.10-1.14, FSA100POST32). Where no width
+        # stages busy at its balance, the widest staging busy at all, then the widest that holds.
+        widths = _held_widths(layouts, consumers, columns, role, most_rows)
+        side = _balanced_side(layouts, consumers, role, most_rows)
+        busy_at, fallback = None, None
+        for block_n, held_rows in widths:
+            tile, staged = held_tile(block_n, held_rows)
+            if tile is None:
+                continue
+            if staged and tile.block_m >= min(held_rows, side):
+                return tile
+            busy_at = busy_at or (tile if staged else None)
+            fallback = fallback or tile
+        return busy_at or fallback
 
     # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
     # does a call no cooperative tile holds (a wide epilogue's outputs past a block), and a grouped call
@@ -233,28 +243,16 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # 0.73 to 0.999 of the cooperative tile's time at 1 to 32 rows a group, and 1.13 to 1.26 of it at 64.
     most = min(family.consumers, CONSUMERS)
     whole = rows >= family.role_rows if grouped else ragged or rows % (family.role_rows * most) == 0
-    # Each consumer count's tile at the most programs that hold one, the count the objective prices least
-    # (`_reads`), the most consumers on a tie.
-    counted = [next((tile for programs in range(family.programs(consumers), 0, -1)
+    # The most consumers the call takes, a cooperative tile holding each consumer's registers so its
+    # balanced side, and with it each operand's reads a FLOP, at least one consumer's (CUTLASS's split, 2-7%
+    # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
+    # that hold its tile.
+    for consumers in dict.fromkeys((most if whole else 1, 1)):
+        tile = next((tile for programs in range(family.programs(consumers), 0, -1)
                      if (tile := tiled(consumers, programs)) is not None), None)
-               for consumers in range(most if whole else 1, 0, -1)]
-    return min((tile for tile in counted if tile is not None), key=functools.partial(_reads, family),
-               default=None)
-
-
-def _reads(family: mosaic.Family, tile: "Tiles") -> tuple[float, float]:
-    """Dew: `derived`'s objective over its consumer counts' tiles: the operand reads a FLOP each consumer's
-    share issues from shared memory (1/rows + 1/columns of its share), where its products read registers
-    its warps load (`mosaic.Issuer.operands_in_registers`: mma.sync's fragments, each an instruction its
-    warps issue beside their products), then the tile's own reads a FLOP (1/rows + 1/columns), which a
-    wider tile lowers. On an A100, two consumers' 64-row shares of a 128 x 128 tile issued 1.5x one
-    consumer's fragment loads (176M against 118M LDSM, 0.0234 against 0.0156 reads a FLOP) and ran 2.78x
-    its input gradient's time (NS-P2-NCU2-a100); their 128 x 256 tiles 1.355x one consumer's 128 x 128
-    over 19 rows (NS-P2-CONSUMERS-a100). Warpgroup MMA reads both operands from shared memory itself, no
-    instruction its warps issue: there the cooperative tile's fewer reads lead (CUTLASS's split, 2-7% faster
-    on every H100 scoreboard row)."""
-    share = 1 / (tile.block_m // tile.warpgroups) + 1 / tile.block_n
-    return share if family.operands_in_registers else 0.0, 1 / tile.block_m + 1 / tile.block_n
+        if tile is not None:
+            return tile
+    return None
 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], busy: int, shaped: Callable,
@@ -292,13 +290,21 @@ def _held_widths(layouts: tuple, consumers: int, columns: list[int], role: int,
     if not columns:
         return []
     area = max(resources.held_area(layout, consumers) for layout in layouts)
-    side = max(role, min(most_rows, math.isqrt(area) // role * role))
+    side = _balanced_side(layouts, consumers, role, most_rows)
     widest = next((block_n for block_n in columns if block_n * side <= area), columns[-1])
 
     def held(block_n: int) -> int:
         return min(most_rows, max(resources.held_rows(layout, consumers, block_n) for layout in layouts))
 
     return [(block_n, held(block_n)) for block_n in columns if block_n <= widest and held(block_n) >= role]
+
+
+def _balanced_side(layouts: tuple, consumers: int, role: int, most_rows: int) -> int:
+    """`derived`'s balanced rows at `consumers`: the square root of the accumulator area their registers
+    hold (`resources.held_area`, `layouts`' most generous), which reads each operand fewest times a FLOP
+    (1/rows + 1/columns at rows x columns = area), in whole roles, at least one, no more than the call's."""
+    area = max(resources.held_area(layout, consumers) for layout in layouts)
+    return max(role, min(most_rows, math.isqrt(area) // role * role))
 
 
 def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, programs: int, rows: int,

@@ -297,6 +297,33 @@ def test_a_norms_activation_and_every_gradient_hold_the_float64_gate(dtype, afte
             SEEDS[(2, 3, 31)])
 
 
+def test_a_norms_activation_reading_its_width_divides_by_the_rows_not_a_padded_tiles():
+    """An activation reading its operand's shape (`y / y.shape[-1]`, which `elementwise` takes) after the
+    fused norm, interpreted on a CPU at a width no tile divides (3 columns, a 4-wide tile): its output and its
+    input's and weight's gradients on par with the portable norm's (check 1), which divides by the row's 3
+    columns (norms.py), where a tile's 4 put every output a third off."""
+    def activation(y):
+        return y / y.shape[-1]
+
+    def norm(output_dtype, x, scale, implementation="xla"):
+        return stream_rms_normalized(x, None, scale, 1e-5, output_dtype, scale_offset=False,
+                                     scale_after_cast=False, fp32_statistics=True,
+                                     implementation=implementation, activation=activation)[1]
+
+    def fused(x, scale):
+        def portable(x, branch, scale):
+            return stream_rms_normalized(x, branch, scale, 1e-5, jnp.float32, scale_offset=False,
+                                         scale_after_cast=False, fp32_statistics=True,
+                                         implementation="xla", activation=activation)
+
+        return norm_swiglu.stream_rms_norm(x, None, scale, 1e-5, jnp.float32, offset=False, after_cast=False,
+                                           portable=portable, epilogue=activation)[1]
+
+    compare((functools.partial(norm, jnp.float32), fused, functools.partial(norm, jnp.float64)),
+            lambda draw: norm_operands((2, 5, 3), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),
+            SEEDS[(2, 3, 31)])
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("scale_dtype", [None, jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("offset", [False, True])

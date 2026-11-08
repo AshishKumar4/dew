@@ -316,6 +316,54 @@ def _maps_alone(function, shape: tuple[int, int]) -> bool:
     return isinstance(out, jax.ShapeDtypeStruct) and out.shape == shape and closed_mapped(closed)
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Logical:
+    """An `elementwise` activation traced once at the call's logical shape (`traced`, at `shape`) and
+    applied to a kernel's tile of any shape: the traced graph evaluated on the tile, each shape it states
+    (`broadcast_in_dim`'s, a reshape's) the tile's and every constant the trace's, so an activation reading
+    its operand's shape (`y / y.shape[-1]`) divides by the row's width, not a padded tile's (norms.py's
+    arithmetic), and its pullback derives from the same graph (`jax.vjp` through it)."""
+
+    traced: jax.extend.core.ClosedJaxpr
+    shape: tuple[int, ...]
+
+    @classmethod
+    def of(cls, epilogue, shape: tuple[int, ...]) -> "_Logical | None":
+        return None if epilogue is None else cls(
+            jax.make_jaxpr(epilogue)(jax.ShapeDtypeStruct(shape, jnp.float32)), tuple(shape))
+
+    def __call__(self, y: jax.Array) -> jax.Array:
+        (out,) = _on_tile(self.traced.jaxpr, self.traced.consts, self.shape, y.shape, y)
+        return out
+
+
+def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
+    """`jaxpr`, traced at the `logical` shape, evaluated on `args` of the `tile` shape: each shape parameter
+    that is the logical shape the tile's, a nested program (a jit's, a custom rule's primal) evaluated so too
+    in place."""
+    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
+
+    def read(atom):
+        return atom.val if isinstance(atom, jax.extend.core.Literal) else values[atom]
+
+    for equation in jaxpr.eqns:
+        given = [read(atom) for atom in equation.invars]
+        nested = next((value for key, value in equation.params.items()
+                       if key in ("jaxpr", "call_jaxpr", "fun_jaxpr")
+                       and isinstance(value, jax.extend.core.ClosedJaxpr)), None)
+        if nested is not None:
+            given = given[len(given) - len(nested.jaxpr.invars):]
+            outputs = _on_tile(nested.jaxpr, nested.consts, logical, tile, *given)
+        else:
+            params = {key: tuple(tile) if isinstance(value, tuple) and tuple(value) == logical else value
+                      for key, value in equation.params.items()}
+            with equation.ctx.manager:
+                made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
+            outputs = made if equation.primitive.multiple_results else [made]
+        values.update(zip(equation.outvars, outputs, strict=True))
+    return [read(atom) for atom in jaxpr.outvars]
+
+
 def _runs(case) -> bool:
     """Whether the Pallas kernels run here: on a GPU Dew's Triton kernels run on (`generation.triton_runs`),
     the assumed one's within `generation.assumed`. Off one, every call takes XLA's arithmetic, a kernel
@@ -1080,7 +1128,7 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
                            lambda x, scale: portable(x, None, scale)[1], axes=axes, weight_first=weight_first,
                            epilogue=epilogue)
     norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(weight_first=weight_first,
-                                                                     epilogue=epilogue)
+                                                                     epilogue=_Logical.of(epilogue, x.shape))
 
     def forward(x, branch, scale):
         outputs, mean_square = _rms_with_mean_square(x, branch, scale, None, norm)
@@ -1105,7 +1153,7 @@ def rms_norm(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool, po
     multiplies, as `unweighted_rmsnorm` rounds it; `weight_first` and `epilogue` as `stream_rms_norm`'s."""
     norm = _norm(epsilon, dtype, offset, after_cast, scale)._replace(inverse_rounded=inverse_rounded,
                                                                      weight_first=weight_first,
-                                                                     epilogue=epilogue)
+                                                                     epilogue=_Logical.of(epilogue, x.shape))
 
     def forward(x, scale):
         (_, y), mean_square = _rms_with_mean_square(x, None, scale, None, norm)
