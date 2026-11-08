@@ -34,6 +34,15 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
+def this_gpus(count: int = 1) -> tuple:
+    """`count` compile-only GPUs of this GPU's own target, its generation and its multiprocessors (an H100
+    PCIe's 114, not the canonical H100's 132), whose programs this GPU's loader takes (`BuildTarget.held`)."""
+    from dew.training.ahead import BuildTarget, compile_only_gpus
+
+    own = BuildTarget.of(jax.devices()[:1])
+    return compile_only_gpus(own.generation, count, multiprocessors=own.multiprocessors)
+
+
 def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
               inspection=None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
@@ -881,13 +890,15 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
     from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
-    from dew.nn.kernels.generation import device_generation
-    from dew.training.ahead import CompiledAhead
+    from dew.training.ahead import BuildTarget, CompiledAhead
 
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
     stated = ["--trainer.checkpoint-dir", str(runs), *CLOCKED]
-    ahead = ["--trainer.compile-ahead.generation", device_generation(),
+    # This GPU's own target, its multiprocessors as it counts them (an H100 PCIe's 114).
+    own = BuildTarget.of(jax.devices()[:1])
+    ahead = ["--trainer.compile-ahead.generation", own.generation,
+             "--trainer.compile-ahead.multiprocessors", str(own.multiprocessors),
              "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
     compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default)
     with pytest.raises(CompiledAhead):
@@ -943,19 +954,19 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
 
 
 def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
-    """A step compiled ahead for one compile-only GPU of this GPU's generation, saved, and loaded
-    again, runs on this GPU in the place of the run's own compile of it: handed the arguments the
+    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved,
+    and loaded again, runs on this GPU in the place of the run's own compile of it: handed the arguments the
     run's step is (the state the trainer places, the batch, the first part), it makes outputs of
     the same tree, shapes, dtypes and placements, the same step and microstep counters, a finite
     loss, and parameters it has updated. Its floats are not held to the run's own bit for bit: XLA
     tunes a GEMM's algorithm on the GPU it compiles on and takes its default with none attached."""
-    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.nn.kernels.generation import chosen
     from dew.state import apart
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus, step_batch
+    from dew.training.ahead import AheadOfTime, compile_ahead, step_batch
 
     # A step that reads its parameters whole, so its arguments are the placed state's own.
     with chosen(narrow_copies="off"):
-        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1))),
+        compile_ahead(fine_tune(MeshSpec().build(this_gpus())),
                       token_rows(VOCAB, BATCH, SEQ_LEN + 1)).save(tmp_path / "step.dew-aot")
         run = fine_tune(MeshSpec().build(jax.devices()[:1]))
         batch = step_batch(run, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
@@ -990,18 +1001,18 @@ def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path)
 
 
 def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
-    """A step compiled ahead for one compile-only GPU of this GPU's generation, saved and handed to
-    the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
+    """A step compiled ahead for one compile-only GPU of this GPU's own target (`this_gpus`), saved and
+    handed to the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
     trains from it, its plan's first compile the step compiled ahead: its steps advance and its
     parameters move (row 1915). A wider model's step for this GPU is another program, refused. The
     model's attention takes XLA's path, which a step compiled with no GPU attached traces too."""
-    from dew.nn.kernels.generation import chosen, device_generation
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.nn.kernels.generation import chosen
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     with chosen(narrow_copies="off"):
         for name, width in (("step", None), ("wide", 48)):
-            compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1)), xla=True,
+            compile_ahead(fine_tune(MeshSpec().build(this_gpus()), xla=True,
                                     width=width), batch).save(tmp_path / f"{name}.dew-aot")
         here = MeshSpec().build(jax.devices()[:1])
         run = fine_tune(here, ahead=AheadOfTime.load(tmp_path / "step.dew-aot"), xla=True)
@@ -1036,14 +1047,14 @@ def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
     compiled ahead for this host's own GPU, takes both (`taken`) and compiles no step program on its GPU
     (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
     review)."""
-    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.nn.kernels.generation import chosen
     from dew.telemetry.compiles import Compiles
     from dew.training import Inspection
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
     batch, watched = token_rows(VOCAB, BATCH, SEQ_LEN + 1), Inspection(every=1)
     with chosen(narrow_copies="off"):
-        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1)), xla=True,
+        compile_ahead(fine_tune(MeshSpec().build(this_gpus()), xla=True,
                                 inspection=watched), batch).save(tmp_path / "step.dew-aot")
         run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True, inspection=watched,
                         ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
@@ -1149,14 +1160,14 @@ def a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_wit
     rather than lowering another program and refusing it; resumed from its checkpoint without the step,
     it traces with that link again, not one it measures (row 2229)."""
     from dew.checkpoints import Checkpoints
-    from dew.nn.kernels.generation import chosen, device_generation
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.nn.kernels.generation import chosen
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     spec, path = MeshSpec(tensor=2), tmp_path / "step.dew-aot"
     here = spec.build(jax.devices()[:2])
     with chosen(narrow_copies="off"):
-        target = spec.build(compile_only_gpus(device_generation(), 2))
+        target = spec.build(this_gpus(2))
         compile_ahead(latent(target), batch).save(path)
         saved = str(tmp_path / "run")
         run = latent(here, ahead=AheadOfTime.load(path), links=FAST, checkpoints=Checkpoints(saved))
@@ -1172,12 +1183,12 @@ def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     """An offline plan for two microbatches is handed to a live run with its split unpinned. The
     live planner takes the saved split before lowering, so the artifact's program is reused and its
     two donated microbatch calls produce one committed update, not a mismatch or a recompile."""
-    from dew.nn.kernels.generation import chosen, device_generation
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.nn.kernels.generation import chosen
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     with chosen(narrow_copies="off"):
-        target = MeshSpec().build(compile_only_gpus(device_generation(), 1))
+        target = MeshSpec().build(this_gpus())
         saved = compile_ahead(fine_tune(target, xla=True, split=2), batch)
         path = tmp_path / "split.dew-aot"
         saved.save(path)
