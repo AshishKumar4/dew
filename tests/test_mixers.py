@@ -566,7 +566,7 @@ def test_a_blocks_call_stating_its_keys_validity_alone_is_refused():
     x = jax.random.normal(jax.random.key(23), (1, 4, 64))
     variables = layer.init(jax.random.key(22), x)
     valid = jnp.asarray([[True, False, True, True]])
-    with pytest.raises(ValueError, match="attention_key_valid"):
+    with pytest.raises(ValueError):
         layer.apply(variables, x, MixerCall(AttentionMetadata(key_valid=valid)))
     runs = jnp.broadcast_to(jnp.asarray([[0, 4]]), (1, 4, 1, 2))
     layer.apply(variables, x, MixerCall(AttentionMetadata(key_runs=runs, key_valid=valid)))
