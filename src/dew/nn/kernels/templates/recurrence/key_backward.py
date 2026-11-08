@@ -439,9 +439,12 @@ def _key_pairs_staged(call: Call, keys: int) -> tuple:
     landing."""
     parted = _parted(call)
     # Where the call's pairs do not factor (`Call.factored`), a key block's keys and separated prefix below a
-    # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads).
-    padded = () if call.factored else (plgpu.SMEM((3, algebra.SUB + CHUNK, keys), jnp.float32),
-                                       plgpu.SMEM((CHUNK + algebra.SUB, keys), jnp.float32))
+    # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads), stated
+    # plain as the forward's are (`mosaic.plain`): unstated, layout inference tiled them, and the reads at
+    # row offsets no tiling divides took other rows on every GPU, Kimi delta attention's gradients 1e4 times
+    # their size where its pairs do not factor, its interpreted run right (row 5194).
+    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),
+                                       mosaic.plain((CHUNK + algebra.SUB, keys), jnp.float32))
     staging = ([staging_tiles(parted, (CHUNK, keys))[0] for _ in range(2)],
                [staging_tiles(parted, (CHUNK, CHUNK))[0] for _ in range(2)],
                plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32), *padded)
