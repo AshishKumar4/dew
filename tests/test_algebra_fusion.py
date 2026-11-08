@@ -103,6 +103,25 @@ pass keeps the program as traced), and an H100's and an A100's selectors, which 
 XLA's dot."""
 
 
+def test_a_program_writing_a_ref_inside_a_nested_body_computes_as_written():
+    """A program one of whose equations makes no value but writes a ref in its nested body, which binds the
+    anchors the pass reads regions around (an exponential, an inverse square root, a sigmoid: a launch that
+    rewalks into its outputs in place, a fused backward's dQ), under the pass with its kernels: the
+    recognizer reads no region around it, and the program computes as written, bitwise."""
+    def written(x):
+        out = jax.new_ref(jnp.zeros_like(x))
+
+        def anchored():
+            out[...] = jnp.exp(x) + jax.lax.rsqrt(jnp.abs(x) + 1) + jax.nn.sigmoid(x)
+
+        jax.lax.cond(jnp.all(jnp.isfinite(x)), anchored, lambda: None)
+        return jax.freeze(out) * 2
+
+    x = jnp.asarray(np.random.default_rng(4783).standard_normal((4, 8)), jnp.float32)
+    with generation.assumed("sm90"):
+        assert_equal(rewritten(written, x), jax.jit(written)(x))
+
+
 @pytest.mark.parametrize("layer", LAYERS, ids=lambda layer: layer.__name__)
 @pytest.mark.parametrize(("generation_name", "named"), ARMS, ids=["sm90-named", "sm80-named", "sm90", "sm80"])
 def test_a_layer_under_the_pass_computes_what_it_does_as_written(layer, generation_name, named):
