@@ -717,7 +717,11 @@ def _transparent(pipeline: Pipeline, cache: int) -> bool:
     """Whether a read takes the cache at `cache` as the steps it stands for read: an automatic cache's,
     whose steps keep or reject each input, so a position saved with it resumes without it and the
     reverse, by index and by stream (rows 803, 4217)."""
-    stage = pipeline.stages[cache]
+    return _automatic_cache(pipeline.stages[cache])
+
+
+def _automatic_cache(stage: Stage) -> bool:
+    """Whether `stage` is a run's automatic cache (`dew.data.compile._automatic`)."""
     return isinstance(stage, Artifact) and stage.automatic
 
 
@@ -1305,8 +1309,12 @@ class _Build:
         shards in its workers' own, each worker's shards its own, as a stream is read through and never by
         index: in order, every worker would read the whole stream (`_StreamOrder`). So does a cache of
         steps that drop records, which its workers read as a stream of each input's outputs, its views'
-        repeat that stream's (`_carried`), where a read in none repeats the views over its inputs."""
-        cached = self.lowering.cache is not None and not self.lowering.one_to_one
+        repeat that stream's (`_carried`), where a read in none repeats the views over its inputs; an
+        automatic cache's, which keeps or rejects each input (`_transparent`), is read by index, one output
+        an input, as the run without it reads them, so a position either saves resumes in the other."""
+        cache = self.lowering.cache
+        cached = (cache is not None and not self.lowering.one_to_one
+                  and not _automatic_cache(self.lowering.stages[cache]))
         streams = self.read == "streamed" or cached
         return self.elastic or (self.training and not self.global_order and self.version >= IN_ORDER
                                 and not streams)
@@ -1504,8 +1512,12 @@ class _Build:
             # marker, read as the uncached run's rows are read and dropped (`record_stage`), so a position
             # either saves resumes in the other, the cache on or off (row 803); a chain's own cache keeps
             # the form its positions saved.
-            single = _as_iter(view.map(_CachedOne()), self.loading)
-            kept = single if marked else Accepted(single, _name(pipeline), _label(pipeline))
+            single = view.map(_CachedOne())
+            if self.in_order:
+                # Read by index in its inputs' order, as the uncached run's workers read them (`in_order`).
+                return single, cache + 1, None
+            kept = (_as_iter(single, self.loading) if marked
+                    else Accepted(_as_iter(single, self.loading), _name(pipeline), _label(pipeline)))
             return kept, cache + 1, None
         # A fetch with a pool of its own among the cached steps reads that many inputs at once.
         threads = max(self.loading.threads, prefix.threads or 0)
