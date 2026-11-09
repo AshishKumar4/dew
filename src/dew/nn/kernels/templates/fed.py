@@ -5,10 +5,10 @@ import dataclasses
 from collections.abc import Callable
 
 import jax
-from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import resources
+from dew.nn.kernels.templates.handoffs import Role, Schedule
 from dew.nn.kernels.templates.mosaic import Ring, RingFamily
 
 
@@ -85,13 +85,9 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         return resources.entry_registers(consumers, programs)
 
 
-    def warpgroups(self, consumers: int) -> int:
-        return consumers
-
-    def roles(self, consumers: int, consumer, producer):
-        # Every consumer runs one program: its value the program's, for a scope after the walk's.
-        del consumers, producer
-        return consumer(lax.axis_index("wg"))
+    def roles(self, consumers: int) -> Schedule:
+        # Every warpgroup a consumer, its value the program's, for a scope after the walk's.
+        return Schedule((Role("consumer", consumers),))
 
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
         raise NotImplementedError(f"{self.name}'s consumers feed their own rings (`fed`)")

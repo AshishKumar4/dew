@@ -30,6 +30,7 @@ The workflow's fp32 rows are tests/test_block_diffusion.py's.
 """
 
 import contextlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -38,13 +39,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import fixture_ids, transformers_arms, transformers_model
+from interop_support import clearing_selections, fixture_ids, transformers_arms, transformers_model
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
+from selection_margins import NARROW_MARGIN
 
 from dew.interop import Pretrained, diffusion_gemma as adapter
 from dew.nn.inputs import ModelInputs
+from dew.nn.kernels import generation
+from dew.nn.precision import ACCURATE
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny",
@@ -54,9 +58,10 @@ DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek
 DECODER_SEEDS = {"float32": {"mixtral-tiny": 16}, "bfloat16": {"mixtral-tiny": 512}}
 """Each decoder's declared draws of ids against transformers' forward in the same precision (check 1),
 sized by `seeds_for` paired with Dew's logits on the CPU: 8 where a decoder is not named."""
-ONE_DRAW = {("deepseek-v3-tiny", "bfloat16")}
-"""The decoders whose check 1 does not resolve within the 512-seed cap, paired (G02's open row): held on
-their recorded draw by the one-draw rule, as before, until it does."""
+NARROW_ROUTED = ("deepseek-v3-tiny",)
+"""The decoders whose bfloat16 routing flips move both arms' errors past check 1's resolution (DeepSeek-V3's
+group selection: each draw's flip a heavy tail, its paired ratio 0.96 over cleared draws, row 4734); the
+others' check 1 resolves over every draw."""
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
@@ -64,22 +69,23 @@ their recorded draw by the one-draw rule, as before, until it does."""
 def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     """Dew's logits in `dtype` (bfloat16 over float32 masters, as training runs) are on par with
     transformers' own forward in `dtype` (its weights cast to it, as `from_pretrained` casts them), both
-    from the float64 twin of the stored weights, over drawn ids (check 1)."""
+    from the float64 twin of the stored weights, over drawn ids (check 1). A decoder whose bfloat16 routing
+    moves both arms past check 1 (`NARROW_ROUTED`) draws ids whose routes Dew's float64 run decides by
+    bfloat16's margin (`clearing_selections`, `NARROW_MARGIN`), so neither narrow run routes otherwise than
+    the truth (row 4734)."""
     directory = FIXTURES / name
     pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
-    if (name, dtype) in ONE_DRAW:
-        ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
-        logits = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
-        with np.load(directory / "numerics.npz") as exact:
-            assert_as_exact_as_the_reference(logits, exact["bf16"], exact["f64"], f"{name} {dtype}")
-        return
+    draw = fixture_ids(directory)
+    if dtype == "bfloat16" and name in NARROW_ROUTED:
+        truth_model = Pretrained.load(str(directory), dtype="float64", attention_impl="reference")
+        draw = clearing_selections(truth_model, draw, f"{name} {dtype}", tries=256, margin=NARROW_MARGIN)
     source = transformers_model(directory)
     narrow = source if dtype == "float32" else transformers_model(directory, dtype=dtype)
     reference, truth = transformers_arms(narrow, lambda model, ids: model(ids, use_cache=False).logits,
                                          source=source)
     assert_as_exact(lambda ids: pretrained.model.apply(pretrained.variables, ids).astype(jnp.float32),
-                    reference, fixture_ids(directory), f"{name} {dtype}",
-                    seeds=DECODER_SEEDS[dtype].get(name, 8), truth_fn=truth)
+                    reference, draw, f"{name} {dtype}", seeds=DECODER_SEEDS[dtype].get(name, 8),
+                    truth_fn=truth)
 
 
 BIAS_SEEDS = {"qwen2-tiny": 64, "llama-tiny": 32}
@@ -169,7 +175,8 @@ def denoise(model, variables, prompt, canvas, **conditioning):
     cache = model.apply({**variables, "cache": cache}, inputs,
                         method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
                         mutable=["cache"])[1]["cache"]
-    return model.apply({**variables, "cache": cache}, canvas, **conditioning).astype(jnp.float32)
+    logits = model.apply({**variables, "cache": cache}, canvas, **conditioning)
+    return logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
 
 
 def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
@@ -199,6 +206,72 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
                                          f"workflow {name}")
 
 
+EXPERT_SEEDS = 16
+"""The expert site's declared seeds."""
+
+
+def test_the_diffusion_denoisers_experts_are_as_exact_as_the_reference_in_bf16():
+    """DiffusionGemma's routed experts' continuous math in bfloat16, on par with transformers' own
+    (`DiffusionGemmaTextExperts`) over drawn inputs, both measured from its float64 twin (check 1): its first
+    layer's experts, Dew's as the model builds them (read from one forward by `flax.linen.intercept_methods`),
+    over drawn hidden states, expert ids (each token's two distinct) and gates, given to both. The whole
+    model's bfloat16 site above stays on its recorded draw: its routers' bfloat16 scores move past every
+    draw's least margin, so no drawn routing is the float64 run's (row 4739); routing itself is held by
+    tests/test_block_diffusion.py's float32 sites and the router tests."""
+    import torch
+    from flax import linen as nn
+
+    from dew.nn.moe import ExpertMLP
+
+    directory = FIXTURES / "diffusion-gemma-workflow"
+    config = json.loads((directory / "config.json").read_text())
+    model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
+    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    with np.load(directory / "reference.npz") as stored:
+        prompt = stored["prompt"]
+    held = []
+
+    def first(next_fun, args, kwargs, context):
+        if isinstance(context.module, ExpertMLP) and context.method_name == "__call__" and not held:
+            held.append((context.module.clone(parent=None), context.module.variables))
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(first):
+        denoise(model, variables, prompt, prompt[:, :1])
+    experts, expert_variables = held[0]
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaForBlockDiffusion,
+        DiffusionGemmaTextExperts,
+    )
+
+    # Eager experts: the grouped matmul has no float64 kernel.
+    loaded = DiffusionGemmaForBlockDiffusion.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True, experts_implementation="eager")
+    network = next(module for module in loaded.modules() if isinstance(module, DiffusionGemmaTextExperts))
+    narrow = copy.deepcopy(network).to(torch.bfloat16)
+    tokens, width = 32, network.hidden_dim
+
+    def draw(seed):
+        rng = np.random.default_rng([4739, seed])
+        chosen = np.stack([rng.permutation(network.num_experts)[:2] for _ in range(tokens)]).astype(np.int32)
+        gates = rng.uniform(0.1, 1.0, (tokens, 2)).astype(np.float32)
+        hidden = rng.standard_normal((tokens, width)).astype(np.float32)
+        return hidden, chosen, gates / gates.sum(-1, keepdims=True)
+
+    @as_given
+    def dew(hidden, chosen, gates):
+        out = experts.apply(expert_variables, jnp.asarray(hidden, jnp.bfloat16),
+                            jnp.asarray(gates, jnp.bfloat16), jnp.asarray(chosen))
+        return {"experts": jnp.asarray(out, jnp.float32)}
+
+    def run(module, hidden, chosen, gates):
+        dtype = next(module.parameters()).dtype
+        return {"experts": module(hidden.to(dtype), chosen, gates.to(dtype))}
+
+    reference, truth = transformers_arms(narrow, run, source=network)
+    assert_as_exact(dew, reference, draw, "workflow experts bfloat16", seeds=EXPERT_SEEDS, truth_fn=truth)
+
+
 def bfloat16(bits: np.ndarray) -> jax.Array:
     return jax.lax.bitcast_convert_type(jnp.asarray(bits), jnp.bfloat16)
 
@@ -220,10 +293,13 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
     Dew's with bf16 parameters at 1.05 (5.24), ratio 0.95; the two bf16
     runs are 1.56 apart at most because each is that far from the truth,
     not because either computes something else. Dew in bf16 over fp32
-    masters, the training configuration, sits at 0.53. In fp32 Dew is at
-    8.6e-05 and transformers at 4.9e-05 (ratio 1.78: the SSD sums its chunks
-    in another order). Each is held over MAMBA2_SEEDS prompts drawn from
-    the text's tokens (check 1)."""
+    masters, the training configuration, sits at 0.53. In fp32 Dew runs its
+    accurate forms (`ACCURATE`), the IEEE products transformers' fp32 run
+    takes: under its fast forms a GPU's products are TF32-class, as
+    mamba_ssm's are, which put Dew on an H100 2.975 times the CPU arm's
+    distance from float64 where both on a CPU sit at 1.45 (ledger 4769).
+    Each is held over MAMBA2_SEEDS prompts drawn from the text's tokens
+    (check 1)."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -250,5 +326,9 @@ def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
                                              twin=twin)
         pretrained = Pretrained.load(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
                                      param_dtype=dtype, attention_impl="xla")
-        assert_as_exact(lambda drawn, model=pretrained: model.model.apply(model.variables, drawn).astype(
-            jnp.float32), reference, draw, f"{MAMBA2_130M} {dtype}", seeds=MAMBA2_SEEDS, truth_fn=truth)
+
+        def dew(drawn, model=pretrained, accurate=dtype == "float32"):
+            with generation.run_precision(ACCURATE) if accurate else contextlib.nullcontext():
+                return model.model.apply(model.variables, drawn).astype(jnp.float32)
+
+        assert_as_exact(dew, reference, draw, f"{MAMBA2_130M} {dtype}", seeds=MAMBA2_SEEDS, truth_fn=truth)

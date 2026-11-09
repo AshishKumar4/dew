@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_source import ran, selected
-from reference_worker import serve
+from reference_worker import drawn, serve
 from torch_precision import dtype_widened, float64, replaced
 
 REPO, REVISION = "moonshotai/Kimi-K3", "f831ab66814297da540d832a5235f8e904f29d06"
@@ -128,14 +128,12 @@ def main() -> None:
             module.eps = torch.finfo(torch.float32).eps
 
     def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        out = {}
-        for name in sorted({key.split(".", 1)[0] for key in cases}):
-            for kind, grid in GRIDS.items():
-                patches = cases[f"{name}.{kind}"]
-                out[f"{name}.reference.{kind}"] = projected(*narrow, patches, grid)
-                with float64(), twin_policy(release):
-                    out[f"{name}.truth.{kind}"] = projected(*wide, patches, grid)
-        return out
+        def answer(inputs):
+            reference = {kind: projected(*narrow, inputs[kind], grid) for kind, grid in GRIDS.items()}
+            with float64(), twin_policy(release):
+                return reference, {kind: projected(*wide, inputs[kind], grid) for kind, grid in GRIDS.items()}
+
+        return drawn(cases, answer)
 
     serve(run)
 

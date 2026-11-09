@@ -24,7 +24,7 @@ import math
 import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from numbers import Real
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, overload
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -265,8 +265,13 @@ _REMOVED_BY_NAME = {path.rsplit(":", 1)[-1]: names for path, names in REMOVED_FI
 """`REMOVED_FIELDS` by class name, as a configuration's repr names it."""
 
 
+@overload
+def without_fields(value: dict[str, JSON], names: Collection[str]) -> dict[str, JSON]: ...
+@overload
+def without_fields(value: JSON, names: Collection[str]) -> JSON: ...
 def without_fields(value: JSON, names: Collection[str]) -> JSON:
-    """`value` without a field of `names` in any record it nests, a list's records among them."""
+    """`value` without a field of `names` in any record it nests, a list's records among them; a record
+    stays the record it is."""
     if isinstance(value, list):
         return [without_fields(part, names) for part in value]
     if isinstance(value, dict):

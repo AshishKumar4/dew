@@ -5,7 +5,10 @@ inputs whose margins clear MARGIN, so its float32 runs and its float64 run selec
 rounding of a boundary picks other keys, units or experts in other runs, a difference no precision
 bounds (docs/design/testing.md asks a stated margin of such a draw)."""
 
+from collections.abc import Mapping
+
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
@@ -16,6 +19,14 @@ run and the float64 run select alike. Gemma 3n's gate in tests/test_architecture
 whose inputs carry the rounding of the attention and AltUp before it, moved at most 3.7e-6 of its row's
 deviation over the 1,200 forwards of 320 draws, a light tail: each draw's largest was 1.6e-6 at the
 median and 2.5e-6 at the 99th percentile."""
+
+
+NARROW_MARGIN = 8 * float(jnp.finfo(jnp.bfloat16).eps)
+"""The least selection margin a draw admits where the compared runs compute in bfloat16 (0.0625): above the
+distance bfloat16 rounding moves a selection's inputs. DeepSeek-V3-tiny's group scores (each the sum of its
+two best sigmoid-plus-bias expert scores), over 8,192 draws, moved by at most 0.033 relative between bfloat16
+and float64, and the difference of two groups' by at most 0.060 (transformers') and 0.041 (Dew's); the 491
+draws clearing 0.0625 flipped no group in either bfloat16 run (row 4734)."""
 
 
 def routes(config) -> bool:
@@ -34,10 +45,18 @@ def selects(config) -> bool:
     """Whether a decoder built from `config` selects discontinuously: a lightning indexer's top-k, the
     model's own or a layer kind's (DeepSeek V4's compressed sparse attention), Gemma 3n's gaussian top-k
     or a mixture's routing."""
-    mixers = [config.get("mixer", {}), *(kind.get("mixer", {}) for kind in config.get("kinds", {}).values())]
+    mixers = [config.get("mixer"), *(_read(kind, "mixer") for kind in config.get("kinds", {}).values())]
     sparsities = config.get("activation_sparsity_pattern", ())
-    indexed = any((mixer or {}).get("fields", {}).get("index_topk") for mixer in mixers)
+    indexed = any(_read(_read(mixer, "fields") or mixer, "index_topk") for mixer in mixers)
     return bool(indexed or any(sparsities) or routes(config))
+
+
+def _read(held, name: str):
+    """`name` of a config's entry, as a spec's dict holds it or as its typed config (a `Mamba2Mixer`'s, an
+    `MLAMixer`'s field); None where it holds none."""
+    if held is None:
+        return None
+    return held.get(name) if isinstance(held, Mapping) else getattr(held, name, None)
 
 
 def capturing(model, variables, *arguments, method=None, mutable=(), **options):

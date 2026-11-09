@@ -43,16 +43,16 @@ from dew.interop.families.deepseek import (
     v4_routes,
 )
 from dew.interop.layouts import Route, mapped, one_of
+from dew.interop.towers.deepseek_v41 import (
+    translate_deepseek_v41_projector_config,
+    translate_deepseek_v41_vision_config,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.engram import Engram
 from dew.nn.hyper_connections import HyperConnections
-from dew.nn.vision.deepseek_v41 import (
-    translate_deepseek_v41_projector_config,
-    translate_deepseek_v41_vision_config,
-)
 
 # The release's config.json nests the text model's fields under text_config
 # beside a vision tower.

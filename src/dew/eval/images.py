@@ -39,7 +39,7 @@ def _get_clip(modelname: str):
     built from this module shares the copy."""
     from transformers import CLIPImageProcessorPil
 
-    from dew.nn.text_encoders import CLIPModel
+    from dew.interop.text_encoders import CLIPModel
     _log.info("loading CLIP model %r (cached for reuse)", modelname)
     return CLIPModel.from_pretrained(modelname), CLIPImageProcessorPil.from_pretrained(modelname)
 

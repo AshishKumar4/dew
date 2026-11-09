@@ -32,8 +32,8 @@ from interop_support import (
     scaled_gap,
 )
 
+from dew.interop.autoencoders.qwen_image import load_qwen_image_vae
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5

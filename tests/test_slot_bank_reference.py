@@ -27,9 +27,10 @@ def recorded_runs(tool, tmp_path, options, logits, *, count=8, pool_commit=COMMI
     records over it, made on the CPU at float32 in one run of COMMIT: `count` verdict draws and their
     redraw, twice `count` pilots from SIZING_FROM, two questions of `options` options a request, and
     each question's logits `logits(phase, seed, question)`; the pool names `pool_commit`, where one."""
-    from check1_wire import staged_units
-    from reference_error import SIZING_FROM
     from safetensors.numpy import save_file
+
+    from dew.parity import SIZING_FROM
+    from dew.parity_stages import staged_units
 
     source = tmp_path / "source"
     source.mkdir()

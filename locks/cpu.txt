@@ -1193,6 +1193,8 @@ py-key-value-aio==0.4.6
     # via fastmcp-slim
 py-partiql-parser==0.6.3
     # via moto
+py-spy==0.4.2
+    # via dewml (pyproject.toml)
 pyahocorasick==2.3.1
     # via datatrove
 pyarrow==25.0.1

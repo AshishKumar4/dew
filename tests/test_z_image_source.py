@@ -35,9 +35,9 @@ from interop_support import (
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from whole_suite import timed
 
-from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import z_image_fields, z_image_path
 from dew.nn.backbones.z_image import ZImageTransformer
+from dew.nn.inputs import DenoisingCondition
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("padded", "exact", "deep")

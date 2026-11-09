@@ -23,7 +23,14 @@ from dew._coordination import from_every_process
 from dew._files import write_atomically
 from dew._records import JSON, number, record
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
-from dew.data.dataset import Checkpointable, DataPartition, RampedStream, rows_of, stream_identity
+from dew.data.dataset import (
+    Checkpointable,
+    DataPartition,
+    PhasedStream,
+    RampedStream,
+    rows_of,
+    stream_identity,
+)
 from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
@@ -203,7 +210,7 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
     A `batch` the mesh cannot divide fails where it is placed or
     traced (`check_batch`), unless the stream's rows are not the step's
     (`rows`; a rollout's are its own, checked where its step traces), and a
-    ramp stage's, for a later stage, an hour in. A ramp reads each stage's
+    ramp stage's or a later phase's (`PhasedStream.batches`), an hour in. A ramp reads each stage's
     batch whole; an accumulation window pools its stages' batches as it pools
     any, but for a loss that replays its window's batches (`dew.training._candidates.prepared_for`).
     """
@@ -217,6 +224,11 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
                   "from_iter(replay=True))")
         raise ValueError(f"step {resumed}'s checkpoint holds no data position, as {why}, so resuming "
                          f"would read its data again from the start; {remedy}")
+    if isinstance(source, PhasedStream):
+        if rows:
+            for read in sorted(set(source.batches)):
+                check_batch(read, mesh, microbatches)
+        return
     if not isinstance(source, RampedStream):
         if rows:
             check_batch(batch, mesh, microbatches)

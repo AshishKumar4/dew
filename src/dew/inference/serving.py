@@ -681,7 +681,8 @@ class Server:
                 _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
             formats, chosen = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
-                state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar, progress)
+                state_shardings(self.mesh, shapes, offloaded=_offloaded(model)), self._admitted, transforms,
+                stopping, grammar, progress)
             self._step, self._admitting = map(dispatched, decode_programs(formats, self._admitted,
                                                                           compiler_options(model)))
             if chosen is not None:
@@ -1688,6 +1689,11 @@ def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, gr
                                    host=host // groups)
                              for _ in range(groups)], chunk, capacity // layout.page_size,
                             states=slots // groups if states is None else states, every=every)
+
+
+def _offloaded(model: nn.Module) -> bool:
+    """Whether the served model keeps its paged pool in host memory (`KVCache.offloaded`)."""
+    return isinstance(model, Layered) and model.kv_cache.offloaded
 
 
 def _padded(pairs: Sequence[tuple[int, int]], count: int, dropped: int) -> tuple[np.ndarray, np.ndarray]:

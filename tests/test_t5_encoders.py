@@ -85,7 +85,7 @@ def test_training_drops_units_and_one_key_drops_the_same_ones():
     """The config's dropout_rate reaches the tower, and with `train` the
     encoder drops units: two dropout keys give different states, one key the
     same states twice, and evaluation is the encoder's own forward."""
-    from dew.nn.text_encoders import translate_t5_config
+    from dew.interop.text_encoders import translate_t5_config
 
     config = json.loads((TINY / "config.json").read_text())
     tower = translate_t5_config({**config, "dropout_rate": 0.25}).value

@@ -877,11 +877,10 @@ class Mixture:
 
 @dataclasses.dataclass(frozen=True)
 class Phases:
-    """Pipelines a run reads one after another, each to its end (`ends`). Every phase batches alike, as
-    compiling phases refuses otherwise (`dew.data.compile`): a phase's end on the step clock is counted
-    in steps of the first phase's batch, which phases of other batches would misplace (row 3940); each
-    phase's own steps counted toward its end would let them differ, which no phase does yet (row
-    4812)."""
+    """Pipelines a run reads one after another, each to its end (`ends`), each in batches of its own: a
+    phase's end on the step clock is the records of the phases before it and its own steps in its own
+    rows, and a phase of another batch than the one before it begins where an update does
+    (`dew.data.dataset.PhasedStream`; rows 3940, 4812)."""
 
     pipelines: tuple[Pipeline, ...]
     ends: tuple[int | None, ...]
@@ -1471,7 +1470,7 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
 def phases(*entries: tuple[Dataset, int | None]) -> Pipeline:
     """Datasets read one after another: each `(dataset, until_step)` until the training step it
     names, the last until the run ends (`None`). Each phase is a whole chain, laid out and batched
-    as it reads, each of the same batch."""
+    as it reads, each in its own batch (`Phases`)."""
     if not entries:
         raise ValueError("phases need at least one (dataset, until_step)")
     return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in entries),
@@ -1485,8 +1484,8 @@ def schedule(stages: Sequence[tuple[Dataset, float | None]]) -> Pipeline:
     ends at the step whose commit reaches its tokens, on every process alike, so its last step may
     commit past them; one that a single step's commit passes reads nothing. A corpus that an earlier
     stage read continues from where it left it, and what the run had read ahead of the end is not
-    trained on. Each stage is a whole chain, laid out and batched as it reads, every stage in one
-    batch (`Phases`: row 4812)."""
+    trained on. Each stage is a whole chain, laid out and batched as it reads, each in its own batch
+    (`Phases`)."""
     if not stages:
         raise ValueError("a schedule needs at least one (dataset, tokens)")
     budgets = [tokens for _, tokens in stages]

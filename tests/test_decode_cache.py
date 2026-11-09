@@ -5,11 +5,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import rows_prefill_pause_and_resume
+from model_support import TINY_DECODER, rows_prefill_pause_and_resume
 
 from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import causal_attention_mask
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kv_cache import cached_validity, open_kv_cache
 from dew.nn.linear import GatedDeltaNet
@@ -77,3 +78,44 @@ def test_mixer_prefill_and_resume_follow_each_rows_real_tokens(kind):
             step, cache, lambda history: module.apply(params, history)[0, -1], hidden, PREFILL_VALID,
             [(3, [True, False]), (4, [False, True]), (5, [True, True])]):
         np.testing.assert_allclose(actual, expected, atol=3e-6, rtol=3e-6)
+
+
+PACKED_VOCAB = 29
+"""The packed continuation's vocabulary."""
+
+
+@pytest.mark.parametrize("kind", ["full", "window"])
+def test_a_packed_prompts_continuation_reads_its_last_document_alone(kind):
+    """A causal decoder prefilled with a packed prompt, documents A then B (`coordinates`' segments), then
+    continued with no segments, as generation continues a prompt: two decode steps on the greedy tokens and
+    a two-token call (a speculative replay) read B's keys alone, so their logits, the generated tokens'
+    likelihoods among them, are the same bits whatever A holds (the cache's own document identity,
+    `KVCache.documents`), under full attention and under a window the prompt fits."""
+    kinds = {"sliding_attention": {"window": 12}} if kind == "window" else {"full_attention": {}}
+    types = tuple(kinds) * TINY_DECODER["num_layers"]
+    decoder = CausalTransformer(vocab_size=PACKED_VOCAB, **TINY_DECODER, num_kv_heads=2, dtype="float32",
+                                attention_impl="xla", layer_types=types, kinds=kinds)
+    segments = jnp.asarray([[1] * 4 + [2] * 3])
+    b = jax.random.randint(jax.random.key(1), (1, 3), 0, PACKED_VOCAB)
+    params = decoder.init(jax.random.key(0), jnp.zeros((1, 7), jnp.int32))
+
+    def continued(a):
+        _, made = decoder.apply(params, 1, method=CausalTransformer.init_cache, mutable=["cache"])
+        prompt = jnp.concatenate([a, b], axis=1)
+        _, held = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True,
+                                coordinates=coordinates(segments=segments), mutable=["cache"])
+        cache, token, logits = held["cache"], None, []
+        block, _ = decoder.apply({**params, "cache": cache}, jnp.asarray([[3, 5]]), decode=True,
+                                 mutable=["cache"])
+        logits.append(block)
+        token = jnp.asarray([[7]])
+        for _ in range(2):
+            step, held = decoder.apply({**params, "cache": cache}, token, decode=True, mutable=["cache"])
+            cache, token = held["cache"], jnp.argmax(step[:, -1:], axis=-1)
+            logits.append(step)
+        return [np.asarray(x) for x in logits]
+
+    first = continued(jax.random.randint(jax.random.key(2), (1, 4), 0, PACKED_VOCAB))
+    other = continued(jax.random.randint(jax.random.key(3), (1, 4), 0, PACKED_VOCAB))
+    for ours, theirs in zip(first, other, strict=True):
+        assert ours.tobytes() == theirs.tobytes()

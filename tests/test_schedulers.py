@@ -396,7 +396,7 @@ def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_
     """A run derives its EDM preset's space where it builds its process (`derived_preset`): pixels without an
     autoencoder, latents with one; sigmas the preset states win."""
     from dew.config.diffusion import DiffusionRunConfig
-    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
 
     for config, mean, std in (
         (DiffusionRunConfig(), -1.2, 1.2),

@@ -862,7 +862,7 @@ def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray])
         parts = name.split(".")
         leaf = parts[-1]
         if component == "vae":
-            from dew.nn.autoencoders.vae import _vae_path
+            from dew.interop.autoencoders.vae import _vae_path
             path = _vae_path(name, array.ndim)
         else:
             if leaf in ("weight", "bias"):
