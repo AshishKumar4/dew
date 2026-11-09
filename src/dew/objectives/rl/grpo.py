@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import SEGMENTS_FIELD, Variables, coordinates, real_slots, thaw
+from dew.batch import SEGMENTS_FIELD, Variables, real_slots, thaw
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
@@ -56,6 +56,7 @@ from .sessions import (
     SESSION_WEIGHTS_KEY,
     SUPPORT_COLUMNS_KEY,
     SUPPORT_KEY,
+    packed_coordinates,
     routing_of,
 )
 
@@ -274,16 +275,15 @@ class GRPOObjective(TokenScorer):
         for it, the routers' choices where `routing` does, and the watched activations where the step
         watches (`watched`)."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
-        segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         for key in (SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
             if jnp.shape(batch[key]) != ids.shape:
                 raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
                                  f"the shape of {IDS_KEY}, {ids.shape}")
         routed = routing_of(batch)
         routes = None if routed is None else (routed, batch.get(ROUTED_KEY))
-        # The rollout's packed columns laid out once (`Coordinates`), the layout the model reads.
-        laid = coordinates(ids.shape, segments=segments,
-                           positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32))
+        # The rollout's packed columns laid out once (`Coordinates`), the layout the model reads, its
+        # groups' shared prompts among them (`packed_coordinates`).
+        laid = packed_coordinates(batch)
         scores = self.token_scores(params, ids, coordinates=laid, routes=routes, qk_stats=qk_stats,
                                    routing=routing, watched=watched, progress=progress)
         support = (None if SUPPORT_KEY not in batch

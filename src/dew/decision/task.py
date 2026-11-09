@@ -317,6 +317,14 @@ class Decide(SavedRunTask, InItsForm):
     processor: Processor | None = None
     """The backbone's own processor, which prepares a request's images for it."""
 
+    def __post_init__(self) -> None:
+        # A request's questions are scored over one copy of its state where the backbone and head read each
+        # question as its own row (`QuestionLayout.shared_for`).
+        if isinstance(self.layout, QuestionLayout):
+            from dew.decision.shared_state import shared_for
+
+            object.__setattr__(self, "layout", shared_for(self.layout, self.model.backbone, self.model.head))
+
     @classmethod
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
@@ -901,7 +909,7 @@ class Decide(SavedRunTask, InItsForm):
         scored as it is alone, the windows placed on the weights' mesh (`RowPlan`). A server's pass counts
         its tokens in `counted` (`PassTokens`), the windows the mesh computes among them."""
         from dew.data.packing import first_fit_windows
-        from dew.decision.rows import PackedRows, model_row
+        from dew.decision.rows import PackedRows, forked_documents, model_row
 
         shape = self._shape(rows) if shape is None else shape
         offered = max(len(laid.options) for row in rows for laid in row.questions)
@@ -919,7 +927,9 @@ class Decide(SavedRunTask, InItsForm):
         # run's (`DecisionObjective.data`).
         compact = (-(-bounds.options // OPTION_TILE) * OPTION_TILE
                    if self.layout.joint and bounds.options is not None else None)
-        read = PackedRows(shape.length, compact, in_context)
+        read = PackedRows(shape.length, compact, in_context,
+                          documents=forked_documents(self.layout, replace(bounds, questions=max(
+                              bounds.questions, *(len(row.questions) for row in rows)))))
         laid = [read.map(window) for window, _ in windows]
         batch = {name: np.stack([window[name] for window in laid]) for name in laid[0]}
         inputs = laid_out(batch, bounds.segments, spans_in_context=in_context,
@@ -1624,7 +1634,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
                           context_segments=given("context_segments"), question_rows=given("question_rows"),
-                          blocks=given("blocks"), streams=given("streams"),
+                          blocks=given("blocks"), streams=given("streams"), documents=given("documents"),
+                          parents=given("parents"),
                           reads=None if attention is None else attention[0],
                           fragments=1 if attention is None else attention[1], max_segments=max_segments,
                           spans_in_context=spans_in_context, whole_blocks=whole_blocks and "blocks" in batch)

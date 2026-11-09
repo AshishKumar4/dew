@@ -22,6 +22,8 @@ class GatedDeltaNetMixer(MixerBase):
     """
 
     residuals = DELTA_RULE_RESIDUALS
+    # Each document from the state and conv history its parent leaves (`dew.nn.linear.forked_scan`).
+    reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
     packed_cache = True
 

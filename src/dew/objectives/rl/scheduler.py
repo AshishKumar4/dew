@@ -175,15 +175,14 @@ from .sessions import (
     Task,
     agreed_records,
     centred_moments,
-    chain_lengths,
     check_credit,
     check_estimator,
     check_truncation,
     local_task_ids,
     pack,
+    packed_rows,
     pooled,
     reference_penalties,
-    rows_needed,
     sampled_values,
     session_metrics,
     varies,
@@ -267,8 +266,6 @@ class _Group:
     label: str
     live: list[_Sample] = field(default_factory=list)
     done: list[Session] = field(default_factory=list)
-    lengths: list[int] = field(default_factory=list)
-    """Once complete, the lengths of the chains its sessions pack into."""
     latencies: list[float] = field(default_factory=list)
     failures: Counter[int] = field(default_factory=Counter)
     abandoned: bool = False
@@ -609,6 +606,9 @@ class RolloutScheduler:
       estimator compares returns: the packed rows are scored under its
       reference, the state's frozen starting policy, and repacked with
       `sessions.reference_penalties`.
+    - `share` packs the prompt a group's chains begin with once (`pack`'s `share`), which a policy whose
+      model computes a shared prefix as each chain's own takes (`TokenScorer.shares_prefixes`); `sampled`
+      and `served` derive it from their objective.
 
     `metrics` holds the latest call's numbers, which the trainer logs as
     `rollout/<name>`.
@@ -627,7 +627,7 @@ class RolloutScheduler:
                  credit: str = "session", support_capacity: int | None = None,
                  log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
                  overlong: tuple[int, int] | None = None, reference: GRPOObjective | None = None,
-                 generation_batches: int = 1):
+                 generation_batches: int = 1, share: bool = False):
         for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0),
                                    ("generation_batches", generation_batches, 1)):
             if type(value) is not int or value < least:
@@ -650,6 +650,7 @@ class RolloutScheduler:
                              "rewards pay, and this one's is 0")
         self.reference = reference
         self.generation_batches = generation_batches
+        self.share = share
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
         self._owned: tuple[Callable[[], None], ...] = ()
@@ -688,7 +689,8 @@ class RolloutScheduler:
         return cls(Synchronous(collector), tasks=prompt_tasks, groups=groups, estimator=estimator,
                    truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
                    reference=objective if isinstance(objective, GRPOObjective) and objective.reward_kl > 0
-                   else None, generation_batches=generation_batches)
+                   else None, generation_batches=generation_batches,
+                   share=objective.shares_prefixes(train=True))
 
     @classmethod
     def served(cls, objective: GRPOObjective, reward: Reward, *, tasks: int, slots: int,
@@ -738,7 +740,7 @@ class RolloutScheduler:
         scheduler = cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator,
                         truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
                         reference=objective if objective.reward_kl > 0 else None,
-                        generation_batches=generation_batches)
+                        generation_batches=generation_batches, share=objective.shares_prefixes(train=True))
         # The source and the server it built end with it: the reward pool, then the engine.
         scheduler._owned = (source.close, server.close)
         return scheduler
@@ -869,8 +871,7 @@ class RolloutScheduler:
         """
         home = entry.packs or entry
         width, rows = self.acquisition.width, self.acquisition.rows(len(home.tasks), self.groups)
-        group.lengths = chain_lengths(group.done, width, truncation=self.truncation)
-        alone = rows_needed(group.lengths, width)
+        alone = packed_rows(group.done, width, truncation=self.truncation, share=self.share)
         if alone > rows:
             raise ValueError(
                 f"one group of task {group.task.id} needs {alone} rows of {width} ids, "
@@ -880,8 +881,8 @@ class RolloutScheduler:
                                       overlong=self.overlong):
             tally.uniform += 1
             return
-        admitted = [length for complete in home.complete for length in complete.lengths]
-        if rows_needed([*admitted, *group.lengths], width) <= rows:
+        admitted = [session for complete in home.complete for session in complete.done]
+        if packed_rows([*admitted, *group.done], width, truncation=self.truncation, share=self.share) <= rows:
             home.complete.append(group)
             return
         tally.cut += 1
@@ -1086,7 +1087,7 @@ class RolloutScheduler:
                       rows=self.acquisition.rows(len(entry.tasks), self.groups),
                       estimator=self.estimator, truncation=self.truncation, credit=self.credit,
                       support_capacity=self.support_capacity, overlong=self.overlong, shaping=shaping,
-                      whitening=whitening)
+                      whitening=whitening, share=self.share)
         if self.acquisition.rescore is None:
             packed[OLD_LOG_PROBS_KEY] = sampled_values(
                 packed, lambda index, call: _recorded(rollouts[index], call))

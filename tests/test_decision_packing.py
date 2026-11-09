@@ -88,7 +88,9 @@ ARMS = {
     # (`DecisionModel._read`, row 1835).
     "parallel": (replace(ROWS, parallel=True), functools.partial(attending, implementation="template"),
                  lambda: DecisionHead(32, layers=1)),
-    "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS), qwen35,
+    # A row a question, packed beside others (`shared_state=1`): rows over one state are
+    # tests/test_decision_state_once.py's.
+    "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS, shared_state=1), qwen35,
                 lambda: LabelReadout(64, LABELS.ids(TOKENIZER, 3))),
 }
 """Joint rows under the joint schema head and rows of one question under the marker head,
@@ -547,8 +549,10 @@ def test_a_batch_of_requests_holds_each_row_and_its_padding_within_the_sequence_
     sequence kernel runs each row and its padding as two sequences (`dew.nn.inputs.cu_seqlens`),
     the row within the documents the rows' coordinates state and the padding the one more the kernel
     adds, so no request runs in another's."""
-    rows = [row for example in EXAMPLES for row in ROWS.rows(TOKENIZER, SPECIALS, example.state,
-                                                             example.questions)]
+    # A row a question (`shared_state=1`): a row over one state's documents are its forks'.
+    alone = replace(ROWS, shared_state=1)
+    rows = [row for example in EXAMPLES for row in alone.rows(TOKENIZER, SPECIALS, example.state,
+                                                              example.questions)]
     laid = DecisionInputs.collate(rows, SPECIALS.pad).coordinates()
     starts = np.asarray(laid.starts)
     assert starts[:, 1:].any(), "no request was padded"

@@ -1186,7 +1186,7 @@ class CausalTransformer(LinearProducts):
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
-                 attention_key_valid=None, attention_tree: tuple[int, ...] | None = None,
+                 attention_key_valid=None,
                  right_padded: bool = False, coordinates: Coordinates | None = None,
                  conditioning: Mapping[str, jax.Array] | None = None, progress: Progress | None = None):
         # The call's token layout, converted once (`token_coordinates`): the trunk and the
@@ -1198,7 +1198,7 @@ class CausalTransformer(LinearProducts):
             block_groups=block_groups, rotary_positions=rotary_positions,
             attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
             attention_key_runs=attention_key_runs, attention_key_valid=attention_key_valid,
-            attention_tree=attention_tree, coordinates=coordinates, conditioning=conditioning,
+            coordinates=coordinates, conditioning=conditioning,
             progress=progress)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
@@ -1584,7 +1584,6 @@ class CausalTransformer(LinearProducts):
                               input_embeddings=None, image_groups=None, block_groups=None,
                               rotary_positions=None, attention_pairwise_mask=None,
                               attention_key_positions=None, attention_key_runs=None, attention_key_valid=None,
-                              attention_tree: tuple[int, ...] | None = None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None,
@@ -1611,7 +1610,6 @@ class CausalTransformer(LinearProducts):
           query's key intervals, whose union it reads, R of them, static, its
           key positions windowed within each run alone (the template's spans,
           `dew.nn.attention.scaled_dot_product_attention`'s `key_runs`).
-        - `attention_tree`, static: a cached call's tree of candidates (`AttentionMetadata.tree_parents`).
         - `routed_experts` `[B, S, layers, top_k]` (or one such a routed site, keyed by
           it, `LayerInputs.experts`, where a layer routes at several) replays a rollout engine's
           routing (vLLM's `routed_experts`, SGLang's
@@ -1626,6 +1624,11 @@ class CausalTransformer(LinearProducts):
           the batch's builder made them (`dew.batch.coordinates`, with the
           packer's `max_segments`, and `right_padded` where each row holds its
           real tokens first); None for one document a row, every token real.
+          Their `forks` make documents that continue another (`dew.batch.Forks`):
+          each reads its ancestors as its own beginning, attention their keys and a
+          recurrent layer the state they leave, a shared prefix computed once. A
+          cached call over forks (a speculative tree's verify) follows the row's
+          cache and leaves its recurrent state as it was.
         - `conditioning` carries the sequence the `cross_attention` layers read
           (`dew.nn.inputs.CONTEXT`) and its rows' lengths (`CONTEXT_LENGTHS`).
           A cached call that carries it keeps its keys and values for the
@@ -1643,7 +1646,7 @@ class CausalTransformer(LinearProducts):
         attention_metadata = call_metadata(
             self, tokens, decode, image_groups, block_groups, rotary_positions, attention_pairwise_mask,
             attention_key_positions, attention_key_runs, media_mask, admitted, coordinates, conditioning,
-            whole_blocks=whole_blocks, progress=progress, key_valid=attention_key_valid, tree=attention_tree)
+            whole_blocks=whole_blocks, progress=progress, key_valid=attention_key_valid, train=train)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -2453,6 +2456,12 @@ class CausalTransformer(LinearProducts):
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot continue this decoder's rows (`decoder_refusals.generation`)."""
         return decoder_refusals.generation(self)
+
+    @nn.nowrap
+    def fork_refusal(self, train: bool = False) -> str | None:
+        """Why a call over forks would not compute each document as its own row does, in training where
+        `train` (`decoder_refusals.forked`)."""
+        return decoder_refusals.forked(self, train)
 
     @nn.nowrap
     def split_prefill_refusal(self) -> str | None:

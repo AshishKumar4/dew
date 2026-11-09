@@ -35,7 +35,17 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import CLOSES_WINDOW, FROZEN, Batch, at_path, owned_dicts, placed_at, select, unboxed
+from dew.batch import (
+    CLOSES_WINDOW,
+    FROZEN,
+    UNIT_ROWS,
+    Batch,
+    at_path,
+    owned_dicts,
+    placed_at,
+    select,
+    unboxed,
+)
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
 from dew.data.compile import Handed
 from dew.data.dataset import (
@@ -119,6 +129,7 @@ from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, res
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    batch_divisor,
     check_batch,
     check_stream,
     link_figure,
@@ -168,6 +179,7 @@ from dew.training.planning import (
     read_whole,
     settled,
     splits,
+    unit_order,
     whole_step,
 )
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
@@ -1074,8 +1086,18 @@ class Trainer(Generic[Loss, Effects]):
         split, candidate = planned.split, planned.candidate
         parts = planned.parts(mesh)
         window = split * self.accumulation
+        shards = batch_divisor(mesh, self.microbatches) // self.microbatches
 
         def run(current, batch, sampled: bool = False):
+            # Each unit's rows in one of the step's parts (`unit_order`), as the plan admitted its split.
+            order = None if UNIT_ROWS not in batch else unit_order(batch, split * self.microbatches, shards)
+            if UNIT_ROWS in batch and order is None:
+                raise LayoutRefused(f"this batch's units cannot keep whole in {split} parts over {shards} "
+                                    "shards; read it in a split the plan admits")
+            if order is not None and not np.array_equal(order, np.arange(len(order))):
+                rows = len(order)
+                batch = jax.tree.map(
+                    lambda leaf: leaf[order] if np.ndim(leaf) and np.shape(leaf)[0] == rows else leaf, batch)
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
             executable = planned.sampled.executable if sampled and planned.sampled is not None else (
                 planned.executable)

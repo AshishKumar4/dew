@@ -1181,6 +1181,18 @@ class Generating(Protocol):
 
 
 @runtime_checkable
+class ForkedCalls(Protocol):
+    """A decoder that says, after examining the layers it builds, why a call over forks
+    (`dew.batch.Forks`: documents that continue another, a shared prefix computed once) would not compute
+    each document as its own row of its ancestors and itself does, or None; with `train`, as a training
+    step runs it, its dropout drawing at random. A caller that packs rows over their shared prefixes
+    (`dew.data.forked_rows.ForkedRows`) lays them whole where it says why; a model that does not state it
+    is laid whole too."""
+
+    def fork_refusal(self, train: bool = False) -> str | None: ...
+
+
+@runtime_checkable
 class DecoderTraining(Predicting, Protocol):
     """What a decoder trains beside its next token: its multi-token prediction
     depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`

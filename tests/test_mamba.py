@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
 from reference_error import assert_as_exact
 
@@ -107,3 +108,14 @@ def test_state_spaces_mamba_130m_computes_the_references_logits():
     logits = np.asarray(loaded.model.apply(loaded.variables, ids), np.float32)
     assert float(np.max(np.abs(logits - expected))) < 1e-3
     assert np.array_equal(logits.argmax(-1), expected.argmax(-1))
+
+
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_documents_that_continue_another_read_its_state_and_history_as_their_own_rows_do(layout):
+    """The Mamba layer over forks (`dew.batch.Forks`) gives each document's tokens, and the gradients
+    through them, what its own row of its ancestors and itself gives (check 1; `forks_support`): its
+    selective scan enters each document's own state (`recurrence_chunk.selective_scan`'s `entered`)."""
+    mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4)
+    variables = jax.jit(mixer.init)(jax.random.key(0), jnp.ones((1, 4, 8), jnp.float32))
+    assert_forks_as_own_rows(mixer, variables, 8, layout, "Mamba")
+

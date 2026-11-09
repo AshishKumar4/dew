@@ -10,7 +10,7 @@ from jax.experimental import checkify
 from model_support import decoder
 from reference_error import as_given, assert_as_exact, widened
 
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import AttentionMetadata, ModelInputs, fork_runs
 from dew.sampling.text import decode_ops, prefill_state
 from dew.sampling.trees import TreeBlock, TreeShape
 
@@ -92,12 +92,16 @@ def test_a_trees_nodes_verified_in_one_pass_score_as_their_paths_walked(kind):
                     seeds=SEEDS, truth_fn=truth)
 
 
-def test_a_trees_runs_read_each_nodes_prefix_and_ancestors():
-    """A tree block's key runs (`TreeBlock.runs`) hold each fed token's prefix and root, then its ancestors
-    and itself a slot each: their union is exactly the keys its path reads."""
+def test_a_trees_forks_read_each_nodes_prefix_and_ancestors():
+    """A tree block's fed tokens are documents continuing their parents', the root's the row's cache
+    (`TreeBlock.coordinates`): after the cache, at each row's cursor (`fork_runs`' anchor), the union of a
+    fed token's key runs is exactly the keys its path reads, and its place is the root's plus its depth."""
     shape = TreeShape((-1, -1, 0, 1, 2))
     cursor = jnp.asarray([3, 0], jnp.int32)
-    runs = np.asarray(TreeBlock(shape, cursor, cursor).runs())
+    block = TreeBlock(shape, cursor, cursor + 5)
+    laid = block.coordinates(jnp.ones((2, shape.nodes + 1), bool))
+    runs = np.asarray(fork_runs(AttentionMetadata(coordinates=laid), 2, shape.nodes + 1,
+                                (cursor, jnp.zeros_like(cursor))))
     for row, at in enumerate((3, 0)):
         for fed in range(shape.nodes + 1):
             seen = set()
@@ -105,6 +109,7 @@ def test_a_trees_runs_read_each_nodes_prefix_and_ancestors():
                 seen.update(range(start, end))
             path = () if fed == 0 else shape.ancestry(fed - 1)
             assert seen == set(range(at + 1)) | {at + 1 + node for node in path}, (row, fed, runs[row, fed])
+            assert int(laid.positions[row, fed]) == at + 5 + len(path)
 
 
 def _tree_generated(model, params, prompts, budget: int, sampling, shape: TreeShape, drafting, key):

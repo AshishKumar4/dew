@@ -12,7 +12,7 @@ import jax.numpy as jnp
 
 from dew.batch import Coordinates
 
-from ..inputs import AttentionMetadata, CrossContext, check_tree, coordinates_of, numbered_blocks
+from ..inputs import AttentionMetadata, CrossContext, coordinates_of, numbered_blocks
 from ..progress import Progress
 from . import decoder_refusals
 
@@ -25,7 +25,7 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
                   coordinates: Coordinates | None = None,
                   conditioning: Mapping[str, jax.Array] | None = None, *,
                   whole_blocks: bool = False, progress: Progress | None = None,
-                  key_valid=None, tree: tuple[int, ...] | None = None) -> AttentionMetadata | None:
+                  key_valid=None, train: bool = False) -> AttentionMetadata | None:
     """What `model`'s layers read beside the residual, None for a call that
     carries none of it: the tokens' layout `hidden_and_mtp_inputs`
     converted (`coordinates`), the token ids a hash router selects by,
@@ -44,24 +44,30 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         # a standalone call, and a cached and a full one, project the same values.
         context = dataclasses.replace(context, embeddings=context.embeddings.astype(model.context_dtype))
     # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
-    if key_positions is not None and pairwise_mask is None and key_runs is None:
-        raise ValueError("attention_key_positions requires attention_pairwise_mask or "
-                         "attention_key_runs")
+    forked = coordinates is not None and coordinates.forks is not None
+    if key_positions is not None and pairwise_mask is None and key_runs is None and not forked:
+        raise ValueError("attention_key_positions requires attention_pairwise_mask, attention_key_runs "
+                         "or forks")
     if pairwise_mask is not None and key_runs is not None:
         raise ValueError("attention_key_runs and attention_pairwise_mask each name a call's whole "
                          "visibility; pass one")
     if model.engram is None and (model.mixture is None or not model.mixture.media_bias):
         media_mask = None
-    if decode and coordinates is not None and coordinates.max_segments > 1 and (
+    # A call over forks reads its documents by their forks on every layer, never by its cache's documents.
+    if decode and coordinates is not None and coordinates.max_segments > 1 and coordinates.forks is None and (
             refusal := decoder_refusals.packed_cache(model)) is not None:
         raise ValueError(f"packed rows cannot append to this decoder's cache, which would read their "
                          f"documents together ({refusal}); prefill each document into a row of its own")
-    if tree is not None:  # N-gram hashes and routing blocks read the tokens in their order.
-        routed = model.mixture is not None and model.mixture.routing_block is not None
-        positions = None if coordinates is None else coordinates.positions
-        check_tree(tree, tokens.shape[1], decode=decode, ordered=model.engram is not None or routed,
-                   positioned=positions is not None or rotary_positions is not None,
-                   entered=coordinates is not None and coordinates.entered is not None)
+    if coordinates is not None and coordinates.forks is not None:
+        # A trust boundary: a caller that asks the model first lays such rows whole (`ForkedCalls`).
+        refusal = decoder_refusals.forked(model, train)
+        if refusal is not None:
+            raise ValueError(f"documents that continue another (Forks) are computed as their own rows "
+                             f"only where every layer reads each from its ancestors and itself alone; "
+                             f"{refusal}. Lay the rows whole (ForkedRows.pack(share=False))")
+        if coordinates.segments is None or admitted is not None:
+            raise ValueError("forks number a row's documents by its segments, in a call of its own rows; "
+                             "give coordinates with segments, outside a serving step's mixed call")
     engram_ids = (None if model.engram is None else model.engram_hashes(tokens, coordinates, decode,
                                                                       media_mask))
     if context is not None and context.segments is not None:
@@ -77,7 +83,7 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         block)
     if (coordinates is None and image_groups is None and block_groups is None and rotary_positions is None
             and pairwise_mask is None and key_positions is None and key_runs is None and key_valid is None
-            and tree is None and not model.hash_layers
+            and not model.hash_layers
             and engram_ids is None and media_mask is None and admitted is None and blocks is None
             and context is None and (progress is None or progress.updates is None)):
         return None
@@ -92,5 +98,5 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         # pipeline's microbatches slice (`run_pipeline`).
         progress=None if progress is None or progress.updates is None else jnp.broadcast_to(
             jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
-        routing_block=block, tree_parents=tree,
+        routing_block=block,
         whole_blocks=whole_blocks and block_groups is not None)

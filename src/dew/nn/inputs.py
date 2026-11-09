@@ -23,7 +23,7 @@ from dew.batch import (
     TOKEN_LAYOUT_FIELDS,
     VALIDITY_FIELD,
     Coordinates,
-    Entered,
+    Forks,
     coordinates,
     document_firsts,
     document_ranks,
@@ -303,7 +303,7 @@ class ModelInputs:
         # (`Coordinates.along_tokens`).
         def sliced(value):
             if isinstance(value, Coordinates):
-                return value.along_tokens(lambda leaf: leaf[:, selection])
+                return value.along_tokens(lambda leaf: leaf[:, selection], prefix=start in (None, 0))
             return jax.tree.map(lambda leaf: leaf[:, selection], value)
 
         return replace(self, tokens=self.tokens[:, selection],
@@ -638,12 +638,6 @@ class AttentionMetadata:
     context: CrossContext | None = None
     progress: jax.Array | None = None
     routing_block: int | None = struct.field(pytree_node=False, default=None)
-    tree_parents: tuple[int, ...] | None = struct.field(pytree_node=False, default=None)
-    """A cached call over a tree of candidate tokens (tree speculative decoding's verify block): each call
-    token's parent among the call's tokens, earlier than it, -1 for the row's last cached token
-    (`check_tree`). A token reads its ancestors' keys and states alone: attention masks it by the call's
-    `key_runs`, a recurrent mixer advances each token from its parent's state, and a mixer that reads no
-    tree refuses one (`MIXING`)."""
     whole_blocks: bool = struct.field(pytree_node=False, default=False)
     """Whether each block of `block_groups` is its document's whole run of real tokens, as its producer
     states it (a decision row read whole, `QuestionLayout.split` 'whole'): a layer that reads blocks
@@ -660,39 +654,59 @@ class AttentionMetadata:
         return self.coordinates is not None and self.coordinates.right_padded
 
     @property
-    def entered(self) -> Entered | None:
-        """The documents that continue another (`Coordinates.entered`), None where none does."""
-        return None if self.coordinates is None else self.coordinates.entered
-
-def check_tree(parents: tuple[int, ...], length: int, *, decode: bool, positioned: bool,
-               ordered: bool, entered: bool) -> None:
-    """Refuse a tree call (`AttentionMetadata.tree_parents`) no layer could read as its paths: outside a
-    cached call, of another length than its `length` tokens, with a parent not before its child,
-    branching where the call does not state its tokens' positions (`positioned`: coordinates or rotary
-    positions, each token's its depth, which its index is on a chain alone), or in a model that reads the
-    call's tokens in their order before its mixers see the tree (`ordered`: n-gram hashes, routing
-    blocks), or beside documents that enter another (`entered`: a tree verify reads the cache as held,
-    and an entered document reads another's memory, which no mixer reads along a tree's paths)."""
-    if entered:
-        raise ValueError("a tree call reads the row's cache as held; its documents enter no other")
-    if not decode or len(parents) != length or any(not -1 <= parent < index
-                                                   for index, parent in enumerate(parents)):
-        raise ValueError(f"a tree is a cached call's, each of its {length} tokens' parent an earlier one "
-                         f"or -1 for the row's cache, got {parents}")
-    if not positioned and any(parent != index - 1 for index, parent in enumerate(parents)):
-        raise ValueError("a branching tree states its tokens' positions, each its depth on its path "
-                         "(coordinates or attention_rotary_positions)")
-    if ordered:
-        raise ValueError("a tree call is read along its paths by the mixers alone; this model's n-gram "
-                         "hashes or routing blocks read its tokens in their order")
+    def forks(self) -> Forks | None:
+        """The documents that continue another (`Coordinates.forks`), None where none does."""
+        return None if self.coordinates is None else self.coordinates.forks
 
 
+def fork_runs(metadata: AttentionMetadata, batch: int, queries: int, anchor=None):
+    """The key runs `[B, queries, R, 2]` a call's forks give its attention (`dew.batch.Forks.runs`), None
+    where it has none. An uncached call's runs are over its own tokens. A cached call's tokens follow the
+    row's cache (`anchor`, `(first, start)` `[B]` each: the slot the call's first real token is stored at,
+    its real tokens after it in their order as the cache compacts them (`cache_positions`), and the first
+    slot of the row's last cached document, the one the call's roots continue): each run's bounds move to
+    the slots its real tokens are stored at, a run of none empty, and a run of the cache's document,
+    `[start, first)`, comes before every token's chain."""
+    forks = metadata.forks
+    if forks is None:
+        return None
+    coordinates = metadata.coordinates
+    assert coordinates is not None
+    segments = (jnp.ones((batch, queries), jnp.int32) if coordinates.segments is None
+                else jnp.asarray(coordinates.segments, jnp.int32))
+    runs = forks.runs(segments)
+    if anchor is None:
+        return runs
+    first, start = (jnp.asarray(x, jnp.int32)[:, None, None] for x in anchor)
+    valid = (jnp.ones((batch, queries), bool) if coordinates.valid is None
+             else jnp.asarray(coordinates.valid, bool))
+    # Each call slot's count of the real tokens before it: the cache stores the next real one that far past
+    # `first`.
+    before = jnp.concatenate([jnp.zeros((batch, 1), jnp.int32), prefix_sum(valid, dtype=jnp.int32)], axis=1)
+    stored = jax.vmap(lambda counts, bounds: counts[bounds])(before, runs) + first[..., None]
+    moved = jnp.where((stored[..., 1] > stored[..., 0])[..., None], stored, 0)
+    real = (segments > 0)[:, :, None]
+    cache = jnp.where(real[..., None], jnp.stack([jnp.broadcast_to(start, (batch, queries, 1)),
+                                                  jnp.broadcast_to(first, (batch, queries, 1))], -1), 0)
+    return jnp.concatenate([cache, moved], axis=2)
 
-MIXING = ("pairwise_mask", "key_positions", "key_runs", "key_valid", "position_bias", "admitted",
-          "entered", "tree_parents")
+
+def intersected_runs(first, second):
+    """The key runs `[B, Q, R1 * R2, 2]` a query reads where it reads `first` `[B, Q, R1, 2]` and `second`
+    `[B, Q, R2, 2]` both: each pair's overlap, `(0, 0)` where a pair's is empty. Disjoint runs on either
+    side keep the overlaps disjoint."""
+    lo = jnp.maximum(first[:, :, :, None, 0], second[:, :, None, :, 0])
+    hi = jnp.minimum(first[:, :, :, None, 1], second[:, :, None, :, 1])
+    kept = hi > lo
+    runs = jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1)
+    return runs.reshape(*runs.shape[:2], -1, 2)
+
+
+MIXING = ("pairwise_mask", "key_positions", "key_runs", "key_valid", "position_bias", "admitted", "forks")
 """The `AttentionMetadata` fields that say which tokens a mixer lets each token
 read, or how much: a call's own mask, or its keys' runs, and the key positions
-it is read by, an additive bias, a server's mixed layout, a tree's parents. A
+it is read by, an additive bias, a server's mixed layout, the documents that
+continue another (`Forks`). A
 mixer runs a call that sets one only where it reads it (`MixerCall`). The rest
 describe the tokens themselves, which a mixer reads as far as its form uses
 them: their coordinates, rotary positions, and image and block groups, which

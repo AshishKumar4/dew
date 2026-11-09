@@ -12,7 +12,7 @@ import numpy as np
 from flax import linen as nn, struct
 
 from dew._coordination import agreed, from_every_process
-from dew.batch import Batch, Coordinates, Variables, coordinates, part, token_coordinates
+from dew.batch import Batch, Coordinates, Variables, part, token_coordinates
 from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
@@ -48,11 +48,10 @@ from .sessions import (
     ADVANTAGES_KEY,
     CALL_INDEX_KEY,
     IDS_KEY,
-    POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    SEGMENT_IDS_KEY,
     SESSION_INDEX_KEY,
     TOKEN_REWARDS_KEY,
+    packed_coordinates,
 )
 
 if TYPE_CHECKING:
@@ -250,10 +249,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         """The critic's values and, when requested, the QK collection from that same forward, at the run's
         `progress` where the critic reads it."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
-        segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
-        # The rollout's packed columns laid out once (`Coordinates`), the layout the backbone reads.
-        laid = coordinates(ids[:, :-1].shape, segments=segments[:, :-1],
-                           positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
+        # The rollout's packed columns laid out once (`Coordinates`), the layout the backbone reads, its
+        # groups' shared prompts among them (`packed_coordinates`).
+        laid = packed_coordinates(batch, -1)
         values = self.critic.apply(part(variables, "critic"), ids[:, :-1], coordinates=laid,
                                    mutable=["qk"] if qk_stats else False, **progressed(self.critic, progress))
         qk = None

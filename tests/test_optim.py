@@ -1147,10 +1147,14 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     rows = jax.device_count()
     ids = jnp.asarray(np.random.default_rng(7).integers(0, 32, (rows, 6)), jnp.int32)
     if kind == "dpo":
-        paired = jnp.stack((ids, (ids + 3) % 32), axis=1)
-        batch = {"input_ids": paired, "completion_mask": jnp.ones_like(paired)}
-        scoring_ids = jnp.concatenate((paired[:, 0], paired[:, 1]))
-        packing = {}
+        from dew.data.preferences import pair_windows
+        from dew.objectives.rl.preference import window_coordinates
+
+        paired = np.stack((np.asarray(ids), (np.asarray(ids) + 3) % 32), axis=1)
+        batch = pair_windows(paired, np.ones_like(paired), count=rows)
+        scoring_ids = jnp.asarray(batch["input_ids"])
+        packing = {"coordinates": window_coordinates(batch).along_tokens(lambda leaf: leaf[:, :-1],
+                                                                         prefix=True)}
     else:
         mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
         batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
