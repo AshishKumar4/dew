@@ -180,6 +180,10 @@ class Forks:
 
     parents: jax.Array | np.ndarray
     depth: int = struct.field(pytree_node=False, default=1)
+    joint: bool = struct.field(pytree_node=False, default=False)
+    """Whether each tree's documents are one row's, read together, its dropout drawn once (a decision
+    row's questions with siblings, `QuestionLayout.siblings`), rather than rows a shared prefix stands in
+    for, each of which would draw its own (`dew.nn.backbones.decoder_refusals.forked`)."""
 
     @property
     def count(self) -> int:

@@ -40,7 +40,7 @@ from dew.decision.rows import (
     packing,
 )
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.shared_state import shared_for
+from dew.decision.shared_state import fork_depth, joint, shared_for
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
 from dew.inference.projections import declared_groups
 from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
@@ -423,7 +423,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
-                          attention=self.layout.attention)
+                          attention=self.layout.attention, fork_depth=self._fork_depth,
+                          joint_forks=self._joint_forks)
         logits, sown = self.model.observed_logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             progress=self.progress(step), opened=step.sown())
@@ -459,14 +460,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
-                          attention=self.layout.attention)
+                          attention=self.layout.attention, fork_depth=self._fork_depth,
+                          joint_forks=self._joint_forks)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[Ratio | Weighted, Decisions]:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
-                          attention=self.layout.attention)
+                          attention=self.layout.attention, fork_depth=self._fork_depth,
+                          joint_forks=self._joint_forks)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
 
@@ -502,6 +505,19 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     @property
     def _logits(self):
         return self.program('logits', lambda variables, inputs: self.model.logits(variables, inputs))
+
+    @property
+    def _fork_depth(self) -> int:
+        """The longest chain of documents its batches hold, laid out as it states its layout or as it
+        derives it (`data`, by the plan's version): the longer of the two (`fork_depth`), a chain past
+        which a document reads nothing more."""
+        return max(fork_depth(self.layout), fork_depth(self.stated))
+
+    @property
+    def _joint_forks(self) -> bool:
+        """Whether its batches' rows read their documents together, as siblings do (`joint`), laid out as
+        it states its layout or as it derives it (`_fork_depth`)."""
+        return joint(self.layout) or joint(self.stated)
 
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
         """Fit rows before mixing, augment training layouts, and pack training

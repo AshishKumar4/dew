@@ -219,8 +219,9 @@ class Encoded:
     token attends to (`Reads`, `Layout.attention`); None for a row read in order."""
     forked: tuple[int, ...] | None = None
     """Each token's document in a row of questions over one state (`dew.decision.shared_state`): 1 the
-    shared part, each question's own part a document after it continuing it (`dew.batch.Forks`); None
-    for a row of one document."""
+    shared part, each question's own part one continuing it (`Forks`); None for a row of one document."""
+    forked_parents: tuple[int, ...] | None = None
+    """With siblings, each token's document's parent in its row (`dew.decision.shared_state.merged`)."""
 
     @property
     def trimmed(self) -> bool:
@@ -718,22 +719,19 @@ class QuestionLayout(Layout):
     option (`option_0`) writes nothing the row reads. An option with no description is its key."""
 
     shared_state: int | None = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
-    """The most questions a row asks over one copy of their request's state, each continuing it as its own
-    row does (`dew.decision.shared_state`): one at 1, and where None, unstated, one too, as the layout read
-    before rows shared a state, until what reads the rows states it (`shared_for`, as many as a row holds
-    where the backbone and head read each question as its own row does)."""
+    """The most questions a row asks over one copy of their request's state (`dew.decision.shared_state`):
+    one at 1, and where None, unstated, one too, as before rows shared a state, until what reads its rows
+    states it (`shared_for`)."""
+    siblings: bool = dataclasses.field(default=False, repr=False, metadata={_records.ADDED: True})
+    """Whether a question of a row of several (`shared_state`) also reads the ones before it in its row,
+    whole (`dew.decision.shared_state.fork_depth`); off, each reads the shared part and itself."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.shared_state is not None:
-            _least("shared_state", self.shared_state, 1)
-            from dew.decision.shared_state import forkable
+        if self.shared_state is not None or self.siblings:
+            from dew.decision.shared_state import check_sharing
 
-            if self.shared_state > 1 and not forkable(self):
-                raise ValueError("a row of questions over one state writes its state before its question, "
-                                 "the question's instructions before its options and cue, and sets nothing "
-                                 "else its tokens read, as parallel options, blocks, reads and a question in "
-                                 "context do")
+            check_sharing(self)
         if self.head_max_len is not None:
             _least("head_max_len", self.head_max_len, 1)
         if self.option_tokens is not None:
@@ -804,9 +802,7 @@ class QuestionLayout(Layout):
 
     def row_questions(self, questions: int) -> int:
         """As many of them as one row asks over one state (`shares`, `shared_state`), else one."""
-        if not self.shares or self.shared_state is None:
-            return 1
-        return min(questions, self.shared_state)
+        return min(questions, self.shared_state) if self.shares and self.shared_state is not None else 1
 
     @property
     def shares(self) -> bool:
@@ -827,6 +823,7 @@ class QuestionLayout(Layout):
         """Its rows' reads over their streams (`streamed_attention`)."""
         return streamed_attention(self.reads, self.written)
 
+
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
              tokens: Sequence[int] | None = None, request: Mapping[str, Question] | None = None
@@ -840,11 +837,9 @@ class QuestionLayout(Layout):
                              tokens=tokens, conversation=_conversation(state),
                              request=questions if request is None else request)
                for name, question in questions.items()]
-        if not self.shares or self.shared_state is None:
-            return own
         from dew.decision.shared_state import over_one_state
 
-        return over_one_state(own, self.max_len, self.shared_state)
+        return over_one_state(own, self)
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
                state: Sequence[int], *, conversation: bool = False,
@@ -2347,6 +2342,10 @@ class DecisionInputs:
     whole_blocks: bool = struct.field(pytree_node=False, default=False)
     """Whether each row's one block is the whole row (`QuestionLayout.split` 'whole'), which a backbone
     reads as non-causal attention by rows (`AttentionMetadata.whole_blocks`)."""
+    fork_depth: int = struct.field(pytree_node=False, default=1)
+    """The longest chain of `documents` (`Forks.depth`)."""
+    joint_forks: bool = struct.field(pytree_node=False, default=False)
+    """Whether each row's `documents` are read together, as its siblings are (`Forks.joint`)."""
 
     @property
     def valid(self) -> jnp.ndarray:
@@ -2366,7 +2365,8 @@ class DecisionInputs:
         assert self.parents is not None, "a window's documents come with the documents they continue"
         laid = coordinates(segments=self.documents, positions=self.positions,
                            max_segments=self.parents.shape[1], right_padded=True)
-        return dataclasses.replace(laid, forks=Forks(self.parents, depth=1))
+        return dataclasses.replace(laid, forks=Forks(self.parents, depth=self.fork_depth,
+                                                     joint=self.joint_forks))
 
     @property
     def question_segments(self) -> jnp.ndarray:
@@ -2424,12 +2424,12 @@ class DecisionInputs:
                                         fields=fields or None)
         valid = padded.get(VALIDITY_FIELD, np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
-        documents = parents = None
+        documents, parents, depth, joint = None, None, 1, False
         if forked:
-            # A window a row: its shared part document 1, each question's own part continuing it.
-            documents = jnp.asarray(np.where(valid, padded["forked"], 0), jnp.int32)
-            parents = jnp.asarray(np.broadcast_to(np.arange(count + 1) > 0, (len(rows), count + 1)),
-                                  jnp.int32)
+            from dew.decision.shared_state import collated_forks
+
+            numbered = np.where(valid, padded["forked"], 0)
+            documents, parents, depth, joint = collated_forks(rows, numbered, count)
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
         labelled = labelled_rows(rows)
         laid = [question_fields(row, count, width, labelled) for row in rows]
@@ -2465,7 +2465,7 @@ class DecisionInputs:
                    blocks=jnp.asarray(np.where(valid, padded["blocks"], -1), jnp.int32) if blocked else None,
                    streams=(jnp.asarray(np.where(valid, padded["streams"], -1), jnp.int32) if streamed
                             else None),
-                   documents=documents, parents=parents,
+                   documents=documents, parents=parents, fork_depth=depth, joint_forks=joint,
                    reads=None if attention is None else attention[0],
                    fragments=1 if attention is None else attention[1],
                    spans_in_context=in_context)

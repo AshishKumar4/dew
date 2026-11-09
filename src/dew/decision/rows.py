@@ -208,6 +208,8 @@ def model_row(encoded: Encoded, width: int, context_length: int | None = None) -
         row["streams"] = np.asarray(encoded.streams, np.int32)
     if encoded.forked is not None:
         row["forked"] = np.asarray(encoded.forked, np.int32)
+        if encoded.forked_parents is not None:
+            row["forked_parents"] = np.asarray(encoded.forked_parents, np.int32)
     if context_length is not None:
         row["context"] = np.asarray(encoded.context or (), np.int32)
     return row
@@ -722,6 +724,8 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     # A row of questions over one state lays each at its own row's positions, each question's own part a
     # document continuing the shared part (`QuestionLayout.shares`, `Encoded.forked`).
     forked = isinstance(layout, QuestionLayout) and layout.shares
+    # With siblings, each question's document continuing the one before it (`Encoded.forked_parents`).
+    chained = forked and isinstance(layout, QuestionLayout) and layout.siblings
     positioned = parallel or forked
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
     streamed = layout.attention is not None
@@ -737,6 +741,7 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     fields = ("tokens", *(("positions",) if positioned else ()), *(("slots",) if parallel else ()),
               *(("blocks",) if blocked else ()),
               *(("streams",) if streamed else ()), *(("forked",) if forked else ()),
+              *(("forked_parents",) if chained else ()),
               *(("row",) if grouped else ()))
     return Pack(layout.max_len, fields, segments=bounds.segments, along=along)
 
@@ -876,10 +881,12 @@ class PackedRows(pygrain.MapTransform):
         if "forked" in element:
             if self.documents is None:
                 raise ValueError("a window of rows over one state states the most documents it holds")
-            # Each row's shared part its document 1, each question's own part continuing it.
+            # Each row's shared part its document 1, each question's own part continuing it, or with
+            # siblings the question's before it (`Encoded.forked_parents`).
             forked = np.asarray(element["forked"])
-            laid["documents"], laid["parents"] = window_forks(segments, forked, (forked > 1).astype(np.int32),
-                                                              self.documents)
+            parent = (np.asarray(element["forked_parents"]) if "forked_parents" in element
+                      else (forked > 1).astype(np.int32))
+            laid["documents"], laid["parents"] = window_forks(segments, forked, parent, self.documents)
         if contexts is not None:
             laid["context"] = element["context"]
             laid["context_segments"] = contexts
