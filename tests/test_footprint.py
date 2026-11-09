@@ -714,7 +714,9 @@ def test_a_cpu_attention_training_steps_derived_peak_bounds_its_compile(rows, to
         return jax.vjp(attended, query, key, value)[1](cotangent)
 
     def compiled(step, *shapes) -> int:
-        analysis = jax.jit(step).lower(*shapes).compile().memory_analysis()
+        # Compiled for the CPU the derivation is of, whatever device the process runs first.
+        with jax.default_device(jax.devices("cpu")[0]):
+            analysis = jax.jit(step).lower(*shapes).compile().memory_analysis()
         return (analysis.argument_size_in_bytes + analysis.output_size_in_bytes
                 + analysis.temp_size_in_bytes - analysis.alias_size_in_bytes)
 

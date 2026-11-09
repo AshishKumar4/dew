@@ -360,8 +360,9 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     # (`siblings`): the step's own program's, whose parameters' layouts are fixed, not a loop's body's.
     entry = slicing is None and not carried
     beside, spans, spanned = siblings(frontier, program) if entry and platform == "gpu" else ({}, [], {})
+    begun: dict = {}
     if platform != "gpu":
-        beside, spans, spanned = cpu_layouts(frontier, program)
+        beside, spans, spanned, begun = cpu_layouts(frontier, program)
     laid = laid_copies(frontier, program) if entry else []
     if platform != "gpu":
         # A copy of an input reads nothing XLA must wait on: a CPU's schedule makes it at the program's
@@ -380,7 +381,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     # The step's results are one tuple, a pointer to each, which XLA holds the whole program
     # (`ShapeUtil::ByteSizeOf` of a tuple).
     live = POINTER_BYTES * len(program.outvars) if entry and len(program.outvars) > 1 else 0
-    held, most = set(), 0
+    held, most = set(), live
     for index, equation in enumerate(program.eqns):
         live += sum(size for first, _, size in copies if first == index)
         made = [out for out in equation.outvars
@@ -397,8 +398,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
             if platform != "gpu":
                 # The arrays the fusions making its operands read apart (`laid_inputs`), a shared one's
                 # where it is made, before its first reader.
-                starting = {value for value in spanned.get(index, set())
-                            if min(at for at, values in spanned.items() if value in values) == index}
+                starting = {value for value in spanned.get(index, set()) if begun[value] == index}
                 # A reduction's fusion runs on YNNPACK's kernels as a product's does; an elementwise
                 # one is XLA's own loop, which reads its broadcasts and transposes in place.
                 reduced = [out for out in made if named(equation.primitive).startswith("reduce_")]
@@ -476,8 +476,8 @@ def laid_copies(frontier: Frontier, program: jcore.Jaxpr) -> list[tuple[int, int
     return [(first, ended, size) for first, ended, size in spans.values()]
 
 
-def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int], list[tuple[int, int, int]],
-                                                                    dict[int, set]]:
+def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[
+        dict[int, int], list[tuple[int, int, int]], dict[int, set], dict[jcore.Var, int]]:
     """What a CPU's products hold beside the operands they read made for them (`unfused`): XLA's CPU
     products (YNNPACK's and Eigen's) read every operand from memory in the order they take it, so a
     fused value two products read is made once, held from the first to the last (a span, `(first, last,
@@ -485,7 +485,8 @@ def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int
     read by its keys' and its queries' gradients); and each value XLA keeps a buffer of (`Frontier`), or
     so made once, that a product reads in an order it does not take (`product_order`) is copied for that
     product (bytes, by product: an attention's probabilities read by its values' gradient laid out
-    otherwise). Row 5290: 64 x 128 tokens, 8 heads over 2, compiled 1.375 times the derivation without."""
+    otherwise). Row 5290: 64 x 128 tokens, 8 heads over 2, compiled 1.375 times the derivation without.
+    Last, each shared value's first reader, where it is made."""
     products = [(index, equation) for index, equation in enumerate(program.eqns)
                 if named(equation.primitive) == "dot_general"]
     reads: dict = {}
@@ -497,18 +498,20 @@ def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int
     constant = {value for value in reads if not frontier.roots([value])}
     shared = {value: [0, *readers] if value in constant else readers for value, readers in reads.items()
               if len(readers) > 1 or value in constant}
-    spanned = {index: {value for value, readers in shared.items() if index in readers[1:] or (
-        index == readers[0] and value not in constant)} for index, _ in products}
+    spanned: dict[int, set] = {}
+    for value, readers in shared.items():
+        for index in readers if value not in constant else readers[1:]:
+            spanned.setdefault(index, set()).add(value)
     copied: dict[int, int] = {}
     for index, equation in products:
         (contracted, batched) = equation.params["dimension_numbers"]
         for operand, contracting, batch in zip(equation.invars[:2], contracted, batched, strict=True):
-            kept = computed(operand) and operand not in frontier.inputs and (
+            kept = isinstance(operand, jcore.Var) and operand not in frontier.inputs and (
                 frontier.buffered(operand) or operand in shared)
             if kept and product_order(operand, contracting, batch) is not None:
                 copied[index] = copied.get(index, 0) + device_share(operand)
     return (copied, [(readers[0], readers[-1], device_share(value)) for value, readers in shared.items()],
-            {index: values for index, values in spanned.items() if values})
+            spanned, {value: readers[value in constant] for value, readers in shared.items()})
 
 
 def laid_inputs(frontier: Frontier, values: Sequence[jcore.Var]) -> set[jcore.Var]:
