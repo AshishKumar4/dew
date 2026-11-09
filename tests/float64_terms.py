@@ -647,9 +647,10 @@ def _scan_reads(params, operands: int, used, compiling: bool = False) -> tuple:
     while True:
         read = {body.outvars[index] for index, kept in enumerate(reading)
                 if kept and isinstance(body.outvars[index], Var)}
-        for (start, _), found in zip(spans, _reading(body, spans, reading), strict=True):
+        for (start, stop), found in zip(spans, _reading(body, spans, reading), strict=True):
             if found is not None:
-                read.update(var for var in body.eqns[start].invars if isinstance(var, Var))
+                read.update(var for equation in body.eqns[start:stop] for var in equation.invars
+                            if isinstance(var, Var))
         added = [index for index in range(carries)
                  if not reading[index] and body.invars[constants + index] in read]
         if not added:
