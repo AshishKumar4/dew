@@ -232,10 +232,12 @@ def test_a_mixed_product_converts_its_operands_as_the_product_does():
         wide = jax.jit(lambda ints, floats: float32_einsum("i,i->", ints, floats,
                                                          preferred_element_type=jnp.float64))(ints, floats)
         assert wide.dtype == jnp.float64 and float(wide) == 1.0
-    # With x64 off a float64 result is a float32 one, whose products sum in float64.
+    # With x64 off a float64 result is a float32 one (JAX truncates it, and says so), whose products sum in
+    # float64.
     lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
-    narrowed = jax.jit(lambda lhs, rhs: float32_einsum("ik,kj->ij", lhs, rhs,
-                                                       preferred_element_type=jnp.float64))(lhs, rhs)
+    with pytest.warns(UserWarning):
+        narrowed = jax.jit(lambda lhs, rhs: float32_einsum("ik,kj->ij", lhs, rhs,
+                                                           preferred_element_type=jnp.float64))(lhs, rhs)
     assert narrowed.dtype == jnp.float32 and np.asarray(narrowed).tolist() == [[1.0]]
     assert float(accumulated(jnp.dot, 2.0, 3.0, preferred_element_type=jnp.float32)) == 6.0
 

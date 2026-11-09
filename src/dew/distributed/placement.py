@@ -859,9 +859,11 @@ def placed_bytes(tree) -> int:
 
 def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT]) -> TreeT:
     """`tree`'s arrays as their shapes, each carrying where `placement` puts it: what a
-    lowering, a restore and `Layout.validate` read of a state not yet placed."""
-    return jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
-                                                                    sharding=sharding), tree, placement)
+    lowering, a restore and `Layout.validate` read of a state not yet placed. Each in the dtype a
+    program reads it as: a host float64 leaf a float32 one where x64 is off."""
+    return jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(
+        np.shape(leaf), jax.dtypes.canonicalize_dtype(leaf.dtype, allow_extended_dtype=True),
+        sharding=sharding), tree, placement)
 
 
 @runtime_checkable

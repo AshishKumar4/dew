@@ -88,7 +88,7 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     ready_process()
     with startup.phase("data", "preparing the data"):
         loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples,
-                                    epochs=epochs)
+                                    epochs=epochs, steps=steps)
     # The widths the data bound, which a saved run of the objective records.
     objective.bind_widths(loader.widths)
     # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
