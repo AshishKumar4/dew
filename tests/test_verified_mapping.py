@@ -367,8 +367,8 @@ verifies the type (`test_a_type_a_script_defines_and_registers_verifies`)."""
 def test_a_type_a_script_defines_and_registers_verifies(tmp_path):
     """A type whose config and causal LM a script defines in its own `__main__` and registers at runtime
     verifies from parts: tier 2's float64 twin, built in a process of its own (`dew.interop.isolated`),
-    finds the script's classes there as `multiprocessing` finds them, the script's guarded block not run
-    again."""
+    finds the script's classes there as `multiprocessing`'s spawn finds them, the script's guarded block
+    not run again."""
     import os
     import subprocess
     import sys
@@ -383,6 +383,43 @@ def test_a_type_a_script_defines_and_registers_verifies(tmp_path):
                          capture_output=True, text=True, check=False)
     assert ran.returncode == 0, ran.stderr[-4000:]
     assert json.loads(verdict.read_text()) == {"verdict": "VerifiedMapping", "family": "parts"}
+
+
+UNGUARDED = """
+import json
+import sys
+
+from dew.interop.verify import verify_mapping
+
+with open(sys.argv[2], "a") as runs:
+    runs.write("ran\\n")
+verified = verify_mapping(json.loads(sys.argv[1]))
+with open(sys.argv[3], "w") as out:
+    json.dump({"verdict": type(verified).__name__, "family": getattr(verified, "family", None)}, out)
+"""
+"""A script that verifies a type transformers registers at its top level, no `__main__` guard around it
+(`test_a_script_verifying_at_its_top_level_runs_once`)."""
+
+
+def test_a_script_verifying_at_its_top_level_runs_once(tmp_path):
+    """A script that verifies a type transformers registers, CWM, at its top level with no `__main__` guard,
+    verifies, and runs once: the twin's process (`dew.interop.isolated`) imports no script whose classes
+    it does not need, so the script's own load is not run again there."""
+    import os
+    import subprocess
+    import sys
+
+    script, runs, verdict = tmp_path / "unguarded.py", tmp_path / "runs.txt", tmp_path / "verdict.json"
+    script.write_text(UNGUARDED)
+    write_tiny(tmp_path / "source", "cwm", sliding_window=4)
+    config = (tmp_path / "source" / "config.json").read_text()
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(path for path in sys.path if path),
+                   "XDG_CACHE_HOME": str(tmp_path / "cache")}
+    ran = subprocess.run([sys.executable, str(script), config, str(runs), str(verdict)], env=environment,
+                         capture_output=True, text=True, check=False)
+    assert ran.returncode == 0, ran.stderr[-4000:]
+    assert runs.read_text().splitlines() == ["ran"]
+    assert json.loads(verdict.read_text())["verdict"] == "VerifiedMapping"
 
 
 def test_a_probe_keeps_the_depth_of_code_not_transformers_own():
