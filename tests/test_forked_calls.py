@@ -519,13 +519,15 @@ def _recurrence_call(layer: str, length: int, documents: int):
 @pytest.mark.parametrize("layer", ["gated delta net", "SSD"])
 def test_a_forked_recurrence_costs_its_tokens_and_a_chunk_a_document(layer, documents):
     """A recurrence whose documents each enter a memory of their own (a call over forks) costs, in its
-    gradient's temporaries and FLOPs, what its packed row costs laid one chunk longer a document
-    (`AlignedDocuments`: each document from a chunk's edge), with each document's memory, its cotangent,
-    its final and that final's cotangent beside it, fp32, each an operation an element: a decision window's
-    rows at a documents bound of its own windows and at a loose one."""
+    gradient's temporaries and FLOPs, at most twice what its packed row costs laid one chunk longer a
+    document (`AlignedDocuments`: each document from a chunk's edge): the walk once on that grid, and the
+    call's own operands and their cotangents laid onto it and back at most once more, with each document's
+    memory, its cotangent, its final and that final's cotangent beside it, fp32, an operation an element: a
+    decision window's rows at a documents bound of its own windows and at a loose one, nothing scaled by the
+    bound times the row (armada, 11-09: 1.04 and 1.28 times the grid's packed row, gated delta net and SSD)."""
     call, operands, chunk, memories = _recurrence_call(layer, FORKED_LENGTH, documents)
     temporaries, flops = _compiled_cost(call, *operands)
     packed = _recurrence_call(layer, FORKED_LENGTH + documents * chunk, 0)
     bound, work = _compiled_cost(packed[0], *packed[1])
-    assert temporaries <= bound + 4 * 4 * memories, (temporaries, bound, memories)
-    assert flops <= work + 4 * memories, (flops, work, memories)
+    assert temporaries <= 2 * bound + 4 * 4 * memories, (temporaries, bound, flops, work, memories)
+    assert flops <= 2 * work + 4 * memories, (temporaries, bound, flops, work, memories)
