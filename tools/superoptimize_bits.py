@@ -39,7 +39,7 @@ MASK = bits.MASK
 
 # --- the reference traced into a form ---------------------------------------------------------------------
 
-_PREDICATES = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
+_PREDICATES = {name: code for code, name in enumerate(bits.COMPARISONS)}
 _FLIPPED = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
 
