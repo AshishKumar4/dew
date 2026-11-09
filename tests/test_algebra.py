@@ -372,3 +372,40 @@ def test_one_input_rewrites_to_one_program_in_any_process():
         found.append(json.loads(done.stdout.strip().splitlines()[-1]))
     assert found[0] == found[1]
     assert any(rewrite["nodes"] and rewrite["spliced"] for rewrite in found[0]["rewrites"])
+
+
+@pytest.mark.parametrize("call", ["jit", "checkpoint", "custom_jvp", "custom_vjp", "custom_vmap"])
+def test_recognition_reads_a_program_inside_any_call_as_the_program(call):
+    """A program run inside a call (`dew.nn.programs.CALLS`: a jit, a checkpoint, a custom derivative's
+    primal, a custom batching rule's program) is read by recognition's normal form (`canonical`) as the
+    program itself, its equations the same."""
+    from jax.custom_batching import custom_vmap
+
+    from dew.algebra.normal_form import canonical
+
+    def program(x):
+        return jnp.exp(x) * x + 1.0
+
+    def wrapped():
+        if call == "jit":
+            return jax.jit(program)
+        if call == "checkpoint":
+            return jax.checkpoint(program)
+        if call == "custom_jvp":
+            inner = jax.custom_jvp(program)
+            inner.defjvp(lambda primals, tangents: (inner(*primals), tangents[0]))
+            return inner
+        if call == "custom_vjp":
+            inner = jax.custom_vjp(program)
+            inner.defvjp(lambda x: (inner(x), x), lambda x, cotangent: (cotangent,))
+            return inner
+        inner = custom_vmap(program)
+        inner.def_vmap(lambda size, batched, x: (program(x), batched[0]))
+        return inner
+
+    x = jnp.ones(8)
+
+    def names(function):
+        return [equation.primitive.name for equation in canonical(jax.make_jaxpr(function)(x)).eqns]
+
+    assert names(wrapped()) == names(program)

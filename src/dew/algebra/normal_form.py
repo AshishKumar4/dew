@@ -22,7 +22,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import terms
 from dew.algebra.forms import aval
-from dew.nn.programs import host_evaluated, jax_name, on_host
+from dew.nn.programs import called, host_evaluated, jax_name, on_host
 
 
 def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -70,14 +70,6 @@ def _live(equations: list[jcore.JaxprEqn], outvars: list) -> list[jcore.JaxprEqn
     return kept[::-1]
 
 
-BODY_PARAMS = {"jit": "jaxpr", "pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
-               "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
-               "custom_vjp_call_jaxpr": "fun_jaxpr", "remat2": "jaxpr", "checkpoint": "jaxpr"}
-"""The nested programs `_evaluated` runs in place, by the parameter holding each one's body: what its call
-computes, the primal of a custom derivative's. A program's own derivative rule bars its region (`BARRIERS`);
-a declaration's is the call's, kept where the call is written."""
-
-
 class _Made:
     """A record of values `_evaluated` made, each by its identity, the value held with its entry so no other
     value takes its identity while the record lasts."""
@@ -113,9 +105,9 @@ class _Forms(NamedTuple):
 
 
 def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | None = None) -> list:
-    """`jaxpr` run over `values` with every nested program (`BODY_PARAMS`) run in place, each equation in the
-    form recognition compares (`_normal`): under a trace its equations each bind once, a value of constants
-    alone computed where it is made."""
+    """`jaxpr` run over `values` with every call's program (`dew.nn.programs.called`) run in place, each
+    equation in the form recognition compares (`_normal`): under a trace its equations each bind once, a value
+    of constants alone computed where it is made."""
     env: dict[jcore.Var, object] = dict(zip(jaxpr.constvars, consts, strict=True))
     env.update(zip(jaxpr.invars, values, strict=True))
     forms = forms or _Forms(_Made(), _Made(), _Made())
@@ -126,10 +118,11 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
 
     for equation in jaxpr.eqns:
         operands = [read(atom) for atom in equation.invars]
-        body = equation.params.get(BODY_PARAMS.get(equation.primitive.name, ""))
+        body = called(equation)
         if body is not None:
-            given = operands[len(operands) - len(body.invars):]
-            outputs = _evaluated(body, body.consts, *given, forms=forms)
+            # What the call computes, the primal of a custom derivative's: its own derivative rule bars its
+            # region (`BARRIERS`); a declaration's is the call's, kept where the call is written.
+            outputs = _evaluated(body, body.consts, *operands, forms=forms)
         else:
             # A value of constants alone is computed where it is made, so the program and a declaration
             # hold one constant (a mean of zeros, a mask of iotas) however each built it: of the equations

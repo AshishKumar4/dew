@@ -21,12 +21,13 @@ from jax._src import mesh as mesh_lib
 from jax.interpreters import ad
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call", "marked_call"})
+                   "custom_vjp_call", "custom_vmap_call", "marked_call"})
 """The primitives that run a program on their operands, one for one, and return its results. A `jit`
 lowers to a call that XLA's `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
 `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a checkpoint
 (`_remat_lowering`, jax/_src/ad_checkpoint.py), a custom derivative's primal
-(`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py) and a marked span
+(`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py), a custom batching rule's (its `call`,
+`custom_vmap_p`'s lowering, jax/_src/custom_batching.py) and a marked span
 (`dew.nn.derivatives.marked_call_p`, its body inlined) lower to their program in the caller, so XLA sees no
 call. A result that is the program's own parameter is its operand's buffer, and one that is a
 cheap value of another is recomputed where it is read, as it would be without the call."""
@@ -205,7 +206,8 @@ def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The program a call (`CALLS`) runs on `equation`'s operands one for one, returning its results, else
     None: every reader of a call through its program reads it here (`dew.training.compiled_program`'s
     `compiled` and `gradients_read`, staging's flattening, the kernel split's `_inlined`, the float64
-    terms)."""
+    terms, the algebra's normal forms). Its constants are its own (`consts`); a custom rule's leading
+    constants (`num_consts`) are among the operands its program reads, one for one."""
     found = bodies(equation) if equation.primitive.name in CALLS else []
     if len(found) == 1 and (len(found[0].invars), len(found[0].outvars)) == (
             len(equation.invars), len(equation.outvars)):
