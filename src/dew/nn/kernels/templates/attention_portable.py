@@ -76,11 +76,6 @@ def _composed(keys_at, tile_of):
     return lambda step: keys_at(tile_of(step))
 
 
-def _weighted(carry: algebra.Carry, *, rows) -> jax.Array:
-    """A training walk's weighted values, its split sums joined (`algebra.joined`), where they overflow."""
-    return algebra.joined(carry, rows).acc
-
-
 def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.Array, start: jax.Array,
             end: jax.Array, query_ids: jax.Array | None, key_ids: jax.Array | None, score_params,
             score_kinds: tuple[Kind, ...], output_params, output_kinds: tuple[Kind, ...], initial, *,
@@ -143,24 +138,19 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
 
-        def walk(form: algebra.Forward, live):
-            # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows
-            # shifting (`algebra.walked`).
+        def walk(form: algebra.Forward):
+            # The walk in `form`: the call's, or the fold's rewalk's (`algebra.walked`).
             tiles_of = _composed(functools.partial(keys_at, form), tile_of)
             return attention_program.walk(form, lo, hi, tiles_of, anchor_rows, resumed, block_q, value_width,
-                                          live=live, training=residuals, dropping=drop is not None)
+                                          training=residuals, dropping=drop is not None)
 
         def finished(form: algebra.Forward, carry):
             # A walk's outputs in `form` (`attention_program.finished`), as the Triton mainloop's.
-            tiles_of = _composed(functools.partial(keys_at, form), tile_of)
-            out, *kept = attention_program.finished(form, carry, tiles_of, anchor_rows, (lo, hi), resumed,
-                                                    training=residuals, output_mod=output_mod,
-                                                    output_params=out_params)
+            out, *kept = attention_program.finished(form, carry, anchor_rows, resumed, training=residuals,
+                                                    output_mod=output_mod, output_params=out_params)
             return (out.astype(query.dtype), *kept) if residuals else out.astype(query.dtype)
 
-        # A training walk's weighted values are its split sums joined, where they overflow.
-        weighted = functools.partial(_weighted, rows=anchor_rows) if residuals else None
-        return algebra.walked(spec, walk, finished, weighted)
+        return algebra.walked(spec, walk, finished)
 
     mapped = jax.lax.map(program, jnp.arange(blocks * batch * heads))
     return _unmapped(mapped, (blocks, batch, heads, block_q, value_width), residuals=residuals)
@@ -226,8 +216,9 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
     query, scale, power = prescaled(query, scale)
     call = padded_call(query, key, value, spans, hooks, config.pad)
     queries, value_width = call.queries, value.shape[-1]
-    # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
-    # fold its logits' reach (`algebra.walked`).
+    # Every form scales its rows' sums in the walk where they can pass fp32's largest
+    # (`algebra.Forward.headroom`, `algebra.SCALED_WALK`), and the fold guards its logits' reach
+    # (`algebra.walked`).
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score_mod,
                            natural, hooks.rounds is None and algebra.headroom(value.dtype),
                            hooks.initial is not None, compensated=algebra.compensates(value.dtype),
@@ -261,8 +252,7 @@ def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_
 
 def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
                 residuals: bool):
-    """`xla_mainloop`'s walk of a padded call (`padded_call`) in `spec`'s form, which a caller holding a form
-    of its own walks too (another mainloop's guarded rows, `attention_mosaic`): the output `[B, Qp, H, Dvp]`
+    """`xla_mainloop`'s walk of a padded call (`padded_call`) in `spec`'s form: the output `[B, Qp, H, Dvp]`
     and, with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
     None)."""
     initial = None
@@ -293,9 +283,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                split: bool, accurate: bool, drop=None):
     """The Triton mainloop's dQ launch (`attention_triton._dq_launch`), a query block and head at a time:
     each query's denominator and `D - c` from the forward's split `sums` (`gradient.split_delta`), or without
-    `split` from a first pass at the forward's maximum (`gradient.off_anchor_delta`) but for the rows whose
-    forward walked them normalized (shift -1, `algebra.split_residuals`), which the first pass cannot
-    recompute without the forward's denominator; under dropout (`drop`) from its own centred first pass
+    `split` from a first pass at the forward's maximum and its rows' shift (`gradient.off_anchor_delta`) but
+    for the rows whose split sums are normalized (shift -1, `algebra.normalized_rows`), which the first pass
+    cannot recompute without the forward's denominator; under dropout (`drop`) from its own centred first pass
     (`gradient.dropout_centre`); then dQ and the dQ program's hook gradients under it, `D` refined once from
     its own sums (`gradient.refinement`)."""
     batch, queries, heads, _ = query.shape

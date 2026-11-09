@@ -123,7 +123,7 @@ class OffAnchor(NamedTuple):
 def off_anchor_start(peak0: jax.Array, total0: jax.Array, maximum: jax.Array, width: int,
                      shift: jax.Array) -> tuple[OffAnchor, jax.Array]:
     """The first pass from the softmax's initial state (its maximum and denominator) weighed at the
-    forward's `maximum`, its sums at each row's `2^-shift` (the forward's, `room`), and that state's
+    forward's `maximum`, its sums at each row's `2^-shift` (the forward's scale, `Scale`), and that state's
     denominator there, unshifted; its share of D enters as that weight over the total times its values'
     mean's product with the cotangent (`off_anchor_delta`), never `acc0 · dO`, which overflows where the
     state's sums are near fp32's largest."""
@@ -140,10 +140,11 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
                        dtype, shift: jax.Array, how: Recompute = PLAIN
                        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """A tile's weights `exp(s - m)` at the forward's maximum, fp32, at the forward's weights' shift,
-    `2^-min(shift, WEIGHT_SHIFT)` (`room`); them narrowed to the values' `dtype` as the forward rounds
+    `2^-min(shift, WEIGHT_SHIFT)`; them narrowed to the values' `dtype` as the forward rounds
     them, zero at the anchor key (`at_anchor`), the left operand of `B`'s product; the anchor key's
     narrowed weight, fp32; and the weights that shift would push below fp32's least normal, unshifted
-    and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's (`room`)."""
+    and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's small weights'
+    (`at_scale`)."""
     exponentials = below(logits, maximum, how)
     weight = expand(jnp.minimum(shift, WEIGHT_SHIFT), exponentials)
     small = jnp.where(exponentials < power2(jnp.float32(1.0), weight - 126.0), exponentials, 0.0)
@@ -157,7 +158,7 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
 def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: jax.Array,
                others: jax.Array, shift: jax.Array, small: jax.Array, small_others: jax.Array) -> OffAnchor:
     """The first pass after a tile (`off_anchor_weights`), `others` the tile's `rest · V`, its sums taken
-    from the weights' shift to each row's `shift`, as the forward's (`beyond_weights`), and the small
+    from the weights' shift to each row's `shift`, as the forward's (`carry_factor`), and the small
     weights and their product `small_others` taken there after the product: they feed D alone, whose
     small terms are below an ulp of it."""
     beyond = jnp.minimum(shift, WEIGHT_SHIFT) - shift
@@ -197,7 +198,7 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     rounds it, which suits a query whose weights spread over many keys; and about `c = v_c · dO`,
     `sum_{j != c} p_j (v_j - v_c) · dO`, where c enters as exactly 0, which suits one whose weight sits on
     c. Each query takes the one nearer its D, the one whose terms cancel less. The pass's sums are at each
-    row's `2^-shift` (`room`), and each is taken over the total before its product with dO, as the
+    row's `2^-shift` (`Scale`), and each is taken over the total before its product with dO, as the
     reference's output is, so none overflows where the sums are near fp32's largest; the initial state's
     share is its weight over the total times its values' mean's product with dO (`mean0`). Each row's
     product with dO is `rows`', the issuer's own that forms dP (`summed_rows` in a kernel's body,
@@ -225,10 +226,11 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     at the forward's maximum. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
     `(B - others_total v_c) · dO - state_total c`, its terms kept apart so a state or keys that weigh
     little beside the anchor are not lost from a total; each query takes the one nearer its D. The split
-    sums are at each row's `2^-shift` (`room`), and `total` is taken there; a row at the shift `NORMALIZED`
-    holds normalized sums (`split_residuals`, `normalized_rows`), its total 1. Each sum is taken over the
-    total before its product with dO, as the reference's output is, so none overflows where the sums are
-    near fp32's largest (a state's). Each row's product with dO is `rows`' (`off_anchor_delta`'s)."""
+    sums are at each row's `2^-shift` (`Scale`), and `total` is taken there; a row at the shift
+    `NORMALIZED` holds normalized sums (an output residual's, `normalized_rows`), its total 1. Each sum is
+    taken over the total before its product with dO, as the reference's output is, so none overflows where
+    the sums are near fp32's largest (a state's). Each row's product with dO is `rows`'
+    (`off_anchor_delta`'s)."""
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).

@@ -115,7 +115,8 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     """The four launches of a norm seam and SwiGLU step are recorded as it
     traces (`tuning.seen`), keyed with their token axis at a power of two. Each
     takes its heuristic, a pinned config of its type (one of another type
-    raises, naming the config and why), and in a fresh
+    raises, naming the config and why, or within `pinned_where_taken` is
+    set aside), and in a fresh
     process reading picks as an opt-in tuning run does (`tuning.reading`)
     the picks stored for its device beside its compilation cache (each a
     variant of its launch, `KernelOp.variants`), for every token count in
@@ -147,6 +148,16 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
           pytest.raises(tuning.Unpinnable) as refused):
         launches(step(), *operands(15))
     assert (refused.value.kernel, refused.value.config) == ("RmsForward", norm_swiglu.BlockConfig(1024, 4))
+    # A launch made under a pin it cannot take (`tuning.pinned_where_taken`: a scaled attention forward
+    # beside its common one) takes its own config, every other kind's pin kept; one it can take, the pin.
+    rms = ops[norm_swiglu.RmsForward]
+    for pin, rows in ((norm_swiglu.BlockConfig(1024, 4), usual["rms_norm_forward"]),
+                      (norm_swiglu.RowsConfig(1, 1), ((15,), 1))):
+        with (tuning.pinned({norm_swiglu.RmsForward: pin,
+                             norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)}),
+              tuning.pinned_where_taken(rms.op, rms)):
+            taken = launches(step(), *operands(15))
+        assert taken["rms_norm_forward"] == rows and taken["swiglu_forward"] == ((1,), 8)
 
     # The picks a GPU measured, stored for this device, as a fresh process finds them: each launch's
     # variant beside its heuristic (16 rows and 4 warps a norm program, a step's 1024 elements a SwiGLU's).

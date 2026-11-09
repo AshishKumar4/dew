@@ -2,9 +2,9 @@
 (`attention_algebra`) under each mainloop. The plain-JAX one (`attention_portable`) is held to check 1
 against the template's reference over every call form and hook, as the Triton one is
 (`test_attention_triton.check`, `check_backward`): the gate and time decide, and no test asks two mainloops
-for the same bits (bible §4). Exact claims stay exact within a mainloop: a guard that leaves ordinary rows
-the plain walk's bits, a query of one key whose gradient is zero. The algebra's own `merge` is held to one
-pass over the keys it joins."""
+for the same bits (bible §4). Exact claims stay exact within a mainloop: a scaled walk that leaves ordinary
+rows the unscaled walk's bits, a query of one key whose gradient is zero. The algebra's own
+`merge` is held to one pass over the keys it joins."""
 
 import functools
 
@@ -432,30 +432,78 @@ def test_the_fold_reads_its_factor_as_the_kernel_rounds_it():
     assert algebra.Forward("full", 1, ids=False, scale=0.5).base2
 
 
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
-    """The accurate form's walk with its headroom guard (`algebra.guarded`) gives the same bits as the walk
-    without it on drawn inputs, whose sums never overflow: the guard only reads the plain walk's sums."""
-    query, key, value = drawing(200, 300, jnp.float32, width=64, value_width=64)(0)
-    spans = template.spans(200, 300, ROWS, causal=causal)
-    call = template.padded_call(query, key, value, spans, template.Hooks(), attention_triton.BLOCK)
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+def test_the_scaled_walks_tiles_take_the_unscaled_arithmetic_where_no_row_is_scaled(dtype, natural):
+    """The scaled walk (`algebra.SCALED_WALK`) over three drawn key tiles, each's maximum past the last's,
+    none of whose rows' sums can pass fp32's largest, step for step against the walk with no scale: after
+    every tile its sums, maximum and denominator (and an fp32 walk's dropped parts, `algebra.Low`) are the
+    same bits, and so is the finished output. The operations run one at a time (`jax.disable_jit`): the
+    claim is the arithmetic's, which a compiler's fusion of the walk around its branch does not decide
+    (XLA's CPU rounded an fp32 call's sums an ulp apart in a third of its rows where a branch sat beside
+    them)."""
+    rows, keys, width = 16, 32, 16
+    streams = jax.random.split(jax.random.key(0), 3)
+    query = jax.random.normal(streams[0], (rows, width)).astype(dtype)
+    key = jax.random.normal(streams[1], (3, keys, width)).astype(dtype)
+    value = jax.random.normal(streams[2], (3, keys, width)).astype(dtype)
+    specs = {headroom: algebra.Forward("full", 3 * keys, ids=False, scale=width ** -0.5, natural=natural,
+                                       headroom=headroom, compensated=algebra.compensates(dtype))
+             for headroom in (False, True)}
 
-    def walked(*, headroom: bool):
-        spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=64 ** -0.5, natural=True,
-                               headroom=headroom)
-        out, _ = attention_portable.forward(spec, call.query, call.key, call.value, call.start, call.end,
-                                            None, None, (), (), (), (), None, block_q=32, block_k=32,
-                                            output_mod=None, residuals=False)
-        return np.asarray(out)
+    def dot(a, b):
+        return jnp.matmul(a, b, preferred_element_type=jnp.float32)
 
-    np.testing.assert_array_equal(walked(headroom=True), walked(headroom=False))
+    with jax.disable_jit():
+        states = {headroom: algebra.compensated(spec, algebra.started(spec, None, rows, width))
+                  for headroom, spec in specs.items()}
+        for tile in range(3):
+            coords = algebra.Coords(jnp.arange(rows)[:, None], tile * keys + jnp.arange(keys)[None, :])
+            # Each tile's logits past the last's, so every tile moves the maximum.
+            scores = dot(query, key[tile].T) + 4.0 * tile
+            for headroom, spec in specs.items():
+                logits, products = algebra.logits_of(spec, scores, coords)
+                tiled = value[tile]
+                operand = algebra.Operand(tiled.shape, tiled.dtype, lambda tiled=tiled: tiled)
+                states[headroom] = algebra.plain_step(
+                    spec, states[headroom], algebra.Keys(coords, logits, operand, dot, products=products))
+            for field in ("acc", "m", "total", "low"):
+                for mine, theirs in zip(jax.tree.leaves(getattr(states[True], field)),
+                                        jax.tree.leaves(getattr(states[False], field)), strict=True):
+                    np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs),
+                                                  err_msg=f"tile {tile} {field}")
+        outputs = [np.asarray(algebra.finish(specs[headroom], algebra.settled(states[headroom]),
+                                             initial=False)[0]) for headroom in (False, True)]
+    np.testing.assert_array_equal(outputs[1], outputs[0])
 
 
-def test_a_padded_calls_padding_rows_stay_finite_and_flag_no_overflow():
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
+def test_a_scaled_rows_unseen_keys_and_far_logits_weigh_nothing(natural):
+    """A row the scaled walk scales (its first key's value near fp32's largest, `algebra.SCALED_WALK`)
+    beside keys past its length whose values are near fp32's largest in another column, and keys it sees at
+    logits far below its maximum (a weight below 2^-150, which fp32 holds as none): its small weights'
+    product (`algebra.at_scale`, raised from each weight's exponent) gives every such key the weight 0,
+    so that column of the output is exactly 0 and the first its one value."""
+    keys, length = 16, 8
+    value = np.zeros((1, keys, 1, 16), np.float32)
+    value[0, 0, 0, 0] = 3e38
+    value[0, length:, 0, 1] = 3e38
+    key = np.zeros((1, keys, 1, 16), np.float32)
+    # Every seen key but the first far below it, past fp32's smallest weight; the unseen keys at the first's
+    # logit, which their length masks.
+    key[0, 1:length, 0, 0] = -1e4
+    query = np.zeros((1, 1, 1, 16), np.float32)
+    query[0, 0, 0, 0] = 1.0
+    spans = template.spans(1, keys, 1, lengths=jnp.asarray([length], jnp.int32))
+    out = attention_portable.xla_mainloop(attention_portable.Tiles(16, 16, 16), jnp.asarray(query),
+                                          jnp.asarray(key), jnp.asarray(value), spans, natural=natural)
+    np.testing.assert_array_equal(np.asarray(out)[0, 0, 0, :2], np.float32([3e38, 0.0]))
+
+
+def test_a_padded_calls_padding_rows_stay_finite_and_read_zero():
     """A full bf16 call walked past its queries (`Forward.queries`, a mainloop's padding to whole tiles),
-    whose padding rows see no key (`seen`): its plain and anchored training walks leave those rows' sums
-    finite and flag no row overflowed, so a mainloop that reruns overflowed rows (`walked_launches`) takes
-    its one plain launch, and the padding rows' output is 0."""
+    whose padding rows see no key (`seen`): its plain and anchored training walks, scaled
+    (`algebra.SCALED_WALK`), leave every row's output finite and the padding rows' 0."""
     queries, rows, keys, width = 20, 32, 32, 16
     spec = algebra.Forward("full", keys, ids=False, scale=width ** -0.5,
                            headroom=algebra.headroom(jnp.bfloat16), queries=queries)
@@ -474,12 +522,11 @@ def test_a_padded_calls_padding_rows_stay_finite_and_flag_no_overflow():
 
     keys_of = algebra.Keys(coords, logits, algebra.Operand(value.shape, value.dtype, lambda: value), dot,
                            products=products)
-    state = algebra.plain_step(spec, algebra.started(spec, None, rows, width, None), keys_of)
+    state = algebra.plain_step(spec, algebra.started(spec, None, rows, width), keys_of)
     arg = algebra.argmax(algebra.no_argmax(rows), logits, coords.k_pos)
-    start = algebra.anchored(spec, algebra.started(spec, None, rows, width, None), arg)
+    start = algebra.anchored(spec, algebra.started(spec, None, rows, width), arg)
     anchored = algebra.anchored_step(spec, start, keys_of._replace(accumulate=accumulate))[0]
     for walked in (state, anchored):
-        assert not np.any(np.asarray(algebra.overflowed(walked.acc)))
         out = np.asarray(algebra.finish(spec, walked, initial=False)[0])
         assert np.isfinite(out).all()
         np.testing.assert_array_equal(out[queries:], 0.0)
@@ -519,7 +566,7 @@ def test_a_training_walk_at_its_anchor_known_is_on_par_with_the_gathering_walk(n
 
     def walk(logits, values, *, anchored: bool):
         nothing = jnp.zeros((queries,), logits.dtype)
-        start = algebra.started(spec, None, queries, width, None)
+        start = algebra.started(spec, None, queries, width)
         start = start._replace(acc=start.acc.astype(logits.dtype), m=start.m.astype(logits.dtype),
                                total=start.total.astype(logits.dtype))
         arg = algebra.Argmax(nothing - jnp.inf, jnp.zeros((queries,), jnp.int32))
@@ -594,9 +641,10 @@ def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges
 
 def test_a_row_that_does_not_overflow_keeps_the_plain_walks_bits_beside_one_that_does():
     """Two documents a row of one program: two queries over two drawn keys, and four over four equal keys
-    whose values near 1e38 overflow their weighted sum. The guarded walk shifts only the latter rows
-    (`algebra.room`'s `live`): the former's output and residuals are the unguarded walk's to the bit, in
-    the plain-JAX mainloop; the Triton one's output is finite on every row."""
+    whose values near 1e38 overflow their weighted sum. The scaled walk scales only the latter rows
+    (`algebra.SCALED_WALK`, each row's own bound): the former's output and residuals are the unscaled walk's
+    to the bit, in the plain-JAX mainloop, though their program's tiles take the scaled arithmetic; the
+    Triton one's output is finite on every row."""
     streams = jax.random.split(jax.random.key(0), 3)
     query = jnp.zeros((1, 6, 1, 16), jnp.float32).at[:, :2].set(jax.random.normal(streams[0], (1, 2, 1, 16)))
     key = jnp.zeros((1, 6, 1, 16), jnp.float32).at[:, :2].set(jax.random.normal(streams[1], (1, 2, 1, 16)))
@@ -614,9 +662,9 @@ def test_a_row_that_does_not_overflow_keeps_the_plain_walks_bits_beside_one_that
         return [np.asarray(leaf)[..., :6, :, :16] if leaf.ndim == 4 and leaf.shape[1] == call.queries
                 else np.asarray(leaf) for leaf in jax.tree.leaves((out, kept))]
 
-    guarded, plain = portable(headroom=True), portable(headroom=False)
-    assert not np.isfinite(plain[0][0, 2:]).all() and np.isfinite(guarded[0]).all()
-    for leaf, (mine, theirs) in enumerate(zip(guarded, plain, strict=True)):
+    scaled, plain = portable(headroom=True), portable(headroom=False)
+    assert not np.isfinite(plain[0][0, 2:]).all() and np.isfinite(scaled[0]).all()
+    for leaf, (mine, theirs) in enumerate(zip(scaled, plain, strict=True)):
         rows = (slice(None), slice(0, 2)) if leaf == 0 else (slice(None), slice(None), slice(0, 2))
         np.testing.assert_array_equal(mine[rows], theirs[rows], err_msg=f"leaf {leaf}")
     with tuning.pinned({attention_triton.TritonForward: TILES[1]}):

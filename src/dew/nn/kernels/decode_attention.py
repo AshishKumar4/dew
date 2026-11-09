@@ -43,7 +43,6 @@ A row reads at least one key: an idle slot reads its first.
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
 from typing import TYPE_CHECKING, ClassVar
 
 import jax
@@ -173,11 +172,11 @@ def _spec(scale: float, power: float, softcap: float | None, natural: bool | Non
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`; None:
     natural for fp32 operands, whose edge logit's base-2 conversion rounded before exp2 moves its normal
     weight by several ppm, which a large value carries into the output, ledger 2151), and in either form
-    whether a row's sums of `dtype` values need a guard (`algebra.headroom`) and keep their additions'
-    rounding (`algebra.compensates`), folded logits a difference of raw products scaled after it is taken
-    (`algebra.Forward.subtracted`: no fold's divergence past its reach, row 1955, on a walk the memory
-    bounds). A decode block's rows are a key head's query heads and positions (`grouped_query`), so the hook
-    takes no query positions."""
+    whether a row's sums of `dtype` values are scaled in the walk (`algebra.headroom`,
+    `algebra.SCALED_WALK`) and keep their additions' rounding (`algebra.compensates`), folded logits a
+    difference of raw products scaled after it is taken (`algebra.Forward.subtracted`: no fold's divergence
+    past its reach, row 1955, on a walk the memory bounds). A decode block's rows are a key head's query
+    heads and positions (`grouped_query`), so the hook takes no query positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else Capped(softcap),
                            natural=jnp.dtype(dtype) == jnp.float32 if natural is None else natural,
@@ -203,41 +202,15 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         return algebra.Keys(coords, logits, algebra.Operand(value.shape, value.dtype, lambda: value),
                             functools.partial(kernel_dot, interpret=interpret))
 
-    def walk(live=None) -> algebra.Partial:
-        # The plain walk where `live` is None, else the guarded one, those rows shifting.
-        start = algebra.empty(QUERIES, query.shape[-1])
-        if sink is not None:
-            real = sink > -jnp.inf
-            start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc, live=live)
-        elif live is not None:
-            start = algebra.headroomed(start, live)
-        first, last = steps
-        return algebra.plain_walk(spec, first, last, keys_at, start)
-
-    if not spec.headroom:
-        return walk()
-    # A slice's state carries a bound on its values (`algebra.headroomed`), so a merge of slices each
-    # finite but whose join overflows shifts as it needs (`algebra.merge`).
-    return algebra.headroomed(algebra.guarded(walk, walk))
-
-
-def _guarded(launch: Callable[..., jax.Array], spec: algebra.Forward, spans: jax.Array) -> jax.Array:
-    """`launch(spec, spans)`'s output with its sums guarded only where they overflow: under headroom
-    (`algebra.Forward.headroom`) the plain launch first, then the guarded one over the rows some output of
-    which is not finite (an overflowed sum's, or a merge's of two finite slices; or a call's own non-finite
-    input, which the guarded launch gives again), every other row's span empty, so it walks no key of them,
-    and its rows taken where they overflowed. The guarded launch runs every step, no branch: a branch's
-    predicate is read on the host before its launch may run, a decode step's round trip (row 1978: 0.280 ms
-    wall against 0.015 on the device). It walks a live row's keys in one slice (`launch`'s `splits`): a
-    row overflows rarely, and a sliced launch of empty walks cost its slices' merge every step, 12 us a step
-    at one row over 4096 keys on an H100, 43 against 31 (ET-1978-h100). The guarded launch is a kernel of
-    its own name (`_headroom`), as the Triton forward's is."""
-    if not spec.headroom:
-        return launch(spec, spans)
-    out = launch(dataclasses.replace(spec, headroom=False), spans)
-    over = ~jnp.all(jnp.isfinite(out), axis=tuple(range(1, out.ndim)))
-    guarded = launch(spec, jnp.where(over[:, None], spans, 0), 1)
-    return jnp.where(over.reshape(-1, *(1,) * (out.ndim - 1)), guarded, out)
+    start = algebra.empty(QUERIES, query.shape[-1], scaled=spec.headroom)
+    if sink is not None:
+        real = sink > -jnp.inf
+        start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc)
+    first, last = steps
+    # Its rows' sums scaled in the walk where they could pass fp32's largest (`algebra.SCALED_WALK`), each
+    # tile's values' largest magnitude read from the loaded tile beside its product, which the memory bounds;
+    # a merge of slices joins them at their joined scale (`algebra.merge`).
+    return algebra.plain_walk(spec, first, last, keys_at, start)
 
 
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
@@ -259,8 +232,8 @@ def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
         out = algebra.finish(spec, state, initial=True)[0]
         out_refs[0][...] = out.astype(out_refs[0].dtype)
     else:
-        # The state's sums, maxima and totals, with its shifts, bounds and small sums under headroom;
-        # which rows shifted is the merge's own to find again (`algebra.merge`).
+        # The state's sums, maxima and totals, and its rows' scale on the scaled walk, which the merge reads
+        # (`algebra.merge`).
         for ref, value in zip(out_refs, algebra.exported(state), strict=True):
             ref[...] = value
 
@@ -305,23 +278,22 @@ def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pa
 
 
 def _combined(spec: algebra.Forward, *parts, axis: int):
-    """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima, totals,
-    shifts and reaches) merged at once (`algebra.merged`), as the normalized output in fp32: an empty
-    slice's state (a maximum of -inf) merges as nothing."""
+    """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima and totals, and
+    their rows' scale on the scaled walk, `algebra.exported`) merged at once (`algebra.merged`), as the
+    normalized output in fp32: an empty slice's state (a maximum of -inf) merges as nothing."""
     return algebra.finish(spec, algebra.merged(spec, algebra.imported(parts), axis), initial=True)[0]
 
 
-def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, reduced, *, headroom: bool):
+def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, reduced, *, scaled: bool):
     """The launch's outputs and their blocks: the output `shape` in `dtype` for one slice, else the
-    slices' fp32 states (`algebra.Partial`: sums, maxima and totals, with shifts, reaches and the small
-    weights' sums under headroom) with a slices axis at `at` (`spec`, `summed` and `reduced` the blocks)."""
+    slices' fp32 states (`algebra.exported`: sums, maxima and totals, and the rows' exponents and bounds
+    where the walk is `scaled`) with a slices axis at `at` (`spec`, `summed` and `reduced` the blocks)."""
     if splits == 1:
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
     sums, rows = jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32)
-    if not headroom:
-        return [sums, rows, rows], [summed, reduced, reduced]
-    return [sums, rows, rows, rows, rows, sums, rows], [summed, *[reduced] * 4, summed, reduced]
+    count = 4 if scaled else 2
+    return [sums, *[rows] * count], [summed, *[reduced] * count]
 
 
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
@@ -398,7 +370,7 @@ class DecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
         def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
-                                            headroom=spec.headroom)
+                                            scaled=spec.headroom)
             out = launches.pallas_call(
                 lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
                                       sinks=sinks is not None),
@@ -409,12 +381,12 @@ class DecodeAttention(tuning.KernelOp):
                 out_shape=out_shape,
                 compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
                 interpret=interpret,
-                name="decode_attention_headroom" if spec.headroom else "decode_attention",
+                name="decode_attention",
             )(spans, query, key, value, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)
 
         spec = _spec(scale, power, softcap, natural, value.dtype, sinks is not None)
-        return _guarded(launch, spec, spans), None
+        return launch(spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:
         return _heuristic(*self._launch(ba))
@@ -469,7 +441,7 @@ class PagedDecodeAttention(tuning.KernelOp):
 
         def launch(spec: algebra.Forward, spans: jax.Array, splits: int = splits) -> jax.Array:
             out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
-                                            headroom=spec.headroom)
+                                            scaled=spec.headroom)
             out = launches.pallas_call(
                 lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits,
                                             interpret=interpret, sinks=sinks is not None),
@@ -481,12 +453,12 @@ class PagedDecodeAttention(tuning.KernelOp):
                 out_shape=out_shape,
                 compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
                 interpret=interpret,
-                name="paged_decode_attention_headroom" if spec.headroom else "paged_decode_attention",
+                name="paged_decode_attention",
             )(spans, table, query, key_pages, value_pages, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)
 
         spec = _spec(scale, power, softcap, natural, value_pages.dtype, sinks is not None)
-        return _guarded(launch, spec, spans), None
+        return launch(spec, spans), None
 
     def _get_heuristics_config(self, ba) -> Split:
         return _heuristic(*self._launch(ba))

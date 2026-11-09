@@ -761,11 +761,11 @@ def _trained(spans: template.KeySpans):
 @pytest.mark.parametrize("width", [64, 128, 256])
 @pytest.mark.parametrize("generation_name", ["sm120", "sm86"])
 def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, width):
-    """The forward and a training step's backward (its forward kept, the guarded training forward's
-    rewalk among its launches) at the tiles they derive on a GPU of a 99 KB block (an RTX PRO 6000's, an
-    A10's), causal, bf16, compiled by XLA's CUDA backend for a compile-only device of it on this CPU
-    (tests/kernel_compile.py): every Triton launch within the block (a width-256 training forward derived
-    32 x 64, whose rewalk asked 114688 bytes, and XLA refused the whole program)."""
+    """The forward and a training step's backward (its forward kept) at the tiles they derive on a GPU of a
+    99 KB block (an RTX PRO 6000's, an A10's), causal, bf16, compiled by XLA's CUDA backend for a
+    compile-only device of it on this CPU (tests/kernel_compile.py): every Triton launch within the block
+    (a width-256 training forward's overflow rewalk once asked 114688 bytes, and XLA refused the whole
+    program)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
@@ -788,8 +788,7 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     naming no kernel, where its launches ask more shared memory than the GPU's 99 KB block; the run's
     compile (`report.kept`) refuses the configs of the traced Triton launches XLA refuses each compiled
     alone (`report.refused_alone`), each at the bytes it asked, each derivation takes its next config, and
-    the program compiles on its one recompile (row 3584, audit group 71); the program's other Triton
-    launches keep theirs."""
+    the program compiles on its one recompile (row 3584, audit group 71)."""
     import dataclasses
 
     import kernel_compile
@@ -823,7 +822,7 @@ def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
         report.kept(first, relower=lowered)
         misses = [miss for miss in report.misses() if miss.shared is not None]
         refused = [config for _, config, _ in report.refused_launches()]
-    assert alone and set(alone) < every, (alone, every)
+    assert alone and set(alone) <= every, (alone, every)
     assert misses and all(miss.stepped for miss in misses), misses
     assert {miss.config for miss in misses} == set(refused), (misses, refused)
     # Each launch refused is one XLA refuses alone, at the bytes it asked alone (a launch the run did not
