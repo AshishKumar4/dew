@@ -2,7 +2,7 @@
 
 import contextlib
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -169,7 +169,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         self.inputs = self.actor.inputs
         reference = self.actor.ema
         self.ema = None if reference is None else EMASpec(reference.decay,
-            lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
+            lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])),
+            stated=None if reference.stated is None else ("policy", reference.stated))
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """The policy's runs a pipeline over `stages` stacks, under `policy`, and the critic's, under
@@ -261,6 +262,15 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
         return onto_ids(batch, values.astype(at_least_fp32(values.dtype))), qk
+
+    def trace_key(self) -> Hashable | None:
+        """Its actor's key (none where its actor states none), its critic and its value settings
+        (`Objective.traced_by`)."""
+        from dew.objectives.base import stated_trace
+
+        actor = stated_trace(self.actor)
+        return None if actor is None else self.traced_by(actor, self.critic, self.seq_len,
+                                                         self.value_coefficient, self.value_clip)
 
     def loss(self, variables: Variables, batch, step: Step) -> tuple[PPOStatistics, Aux[Variables]]:
         """Return independent statistics for the actor and the clipped value error.

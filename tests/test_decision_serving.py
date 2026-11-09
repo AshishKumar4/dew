@@ -256,6 +256,72 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
     assert not compiled_while_serving(server)
 
 
+def test_a_budget_names_the_lengths_and_window_counts_its_passes_compile(decide):
+    """A budget names the shapes a server compiles (`Budget.lengths`, `Budget.counts`): by default the
+    layout's window and three halvings, each at one window, the powers of 8 and the most its tokens and
+    rows allow; one length at the most windows alone compiles one program, which serves requests of every
+    length, question and option count, alone and together, compiling nothing more."""
+    from test_decision_batches import CASES
+
+    from dew.decision.task import Budget
+    from dew.telemetry.compiles import Compiles
+
+    window = decide.layout.max_len
+    default = replace(decide, budget=Budget(options=16))
+    shortest = len(default._probe[0].tokens)
+    lengths = {max(shortest, window >> step) for step in range(4)}
+    assert {shape.length for shape in default.pass_shapes} == lengths
+    most = {shape.length: shape.rows for shape in default.pass_shapes}
+    for length in most:
+        counts = sorted(shape.rows for shape in default.pass_shapes if shape.length == length)
+        powers = [8 ** power for power in range(len(counts)) if 8 ** power < most[length]]
+        assert counts == sorted({*powers, most[length]})
+    lone = replace(decide, budget=Budget(options=16, lengths=1, counts=(1, "most")))
+    assert [(shape.length, shape.rows) for shape in lone.pass_shapes] == [(window, 1), (window, most[window])]
+    one = replace(decide, budget=Budget(options=16, lengths=1, counts=("most",)))
+    server = ScoringServer.from_task(*one.scoring())
+    assert server.programs == one.pass_shapes
+    assert [(shape.length, shape.rows) for shape in one.pass_shapes] == [(window, most[window])]
+    with Compiles("logits") as compiles:
+        futures = [server.submit(body) for body in [*CASES.values(), REQUEST]]
+        server.run()
+        for future in futures:
+            future.result()
+    assert [program for program in compiles.programs if program.kind == "compiled"] == []
+    alone = replace(decide, budget=Budget(options=16, counts=(1, 10 ** 6)))
+    assert {shape.rows for shape in alone.pass_shapes} <= {1, *most.values()}
+    for refused in ({"lengths": 0}, {"counts": ()}, {"counts": (0,)}, {"counts": ("some",)}):
+        with pytest.raises(ValueError):
+            Budget(**refused)
+
+
+def test_a_call_over_known_rows_compiles_the_shapes_its_passes_take_alone(decide):
+    """A call over rows it holds (`Decide.logits`) compiles the programs its passes take and none other: a
+    few short requests take one of the budget's shapes; compiled first over those rows
+    (`compile_scoring(rows=...)`, the shapes `planned_shapes` gives), all at once, that one alone
+    compiles, and the call then compiles nothing."""
+    from dew.decision import Question
+    from dew.decision.task import Budget
+    from dew.telemetry.compiles import Compiles
+
+    single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
+    questions = {name: Question.from_wire(wire) for name, wire in single["questions"].items()}
+
+    def compiled(run) -> int:
+        with Compiles("logits") as compiles:
+            run()
+        return len([program for program in compiles.programs if program.kind == "compiled"])
+
+    lazy = replace(decide, budget=Budget(options=24))
+    rows = [row for _ in range(3) for row in lazy._encoded(single["state"], questions)]
+    planned = lazy.planned_shapes(rows)
+    assert len(planned) == 1 and len(lazy.pass_shapes) > 1
+    assert compiled(lambda: lazy.logits(rows)) == len(planned)
+    ahead = replace(decide, budget=Budget(options=20))
+    assert compiled(lambda: ahead.compile_scoring(rows=rows)) == len(planned)
+    assert compiled(lambda: ahead.logits(rows)) == 0
+
+
 def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decide):
     """`Decide`'s call over requests scores them in the passes a scoring server runs (`RowScoring`, one
     path for a call and a server, ledger 2514): over a task whose budget declares its widths, after its

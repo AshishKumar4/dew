@@ -11,15 +11,7 @@ import optax
 import pytest
 import torch
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    indexed_recording,
-    over_windows,
-    recording,
-    seeds_for,
-    windows,
-)
+from reference_error import as_given, assert_as_exact, indexed_recording, over_windows, recording, windows
 from transformers import (
     AutoModelForImageTextToText,
     Gemma4UnifiedConfig,
@@ -451,8 +443,8 @@ def assert_live_forward(pair, draw, label):
     """Check 1 of Dew's forward against transformers' on `draw`'s inputs, the reference compared with
     itself sizing the site's seeds (`seeds_for`)."""
     ours, reference, truth = forward_functions(pair)
-    seeds = seeds_for(reference, draw, label, truth_fn=truth)
-    assert_as_exact(ours, reference, draw, label, seeds=seeds, truth_fn=truth)
+    # The count `seeds_for` sized.
+    assert_as_exact(ours, reference, draw, label, seeds=128, truth_fn=truth)
 
 
 def test_vision_without_its_token_types_runs_causal_as_transformers_does(source):

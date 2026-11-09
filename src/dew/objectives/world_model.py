@@ -12,7 +12,9 @@ and predicts each frame's clean latents (x-prediction).
 Choices the paper leaves open (docs/research/dreamer4.md, last section) are this module's: the
 widths and depths, `K_max` = 64, one attention over space and time in every layer, learned position
 embeddings, the ramp weight multiplying each frame's loss, no LPIPS term in the tokenizer's loss,
-and context frames at signal level 1 - `tau_ctx` when generating.
+and context frames at signal level 1 - `tau_ctx` when generating. One departs from Eq. 7: shortcut
+forcing takes the x-prediction's error at every step size, not the smallest alone
+(`shortcut_forcing_loss`, row 4802).
 """
 
 from __future__ import annotations
@@ -220,6 +222,9 @@ class TokenizerObjective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return None
 
+    traced = ("max_mask",)
+    """Its masking."""
+
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         video = unit_frames(batch["video"])
         rows, frames = video.shape[:2]
@@ -242,7 +247,16 @@ class Dynamics(nn.Module):
     tokenizer latents regrouped into `spatial` tokens, with one action token a step (a learned
     embedding plus a projection of `action_size` actions, none for unlabeled video) and one shortcut
     token, the embeddings of its signal level's and step size's grid indices at `levels` levels
-    (`K_max` = 2 ** (levels - 1)), predicting each frame's clean latents."""
+    (`K_max` = 2 ** (levels - 1)), predicting each frame's clean latents.
+
+    `positions` is how its tokens know where they are. "rotary", Dreamer 4's (Section 3.2), rotates every
+    attention's queries and keys by each token's frame and its place in the frame (the action token, the
+    shortcut token, then the spatial ones), beside the learned vectors each adds. "learned" is the
+    learned vectors alone, the dynamics models were saved with before row 4802: started at 0.02 against
+    the latents' unit scale, they left a frame's tokens no way to tell their past's apart, and a model
+    trained on clips whose latents shift a place a frame forecast from its context no better than from
+    noise (a teacher-forced error of 1.06 from a clean context, 1.15 from noise, against the mean
+    frame's 0.84; the same vectors started at 1.0, 0.54 and 1.30)."""
 
     latents: int = 16
     bottleneck: int = 8
@@ -253,6 +267,7 @@ class Dynamics(nn.Module):
     heads: int = 4
     levels: int = 7
     frames: int = 32
+    positions: Literal["rotary", "learned"] = "rotary"
 
     @property
     def k_max(self) -> int:
@@ -284,9 +299,20 @@ class Dynamics(nn.Module):
         tokens = tokens + times[:frames, None]
         tokens = tokens.reshape(batch, frames * per_frame, self.width)
         time = jnp.repeat(jnp.arange(frames), per_frame)
-        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}")
+        rotary = self.positions == "rotary"
+        head = self.width // self.heads
+        if rotary and head < 4:
+            raise ValueError(f"a dynamics model's two-axis rotary turns a pair of channels or more for each "
+                             f"axis, and its heads are {head} wide; make width // heads at least 4")
+        # The frames' channels, a whole number of pairs, and the places' the rest, as near halves as they
+        # split (`CausalTokenizer`'s).
+        channels = 2 * ((head + 2) // 4)
+        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}",
+                         rotary_axes=(channels, head - channels) if rotary else None)
                   for index in range(self.depth)]
-        tokens = _attended(blocks, tokens, time[:, None] >= time[None, :])
+        places = jnp.stack([time, jnp.tile(jnp.arange(per_frame), frames)], -1).astype(jnp.float32)
+        tokens = _attended(blocks, tokens, time[:, None] >= time[None, :],
+                           positions=places if rotary else None)
         spatial_out = tokens.reshape(batch, frames, per_frame, -1)[:, :, 2:]
         out = nn.Dense(grouped.shape[-1])(nn.RMSNorm(epsilon=RMS_EPSILON)(spatial_out))
         return out.reshape(noisy.shape)
@@ -310,9 +336,17 @@ type Predictor = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 
 def shortcut_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau: jax.Array, d: jax.Array,
                           d_min: float) -> jax.Array:
-    """Eqs. 6-8: each frame's loss `[B, T]`, its x-prediction's squared error at the smallest step and
-    else its velocity's against the average of its own two half steps, held still and scaled back to
-    x-space by (1 - tau)^2, every frame weighted by the ramp."""
+    """Eqs. 6-8: each frame's loss `[B, T]`, its x-prediction's squared error at every step size, and past
+    the smallest its velocity's against the average of its own two half steps, held still and scaled back
+    to x-space by (1 - tau)^2, every frame weighted by the ramp.
+
+    Eq. 7 takes the x-prediction's error at the smallest step alone. The bootstrap's half steps advance
+    every frame, the context a frame reads among them (Eq. 7's vector form), and a predictor that ignores
+    its data, one constant, is consistent across its own half steps, so its bootstrap error is zero: with
+    the x-prediction's error on a seventh of the frames (`K_max` 64), the dynamics trained on still clips
+    forecast their next frame with 0.22 to 0.25 of the mean frame's error, where diffusion forcing leaves
+    0.048 (H100, 3,000 updates), and 0.184 against 0.025 at 12,000 (row 4802). Its error at every step
+    anchors each to the data: 0.055, and 0.025 at 12,000, the bootstrap kept for few-step sampling."""
     level = tau.reshape(*tau.shape, *(1,) * (clean.ndim - tau.ndim))
     step = d.reshape(level.shape)
     noisy = (1 - level) * noise + level * clean
@@ -326,7 +360,7 @@ def shortcut_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau:
     axes = tuple(range(tau.ndim, clean.ndim))
     smallest = jnp.sum(jnp.square(predicted - clean), axes)
     bootstrap = jnp.sum(jnp.square(1 - level) * jnp.square((predicted - noisy) / (1 - level) - target), axes)
-    return ramp(tau) * jnp.where(d <= d_min, smallest, bootstrap)
+    return ramp(tau) * (smallest + jnp.where(d <= d_min, 0.0, bootstrap))
 
 
 def diffusion_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau: jax.Array,
@@ -386,6 +420,9 @@ class WorldModelObjective(Objective[Ratio]):
     def latents(self, variables: Variables, video: jax.Array) -> jax.Array:
         """`video`'s latents, each frame encoded by the tokenizer `variables` hold (`TOKENIZER`)."""
         return jax.lax.stop_gradient(self.tokenizer.bind(variables[TOKENIZER]).encode(video))
+
+    traced = ("tokenizer", "shortcut")
+    """Its tokenizer and its forcing; both trees pass as arguments."""
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         clean = self.latents(variables, unit_frames(batch["video"]))

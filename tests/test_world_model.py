@@ -11,11 +11,12 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 from dew.objectives.world_model import Dynamics, shortcut_forcing_loss
 
 
-def test_shortcut_forcing_is_the_papers_bootstrap():
-    """Each frame's loss is its x-prediction's squared error where d is the smallest step, and else
+def test_shortcut_forcing_is_the_papers_bootstrap_beside_the_x_prediction_at_every_step():
+    """Each frame's loss is its x-prediction's squared error, and where d is past the smallest step
     (1 - tau)^2 times the squared error of its velocity against the mean of the two half-step
     velocities the predictor takes itself, every frame times 0.9 tau + 0.1, within float64 rounding
-    of Eq. 7 run in NumPy over a predictor with a closed form."""
+    of Eq. 7 run in NumPy over a predictor with a closed form, its x-prediction's error taken at every
+    step where Eq. 7 takes it at the smallest alone (`shortcut_forcing_loss`, row 4802)."""
     rng = np.random.default_rng(0)
     clean, noise = rng.normal(size=(3, 5, 4, 2)), rng.normal(size=(3, 5, 4, 2))
     d = 1 / 2.0 ** rng.integers(0, 4, (3, 5))
@@ -40,18 +41,42 @@ def test_shortcut_forcing_is_the_papers_bootstrap():
             noisy = (1 - level) * z0 + level * z1
             one = np.asarray([[level]]), np.asarray([[step]])
             predicted = f(noisy[None, None], *one)[0, 0]
-            if step <= 1 / 8:
-                loss = np.sum((predicted - z1) ** 2)
-            else:
+            loss = np.sum((predicted - z1) ** 2)
+            if step > 1 / 8:
                 half = np.asarray([[step / 2]])
                 first = (f(noisy[None, None], one[0], half)[0, 0] - noisy) / (1 - level)
                 between = noisy + first * step / 2
                 later = f(between[None, None], one[0] + step / 2, half)[0, 0]
                 second = (later - between) / (1 - level - step / 2)
                 velocity = (predicted - noisy) / (1 - level)
-                loss = (1 - level) ** 2 * np.sum((velocity - (first + second) / 2) ** 2)
+                loss += (1 - level) ** 2 * np.sum((velocity - (first + second) / 2) ** 2)
             expected[b, t] = (0.9 * level + 0.1) * loss
     assert_computes_the_oracle(found, expected, "shortcut forcing", roundings=roundings)
+
+
+def test_a_predictor_that_ignores_its_data_is_charged_at_every_step_size():
+    """A predictor that ignores its data, one constant, is consistent across its own half steps, so
+    shortcut forcing's bootstrap charges it nothing past the smallest step: each frame's loss is still its
+    x-prediction's error under the ramp, at every step size, so no step trains toward it (row 4802: the
+    dynamics trained on still clips forecast with 4.6 times diffusion forcing's error where Eq. 7 charged
+    the x-prediction at the smallest step alone)."""
+    rng = np.random.default_rng(1)
+    clean, noise = rng.normal(size=(2, 7, 4, 2)), rng.normal(size=(2, 7, 4, 2))
+    d = np.broadcast_to(1 / 2.0 ** np.arange(7), (2, 7))
+    tau = np.floor(rng.uniform(size=(2, 7)) / d) * d
+    constant = rng.normal(size=(4, 2))
+
+    def ignoring(noisy, tau, d):
+        return jnp.broadcast_to(constant, noisy.shape)
+
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(shortcut_forcing_loss(ignoring, clean, noise, tau, d, 1 / 64))
+        roundings = chain_roundings(jax.make_jaxpr(
+            lambda *a: shortcut_forcing_loss(ignoring, *a, 1 / 64))(clean, noise, tau, d))
+    charged = (0.9 * tau + 0.1) * np.sum((constant - clean) ** 2, axis=(-2, -1))
+    assert_computes_the_oracle(found, charged, "an ignoring predictor's shortcut forcing",
+                               roundings=roundings)
+    assert (charged > 0).all()
 
 
 def test_step_sizes_are_powers_of_two_and_levels_lie_on_their_grid():
@@ -320,3 +345,66 @@ def test_a_world_models_tokenizer_rides_in_its_state_and_its_loss_reads_it_there
     held, _ = objective.loss(variables, {"video": video}, step)
     swapped, _ = objective.loss({**variables, TOKENIZER: other}, {"video": video}, step)
     assert float(held.total) != float(swapped.total)
+
+
+SHIFT_UNITS = 32
+"""The held-out clips a dynamics model's forecast is judged over, a unit a clip."""
+
+
+def test_a_dynamics_model_reads_its_context_to_forecast_the_shifting_latents_it_trained_on():
+    """A dynamics model trained by diffusion forcing on clips whose latents shift a place each frame (each
+    clip's first frame drawn from a unit normal, every frame after it the one before rolled along its
+    latents, 1,024 clips of 4 frames) for 1,000 updates of 32 clips predicts held-out clips' last frame
+    from pure noise, its three before it near clean at the finest step, within half the mean frame's
+    error, judged by the learning gate, a unit a clip: its tokens know their frame and place by
+    rotary positions (Dreamer 4's, `Dynamics.positions`). By learned vectors started at 0.02 the same
+    model erred 0.71 against the mean frame's 0.84, no better than it does from a context of noise
+    (row 4802: tutorial 12's dynamics forecast no ball over a tokenizer that reconstructed it); rotary,
+    0.19."""
+    import optax
+
+    from dew.objectives.world_model import diffusion_forcing_loss
+
+    def clips(rows, seed):
+        first = np.random.default_rng(seed).normal(size=(rows, 1, 4, 4)).astype(np.float32)
+        return np.concatenate([np.roll(first, shift, axis=2) for shift in range(4)], axis=1)
+
+    model = Dynamics(latents=4, bottleneck=4, spatial=4, width=32, depth=2, heads=2, levels=4, frames=4)
+    trained, held = clips(1024, 0), clips(SHIFT_UNITS, 1)
+    d_min = 1.0 / model.k_max
+
+    def loss(params, clean, key):
+        level_key, noise_key = jax.random.split(key)
+        tau = jnp.floor(jax.random.uniform(level_key, clean.shape[:2]) / d_min) * d_min
+        noise = jax.random.normal(noise_key, clean.shape)
+
+        def f(noisy, tau, d):
+            return model.apply(params, noisy, tau, d)
+        return jnp.mean(diffusion_forcing_loss(f, clean, noise, tau, d_min))
+
+    params = model.init(jax.random.key(0), jnp.asarray(trained[:1]), jnp.ones((1, 4)), jnp.ones((1, 4)))
+    optimizer = optax.adam(1e-3)
+
+    @jax.jit
+    def update(params, state, clean, key):
+        gradient = jax.grad(loss)(params, clean, key)
+        changes, state = optimizer.update(gradient, state, params)
+        return optax.apply_updates(params, changes), state
+
+    state = optimizer.init(params)
+    for step in range(1000):
+        start = 32 * step % 1024
+        batch = jnp.asarray(trained[start:start + 32])
+        params, state = update(params, state, batch, jax.random.key(step + 1))
+
+    clean = jnp.asarray(held)
+    noise = jax.random.normal(jax.random.key(9), clean.shape)
+    level = 1 - d_min
+    tau = jnp.concatenate([jnp.full((SHIFT_UNITS, 3), level), jnp.zeros((SHIFT_UNITS, 1))], 1)
+    noisy = jnp.concatenate([level * clean[:, :3] + (1 - level) * noise[:, :3], noise[:, 3:]], 1)
+    predicted = np.asarray(model.apply(params, noisy, tau, jnp.full((SHIFT_UNITS, 4), d_min)))[:, 3]
+    last = held[:, 3]
+    missed = np.mean(np.square(predicted - last), (1, 2))
+    contrasts = {"errs within half the mean frame's error": np.mean(np.square(last), (1, 2)) / 2 - missed}
+    assert_learns(lambda units: {claim: values[units] for claim, values in contrasts.items()},
+                  "a dynamics model's shifting latents", units=SHIFT_UNITS)

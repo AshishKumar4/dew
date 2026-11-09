@@ -213,12 +213,17 @@ DESCRIBE = {"op": "describe", "repo": "model", "revision": "pinned"}
 
 def connected(path, payload):
     """A guest's connection to the service at `path` carrying `payload`, and its lines."""
-    import json
     import socket
 
     client = socket.socket(socket.AF_UNIX)
     client.connect(str(path))
-    client.sendall(json.dumps(payload).encode() + b"\n")
+    return sent(client, payload)
+
+
+def sent(client, payload):
+    """`payload` sent on a guest's connected `client` by the site's own client (`model_client.sent`), and its
+    lines."""
+    load("model_client", "site/live/container").sent(client, payload)
     return client, client.makefile()
 
 
@@ -266,6 +271,29 @@ class Holding:
                 return super().forward(variables, rows)
 
         return Held(**{field.name: getattr(scoring, field.name) for field in dataclasses.fields(scoring)})
+
+
+def test_a_guest_refused_before_it_sends_hears_why(service, tmp_path):
+    """The service refuses a guest as it accepts its connection, writing why and closing it before reading
+    its request: a guest's client that sends after that close still reads the refusal, as the site's own
+    client (model_client.request) does (row 5334: a refusal written and closed before the test's guest sent
+    its request broke its send, the run's one red, at train 758)."""
+    import socket
+
+    path = tmp_path / "model.sock"
+    shared = service.ModelService(path, None, uids=())
+    try:
+        refused, later = socket.socket(socket.AF_UNIX), socket.socket(socket.AF_UNIX)
+        with refused, later:
+            refused.connect(str(path))
+            later.connect(str(path))
+            # The service accepts one connection at a time: once the later one's refusal has ended, the
+            # first's was written and its connection closed, and its guest has sent nothing yet.
+            assert later.makefile().read().count("\n") == 1
+            _, lines = sent(refused, DESCRIBE)
+            assert reply(lines)["error"]["name"] == "PermissionError"
+    finally:
+        shared.server_close()
 
 
 def test_a_guest_whose_request_outlasts_its_connection_stays_admitted_until_the_engine_settles_it(
