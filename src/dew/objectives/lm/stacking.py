@@ -16,8 +16,9 @@ read each level at the version its window opened with. A window's gradient in it
 its chunks of each chunk's loss's gradient there, the cache holding the chunks before it fixed: dynamic
 evaluation's segment gradient, a chunk its segment. A level's window counts the row's slots, its padding
 among them, as its cache reads them. Each chunk reads the row's layout (`Coordinates`) at its own slots,
-its places, validity and documents as the caller gave them; the decode cache keeps no document ids, so a
-packed row of several documents is refused there (`CausalTransformer`'s own refusal): one document a row.
+its places, validity and documents as the caller gave them. A row's levels are one level a row, every
+token reading its window's version, so a row of several documents, whose later document's windows would
+read the levels stepped by an earlier one's tokens, is refused: one document a row.
 A row whose attention reads its blocks whole (a prefix run's, `block_groups`) reads each block in one call,
 as a server's prefill reads a prompt's: a chunk's end that falls inside a block moves to the block's end
 (`_chunk_bounds`), so the chunk the block starts in reads it whole before the cache holds it, at that
@@ -76,10 +77,16 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
     names = tuple(starts)
     steps = {name: _stepped_mask(starts[name], adaptation) for name in names}
     rows, length = targets.shape
+    laid = field_coordinates(fields, (rows, length))
+    if laid is not None and laid.max_segments > 1:
+        raise ValueError(f"a decoder stepping its own blocks steps one level a row, which a row of up to "
+                         f"{laid.max_segments} documents would step by an earlier document's tokens for a "
+                         f"later one's windows, where that document's own pass reads none of them: lay "
+                         f"one document a row")
     chunks = -(-length // chunk)
     padded = chunks * chunk
     cache = model.apply(variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
-    layout = _padded_layout(field_coordinates(fields, (rows, length)), rows, length, padded)
+    layout = _padded_layout(laid, rows, length, padded)
     blocks = fields.get(BLOCKS_FIELD)
     if blocks is not None:
         blocks = jnp.pad(jnp.asarray(blocks, jnp.int32), ((0, 0), (0, padded - length)), constant_values=-1)

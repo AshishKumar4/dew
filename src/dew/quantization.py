@@ -1628,7 +1628,17 @@ def _providers() -> tuple[type, type]:
     (`_scaled_in_float32`)."""
 
     class QtProvider(_group_scaled_convolution(), _complex_in_float(), _grouped_convolution_gradient()):
-        pass
+        def ragged_dot(self, lhs, rhs, group_sizes, precision=None, preferred_element_type=None,
+                       group_offset=None, *, out_sharding=None):
+            # Qwix 0.1.8's takes no output sharding (qwix/_src/providers/qt.py:201-208), which a ragged
+            # product on a mesh with Explicit axes names (`grouped_matmul.ragged_placement`): a product no
+            # rule quantizes passes it to JAX's own, and a quantized one is constrained to it.
+            if not self._matched("ragged_dot"):
+                return jax.lax.ragged_dot(lhs, rhs, group_sizes, precision=precision,
+                                          preferred_element_type=preferred_element_type,
+                                          group_offset=group_offset, out_sharding=out_sharding)
+            out = super().ragged_dot(lhs, rhs, group_sizes, precision, preferred_element_type, group_offset)
+            return _honoured(out, None, out_sharding)
 
     return QtProvider, _serving_provider()
 
