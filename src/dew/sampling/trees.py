@@ -110,6 +110,8 @@ class TreeDraft(NamedTuple):
 
 class DraftTree(Protocol):
     """`DecodeOps.draft_tree`: a tree of `shape`'s nodes after each row's `root` token `[rows]`, drawn with
-    the rows' `keys` where it samples (`TreeDraft`)."""
+    the rows' `keys` where it samples (`TreeDraft`), the root at coordinate `base` `[rows]` and each node
+    its depth past it."""
 
-    def __call__(self, state, root: jax.Array, shape: TreeShape, keys: jax.Array, /) -> TreeDraft: ...
+    def __call__(self, state, root: jax.Array, shape: TreeShape, keys: jax.Array, base: jax.Array,
+                 /) -> TreeDraft: ...
