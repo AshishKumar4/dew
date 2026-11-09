@@ -11,10 +11,11 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, with_gradients
 from test_mixers import tiny
-from test_recurrence_chunk import hosted, sigmoid, softplus
+from test_recurrence_chunk import hosted, marked, sigmoid, softplus
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
 from dew.nn.mixers.mamba3 import Carried, chunk_mamba3, recurrent_mamba3, step_mamba3
+from dew.nn.scatter import gather_positions
 from dew.registry import mixers
 
 ROWS, LENGTH, GROUPS, HEADS, WIDTH, STATE = 2, 70, 1, 2, 8, 16
@@ -47,11 +48,8 @@ MIMO_DECODER_SEEDS = {"mamba3 mimo raw": 16, "mamba3 mimo policy": 16}
 
 
 def marks(documents):
-    """Each row's `documents` as the `[ROWS, LENGTH]` marks of each document's first token."""
-    starts = np.zeros((ROWS, LENGTH), bool)
-    for row, firsts in enumerate(documents):
-        starts[row, list(firsts)] = True
-    return starts
+    """Each row's `documents` as the `[ROWS, LENGTH]` marks of each document's first token (`marked`)."""
+    return marked(documents, LENGTH)
 
 
 def draw(rank: int, seed: int):
@@ -122,11 +120,9 @@ def compacted(x, dt, A, B, C, lam, theta, state):
     documents' starts with them."""
     kept = real_tokens()
 
-    def taken(t):
-        return jnp.take_along_axis(t, kept.reshape(*kept.shape, *(1,) * (t.ndim - 2)), axis=1)
-
     starts = np.take_along_axis(marks(CONTINUED), kept, axis=1)
-    return recurrent_mamba3(*(taken(t) for t in (x, dt, A, B, C, lam, theta)), state, starts=starts)
+    return recurrent_mamba3(*(gather_positions(t, kept) for t in (x, dt, A, B, C, lam, theta)), state,
+                            starts=starts)
 
 
 @pytest.mark.parametrize('rank', RANKS)

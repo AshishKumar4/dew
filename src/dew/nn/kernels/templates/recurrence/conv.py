@@ -120,6 +120,7 @@ class _Piece:
         self.row, self.length, self.count = lax.axis_index("rows"), length, count
         self.start = lax.axis_index("tokens") * tokens
         self.local, self.columns = pl.ds(local, lanes_), pl.ds(first + local, lanes_)
+        self.lanes = lanes_
         layout = scan.blocked(lanes_)
         self.taps = [plgpu.load(self.w_ref.at[tap, self.columns], layout=layout, optimized=False)
                      .astype(jnp.float32) for tap in range(count)]
@@ -273,12 +274,12 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
     dx_ref, dw_ref, db_ref = outs
     count, length = piece.count, piece.length
     block = lax.axis_index("tokens")
-    zero = jnp.zeros((piece.columns.size,), jnp.float32)
-    group = _group(head, piece.columns.size)
+    zero = jnp.zeros((piece.lanes,), jnp.float32)
+    group = _group(head, piece.lanes)
     # The walk's tokens a whole number of turns: those past the block's last K-1 add only to tokens no
     # program here owns. A turn's tokens hold their inputs and output gradients a vector each, so fewer a
     # wider vector: eight tokens of eight channels spilled 2140 bytes a thread (the conv's resource gate).
-    unrolled = min(UNROLLED, 2 * UNROLLED // (piece.columns.size // scan.THREADS))
+    unrolled = min(UNROLLED, 2 * UNROLLED // (piece.lanes // scan.THREADS))
     steps = -(-(tokens + count - 1) // unrolled) * unrolled
     last = piece.start + steps - 1
 

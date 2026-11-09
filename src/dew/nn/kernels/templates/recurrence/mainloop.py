@@ -82,7 +82,9 @@ def issued(dtype=jnp.bfloat16) -> tuple[mosaic.Family, bool]:
     family = family_of(dtype)
     if family is not None and generation.backend() == 'gpu':
         return family, False
-    return bundles.of(generation.interpreted_target().generation, bundle_dtype(dtype), scoped=True), True
+    interpreted = bundles.of(generation.interpreted_target().generation, bundle_dtype(dtype), scoped=True)
+    assert interpreted is not None, "the interpreted target's generation has a bundle for every dtype"
+    return interpreted, True
 
 def value_unit(family: mosaic.Family) -> int:
     """The values' padded width's step on `family`'s bundle: a staged operand's narrowest block of 16-bit
