@@ -20,6 +20,7 @@ from jax.typing import DTypeLike
 from dew import _records
 from dew.batch import Variables, unboxed
 from dew.interop.weights import AUTO
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import Numerics
 from dew.nn.protocols import Bounded, ComputesIn
 from dew.registry import DtypeName, dtype_name, from_record, to_record
@@ -52,10 +53,11 @@ def capacity(model: nn.Module) -> dict[str, int]:
     return {} if held is None else {"max_seq_len": held}
 
 
-ROUNDING = ("scale_after_cast", "force_fp32_for_softmax")
+ROUNDING = tuple(field.name for field in dataclasses.fields(CausalTransformer)
+                 if field.metadata.get(_records.ROUNDS))
 """A model's fields that order its rounding (a norm's scale against its cast to the compute dtype, a softmax's
-width), which no family's config states and which change what it computes below float32 alone
-(`dew.interop.hf_decoders._RUNTIME_FIELDS`)."""
+width), which no family's config states and which change what it computes below float32 alone: the
+decoder's that say so (`dew._records.ROUNDS`), by name in any model that declares them."""
 
 
 def rounding(model: nn.Module) -> dict[str, bool]:

@@ -95,7 +95,7 @@ from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.gemma3n import AltUp
-from dew.registry import from_record, towers
+from dew.registry import constructor_fields, from_record, towers
 
 if TYPE_CHECKING:
     from dew.nn.multimodal import MultimodalTransformer
@@ -1498,21 +1498,11 @@ def export_config(model) -> Mapping[str, object]:
     return written
 
 
-NUMERICS_FIELDS = frozenset({'dtype', 'precision'})
-"""A module's fields that say in what numbers it computes, not what: a decoder's, and every part of a
-wrapper's (its towers, projections), which no export's config reads back as fields."""
-
-_RUNTIME_FIELDS = NUMERICS_FIELDS | frozenset({
-    'parent', 'name', 'force_fp32_for_softmax', 'attention_impl', 'kv_cache', 'remat',
-    'scan_layers', 'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
-    'initializer_range', 'depth_scaled_init', 'max_seq_len', 'mask_token_id', 'layer_scalar',
-    'scale_after_cast'})
-"""CausalTransformer fields that say how a model runs or trains, not what it
-computes: precision and kernels, dropout, and the initialization a loaded
-model's weights replace. `layer_scalar` is whether Gemma 4's scalars train;
-either way the forward multiplies by them. `scale_after_cast` orders a
-norm's scale and its cast to the compute dtype, which are the same product
-in fp32."""
+NUMERICS_FIELDS = frozenset(field.name for field in dataclasses.fields(CausalTransformer)
+                            if field.metadata.get(_records.NUMBERS))
+"""A module's fields that say in what numbers it computes, not what (`dew._records.NUMBERS`): a
+decoder's, and every part of a wrapper's (its towers, projections), which no export's config reads back
+as fields."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     "num_kv_heads": lambda model: model.kv_heads,
@@ -1559,8 +1549,10 @@ def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_t
     """Refuse a decoder whose written config reads back as `rebuilt`, another computation than `model`,
     naming the fields that differ."""
     lost: dict[str, tuple[str, str]] = {}
-    for declared in dataclasses.fields(model):
-        if declared.name in _RUNTIME_FIELDS:
+    # A Flax module's place in its tree aside (`constructor_fields`), and every field that says how the model
+    # runs, not what it computes (`dew._records.RUNS`).
+    for declared in constructor_fields(type(model)):
+        if declared.metadata.get(_records.RUNS):
             continue
         resolve = _RESOLVED.get(declared.name, operator.attrgetter(declared.name))
         ours, theirs = resolve(model), resolve(rebuilt)
