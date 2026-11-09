@@ -880,10 +880,14 @@ def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
                     record: decoder_parts.DecoderFields, variables: Variables, label: str) -> int:
     """Dew's float32 gradient of every parameter on par with the source's from its float64 twin's
     (`_judged`), over the probe's draws of ids and cotangents, every parameter's gradient laid end to end
-    as one leaf: a backward the forward does not show moves some parameter's gradient by a share of its
-    value, which no other's rounding hides, where a parameter's own leaf holds too few values a draw for
-    check 1 to size (a learned activation's scalars, an embedding's rows a few tokens touch, a norm's
-    scale). The source's eval-mode gradients,
+    as one leaf, each in units of its own size (its float64 gradient's RMS on the draw): a backward the
+    forward does not show moves some parameter's gradient by a share of its value, which no other's
+    rounding hides, where a parameter's own leaf holds too few values a draw for check 1 to size (a
+    learned activation's scalars, an embedding's rows a few tokens touch, a norm's scale). Unscaled, the
+    few largest gradients (an embedding's rows) set each draw's error, and its ratio spreads with them: a
+    routed decoder of mixed parts' draws' log ratios spread 0.39 over 64 draws of 128 x 4 tokens (0.36 of
+    512 x 4), at the 0.4 the tail test sees at, and check 1 resolved it within no 512 seeds; scaled,
+    0.28. The source's eval-mode gradients,
     its float32 ones and its twin's, are stored as `save_pretrained` stores its weights (`_as_stored`) and
     read into Dew's tree as they are (`translate_weights`; a gradient rearranges as its parameter does)."""
     model = models.build('causal_transformer', {**record, 'dtype': 'float32', 'attention_impl': 'reference'})
@@ -915,7 +919,10 @@ def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
                     flax_traverse.flatten_dict(compiled(held['params'], ids, cotangent)).items()}
         if set(ours) != set(reference):
             raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(reference))[:4]} apart")
-        return tuple(np.concatenate([tree[path].ravel() for path in sorted(ours)])
+        # Each parameter in units of its truth's RMS, so no parameter's size outweighs another's.
+        sizes = {path: max(float(np.sqrt(np.mean(truth[path] ** 2))), np.finfo(np.float64).tiny)
+                 for path in ours}
+        return tuple(np.concatenate([tree[path].ravel() / sizes[path] for path in sorted(ours)])
                      for tree in (ours, reference, truth))
 
     return _judged(draw, label)
