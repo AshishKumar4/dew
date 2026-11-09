@@ -57,7 +57,7 @@ from tiny_configs import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Loader, replayed
-from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
+from dew.data.preferences import pair_windows
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, MarkerLayout, Specials, StateFirstLayout
@@ -600,20 +600,22 @@ def lm(family: Family, directory: Path) -> None:
                    batch)
 
 
-def preference_batch() -> dict:
-    """Chosen and rejected completions of one prompt per row."""
+def preference_batch(segments: int | None = None) -> dict:
+    """Chosen and rejected completions of one prompt per row, packed as `segments` lets a window hold."""
     ids = np.stack([token_batch(SEQ + 1, seed=1), token_batch(SEQ + 1, seed=2)], axis=1)
     ids[:, 1, :SEQ // 2] = ids[:, 0, :SEQ // 2]
     mask = np.zeros(ids.shape, np.int32)
     mask[:, :, SEQ // 2:] = 1
-    return {PAIR_IDS_KEY: ids, PAIR_MASK_KEY: mask}
+    return pair_windows(ids, mask, segments=segments, count=ids.shape[0] * (2 if segments == 1 else 1))
 
 
 def dpo(family: Family, directory: Path) -> None:
     """Preference pairs against the frozen starting policy."""
     held = loaded(family)
-    objective = DPOObjective(held.model, SEQ, variables=held.variables)
-    trained = assert_trains(objective, preference_batch(), directory)
+    # A backbone that reads one document a row (no packing) holds one half a window (`segments`).
+    segments = None if PACKING in family.facts else 1
+    objective = DPOObjective(held.model, SEQ, variables=held.variables, segments=segments)
+    trained = assert_trains(objective, preference_batch(segments), directory)
     assert trained.state.ema is not None, "the reference policy is the frozen average"
 
 

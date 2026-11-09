@@ -70,15 +70,15 @@ from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.linear import (
     DepthwiseConv1d,
-    call_tree,
     decode_kernel,
     decode_step,
-    entered_scan,
+    fork_cache,
+    forked_conv,
+    forked_scan,
     fused_token,
     held_scan,
     over_sequence,
     sequence_conv,
-    tree_scan,
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
@@ -240,12 +240,11 @@ class Mamba2(nn.Module):
     (`recurrence_algebra.entering`); decoding and padded rows are refused there.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"entered", "tree_parents", "key_runs", "key_positions"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that enter another, each read
-    from the state and the conv history the one it enters ends with (`dew.nn.linear.entered_scan`), and a
-    tree's, with the key runs and positions of its attention beside it (`dew.nn.linear.call_tree`): on a tree
-    each token's path (`tree_scan`); no mask or bias, which a recurrence reading every earlier token of its
-    document has no way to narrow."""
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that continue another
+    (`dew.batch.Forks`), each read from the state and the conv history its parent leaves
+    (`dew.nn.linear.forked_conv`, `forked_scan`); no mask, runs or bias, which a recurrence reading every
+    earlier token of its document has no way to narrow."""
 
     emb_features: int
     num_heads: int
@@ -394,29 +393,20 @@ class Mamba2(nn.Module):
             state_size=self.state_size, chunk_size=self.chunk_size,
             time_step_limit=self.time_step_limit)
         shards = sequence_shards()
-        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
-        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
-        if tree is not None or tokens.entered is not None:
-            if tree is not None:
-                def rule(convolved, step, held):
-                    return scan(convolved, dt=step, heads=heads, held=held)
+        if tokens.forks is not None:
+            if shards > 1:
+                raise LayoutRefused("documents that continue another are read whole in their rows; a "
+                                    "sequence axis splits them")
 
-                out = tree_scan(self, mixed, taps, bias, tree, rule, (dt,), valid=valid, state_dtype=wide,
-                                dtype=compute)
-            else:
-                if decode or shards > 1:
-                    raise LayoutRefused("documents that enter another are read whole in their rows by a "
-                                        "training or scoring call; a decode step or a sequence axis splits "
-                                        "them")
+            def forked_rule(convolved, *, valid, starts, state, entered):
+                return scan(convolved, dt, heads, starts=starts, valid=valid, held=state, entered=entered)
 
-                def entered_rule(convolved, *, valid, starts, state, entered):
-                    return scan(convolved, dt, heads, starts=starts, valid=valid, held=state, entered=entered)
-
-                out = entered_scan(mixed, taps, bias, entered_rule, tokens,
-                                   (self.num_heads, self.state_size, self.head_dim), dtype=compute,
-                                   state_dtype=wide)
-                if valid is not None:
-                    out = jnp.where(valid[:, :, None], out, 0)
+            history, held = fork_cache(self, 'ssm_state') if decode else (None, None)
+            convolved = forked_conv(mixed, taps, tokens, history=history, bias=bias, dtype=compute)
+            out = forked_scan(convolved, forked_rule, tokens,
+                              (self.num_heads, self.state_size, self.head_dim), held=held, state_dtype=wide)
+            if valid is not None:
+                out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self._gated(out, gate))
         if shards > 1:
             if decode:
@@ -527,6 +517,8 @@ class Mamba2Mixer(MixerBase):
     """
 
     residuals = ('context', 'scan', 'conv')
+    # Each document from the state and conv history its parent leaves (`dew.nn.linear.forked_scan`).
+    reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
     packed_cache = True
     draws_init_std = True

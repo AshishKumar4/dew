@@ -45,7 +45,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import recurrence_algebra, recurrence_chunk
-from dew.nn.linear import DepthwiseConv1d, call_tree, held_scan, tree_scan
+from dew.nn.linear import DepthwiseConv1d, fork_cache, forked_conv, forked_scan, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
@@ -111,9 +111,10 @@ class Mamba(nn.Module):
     (`segment_ids`) run as if alone.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
-    of its attention beside it (`dew.nn.linear.call_tree`): on a tree each token's path (`tree_scan`)."""
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that continue another
+    (`dew.batch.Forks`), each from the state and the conv history its parent leaves
+    (`dew.nn.linear.forked_conv`, `forked_scan`)."""
 
     emb_features: int
     intermediate_size: int
@@ -202,14 +203,14 @@ class Mamba(nn.Module):
         # casts them, or in the model's own dtype where it is wider.
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
-        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
-        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
-        if tree is not None:
-            def rule(convolved, held):
-                return self._scan(convolved, starts=None, valid=None, held=held)
+        if tokens.forks is not None:
+            def forked_rule(convolved, *, valid, starts, state, entered):
+                return self._scan(convolved, starts=starts, valid=valid, held=state, entered=entered)
 
-            out = tree_scan(self, mixed, taps, bias, tree, rule, (), valid=valid, state_dtype=wide,
-                            dtype=wide)
+            history, held = fork_cache(self, 'ssm_state') if decode else (None, None)
+            convolved = forked_conv(mixed, taps, tokens, history=history, bias=bias, dtype=wide)
+            out = forked_scan(convolved, forked_rule, tokens, (self.intermediate_size, self.state_size),
+                              held=held, state_dtype=wide)
         else:
             out = held_scan(self, mixed, taps, bias, self._scan,
                             (self.intermediate_size, self.state_size),
@@ -223,11 +224,12 @@ class Mamba(nn.Module):
         gated = out * nn.silu(gate.astype(wide))
         return self.out_proj(gated.astype(gate.dtype))
 
-    def _scan(self, convolved, *, starts, valid, held):
+    def _scan(self, convolved, *, starts, valid, held, entered=None):
         """The selective scan of the convolved `[B, S, D]` inner channels:
         the raw step, B and C from `x_proj`, then the step through
         `dt_proj`. Returns `[B, S, D]` before the gate and the state leaving
-        it."""
+        it; with `entered`, each of `starts`' documents from its own slot of
+        `held` and each one's final state (`recurrence_chunk.selective_scan`)."""
         xs = convolved
         if valid is not None:
             xs = jnp.where(valid[:, :, None], xs, 0)
@@ -243,7 +245,7 @@ class Mamba(nn.Module):
         # The scan on the kernel its selector gives each product (`recurrence_chunk.SELECTIVE`).
         return recurrence_chunk.selective_scan(
             xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C, jnp.asarray(self.D, wide), held, starts,
-            portable=functools.partial(selective_scan, chunk_size=self.chunk_size))
+            portable=functools.partial(selective_scan, chunk_size=self.chunk_size), entered=entered)
 
 
 class _StepProjection(nn.Module):
@@ -298,6 +300,8 @@ class MambaMixer(MixerBase):
     """
 
     residuals = ('context', 'scan', 'conv')
+    # Each document from the state and conv history its parent leaves (`dew.nn.linear.forked_scan`).
+    reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
     packed_cache = True
 

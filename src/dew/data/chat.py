@@ -45,6 +45,7 @@ from jinja2 import TemplateError
 from dew._records import JSON
 from dew.data.facts import unshaped
 from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
+from dew.data.tokens import common_prefix
 
 if TYPE_CHECKING:
     from transformers import BatchEncoding, PreTrainedTokenizerBase
@@ -503,16 +504,6 @@ def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation
                       generation_prompt=True, where=where, thinking=thinking)
 
 
-def _agreement(rendered: Sequence[int], full: Sequence[int]) -> int:
-    """How many leading ids `rendered` shares with `full`."""
-    count = 0
-    for mine, theirs in zip(rendered, full, strict=False):
-        if mine != theirs:
-            break
-        count += 1
-    return count
-
-
 def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
                         where: str) -> tuple[np.ndarray, np.ndarray]:
     """Token ids and per-token roles for one conversation.
@@ -594,7 +585,7 @@ def _turn_end(full: Sequence[int], following: Sequence[int], agreed: int, role: 
     render stops agreeing with the whole conversation. A turn that rewrites
     an earlier turn's tokens, or renders to none of its own, fails here.
     """
-    end = _agreement(following, full)
+    end = common_prefix(following, full)
     if end < agreed:
         raise ValueError(
             f"tokenizer {where!r} rewrites message {index - 1}'s tokens when "

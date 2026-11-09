@@ -81,6 +81,13 @@ trainer's transaction reads it for the examples' draws (`Step.example_index`) an
 batch the objective sees."""
 
 
+UNIT_ROWS = "unit_rows"
+"""A batch's column of each row's unit, int32: rows one loss term reads together, a preference pair whose
+halves stand a window each (`dew.data.preferences`, `segments=1`). Whatever cuts the batch's rows into
+parts, a step's microbatches and its devices' shares (`dew.training.planning.splits`), keeps each unit's
+rows in one part."""
+
+
 EXAMPLES_CONSUMED = "examples_consumed"
 """A training batch's column of the source examples each row is the last of, int32, in a run bounded in
 examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
@@ -163,46 +170,164 @@ def token_ids(values: object, *, where: str) -> list[int]:
 
 
 @struct.dataclass
-class Entered:
-    """Packed documents of which some continue another (row 1506): `documents` `[B, S]` numbers each
-    token's document within its row from 1 (0 on padding), and `entered` `[B, D]` the document each enters,
-    by its number, 0 for none, each entered one whole before it. A document that enters another reads it
-    as if it were its own beginning, and no other: attention its keys (`runs`), a recurrence its final
-    memory and a conv its last tokens (`dew.nn.linear.entered_conv1d`). A request's questions over one
-    copy of its state (`dew.decision.shared_state`) are the documents that enter the state's."""
+class Forks:
+    """A row's documents of which some continue another: a forest of shared prefixes. `parents` `[B, D]`
+    is the document each of a row's documents continues, by its number in the row's `segments`
+    (`Coordinates.segments`, numbered from 1 in the row's order, 0 on padding), 0 for one that continues
+    the row's start: nothing in an uncached call, the row's cache in a cached one. `depth`, static, is the
+    longest chain of parents in the batch, 0 where no document continues another.
 
-    documents: jax.Array
-    entered: jax.Array
+    A document that continues another reads its whole chain of ancestors as its own beginning, and no other
+    document: attention their keys (`runs`), a recurrent layer the state its parent's tokens leave and a
+    conv its parent's last tokens (`dew.nn.linear.forked_scan`), each token at the place its chain gives it
+    (`positions`). So a document computes what its own row of its ancestors and itself computes, and a
+    prefix that several continue is computed once: a request's questions over its state, a prompt's
+    completions, a speculative tree's candidates (each a document of one token). `dew.batch.ForkedRows`
+    packs rows that share prefixes into such documents."""
+
+    parents: jax.Array | np.ndarray
+    depth: int = struct.field(pytree_node=False, default=1)
 
     @property
     def count(self) -> int:
         """The documents a row may number, `D`."""
-        return self.entered.shape[1]
+        return self.parents.shape[1]
 
-    @property
-    def roots(self) -> jax.Array:
-        """`[B, S]` whether each token's document enters none (padding's 0 among them)."""
-        held = jnp.take_along_axis(self.entered, jnp.maximum(self.documents - 1, 0), axis=1)
-        return (self.documents > 0) & (held == 0)
+    def spans(self, segments, *, xp=jnp):
+        """Each document's first slot and the slot past its last `[B, D]`, `S` and `S` for one the row
+        holds none of: a document is a contiguous run of its row's slots."""
+        batch, length = segments.shape
+        slots = xp.broadcast_to(xp.arange(length, dtype=np.int32), (batch, length))
+        number = xp.maximum(xp.asarray(segments, np.int32) - 1, 0)
+        held = segments > 0
+        if xp is np:
+            first = np.full((batch, self.count), length, np.int32)
+            end = np.zeros((batch, self.count), np.int32)
+            rows = np.broadcast_to(np.arange(batch)[:, None], (batch, length))
+            np.minimum.at(first, (rows[held], number[held]), slots[held])
+            np.maximum.at(end, (rows[held], number[held]), slots[held] + 1)
+        else:
+            rows = jnp.arange(batch)[:, None]
+            first = jnp.full((batch, self.count), length, jnp.int32).at[rows, number].min(
+                jnp.where(held, slots, length))
+            end = jnp.zeros((batch, self.count), jnp.int32).at[rows, number].max(
+                jnp.where(held, slots + 1, 0))
+        return first, xp.where(end > 0, end, length)
 
-    def runs(self) -> jax.Array:
-        """Each token's key runs `[B, S, 2, 2]` (`AttentionMetadata.key_runs`): the document its document
-        enters, whole, and its own up to itself; an empty first run for one that enters none."""
-        batch, length = self.documents.shape
+    def ancestors(self, *, xp=jnp):
+        """Each document's ancestors `[B, D, depth]`: its parent, its parent's parent and so on, by number,
+        0 past its chain."""
+        parents = xp.asarray(self.parents, np.int32)
+        chain, above = [], parents
+        for _ in range(self.depth):
+            chain.append(above)
+            above = xp.where(above > 0, xp.take_along_axis(parents, xp.maximum(above - 1, 0), axis=1), 0)
+        if not chain:
+            return xp.zeros((*parents.shape, 0), np.int32)
+        return xp.stack(chain, axis=-1)
+
+    def levels(self, *, xp=jnp):
+        """Each document's level `[B, D]`: how many ancestors it continues, 0 for a root."""
+        return xp.sum(self.ancestors(xp=xp) > 0, axis=-1, dtype=np.int32)
+
+    def offsets(self, segments, valid=None, *, xp=jnp):
+        """Each document's place before its first token `[B, D]`: its ancestors' lengths summed, each its
+        real tokens (`valid` `[B, S]`, every one where None)."""
+        segments = xp.asarray(segments, np.int32)
+        batch = segments.shape[0]
+        real = (segments > 0) if valid is None else (segments > 0) & xp.asarray(valid, bool)
+        number = xp.maximum(segments - 1, 0)
+        if xp is np:
+            lengths = np.zeros((batch, self.count), np.int32)
+            rows = np.broadcast_to(np.arange(batch)[:, None], segments.shape)
+            np.add.at(lengths, (rows[real], number[real]), 1)
+        else:
+            lengths = jnp.zeros((batch, self.count), jnp.int32).at[jnp.arange(batch)[:, None], number].add(
+                real.astype(jnp.int32))
+        chain = self.ancestors(xp=xp)
+        taken = xp.take_along_axis(lengths[:, :, None], xp.maximum(chain - 1, 0).reshape(
+            chain.shape[0], -1, 1), axis=1).reshape(chain.shape)
+        return xp.sum(xp.where(chain > 0, taken, 0), axis=-1, dtype=np.int32)
+
+    def positions(self, segments, base=None, valid=None, *, xp=jnp):
+        """Each token's place `[B, S]`: `base` `[B]` (0 where None: an uncached call; a cached call's the
+        place of the row's next token), its document's ancestors' real tokens (`valid` `[B, S]`, every one
+        where None), and the real tokens before it in its document, as its own row of its ancestors and
+        itself counts it, a token a row does not hold taking no place; 0 on padding."""
+        segments = xp.asarray(segments, np.int32)
+        batch, length = segments.shape
+        real = (segments > 0) if valid is None else (segments > 0) & xp.asarray(valid, bool)
+        first, _ = self.spans(segments, xp=xp)
+        number = xp.maximum(segments - 1, 0)
+        before = xp.take_along_axis(self.offsets(segments, valid, xp=xp), number, axis=1)
+        counted = xp.cumsum(real.astype(np.int32), axis=1) - real.astype(np.int32)
+        start = xp.minimum(xp.take_along_axis(first, number, axis=1), length - 1)
+        opened = xp.take_along_axis(counted, start, axis=1)
+        shift = 0 if base is None else xp.asarray(base, np.int32).reshape(batch, 1)
+        places = before + counted - opened + shift
+        return xp.where(segments > 0, places, 0).astype(np.int32)
+
+    def predecessors(self, segments, *, xp=jnp):
+        """The slot whose output predicts each token `[B, S]`: the one before it in its document, its
+        parent's last for a document's first token, -1 for a root's first token and for padding, which no
+        token predicts. A next-token loss scores each token from its predecessor's state."""
+        segments = xp.asarray(segments, np.int32)
+        batch, length = segments.shape
+        first, end = self.spans(segments, xp=xp)
+        number = xp.maximum(segments - 1, 0)
+        slots = xp.broadcast_to(xp.arange(length, dtype=np.int32), (batch, length))
+        opening = slots == xp.take_along_axis(first, number, axis=1)
+        parent = xp.take_along_axis(xp.asarray(self.parents, np.int32), number, axis=1)
+        last = xp.take_along_axis(end, xp.maximum(parent - 1, 0), axis=1) - 1
+        before = xp.where(opening, xp.where(parent > 0, last, -1), slots - 1)
+        return xp.where(segments > 0, before, -1).astype(np.int32)
+
+    def runs(self, segments):
+        """Each token's key runs `[B, S, depth + 1, 2]` over the call's own slots
+        (`dew.nn.inputs.AttentionMetadata.key_runs`): its ancestors whole, its root's first, then its own
+        document up to itself, empty runs `(0, 0)` past a shallower chain; a padding slot reads itself
+        alone. A cached call's attention places them after the row's cache (`fork_runs`)."""
+        segments = jnp.asarray(segments, jnp.int32)
+        batch, length = segments.shape
+        first, end = self.spans(segments)
+        number = jnp.maximum(segments - 1, 0)
         slots = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-        rows = jnp.arange(batch)[:, None]
-        number = jnp.maximum(self.documents - 1, 0)
-        first = jnp.full((batch, self.count), length, jnp.int32).at[rows, number].min(
-            jnp.where(self.documents > 0, slots, length))
-        end = jnp.zeros((batch, self.count), jnp.int32).at[rows, number].max(
-            jnp.where(self.documents > 0, slots + 1, 0))
-        entered = jnp.take_along_axis(self.entered, number, axis=1)
-        before = jnp.maximum(entered - 1, 0)
-        reads = entered > 0
-        prior = jnp.stack([jnp.where(reads, jnp.take_along_axis(first, before, axis=1), 0),
-                           jnp.where(reads, jnp.take_along_axis(end, before, axis=1), 0)], axis=-1)
-        own = jnp.stack([jnp.take_along_axis(first, number, axis=1), slots + 1], axis=-1)
-        return jnp.stack([prior, own], axis=2)
+        # Each token's document's ancestors `[B, S, depth]`, nearest first.
+        chain = jnp.take_along_axis(self.ancestors(), number[:, :, None], axis=1)
+        level = jnp.sum(chain > 0, axis=-1)
+        runs = []
+        for index in range(self.depth + 1):
+            # Run `index` is the ancestor `level - index` above the token's document, its own at `level`.
+            distance = level - index
+            ancestor = jnp.take_along_axis(jnp.pad(chain, ((0, 0), (0, 0), (1, 0))),
+                                           jnp.clip(distance, 0, self.depth)[..., None], axis=-1)[..., 0]
+            lo = jnp.take_along_axis(first, jnp.maximum(ancestor - 1, 0), axis=1)
+            hi = jnp.take_along_axis(end, jnp.maximum(ancestor - 1, 0), axis=1)
+            own = distance == 0
+            lo = jnp.where(own, jnp.take_along_axis(first, number, axis=1), lo)
+            hi = jnp.where(own, slots + 1, hi)
+            kept = (distance >= 0) & (segments > 0)
+            pad = segments == 0
+            lo = jnp.where(kept, lo, jnp.where(pad & (index == 0), slots, 0))
+            hi = jnp.where(kept, hi, jnp.where(pad & (index == 0), slots + 1, 0))
+            runs.append(jnp.stack([lo, hi], axis=-1))
+        return jnp.stack(runs, axis=2).astype(jnp.int32)
+
+    @staticmethod
+    def depth_of(parents) -> int:
+        """The longest chain of `parents` `[B, D]` (host arrays), refusing a document that continues
+        itself through its chain: the static `depth` a `Forks` states."""
+        parents = np.asarray(parents, np.int64)
+        if parents.size and (parents.min() < 0 or parents.max() > parents.shape[1]):
+            raise ValueError(f"a document continues another of its row's {parents.shape[1]} by number, or 0 "
+                             f"for none, got {parents.min()} to {parents.max()}")
+        depth, above = 0, parents
+        while np.any(above > 0):
+            depth += 1
+            if depth > parents.shape[1]:
+                raise ValueError("a document's chain of parents returns to itself")
+            above = np.where(above > 0, np.take_along_axis(parents, np.maximum(above - 1, 0), axis=1), 0)
+        return depth
 
 
 @struct.dataclass
@@ -241,8 +366,8 @@ class Coordinates:
     valid: jax.Array | None = None
     starts: jax.Array | None = None
     firsts: jax.Array | None = None
-    entered: Entered | None = None
-    """Documents within its rows that continue another (`Entered`), None where none does."""
+    forks: Forks | None = None
+    """The documents within its rows that continue another (`Forks`), None where none does."""
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
 
@@ -254,13 +379,16 @@ class Coordinates:
         layout reads."""
         return {name: getattr(self, name) for name in self.TOKEN_ALIGNED if getattr(self, name) is not None}
 
-    def along_tokens(self, transform: Callable[[jax.Array], jax.Array]) -> Coordinates:
+    def along_tokens(self, transform: Callable[[jax.Array], jax.Array], *,
+                     prefix: bool = False) -> Coordinates:
         """`transform` applied along the tokens to each token-aligned field (`TOKEN_ALIGNED`): a slice or a
         rotation of the slots. The documents' firsts, which index the slots, are built again from the
-        moved starts (`document_firsts`), as every `Coordinates` builds them."""
-        if self.entered is not None:
-            raise ValueError("documents that enter another are read whole in their rows; a call that slices "
-                             "or rotates the rows' slots runs none")
+        moved starts (`document_firsts`), as every `Coordinates` builds them. `prefix` says the transform
+        keeps each row's first slots where they stand (a slice from slot 0), which keeps its forks'
+        documents in place, each at its places."""
+        if self.forks is not None and not prefix:
+            raise ValueError("documents that continue another are read whole in their rows; a call that "
+                             "slices or rotates the rows' slots runs none")
         moved = replace(self, **{name: transform(value) for name, value in self.tokens().items()})
         if moved.starts is None:
             return moved
@@ -585,6 +713,8 @@ def with_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
     rebuilt = coordinates(tuple(np.shape(given[0])[:2]), segments=segments, valid=valid, positions=positions,
                           max_segments=None if laid is None else laid.max_segments,
                           right_padded=laid is not None and laid.right_padded, xp=np if host else jnp)
+    if laid is not None and laid.forks is not None:
+        rebuilt = replace(rebuilt, forks=laid.forks)
     return {**rest, COORDINATES_FIELD: rebuilt}
 
 
@@ -626,7 +756,7 @@ def shifted_span(shape: tuple[int, ...], shift: int, *, valid=None, segments=Non
 
 
 def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
-                   roles=None, role: int | None = None, blocks=None):
+                   roles=None, role: int | None = None, blocks=None, forks: Forks | None = None):
     """Whether each target the loss scores at prediction `depth` counts, as
     `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
     geometry and the data's target counts, jax.numpy for the loss): the
@@ -637,9 +767,20 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     token, give the target that role. With `blocks`, each token's block (-1 none), a target in its state's
     block does not count. Blocks are contiguous runs (`AttentionMetadata.block_groups`), so this is exact
     for the trunk's targets (`depth` 0): a prediction depth reads blocks beyond its own source, so
-    `token_scores` refuses depths with blocks."""
+    `token_scores` refuses depths with blocks. With `forks` (`Coordinates.forks`, at `depth` 0), each
+    target is its own token's, scored from its predecessor's state (`Forks.predecessors`): it counts where
+    it has one and both are real, a document's first token from its parent's last."""
     span = depth + 1
-    counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
+    if forks is not None:
+        if depth or segment_ids is None:
+            raise ValueError("forks' targets are each token's own, scored from its predecessor, at depth 0 "
+                             "over the segments the forks number")
+        before = forks.predecessors(segment_ids, xp=xp)[:, 1:]
+        real = xp.ones(tokens.shape, bool) if attention_mask is None else xp.asarray(attention_mask, bool)
+        source = xp.take_along_axis(real, xp.maximum(before, 0), axis=1)
+        counted = (before >= 0) & real[:, 1:] & source
+    else:
+        counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
     if pad_id is not None:
         counted = counted & (tokens[:, span:] != pad_id)
     if segment_ids is not None:
@@ -886,6 +1027,7 @@ __all__ = [
     "PARAMETER_ROOTS",
     "SCAN_BLOCKS",
     "TEXT_KEY",
+    "UNIT_ROWS",
     "VALIDITY_FIELD",
     "VALID_ROWS",
     "Batch",

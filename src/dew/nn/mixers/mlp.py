@@ -103,6 +103,13 @@ class MLPMixer(MixerBase):
         slot's are its mixture's."""
         return self.mixture is None
 
+    # Tokenwise: a token reads no other's input, so forks change nothing it computes but its mixture's.
+    reads_forks = True
+
+    def fork_refusal(self) -> str | None:
+        """Its mixture's (`Mixture.fork_refusal`), where the slot is routed."""
+        return None if self.mixture is None else self.mixture.fork_refusal()
+
     def generation_refusal(self) -> str | None:
         """Its mixture's (`Mixture.generation_refusal`), where the slot is routed."""
         return None if self.mixture is None else self.mixture.generation_refusal()

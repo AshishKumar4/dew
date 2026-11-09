@@ -330,8 +330,10 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0))
     count = max(2, jax.device_count())
     if kind == "dpo":
+        from dew.data.preferences import pair_windows
+
         pairs = np.tile(np.asarray([[[1, 2, 3], [1, 2, 4]]], np.int32), (count, 1, 1))
-        batch = {"input_ids": pairs, "completion_mask": np.ones_like(pairs, np.float32)}
+        batch = pair_windows(pairs, np.ones_like(pairs), count=count)
     else:
         ids = np.tile(np.asarray([[1, 2, 3]], np.int32), (count, 1))
         before = trainer.initial_state()

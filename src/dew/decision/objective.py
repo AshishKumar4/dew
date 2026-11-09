@@ -29,8 +29,18 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
-from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, option_width, packing
+from dew.decision.rows import (
+    ConfigureLayout,
+    Fit,
+    PackedRows,
+    QuestionRows,
+    _rows,
+    forked_documents,
+    option_width,
+    packing,
+)
 from dew.decision.scoring import LogLoss, ScoringRule
+from dew.decision.shared_state import shared_for
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
 from dew.inference.projections import declared_groups
 from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
@@ -317,7 +327,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                     "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)"
                 )
             layout = default_layout(module.causal, head.one_question)
-        self.layout = layout
+        # A request's questions train over one copy of its state where the backbone and head read each
+        # question as its own row (`QuestionLayout.shared_for`), in a training step's form.
+        self.layout = (shared_for(layout, module, head, train=True) if isinstance(layout, QuestionLayout)
+                       else layout)
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
@@ -511,7 +524,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
             pack=packing(self.layout, self.bounds, self.context_window, grouped),
-            packed=(PackedRows(self.layout.max_len, compact, self.spans_in_context),),
+            packed=(PackedRows(self.layout.max_len, compact, self.spans_in_context,
+                               documents=forked_documents(self.layout, self.bounds)),),
         )
 
     def bind_widths(self, widths: Mapping[str, object]) -> None:

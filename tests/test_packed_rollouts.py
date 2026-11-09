@@ -24,9 +24,8 @@ from dew.objectives.rl.sessions import (
     Session,
     Status,
     advantages,
-    chain_lengths,
     pack,
-    rows_needed,
+    packed_rows,
     sampled_values,
     session_metrics,
 )
@@ -165,7 +164,7 @@ def test_the_truncation_policy_decides_whether_a_truncation_trains_and_on_what_r
     batch = pack(sessions, 3, estimator="mean", truncation=truncation)
     trained = {0, 1} if truncation == "mask" else {0, 1, 2}
     assert set(np.unique(batch[SESSION_INDEX_KEY][batch[RESPONSE_MASK_KEY] > 0])) == trained
-    assert rows_needed(chain_lengths(sessions, 3, truncation=truncation), 3) == batch[IDS_KEY].shape[0]
+    assert packed_rows(sessions, 3, truncation=truncation) == batch[IDS_KEY].shape[0]
     metrics = session_metrics(sessions, batch, truncation=truncation)
     assert metrics["reward/mean"] == pytest.approx({"mask": .5, "score": 2.0, "zero": 1 / 3}[truncation])
     assert ("masked/truncated" in metrics) == (truncation == "mask")

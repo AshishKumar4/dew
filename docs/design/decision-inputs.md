@@ -68,25 +68,28 @@ no stream segments stands in the row's one stream, which a one-entry table reads
 
 ## 2b. A request's questions over one state
 
-A question layout writes a row a question, each holding the request's state (`QuestionLayout.rows`), so a
-request of `q` questions over a state of `S` tokens reads `q·S` of state. With `shared_state=n` a row asks
-up to `n` of the request's questions over one copy: what each question's own row writes before its
-question, the state there, once, and each question's own part after it (`_shared`).
+A question's own row holds the request's state, so a request of `q` questions over a state of `S` tokens
+laid out a row a question reads `q·S` of state. A question layout asks a request's questions over one
+copy instead (`QuestionLayout.shared_state`: as many as a row holds where None, at most `n`, a row a
+question at 1): what each question's own row writes before its question, the state there, once, and each
+question's own part after it (`dew.decision.shared_state`).
 
-- **Reading.** The row's streams (§2a): the shared part is stream 0, reading itself causally; question `k`
-  is stream `k`, reading the shared part whole and itself causally, and with `siblings` each question before
-  it whole. The layout lowers that table itself (`Layout.attention`, `n + 1` streams).
+- **Reading.** The row's forks (`dew.batch.Forks`, `Encoded.forked`): the shared part is a document, and
+  each question's own part a document continuing it. Attention reads the shared part whole and the
+  question's own part causally, and a recurrent layer starts each question from the state the shared part
+  leaves, its conv after the shared part's last tokens (the backbone's forks, below the decision layer).
 - **Positions.** Each question's part keeps the positions its own row lays it at, from the shared part's
-  end (`Encoded.positions`, carried as the parallel layout's are), so with `siblings` off it decides as its
-  own row does: the tests hold this to check 1 against each question's own row.
-- **Splits.** Questions join the first row that holds the same shared part, has room for their part within
-  `max_len` and asks fewer than `n`; a request that outgrows a row takes several, each repeating the state,
-  and a question whose own row cuts the state keeps a row of its own.
-- **Refusals.** It takes the place of parallel options, blocks, a row's own reads and a question written to
-  its context, each of which sets what a token reads; a head that reads one question a row
-  (`Head.one_question`, Laya's) refuses its rows as it refuses a joint row's; a backbone whose recurrent
-  mixers read no key runs refuses them (`MixerCall`) until a document can enter from a given memory (row
-  1506).
+  end (`Encoded.positions`), so it decides as its own row does: the tests hold this to check 1 against each
+  question's own row, scoring and training.
+- **Splits.** Questions join the first row that holds the same shared part and has room for their part
+  within `max_len`; a request that outgrows a row takes several, each repeating the state, and a question
+  whose own row cuts the state keeps a row of its own.
+- **When.** A row whose tokens read otherwise (parallel options, blocks, a row's own reads, a question
+  written to its context or before its state) is a row a question; so is a row a head reads across its
+  questions (`Head.reads_apart`, `Head.one_question`) or a backbone would not compute as its own rows
+  (`ForkedCalls`: engram, block routing, an expert capacity, a mixer that reads no forks, dropout in a
+  training step), as `QuestionLayout.shared_for` derives it for a run and a task. A layout asking several
+  questions a row explicitly where its rows read otherwise is refused.
 
 ## 3. The head reads the main pass
 

@@ -16,17 +16,26 @@ LOADING = Loading(workers=0, threads=1, read_buffer=2)
 
 
 def test_the_preferences_preset_lays_out_pairs_as_its_step_written_out():
-    """Chosen and rejected token ids with their completion masks, laid out in six tokens padded
-    with 7, read by index: the batches of the pair step written out."""
-    from dew.data.preferences import PreferencePair
+    """Chosen and rejected token ids with their completion masks, each half at most six tokens, packed
+    first-fit into windows of twelve, read by index: the batches of the pair step, the pack, the window
+    step and the batch's pair numbering written out."""
+    from dew.data.preferences import (
+        TOKEN_FIELDS,
+        PairIds,
+        PreferencePair,
+        PreferenceWindows,
+        window_documents,
+    )
 
     pairs = Memory([{"chosen": [1, 2, 3, 4][: 2 + index % 3], "rejected": [1, 2, 5][: 2 + index % 2],
                      "chosen_mask": [0, 0, 1, 1][: 2 + index % 3],
                      "rejected_mask": [0, 0, 1][: 2 + index % 2]}
                     for index in range(12)])
-    written = compile(pairs.shuffle(0).repeat().map(PreferencePair(6, pad_id=7)).batch(4), read="indexed",
-                      loading=LOADING)
-    chain = pairs.shuffle(0).repeat().pipe(presets.preferences, seq_len=6, batch=4, pad_id=7)
+    steps = pairs.shuffle(0).repeat().map(PreferencePair(6)).pack(12, fields=TOKEN_FIELDS, policy="first-fit",
+                                                                  segments=6)
+    written = compile(steps.map(PreferenceWindows(12, window_documents(6))).batch(4).map(PairIds()),
+                      read="indexed", loading=LOADING)
+    chain = pairs.shuffle(0).repeat().pipe(presets.preferences, seq_len=6, batch=4)
     same_batches(written, compile(chain, read="indexed", loading=LOADING), 3)
 
 

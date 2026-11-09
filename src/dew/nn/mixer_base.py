@@ -312,6 +312,16 @@ class MixerBase:
         (`dew.nn.protocols.Generating`): by default nothing refuses it."""
         return None
 
+    reads_forks: ClassVar[bool] = False
+    """Whether the mixer this kind builds reads a call's forks (`dew.batch.Forks`, the `forks` of its
+    `MIXING` fields): each document over its ancestors' keys or the state they leave. A kind that reads
+    no other token's input reads them by not reading other tokens at all (`TOKENWISE`)."""
+
+    def fork_refusal(self) -> str | None:
+        """Why the mixer this kind builds would not compute a document over its ancestors as its own row
+        does, or None (`reads_forks`)."""
+        return None if self.reads_forks else f"{type(self).__name__} reads no forks"
+
     @property
     def reads_blocks(self) -> bool:
         """Whether the mixer this kind builds reads each block of a call's `block_groups` whole
