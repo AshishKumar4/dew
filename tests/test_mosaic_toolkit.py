@@ -298,6 +298,29 @@ def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
             or pool - sum(held) < step * sum(weight for weight, _ in raised))
 
 
+@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_consumers_hold_the_rest(
+        generation_name):
+    """A launch stating its producer's registers (a producer whose issue loop holds more than setmaxnreg's
+    least: the sm100 states launch's, 44 to 60 bytes spilled at 24) runs its schedule's producer at them,
+    its consumers sharing what remains of the launch's pool, and its register model states the same split:
+    so the consumers' budget a derivation reads is the raise the kernel runs."""
+    from dew.nn.kernels.templates import handoffs, resources
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    with generation.assumed(generation_name):
+        least, stated = resources.producer_floor(), 48
+        for consumers in (1, 2):
+            roles = WGMMA.roles(consumers, stated).registers()
+            assert roles["producer"] == stated
+            assert roles["consumer"] == WGMMA.registers(consumers, producer=stated)
+            assert roles["consumer"] <= WGMMA.registers(consumers)
+            assert WGMMA.roles(consumers).registers()["producer"] == least
+            model = resources.register_model(WGMMA, consumers, roles["consumer"], producer=stated)
+            assert (model.producer, model.budget) == (stated, roles["consumer"])
+            assert handoffs.Schedule(WGMMA.roles(consumers).roles, floor=stated).registers() == roles
+
+
 def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
     """A hand-off's barriers (`Schedule.scratch`) count the arrivals of the roles that fill and give it
     back: a signal two softmax warpgroups fill counts two, and an accumulator ring the product warp fills

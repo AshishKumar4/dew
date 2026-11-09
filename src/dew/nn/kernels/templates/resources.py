@@ -43,9 +43,11 @@ def producer_floor() -> int:
     3's). A producer's rule is the least of setmaxnreg's steps that holds its issue loop's live set, and every
     family's holds at the least: ptxas spills nothing at 24 in the attention forward's 154 kernels and
     backward's 17 and the recurrence's 75 under 12.9, and in the D128 forward's 144, the training and natural
-    forms among them, under 13.4 (row 3639's scans, each kernel's decrease rewritten to 24 through 96). A
-    producer that outgrew it would spill, which the CPU compile gate refuses (tests/kernel_compile.py's
-    `mosaic_failures`)."""
+    forms among them, under 13.4 (row 3639's scans, each kernel's decrease rewritten to 24 through 96). Not
+    every one: sm100's recurrence states launch's tcgen05 producer spills 44 to 60 bytes at 24 and none at 40
+    to 48 (its PTX's producer decrease rewritten, the r08 theme's debugging), so a launch whose producer
+    holds more states its own (`Family.roles`' and `register_model`'s `producer`). A producer that outgrew
+    it would spill, which the CPU compile gate refuses (tests/kernel_compile.py's `mosaic_failures`)."""
     return facts().raises().lowest
 
 
@@ -264,19 +266,21 @@ def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | Non
     return tuple(held.get(index, floor) for index in range(len(weights)))
 
 
-def consumer_registers(consumers: int, programs: int = 1) -> int:
+def consumer_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
     """The registers a thread of each of `consumers` consumer warpgroups holds, `programs` programs a
-    multiprocessor: its raise (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its
-    program's entry's otherwise."""
-    return (raised_registers(consumers, programs) if RAISES_HONORED
+    multiprocessor, beside a producer lowered to `producer` (`producer_floor` where None): its raise
+    (`raised_registers`) where the GPU's compile honors it (`RAISES_HONORED`), its program's entry's
+    otherwise."""
+    return (raised_registers(consumers, programs, producer) if RAISES_HONORED
             else entry_registers(consumers + 1, programs))
 
 
-def producer_registers(consumers: int, programs: int = 1) -> int:
+def producer_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
     """The registers a thread of a program's producer beside `consumers` consumer warpgroups holds, `programs`
-    programs a multiprocessor: its lowered `producer_floor` where the GPU's compile honors the program's
-    raises, its entry's otherwise."""
-    return producer_floor() if RAISES_HONORED else entry_registers(consumers + 1, programs)
+    programs a multiprocessor: what it lowers to, `producer` (`producer_floor` where None), where the GPU's
+    compile honors the program's raises, its entry's otherwise."""
+    lowered = producer_floor() if producer is None else producer
+    return lowered if RAISES_HONORED else entry_registers(consumers + 1, programs)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -404,22 +408,23 @@ def resident_warpgroups() -> int:
     return min(held.resident_threads // THREADS, held.resident_blocks)
 
 
-def register_programs(family: "Family", consumers: int, registers: int | None = None) -> int:
+def register_programs(family: "Family", consumers: int, registers: int | None = None,
+                      producer: int | None = None) -> int:
     """The most programs of a launch of `consumers` consumer roles a multiprocessor's registers hold at once,
     each consumer thread holding `registers` (None: the family's budget at one program, `Family.registers`):
     the most at whose share (`Family.registers` at that residency, a raise's where the family's roles raise)
     its consumers hold them, beside its producer's where its layout has one. A launch's own need sets its
     residency: two programs of a one-consumer launch at 127 registers ran its walk 1.35 times as fast as one
     (FS-WHY3-h100). A core whose family budgets no registers (a TPU's, `Family.budgets_registers`) runs
-    one."""
+    one. Its producer lowers to `producer` (`producer_floor` where None)."""
     if not family.budgets_registers:
         return 1
     warpgroups = family.warpgroups(consumers)
-    need = family.registers(consumers) if registers is None else registers
+    need = family.registers(consumers, producer=producer) if registers is None else registers
     for programs in range(resident_warpgroups() // warpgroups, 0, -1):
-        producer = producer_registers(consumers, programs) if warpgroups > consumers else 0
-        if need <= family.registers(consumers, programs) and programs * _register_allocation(
-                need, consumers, producer, family.register_step) <= facts().registers:
+        lowered = producer_registers(consumers, programs, producer) if warpgroups > consumers else 0
+        if need <= family.registers(consumers, programs, producer) and programs * _register_allocation(
+                need, consumers, lowered, family.register_step) <= facts().registers:
             return programs
     return 0
 
@@ -470,21 +475,23 @@ class RegisterModel:
 
 def register_model(family: "Family", consumers: int, registers: int | None, *,
                    shared: int | None = None, target: "GpuTarget | None" = None,
-                   tmem: int = 0) -> RegisterModel:
+                   tmem: int = 0, producer: int | None = None) -> RegisterModel:
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
-    (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), and the most
-    programs a multiprocessor holds of it at those registers (`register_programs`), as its plan's."""
+    (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), lowered to
+    `producer` (`producer_floor` where None), and the most programs a multiprocessor holds of it at those
+    registers (`register_programs`), as its plan's."""
     warpgroups = family.warpgroups(consumers)
-    most = family.programs(consumers, registers)
+    most = family.programs(consumers, registers, producer)
     if target is not None:
         if shared is not None:
             block = generation.shared_budget(target)
             most = next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
         if tmem:
             most = min(most, (target.tmem_columns or 0) // tmem)
-    return RegisterModel(registers, family.registers(consumers), consumers, most, family.register_step,
-                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family,
-                         file=facts().registers)
+    return RegisterModel(registers, family.registers(consumers, producer=producer), consumers, most,
+                         family.register_step,
+                         producer_registers(consumers, producer=producer) if warpgroups > consumers else 0,
+                         shared, family, file=facts().registers)
 
 
 @dataclasses.dataclass(frozen=True)
