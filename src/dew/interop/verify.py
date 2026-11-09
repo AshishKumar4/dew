@@ -49,11 +49,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import traverse_util as flax_traverse
 
-from dew import _records, parity as parity_check
+from dew import _records
 from dew._cache import package_digest
 from dew.interop import decoder_config, decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
-from dew.nn import precision
+from dew.interop.isolated import Isolated
 from dew.nn.blocks import padded_row
 from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
@@ -88,13 +88,13 @@ its parts is read from the source's own modeling code."""
 BATCH, LENGTH = 2, 12
 """The probe's token grid, which the committed fixtures share."""
 _DRAWN = (8, 16)
-"""Each of check 1's draws of the logits' token grid (`logits_parity`), as a test's `model_draw` draws:
-past LENGTH, so a window the probe tells conventions apart by is applied on every draw."""
-_GRADIENT_DRAWN = (128, 4)
-"""Each of check 1's draws of the gradients' token grid (`gradient_parity`): many short sequences, so a
-gradient summed over the draw is filled, and a recurrence's backward, which carries one rounding event
-along a sequence into every parameter, sums over enough independent sequences for its error to size
-(Falcon-H1's mamba sizes at 128 x 4, not at 64 x 8 nor 8 x 16)."""
+"""Each draw's token grid of tier 2's verdict (`_mapped`), its logits' and its gradients': past LENGTH, so a
+window, a chunk and a ramp's context the probe shrinks below it (`shrink`) act on every draw, forward and
+backward."""
+_DRAWS = 2
+"""The draws tier 2's verdict reads (`_mapped`): two float64 computations of one function agree to float64's
+rounding on every draw, so the verdict is decided on its first, the second a different draw's ids and
+cotangent; it sizes nothing."""
 
 _HEAD_DIM = 16
 _VOCAB = 256
@@ -119,11 +119,13 @@ _FREQUENCY_FACTORS = frozenset({'long_factor', 'short_factor'})
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoder_parts.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
-# Tier 2 judges a candidate as every test of Dew against a reference is judged: check 1 (`dew.parity`),
-# Dew's RMS error from the source's float64 twin on par with the source's own float32 one, leaf by leaf,
-# over draws `dew.parity.seeds_for` sizes. Two float32 roundings of one computation pass, and a Dew more
-# exact than the source; a computation Dew does not share, in the forward or in a backward the forward
-# does not show (a hook, a custom autograd function), sets Dew as far from the twin as it moves a value.
+# Tier 2 verifies a mapping, that Dew's decoder computes the source's function (docs/design/testing.md,
+# "Tier 2's verdict"): Dew's float64 model against the source's float64 twin, its logits and every
+# parameter's gradient, each leaf and each of its rows departing no further than the source's own float32
+# rounding moves it (`_mapped`). A correct mapping sits at float64's rounding of the same computation, about
+# 2^-29 of that; a computation Dew does not share, in the forward or in a backward the forward does not
+# show (a hook, a custom autograd function), moves a value by a share of itself. Float32 accuracy is each
+# family's check 1 in Dew's tests, not tier 2's.
 
 
 _log = logging.getLogger(__name__)
@@ -545,9 +547,9 @@ class VerifiedMapping:
     """The registered family the type loads as (a `CONVENTIONS` name)."""
     reference: str
     """The transformers class and release the probe ran."""
-    seeds: int
-    """The probe's draws check 1 held Dew's route's fp32 logits on par with the reference's over, each
-    from the reference's float64 twin (`logits_parity`), as `dew.parity.seeds_for` sized them."""
+    draws: int
+    """The probe's draws its verdict read (`_mapped`, `_DRAWS`): Dew's float64 logits, and from parts every
+    parameter's float64 gradient, within the reference's own float32 rounding of its float64 twin's."""
     inert: tuple[str, ...]
     """The config fields the convention does not read, which changed nothing on the probe's shrunken
     instance: a field whose effect starts past a context the probe never reaches (one `shrink` does not
@@ -595,8 +597,9 @@ class VerifiedMapping:
                  if self.family == PARTS else f"as the registered {self.family!r} family")
         warnings.warn(
             f"tier 2: verified mapping: model_type {self.model_type!r} loads {loads}; "
-            f"its fp32 logits on a random shrunken instance are on par with {self.reference}'s from its "
-            f"float64 twin by check 1 over {self.seeds} draws; it does not read the config fields "
+            f"its float64 logits on a random shrunken instance agree with {self.reference}'s float64 twin's "
+            f"within {self.reference}'s own float32 rounding over {self.draws} draws; it does not read the "
+            "config fields "
             f"{list(self.inert)}, which changed nothing on that instance",
             VerifiedMappingWarning, stacklevel=3)
         return record
@@ -786,62 +789,126 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     except (KeyError, ValueError) as error:
         # A candidate's reading of tensors it does not hold disqualifies that candidate alone.
         raise _Mismatch(f"its tensors do not fill {convention}'s model ({error})") from error
-    try:
-        return logits_parity(source.logits, model, variables, f"{convention}'s logits against {name}'s")
-    except parity_check.GateFailure as failure:
-        raise _Mismatch(f"{convention}'s fp32 logits on a random shrunken instance are not on par with "
-                        f"{name}'s from its float64 twin ({failure}), so its config fields {sorted(inert)} "
-                        f"or its modeling compute something {convention} does not") from failure
-
-
-def _users_arithmetic():
-    """The precision the parities run Dew's decoder at (`logits_parity`, `gradient_parity`): a float32 run
-    as a user's process runs it, its products summed in float32 (`precision.FP32_SUMS`), not in TF32 on a
-    GPU nor in float64 as a test process's wide CPU arithmetic sums them
-    (`precision.WIDE_CPU_ARITHMETIC`), which would set it nearer the truth than users get, as check 1's
-    arms run (`_summed_as_run`)."""
-    return precision.configured_precision(precision.FP32_SUMS)
+    departed = logits_mapped(source.logits, record, variables)
+    if departed:
+        raise _Mismatch(f"{convention}'s float64 logits on a random shrunken instance depart from {name}'s "
+                        f"float64 twin's past {name}'s own float32 rounding ({'; '.join(departed[:4])}), so "
+                        f"its config fields {sorted(inert)} or its modeling compute something {convention} "
+                        "does not")
+    return _DRAWS
 
 
 @dataclass(frozen=True)
 class _Source:
-    """The probe's reference at float32 and its float64 twin (`source_twin`), whose runs over each draw
-    the parities judge Dew's against."""
+    """The probe's reference at float32, in the load's process, and its float64 twin, built and run in a
+    process of its own (`twin`, `dew.interop.isolated`: the twin sets torch's defaults process-wide),
+    whose runs over each draw tier 2's verdict reads (`_mapped`)."""
 
     reference: PreTrainedModel
-    twin: PreTrainedModel
+    twin: Isolated
 
     def logits(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """The reference's float32 logits over `ids` and its twin's, as float64."""
+        """The reference's float32 logits over `ids` and its twin's float64 ones, as float64."""
         return (np.asarray(reference_logits(self.reference, ids.astype(np.int64)), np.float64),
-                twin_logits(self.twin, ids.astype(np.int64)))
+                self.twin.call(_twin_logits, ids.astype(np.int64)))
+
+    def gradients(self, ids: np.ndarray, cotangent: np.ndarray) -> dict[str, np.ndarray]:
+        """The twin's float64 gradient of every trained parameter by name over `ids` against
+        `cotangent` (`_probe_gradients`)."""
+        return self.twin.call(_twin_gradients, ids, cotangent)
 
 
-def _judged(draw, label: str) -> int:
-    """Check 1's verdict over `draw` (seed -> Dew's, the source's and the twin's trees), at the seeds
-    `dew.parity.seeds_for` sizes on draws the verdict never sees: those seeds where every leaf is on par,
-    or `dew.parity.GateFailure` naming each leaf that is not, `dew.parity.Inconclusive` one unresolved."""
-    seeds = parity_check.seeds_for(draw, label)
-    parity_check.judge(draw, seeds, label)
-    return seeds
+_TWIN: dict[str, PreTrainedModel] = {}
+"""The twin process's float64 twin (`_twin_built`), built once."""
 
 
-def logits_parity(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]], model: nn.Module,
-                  variables: Variables, label: str) -> int:
-    """Dew's float32 logits over the probe's draws of ids (`probe_ids`) on par with the source's from its
-    float64 twin (`_judged`), `source` the two over a draw's ids (`_Source.logits`), Dew's run as a user's
-    process runs it (`_users_arithmetic`)."""
-    held = jax.tree.map(lambda leaf: jnp.asarray(leaf, 'float32'), variables)
-    forward = owned_program(lambda variables, ids: model.apply(variables, ids), model)
+def _twin_built(origin: ModelSource, config: PretrainedConfig, weights: Mapping[str, np.ndarray],
+                registered: tuple[type[PretrainedConfig], type[PreTrainedModel]] | None) -> None:
+    """In the twin's process: the reference's float32 model of `config` and `weights` and its float64 twin,
+    each built by the source's own constructor (`origin`, `source_twin`) as the probe built the reference,
+    so whatever its code attaches to what it builds (a hook on a gradient) is attached here too.
+    `registered` is the config class and causal LM a process registered with transformers' auto classes
+    at runtime, which this process registers alike."""
+    import torch
+    from transformers import AutoModelForCausalLM
 
-    def draw(seed: int):
-        ids = probe_ids(_VOCAB, seed, _DRAWN)
-        with _users_arithmetic():
-            ours = np.asarray(forward(held, ids), np.float64)
-        theirs, truth = source(ids)
-        return ours, theirs, truth
+    from _dew_torch.precision import widened_config
 
-    return _judged(draw, label)
+    if registered is not None:
+        AutoModelForCausalLM.register(*registered, exist_ok=True)
+    reference = origin.causal_lm(copy.deepcopy(config)).float()
+    reference.load_state_dict({name: torch.from_numpy(np.asarray(value)) for name, value in weights.items()})
+    _TWIN['twin'] = source_twin(reference, lambda: origin.causal_lm(widened_config(copy.deepcopy(config))))
+
+
+def _twin_logits(ids: np.ndarray) -> np.ndarray:
+    """In the twin's process: its float64 logits over `ids` (`twin_logits`)."""
+    return twin_logits(_TWIN['twin'], ids)
+
+
+def _twin_gradients(ids: np.ndarray, cotangent: np.ndarray) -> dict[str, np.ndarray]:
+    """In the twin's process: its float64 gradient of every trained parameter by name."""
+    with _wide():
+        return _probe_gradients(_TWIN['twin'], ids, cotangent.astype(np.float64), train=False)[1]
+
+
+def _departed(ours: Mapping[str, np.ndarray], theirs: Mapping[str, np.ndarray],
+              truth: Mapping[str, np.ndarray], draw: int) -> list[str]:
+    """Each leaf of Dew's float64 `ours`, and each row of it along its last axis, that departs from the
+    source's float64 `truth` past the source's own float32 rounding of it (`theirs`), RMS against RMS, named
+    with both: tier 2's verdict at one draw (docs/design/testing.md, "Tier 2's verdict"). A row the
+    float32 source computes exactly must be exact. A leaf's RMS alone would let a departure on one row (an
+    embedding row, one head's parameter) hide by its share."""
+    found = []
+    for name in ours:
+        mine, own = (np.asarray(arm, np.float64) - np.asarray(truth[name], np.float64)
+                     for arm in (ours[name], theirs[name]))
+        rows = (mine.reshape(1, -1), own.reshape(1, -1)) if mine.ndim < 2 else (
+            mine.reshape(-1, mine.shape[-1]), own.reshape(-1, own.shape[-1]))
+        leaf = (math.sqrt(np.mean(mine ** 2)), math.sqrt(np.mean(own ** 2)))
+        each = (np.sqrt(np.mean(rows[0] ** 2, axis=-1)), np.sqrt(np.mean(rows[1] ** 2, axis=-1)))
+        past = np.flatnonzero(each[0] > each[1])
+        if leaf[0] > leaf[1]:
+            found.append(f"{name} at draw {draw}: {leaf[0]:.3g} from the twin where the source's float32 is "
+                         f"{leaf[1]:.3g}")
+        elif past.size:
+            row = int(past[0])
+            found.append(f"{name}'s row {row} at draw {draw}: {each[0][row]:.3g} from the twin where the "
+                         f"source's float32 is {each[1][row]:.3g}")
+    return found
+
+
+def _mapped(draw: Callable[[int], tuple[dict, dict, dict]]) -> list[str]:
+    """Tier 2's verdict over its draws (`_DRAWS`), `draw(seed)` Dew's float64 tree, the source's float32
+    and its twin's float64: every departure `_departed` names, none where Dew computes the source's
+    function."""
+    return [found for seed in range(_DRAWS) for found in _departed(*draw(seed), seed)]
+
+
+def _wide_dew(record: decoder_parts.DecoderFields, variables: Variables) -> tuple[nn.Module, Variables]:
+    """Dew's decoder of `record` in float64, and `variables` widened, built and read under x64."""
+    model = models.build('causal_transformer', {**record, 'dtype': 'float64', 'attention_impl': 'reference'})
+    return model, jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
+
+
+def logits_mapped(source: Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]],
+                  record: decoder_parts.DecoderFields, variables: Variables) -> list[str]:
+    """Tier 2's verdict on the logits (`_mapped`): Dew's decoder of `record` in float64 over the probe's
+    draws of ids (`probe_ids`) against the source's float64 twin, within the source's float32 rounding,
+    `source` the two over a draw's ids (`_Source.logits`). The departures it finds, none where Dew
+    computes the source's forward."""
+    with jax.enable_x64(new_val=True):
+        model, held = _wide_dew(record, variables)
+        # Held by this verdict alone, which a closure over its probe's arrays is (`owned_program`).
+        forward = owned_program(lambda ids: model.apply(held, ids), model)
+
+        def draw(seed: int):
+            ids = probe_ids(_VOCAB, seed, _DRAWN)
+            theirs, truth = source(ids)
+            ours = np.asarray(forward(ids), np.float64)
+            return {'logits': ours}, {'logits': theirs}, {'logits': truth}
+
+        return _mapped(draw)
 
 
 def _probe_gradients(model: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, *,
@@ -876,56 +943,46 @@ def _as_stored(model: PreTrainedModel, tensors: Mapping[str, np.ndarray]) -> dic
     return {name: tensor.numpy() for name, tensor in stored.items()}
 
 
-def gradient_parity(source: _Source, family: decoder_parts.DecoderFamily,
-                    record: decoder_parts.DecoderFields, variables: Variables, label: str) -> int:
-    """Dew's float32 gradient of every parameter on par with the source's from its float64 twin's
-    (`_judged`), over the probe's draws of ids and cotangents, every parameter's gradient laid end to end
-    as one leaf, each in units of its own size (its float64 gradient's RMS on the draw): a backward the
-    forward does not show moves some parameter's gradient by a share of its value, which no other's
-    rounding hides, where a parameter's own leaf holds too few values a draw for check 1 to size (a
-    learned activation's scalars, an embedding's rows a few tokens touch, a norm's scale). Unscaled, the
-    few largest gradients (an embedding's rows) set each draw's error, and its ratio spreads with them: a
-    routed decoder of mixed parts' draws' log ratios spread 0.39 over 64 draws of 128 x 4 tokens (0.36 of
-    512 x 4), at the 0.4 the tail test sees at, and check 1 resolved it within no 512 seeds; scaled,
-    0.28. The source's eval-mode gradients,
-    its float32 ones and its twin's, are stored as `save_pretrained` stores its weights (`_as_stored`) and
-    read into Dew's tree as they are (`translate_weights`; a gradient rearranges as its parameter does)."""
-    model = models.build('causal_transformer', {**record, 'dtype': 'float32', 'attention_impl': 'reference'})
-    held = jax.tree.map(lambda leaf: jnp.asarray(leaf, 'float32'), variables)
+def _gradient_inputs(seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """The ids and float32 cotangent of the gradients' draw `seed` (`gradients_mapped`)."""
+    ids = probe_ids(_VOCAB, seed, _DRAWN)
+    return ids, np.random.RandomState(11 + seed).standard_normal((*_DRAWN, _VOCAB)).astype(np.float32)
 
-    def gradient(params, ids, cotangent):
-        return jax.grad(lambda params: jnp.sum(model.apply({**held, 'params': params}, ids) * cotangent))(
-            params)
 
-    # Held by this qualification alone, which a closure over its probe's arrays is (`owned_program`).
-    compiled = owned_program(gradient, model)
+def gradients_mapped(source: _Source, family: decoder_parts.DecoderFamily,
+                     record: decoder_parts.DecoderFields, variables: Variables) -> list[str]:
+    """Tier 2's verdict on every parameter's gradient (`_mapped`), each a leaf of its own: Dew's float64
+    gradient of its logits against a drawn cotangent, against the source's float64 twin's within the
+    source's float32 rounding. The source's eval-mode gradients are stored as `save_pretrained` stores its
+    weights (`_as_stored`) and read into Dew's tree as they are (`translate_weights`; a gradient rearranges
+    as its parameter does). The departures it finds, none where Dew computes the source's backward."""
 
-    def theirs(network: PreTrainedModel, ids: np.ndarray, cotangent: np.ndarray, dtype: str) -> dict:
-        _, gradients = _probe_gradients(network, ids, cotangent, train=False)
+    def stored(gradients: Mapping[str, np.ndarray], dtype: str) -> dict:
         tree = decoders.translate_weights(_as_stored(source.reference, gradients), record, family,
                                           param_dtype=dtype)
         return {'/'.join(path): np.asarray(leaf, np.float64)
                 for path, leaf in flax_traverse.flatten_dict(tree['params']).items()}
 
-    def draw(seed: int):
-        ids = probe_ids(_VOCAB, seed, _GRADIENT_DRAWN)
-        cotangent = np.random.RandomState(11 + seed).standard_normal((*_GRADIENT_DRAWN, _VOCAB)).astype(
-            np.float32)
-        reference = theirs(source.reference, ids, cotangent, 'float32')
-        with _wide(), jax.enable_x64(new_val=True):
-            truth = theirs(source.twin, ids, cotangent.astype(np.float64), 'float64')
-        with _users_arithmetic():
-            ours = {'/'.join(path): np.asarray(leaf, np.float64) for path, leaf in
-                    flax_traverse.flatten_dict(compiled(held['params'], ids, cotangent)).items()}
-        if set(ours) != set(reference):
-            raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(reference))[:4]} apart")
-        # Each parameter in units of its truth's RMS, so no parameter's size outweighs another's.
-        sizes = {path: max(float(np.sqrt(np.mean(truth[path] ** 2))), np.finfo(np.float64).tiny)
-                 for path in ours}
-        return tuple(np.concatenate([tree[path].ravel() / sizes[path] for path in sorted(ours)])
-                     for tree in (ours, reference, truth))
+    with jax.enable_x64(new_val=True):
+        model, held = _wide_dew(record, variables)
 
-    return _judged(draw, label)
+        def gradient(params, ids, cotangent):
+            return jax.grad(lambda params: jnp.sum(model.apply({**held, 'params': params}, ids) * cotangent))(
+                params)
+
+        compiled = owned_program(gradient, model)
+
+        def draw(seed: int):
+            ids, cotangent = _gradient_inputs(seed)
+            theirs = stored(_probe_gradients(source.reference, ids, cotangent, train=False)[1], 'float32')
+            truth = stored(source.gradients(ids, cotangent), 'float64')
+            ours = {'/'.join(path): np.asarray(leaf, np.float64) for path, leaf in flax_traverse.flatten_dict(
+                compiled(held['params'], ids, cotangent.astype(np.float64))).items()}
+            if set(ours) != set(theirs):
+                raise _Mismatch(f"its gradients fill {sorted(set(ours) ^ set(theirs))[:4]} apart")
+            return ours, theirs, truth
+
+        return _mapped(draw)
 
 
 def _trained(source: _Source, assembly: parts.Assembly, family: decoder_parts.DecoderFamily,
@@ -933,8 +990,8 @@ def _trained(source: _Source, assembly: parts.Assembly, family: decoder_parts.De
     """The training qualification of a decoder assembled from parts, beside the probe's eval logits:
     the source's training forward and gradients, its attention dropout set to zero, are its eval ones
     bitwise (no training-only behavior, a hook or another branch, that Dew's decoder lacks), and
-    Dew's gradients are on par with its own from its float64 twin (`gradient_parity`: no backward the
-    forward does not show). `_Mismatch` names what differs."""
+    Dew's float64 gradients agree with its float64 twin's within its float32 rounding (`gradients_mapped`:
+    no backward the forward does not show). `_Mismatch` names what differs."""
     reference = source.reference
     for path, attribute in assembly.dropouts:
         setattr(reference.get_submodule(path), attribute, 0.0)
@@ -948,11 +1005,11 @@ def _trained(source: _Source, assembly: parts.Assembly, family: decoder_parts.De
     with tempfile.TemporaryDirectory() as folder:
         reference.save_pretrained(folder)
         variables = decoders.translate_weights(sources.load_shards(Path(folder)), record, family)
-    try:
-        gradient_parity(source, family, record, variables, f"Dew's gradients against {name}'s")
-    except parity_check.GateFailure as failure:
-        raise _Mismatch(f"Dew's gradients are not on par with {name}'s from its float64 twin ({failure}), so "
-                        "its backward computes something Dew's does not") from failure
+    departed = gradients_mapped(source, family, record, variables)
+    if departed:
+        raise _Mismatch(f"Dew's float64 gradients depart from {name}'s float64 twin's past {name}'s own "
+                        f"float32 rounding ({'; '.join(departed[:4])}), so its backward computes something "
+                        "Dew's does not")
 
 
 def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = None,
@@ -971,9 +1028,9 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
     transformers builds its class for the type from `shrink(hf_config)` with
     random weights (`scatter_weights`) and saves it as safetensors; each
     `CONVENTIONS` candidate whose reading takes the real config loads that
-    directory and runs the same ids in fp32. The first whose logits are on
-    par with the reference's from its float64 twin by check 1
-    (`logits_parity`), is the mapping. When several read the config and match,
+    directory and runs the probe's ids in float64. The first whose logits agree with the reference's
+    float64 twin's within the reference's own float32 rounding (`logits_mapped`), and from parts whose
+    every gradient does too (`gradients_mapped`), is the mapping. When several read the config and match,
     the `CONVENTIONS` order is the tie-break: each computed the probe's
     logits, so any of them is sound. With none, the type is `Unmapped`, with
     every candidate's reason and the shrunken config. A type transformers has
@@ -998,9 +1055,8 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
     if recorded is not None:
         return replace(recorded, source=held)
     _log.warning("tier 2: model_type %r is no registered family; verifying which convention computes it "
-                 "against its %s code by check 1 on a shrunken instance, its forward and its backward over "
-                 "drawn inputs: seconds for most types, about two minutes for a recurrent hybrid's "
-                 "backward (Falcon-H1's on 24 CPU cores), done once a type%s.", model_type,
+                 "against its %s code in float64 on a shrunken instance, its forward and its backward over "
+                 "two drawn inputs: seconds, done once a type%s.", model_type,
                  'remote' if source.remote is not None else "transformers'",
                  ' and recorded' if key is not None else ' (its local code at each load)')
     verdict = _verified(hf_config, source)
@@ -1044,7 +1100,7 @@ def _recorded(key: str) -> VerifiedMapping | None:
     record = _records.record(json.loads(path.read_text()), 'verified mapping')
     return VerifiedMapping(
         _records.text(record['model_type'], 'model_type'), _records.text(record['family'], 'family'),
-        _records.text(record['reference'], 'reference'), _records.integer(record['seeds'], 'seeds'),
+        _records.text(record['reference'], 'reference'), _records.integer(record['draws'], 'draws'),
         tuple(_records.strings(record['inert'], 'inert')))
 
 
@@ -1056,7 +1112,7 @@ def _record(key: str, verified: VerifiedMapping) -> None:
     with _files.staged(directory) as staging:
         (staging / 'mapping.json').write_text(json.dumps({
             'model_type': verified.model_type, 'family': verified.family, 'reference': verified.reference,
-            'seeds': verified.seeds, 'inert': list(verified.inert)}))
+            'draws': verified.draws, 'inert': list(verified.inert)}))
 
 
 def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedMapping | Unmapped:
@@ -1101,54 +1157,71 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         # The probe runs whether or not a candidate is left, so a type no convention computes is
         # one whose shrunken model ran (`Unmapped`), and one whose model does not run is
         # `ProbeUnavailable`, whatever the candidates.
-        from _dew_torch.precision import widened_config
-
-        try:
-            reference = source.causal_lm(config).float()
-            scatter_weights(reference)
-            reference_logits(reference, probe_ids(_VOCAB).astype(np.int64))
-            probed = _Source(reference, source_twin(
-                reference, lambda: source.causal_lm(widened_config(copy.deepcopy(config)))))
-        except Exception as error:
-            raise _unavailable(model_type, f"{name} does not run its shrunken config "
-                               f"({type(error).__name__}: {error})") from error
-        # The row the source's table pads, nn.Embedding's notion (Gemma's scaled table is one); a lookup
-        # of another kind has no padding_idx to pad by. The reference ran, so torch is installed.
-        import torch
-
-        lookup = reference.get_input_embeddings()
-        pad = lookup.padding_idx if isinstance(lookup, torch.nn.Embedding) else None
-        with tempfile.TemporaryDirectory() as scratch:
-            # Saved first: the parts read the checkpoint's names as its load does, over its whole
-            # inventory where its conversion renames a key by another's presence (`parts.assemble`).
-            reference.save_pretrained(scratch)
-            assembly = None
+        with Isolated() as twin:
             try:
-                assembly = parts.assemble(reference, _saved_names(Path(scratch)))
-            except parts.Ambiguous as ambiguous:
-                reasons[PARTS] = str(ambiguous)
+                reference = source.causal_lm(config).float()
+                scatter_weights(reference)
+                probed = _Source(reference, twin)
+                weights = {key: value.detach().cpu().numpy() for key, value in reference.state_dict().items()}
+                twin.call(_twin_built, source, config, weights, _registered(source, reference))
+                probed.logits(probe_ids(_VOCAB))
+            except Exception as error:
+                raise _unavailable(model_type, f"{name} does not run its shrunken config "
+                                   f"({type(error).__name__}: {error})") from error
+            return _candidates(model_type, name, reasons, sized, probed, fields)
+
+
+def _registered(source: ModelSource, reference: PreTrainedModel
+                ) -> tuple[type[PretrainedConfig], type[PreTrainedModel]] | None:
+    """The config class and the causal LM transformers' auto classes built `reference` of
+    (`ModelSource.causal_lm`), which a process other than this one registers alike (`_twin_built`), so a
+    type a script registered at runtime builds there; None for a source's remote code, which its auto
+    classes do not build."""
+    return None if source.remote is not None else (type(reference.config), type(reference))
+
+
+def _candidates(model_type: str, name: str, reasons: dict[str, str], sized: list, probed: _Source,
+                fields: Mapping[str, object]) -> VerifiedMapping | Unmapped:
+    """The probe's candidates against its reference and twin (`_verified`), parts first: the first whose
+    mapping tier 2's verdict holds, or `Unmapped` with every candidate's reason."""
+    reference = probed.reference
+    # The row the source's table pads, nn.Embedding's notion (Gemma's scaled table is one); a lookup
+    # of another kind has no padding_idx to pad by. The reference ran, so torch is installed.
+    import torch
+
+    lookup = reference.get_input_embeddings()
+    pad = lookup.padding_idx if isinstance(lookup, torch.nn.Embedding) else None
+    with tempfile.TemporaryDirectory() as scratch:
+        # Saved first: the parts read the checkpoint's names as its load does, over its whole
+        # inventory where its conversion renames a key by another's presence (`parts.assemble`).
+        reference.save_pretrained(scratch)
+        assembly = None
+        try:
+            assembly = parts.assemble(reference, _saved_names(Path(scratch)))
+        except parts.Ambiguous as ambiguous:
+            reasons[PARTS] = str(ambiguous)
+        else:
+            record = assembly.fields
+            try:
+                model = models.build("causal_transformer",
+                                     {**record, "dtype": "float32", "attention_impl": "reference"})
+            except ValueError as refused:
+                # Parts each read alike may still combine into a decoder Dew refuses to build.
+                reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"
             else:
-                record = assembly.fields
+                sized.insert(0, (PARTS, parts.family(model_type, assembly), model, record, set()))
+        if sized:
+            for convention, family, model, record, inert in sized:
                 try:
-                    model = models.build("causal_transformer",
-                                         {**record, "dtype": "float32", "attention_impl": "reference"})
-                except ValueError as refused:
-                    # Parts each read alike may still combine into a decoder Dew refuses to build.
-                    reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"
-                else:
-                    sized.insert(0, (PARTS, parts.family(model_type, assembly), model, record, set()))
-            if sized:
-                for convention, family, model, record, inert in sized:
-                    try:
-                        seeds = _agreement(convention, family, model, record, inert, name, probed,
-                                           Path(scratch), pad)
-                        if convention == PARTS:
-                            assert assembly is not None
-                            _trained(probed, assembly, family, record, name)
-                    except _Mismatch as mismatch:
-                        reasons[convention] = str(mismatch)
-                        continue
-                    return VerifiedMapping(model_type, convention, name, seeds, tuple(sorted(inert)))
+                    draws = _agreement(convention, family, model, record, inert, name, probed,
+                                       Path(scratch), pad)
+                    if convention == PARTS:
+                        assert assembly is not None
+                        _trained(probed, assembly, family, record, name)
+                except _Mismatch as mismatch:
+                    reasons[convention] = str(mismatch)
+                    continue
+                return VerifiedMapping(model_type, convention, name, draws, tuple(sorted(inert)))
     return Unmapped(model_type,
                     {name: reasons[name] for name in (PARTS, *dict(CONVENTIONS)) if name in reasons},
                     {**fields, 'model_type': model_type})
