@@ -195,8 +195,9 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     """A decoder record from before dropout builds with every rate zero and computes what its
     serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
     reference, and the same pre-dropout program exported in float64 from the same source its truth,
-    over the export's own weights and drawn ids (the two are different programs, which no bits
-    bind)."""
+    over drawn weights of the export's tree and drawn ids (the two are different programs, which no
+    bits bind; the export's own weights, one draw shared by every seed, leave its small leaves'
+    ratios unresolved within 512 seeds)."""
     from flax.traverse_util import unflatten_dict
     from jax import export
 
@@ -221,23 +222,26 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
     current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
 
+    initialized = jax.jit(lambda key, ids: nn.unbox(model.init(key, ids)))
+
     def draw(seed):
-        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
-        return (ids.astype(held["ids"].dtype),)
-
-    @as_given
-    def ours(ids):
-        with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
-            return jax.device_get(current(params, ids))
-
-    @as_given
-    def theirs(ids):
+        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape).astype(held["ids"].dtype)
         with jax.default_device(cpu):
-            return jax.device_get(exported(params, ids))
+            return jax.device_get(initialized(jax.random.key(seed), ids)), ids
 
-    def truth(ids):
+    @as_given
+    def ours(weights, ids):
+        with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
+            return jax.device_get(current(weights, ids))
+
+    @as_given
+    def theirs(weights, ids):
+        with jax.default_device(cpu):
+            return jax.device_get(exported(weights, ids))
+
+    def truth(weights, ids):
         with jax.enable_x64(new_val=True), jax.default_device(cpu):
-            return jax.device_get(wide.call(widened(params), ids))
+            return jax.device_get(wide.call(widened(weights), ids))
 
     assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
                     truth_fn=truth)
