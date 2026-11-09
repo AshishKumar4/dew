@@ -33,7 +33,6 @@ from reference_error import (
     assert_as_exact,
     equations,
     torch_with_gradients,
-    widened,
     with_gradients,
     without_ynn,
 )
@@ -241,7 +240,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
 
     def truth(weights, ids):
         with jax.enable_x64(new_val=True), jax.default_device(cpu):
-            return jax.device_get(wide.call(widened(weights), ids))
+            return wide.call(weights, ids)
 
     assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
                     truth_fn=truth)
