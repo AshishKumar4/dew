@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 
-from dew import _records
 from dew.batch import unboxed
+from dew.interop.config_records import hf_metadata
 from dew.interop.unread import Stored
 from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.audio import Gemma3nAudio, Gemma4Audio
@@ -22,8 +22,6 @@ from dew.registry import from_record
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
-
-_METADATA = _records.HF_METADATA | {"model_type"}
 
 
 def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
@@ -38,7 +36,8 @@ def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
     else:
         raise ValueError(f"audio model_type {model_type!r} is not supported")
     fields = {field.name for field in dataclasses.fields(cls)}
-    unknown = set(record) - fields - _METADATA - other - {key for key in record if key.startswith("_")}
+    unknown = (set(record) - fields - hf_metadata() - other
+               - {key for key in record if key.startswith("_")})
     if unknown:
         raise ValueError(f"audio config fields {sorted(unknown)} have no counterpart")
     return from_record(cls, {key: value for key, value in record.items() if key in fields})

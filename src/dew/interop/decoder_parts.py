@@ -26,7 +26,7 @@ from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import unboxed
 from dew.interop.codecs import CODEC_FIELDS
-from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.config_records import NativeFields, hf_metadata, native_fields
 from dew.interop.layouts import (
     Condition,
     Config,
@@ -142,11 +142,11 @@ fields, in its order."""
 # These fields have no effect on an eval-time forward pass: metadata, token
 # ids, or runtime knobs of the reference implementation (Gemma 3 ships
 # cache_implementation 'hybrid', which describes transformers' KV cache).
-IGNORED_FIELDS = set(_records.HF_METADATA) | {
+IGNORED_FIELDS = frozenset({
     'attention_dropout', 'attn_implementation', 'auto_map', 'bos_token_id', 'cache_implementation',
     'eos_token_id', 'initializer_range', 'max_window_layers', 'pad_token_id', 'pretraining_tp',
     'use_cache', 'use_sliding_window', 'unk_token_id',
-}
+})
 
 
 # A wrapper's text_config serialized by transformers 4.56.2 carries every
@@ -223,7 +223,7 @@ def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
     model_type = hf_config.get('model_type')
     inert = _INERT_FIELDS[None] | _INERT_FIELDS.get(model_type if isinstance(model_type, str) else None,
                                                     frozenset())
-    return (set(hf_config) - used - IGNORED_FIELDS - CODEC_FIELDS - inert
+    return (set(hf_config) - used - hf_metadata() - IGNORED_FIELDS - CODEC_FIELDS - inert
             - {key for key in hf_config if str(key).startswith('_')})
 
 
