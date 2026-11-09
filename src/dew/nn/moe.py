@@ -661,8 +661,8 @@ def gathered(x: jax.Array | Gathered) -> jax.Array:
     return x.tokens[x.rows] if isinstance(x, Gathered) else x
 
 
-def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | Layered, group_sizes: jax.Array,
-                      dtype: Dtype | None, implementation: str,
+def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | gemm.NvFp4 | Layered,
+                      group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike, bias: jax.Array | None = None,
                       scatter: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
