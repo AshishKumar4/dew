@@ -945,29 +945,34 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
 
 
 @runs("sm90")
+@pytest.mark.parametrize("out_dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32, exact sums"])
 @pytest.mark.parametrize(("rows", "depth", "width"), [(320, 128, 2816), (200, 128, 2816), (320, 256, 1408)])
-def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width):
+def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype):
     """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
     wave at most half full (`mosaic_gpu.balanced_tail`, its hand-off unmeasured, so the tail is taken at
     these few steps a tile): its tail's steps balanced over the programs, a program's range crossing a tile's
     boundary, each tile fixed up across them, on par with XLA's over the draws (check 1), truth float64's;
-    at rows a step does not divide, and at a tile of 256 x 128."""
+    at rows a step does not divide, and at a tile of 256 x 128; into fp32 at the highest precision too, its
+    programs' partials exactly summed (`templates.product.promoted`) and added by IEEE adds."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
     spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     gradient = grouped_matmul.MosaicTgmm()
+    exact = jnp.dtype(out_dtype) == jnp.float32
     with generation.assumed(target):
         call = gradient.bind(spec((rows, depth)), spec((rows, width)), jax.ShapeDtypeStruct((1,), jnp.int32),
-                             interpret=False, out_dtype="bfloat16", dense=True)
+                             interpret=False, out_dtype=jnp.dtype(out_dtype).name, dense=True,
+                             exact_sums=exact)
         tile = gradient.derived(call, target)
     assert mosaic_gpu.balanced_tail(tile, (depth // tile.block_m, width // tile.block_n),
                                     -(-rows // tile.block_k), (2, 2), target, 8) is not None
 
     def dew(x, w, dy):
         del w
-        return gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)[0]
+        return gemm.gemm_t(x, dy, None, out_dtype=out_dtype, interpret_on_cpu=True,
+                           precision="highest" if exact else None)[0]
 
-    def plain(x, w, dy, wide=jnp.float32, out=jnp.bfloat16):
+    def plain(x, w, dy, wide=jnp.float32, out=out_dtype):
         del w
         return jnp.dot(x.T.astype(wide), dy.astype(wide)).astype(out)
 
@@ -1022,8 +1027,9 @@ def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, tr
     """A dense product whose depth splits (`Tiles.splits`, template push piece 4) walks every tile's first run
     of steps, then every tile's second, in one launch, each run's fp32 partial its own output slice, the
     partials summed in order and rounded once: over small integers, every product and sum exact, bitwise
-    the unsplit launch's, at two and three runs (the last shorter), on each family; a hooked call, or a
-    split leaving a run no step, is refused."""
+    the unsplit launch's, at two and three runs (the last shorter), on each family, into bf16 and exactly
+    summed into fp32 (each run's exact sums, the partials added by IEEE adds); a hooked call, or a split
+    leaving a run no step, is refused."""
     rows, depth, width = 136, 320, 256
     keys = jax.random.split(jax.random.key(4))
     x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
@@ -1032,16 +1038,17 @@ def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, tr
     tiles = (COOPERATIVE if generation_name == "sm90"
              else mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="mma.sync"))
 
-    def dew(splits, **hooks):
+    def dew(splits, out_dtype=jnp.bfloat16, **hooks):
         return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
                               tiles=dataclasses.replace(tiles, splits=splits), transpose_rhs=transpose_rhs,
-                              out_dtype=jnp.bfloat16, multiprocessors=8, interpret=grouped_matmul.INTERPRETED,
-                              dense=True, **hooks)
+                              out_dtype=out_dtype, multiprocessors=8, interpret=grouped_matmul.INTERPRETED,
+                              dense=True, exact_sums=bool(jnp.dtype(out_dtype) == jnp.float32), **hooks)
 
     with generation.assumed(generation_name):
-        whole = np.asarray(dew(1), np.float32)
-        for splits in (2, 3):
-            np.testing.assert_array_equal(np.asarray(dew(splits), np.float32), whole)
+        for out_dtype in (jnp.bfloat16, jnp.float32):
+            whole = np.asarray(dew(1, out_dtype), np.float32)
+            for splits in (2, 3):
+                np.testing.assert_array_equal(np.asarray(dew(splits, out_dtype), np.float32), whole)
         for refused in ({"splits": 2, "epilogue": lambda acc: acc * 2}, {"splits": 4}):
             with pytest.raises(ValueError):
                 dew(refused.pop("splits"), **refused)
@@ -2162,7 +2169,7 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
     (jnp.bfloat16, HIGHEST, (jnp.float32,), True, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16,), False, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16, jnp.float32), True, None),
-    (jnp.float16, DEFAULT, (jnp.float32,), True, None),
+    (jnp.float16, DEFAULT, (jnp.float32,), False, None),
     (jnp.bfloat16, DEFAULT, (jnp.bfloat16,), False, None),
     (jnp.float32, DEFAULT, (jnp.float32,), False, None),
     (jnp.float32, HIGHEST, (jnp.float32,), True, "TF32"),
@@ -2178,8 +2185,9 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
 ])
 def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, precision, outputs, promoted,
                                                                    refused):
-    """A precision above the default, or 16-bit operands at any (row 4331), promotes each depth step's
-    partial where an output is fp32, and an FP8 product always (testing.md, FP8 products); the kernels refuse
+    """A precision above the default promotes each depth step's partial where an output is fp32, 16-bit
+    operands at the default precision summing on the tensor cores (M-EM-3), and an FP8 product always
+    (testing.md, FP8 products); the kernels refuse
     fp32 products above the default (they multiply in TF32), a dtype they do not multiply in, and a
     declared dot algorithm whose products are not the operands' whole ones (TF32's, bf16 parts of an fp32
     product, F64's: `precision.exact_products`), which a portable route computes."""

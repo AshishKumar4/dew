@@ -103,6 +103,55 @@ def test_a_cpu_pairwise_dense_product_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("form", ["rows", "groups"])
+def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
+    """`pairwise.pairwise_ragged_dot_general` (a CPU's float32 grouped product summed blocked and pairwise,
+    row 4863's GEMM remainder): its rows grouped and their depth contracted, and each group's rows contracted
+    into the group's matrix (96 deep, and 36 rows, few enough that no partial sum of its products near
+    float32's largest passes it where its total does not), so both take blocks and a partial last one, one
+    group empty:
+    every order runs in the float operands, the group sizes not differentiable, finite wherever float64 is a
+    normal float32 and wherever the plain grouped product is (by a mask, its float64 run the truth; each
+    group's rows contracted by the dense form, whose tree the grouped form's is)."""
+    from dew.nn import pairwise
+
+    sizes = jnp.asarray([70, 0, 66] if form == "rows" else [20, 0, 16], jnp.int32)
+    rows = int(sizes.sum())
+    groups = jax.nn.one_hot(jnp.repeat(jnp.arange(3), sizes, total_repeat_length=rows), 3)
+    if form == "rows":
+        numbers = jax.lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
+        shapes, out = ((136, 96), (3, 96, 5)), (136, 5)
+
+        def plain(rows, matrices):
+            return jnp.einsum("rg,rk,gkn->rn", groups.astype(rows.dtype), rows, matrices)
+    else:
+        numbers = jax.lax.RaggedDotDimensionNumbers((((0,), (0,)), ((), ())), (0,), ())
+        shapes, out = ((rows, 4), (rows, 5)), (3, 4, 5)
+
+        def masked(rows, cotangent):
+            return jnp.einsum("rg,rk,rn->gkn", groups.astype(rows.dtype), rows, cotangent)
+
+        def plain(rows, cotangent):
+            # Each group's rows summed as the dense form sums a contraction (`pairwise_dot_general`), whose
+            # partial sums near float32's largest pass it where they pass it (the same tree, bitwise:
+            # tests/test_cpu_dense_sums.py), where XLA's chain sums them in another order; float64 the
+            # masked product's.
+            if rows.dtype == jnp.float64:
+                return masked(rows, cotangent)
+            starts, numbers = np.cumsum([0, *np.asarray(sizes)]), (((1,), (0,)), ((), ()))
+            return jnp.stack([pairwise.pairwise_dot_general(rows[a:b].T, cotangent[a:b], numbers)
+                              for a, b in itertools.pairwise(starts)])
+
+    primals = normal_draw(4866, *shapes, scale=EDGES[edge])
+    direction = normal_draw(4867, *shapes, scale=EDGES[edge])
+    (cotangent,) = normal_draw(4868, out)
+    assert pairwise.contraction_block(96) < 96 and pairwise.contraction_block(36) < 36
+    assert_contract(lambda lhs, rhs: pairwise.pairwise_ragged_dot_general(lhs, rhs, sizes, numbers),
+                    primals, direction, cotangent, f"a CPU pairwise grouped product {form} {edge}",
+                    truth_fn=plain if form == "rows" else masked, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch, edge):
     """`precision.accumulated` in a process running wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, its own
     custom derivative of the float64-summed product): every order runs, finite wherever float64 is a

@@ -404,13 +404,15 @@ deepest, narrow key and narrowest gate products, its HLO 10-28), and a kernel gr
 which one consumer computes."""
 
 PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "input gradient fp16",
-               "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
-"""The forms every family's GEMM launches emit: each product and output dtype they take."""
+               "kernel gradient", "kernel gradient fp32", "kernel gradient fp16", "dense kernel gradient")
+"""The forms every family's GEMM launches emit: each product and output dtype they take, and a dense kernel
+gradient, its stages read as loaded (`mosaic_gpu.rows_unstaged`)."""
 
 FP8_FORMS = ("forward fp8",)
 """The FP8 forms a family whose products take FP8 operands emits (`Family.takes_fp8`)."""
 
-EXACT_FORMS = ("kernel gradient exact fp32", "forward exact fp32", "input gradient exact fp32")
+EXACT_FORMS = ("kernel gradient exact fp32", "forward exact fp32", "input gradient exact fp32",
+               "dense kernel gradient exact fp32")
 """The exactly summed forms a family whose model counts a running sum emits (`Family.counts_sums`): an fp32
 output of 16-bit products (`templates.product.promoted`)."""
 
@@ -446,6 +448,7 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     vector = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
     sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
+    whole = jax.ShapeDtypeStruct((1,), jnp.int32)
     x, w, dy = shaped((rows, depth)), shaped((groups, depth, width)), shaped((rows, width))
     x16, w16, dy16 = (jax.ShapeDtypeStruct(array.shape, jnp.float16) for array in (x, w, dy))
     # An FP8 product's operands (E4M3), its matrix K-major as Hopper's FP8 tensor cores read it (row 3620).
@@ -468,6 +471,9 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
         ("kernel gradient fp32", tgmm, (x, dy, sizes), backward),
         ("kernel gradient fp16", tgmm, (x16, dy16, sizes), backward),
         ("kernel gradient exact fp32", tgmm, (x, dy, sizes), {**backward, "exact_sums": True}),
+        ("dense kernel gradient", tgmm, (x, dy, whole), {**backward, "out_dtype": "bfloat16", "dense": True}),
+        ("dense kernel gradient exact fp32", tgmm, (x, dy, whole),
+         {**backward, "exact_sums": True, "dense": True}),
         ("forward exact fp32", gmm, (x, w, sizes), {**forward, "out_dtype": "float32", "exact_sums": True}),
         ("input gradient exact fp32", gmm, (dy, w, sizes),
          {**backward, "trans_rhs": True, "exact_sums": True}),
@@ -622,7 +628,9 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
              *(HOOKED_FORMS if family.counts_hooks else ()),
              *(FP8_FORMS if family.takes_fp8 else ())}
     if not family.issues_in_consumers:
-        forms = {form for form in forms if "kernel gradient" not in form and form not in EXACT_FORMS}
+        # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`).
+        forms = {form for form in forms
+                 if form.startswith("dense") or ("kernel gradient" not in form and form not in EXACT_FORMS)}
     if shape is None:
         return forms
     _, depth, width, _ = GEMM_SHAPES[shape]

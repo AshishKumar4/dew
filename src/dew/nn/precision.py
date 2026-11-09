@@ -496,22 +496,26 @@ def _sums_in_float64(*operands) -> bool:
     return _wide_cpu_products(*operands) and jax.config.jax_default_matmul_precision != FP32_SUMS
 
 
-def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
+def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike, counts: int = 0) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
     CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`), with no platform of its own to choose.
     Its products run at HIGHEST precision, whatever fp32 algorithm the caller bound, which would
-    narrow float64 operands back to float32."""
+    narrow float64 operands back to float32. Its last `counts` operands (a ragged dot's group sizes) multiply
+    nothing and pass through as they are."""
     with jax.enable_x64(new_val=True):
-        wide = product(*_widened(operands), precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
+        wide = product(*_widened(operands, counts), precision=jax.lax.Precision.HIGHEST,
+                       preferred_element_type=None)
         return wide.astype(dtype)
 
 
-def _widened(operands) -> list[jax.Array]:
+def _widened(operands, counts: int = 0) -> list[jax.Array]:
     """`operands` as the float64 operands of their float32 product: each converted to the dtype they
     multiply in (`products_dtype`), as the product converts them, then widened exactly."""
-    dtype = products_dtype(*operands)
-    return [operand.astype(dtype).astype(jnp.float64) for operand in operands]
+    multiplied = operands[:len(operands) - counts]
+    dtype = products_dtype(*multiplied)
+    widened = [operand.astype(dtype).astype(jnp.float64) for operand in multiplied]
+    return widened + list(operands[len(multiplied):])
 
 
 def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
@@ -571,6 +575,16 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     products here. A computation that stands for such a target, a reference for a kernel interpreted
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
+    if _ragged(product):
+        # A ragged dot's group sizes count its rows and multiply nothing (`counts`): its product is of the two
+        # others, the sizes passed through as they are.
+        *multiplied, _ = operands
+        if _sums_in_float64(*multiplied):
+            return _summed_wide(product, preferred_element_type, *operands, counts=1)
+        if (all(isinstance(operand, jax.Array | np.ndarray) for operand in multiplied)
+                and products_dtype(*multiplied) == jnp.dtype(jnp.float32)):
+            return _summed_pairwise(product, preferred_element_type, *operands)
+        return product(*operands, preferred_element_type=preferred_element_type)
     if not _sums_in_float64(*operands):
         if ((key := _contraction(product, preferred_element_type)) is not None
                 and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
@@ -582,8 +596,16 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     return _summed_wide(product, preferred_element_type, *operands)
 
 
+def _ragged(product: Callable) -> bool:
+    """Whether `product` is `jax.lax.ragged_dot_general` (bound through `functools.partial`s), whose last
+    operand is its group sizes."""
+    while isinstance(product, functools.partial) and type(product) is functools.partial:
+        product = product.func
+    return product is jax.lax.ragged_dot_general
+
+
 def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
-                       preferred_element_type) -> jax.Array | None:
+                       preferred_element_type, group_sizes=None) -> jax.Array | None:
     """A layer's projection (`product`, its own `jax.lax.dot_general`, as `gemm.dot_general` takes a layer's
     product past the template) of float32 operands into float32, summed as a vectorized dot sums it where a
     CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other platform;
@@ -591,14 +613,27 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
     sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
     product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
-    takes it too (`_paired`)."""
+    takes it too (`_paired`). With `group_sizes`, `product` is a ragged dot (`jax.lax.ragged_dot_general`, its
+    `dimension_numbers` the ragged ones) of a grouped GEMM's form (`pairwise.ragged_form`), summed so by
+    `pairwise.pairwise_ragged_dot_general`; None for any other form."""
     from dew.nn import pairwise
 
     if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
             or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
             or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
-                       for operand in (lhs, rhs))):
+                       for operand in (lhs, rhs))
+            or (group_sizes is not None and pairwise.ragged_form(lhs, rhs, dimension_numbers) is None)):
         return None
+
+    if group_sizes is not None:
+        def plain_grouped(lhs, rhs, sizes):
+            return product(lhs, rhs, sizes, dimension_numbers, precision=precision,
+                           preferred_element_type=preferred_element_type)
+
+        blocked_grouped = functools.partial(pairwise.pairwise_ragged_dot_general,
+                                            ragged_dot_dimension_numbers=dimension_numbers,
+                                            precision=precision)
+        return jax.lax.platform_dependent(lhs, rhs, group_sizes, cpu=blocked_grouped, default=plain_grouped)
 
     def plain(lhs, rhs):
         return product(lhs, rhs, dimension_numbers, precision=precision,
@@ -697,8 +732,8 @@ def _summed_pairwise(product: Callable, preferred_element_type, *operands) -> ja
 
 def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
     """`jaxpr` evaluated on `operands`, each `dot_general` in it, a jit's program's included (`jnp.einsum`'s),
-    the product `projection_product` takes where it takes it: a CPU's vectorized-dot sum of float32
-    operands into float32."""
+    and each grouped GEMM's `ragged_dot_general`, the product `projection_product` takes where it takes it: a
+    CPU's vectorized-dot sum of float32 operands into float32."""
     values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, operands, strict=True))
 
     def read(atom):
@@ -709,9 +744,16 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
         params = equation.params
         inner = params.get("jaxpr")
         product = functools.partial(jax.lax.dot_general, out_sharding=params.get("out_sharding"))
-        if equation.primitive is jax.lax.dot_general_p and (made := projection_product(
-                product, given[0], given[1], params["dimension_numbers"], params["precision"],
-                params["preferred_element_type"])) is not None:
+        made = None
+        if equation.primitive is jax.lax.dot_general_p:
+            made = projection_product(product, given[0], given[1], params["dimension_numbers"],
+                                      params["precision"], params["preferred_element_type"])
+        elif equation.primitive.name == "ragged_dot_general" and params.get("group_offset") is None:
+            made = projection_product(
+                functools.partial(jax.lax.ragged_dot_general, out_sharding=params.get("out_sharding")),
+                given[0], given[1], params["ragged_dot_dimension_numbers"], params["precision"],
+                params["preferred_element_type"], group_sizes=given[2])
+        if made is not None:
             outputs = [made]
         elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.Jaxpr):
             # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
@@ -725,10 +767,10 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
     return [read(atom) for atom in jaxpr.outvars]
 
 
-def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Array:
+def _summed_wide(product: Callable, preferred_element_type, *operands, counts: int = 0) -> jax.Array:
     """`accumulated`'s product under Dew's wide CPU arithmetic: its float64 sum where it takes the
     platform's choice (`platform_dependent`), the plain product where its result is wider than float32 or
-    its library states its derivative."""
+    its library states its derivative; its last `counts` operands multiply nothing (`float64_sum`)."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
@@ -740,14 +782,14 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
         return narrow(*operands)
 
     def summed(*operands):
-        return float64_sum(product, *operands, dtype=dtype)
+        return float64_sum(product, *operands, dtype=dtype, counts=counts)
 
     def pulled(saved, operands, cotangent, live):
         """The cotangents of the operands at `live`, each the float64 sum of its products rounded
         once: JAX transposes a product after its trace, outside the scope that widened it, so the
         pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
-            wide = _widened(operands)
+            wide = _widened(operands, counts)
             wide_cotangent = cotangent.astype(jnp.float64)
 
             def transposed(index):

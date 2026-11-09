@@ -252,8 +252,9 @@ def test_a_padded_rows_layout_reads_as_its_coordinates_say():
 
 
 def test_a_stacked_row_refuses_several_packed_documents():
-    """A stacked pass refuses a row of several packed documents: the decode cache keeps no document ids
-    (the decoder's own refusal, ValueError)."""
+    """A stacked pass refuses a row of several packed documents: its levels are one level a row, so a later
+    document's windows would read the levels an earlier one's tokens stepped (ValueError, its own refusal:
+    the decode cache keeps each key's document since the workaround audit's group 84, and refuses none)."""
     adaptation = ChunkAdaptation(window=3, rate=0.1, layers=(0,))
     variables, tokens = draw(0)
     inputs, targets = tokens[:, :-1], tokens[:, 1:]

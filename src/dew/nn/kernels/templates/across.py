@@ -90,3 +90,27 @@ def summed_across(value, scratch: dict, wg, consumers: int, store: Callable) -> 
             total = total + parts[other]
         plgpu.barrier_arrive(read.at[0])
         store(total)
+
+
+MERGED_REGISTERS = 64
+"""The registers a thread of a merging role holds the partials it reads ahead of combining them in
+(`Family.fixed_up`): as many partials as fit, at least one (an H100's 16-row decode's at 64 columns 10, its
+tile's 8 and its two statistics' 1 each; a GEMM's 128 x 128 fp32 tile 128). One partial read at a time
+waited each read behind the last one's combine, 0.49 us a slice (a 16-row decode's 49, M-DD-12)."""
+
+
+def merge_slices(summed, held: int) -> tuple[int | None, int]:
+    """The place among a partial's leaves of its widest 2-D leaf and the column slices `Family.fixed_up`
+    merges it in: as few as bring its registers a thread (`held`) within `MERGED_REGISTERS`, each a whole
+    number of the layout's 8-column atoms dividing its columns; none (and one slice) where it already fits or
+    has no 2-D leaf."""
+    leaves = jax.tree.leaves(summed)
+    tiles = [place for place, leaf in enumerate(leaves) if leaf.ndim == 2]
+    if held <= MERGED_REGISTERS or not tiles:
+        return None, 1
+    widest = max(tiles, key=lambda place: leaves[place].size)
+    columns = leaves[widest].shape[1]
+    slices = -(-held // MERGED_REGISTERS)
+    while slices < columns // 8 and (columns % slices or (columns // slices) % 8):
+        slices += 1
+    return (widest, slices) if columns % slices == 0 and (columns // slices) % 8 == 0 else (None, 1)

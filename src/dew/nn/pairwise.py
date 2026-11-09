@@ -188,3 +188,146 @@ def pairwise_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, prec
 def _inverse(permutation: tuple) -> tuple:
     """The permutation undoing `permutation`."""
     return tuple(sorted(range(len(permutation)), key=permutation.__getitem__))
+
+
+def _rows_blocked(rows: jax.Array, matrices: jax.Array, group_sizes: jax.Array, precision) -> jax.Array:
+    """Each row of float32 `rows` (`[rows, depth]`) times its group's matrix of `matrices` (`[groups, depth,
+    columns]`, the groups `group_sizes`' runs of rows, the rows past them zero), summed as `_blocked` sums a
+    dense product: the depth in blocks (`contraction_block`), each block's ragged dot XLA's own, their sums
+    added as a tree (`_tree`), a run of the columns at a time where the blocks' sums would hold more than
+    `workspace_bytes`."""
+    depth, columns = rows.shape[1], matrices.shape[2]
+    block = contraction_block(depth)
+
+    def plain(rows, matrices):
+        return jax.lax.ragged_dot(rows, matrices, group_sizes, precision=precision,
+                                  preferred_element_type=jnp.float32)
+
+    if block >= depth or 0 in rows.shape + matrices.shape:
+        return plain(rows, matrices)
+    count = -(-depth // block)
+    pad = count * block - depth
+    rows = jnp.pad(rows, ((0, 0), (0, pad))).reshape(rows.shape[0], count, block).transpose(1, 0, 2)
+    held = count * rows.shape[1] * columns * 4
+    runs = min(columns, max(1, -(-held // workspace_bytes())))
+    width = -(-columns // runs)
+    matrices = jnp.pad(matrices, ((0, 0), (0, pad), (0, runs * width - columns)))
+    matrices = matrices.reshape(matrices.shape[0], count, block, runs, width).transpose(3, 1, 0, 2, 4)
+
+    def run(columns_run):
+        parts = jax.lax.map(lambda pair: plain(*pair), (rows, columns_run))
+        return _tree(jnp.moveaxis(parts, 0, 1))
+
+    summed = jax.lax.map(run, matrices) if runs > 1 else run(matrices[0])[None]
+    return jnp.moveaxis(summed, 0, 1).reshape(rows.shape[1], runs * width)[:, :columns]
+
+
+def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Array, precision) -> jax.Array:
+    """Each group's float32 `rows` (`[rows, depth]`) transposed times its rows of `cotangent` (`[rows,
+    width]`), `[groups, depth, width]`, summed as `_blocked` sums a dense contraction over its rows: each
+    group's rows in blocks from its first (`contraction_block` of the rows), a block of every group a batched
+    dot of XLA's own, the blocks' sums added as `_tree` adds them, one block's into a binary counter of
+    partial sums at a time, so the steps are the largest group's blocks and the sums held a level of the tree
+    each (a group of no rows zero). The steps walk to the most blocks any group may hold, a static count
+    reverse mode differentiates, each past the largest group's blocks skipped (`lax.cond`): adding a zero
+    block to the counter changes no sum."""
+    total, depth, width = rows.shape[0], rows.shape[1], cotangent.shape[1]
+    groups = group_sizes.shape[0]
+    block = contraction_block(total)
+    starts = jnp.cumsum(group_sizes) - group_sizes
+    steps = (jnp.max(group_sizes, initial=0) + block - 1) // block
+    most = max(1, -(-total // block))
+    levels = most.bit_length()
+    offsets = jnp.arange(block)
+
+    def gathered(operand, step):
+        place = step * block + offsets[None, :]
+        valid = place < group_sizes[:, None]
+        taken = operand[jnp.clip(starts[:, None] + place, 0, total - 1)]
+        return jnp.where(valid[..., None], taken, 0)
+
+    def counted(held, step):
+        return jax.lax.cond(step < steps, functools.partial(added, step), lambda held: held, held), None
+
+    def added(step, held):
+        value = jax.lax.dot_general(gathered(rows, step), gathered(cotangent, step),
+                                    (((1,), (1,)), ((0,), (0,))), precision=precision,
+                                    preferred_element_type=jnp.float32)
+        done = jnp.zeros((), jnp.bool_)
+        for level in range(levels):
+            bit = (step >> level) & 1 == 1
+            value = jnp.where(~done & bit, held[level] + value, value)
+            held = held.at[level].set(jnp.where(~done & ~bit, value, held[level]))
+            done = done | ~bit
+        return held
+
+    held, _ = jax.lax.scan(counted, jnp.zeros((levels, groups, depth, width), jnp.float32), jnp.arange(most))
+    # The counter's levels added from the lowest, as `_tree` carries its odd part up to the last add.
+    summed, have = jnp.zeros((groups, depth, width), jnp.float32), jnp.zeros((), jnp.bool_)
+    for level in range(levels):
+        bit = (steps >> level) & 1 == 1
+        summed = jnp.where(bit & ~have, held[level], jnp.where(bit, held[level] + summed, summed))
+        have = have | bit
+    return summed
+
+
+def ragged_form(lhs, rhs, ragged_dot_dimension_numbers) -> str | None:
+    """Which of a grouped GEMM's ragged products `jax.lax.ragged_dot_general` of `lhs` and `rhs` is
+    (`pairwise_ragged_dot_general` sums these): 'rows', rows grouped and their depth contracted, `[rows,
+    depth]` by `[groups, depth, width]`; 'rows transposed', its matrices `[groups, width, depth]`; 'groups',
+    each group's rows contracted, `[rows, depth]` by `[rows, width]` into `[groups, depth, width]`; None for
+    any other."""
+    (contracted_axes, against), batch = (tuple(map(tuple, pair))
+                                         for pair in ragged_dot_dimension_numbers.dot_dimension_numbers)
+    ragged = tuple(ragged_dot_dimension_numbers.lhs_ragged_dimensions)
+    grouped = tuple(ragged_dot_dimension_numbers.rhs_group_dimensions)
+    if batch != ((), ()) or jnp.ndim(lhs) != 2 or ragged != (0,):
+        return None
+    if grouped == (0,) and jnp.ndim(rhs) == 3 and contracted_axes == (1,) and against in ((1,), (2,)):
+        return 'rows' if against == (1,) else 'rows transposed'
+    if grouped == () and jnp.ndim(rhs) == 2 and contracted_axes == (0,) and against == (0,):
+        return 'groups'
+    return None
+
+
+def pairwise_ragged_dot_general(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array,
+                                ragged_dot_dimension_numbers, precision=None) -> jax.Array:
+    """`jax.lax.ragged_dot_general` of float32 `lhs` and `rhs` into float32 in a form `ragged_form` names,
+    summed blocked and pairwise as `pairwise_dot_general` sums a dense one: rows grouped and their depth
+    contracted by `_rows_blocked`, each group's rows contracted by `_groups_blocked`. Its reverse pass is the
+    plain product's, each cotangent a product of its own summed so over its own contraction (Protected, as
+    the dense form's)."""
+    from dew.nn.kernels.generation import linear_tangent
+
+    form = ragged_form(lhs, rhs, ragged_dot_dimension_numbers)
+    if form is None:
+        raise ValueError(f"no pairwise ragged product takes {ragged_dot_dimension_numbers}")
+    if form != 'groups':
+        transposed = form == 'rows transposed'
+
+        def summed(rows, matrices, sizes):
+            matrices = jnp.swapaxes(matrices, 1, 2) if transposed else matrices
+            return _rows_blocked(rows, matrices, sizes, precision)
+
+        def pulled(saved, operands, cotangent, live):
+            rows, matrices, sizes = operands
+            laid = jnp.swapaxes(matrices, 1, 2) if transposed else matrices
+            gradients = {0: lambda: _rows_blocked(cotangent, jnp.swapaxes(laid, 1, 2), sizes, precision),
+                         1: lambda: (lambda grads: jnp.swapaxes(grads, 1, 2) if transposed else grads)(
+                             _groups_blocked(rows, cotangent, sizes, precision))}
+            return tuple(gradients[index]() for index in live)
+    else:
+        def summed(rows, cotangent, sizes):
+            return _groups_blocked(rows, cotangent, sizes, precision)
+
+        def pulled(saved, operands, cotangent, live):
+            rows, rows_cotangent, sizes = operands
+            gradients = {0: lambda: _rows_blocked(rows_cotangent, jnp.swapaxes(cotangent, 1, 2), sizes,
+                                                  precision),
+                         1: lambda: _rows_blocked(rows, cotangent, sizes, precision)}
+            return tuple(gradients[index]() for index in live)
+
+    product = contracted("test_a_cpu_pairwise_grouped_product_holds_every_order")(
+        linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
+                       kind=Protected()))
+    return product(lhs, rhs, group_sizes)
