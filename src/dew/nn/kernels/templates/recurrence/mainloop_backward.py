@@ -347,7 +347,11 @@ def _gate_back(run, call: Call, dv2, gated: list, laid_do, skip) -> tuple:
     output's gradient `laid_do`. `dskip` None without a `skip`."""
     if gated:
         dbeta, *skipped = gated
-        return dv2, dbeta.sum(0).T, compensated_sum(skipped[0], (0, 2)) if skipped else None
+        # The skip's terms summed over the call's tokens alone: the walk visits the chunks of the rows'
+        # sequences and leaves a laid chunk no sequence takes unwritten (non-finite where a packed call's
+        # table holds one, the SSD's skip gradient on every draw, M-JS-63).
+        dskip = compensated_sum(run.unlaid(jnp.moveaxis(skipped[0], 2, 0)), (0, 1, 2)) if skipped else None
+        return dv2, dbeta.sum(0).T, dskip
     rows, heads, columns = call.rows, call.heads, call.value_width
     du = dv2.astype(jnp.float32).reshape(rows, heads, columns)
     values = call.given.joined(run.v).reshape(rows, heads, columns)

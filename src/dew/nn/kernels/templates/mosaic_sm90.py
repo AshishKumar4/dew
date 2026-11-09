@@ -87,6 +87,20 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     products_overlap = True
     in_flight = 1
 
+    assembled = 26
+    """The registers past an MMA's fp32 accumulator a thread's register target holds at least, whatever its
+    program's raises: the assembler's own floor, measured, not a model's choice. ptxas 12.9 (sm_90a) refused
+    a kernel of one m64nNk16 MMA (bf16 operands from shared memory into fp32) every target under N / 2 + 26
+    at N of 16, 32, 64 and 128, its one warpgroup's or under producer and consumer roles raised past it
+    (C7602), and assembled it spill-free there; the values' backward's at 16 wide blocks, 32 registers at 8
+    programs, at 34 (jsf-vback-root, M-JS-63). The CPU gate assembles it at the floor
+    (tests/test_kernel_compile_registers.py), so a ptxas that moves it fails there."""
+
+    def entry_floor(self, tiles) -> int:
+        widest = max((columns for _, columns, dtype in tiles if jnp.dtype(dtype) == jnp.float32), default=0)
+        accumulator = min(widest, self.widest_product) * self.rows // resources.THREADS
+        return accumulator + self.assembled if widest else 0
+
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
 
         def scores(acc_ref):

@@ -999,6 +999,15 @@ class Issuer[Accumulator](abc.ABC):
         del rows, depth
         return 0
 
+    def entry_floor(self, tiles) -> int:
+        """The least registers a thread a program issuing products into a consumer's fp32 `tiles` (each
+        `(rows, columns, dtype)`, its accumulators among them) launches with (`resources.Launch.entry`). It
+        binds at the kernel's entry register target, whatever its consumers' setmaxnreg raises them to after:
+        the assembler compiles the products within the entry's share. None of the family's own (tcgen05's
+        accumulators live in tensor memory)."""
+        del tiles
+        return 0
+
     def relaying(self, tile) -> Self:
         """The issuer whose register left operands relay through `tile`, a consumer's own plain
         shared-memory tile (`plain`) of at least `relay_bytes` (`[rows, depth]` of the operand's dtype):
