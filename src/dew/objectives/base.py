@@ -879,8 +879,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         from dew.inference.projections import unpacked
 
         # What the source drew fresh beside the weights it loaded, none where other variables replace them.
-        own = isinstance(source, Extended) and (variables is OMITTED or variables is source.variables)
-        self._fresh = tuple(source.fresh) if own else ()
+        self._fresh = ()
+        if _loaded(source) and isinstance(source, Extended) and (
+                variables is OMITTED or variables is source.variables):
+            self._fresh = tuple(source.fresh)
         if _loaded(source):
             variables = source.variables if variables is OMITTED else variables
             processor = source.text_processor if processor is OMITTED else processor
