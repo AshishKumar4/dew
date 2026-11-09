@@ -765,11 +765,18 @@ def stepped_per_shard(hooks: recurrence.Hooks, state: jax.Array, query: jax.Arra
     return manual_map(local, (memory, P(rows), specs), (three, memory))(state, active, given)
 
 
-def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, fuses: bool, normed: bool = True) -> str:
+def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, groups: int, fuses: bool,
+                  normed: bool = True) -> str:
     """The kernel a decode token over `state` `[B, Hv, Dk, Dv]` runs on the target, as the decode selector
-    reports it (`DELTA_DECODE`): a caller that has its conv and gates for the fused step to take (`fuses`),
+    reports it (`DELTA_DECODE`) of the state each shard steps (`stepped_per_shard`, `grouped_heads`: the
+    value heads split whole where the split divides the `groups` they read, a delta rule's key heads or
+    Mamba-2's B and C groups): a caller that has its conv and gates for the fused step to take (`fuses`),
     and a gated norm over a head with them (`normed`; Mamba2's norms its groups after the step)."""
-    return select(DELTA_DECODE, DecodeCase(state.shape, jnp.dtype(state.dtype), fuses, normed)).kernel
+    rows, heads = grouped_heads((state.shape[0], 1, state.shape[1], state.shape[-1]), groups)
+    mesh = jax.sharding.get_abstract_mesh()
+    rows, heads = (math.prod(mesh.shape[axis] for axis in mesh_axes(axes)) for axes in (rows, heads))
+    shard = (state.shape[0] // rows, state.shape[1] // heads, *state.shape[2:])
+    return select(DELTA_DECODE, DecodeCase(shard, jnp.dtype(state.dtype), fuses, normed)).kernel
 
 
 def fused_token(hooks: recurrence.Hooks, taps, *, heads: tuple[int, int, int], widths: tuple[int, int, int],
@@ -842,7 +849,7 @@ def decode_step(hooks: recurrence.Hooks, state: jax.Array, query: jax.Array, key
     `stepped_per_shard` takes them: the step kernel per shard where `decode_kernel` picks it, else the
     portable step (`recurrence.step_reference`) in the operands' own precision, which the compiler
     partitions."""
-    if decode_kernel(state, fuses=False) == 'step':
+    if decode_kernel(state, groups=key.shape[1], fuses=False) == 'step':
         return stepped_per_shard(hooks, state, query, key, value, log_decay, beta, active, rate=rate,
                                  skip=skip)
     out, _, final = recurrence.step_reference(hooks, recurrence.Step(
@@ -881,8 +888,8 @@ def decode_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
 @dataclasses.dataclass(frozen=True)
 class DecodeCase:
     """A gated delta net's decode token as the decode selector reads it (`DELTA_DECODE`): its state's
-    `[rows, heads, Dk, Dv]` `shape` and `dtype`, and whether the caller has a conv, gates and a gated norm
-    for the fused step to take (`fuses`)."""
+    `[rows, heads, Dk, Dv]` `shape` on a shard (`decode_kernel`) and `dtype`, and whether the caller has a
+    conv, gates and a gated norm for the fused step to take (`fuses`)."""
 
     shape: tuple[int, ...]
     dtype: np.dtype
@@ -890,11 +897,23 @@ class DecodeCase:
     normed: bool = True
 
 
-def _step_fits(case: DecodeCase) -> bool:
-    """Whether the template's step takes `case`'s state (`templates.recurrence.step.fits`)."""
+def _step_fits(case: DecodeCase, *, fused: bool) -> bool:
+    """Whether the template's step takes `case`'s state (`templates.recurrence.step.fits`): the fused step's
+    a head whole where its gated norm reads one (`fused`, a caller's with a conv, gates and norm to fuse; one
+    without them hands its token to the step, `unfused`), the step's by its own widths."""
     from dew.nn.kernels.templates.recurrence import step
 
-    return step.fits(case.shape, case.fuses and case.normed)
+    return step.fits(case.shape, fused and case.fuses and case.normed)
+
+
+def _widths(fused: bool) -> Requirement[DecodeCase]:
+    """A decode kernel's widths (`_step_fits`): the fused step's or the step's own, so a state the fused
+    step's norm refuses (fla's value heads of 512 or 64) still steps on the step."""
+    return Requirement('widths', lambda case: _step_fits(case, fused=fused),
+                       lambda case: "the launch's warpgroup takes a value column a thread over key vectors a "
+                                    "warpgroup wide{}, not {} keys by {} values".format(
+                                        " (a fused step's values a warpgroup a head)" if fused else "",
+                                        *case.shape[-2:]), row='roadmap: recurrence step widths')
 
 
 def _template_runs() -> bool:
@@ -912,23 +931,19 @@ _LAUNCH: tuple[Requirement[DecodeCase], ...] = (
                 lambda case: f"the launch holds a state in fp32 or bf16 and computes in fp32, not "
                              f"{case.dtype} (a float64 state keeps its own precision in `step_reference`)",
                 row=INHERENT),
-    Requirement('widths', lambda case: _step_fits(case),
-                lambda case: "the launch's warpgroup takes a value column a thread over key vectors a "
-                             "warpgroup wide (a fused step's values a warpgroup a head), not {} keys by {} "
-                             "values".format(*case.shape[-2:]), row='roadmap: recurrence step widths'),
 )
 """What the decode launches need of a token's state, the fused step and the step alike, the recurrence
-template's decode step (`templates.recurrence.step`): a GPU a Mosaic GPU bundle claims, a state in fp32 or
-bf16, and widths of whole warpgroups (a thread a value column; the fused step's values one block a head, as
-its conv's history and its gated norm read a head whole)."""
+template's decode step (`templates.recurrence.step`): a GPU a Mosaic GPU bundle claims and a state in fp32 or
+bf16; beside them each kernel's own widths of whole warpgroups (`_widths`: a thread a value column; the fused
+step's values one block a head, as its conv's history and its gated norm read a head whole)."""
 
 
 DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
-    Kernel('fused', (*_LAUNCH, Requirement('unfused', lambda case: case.fuses,
-                                           "the caller has no conv, gates or gated norm for the fused step "
-                                           "to take; its token runs the step alone", row=INHERENT,
-                                           kind='handoff'))),
-    Kernel('step', _LAUNCH),
+    Kernel('fused', (*_LAUNCH, _widths(fused=True),
+                     Requirement('unfused', lambda case: case.fuses,
+                                 "the caller has no conv, gates or gated norm for the fused step to take; "
+                                 "its token runs the step alone", row=INHERENT, kind='handoff'))),
+    Kernel('step', (*_LAUNCH, _widths(fused=False))),
     Kernel('xla', (), generic=True)), lambda case: 'step',
     named_from={('gated_delta_rule', 'xla'): 'xla'})
 """The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s), by what each
@@ -1135,7 +1150,7 @@ class GatedDeltaNet(nn.Module):
         the portable recurrence ('xla')."""
         state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
                                      self._stored(operand)[0])
-        return decode_kernel(state, fuses=True)
+        return decode_kernel(state, groups=self.num_k_heads, fuses=True)
 
     def _fused_hooks(self) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
