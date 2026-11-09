@@ -18,6 +18,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - On an A100 a gathered grouped projection. [5213]
 - Template and port walk the packed rows, each document from its own memory, and the portable walk's entered start. [5288]
 - XLA:GPU compiles a cuDNN fMHA backward with bias. [5322]
+- The template's rated scan (Mamba-2's SSD) gradient under the fast forms, decays near zero. [5335]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [2077, 485, 1424, 3423, 3425, 1506]
 - Derived resources: tiles, registers, residency and issued work. [2943, 3087, 2940, 566]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 2109]
@@ -79,10 +80,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - `precision.correctly_rounded_divide`'s tangent is `jnp.divide`'s. [5277]
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Reference comparisons held by derived bounds. [1719, 2094]
-- Bit-level synthesis in dew.algebra. [3733]
+- Bit-level synthesis in dew.algebra. [3733, 5343]
 - Tests/test_multimodal_model.py judges gemma3n-native-tiny's pixel gradient on its source draw. [5234]
 - Tests/test_multimodal_model.py judges gemma3n-native-tiny's logits after one SGD step on its source draw. [5235]
 - Tests/test_decision_laya.py's released English checkpoint. [5239]
+- algebra.md and the engine agree. [5337, 5338, 5339, 5340, 5342, 5341]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 
 ## Decision
