@@ -225,7 +225,7 @@ def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_
         with jax.default_matmul_precision(precision.FP32_SUMS):
             out = jax.jit(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32))(x, w)
             dx = jax.jit(lambda dy, w: gemm.gemm(dy, w, group_sizes, transpose_rhs=True,
-                                                 out_dtype=jnp.float32))(dy, jnp.swapaxes(w, 1, 2))
+                                                 out_dtype=jnp.float32))(dy, w)
             dw = jax.jit(lambda x, dy: gemm.gemm_t(x, dy, whole, out_dtype=jnp.float32))(x, dy)
         for g, (start, end) in enumerate(zip(starts[:-1], starts[1:], strict=True)):
             rows, cotangent = x[start:end], dy[start:end]

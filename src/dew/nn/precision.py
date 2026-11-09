@@ -415,10 +415,8 @@ def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
 
 def products_dtype(*operands) -> jnp.dtype | None:
     """The dtype `operands` multiply in, by jax's implicit promotion; None where an 8-bit float
-    takes part, which jax promotes with nothing and whose product has no precision to resolve. An integer
-    operand (a ragged product's group sizes) counts rows, multiplies nothing, and is left out."""
-    dtypes = [jnp.dtype(operand.dtype) for operand in operands
-              if not jnp.issubdtype(operand.dtype, jnp.integer)]
+    takes part, which jax promotes with nothing and whose product has no precision to resolve."""
+    dtypes = [jnp.dtype(operand.dtype) for operand in operands]
     if any(jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 16 for dtype in dtypes):
         return None
     return jnp.result_type(*dtypes)
@@ -513,8 +511,7 @@ def _widened(operands) -> list[jax.Array]:
     """`operands` as the float64 operands of their float32 product: each converted to the dtype they
     multiply in (`products_dtype`), as the product converts them, then widened exactly."""
     dtype = products_dtype(*operands)
-    return [operand if jnp.issubdtype(operand.dtype, jnp.integer) else operand.astype(dtype).astype(jnp.float64)
-            for operand in operands]
+    return [operand.astype(dtype).astype(jnp.float64) for operand in operands]
 
 
 def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
@@ -574,6 +571,20 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     products here. A computation that stands for such a target, a reference for a kernel interpreted
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
+    if _ragged(product):
+        # A ragged dot's group sizes count its rows and multiply nothing: its product is of the two others,
+        # the sizes held fixed in it (a closed-over value of its trace, which `_paired` reads).
+        *multiplied, sizes = operands
+
+        def bound(lhs, rhs, **options):
+            return product(lhs, rhs, sizes, **options)
+
+        if _sums_in_float64(*multiplied):
+            return _summed_wide(bound, preferred_element_type, *multiplied)
+        if (all(isinstance(operand, jax.Array | np.ndarray) for operand in multiplied)
+                and products_dtype(*multiplied) == jnp.dtype(jnp.float32)):
+            return _summed_pairwise(bound, preferred_element_type, *multiplied)
+        return product(*operands, preferred_element_type=preferred_element_type)
     if not _sums_in_float64(*operands):
         if ((key := _contraction(product, preferred_element_type)) is not None
                 and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
@@ -583,6 +594,14 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     if (key := _contraction(product, preferred_element_type)) is not None:
         return _traced_once(key, _summed_wide)(*operands)
     return _summed_wide(product, preferred_element_type, *operands)
+
+
+def _ragged(product: Callable) -> bool:
+    """Whether `product` is `jax.lax.ragged_dot_general` (bound through `functools.partial`s), whose last
+    operand is its group sizes."""
+    while isinstance(product, functools.partial) and type(product) is functools.partial:
+        product = product.func
+    return product is jax.lax.ragged_dot_general
 
 
 def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
@@ -638,8 +657,7 @@ def projected(product: Callable) -> Callable:
     return summed
 
 
-CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general,
-                jax.lax.ragged_dot_general)
+CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
 """The contractions `accumulated` traces once a call (`_contraction`): JAX's own, whose trace states no
 derivative of its own (`_own_backward`) and depends on its operands' types and its arguments alone."""
 

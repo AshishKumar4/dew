@@ -228,13 +228,16 @@ def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Arra
     each group's rows in blocks from its first (`contraction_block` of the rows), a block of every group a
     batched dot of XLA's own, the blocks' sums added as `_tree` adds them, one block's into a binary counter
     of partial sums at a time, so the steps are the largest group's blocks and the sums held a level of the
-    tree each (a group of no rows zero)."""
+    tree each (a group of no rows zero). The steps walk to the most blocks any group may hold, a static count
+    reverse mode differentiates, each past the largest group's blocks skipped (`lax.cond`): adding a zero block
+    to the counter changes no sum."""
     total, depth, width = rows.shape[0], rows.shape[1], cotangent.shape[1]
     groups = group_sizes.shape[0]
     block = contraction_block(total)
     starts = jnp.cumsum(group_sizes) - group_sizes
     steps = (jnp.max(group_sizes, initial=0) + block - 1) // block
-    levels = max(1, -(-total // block)).bit_length()
+    most = max(1, -(-total // block))
+    levels = most.bit_length()
     offsets = jnp.arange(block)
 
     def gathered(operand, step):
@@ -243,7 +246,10 @@ def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Arra
         taken = operand[jnp.clip(starts[:, None] + place, 0, total - 1)]
         return jnp.where(valid[..., None], taken, 0)
 
-    def counted(step, held):
+    def counted(held, step):
+        return jax.lax.cond(step < steps, functools.partial(added, step), lambda held: held, held), None
+
+    def added(step, held):
         value = jax.lax.dot_general(gathered(rows, step), gathered(cotangent, step),
                                     (((1,), (1,)), ((0,), (0,))), precision=precision,
                                     preferred_element_type=jnp.float32)
@@ -255,7 +261,7 @@ def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Arra
             done = done | ~bit
         return held
 
-    held = jax.lax.fori_loop(0, steps, counted, jnp.zeros((levels, groups, depth, width), jnp.float32))
+    held, _ = jax.lax.scan(counted, jnp.zeros((levels, groups, depth, width), jnp.float32), jnp.arange(most))
     # The counter's levels added from the lowest, as `_tree` carries its odd part up to the last add.
     summed, have = jnp.zeros((groups, depth, width), jnp.float32), jnp.zeros((), jnp.bool_)
     for level in range(levels):
