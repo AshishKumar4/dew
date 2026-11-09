@@ -944,8 +944,6 @@ def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whol
     is the compiled program's, which this CPU does not build)
     (bible §7: a new accelerator route qualifies through its real target lowering on a multi-device
     mesh)."""
-    import math
-
     from jax.sharding import AxisType, NamedSharding
 
     from dew.nn.kernels.lowered import custom_calls, operations
@@ -1033,15 +1031,20 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
 
 
 def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_linear_in_its_tokens():
-    """On a CPU 'auto' routes a call by time, jax.nn's xla attention's scores counted against the device's
-    memory (`attention_kernels._xla_scores_fit`, `XLA_SCORE_BYTES` a score in a training step): a causal
-    fp32 training step of 8 heads 64 wide long enough that xla's scores would take four times the device's
-    share of the host's memory (`generation.host_memory_share`) compiles in temporaries below a byte a
-    score, the template's plain-JAX mainloop's, which grow with the tokens (row 4826)."""
-    from dew.nn.attention_kernels import XLA_SCORE_BYTES
+    """On a CPU 'auto' routes a call by time, jax.nn's xla attention where its training step's peak, as
+    Dew's footprint model derives it, fits the device's share of the process's memory
+    (`attention_kernels._dense_fits`, `generation.host_memory_share`): a causal fp32 training step of 8 heads
+    64 wide, the first of 1024 tokens doubled whose xla attention does not fit, takes the template, its
+    compiled temporaries below a byte a score, the template's plain-JAX mainloop's, which grow with the
+    tokens, and within the process's memory (rows 4826, 5283)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
 
-    heads, width = 8, 64
-    tokens = 1024 * -(-math.isqrt(4 * generation.host_memory_share() // (XLA_SCORE_BYTES * heads)) // 1024)
+    heads, width, tokens = 8, 64, 1024
+    while attention_kernels._dense_fits(attention_case(
+            jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.float32),
+            jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.float32), causal=True)):
+        tokens *= 2
     shape = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.float32)
 
     def loss(query, key, value):
@@ -1050,7 +1053,68 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
     step = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
     analysis = step.lower(shape, shape, shape).compile().memory_analysis()
     assert analysis is not None
-    assert analysis.temp_size_in_bytes < heads * tokens * tokens
+    assert analysis.temp_size_in_bytes < min(heads * tokens * tokens, generation.host_memory_share())
+
+
+@pytest.mark.parametrize(("rows", "tokens", "heads", "ran"),
+                         [(1, 1024, 32, "xla"), (1, 2048, 32, "template"), (512, 1024, 64, "template")],
+                         ids=["measured", "past-measured", "past-memory"])
+def test_an_a100s_fp32_call_takes_xla_only_where_its_receipt_measured_and_its_scores_fit(rows, tokens, heads,
+                                                                                         ran):
+    """An A100's fp32 causal call, 128 wide over 8 key heads, whose declared cell names jax.nn's xla
+    attention (`attention_kernels.DECLARED`, timed at 1 x 1024 tokens): the call its receipt measured takes
+    xla; a longer one is a cell none declares (`FP32_MEASURED`), and one whose xla attention would not fit the
+    A100's 80 GB (512 rows of 64 heads, 412 GB of training scores by Dew's footprint model,
+    `_dense_fits`) refuses it, each taking the template, whose temporaries grow with the tokens (row 5283)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+    from dew.nn.kernels import selection
+
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.float32)
+    key = jax.ShapeDtypeStruct((rows, tokens, 8, 128), jnp.float32)
+    with generation.assumed("sm80"):
+        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, causal=True))
+    assert route.kernel == ran
+
+
+@pytest.mark.parametrize(("rows", "heads", "ran"), [(1, 32, "inference"), (512, 64, "template")],
+                         ids=["fits", "past-memory"])
+def test_an_a100s_dense_bias_trains_on_xla_only_where_its_scores_fit(rows, heads, ran):
+    """An A100's bf16 call of 1024 tokens under a bias that varies by query, 128 wide over 8 key heads: it
+    infers on the template and trains on jax.nn's xla attention ('inference') where that fits the A100's
+    80 GB; one of 512 rows of 64 heads, whose xla attention holds over a terabyte of fp32 scores a training
+    step, takes the template whole (`attention_kernels._FITS`, row 5283)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+    from dew.nn.kernels import selection
+
+    query = jax.ShapeDtypeStruct((rows, 1024, heads, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, 1024, 8, 128), jnp.bfloat16)
+    bias = jax.ShapeDtypeStruct((rows, heads, 1024, 1024), jnp.float32)
+    with generation.assumed("sm80"):
+        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, bias=bias))
+    assert route.kernel == ran
+
+
+@pytest.mark.parametrize(("groups", "limits", "least"), [
+    ("0::/outer/inner\n", {"sys/fs/cgroup/memory.max": "max", "sys/fs/cgroup/outer/memory.max": "2147483648",
+                           "sys/fs/cgroup/outer/inner/memory.max": "4294967296"}, 2147483648),
+    ("4:cpu,cpuacct:/job\n5:memory:/outer/inner\n",
+     {"sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712",
+      "sys/fs/cgroup/memory/outer/inner/memory.limit_in_bytes": "1073741824"}, 1073741824),
+    ("0::/system.slice/run.service\n", {"sys/fs/cgroup/memory.max": "3221225472"}, 3221225472),
+], ids=["v2-limiting-parent", "v1-nested", "v2-container"])
+def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, groups, limits, least):
+    """A CPU call's memory share reads the limits on this process's control groups (`/proc/self/cgroup`),
+    its own group's and every ancestor's (`generation.cgroup_memory_limits`): a parent's tighter limit
+    under cgroup v2, a nested group's under v1's memory controller, and a container's own group, its mount's
+    root, where the group its process names is not mounted."""
+    (tmp_path / "proc/self").mkdir(parents=True)
+    (tmp_path / "proc/self/cgroup").write_text(groups)
+    for path, limit in limits.items():
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(limit + "\n")
+    assert min(generation.cgroup_memory_limits(str(tmp_path))) == least
 
 
 @pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
