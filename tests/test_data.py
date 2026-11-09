@@ -275,33 +275,37 @@ class _Spread:
         return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
 
 
-def test_automatic_workers_are_sized_for_the_batches_each_read_takes(monkeypatch):
-    """Automatic loading sizes a read's workers for the batches it takes (`Loading.resolved`'s `batches`)
-    however its run states its length: a run of epochs for its passes over its records, as a run of steps
-    for its steps, and a chain that sets its threads alone as one naming no loading; a validation pass
-    starts its workers again each pass, sized for its own, so a pass whose order its workers would read
-    out of order reads in the process, where it took training's count (the train review of row 4862's
-    head: an epochs run was sized for none, a validation pass started training's workers)."""
-    sized = []
-    resolved = Loading.resolved
-
-    def recording(self, records, *, reads, batches=None):
-        sized.append(batches)
-        return resolved(self, records, reads=reads, batches=batches)
-
-    monkeypatch.setattr(Loading, "resolved", recording)
+def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_their_bounds():
+    """However a run states its length (its epochs, its steps), a chain that sets its threads alone, and
+    a validation pass beside a training read, automatic workers read the records a read in no workers
+    reads, in its order, in no more processes than the host's CPUs, a validation pass in no more than its
+    own batches, which it starts its workers for again each pass (the train review of row 4862's head: an
+    epochs run was sized for no batches, a validation pass took training's workers)."""
     auto = Loading(workers="auto", host=TWO_CPUS)
+    none = Loading(workers=0)
     traced = Pipeline(Memory(_Indexed(30))).shuffle(5).random_map(_Jittered()).map(_Where()).batch(4)
-    epochs = compile(traced, seed=5, epochs=3, loading=auto)
-    compile(traced.repeat(), seed=5, steps=17, loading=auto)
-    compile(traced.repeat().threads(2), seed=5, steps=9)
-    assert sized == [3 * -(-epochs.records // 4), 17, 9]
+
+    def read(loader, branch: str, count: int) -> tuple[list[int], set[int]]:
+        """The records `count` batches of `branch` hold, in order, and the processes that made them."""
+        reader = getattr(loader, branch)(DataPartition())
+        try:
+            batches = listed(reader, count)
+        finally:
+            reader.close()
+        return ([int(index) for batch in batches for index in batch["index"]],
+                {int(pid) for batch in batches for pid in batch["pid"]} - {os.getpid()})
+
+    for chain, length in ((traced, {"epochs": 3}), (traced.repeat(), {"steps": 17})):
+        expected, _ = read(compile(chain, seed=5, loading=none, **length), "train", 12)
+        found, workers = read(compile(chain, seed=5, loading=auto, **length), "train", 12)
+        assert found == expected and len(workers) <= TWO_CPUS.cpus
+    expected, _ = read(compile(traced.repeat(), seed=5, loading=none, steps=9), "train", 6)
+    found, workers = read(compile(traced.repeat().threads(2), seed=5, steps=9), "train", 6)
+    assert found == expected and len(workers) <= Host.current().cpus
     held = Pipeline(Memory(_Indexed(8))).map(_Where()).batch(4)
-    reader = compile(traced.repeat(), validation=held, seed=5, steps=10, loading=auto).val(DataPartition())
-    try:
-        assert {int(pid) for batch in listed(reader, 2) for pid in batch["pid"]} == {os.getpid()}
-    finally:
-        reader.close()
+    expected, _ = read(compile(traced.repeat(), validation=held, seed=5, steps=10, loading=none), "val", 2)
+    found, workers = read(compile(traced.repeat(), validation=held, seed=5, steps=10, loading=auto), "val", 2)
+    assert found == expected and len(workers) <= 2
 
 
 def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers():
