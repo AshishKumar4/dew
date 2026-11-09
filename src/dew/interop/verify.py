@@ -58,6 +58,7 @@ from dew.nn.blocks import padded_row
 from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
+from dew.parity import _scaled_rms
 from dew.registry import models
 
 if TYPE_CHECKING:
@@ -858,19 +859,25 @@ def _departed(ours: Mapping[str, np.ndarray], theirs: Mapping[str, np.ndarray],
     source's float64 `truth` past the source's own float32 rounding of it (`theirs`), RMS against RMS, named
     with both: tier 2's verdict at one draw (docs/design/testing.md, "Tier 2's verdict"). A row the
     float32 source computes exactly must be exact. A leaf's RMS alone would let a departure on one row (an
-    embedding row, one head's parameter) hide by its share."""
+    embedding row, one head's parameter) hide by its share. Each RMS is scaled by its row's largest
+    magnitude first (`dew.parity._scaled_rms`), so no square underflows to an exact zero or overflows, and a
+    value any arm holds that is not finite departs, which no comparison of RMS would show."""
     found = []
     for name in ours:
-        mine, own = (np.asarray(arm, np.float64) - np.asarray(truth[name], np.float64)
-                     for arm in (ours[name], theirs[name]))
-        rows = (mine.reshape(1, -1), own.reshape(1, -1)) if mine.ndim < 2 else (
-            mine.reshape(-1, mine.shape[-1]), own.reshape(-1, own.shape[-1]))
-        leaf = (math.sqrt(np.mean(mine ** 2)), math.sqrt(np.mean(own ** 2)))
-        each = (np.sqrt(np.mean(rows[0] ** 2, axis=-1)), np.sqrt(np.mean(rows[1] ** 2, axis=-1)))
+        arms = {"Dew's": ours[name], "the source's float32": theirs[name], "the twin's": truth[name]}
+        held = {arm: np.asarray(values, np.float64) for arm, values in arms.items()}
+        broken = [arm for arm, values in held.items() if not np.all(np.isfinite(values))]
+        if broken:
+            found.append(f"{name} at draw {draw}: {' and '.join(broken)} values are not all finite")
+            continue
+        mine, own = (held[arm] - held["the twin's"] for arm in ("Dew's", "the source's float32"))
+        whole = (_scaled_rms(mine.reshape(1, -1))[0], _scaled_rms(own.reshape(1, -1))[0])
+        width = mine.shape[-1] if mine.ndim >= 2 else mine.size
+        each = (_scaled_rms(mine.reshape(-1, width)), _scaled_rms(own.reshape(-1, width)))
         past = np.flatnonzero(each[0] > each[1])
-        if leaf[0] > leaf[1]:
-            found.append(f"{name} at draw {draw}: {leaf[0]:.3g} from the twin where the source's float32 is "
-                         f"{leaf[1]:.3g}")
+        if whole[0] > whole[1]:
+            found.append(f"{name} at draw {draw}: {whole[0]:.3g} from the twin where the source's float32 is "
+                         f"{whole[1]:.3g}")
         elif past.size:
             row = int(past[0])
             found.append(f"{name}'s row {row} at draw {draw}: {each[0][row]:.3g} from the twin where the "
@@ -1157,13 +1164,21 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         # The probe runs whether or not a candidate is left, so a type no convention computes is
         # one whose shrunken model ran (`Unmapped`), and one whose model does not run is
         # `ProbeUnavailable`, whatever the candidates.
+        # As the reference's constructor received it: its build resolves implementations onto the config
+        # it is given (its experts', its attention's), which the twin's process resolves for itself.
+        stated = copy.deepcopy(config)
+        try:
+            reference = source.causal_lm(config).float()
+            scatter_weights(reference)
+        except Exception as error:
+            raise _unavailable(model_type, f"{name} does not run its shrunken config "
+                               f"({type(error).__name__}: {error})") from error
+        registered = _registered(model_type, source, reference)
         with Isolated() as twin:
+            probed = _Source(reference, twin)
             try:
-                reference = source.causal_lm(config).float()
-                scatter_weights(reference)
-                probed = _Source(reference, twin)
                 weights = {key: value.detach().cpu().numpy() for key, value in reference.state_dict().items()}
-                twin.call(_twin_built, source, config, weights, _registered(source, reference))
+                twin.call(_twin_built, source, stated, weights, registered)
                 probed.logits(probe_ids(_VOCAB))
             except Exception as error:
                 raise _unavailable(model_type, f"{name} does not run its shrunken config "
@@ -1171,13 +1186,23 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             return _candidates(model_type, name, reasons, sized, probed, fields)
 
 
-def _registered(source: ModelSource, reference: PreTrainedModel
+def _registered(model_type: str, source: ModelSource, reference: PreTrainedModel
                 ) -> tuple[type[PretrainedConfig], type[PreTrainedModel]] | None:
     """The config class and the causal LM transformers' auto classes built `reference` of
-    (`ModelSource.causal_lm`), which a process other than this one registers alike (`_twin_built`), so a
-    type a script registered at runtime builds there; None for a source's remote code, which its auto
-    classes do not build."""
-    return None if source.remote is not None else (type(reference.config), type(reference))
+    (`ModelSource.causal_lm`), which the twin's process registers alike (`_twin_built`), so a type a script
+    registered at runtime builds there; None for a source's remote code, which its auto classes do not
+    build. A class the running script defines itself (`__main__`) has no module that process imports, so
+    the probe is refused there, naming it."""
+    if source.remote is not None:
+        return None
+    classes = (type(reference.config), type(reference))
+    scripted = [kind.__name__ for kind in classes if kind.__module__ == '__main__']
+    if scripted:
+        raise _unavailable(model_type, f"its classes {scripted} are defined in the running script "
+                           "(`__main__`), which the process tier 2 builds its float64 twin in "
+                           "(`dew.interop.isolated`) cannot import; define them in a module the script "
+                           "imports")
+    return classes
 
 
 def _candidates(model_type: str, name: str, reasons: dict[str, str], sized: list, probed: _Source,
