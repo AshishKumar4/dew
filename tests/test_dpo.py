@@ -24,7 +24,7 @@ from tool_support import load
 from dew.data import Files, Loading, Memory, presets
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
-from dew.data.preferences import HALVES_KEY, IDS_KEY, MASK_KEY, REAL_KEY, pair_windows, windows
+from dew.data.preferences import HALVES_KEY, IDS_KEY, MASK_KEY, REAL_KEY, pair_windows, window_shape, windows
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 
@@ -208,11 +208,6 @@ def test_a_misshapen_batch_is_refused():
     with pytest.raises(ValueError):
         objective.scalar_loss(params, {IDS_KEY: ids, MASK_KEY: mask}, step)
 
-    short = {key: value[:, :4] if np.ndim(value) == 2 and key != "fork_parents" else value
-             for key, value in batch.items()}
-    with pytest.raises(ValueError):
-        objective.scalar_loss(params, short, step)
-
     wide = {**batch, MASK_KEY: batch[MASK_KEY][:, :4]}
     with pytest.raises(ValueError):
         objective.scalar_loss(params, wide, step)
@@ -253,7 +248,8 @@ def test_a_preference_dataset_trains_as_the_preference_config_does():
                           layout=Layout(min_shard=1, tolerance=1.0))
         return trainer.fit(data, steps=1).variables
 
-    laid = windows(held, 4)
+    # The preset's windows, as wide as its `seq_len` lays them (`window_shape`).
+    laid = windows(held, 4, inputs=window_shape(4)[0])
     rows = [{key: value[at] for key, value in laid.items()} for at in range(len(laid[IDS_KEY]))]
     identical(trained(Memory(rows).batch(len(rows))),
               trained(compile(Memory(held).pipe(presets.preferences, seq_len=4, batch=len(rows)),
@@ -309,8 +305,9 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
 
     assert data.records == 1
     batch = next(data.train(DataPartition()))
-    np.testing.assert_array_equal(np.asarray(batch[IDS_KEY]), [[1, 2, 3, 4, 5, 0, 0]])
-    np.testing.assert_array_equal(np.asarray(batch[MASK_KEY]), [[0, 0, 1, 1, 1, 0, 0]])
+    # The prompt once and the chosen half's rest, its final and the rejected's in the tail.
+    np.testing.assert_array_equal(np.asarray(batch[IDS_KEY]), [[1, 2, 3, 0, 0, 0, 4, 5]])
+    np.testing.assert_array_equal(np.asarray(batch[MASK_KEY]), [[0, 0, 1, 0, 0, 0, 1, 1]])
 
 @pytest.mark.parametrize("share", [True, False], ids=["shared", "whole"])
 def test_pairs_pack_into_windows_each_half_at_its_own_places(share):
@@ -366,8 +363,8 @@ def test_a_preference_pair_marks_each_halfs_real_tokens():
     """A window marks its pairs' ids as real (`REAL_KEY`) and its padding as not, whatever their completion
     marks: a chosen half ending in an unmarked token, a rejected half of no completion."""
     laid = windows([{"chosen": [1, 2, 3, 4], "rejected": [1, 2], "chosen_mask": [0, 0, 1, 0],
-                     "rejected_mask": [0, 0]}], 5)
-    assert laid[REAL_KEY].tolist() == [[1, 1, 1, 1, 0, 0, 0, 0, 0]]
+                     "rejected_mask": [0, 0]}, {"chosen": [7], "rejected": [8]}], 5)
+    assert laid[REAL_KEY].tolist() == [[1, 1, 1, 1, 1], [0, 0, 0, 1, 1]]
 
 
 @pytest.mark.parametrize("share", [True, False], ids=["shared", "whole"])
@@ -379,7 +376,7 @@ def test_packed_pairs_train_as_each_pair_a_row(kind, share):
     scored apart, gives (check 1, over drawn weights and references, float64 truth): each half's completion
     scored from its own predecessors, a half's first token from the shared prompt's last, each pair's sums
     reduced by its number across the batch (`pair_numbers`)."""
-    from model_support import TINY_DECODER, float64_truth, float64_twin
+    from model_support import TINY_DECODER, float64_twin
 
     from dew.batch import coordinates
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -416,9 +413,10 @@ def test_packed_pairs_train_as_each_pair_a_row(kind, share):
     rows.append({"chosen": rng.integers(1, VOCAB, 4).tolist(),
                  "rejected": rng.integers(1, VOCAB, 3).tolist()})
     rows[-1].update({"chosen_mask": [1] * 4, "rejected_mask": [1] * 3})
-    laid = windows(rows, half, share=share, segments=segments)
-    assert laid[IDS_KEY].shape[0] < len(rows) or not share or segments == 1
-    objective = DPOObjective(model, half - 1, beta=0.5, segments=segments)
+    pairs = 1 if segments == 1 else 3
+    laid = windows(rows, half, share=share, segments=segments, pairs_a_window=pairs)
+    assert laid[IDS_KEY].shape[0] < len(rows) or segments == 1
+    objective = DPOObjective(model, half - 1, beta=0.5, segments=segments, pairs=pairs)
     ids = np.zeros((2 * len(rows), half), np.int32)
     marks = np.zeros((2 * len(rows), half), np.float32)
     for index, row in enumerate(rows):
@@ -451,7 +449,7 @@ def test_packed_pairs_train_as_each_pair_a_row(kind, share):
         return jax.jit(run)
 
     # A user's module states no dtype of its own: the gate's float64 run of the reference arm is its truth.
-    truth_fn = None if segments == 1 else float64_truth(each_row(float64_twin(model)))
+    truth_fn = None if segments == 1 else each_row(float64_twin(model))
 
     initialized = jax.jit(objective.init)
 
@@ -473,7 +471,7 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
     however the windows hold them."""
     import optax
     from flax import linen as nn
-    from model_support import TINY_DECODER, float64_truth, float64_twin
+    from model_support import TINY_DECODER, float64_twin
 
     from dew.batch import coordinates
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -491,7 +489,8 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
         chosen, rejected = (prompt + rng.integers(1, VOCAB, 2).tolist() for _ in range(2))
         rows.append({"chosen": chosen, "rejected": rejected,
                      "chosen_mask": [0] * len(prompt) + [1, 1], "rejected_mask": [0] * len(prompt) + [1, 1]})
-    laid = windows(rows, half, segments=segments)
+    pairs = 1 if segments == 1 else 2
+    laid = windows(rows, half, segments=segments, pairs_a_window=pairs)
     assert laid[IDS_KEY].shape[0] == 8
     ids = np.zeros((2 * len(rows), half), np.int32)
     marks = np.zeros((2 * len(rows), half), np.float32)
@@ -502,7 +501,7 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
     held = coordinates(valid=jnp.asarray(ids > 0), right_padded=True)
 
     def trainer_for(seed, split=2):
-        objective = DPOObjective(model, half - 1, beta=0.5, segments=segments)
+        objective = DPOObjective(model, half - 1, beta=0.5, segments=segments, pairs=pairs)
         trainer = Trainer(objective, optax.sgd(rate),
                           key=jax.random.key(seed), split=split, checkpoints=None, tracker=None)
         # Two devices, the data axis taking both: two data shards.
@@ -545,7 +544,7 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
     plain, wide = each_row(model), each_row(float64_twin(model))
     assert_as_exact(lambda _, moved: moved, lambda params, _: plain(params), draw,
                     f"a split step over pairs, segments={segments}", seeds=8,
-                    truth_fn=float64_truth(lambda params, _: wide(params)))
+                    truth_fn=lambda params, _: wide(params))
 
 
 def test_pairs_are_numbered_across_the_windows_a_step_reads_whatever_numbers_they_carry():

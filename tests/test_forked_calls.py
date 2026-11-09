@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, float64_truth, float64_twin
+from model_support import TINY_DECODER, float64_twin
 from reference_error import assert_as_exact
 
 from dew.batch import Forks, coordinates
@@ -114,7 +114,7 @@ def test_rows_over_forks_score_and_train_as_the_rows_laid_out_whole(kind):
     assert_as_exact(scored(objective, shared), scored(objective, whole),
                     lambda seed: (nn.unbox(initialized(jax.random.key(seed))),), f"{kind} over forks",
                     seeds=FORK_SEEDS,
-                    truth_fn=float64_truth(scored(LMObjective(float64_twin(model), WIDTH - 1), whole)))
+                    truth_fn=scored(LMObjective(float64_twin(model), WIDTH - 1), whole))
 
 
 def test_forked_rows_lay_each_prefix_once_and_each_row_back_at_its_tokens():
@@ -363,7 +363,7 @@ def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: s
             return found if valid is None else jnp.where(valid[..., None], found, 0)
         return each_path
 
-    assert_as_exact(tree_logits, decoded(model), draw, label, seeds=64, truth_fn=float64_truth(decoded(wide)))
+    assert_as_exact(tree_logits, decoded(model), draw, label, seeds=64, truth_fn=decoded(wide))
 
 
 @pytest.mark.parametrize("kind", ["attention", "gated_delta_net hybrid", "mixture"])
@@ -408,7 +408,7 @@ def test_a_groups_chains_score_over_their_shared_prompt_as_laid_whole(kind):
             return {"log_probs": found, "grads": grads}
         return jax.jit(run)
 
-    truth = float64_truth(scored(GRPOObjective(float64_twin(model), WIDTH - 1), whole))
+    truth = scored(GRPOObjective(float64_twin(model), WIDTH - 1), whole)
     initialized = jax.jit(grpo.init)
     assert_as_exact(scored(grpo, shared), scored(grpo, whole),
                     lambda seed: (nn.unbox(initialized(jax.random.key(seed))),),

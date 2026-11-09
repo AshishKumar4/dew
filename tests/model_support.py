@@ -194,21 +194,6 @@ def float64_twin(model: nn.Module) -> nn.Module:
     return model.clone(**held, **({"dtype": jnp.float64} if "dtype" in fields else {}))
 
 
-def float64_truth(run):
-    """A check's truth (`assert_as_exact`'s `truth_fn`): `run` on its draw's inputs widened to float64,
-    under x64, where the float32 reference closes over its own precision (a model's `dtype`), so the
-    truth runs its `float64_twin`."""
-    def truth(*inputs):
-        with jax.enable_x64(new_val=True):
-            return run(*jax.tree.map(_float64, inputs))
-    return truth
-
-
-def _float64(leaf):
-    """A floating leaf in float64, under the caller's x64; any other as it is."""
-    return jnp.asarray(leaf, jnp.float64) if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf
-
-
 def largest_difference(left, right) -> float:
     """The largest absolute difference between two trees of the same structure, over every leaf; trees
     of another structure raise, as `jax.tree.map` pairs them."""
