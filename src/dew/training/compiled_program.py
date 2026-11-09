@@ -447,14 +447,14 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
     # The evaluator computes on the host, outside any mesh a plan for compile-only devices sets.
     for equation in reversed(reading):
         operands = list(map(read, equation.invars))
-        if named(equation.primitive) == "dot_general" and len(operands) == 3:
-            # A product with its bias, as the derivation reads a sum XLA's GEMM computes (`biased`): the
-            # product of the first two, plus the third.
-            *operands, bias = operands
-            out = [host_evaluated(equation.primitive, operands, equation.params)[0] + bias]
-        else:
-            out = host_evaluated(equation.primitive, operands, equation.params)
-        values.update(zip(equation.outvars, out, strict=True))
+        # A product with its bias, as the derivation reads a sum XLA's GEMM computes (`biased`): the
+        # product of the first two, plus the third.
+        biased = named(equation.primitive) == "dot_general" and len(operands) == 3
+        out = host_evaluated(equation.primitive, operands[:2] if biased else operands, equation.params)
+        if out is None:
+            # A counter's arithmetic over integers and literals is this host's constant on every program.
+            raise ValueError(f"a loop's offset reads {named(equation.primitive)}, no constant of this host")
+        values.update(zip(equation.outvars, [out[0] + operands[2]] if biased else out, strict=True))
     return [int(read(offset)) for offset in offsets]
 
 
