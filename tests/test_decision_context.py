@@ -202,10 +202,12 @@ def test_a_unit_whose_contexts_outgrow_a_windows_trains_its_examples_apart():
     assert "decision_unit" not in apart and len(apart["decision_rows"]) == 2
 
 
-PACKED_CONTEXT_SEEDS = {"table": 128, "backbone": 8}
+PACKED_CONTEXT_SEEDS = {"table": 128, "backbone": 256}
 """Check 1's declared seeds for packed rows reading their own contexts against each row alone, by encoder,
 sized paired (`seeds_for` with the packed windows as `dew_fn`) on armada: the table's under fp32 sums
-(ledger 1698, rows/1698-fp32-sums at 9f68891e0d, size-ctx), 8 before them."""
+(ledger 1698, rows/1698-fp32-sums at 9f68891e0d, size-ctx), 8 before them; the backbone's at base
+7853cfdf6 (job 20261109062353-1a4d7ce5), whose 8 left the verdict's 40 Inconclusive (a pooled ratio's
+interval [0.755, 2.255])."""
 
 
 def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
@@ -289,9 +291,11 @@ def test_packed_rows_each_read_their_own_context_through_the_token_table_as_each
     packed_contexts_read_as_alone("table")
 
 
+@pytest.mark.check1_shards(seeds=256, per_task=32)
 def test_packed_rows_each_read_their_own_context_through_the_backbone_as_each_does_alone():
     """Packed rows read their own contexts through the backbone's own pass over each context as its own
-    document as each row alone does (`packed_contexts_read_as_alone`)."""
+    document as each row alone does (`packed_contexts_read_as_alone`), its 256 seeds drawn by CI's map
+    tasks (`check1_shards`)."""
     packed_contexts_read_as_alone("backbone")
 
 

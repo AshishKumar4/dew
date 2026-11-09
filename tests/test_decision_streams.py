@@ -194,9 +194,11 @@ def test_a_multimodal_backbones_row_in_streams_reads_as_its_text_decoders():
     np.testing.assert_array_equal(states(text_only=False), states(text_only=True))
 
 
-STREAM_SEEDS = {"joint": 16, "lettered": 8}
+STREAM_SEEDS = {"joint": 16, "lettered": 128}
 """Check 1's declared seeds for packed rows in two streams against each row alone, sized by `seeds_for`
-with the packed windows as `dew_fn` (16 and 8, 2026-10-30)."""
+with the packed windows as `dew_fn`: 16 and 8 on 2026-10-30, the lettered rows' again at base 7853cfdf6
+(job 20261109062353-1a4d7ce5), whose 8 left the verdict's 40 Inconclusive (a pooled ratio's interval
+[0.901, 1.580])."""
 
 
 @pytest.mark.parametrize("layout", [JOINT, LETTERED], ids=["joint", "lettered"])
