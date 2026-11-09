@@ -267,8 +267,8 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
             # No launch reads the rows where they lie (an fp32 call's, which only Mosaic GPU's gathering
             # producer would): the rows gathered first, the grouped launches taking the product, never XLA's
             # ragged dot over every group's matrix (row 5213's, as `_gemm`'s).
-            return kernel(*gathered(lhs, rhs, tables), group_sizes, prologue_arrays, (None, None),
-                          interpret=interpret)
+            rows, columns = gathered(lhs, rhs, tables)
+            return kernel(rows, columns, group_sizes, prologue_arrays, (None, None), interpret=interpret)
         return portable(lhs, rhs, group_sizes, prologue_arrays, tables)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, tables):
