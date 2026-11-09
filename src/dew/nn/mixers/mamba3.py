@@ -172,7 +172,7 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
     them); each rank's output takes the ranks the op read it before or after the recurrence does
     (`_rank_terms`). Returns `(output [B, S, R, H, P], Carried)` in `at_least_fp32` of the operands'
     dtype."""
-    batch, length, rank, heads, _ = x.shape
+    batch, length, _, heads, _ = x.shape
     work, operand, continues, dt, lam, real = _stepped(x, dt, B, C, lam, starts, valid)
     # A document's first token enters no state: its turn and decay act on nothing, so neither enters the
     # chunked op, whose pairs would cancel them to rounding where the recurrence's gradient is exactly zero.
@@ -189,18 +189,8 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
         angles = jnp.remainder(angles + entering, 2 * jnp.pi)
         again = jnp.einsum('bhrn,bhrp->bhnp', carried.key, carried.value)
         held = jnp.swapaxes(carried.state, -1, -2) + entering_weight[:, :, None, None] * again
-    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), angles[:, :, None]).astype(operand)
-                     for t in (B, C))
-    decay = jnp.zeros((batch, length, rank, heads), work).at[:, :, 0].set(unturned * jnp.asarray(A, work))
-    gate = jnp.broadcast_to((lam * dt + following)[:, :, None], decay.shape)
-    begins = None if starts is None else jnp.zeros((batch, length, rank), bool).at[:, :, 0].set(starts)
-    out, final = chunk(MAMBA3, Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
-                                     log_decay=_ranked(decay), beta=_ranked(gate), state=held,
-                                     starts=None if begins is None else _ranked(begins)),
-                       **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
-    # On the rounded keys and queries the chunked op read, so the terms cancel its own.
-    out = out.reshape(x.shape) + _rank_terms(queries.astype(work), keys.astype(work), jnp.asarray(x, work),
-                                             lam * dt, following)
+    out, final, keys = _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, held, starts,
+                                      work=work, operand=operand, chunk_size=chunk_size)
     last = (keys[:, -1].astype(work), jnp.asarray(x[:, -1], work))
     if valid is not None:
         # The last real token's keys and values; a row with none keeps the carried ones.
@@ -214,6 +204,29 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
     return out, Carried(jnp.swapaxes(final, -1, -2), angles[:, -1], *(jnp.swapaxes(t, 1, 2) for t in last))
 
 
+def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, starts, *, work, operand,
+                   chunk_size: int | None, entered=None):
+    """The chunked op of a call's tokens (`chunk_mamba3`, `entered_mamba3`): `B` and `C` rotated by
+    `angles` and rounded to the operands' dtype, the first rank's decay `unturned * A`, the write gate
+    `lam dt + following`, from `state` (`[B, H, N, P]`, or each document's `[B, D, H, N, P]` where
+    `entered` names them, `Chunk.entered`) with `starts` `[B, S]` each document's first token, and the
+    rank terms on the rounded keys and queries the op read, so they cancel its own. Returns `(output,
+    final state, rotated keys)`."""
+    batch, length, rank, heads, _ = x.shape
+    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), angles[:, :, None]).astype(operand)
+                     for t in (B, C))
+    decay = jnp.zeros((batch, length, rank, heads), work).at[:, :, 0].set(unturned * jnp.asarray(A, work))
+    gate = jnp.broadcast_to((lam * dt + following)[:, :, None], decay.shape)
+    begins = None if starts is None else jnp.zeros((batch, length, rank), bool).at[:, :, 0].set(starts)
+    out, final = chunk(MAMBA3, Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
+                                     log_decay=_ranked(decay), beta=_ranked(gate), state=state,
+                                     starts=None if begins is None else _ranked(begins), entered=entered),
+                       **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
+    out = out.reshape(x.shape) + _rank_terms(queries.astype(work), keys.astype(work), jnp.asarray(x, work),
+                                             lam * dt, following)
+    return out, final, keys
+
+
 def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, entered, starts, valid=None,
                    chunk_size: int | None = None):
     """`chunk_mamba3` whose documents each continue a carry of their own (a call over forks,
@@ -223,7 +236,7 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, entered, starts
     writes the carry's token again at its `(1 - lambda) dt`, and the chunked op enters each document's state
     (`Chunk.entered`); returns `(output, Carried)`, a carry a document `[B, D, ...]`, a document holding no
     real token its entering carry."""
-    batch, length, rank, heads, _ = x.shape
+    batch, length, _, heads, _ = x.shape
     work, operand, continues, dt, lam, real = _stepped(x, dt, B, C, lam, starts, valid)
     resets = jnp.asarray(starts, bool)
     documents = entered.shape[1]
@@ -254,18 +267,9 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, entered, starts
     weight = jnp.where(holding[..., None], opening, 0)
     again = jnp.einsum('bdhrn,bdhrp->bdhnp', entering.key, entering.value)
     memories = jnp.swapaxes(entering.state, -1, -2) + weight[..., None, None] * again
-    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), angles[:, :, None]).astype(operand)
-                     for t in (B, C))
-    decay = jnp.zeros((batch, length, rank, heads), work).at[:, :, 0].set(unturned * jnp.asarray(A, work))
-    gate = jnp.broadcast_to((lam * dt + following)[:, :, None], decay.shape)
-    begins = jnp.zeros((batch, length, rank), bool).at[:, :, 0].set(resets)
     own = jnp.broadcast_to(jnp.arange(1, documents + 1, dtype=jnp.int32), (batch, documents))
-    out, finals = chunk(MAMBA3, Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
-                                      log_decay=_ranked(decay), beta=_ranked(gate), state=memories,
-                                      starts=_ranked(begins), entered=own),
-                        **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
-    out = out.reshape(x.shape) + _rank_terms(queries.astype(work), keys.astype(work), jnp.asarray(x, work),
-                                             lam * dt, following)
+    out, finals, keys = _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, memories, resets,
+                                       work=work, operand=operand, chunk_size=chunk_size, entered=own)
     # Each document's last real token's angles, keys and values; one holding none keeps its carry's.
     at = jnp.maximum(last, 0)
 
