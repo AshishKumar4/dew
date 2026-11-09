@@ -22,6 +22,7 @@ import dataclasses
 import fnmatch
 import glob
 import inspect
+import itertools
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -2283,16 +2284,31 @@ class OptimConfig:
         return self.optimizer not in ('muon', 'muonclip') and 'mask' in inspect.signature(make).parameters
 
     def fresh_groups(self) -> tuple[ParamGroup, ...]:
-        """The groups a run takes where it names none and draws modules fresh beside a loaded base: those
-        modules at `FRESH_LEARNING_RATE` at the peak of this config's schedule, on its shape (its rate
-        times their quotient), or at its own where that is higher, and every other parameter at its own,
-        each sparing what the ungrouped decay spares (`ParamGroup.spared`)."""
+        """The groups a run takes that draws modules fresh beside a loaded base: its own where one claims
+        them (`ParamGroup.fresh`); else a group of them at `FRESH_LEARNING_RATE` at the peak of this
+        config's schedule, on its shape (its rate times their quotient), or at its own where that is
+        higher, sparing what the ungrouped decay spares (`ParamGroup.spared`). Where the run names
+        none, every other parameter is a base group at its own rate; where it names some, the fresh
+        group stands ahead of its first catch-all (a pattern of `*`), so a fresh module or leaf no group
+        before that names takes the fresh rate, and one a named group claims ahead of it that group's.
+        A base fine-tunes at a rate a fresh module barely moves at: a decision run whose groups named
+        none fresh trained its cross-attention gates to 3e-4 in 1,063 steps at 5e-6, learning nothing,
+        and to 3e-2 at the fresh rate (row 5246)."""
+        named = self.param_groups
+        if any(group.fresh for group in named):
+            return named
         rate = self.rate
         peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
         multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
-        # The groups a run takes in place of none decay as its ungrouped optimizer would.
-        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=self.spared),
-                ParamGroup("base", ("*",), spared=self.spared))
+        taken = {group.name for group in named}
+        names = itertools.chain(("fresh",), (f"fresh{index}" for index in itertools.count(1)))
+        name = next(name for name in names if name not in taken)
+        # The fresh group decays as the run's ungrouped optimizer would.
+        fresh = ParamGroup(name, fresh=True, learning_rate_multiplier=multiplier, spared=self.spared)
+        if not named:
+            return fresh, ParamGroup("base", ("*",), spared=self.spared)
+        at = next((index for index, group in enumerate(named) if "*" in group.patterns), len(named))
+        return (*named[:at], fresh, *named[at:])
 
     def with_fresh(self, modules: Sequence[str], leaves: Sequence[str] = ()) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the

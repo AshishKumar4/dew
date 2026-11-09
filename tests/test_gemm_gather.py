@@ -9,9 +9,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, equations
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import gemm, generation, grouped_matmul
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 SEEDS = 8
@@ -201,7 +201,6 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
     gathered first and put at their slots after; and its kernel gradient's tables on the template too (row
     4852: mma.sync's consumer-fed rings, their loading consumer gathering each step's rows, `gathered.Ring`),
     bitwise the gradient of the rows gathered first. Integers, every sum exact."""
-    from dew.nn.kernels import gemm
 
     rng = np.random.default_rng(13)
     tokens = jnp.asarray(rng.integers(-1, 2, size=(200, 256)), jnp.bfloat16)
@@ -273,7 +272,6 @@ def test_a_blackwells_gathered_block_scaled_product_gathers_its_scales_by_its_ta
     `nvfp4_block_product`'s `gather`): its codes read where they lie by tcgen05's gather and its rows' block
     scales by the same table, bitwise the product of the operand gathered first (codes and scales), its
     groups whole 128-row blocks, one empty."""
-    from dew.nn.kernels import gemm
 
     choice, form, product = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product),
                              "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product)}[format_]
@@ -344,3 +342,28 @@ def test_a_hoppers_moe_decode_splits_its_experts_depth():
 
     with generation.assumed("sm90"):
         assert derived(8).splits > 1 and derived(8192).splits == 1
+
+
+def test_a_kernel_gradient_no_launch_reads_through_its_tables_runs_a_launch_on_its_gathered_rows():
+    """fp32 rows and cotangent read through tables (an fp32 mixture of experts' gathered tokens and scattered
+    slots), which no launch reads where they lie (Mosaic GPU's gathering producer takes 16-bit rows): on an
+    H100 the kernel gradient gathers them first and a grouped launch takes the product, as the forward's
+    does, never XLA's ragged dot over every group's matrix, whose footprint an MoE step's derived plan bounds
+    from below alone (row 5213); interpreted, bitwise the kernel gradient of the gathered rows."""
+    rng = np.random.default_rng(5)
+    tokens = jnp.asarray(rng.standard_normal((200, 128)), jnp.float32)
+    cotangent = jnp.asarray(rng.standard_normal((256, 64)), jnp.float32)
+    table = jnp.asarray(rng.integers(0, 200, 256), jnp.int32)
+    slots = jnp.asarray(rng.permutation(256), jnp.int32)
+    sizes = jnp.asarray([100, 0, 156, 0], jnp.int32)
+    gradient = {"out_dtype": jnp.float32, "precision": "default", "interpret_on_cpu": True}
+    with generation.assumed("sm90"):
+        def tabled():
+            return gemm.gemm_t(tokens, cotangent, sizes, gather=(table, slots), **gradient)
+
+        graph = jax.make_jaxpr(tabled)()
+        got = jax.jit(tabled)()
+        expected = jax.jit(lambda: gemm.gemm_t(tokens[table], cotangent[slots], sizes, **gradient))()
+    names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
+    assert "ragged_dot_general" not in names, names
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
