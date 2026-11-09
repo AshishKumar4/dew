@@ -84,7 +84,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Tests/test_multimodal_model.py judges gemma3n-native-tiny's pixel gradient on its source draw. [5234]
 - Tests/test_multimodal_model.py judges gemma3n-native-tiny's logits after one SGD step on its source draw. [5235]
 - Tests/test_decision_laya.py's released English checkpoint. [5239]
-- algebra.md and the engine agree. [5337, 5338, 5339, 5340, 5342, 5341]
+- algebra.md and the engine agree. [5337, 5338, 5339, 5340, 5342, 5341, 5346]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 
 ## Decision
