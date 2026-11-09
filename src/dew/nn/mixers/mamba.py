@@ -45,7 +45,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import recurrence_algebra, recurrence_chunk
-from dew.nn.linear import DepthwiseConv1d, fork_cache, forked_conv, forked_scan, held_scan
+from dew.nn.linear import DepthwiseConv1d, fork_cache, fork_start, forked_conv, forked_scan, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
@@ -58,21 +58,31 @@ decays and writes, so the chunk bounds the scan's memory; the output does
 not depend on it."""
 
 
-def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE):
+def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
+                   firsts=None):
     """`mamba_selective_scan` (modeling_mamba.py:175-282) after the softplus.
 
     `x` and `dt` `[B, S, D]`, `A` `[D, N]`, `B` and `C` `[B, S, N]`, `D` `[D]`;
     returns `(output [B, S, D], state [B, D, N])` computed in `at_least_fp32`
     and cast back. `starts` `[B, S]` marks packed documents' first tokens,
     whose entering state drops. A call shorter than a chunk scans its own
-    length, so a decode step is the recurrence's one step.
+    length, so a decode step is the recurrence's one step. A 4-D `state`
+    `[B, Dc, D, N]` is each of a row's documents' own, each first at `firsts`
+    `[B, Dc]`: each document is laid from a chunk's edge and the scan takes up
+    its state there (`AlignedDocuments`), the final state each document's
+    `[B, Dc, D, N]`.
     """
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, channels = x.shape
+    aligned = None
+    if state is not None and state.ndim == 4:
+        assert firsts is not None, "documents entering states of their own name their first slots"
+        aligned = recurrence_chunk.AlignedDocuments.of(firsts, length, chunk_size)
+        skipped = x * D
+        x, dt, B, C = aligned.laid(x, dt, B, C)
+        starts, length = None, aligned.length
     chunk_size = min(chunk_size, length)
-    carried = (rows_like(jnp.zeros((batch, channels, A.shape[-1]), work), x) if state is None
-               else jnp.asarray(state, work))
     pad = (chunk_size - length % chunk_size) % chunk_size
 
     def chunks(t):  # [B, S, ...] -> [NC, B, C, ...], chunks leading for the scan
@@ -81,7 +91,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     # A padded step is dt 0, which neither decays nor writes, and no reset.
     resets = jnp.zeros((batch, length), jnp.bool_) if starts is None else jnp.asarray(starts, jnp.bool_)
 
-    def one_chunk(h, step):
+    def scanned(h, step):
         x_c, dt_c, B_c, C_c, reset_c = step   # [B, C, D] twice, [B, C, N] twice, [B, C]
         # The kernels' decay (`recurrence_algebra.selective_decay`), its rate in base 2, zero at a reset.
         decay = recurrence_algebra.selective_decay(dt_c[..., None], A * recurrence_algebra.LOG2_E,
@@ -93,9 +103,29 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         read = float32_einsum('bcdn,bcn->bcd', states, C_c)
         return states[:, -1], read
 
-    final, out = jax.lax.scan(one_chunk, carried, tuple(chunks(t) for t in (x, dt, B, C, resets)))
-    out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
-    return out.astype(dtype), final.astype(dtype)
+    steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
+    if aligned is None:
+        carried = (rows_like(jnp.zeros((batch, channels, A.shape[-1]), work), x) if state is None
+                   else jnp.asarray(state, work))
+        final, out = jax.lax.scan(scanned, carried, steps)
+        out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
+        return out.astype(dtype), final.astype(dtype)
+    memories = jnp.asarray(state, work)
+
+    def loading(h, step):
+        step, load = step
+        # A chunk that takes a document up enters its state; each row's documents in turn.
+        at = jnp.maximum(load, 0)[:, None, None, None]
+        taken = jnp.where((load >= 0)[:, None, None], jnp.take_along_axis(memories, at, axis=1)[:, 0], h)
+        after, read = scanned(taken, step)
+        return after, (read, h)
+
+    last, (out, left) = jax.lax.scan(loading, jnp.zeros_like(memories[:, 0]),
+                                     (steps, jnp.moveaxis(aligned.loads, 1, 0)))
+    out = jnp.moveaxis(out, 0, 1).reshape(batch, length, channels)
+    finals = jax.vmap(recurrence_chunk.document_finals)(memories, aligned.loads, jnp.moveaxis(left, 0, 1),
+                                                        last)
+    return (aligned.unlaid(out) + skipped).astype(dtype), finals.astype(dtype)
 
 
 class Mamba(nn.Module):
@@ -209,8 +239,8 @@ class Mamba(nn.Module):
 
             history, held = fork_cache(self, 'ssm_state') if decode else (None, None)
             convolved = forked_conv(mixed, taps, tokens, history=history, bias=bias, dtype=wide)
-            out = forked_scan(convolved, forked_rule, tokens, (self.intermediate_size, self.state_size),
-                              held=held, state_dtype=wide)
+            out = forked_scan(convolved, forked_rule, tokens,
+                              fork_start(held, (batch, self.intermediate_size, self.state_size), wide))
         else:
             out = held_scan(self, mixed, taps, bias, self._scan,
                             (self.intermediate_size, self.state_size),

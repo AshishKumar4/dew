@@ -41,9 +41,10 @@ from test_recurrence_mosaic import (
     template_call,
 )
 
+from dew.batch import document_firsts
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, DocumentRows, recomputing
+from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
 from dew.nn.kernels.templates import bundles, mosaic_sm90, mosaic_sm100
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
@@ -417,6 +418,75 @@ ENTERING = {'the gated delta rule': recurrence.Hooks(decay='scalar', scale=16 **
             "Mamba-2's SSD": recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)}
 """The forms whose documents enter memories of their own on the template: a decay a head and a key
 dimension under the delta rule, and the rated scan's."""
+
+
+@dataclasses.dataclass(frozen=True)
+class DocumentRows:
+    """A packed call's documents each a row of its own, `[B * D, S]`, the row's tokens from a document's
+    first, past its end written nothing (its decay one, its write gate zero), so its final memory is the
+    document's: the reference a packed walk of documents entering memories of their own is held to, each
+    document a row of its own entering its memory as a call's `state`."""
+
+    begins: jax.Array
+    """Each row's documents' first slots `[B, D]` (`dew.batch.document_firsts`), `S` past its last."""
+    ends: jax.Array
+    """Each document's end `[B, D]`, the next one's first slot or the row's length."""
+    entered: jax.Array
+    """The slot each document enters `[B, D]`, one-based, zero for a zero memory."""
+
+    @classmethod
+    def of(cls, starts, entered, firsts=None) -> "DocumentRows":
+        """`starts` `[B, S]`' documents (or their first slots, `firsts`), each entering its `entered` slot."""
+        documents = entered.shape[1]
+        begins = document_firsts(starts, documents) if firsts is None else firsts[:, :documents]
+        length = starts.shape[1]
+        ends = jnp.concatenate([begins[:, 1:], jnp.full_like(begins[:, :1], length)], axis=1)
+        return cls(begins, jnp.minimum(ends, length), jnp.asarray(entered, jnp.int32))
+
+    def _index(self, length: int):
+        """Each document row's token's slot in its packed row `[B, D, S]` and whether it is the document's."""
+        offsets = jnp.arange(length, dtype=jnp.int32)
+        slots = self.begins[..., None] + offsets
+        return jnp.minimum(slots, length - 1), slots < self.ends[..., None]
+
+    def laid(self, *operands):
+        """The operands `[B, S, ...]` as the documents' rows `[B * D, S, ...]`, zero past a document's end:
+        a decay one (`g` zero, a step zero), a write gate zero, its queries, keys and values zero."""
+        slots, own = self._index(operands[0].shape[1])
+
+        def taken(x):
+            picked = jax.vmap(lambda row, at: row[at])(x, slots)
+            kept = own.reshape(*own.shape, *(1,) * (picked.ndim - own.ndim))
+            picked = jnp.where(kept, picked, jnp.zeros((), x.dtype))
+            return picked.reshape(-1, *picked.shape[2:])
+
+        return tuple(taken(x) for x in operands)
+
+    def entering(self, state):
+        """Each document row's memory `[B * D, ...]`: its slot's of `state` `[B, D, ...]` (`[B, D, Hv, Dk,
+        Dv]`, a selective scan's `[B, D, C, N]`), zero for slot zero."""
+        if state is None:
+            raise ValueError("documents entering memories of their own (`Chunk.entered`) read the slots' "
+                             "memories, `state` `[B, D, Hv, Dk, Dv]`")
+        picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(state, self.entered)
+        kept = (self.entered > 0).reshape(*self.entered.shape, *(1,) * (state.ndim - 2))
+        return jnp.where(kept, picked, 0.0).reshape(-1, *state.shape[2:])
+
+    def unlaid(self, out):
+        """The documents' rows' output `[B * D, S, ...]` back as the packed rows' `[B, S, ...]`: each token's
+        its document's row's at its offset from the document's first."""
+        rows, documents = self.begins.shape
+        length = out.shape[1]
+        out = out.reshape(rows, documents, *out.shape[1:])
+        offsets = jnp.arange(length, dtype=jnp.int32)
+        document = jnp.sum(offsets[None, :, None] >= self.begins[:, None, :], axis=-1) - 1
+        document = jnp.clip(document, 0, documents - 1)
+        at = offsets[None, :] - jnp.take_along_axis(self.begins, document, axis=1)
+        return jax.vmap(lambda row, d, t: row[d, t])(out, document, jnp.clip(at, 0, length - 1))
+
+    def leaving(self, final):
+        """The documents' rows' final memories `[B * D, ...]` as each document's, `[B, D, ...]`."""
+        return final.reshape(*self.begins.shape, *final.shape[1:])
 
 
 @pytest.mark.parametrize('form', ENTERING)

@@ -73,6 +73,7 @@ from dew.nn.linear import (
     decode_kernel,
     decode_step,
     fork_cache,
+    fork_start,
     forked_conv,
     forked_scan,
     fused_token,
@@ -404,7 +405,7 @@ class Mamba2(nn.Module):
             history, held = fork_cache(self, 'ssm_state') if decode else (None, None)
             convolved = forked_conv(mixed, taps, tokens, history=history, bias=bias, dtype=compute)
             out = forked_scan(convolved, forked_rule, tokens,
-                              (self.num_heads, self.state_size, self.head_dim), held=held, state_dtype=wide)
+                              fork_start(held, (batch, self.num_heads, self.state_size, self.head_dim), wide))
             if valid is not None:
                 out = jnp.where(valid[:, :, None], out, 0)
             return self.out_proj(self._gated(out, gate))

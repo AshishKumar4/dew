@@ -493,17 +493,23 @@ def forked_conv(x, kernel, coordinates: Coordinates, *, history=None, bias=None,
                           bias=bias, parts=parts, dtype=dtype, activation=activation)
 
 
-def forked_scan(convolved, rule, coordinates: Coordinates, state_shape: tuple[int, ...], *, held=None,
-                state_dtype=None):
+def fork_start(held, shape: tuple[int, ...], dtype):
+    """A call over forks' row start (`forked_scan`'s `start`): a cached call's held state (`held`), else
+    zero, `shape` `[B, ...]` in `dtype`."""
+    return jnp.zeros(shape, dtype) if held is None else held.astype(dtype)
+
+
+def forked_scan(convolved, rule, coordinates: Coordinates, start):
     """The recurrence of a call over forks (`Coordinates.forks`) after its conv (`forked_conv`): each
-    document from the state its parent's tokens leave, a root from the row's start (`held` `[B,
-    *state_shape]`, a cached call's state, or zero), as its own row of its ancestors and itself runs it. One
-    call of `rule` a level of the forks' chains, roots first, over the whole row: `rule(convolved, *, valid,
-    starts, state, entered)` runs the tokens `valid` marks, each document numbered by its first slot among
-    the call's `starts` (the row's first slot beginning one), the `d`-th entering slot `entered[d]` of
-    `state` (one-based) and its final state its own (`recurrence_chunk.Chunk.entered`), returning `(output,
-    finals)`. The gradient of a state entered sums over the documents continuing it. A cached call leaves
-    the cache as it was: no document's final state is the row's."""
+    document from the state its parent's tokens leave, a root from the row's start (`start`, a pytree of
+    `[B, ...]` leaves: a cached call's state or zero, `fork_start`; Mamba-3's carry, four), as its own row of
+    its ancestors and itself runs it. One call of `rule` a level of the forks' chains, roots first, over the
+    whole row: `rule(convolved, *, valid, starts, state, entered)` runs the tokens `valid` marks, each
+    document numbered by its first slot among the call's `starts` (the row's first slot beginning one), the
+    `d`-th entering slot `entered[d]` of `state` (`start`'s leaves `[B, slots, ...]`, one-based) and its
+    final state its own (`recurrence_chunk.Chunk.entered`), returning `(output, finals)`, `finals` as `state`
+    a document a slot. The gradient of a state entered sums over the documents continuing it. A cached call
+    leaves the cache as it was: no document's final state is the row's."""
     forks = coordinates.forks
     assert forks is not None and coordinates.segments is not None
     documents = jnp.asarray(coordinates.segments, jnp.int32)
@@ -511,10 +517,8 @@ def forked_scan(convolved, rule, coordinates: Coordinates, state_shape: tuple[in
     count = forks.count
     real = (jnp.ones((batch, length), bool) if coordinates.valid is None
             else jnp.asarray(coordinates.valid, bool)) & (documents > 0)
-    first = convolved[0] if isinstance(convolved, tuple) else convolved
-    dtype = state_dtype or first.dtype
-    start = jnp.zeros((batch, *state_shape), dtype) if held is None else held.astype(dtype)
-    states = jnp.concatenate([start[:, None], jnp.zeros((batch, count, *state_shape), dtype)], axis=1)
+    states = jax.tree.map(lambda leaf: jnp.concatenate(
+        [leaf[:, None], jnp.zeros((batch, count, *leaf.shape[1:]), leaf.dtype)], axis=1), start)
     rows = jnp.arange(batch)[:, None]
     number = jnp.maximum(documents - 1, 0)
     levels = forks.levels()
@@ -531,7 +535,10 @@ def forked_scan(convolved, rule, coordinates: Coordinates, state_shape: tuple[in
     # whatever it holds (`dew.batch.document_firsts`): as many as the row has slots.
     slots = min(count + 1, length)
     parents = jnp.asarray(forks.parents, jnp.int32)
-    lifted = (batch, count, *(1,) * len(state_shape))
+
+    def lifted(mask, leaf):
+        return mask.reshape(batch, count, *(1,) * (leaf.ndim - 2))
+
     out = None
     for level in range(forks.depth + 1):
         valid = real & (level_of == level)
@@ -541,11 +548,16 @@ def forked_scan(convolved, rule, coordinates: Coordinates, state_shape: tuple[in
         entering = jnp.zeros((batch, slots), jnp.int32).at[rows, jnp.where(here, slot, slots)].set(
             parents + 1, mode="drop")
         found, finals = rule(convolved, valid=valid, starts=begins & valid, state=states, entered=entering)
-        taken = jnp.take_along_axis(finals, jnp.minimum(slot, slots - 1).reshape(lifted), axis=1)
-        prior = jnp.take_along_axis(states, parents.reshape(lifted), axis=1)
-        passed = ((levels == level) & ~holding).reshape(lifted)
-        states = states.at[:, 1:].set(jnp.where(here.reshape(lifted), taken.astype(dtype),
-                                                jnp.where(passed, prior, states[:, 1:])))
+        passed = (levels == level) & ~holding
+
+        def settled(leaf, final, slot=slot, here=here, passed=passed):
+            # A document holding real tokens its final; one holding none its parent's state passed on.
+            taken = jnp.take_along_axis(final, lifted(jnp.minimum(slot, slots - 1), final), axis=1)
+            prior = jnp.take_along_axis(leaf, lifted(parents, leaf), axis=1)
+            return leaf.at[:, 1:].set(jnp.where(lifted(here, leaf), taken.astype(leaf.dtype),
+                                                jnp.where(lifted(passed, leaf), prior, leaf[:, 1:])))
+
+        states = jax.tree.map(settled, states, finals)
         out = found if out is None else jnp.where(valid.reshape(*valid.shape, *(1,) * (found.ndim - 2)),
                                                   found, out)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
@@ -1256,9 +1268,8 @@ class GatedDeltaNet(nn.Module):
             history, held = fork_cache(self, 'recurrent_state') if decode else (None, None)
             convolved = forked_conv(mixed, self.conv1d()[0], tokens, history=history, parts=heads,
                                     dtype=operand if ported else wide)
-            out = forked_scan(convolved, forked_rule, tokens,
-                              (self.num_v_heads, self.head_k_dim, self.head_v_dim), held=held,
-                              state_dtype=wide)
+            out = forked_scan(convolved, forked_rule, tokens, fork_start(
+                held, (x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim), wide))
         elif shards > 1:
             if decode:
                 raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "
