@@ -30,6 +30,7 @@ from dew.nn.kernels.templates.attention_algebra import (
     normalized_rows,
     power2,
     split_output,
+    tiles_walked,
     weights_parts,
 )
 from dew.nn.precision import Running, added_to, compensated_sum, compensates_loops, running_sum, running_total
@@ -573,20 +574,20 @@ def centre_finish(state: Centre, state_total: jax.Array, initial: jax.Array, exp
 
 
 def dropout_centre(lo, hi, terms: Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array, jax.Array]],
-                   keys: int, rows: int, state_total: jax.Array, initial: jax.Array
-                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                   keys: int, rows: int, state_total: jax.Array, initial: jax.Array, *,
+                   most: int | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Dropout's first pass over a query block (`Centre`): `terms(j)` gives key tile `j`'s unnormalized
     weights `exp(s - m)`, its dropped products (`dropped_products`), where its entries are seen, and their
     key indices. Each product is centred about its query's least-magnitude product in its first visible
     tile and scaled before any sum (`centre_step`), and D is rebuilt from that centre (`centre_finish`).
     Returns the second sweep's `(anchor, delta, chosen)`: no anchor, D about zero, and no key chosen, so
-    identical products cancel exactly in its cotangents."""
+    identical products cancel exactly in its cotangents. Its tiles at most `most` (`tiles_walked`)."""
     exponent = centre_scale(keys)
 
     def step(j, state):
         weights, products, seen, positions = terms(j)
         return centre_step(state, weights, products, seen, positions, exponent)
 
-    centred = jax.lax.fori_loop(lo, hi, step, centre_start(rows))
+    centred = tiles_walked(lo, hi, step, centre_start(rows), most)
     return (jnp.zeros((rows,), jnp.float32), centre_finish(centred, state_total, initial, exponent),
             jnp.full((rows,), -1, jnp.int32))
