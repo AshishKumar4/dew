@@ -75,7 +75,7 @@ from dew.interop import unread
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import checkpoint_array, checkpoint_dtype
-from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
+from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fp8_codes
 from dew.nn.precision import correctly_rounded_divide
 
 # --------------------------------------------------------------------------
@@ -805,7 +805,7 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
         return np.concatenate([codes for codes, _ in parts]), np.concatenate([scale for _, scale in parts])
     rows, cols = _sides(block)
     codes, scale_inv = _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
-                                    rounded=_ue8m0 if ue8m0 else np.asarray)
+                                    rounded=_ue8m0 if ue8m0 else np.asarray, coded=np.asarray)
     # A contiguous copy: sliced off the padding, the codes are a view whose
     # buffer a writer taking it would read as the padded rows.
     return np.ascontiguousarray(codes), scale_inv
@@ -817,15 +817,19 @@ def fp8_block_cast(x: ArrayLike, block: Block) -> tuple[jax.Array, jax.Array]:
     (`dew.quantization`). No value is refused and no scale is
     rounded to ue8m0 here."""
     rows, cols = _sides(block)
-    # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do.
+    # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do. The codes round to
+    # E4M3 in Dew's arithmetic (`fake_quant.fp8_codes`), which the cast then holds exactly: XLA GPU's
+    # default excess precision deletes an f32 -> E4M3 -> f32 convert pair, and XLA:CPU converts a
+    # hoisted small loop's narrow floats through float16, rounding twice.
     return _cast_blocks(jnp.asarray(x, jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
-                        rounded=jnp.asarray)
+                        rounded=jnp.asarray, coded=fp8_codes)
 
 
-def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
+def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded, coded):
     """The FP8 block cast of a float32 `values` matrix under `xp`, NumPy or
-    jax.numpy, dividing by `divide` and rounding each block's scale by
-    `rounded`: `quantize_fp8_blocks`' rule. The 1e-4 amax floor is
+    jax.numpy, dividing by `divide`, rounding each block's scale by
+    `rounded` and each value over it to E4M3 by `coded` before the cast:
+    `quantize_fp8_blocks`' rule. The 1e-4 amax floor is
     `per_block_cast_to_fp8`'s `clamp(1e-4)`."""
     height, width = values.shape
     padded = xp.pad(values, ((0, -height % rows), (0, -width % cols)))
@@ -833,7 +837,7 @@ def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
     amax = xp.maximum(xp.max(xp.abs(tiles), axis=(1, 3)), xp.float32(AMAX_FLOOR))
     scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
     # One reciprocal per block, as the reference takes it.
-    codes = (tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
+    codes = coded(tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
     return codes.reshape(padded.shape)[:height, :width], scale_inv
 
 
