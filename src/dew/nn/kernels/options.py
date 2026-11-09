@@ -401,6 +401,14 @@ class OuterProgram:
                 jax_config.trace_context(), jax.sharding.get_mesh()), dynamic, named
 
 
+def trace_context() -> Hashable:
+    """What JAX keys a trace on beside its arguments (its configuration's traced states, Dew's own run
+    precision among them, and the abstract mesh), and the concrete mesh in place: what a call's executable
+    is kept under beside its arguments (`OuterProgram._keyed`), for a cache of traces kept outside the
+    compile point (`dew.training._candidates`)."""
+    return jax_config.trace_context(), jax.sharding.get_mesh()
+
+
 def _signature(leaf) -> Hashable:
     """What jit keys an argument on: an array's abstract value (shape, dtype, weak type), placement
     and layout (its `format`, which holds its sharding; a key array's sharding), another value's type,

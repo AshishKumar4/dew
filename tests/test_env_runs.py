@@ -311,6 +311,25 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped(tmp_path, agent):
     assert_bitwise(whole, run.prepare().train("stopped"))
 
 
+def test_a_dreamer_run_trained_again_in_its_process_reads_the_step_its_equal_traced(tmp_path):
+    """A DreamerV3 run trained again in the same process under another name, its trainer and objective
+    built anew from an equal config, traces no step: it reads the one the first run traced
+    (`Trainer._step_key`, `candidate_for`), and trains to the same leaves, bit for bit. One at another
+    horizon, which its objective reads, traces its own (row 3873: each of a resumed run's fits traced
+    its step again, 6.5 to 12.9 s, and lowered it, 9 s)."""
+    from dew.telemetry.compiles import Compiles
+
+    run = resumable(tmp_path, "dreamer")
+    first = run.prepare().train("first")
+    with Compiles("step") as again:
+        second = run.prepare().train("second")
+    assert [program for program in again.programs if program.kind == "traced"] == []
+    assert_bitwise(first, second)
+    with Compiles("step") as other:
+        run.override({"objective.horizon": 100.0}).prepare().train("third")
+    assert any(program.kind == "traced" for program in other.programs)
+
+
 @pytest.mark.parametrize("agent", ["ppo", "dreamer"])
 def test_a_resumed_run_trains_on_in_another_environment_and_keeps_what_it_trains(tmp_path, agent):
     """A run's environment is what it reads, so the run (`resumable`) trained to its second update and
