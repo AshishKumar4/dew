@@ -164,8 +164,17 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
         return jnp.where(live & right, middle + 1, low), jnp.where(live & ~right, middle, high)
 
     steps = max(values.shape[1], 1).bit_length()
-    # Unrolled into one program: a loop ran each step as a launch of its own (`dew.nn.documents._searched`).
-    return jax.lax.fori_loop(0, steps, step, (lo, hi), unroll=True)[0]
+
+    def search(*, launched: bool) -> Callable[[], jax.Array]:
+        return lambda: jax.lax.fori_loop(0, steps, step, (lo, hi), unroll=launched)[0]
+
+    # Unrolled into one program where a loop's trips are launches of their own (`generation.by_trips`, a
+    # GPU's: `dew.nn.documents._searched`), a loop elsewhere: unrolled on a CPU, its steps' shared selects and
+    # shifts sent XLA:CPU's LLVM loop vectorizer into a recursion exponential in them (VPlan's
+    # `onlyFirstLaneUsed`, a walk of each value's users with no visited set; LLVM 7a1922aff makes it a
+    # worklist, past stock jaxlib's LLVM), its compile of a prefix run's step unfinished past 900 s (rolled
+    # there, 80 s).
+    return generation.by_trips(search)
 
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
