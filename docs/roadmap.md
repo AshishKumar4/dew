@@ -30,6 +30,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - A GEMM of a width or depth no swizzle tile divides. [5299]
 - Tests/test_local_attention.py::test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_axis and…. [5323]
+- Attention's contract is finite inputs. [5327]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Exact on every path, every edge and every derivative order. [2656, 3723]
 - Inference through the templates. [3424, 3602]
