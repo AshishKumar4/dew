@@ -334,12 +334,17 @@ def test_a_jepa_encoders_hidden_states_are_its_representation(case):
 # The torchax fallback.
 
 
+TORCHAX_HEAD_SEEDS = 8
+"""The torchax head site's declared check-1 seeds, sized by `seeds_for` paired on armada."""
+
+
 def test_a_torchax_models_reads_are_its_forward(tmp_path):
     """A tiny random GPT-NeoX through transformers' own forward: the logits
-    read is the call's, its plain head's stored weight contracts to them
-    where both sum as XLA does (torchax's products are XLA's own; Dew's state
-    those sums, `FP32_SUMS`), it writes no cache, and every field past the
-    tokens is refused by name."""
+    read is the call's, it writes no cache, and every field past the tokens
+    is refused by name. Its plain head's stored weight contracts its hidden
+    states on par with its own logits, both from that product in float64 (check
+    1 over drawn tokens): two programs, torchax's XLA sum against Dew's head as
+    a CPU sums under `FP32_SUMS` (`accumulated`), which need not agree to the bit."""
     import torch
     import transformers
 
@@ -356,9 +361,27 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     same(logits, model.apply(variables, tokens))
     table = model.apply(variables, method="output_table")
     assert table is not None
-    hidden = model.apply(variables, tokens, method="hidden_states")
-    with jax.default_matmul_precision(FP32_SUMS):
-        same(contracted(hidden, table, variables), logits)
+
+    def draw(seed):
+        drawn = np.random.default_rng([0x7A, seed]).integers(0, 256, (ROWS, LENGTH))
+        return (jnp.asarray(drawn, jnp.int32),)
+
+    def hidden(tokens):
+        return model.apply(variables, tokens, method="hidden_states")
+
+    @as_given
+    def head(tokens):
+        with jax.default_matmul_precision(FP32_SUMS):
+            return np.asarray(contracted(hidden(tokens), table, variables))
+
+    @as_given
+    def wide(tokens):
+        states = np.asarray(hidden(tokens), np.float64)
+        with jax.enable_x64(new_val=True):
+            return np.asarray(jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), table).logits(states))
+
+    assert_as_exact(head, as_given(lambda tokens: np.asarray(model.apply(variables, tokens))), draw,
+                    "torchax head", seeds=TORCHAX_HEAD_SEEDS, truth_fn=wide)
     for method in ("logits", "hidden_states"):
         with pytest.raises(ValueError):
             model.apply(variables, tokens, method=method, positions=tokens)
