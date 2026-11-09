@@ -201,7 +201,7 @@ class KimiDeltaAttention(nn.Module):
         forked = tokens.forks is not None
         if decode and S == 1 and not forked and decode_kernel(
                 jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
-                fuses=True) == 'fused':
+                groups=self.num_heads, fuses=True) == 'fused':
             token = self._fused_token(taps, g, beta, gate, valid, tokens.starts)
 
         def split(part):
