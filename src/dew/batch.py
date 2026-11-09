@@ -81,13 +81,6 @@ trainer's transaction reads it for the examples' draws (`Step.example_index`) an
 batch the objective sees."""
 
 
-UNIT_ROWS = "unit_rows"
-"""A batch's column of each row's unit, int32: rows one loss term reads together, a preference pair whose
-halves stand a window each (`dew.data.preferences`, `segments=1`). Whatever cuts the batch's rows into
-parts, a step's microbatches and its devices' shares (`dew.training.planning.splits`), keeps each unit's
-rows in one part."""
-
-
 EXAMPLES_CONSUMED = "examples_consumed"
 """A training batch's column of the source examples each row is the last of, int32, in a run bounded in
 examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
@@ -1027,7 +1020,6 @@ __all__ = [
     "PARAMETER_ROOTS",
     "SCAN_BLOCKS",
     "TEXT_KEY",
-    "UNIT_ROWS",
     "VALIDITY_FIELD",
     "VALID_ROWS",
     "Batch",

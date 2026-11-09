@@ -19,11 +19,11 @@ import grain.python as grain
 import numpy as np
 
 from dew._records import record
-from dew.batch import UNIT_ROWS, token_ids
+from dew.batch import token_ids
 from dew.data.facts import shaped, unshaped
 from dew.data.forked_rows import window_forks
-from dew.data.pipeline import PACK_BINS
-from dew.data.tokens import first_fit
+from dew.data.packing import first_fit_windows
+from dew.data.pipeline import PACK_BINS, Pack
 
 if TYPE_CHECKING:
     from dew.batch import Batch
@@ -38,13 +38,9 @@ REAL_KEY = "real_mask"
 """Batch key holding the `[B, W]` marks of each window's ids, 1 on its pairs' tokens and 0 on padding."""
 
 PAIRS_KEY = "pair_ids"
-"""Batch key holding each token's pair `[B, W]`, from 1, 0 on padding: a window's own numbering as the
-packer writes it, every pair's own across its batch once `PairIds` numbers them, which the DPO loss reads
+"""Batch key holding each token's pair `[B, W]`, from 1 in the window's order, 0 on padding: a window's own
+numbering as the packer writes it, which the DPO loss numbers across the windows a step reads
 (`dew.objectives.rl.preference.pair_numbers`)."""
-
-CONTINUED_KEY = "continued"
-"""Batch key holding whether each window `[B]` continues the pair the window before it in the stream
-opened: a window of one half's (`segments=1`) holding a rejected half, which `PairIds` reads."""
 
 HALVES_KEY = "halves"
 """Batch key holding each token's half `[B, W]`: 1 the chosen's, 2 the rejected's, 0 a prompt both share
@@ -68,9 +64,10 @@ and that document's parent there, its completion marks, its half and its place i
 
 
 def window_width(seq_len: int, segments: int | None = None) -> int:
-    """The tokens a window holds: both halves of a pair whose halves take `seq_len` each, or one half where
-    a window holds one document (`segments=1`, a model that reads one document a row)."""
-    return seq_len if segments == 1 else 2 * seq_len
+    """The tokens a window holds: a pair whose halves take `seq_len` each and share at least one token, so
+    the model reads `2 * (seq_len - 1)` of them, twice a half's row; or one half where a window holds one
+    document (`segments=1`, a model that reads one document a row)."""
+    return seq_len if segments == 1 else 2 * seq_len - 1
 
 
 def window_documents(seq_len: int, segments: int | None = None) -> int:
@@ -165,22 +162,37 @@ class PreferencePair(grain.MapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
-class PairHalves:
-    """A pair's document (`PreferencePair`, its halves whole) as one record a half, in order, the chosen
-    first: what a window of one document holds (`segments=1`), a model that reads one document a row."""
+class PairWindows(grain.MapTransform):
+    """A pair's document (`PreferencePair`, its halves whole) as its two halves each in a window of `width`
+    of its own, the chosen first, on an axis of the pair's (`[2, width]` each key, `window`): what a model
+    that reads one document a row takes (`segments=1`), every row dealer keeping a pair whole."""
+
+    width: int
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """Halves in place of pairs, their token fields of no fixed length."""
-        return facts
+        """A pair's two windows' keys in place of its document."""
+        rows = unshaped(facts, *TOKEN_FIELDS)
+        for key in (IDS_KEY, MASK_KEY, REAL_KEY, PAIRS_KEY, HALVES_KEY, POSITIONS_KEY):
+            rows = shaped(rows, key, [2, self.width])
+        return {**rows, "seq_len": self.width}
 
-    def flat_map(self, element: Batch) -> list[Batch]:
+    def map(self, element: Batch) -> Batch:
         documents = np.asarray(element["pair_documents"])
         if np.any(np.asarray(element["pair_parents"]) > 0):
             raise ValueError("a pair whose halves share their prompt is one document; lay its halves whole "
                              "(share=False) to read them a row each")
+        halves = []
+        for number in (1, 2):
+            taken = documents == number
+            size = int(taken.sum())
+            if size > self.width:
+                raise ValueError(f"a half of {size} tokens past its window of {self.width}")
+            fields = {name: np.zeros(self.width, np.asarray(element[name]).dtype) for name in TOKEN_FIELDS}
+            for name in TOKEN_FIELDS:
+                fields[name][:size] = np.asarray(element[name])[taken]
+            halves.append(window(fields, (np.arange(self.width) < size).astype(np.int32), 1, share=False))
         kept = {key: value for key, value in element.items() if key not in TOKEN_FIELDS}
-        return [{**kept, **{name: np.asarray(element[name])[documents == number] for name in TOKEN_FIELDS}}
-                for number in (1, 2)]
+        return {**kept, **{key: np.stack([half[key] for half in halves]) for key in halves[0]}}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -201,9 +213,7 @@ class PreferenceWindows(grain.MapTransform):
                     *((DOCUMENTS_KEY,) if self.documents > 1 else ())):
             rows = shaped(rows, key, [self.width])
         # A half's longest, the run's DPO row width, as a pair a row states it (`PreferencePair`).
-        rows = {**rows, "seq_len": self.width if self.documents == 1 else self.width // 2}
-        if self.documents == 1:
-            rows = shaped(rows, CONTINUED_KEY, [])
+        rows = {**rows, "seq_len": (self.width + 1) // 2}
         return shaped(rows, PARENTS_KEY, [self.documents]) if self.share else rows
 
     def map(self, element: Batch) -> Batch:
@@ -224,54 +234,45 @@ def window(fields: Mapping[str, np.ndarray], pairs: np.ndarray, documents: int, 
     real = pairs > 0
     laid, parents = window_forks(pairs, np.where(real, fields["pair_documents"], 0),
                                  np.where(real, fields["pair_parents"], 0), documents)
-    halves = np.where(real, fields[HALVES_KEY], 0)
     keys = {IDS_KEY: np.where(real, fields["text"], 0).astype(np.int32),
-            # A window whose first half is a rejected one continues the pair the window before it opened.
-            CONTINUED_KEY: np.asarray(bool(real[0]) and int(halves[0]) == 2),
             MASK_KEY: np.where(real, fields[MASK_KEY], 0).astype(np.int32),
             REAL_KEY: real.astype(np.int32), PAIRS_KEY: pairs,
             HALVES_KEY: np.where(real, fields[HALVES_KEY], 0).astype(np.int32),
             POSITIONS_KEY: np.where(real, fields[POSITIONS_KEY], 0).astype(np.int32)}
     if documents > 1:
         keys[DOCUMENTS_KEY] = laid
-        del keys[CONTINUED_KEY]
     return {**keys, PARENTS_KEY: parents} if share else keys
 
 
 def windows(pairs: Sequence[Mapping[str, object]], seq_len: int, *, share: bool = True,
             segments: int | None = None, count: int | None = None,
             bins: int = PACK_BINS) -> Batch:
-    """Preference records (`PreferencePair`'s) packed first-fit with `bins` open windows, in their order,
-    into `count` windows (as many as they need where None) of `window_width(seq_len, segments)` tokens, at
-    most `segments` documents a window (`preferences`), stacked as a batch: the windows the `preferences`
-    preset packs, built on the host for a caller holding its pairs."""
+    """Preference records (`PreferencePair`'s) laid out as the `preferences` preset lays them, run on the host
+    for a caller holding its pairs, stacked as a batch: packed first-fit with `bins` open windows, in
+    their order, into `count` windows (as many as they need where None, the rest empty) of
+    `window_width(seq_len)` tokens (`first_fit_windows`, the stream's packer); with `segments=1`, a pair a
+    record, its halves each in a window of `seq_len` (`PairWindows`), `count` pairs."""
     share = share and segments != 1
     step = PreferencePair(seq_len, share=share)
     documents = [step.map(dict(pair)) for pair in pairs]
     if segments == 1:
-        documents = [half for document in documents for half in PairHalves().flat_map(document)]
-    width = window_width(seq_len, segments)
-    held_documents = window_documents(seq_len, segments)
-    grouped, starts = first_fit(np.asarray([len(document["text"]) for document in documents], np.int64),
-                                width, bins, segments or width // 2)
-    held = len(starts) - 1 if count is None else count
-    if held < len(starts) - 1:
-        raise ValueError(f"the pairs need {len(starts) - 1} windows, more than the {count} asked for")
-    laid = []
-    for at in range(held):
-        members = grouped[starts[at]:starts[at + 1]] if at < len(starts) - 1 else []
-        fields = {name: np.zeros(width, np.int32) for name in TOKEN_FIELDS}
-        pairs_of = np.zeros(width, np.int32)
-        slot = 0
-        for number, member in enumerate(members, start=1):
-            document = documents[member]
-            span = slice(slot, slot + len(document["text"]))
-            for name in TOKEN_FIELDS:
-                fields[name][span] = document[name]
-            pairs_of[span] = number
-            slot = span.stop
-        laid.append(window(fields, pairs_of, held_documents, share=share))
-    return PairIds()({key: np.stack([each[key] for each in laid]) for key in laid[0]})
+        laid = [PairWindows(seq_len).map(document) for document in documents]
+        held = len(laid) if count is None else count
+        if held < len(laid):
+            raise ValueError(f"{len(laid)} pairs, more than the {count} asked for")
+        laid += [{key: np.zeros_like(value) for key, value in laid[0].items()}] * (held - len(laid))
+    else:
+        width = window_width(seq_len, segments)
+        pack = Pack(width, TOKEN_FIELDS, bins=bins, policy="first-fit", segments=segments or width // 2)
+        packed = [window for window, _ in first_fit_windows([pack.document(each) for each in documents],
+                                                            pack)]
+        held = len(packed) if count is None else count
+        if held < len(packed):
+            raise ValueError(f"the pairs need {len(packed)} windows, more than the {count} asked for")
+        empty = {name: np.zeros_like(value) for name, value in packed[0].items()}
+        laying = PreferenceWindows(width, window_documents(seq_len, segments), share)
+        laid = [laying.map(each) for each in packed + [empty] * (held - len(packed))]
+    return {key: np.stack([each[key] for each in laid]) for key in laid[0]}
 
 
 def pair_windows(ids, mask, *, real=None, share: bool = True, segments: int | None = None,
@@ -286,37 +287,3 @@ def pair_windows(ids, mask, *, real=None, share: bool = True, segments: int | No
               for name, values in ((side, ids), (f"{side}_mask", mask))}
              for pair in range(ids.shape[0])]
     return windows(pairs, ids.shape[2], share=share, segments=segments, count=count)
-
-
-@dataclasses.dataclass(frozen=True)
-class PairIds:
-    """A batch of windows (`PreferenceWindows`, rows in the stream's order) with each pair numbered across
-    the batch (`PAIRS_KEY`, from 1 in the batch's order) and each window's unit (`UNIT_ROWS`): a window
-    of one half (`CONTINUED_KEY`) is its pair's, so a step reads a pair's two windows in one of its parts
-    however it cuts its rows (`dew.training.planning.unit_order`). The DPO objective's batch step
-    (`DPOObjective.data`); numbering a numbered batch again leaves it as it is."""
-
-    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """The batch's fields with each window's unit beside them."""
-        return shaped(facts, UNIT_ROWS, [])
-
-    def __call__(self, batch: Batch) -> Batch:
-        pairs = np.asarray(batch[PAIRS_KEY], np.int64)
-        rows = pairs.shape[0]
-        continued = (np.zeros(rows, bool) if CONTINUED_KEY not in batch
-                     else np.asarray(batch[CONTINUED_KEY], bool).reshape(rows))
-        if rows and continued[0]:
-            raise ValueError("a batch opens on the second window of a pair, whose first the batch before it "
-                             "holds: a batch of windows of one half holds an even count of them")
-        numbered = np.zeros_like(pairs)
-        units = np.zeros(rows, np.int32)
-        opened = 0
-        for row in range(rows):
-            # A window's own pairs in their order, its first the one before it where it continues it.
-            local = list(dict.fromkeys(pairs[row][pairs[row] > 0].tolist()))
-            first = opened if continued[row] else opened + 1
-            mapping = {pair: first + at for at, pair in enumerate(local)}
-            numbered[row] = [mapping.get(pair, 0) for pair in pairs[row].tolist()]
-            opened = max(opened, first + len(local) - 1)
-            units[row] = first if local else opened + rows + row
-        return {**batch, PAIRS_KEY: numbered.astype(np.int32), UNIT_ROWS: units}

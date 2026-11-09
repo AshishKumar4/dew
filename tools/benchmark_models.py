@@ -353,12 +353,13 @@ def global_batch(case: Case, seed: int = 0) -> Batch:
                 return {"text": rng.integers(0, vocab - 1, size=(case.batch_size, case.seq_len))
                         .astype(np.int32)}
             case "dpo":
-                # Pairs that share their prompt; the completions after it count.
+                # Pairs that share their prompt, the completions after it counting, a pair a window as
+                # a DPO run's batches lay them (`preferences.pair_windows`).
                 pairs = rng.integers(0, vocab, size=(case.batch_size, 2, width)).astype(np.int32)
                 pairs[:, 1, :prompt] = pairs[:, 0, :prompt]
                 completion = np.zeros(pairs.shape, np.int32)
                 completion[:, :, prompt:] = 1
-                return {preferences.IDS_KEY: pairs, preferences.MASK_KEY: completion}
+                return preferences.pair_windows(pairs, completion, count=case.batch_size)
             case "grpo":
                 # One rollout a row, a prompt and the response the mask counts:
                 # each row's advantage on its response tokens, and the

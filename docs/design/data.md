@@ -304,7 +304,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 | `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None, margin=0, context=0, missing="silence", rejects=True, records=None, host=())` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
 | `video(ds, seconds, *, frames, fps, size, batch, caption="", extensions=(".mp4", ".avi", ".mov", ".webm"), ...)` | a listing of media files (`Files(url, format="files")`, cut to `extensions`), or rows with `path` or `video_path` | the `clips` fields, with each row's caption, `caption` where it states none; its other settings are `clips`' |
 | `prompts(ds, tokenizer, *, max_prompt_len, batch, pad_id=0, long="truncate", thinking=None, reward_bytes=None, cache=None, records=None, host=())` | `prompt`: a string or chat turns; `data_source`, `ground_truth`, `extra_info` for the reward | `prompt` int32 `[B, max_prompt_len]` left-padded, `prompt_length` int32 `[B]`, and the three reward fields as int32 UTF-8 bytes `[B, reward_bytes]` ([post-training batches](#post-training-batches)) |
-| `preferences(ds, *, seq_len, batch, pad_id=0, cache=None, records=None, host=())` | `chosen`, `rejected`: token ids, with `chosen_mask`, `rejected_mask` | each laid out in `seq_len` tokens with its mask (`preferences.PreferencePair`; [post-training batches](#post-training-batches)) |
+| `preferences(ds, *, seq_len, batch, share=True, segments=None, bins=PACK_BINS, cache=None, records=None, host=())` | `chosen`, `rejected`: token ids, with `chosen_mask`, `rejected_mask` | each pair one document, its halves at most `seq_len` tokens each, packed first-fit into windows of `2 * seq_len - 1` tokens (`preferences.PreferencePair`, `PreferenceWindows`; [post-training batches](#post-training-batches)) |
 | `canvas(ds, tokenizer, *, prompt_length, canvas_size, batch, canvases=1, pad_id=0, messages="messages", cache=None, records=None, host=())` | `messages`: chat turns | each assistant turn one block-diffusion row: its prompt in `prompt_length` tokens, its response in `canvases` canvases of `canvas_size`, EOS filling its last canvas and `pad_id` the rest; longer ones keep their first tokens |
 
 - A `lm` or `sft` row holds `seq_len` inputs and their next-token targets.
@@ -332,12 +332,18 @@ The chat, preference and prompt presets write these batches, which the SFT, pref
 | `text_coordinates` | `Coordinates`, `[B, S+1]` leaves | int32/bool | Document membership, padding and positions |
 | `text_roles` | `[B, S+1]` | int8 | Role per id, 0 on padding |
 
-A preference pair holds `chosen` and `rejected` token-id lists, with `chosen_mask` and `rejected_mask` marking the completion tokens; a missing mask marks the whole sequence as completion. The transform pads each pair together, and choosing `seq_len=S+1` prepares the row width `DPOObjective(..., seq_len=S)` reads.
+A preference pair holds `chosen` and `rejected` token-id lists, with `chosen_mask` and `rejected_mask` marking the completion tokens; a missing mask marks the whole sequence as completion. Each pair is one document: with `share`, its halves' shared prompt once and each half's rest continuing it (`dew.batch.Forks`), else its halves whole. The preset packs pairs first-fit into windows of `W = 2 * seq_len - 1` tokens, so the model reads `2 * (seq_len - 1)` of them, twice a half's row; a pair fits where its halves share a token or one is shorter than `seq_len`. With `segments=1`, for a model that reads one document a row, a row is a pair, its halves each in a window of `W = seq_len` on an axis of the pair's (`preferences.PairWindows`, every key below but the documents `[B, 2, W]`), so whatever deals a batch's rows to shares, shards or microbatches deals whole pairs. Choosing `seq_len=S+1` prepares the windows `DPOObjective(..., seq_len=S)` reads. The DPO loss reads both as windows, a pair a row's two in turn, and numbers each pair across the windows a step reads from `pair_ids`.
 
 | Key | Shape | Dtype | Content |
 |---|---|---|---|
-| `input_ids` | `[B, 2, S+1]` | int32 | Chosen at pair index 0, rejected at 1 |
-| `completion_mask` | `[B, 2, S+1]` | int32 | Completion marks aligned with the ids |
+| `input_ids` | `[B, W]` | int32 | Each window's pair documents end to end, 0 on padding |
+| `completion_mask` | `[B, W]` | int32 | 1 on completion tokens |
+| `real_mask` | `[B, W]` | int32 | 1 on the pairs' tokens, 0 on padding |
+| `pair_ids` | `[B, W]` | int32 | Each token's pair in its window, from 1, 0 on padding |
+| `halves` | `[B, W]` | int32 | 1 the chosen half, 2 the rejected, 0 a shared prompt and padding |
+| `pair_positions` | `[B, W]` | int32 | Each token's place in its own half |
+| `fork_documents` | `[B, W]` | int32 | Each token's document in its window, from 1, where a window holds several |
+| `fork_parents` | `[B, D]` | int32 | The document each of a window's continues, 0 for none, where halves share their prompt |
 
 `RenderPrompt` accepts a message conversation, a string or an id sequence, and encodes each row to a left-padded window of ids and its length. The reward columns become fixed-width UTF-8 byte arrays, so every leaf survives the device transfer; a missing reward field becomes an empty string.
 

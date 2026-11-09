@@ -261,11 +261,15 @@ def test_a_masked_diffusion_accuracy_leaves_its_repeat_rows_out(windows):
 
 def test_a_dpo_accuracy_is_the_real_rows_whatever_the_repeats_hold(windows):
     """DPO's preference accuracy over five pairs the policy ranks right,
-    padded with repeats that swap chosen and rejected, which it ranks wrong:
-    the pass reports the five pairs' accuracy, as their batch alone does."""
+    padded with repeats that swap chosen and rejected (each window's halves
+    marked the other's), which it ranks wrong: the pass reports the five
+    pairs' accuracy, as their batch alone does."""
+    from dew.data.preferences import HALVES_KEY
+
     objective, batch = cases(windows)["dpo"]()
     records = records_of(batch, 5)
-    swapped = [jax.tree.map(lambda value: value[::-1], record) for record in records[:ROWS - 5]]
+    swapped = [{**record, HALVES_KEY: np.where(record[HALVES_KEY] > 0, 3 - record[HALVES_KEY], 0)}
+               for record in records[:ROWS - 5]]
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 3)
         step = Step(jnp.asarray(0), jax.random.key(1), moved(objective.init(jax.random.key(0)), 13))

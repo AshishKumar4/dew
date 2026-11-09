@@ -191,6 +191,10 @@ def test_session_metrics_report_merge_masking_reward_latency_and_lag():
     batch = pack(rollouts, 8)
     metrics = session_metrics(rollouts, batch, latencies=[1.0, 2.0, 3.0, 40.0], version=6)
     assert metrics["merge/calls_per_chain"] == pytest.approx(4 / 3)
+    # A group's prompt laid once is no chain of its own.
+    shared = session_metrics(rollouts, pack(rollouts, 8, share=True), latencies=[1.0, 2.0, 3.0, 40.0],
+                             version=6)
+    assert shared["merge/calls_per_chain"] == pytest.approx(4 / 3)
     assert metrics["status/completed"] == metrics["status/truncated"] == .25
     assert metrics["masked/truncated"] == pytest.approx(1 / 9)
     assert metrics["masked/infra_error"] == pytest.approx(3 / 9)
