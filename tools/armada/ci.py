@@ -1413,19 +1413,22 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
 
 
 def told(out: Path, code: int) -> int:
-    """`code`, the task's verdict `out` said last: each red row, its name and its output's last lines.
-    armada keeps a task's log tail beside its exit, and a map task's verdict reaches no report but its
-    judge's red row, which names that tail (Main, 2026-11-09: a map task "exited 1 after 437 s", its row's
-    "pytest exited -9" kept in its output alone)."""
+    """`code`, the task's verdict `out` said last: each red row, its name and its output's first lines (why
+    it is red, its signal and the file it reached: `tested`) and last (what pytest said last). armada keeps a
+    task's log tail beside its exit, and a map task's verdict reaches no report but its judge's red row, which
+    names that tail (Main, 2026-11-09: a map task "exited 1 after 437 s", its row's "pytest exited -9" kept
+    in its output alone)."""
     for found in json.loads(out.read_text())["rows"]:
         if found["exitCode"]:
-            lines = (found.get("output") or "").strip().splitlines()[-TOLD_LINES:]
-            print("\n".join([f"RED {found['name']}", *(f"  | {line}" for line in lines)]), flush=True)
+            lines = (found.get("output") or "").strip().splitlines()
+            shown = (lines if len(lines) <= 2 * TOLD_LINES
+                     else [*lines[:TOLD_LINES], "...", *lines[-TOLD_LINES:]])
+            print("\n".join([f"RED {found['name']}", *(f"  | {line}" for line in shown)]), flush=True)
     return code
 
 
-TOLD_LINES = 10
-"""The last lines of a red row's output a task says (`told`)."""
+TOLD_LINES = 5
+"""The first and the last lines of a red row's output a task says (`told`)."""
 
 
 def site_environment(site: re.Match | None) -> dict[str, str]:
