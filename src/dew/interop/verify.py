@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import math
+import multiprocessing.spawn
 import tempfile
 import warnings
 from collections.abc import Callable, Collection, Iterator, Mapping
@@ -51,7 +52,7 @@ from flax import traverse_util as flax_traverse
 
 from dew import _records
 from dew._cache import package_digest
-from dew.interop import decoder_config, decoder_parts, hf_decoders as decoders, parts, sources
+from dew.interop import decoder_config, decoder_parts, hf_decoders as decoders, isolated, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.isolated import Isolated
 from dew.nn.blocks import padded_row
@@ -1179,6 +1180,9 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             probed = _Source(reference, twin)
             try:
                 weights = {key: value.detach().cpu().numpy() for key, value in reference.state_dict().items()}
+                if registered is not None and any(kind.__module__ == '__main__' for kind in registered):
+                    # The script that defines the type's classes, imported there as spawn imports it.
+                    twin.call(multiprocessing.spawn.prepare, isolated.main())
                 # The config as it serializes, without the implementations a build resolved onto it (its
                 # experts', its attention's), which the twin's process resolves for itself.
                 twin.call(_twin_built, source, type(config), config.to_dict(), weights, registered)
@@ -1192,9 +1196,9 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
 def _registered(source: ModelSource, config: PretrainedConfig) -> tuple[type, object] | None:
     """The config class of `config` and the causal LM transformers' auto classes register for it, the
     constructor `ModelSource.causal_lm` builds by (which may return another class, a factory's), which the
-    twin's process registers alike (`_twin_built`), so a type a script registered at runtime builds there,
-    its classes found as `multiprocessing` finds a script's (`dew.interop.isolated`); None for a source's
-    remote code, which its auto classes do not build."""
+    twin's process registers alike (`_twin_built`), so a type a script or a module registered at runtime
+    builds there (`dew.interop.isolated`); None for a source's remote code, which its auto classes do not
+    build."""
     from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
 
     return None if source.remote is not None else (type(config), MODEL_FOR_CAUSAL_LM_MAPPING[type(config)])
