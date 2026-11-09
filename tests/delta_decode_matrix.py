@@ -174,18 +174,16 @@ CASES = (
     generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
     for case in CASES], ids="-".join)
 def a_decode_token_is_on_par(case: tuple[str, ...]) -> None:
-    """`on_par` of a GPU's case, its routes its family's (`CHOICES`), every other choice's at its reference
-    (`REFERENCES`)."""
-    found = on_par(case)
-    assert all(choice in CHOICES or REFERENCES.get(choice) == kernel for choice, kernel in found)
-    assert ("delta_decode", dict(zip(AXES["delta_decode"], case, strict=True))["kernel"]) in found
+    """`on_par` of a GPU's case."""
+    on_par(case)
 
 
-def on_par(case: tuple[str, ...]) -> set[tuple[str, str]]:
+def on_par(case: tuple[str, ...]) -> None:
     """A layer's `DECODED` decode tokens of `case` on its kernel (interpreted off a GPU), on par with the
     portable step's (check 1, the layer in float64 the truth: a bf16 layer on widened arguments fixes its
     projections and norm in bf16 and casts its state back, so only the stored state's rounding is the
-    contract's); the routes its tokens took, each choice and kernel."""
+    contract's); the routes its tokens took, each choice and kernel, its family's (`CHOICES`) at the case's
+    kernel and every other choice's at its reference (`REFERENCES`)."""
     named = dict(zip(AXES["delta_decode"], case, strict=True))
     layer = LAYERS[named["layer"]]
     held = jnp.dtype(named["state"])
@@ -194,4 +192,6 @@ def on_par(case: tuple[str, ...]) -> set[tuple[str, str]]:
         assert_as_exact(_decoded(module, named["kernel"], layer.state), _decoded(module, "xla", layer.state),
                         functools.partial(layer.drawn, held=held), "-".join(case), seeds=FEWEST_SEEDS,
                         truth_fn=_decoded(module.clone(dtype=jnp.float64), "xla", layer.state))
-    return _choices(found)
+    taken = _choices(found)
+    assert all(choice in CHOICES or REFERENCES.get(choice) == kernel for choice, kernel in taken), taken
+    assert ("delta_decode", named["kernel"]) in taken
