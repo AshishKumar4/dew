@@ -191,11 +191,11 @@ def _inverse(permutation: tuple) -> tuple:
 
 
 def _rows_blocked(rows: jax.Array, matrices: jax.Array, group_sizes: jax.Array, precision) -> jax.Array:
-    """Each row of float32 `rows` (`[rows, depth]`) times its group's matrix of `matrices`
-    (`[groups, depth, columns]`, the groups `group_sizes`' runs of rows, the rows past them zero), summed as
-    `_blocked` sums a dense product: the depth in blocks (`contraction_block`), each block's ragged dot XLA's
-    own, their sums added as a tree (`_tree`), a run of the columns at a time where the blocks' sums would hold
-    more than `workspace_bytes`."""
+    """Each row of float32 `rows` (`[rows, depth]`) times its group's matrix of `matrices` (`[groups, depth,
+    columns]`, the groups `group_sizes`' runs of rows, the rows past them zero), summed as `_blocked` sums a
+    dense product: the depth in blocks (`contraction_block`), each block's ragged dot XLA's own, their sums
+    added as a tree (`_tree`), a run of the columns at a time where the blocks' sums would hold more than
+    `workspace_bytes`."""
     depth, columns = rows.shape[1], matrices.shape[2]
     block = contraction_block(depth)
 
@@ -223,14 +223,14 @@ def _rows_blocked(rows: jax.Array, matrices: jax.Array, group_sizes: jax.Array, 
 
 
 def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Array, precision) -> jax.Array:
-    """Each group's float32 `rows` (`[rows, depth]`) transposed times its rows of `cotangent`
-    (`[rows, width]`), `[groups, depth, width]`, summed as `_blocked` sums a dense contraction over its rows:
-    each group's rows in blocks from its first (`contraction_block` of the rows), a block of every group a
-    batched dot of XLA's own, the blocks' sums added as `_tree` adds them, one block's into a binary counter
-    of partial sums at a time, so the steps are the largest group's blocks and the sums held a level of the
-    tree each (a group of no rows zero). The steps walk to the most blocks any group may hold, a static count
-    reverse mode differentiates, each past the largest group's blocks skipped (`lax.cond`): adding a zero block
-    to the counter changes no sum."""
+    """Each group's float32 `rows` (`[rows, depth]`) transposed times its rows of `cotangent` (`[rows,
+    width]`), `[groups, depth, width]`, summed as `_blocked` sums a dense contraction over its rows: each
+    group's rows in blocks from its first (`contraction_block` of the rows), a block of every group a batched
+    dot of XLA's own, the blocks' sums added as `_tree` adds them, one block's into a binary counter of
+    partial sums at a time, so the steps are the largest group's blocks and the sums held a level of the tree
+    each (a group of no rows zero). The steps walk to the most blocks any group may hold, a static count
+    reverse mode differentiates, each past the largest group's blocks skipped (`lax.cond`): adding a zero
+    block to the counter changes no sum."""
     total, depth, width = rows.shape[0], rows.shape[1], cotangent.shape[1]
     groups = group_sizes.shape[0]
     block = contraction_block(total)

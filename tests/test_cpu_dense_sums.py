@@ -206,12 +206,12 @@ def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share():
 
 
 def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_product():
-    """The grouped GEMM's portable products on a CPU in fixed float32 sums (`gemm.gemm` and `gemm.gemm_t`, their
-    ragged dots through `precision.accumulated`, row 4863's GEMM remainder): each group's rows' product and its
-    input gradient's bitwise `pairwise_dot_general`'s of that group's rows alone, the depth blocked and summed
-    as a tree as a dense product's is, over groups of rows no block divides, one empty and one of a single row,
-    at 96 and 1024 deep; and the kernel gradient of one group of every row bitwise the dense one's, its rows
-    blocked from the group's first and the blocks' sums added as `_tree` adds them."""
+    """The grouped GEMM's portable products on a CPU in fixed float32 sums (`gemm.gemm` and `gemm.gemm_t`,
+    their ragged dots through `precision.accumulated`, row 4863's GEMM remainder): each group's rows' product
+    and its input gradient's bitwise `pairwise_dot_general`'s of that group's rows alone, the depth blocked
+    and summed as a tree as a dense product's is, over groups of rows no block divides, one empty and one of a
+    single row, at 96 and 1024 deep; and the kernel gradient of one group of every row bitwise the dense
+    one's, its rows blocked from the group's first and the blocks' sums added as `_tree` adds them."""
     sizes = [70, 0, 1, 129, 37]
     starts = np.cumsum([0, *sizes])
     rng = np.random.default_rng(4863)
