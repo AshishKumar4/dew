@@ -15,6 +15,7 @@ import dataclasses
 import functools
 import hashlib
 import inspect
+import itertools
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -289,8 +290,18 @@ class OuterProgram:
         signature = api_util.fun_signature(function)
         if signature is not None:
             numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
-        self.numbers = () if numbers is None else (numbers,) if isinstance(numbers, int) else tuple(numbers)
-        self.names = frozenset(() if names is None else (names,) if isinstance(names, str) else names)
+        self.numbers, self.names = _given_tuple(numbers), frozenset(_given_tuple(names))
+        # A call's arguments are read by position or name against the function's fixed parameters
+        # (`_given`), and the arguments it donates as jit resolves them, both once here rather than at each
+        # call (`held`).
+        self._fixed = () if signature is None else tuple(itertools.takewhile(
+            lambda name: signature.parameters[name].kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                                             inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            signature.parameters))
+        donated = arguments.get("donate_argnums"), arguments.get("donate_argnames")
+        if signature is not None:
+            donated = api_util.infer_argnums_and_argnames(signature, *donated)
+        self._donated = tuple(map(_given_tuple, donated))
         self._executables: collections.OrderedDict[Hashable, Future[jax.stages.Compiled]] = (
             collections.OrderedDict())
         # Each compiled executable by its key, read without the lock: a call of a signature compiled before
@@ -387,12 +398,7 @@ class OuterProgram:
         them: a position among the call's positional arguments (a variadic one's included), or a fixed
         parameter's passed by keyword; a name among its keyword arguments, or a fixed parameter's passed by
         position (jit's own resolution of `donate_argnums` and `donate_argnames`)."""
-        fixed = []
-        for parameter in inspect.signature(self.function).parameters.values():
-            if parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY,
-                                      inspect.Parameter.POSITIONAL_OR_KEYWORD):
-                break
-            fixed.append(parameter.name)
+        fixed = self._fixed
         given = [args[number] if number < len(args) else kwargs[fixed[number]] for number in numbers
                  if number < len(args) or (number < len(fixed) and fixed[number] in kwargs)]
         given += [kwargs[name] if name in kwargs else args[fixed.index(name)] for name in names
@@ -403,16 +409,17 @@ class OuterProgram:
         """A call's arguments held to the settled ones' contract: each array of its `settled` arguments not
         marked waited for (its writer's last launch done, so none of its launches overlaps it) and marked;
         an array it donates (by position or name, as jit resolves them) refused where it is marked
-        (`SettledDonated`)."""
+        (`SettledDonated`). A program that settles nothing, while no array is marked, holds nothing: no
+        production program settles one, so each of their calls returns here."""
+        if not self.settled and not _MARKED:
+            return
         for leaf in jax.tree.leaves(self._given(args, kwargs, self.settled)):
             if isinstance(leaf, jax.Array) and not _marked(leaf):
                 jax.block_until_ready(leaf)
                 _MARKED[id(leaf)] = leaf
-        if not _MARKED:
+        numbers, names = self._donated
+        if not _MARKED or not (numbers or names):
             return
-        numbers, names = api_util.infer_argnums_and_argnames(inspect.signature(self.function),
-                                                             self.arguments.get("donate_argnums"),
-                                                             self.arguments.get("donate_argnames"))
         for path, leaf in jax.tree_util.tree_leaves_with_path(self._given(args, kwargs, numbers, names)):
             if isinstance(leaf, jax.Array) and _marked(leaf):
                 raise SettledDonated(f"{self.function.__qualname__} donates its argument "
@@ -502,6 +509,11 @@ class OuterProgram:
                                  if name in self.names), key=lambda static: static[0])))
         return (len(args), statics, structure, tuple(map(_signature, leaves)),
                 jax_config.trace_context(), jax.sharding.get_mesh()), dynamic, named
+
+
+def _given_tuple(given) -> tuple:
+    """jit's argnums or argnames as a tuple: none, one (an int or a str) or several."""
+    return () if given is None else (given,) if isinstance(given, int | str) else tuple(given)
 
 
 def _signature(leaf) -> Hashable:
