@@ -1391,10 +1391,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     site = session.SITE.fullmatch(split)
     if site and site["start"] is not None and any(found["exitCode"]
                                                   for found in json.loads(out.read_text())["rows"]):
-        return 1
+        return told(out, 1)
     groups = [(name, group, at) for (name, group), at in kept.items() if group]
     if not groups:
-        return code
+        return told(out, code)
     rows = json.loads(out.read_text())["rows"]
     for index, (name, group, at) in enumerate(groups, start=1):
         left = deadline - (time.monotonic() - began)
@@ -1409,7 +1409,23 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                                 whole=whole, release=release, kept={name: at}))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
+    return told(out, code)
+
+
+def told(out: Path, code: int) -> int:
+    """`code`, the task's verdict `out` said last: each red row, its name and its output's last lines. armada keeps
+    a task's log tail beside its exit, and a map task's verdict reaches no report but its judge's red row, which
+    names that tail (Main, 2026-11-09: a map task "exited 1 after 437 s", its row's "pytest exited -9" kept in
+    its output alone)."""
+    for found in json.loads(out.read_text())["rows"]:
+        if found["exitCode"]:
+            lines = (found.get("output") or "").strip().splitlines()[-TOLD_LINES:]
+            print("\n".join([f"RED {found['name']}", *(f"  | {line}" for line in lines)]), flush=True)
     return code
+
+
+TOLD_LINES = 10
+"""The last lines of a red row's output a task says (`told`)."""
 
 
 def site_environment(site: re.Match | None) -> dict[str, str]:
