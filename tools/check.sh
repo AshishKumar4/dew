@@ -14,10 +14,13 @@
 # as its slowest gate. --gate NAME runs one gate and exits with its status (the lanes' lint gate runs each
 # gate on a container of its own); --list prints the gates' names.
 #
-# --changed: the gates a head's own Python files decide, in seconds, for iterating on it: ruff and slop lint
-# over the Python files that differ from its merge-base with origin/main (committed or not, untracked
-# included), SLOP020's ratchet, and the duplicate scan's structural reading held to origin/main. Every gate
-# runs, without it, before a LAND.
+# --changed [GATE]: the gates a head's own Python files decide, in seconds, for iterating on it and for a base
+# head's precheck (the lanes' lint gate, --touched, one gate a container): ruff, slop lint and pyright over the
+# Python files that differ from its merge-base with BASE (committed or not, untracked included), SLOP020's
+# ratchet, and the duplicate scan's structural reading held to BASE; GATE runs that one alone. A head whose
+# history holds no merge-base with BASE, or whose changed files cannot be listed, fails: an unread change is no
+# green (2026-11-09: a base head's touched lint was green over a SLOP009 and a SLOP001 its CI then found). Every
+# gate runs, without it, before a LAND.
 set -u
 gates=tools/check_gates
 PYTHON=${PYTHON:-python}
@@ -46,23 +49,46 @@ case "${1:-}" in
   --gate) run "$2"; exit ;;
   --changed)
     . tools/lint_inputs.sh
-    sh tools/base_history.sh
-    since=$(git merge-base origin/main HEAD)
-    gate ruff sh -c '. tools/lint_inputs.sh; python_changed "$1" $ruff_inputs | xargs -0r "$PYTHON" -m ruff check' \
-      _ "$since"
+    only=${2:-}
+    sh tools/base_history.sh || exit 2
+    since=$(git merge-base "$BASE" HEAD) ||
+      { echo "check --changed: HEAD shares no history with $BASE in this checkout"; exit 2; }
+    listed=$(mktemp)
+    trap 'rm -f "$listed"' EXIT
+    # The Python files under the roots given that differ from $since, NUL-separated, into $listed, and how many: a
+    # listing git could not make fails its gate rather than reading as no file changed.
+    changed_files() {
+      python_changed "$since" "$@" > "$listed" ||
+        { echo "check --changed: git could not list the files changed since $since"; return 2; }
+      echo "files read: $(tr -cd '\000' < "$listed" | wc -c)"
+    }
+    changed_ruff() { changed_files $ruff_inputs && xargs -0r "$PYTHON" -m ruff check < "$listed"; }
+    changed_slop() {
+      changed_files $("$PYTHON" tools/lint_slop.py --print-roots) &&
+        JAX_PLATFORMS=cpu xargs -0r "$PYTHON" tools/lint_slop.py < "$listed"
+    }
+    # Pyright over the changed files under its gate's root (its command's last word), in place of the root.
+    changed_pyright() {
+      command=$(grep -v '^#' "$gates" | awk -F'\t' '$1 == "pyright" {print $2}')
+      changed_files "${command##* }" || return 2
+      [ ! -s "$listed" ] || xargs -0 sh -c ". tools/lint_inputs.sh; ${command% *} \"\$@\"" sh < "$listed"
+    }
+    wanted() { [ -z "$only" ] || [ "$only" = "$1" ]; }
+    wanted ruff && gate ruff changed_ruff
     # SLOP020's inventory names files across the tree, and a deleted file can leave its entry behind; SLOP028
     # resolves every seam's contract against tests/test_contracts_*.py: a head that changes the inventory or
     # a contracts test, or deletes a Python file, has the whole tree read, as the full run reads it.
-    if git diff --quiet "$since" -- tools/tolerance_inventory.json 'tests/test_contracts_*.py' &&
+    if ! wanted slop; then :
+    elif git diff --quiet "$since" -- tools/tolerance_inventory.json 'tests/test_contracts_*.py' &&
       [ -z "$(git ls-files --others --exclude-standard -- 'tests/test_contracts_*.py')" ] &&
       [ -z "$(git diff --no-renames --name-only --diff-filter=D "$since" -- '*.py')" ]; then
-      gate slop sh -c '. tools/lint_inputs.sh; python_changed "$1" $("$PYTHON" tools/lint_slop.py --print-roots) |
-        JAX_PLATFORMS=cpu xargs -0r "$PYTHON" tools/lint_slop.py' _ "$since"
+      gate slop changed_slop
     else
       gate slop run slop
     fi
-    gate ratchet run ratchet
-    gate duplicate-structure run duplicate-structure
+    wanted pyright && gate pyright changed_pyright
+    wanted ratchet && gate ratchet run ratchet
+    wanted duplicate-structure && gate duplicate-structure run duplicate-structure
     [ -z "$failed" ] || { echo "check --changed: FAILED$failed"; exit 1; }
     echo "check --changed: green"
     exit 0 ;;
