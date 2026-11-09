@@ -286,7 +286,14 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # made the GPU's product an fp32 one (an sm120's 4096-token gate_up weight gradient 5.91 ms against
         # 2.72 for the bf16 product).
         # A sum over rows an Explicit axis splits lands whole (`ragged_placement`), the depth and width placed
-        # as the rows' and the cotangent's columns are.
+        # as the rows' and the cotangent's columns are. A dense call's is XLA's own dot over the rows, as the
+        # forward's (`grouped_matmul.xla_dot`): its ragged dot of one group took an A100's gate_up weight
+        # gradient 470 ms against the template's 11.4 (W121-a100), where DENSE1 timed XLA's dot.
+        if dense:
+            return jax.lax.dot_general(
+                lhs, rhs.astype(lhs.dtype), (((0,), (0,)), ((), ())), precision=precision,
+                preferred_element_type=wide,
+                out_sharding=grouped_matmul.ragged_placement(((lhs, 1), (rhs, 1))))[None].astype(out_dtype)
         return jax.lax.ragged_dot_general(
             lhs, rhs.astype(lhs.dtype), group_sizes, _CONTRACTED_ROWS,
             precision=precision, preferred_element_type=wide,
