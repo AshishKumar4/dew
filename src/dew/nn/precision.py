@@ -514,7 +514,8 @@ def _widened(operands, counts: int = 0) -> list[jax.Array]:
     multiply in (`products_dtype`), as the product converts them, then widened exactly."""
     multiplied = operands[:len(operands) - counts]
     dtype = products_dtype(*multiplied)
-    return [operand.astype(dtype).astype(jnp.float64) for operand in multiplied] + list(operands[len(multiplied):])
+    widened = [operand.astype(dtype).astype(jnp.float64) for operand in multiplied]
+    return widened + list(operands[len(multiplied):])
 
 
 def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
@@ -630,7 +631,8 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
                            preferred_element_type=preferred_element_type)
 
         blocked_grouped = functools.partial(pairwise.pairwise_ragged_dot_general,
-                                            ragged_dot_dimension_numbers=dimension_numbers, precision=precision)
+                                            ragged_dot_dimension_numbers=dimension_numbers,
+                                            precision=precision)
         return jax.lax.platform_dependent(lhs, rhs, group_sizes, cpu=blocked_grouped, default=plain_grouped)
 
     def plain(lhs, rhs):
