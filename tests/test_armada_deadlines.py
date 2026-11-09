@@ -174,3 +174,19 @@ def test_a_pytest_that_never_began_runs_again_and_one_a_signal_ended_is_red_with
     ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "killed.json", 30.0, cache="off")
     [killed] = json.loads((tmp_path / "killed.json").read_text())["rows"]
     assert (killed["exitCode"], killed["kind"], killed.get("signal")) == (1, "whole", 9)
+
+
+def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path, capsys):
+    """A task's red rows end what it says, each its name and its output's last lines: armada keeps a task's
+    log tail beside its exit, and a map task's verdict reaches no report but its judge's red row, which names
+    that tail (Main, 2026-11-09: a map task "exited 1 after 437 s", its row's "pytest exited -9" kept in its
+    output alone)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_any.py": "import os\nimport signal\n\n\ndef test_dies():\n"
+                                      "    os.kill(os.getpid(), signal.SIGKILL)\n"})
+    capsys.readouterr()
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "killed.json", 30.0, cache="off")
+    said = capsys.readouterr().out.rstrip().splitlines()
+    assert said[-2:] == ["RED 3.12:tests/test_any.py",
+                         "  | pytest was killed by signal 9 with no report of tests/test_any.py"]
+
