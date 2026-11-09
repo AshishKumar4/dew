@@ -190,13 +190,19 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
     assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
 
 
+RECORDS_A_DRAW = 16
+"""The old decoder records a draw of the old record's check 1 holds
+(`test_old_decoder_record_keeps_zero_dropout_and_computes_its_export`)."""
+
+
 def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     """A decoder record from before dropout builds with every rate zero and computes what its
     serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
     reference, and the same pre-dropout program exported in float64 from the same source its truth,
     over drawn weights of the export's tree and drawn ids (the two are different programs, which no
-    bits bind; the export's own weights, one draw shared by every seed, leave its small leaves'
-    ratios unresolved within 512 seeds)."""
+    bits bind). A draw is RECORDS_A_DRAW such records: the export takes its fixture's two rows of four
+    tokens alone, and over one record a norm's 8 scales spread their ratio past what 512 seeds
+    resolve (0.14 to 11 over 64 draws), where Dew's pooled ratio is 0.72 to 1.04 at every leaf."""
     from flax.traverse_util import unflatten_dict
     from jax import export
 
@@ -221,26 +227,34 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
     current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
 
-    initialized = jax.jit(lambda key, ids: nn.unbox(model.init(key, ids)))
+    initialized = jax.jit(jax.vmap(lambda key, ids: nn.unbox(model.init(key, ids))))
 
     def draw(seed):
-        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape).astype(held["ids"].dtype)
+        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, (RECORDS_A_DRAW, *held["ids"].shape))
+        ids = ids.astype(held["ids"].dtype)
         with jax.default_device(cpu):
-            return jax.device_get(initialized(jax.random.key(seed), ids)), ids
+            keys = jax.random.split(jax.random.key(seed), RECORDS_A_DRAW)
+            return jax.device_get(initialized(keys, ids)), ids
+
+    def each(run, weights, ids, stack):
+        """`run` over each record of a draw, its results stacked by `stack`."""
+        results = [run(jax.tree.map(lambda leaf, at=at: leaf[at], weights), ids[at])
+                   for at in range(RECORDS_A_DRAW)]
+        return jax.tree.map(lambda *leaves: stack(leaves), *results)
 
     @as_given
     def ours(weights, ids):
         with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
-            return jax.device_get(current(weights, ids))
+            return each(lambda *record: jax.device_get(current(*record)), weights, ids, np.stack)
 
     @as_given
     def theirs(weights, ids):
         with jax.default_device(cpu):
-            return jax.device_get(exported(weights, ids))
+            return each(lambda *record: jax.device_get(exported(*record)), weights, ids, np.stack)
 
     def truth(weights, ids):
         with jax.enable_x64(new_val=True), jax.default_device(cpu):
-            return wide.call(weights, ids)
+            return each(wide.call, weights, ids, jnp.stack)
 
     assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
                     truth_fn=truth)
