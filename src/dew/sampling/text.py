@@ -672,7 +672,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     else:
         made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths, crosses=crossed,
                          capacity=capacity)
-    return made
+    # A model that drafts chains drafts trees of their picks (`chain_tree`).
+    return dataclasses.replace(made, draft_tree=strategies.chain_tree(made))
 
 
 type _Answer = jax.Array | tuple[jax.Array, jax.Array]
