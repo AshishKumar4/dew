@@ -624,22 +624,34 @@ def _most_at_once(records: list[dict], weight) -> int:
     return most
 
 
+def log_events(path: Path) -> list[list[str]]:
+    """The events of the recorder's log at `path` (lifetime.py), each its owner and its item, in the order
+    they were written; none where there is no log. A line cut short by a kill names no event."""
+    text = path.read_text() if path.is_file() else ""
+    return [line.split("\t", 1) for line in text.splitlines() if "\t" in line]
+
+
+def visited(lines: list[list[str]]) -> list[str]:
+    """The test files whose tests ran, in `lines` (`log_events`), one for each visit (executed.py's switch to
+    a file as its test starts): the last is the file whose test started last, so the one that was running
+    where the process was stopped."""
+    return [name for name, item in lines if item == VISIT and name != SHARED]
+
+
 def recorded(path: Path) -> dict[str, dict]:
     """Each test file's record in the log at `path` and its children's (followed.py's `gathered`): the files
     it executed and read, every earlier file's up to the end of its last visit, `SHARED`'s whenever, and its
     own and `SHARED`'s children's (`depends`, None for a file without a key); its reads of the backend and its
     marks; and the GPU memory it held, its children's pools and shares. A file the log never names has no
     record."""
-    text = path.read_text() if path.is_file() else ""
-    # A line cut short by a kill names no event.
-    lines = [line.split("\t", 1) for line in text.splitlines() if "\t" in line]
+    lines = log_events(path)
     closed = [SHARED, CLOSED] in lines
     starts = Counter(name for name, item in lines if item == f"{STARTED}followed")
     children = gathered(path.with_name(f"{path.name}.children"), dict(starts))
     blank = {"files": set(), "reads": set(), "followed": True, "peak": None, "shares": 0, "pools": 0}
     shared_child = children.get(SHARED, blank)
     visits = [(index, name) for index, (name, item) in enumerate(lines) if item == VISIT]
-    files = list(dict.fromkeys(name for _, name in visits if name != SHARED))
+    files = list(dict.fromkeys(visited(lines)))
     shared = [item for name, item in lines if name == SHARED]
     peaks = [int(item[len(PEAK):]) for item in shared if item.startswith(PEAK)]
     out = {}

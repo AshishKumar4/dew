@@ -20,8 +20,6 @@ from flax.typing import Dtype, PrecisionLike, VariableDict
 
 from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.batch import Coordinates, token_coordinates
-from dew.interop.unread import Stored
-from dew.interop.weights import Tree, translate_parameters
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mlp import GatedMLP
 from dew.nn.multimodal import VisionConditioner
@@ -273,35 +271,6 @@ class DiffusionGemma(DecoderWrapper):
                     attention_pairwise_mask=attention_pairwise_mask,
                     attention_key_positions=attention_key_positions, attention_key_runs=attention_key_runs,
                     attention_key_valid=attention_key_valid, progress=progress)
-
-
-def translate_weights(
-    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
-) -> Tree[Stored]:
-    """Self-conditioning parameters, cast per weight before the layout copy."""
-    paths = {
-        "pre_norm.weight": ("pre_norm", "scale"),
-        "gate_proj.weight": ("gate_proj", "kernel"),
-        "up_proj.weight": ("up_proj", "kernel"),
-        "down_proj.weight": ("down_proj", "kernel"),
-    }
-    seen = set()
-
-    def path_of(name: str) -> tuple[str, ...]:
-        bare = name.removeprefix("self_conditioning.")
-        if bare not in paths:
-            raise ValueError(f"unknown tensor name {name!r}")
-        path = paths[bare]
-        if path[0] in seen:
-            raise ValueError(f"duplicate self-conditioning tensor {name!r}")
-        seen.add(path[0])
-        return path
-
-    params = translate_parameters(hf_tensors, path_of, param_dtype)
-    missing = {path[0] for path in paths.values()} - seen
-    if missing:
-        raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
-    return params
 
 
 __all__ = ["DiffusionGemma", "SelfConditioning"]

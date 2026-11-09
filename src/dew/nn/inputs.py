@@ -169,6 +169,36 @@ def host_token_rows(array: np.ndarray) -> np.ndarray:
 
 
 @struct.dataclass
+class DenoisingCondition:
+    """Text conditioning in the form the published model families read it.
+
+    - `context` holds the token states.
+    - `pooled` is a pooled vector.
+    - `time_ids` are the size and crop ids that the XL towers add.
+    - `guidance` is the distilled guidance value, which a guidance-embedded
+      transformer takes as a model input instead of running two guided
+      branches.
+    - `mask` is the `[B, tokens]` mask of the real token states in a
+      right-padded `context`, read by a family that excludes padded keys.
+    """
+
+    context: jax.Array
+    pooled: jax.Array | None = None
+    time_ids: jax.Array | None = None
+    guidance: jax.Array | None = None
+    mask: jax.Array | None = None
+
+    def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
+        """Return this conditioning with `given`'s distilled guidance value.
+
+        The guidance value belongs to the row and not to its caption, so a
+        dropped or unconditional caption keeps the guidance scale the
+        checkpoint samples at.
+        """
+        return replace(self, guidance=given.guidance)
+
+
+@struct.dataclass
 class ModelInputs:
     """Token rows with sequence-aligned fields and row-aligned conditioning.
 
@@ -1283,7 +1313,7 @@ class Request:
 
 
 __all__ = ["CONTEXT", "CONTEXT_LENGTHS", "RESPONSE_FIELDS", "AttentionMetadata", "CrossContext",
-           "FieldExtension", "LayerInputs", "ModelInputs", "ModelKwarg", "RowPlan"]
+           "DenoisingCondition", "FieldExtension", "LayerInputs", "ModelInputs", "ModelKwarg", "RowPlan"]
 
 
 def routing_blocks(feedforward, metadata: AttentionMetadata | None, shape: tuple[int, ...]) -> dict:

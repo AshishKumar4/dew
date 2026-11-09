@@ -117,6 +117,40 @@ PROMPT, CALL = 6, 4
 """A cached call of four tokens after a prompt of six."""
 
 
+def _prefilled(decoder, rows: int, call: int):
+    """`decoder`'s parameters, its cache after a prompt of `PROMPT` tokens a row prefilled in one cached call,
+    and a block of `call` tokens a row to call it with."""
+    prompt = jax.random.randint(jax.random.key(0), (rows, PROMPT), 0, VOCAB)
+    block = jax.random.randint(jax.random.key(2), (rows, call), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), prompt)
+    _, made = decoder.apply(params, rows, method=CausalTransformer.init_cache, mutable=["cache"])
+    _, prefilled = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"])
+    return params, prefilled["cache"], block
+
+
+@pytest.mark.parametrize("call", [CALL, 1], ids=["block", "step"])
+def test_a_cached_calls_keys_validity_alone_hides_those_keys_from_its_own_visibility(call):
+    """A cached call (`call` tokens after a prompt, a decode step's one among them) stating its keys'
+    validity and no runs or mask hides the keys it marks out from its own causal visibility over the cache
+    (row 4771), bit for bit the call over the pairwise mask they mean: each query its cache's keys up to its
+    place, less those the validity marks out."""
+    decoder = model(full_attention={})
+    rows, slots = 2, TINY_DECODER["max_seq_len"]
+    params, cache, block = _prefilled(decoder, rows, call)
+    valid = np.ones((rows, slots), bool)
+    valid[0, 2], valid[1, PROMPT - 1] = False, False
+    places = PROMPT + np.arange(call)
+    seen = (np.arange(slots)[None, None, :] <= places[None, :, None]) & valid[:, None, :]
+
+    def read(**visibility):
+        return np.asarray(decoder.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
+                                        method=CausalTransformer.hidden_states, **visibility)[0])
+
+    hidden = read(attention_key_valid=jnp.asarray(valid))
+    assert hidden.tobytes() == read(attention_pairwise_mask=jnp.asarray(seen)).tobytes()
+    assert hidden.tobytes() != read().tobytes()
+
+
 @pytest.mark.parametrize("kinds", [{"full_attention": {}}, {"sliding_attention": {"window": 2}},
                                    {"chunked_attention": {"chunk": 3}}], ids=["full", "window", "chunk"])
 def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mean(kinds):
@@ -126,19 +160,12 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
     bitwise on the one kernel (xla's), a windowed
     layer windowing each run over its own positions from the queries' (Block-SFT's denoising pass, row
     1538). A layer naming the template traces it on an A100, where the template refuses a mask by its
-    inherent limit: the call builds none. A chunked layer counts the call's queries at their own places; a
-    call's keys' validity beside no runs or mask is refused, hiding nothing it would otherwise read."""
+    inherent limit: the call builds none. A chunked layer counts the call's queries at their own places."""
     from dew.nn.kernels import generation
 
     decoder = model(**kinds)
     rows, slots = 2, TINY_DECODER["max_seq_len"]
-    prompt = jax.random.randint(jax.random.key(0), (rows, PROMPT), 0, VOCAB)
-    block = jax.random.randint(jax.random.key(2), (rows, CALL), 0, VOCAB)
-    params = decoder.init(jax.random.key(1), prompt)
-    _, made = decoder.apply(params, rows, method=CausalTransformer.init_cache, mutable=["cache"])
-    # The prompt prefilled in one cached call.
-    _, prefilled = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"])
-    cache = prefilled["cache"]
+    params, cache, block = _prefilled(decoder, rows, CALL)
     runs = jnp.broadcast_to(jnp.asarray([[0, PROMPT], [PROMPT, PROMPT + CALL]])[None, None],
                             (rows, CALL, 2, 2))
     places = jnp.concatenate([jnp.arange(PROMPT), jnp.arange(CALL), jnp.arange(slots - PROMPT - CALL)])
@@ -162,9 +189,6 @@ def test_a_cached_call_reads_its_runs_and_its_keys_validity_as_the_mask_they_mea
     paired = read(decoder, attention_pairwise_mask=jnp.asarray(dense(np.asarray(runs), slots)),
                   attention_key_valid=jnp.asarray(valid))
     np.testing.assert_array_equal(np.asarray(paired), np.asarray(masked))
-    with pytest.raises(ValueError):
-        decoder.apply({**params, "cache": cache}, block, decode=True, mutable=["cache"],
-                      attention_key_valid=jnp.asarray(valid))
     if "chunked_attention" in kinds:
         return
     template = decoder.clone(dtype=jnp.bfloat16, attention_impl="template")

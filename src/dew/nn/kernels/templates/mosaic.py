@@ -37,7 +37,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import across, bodies, persistent, product, report, resources
+from dew.nn.kernels.templates import across, bodies, handoffs, persistent, product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -125,9 +125,6 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
     return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else ())
 
 
-_RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
-"""The programs a multiprocessor holds at once of the launch being traced (`kernel`'s `resident`): its roles
-raise their registers to that residency's share (`roles`)."""
 
 
 def _is_ref(operand) -> bool:
@@ -138,13 +135,12 @@ def _is_ref(operand) -> bool:
 def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None,
             settled: tuple[int, ...] = ()) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
-    residency (`_RESIDENT`) under the name `kernel`: a launch built once for every call of its facts checks
-    each call's own; and
-    refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
-    `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's share of the work
-    its cost states (the rest its own recomputation), where given, as its custom call's frontend attribute
-    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads, and the operands it reads ahead of its
-    wait, `settled` (`bodies.SETTLED`), which the compile point checks."""
+    residency (`bodies.RESIDENT`) under the name `kernel`: a launch built once for every call of its facts
+    checks each call's own; and refused at its trace where two of the refs it adds into in place share a shape
+    and a dtype, which `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's
+    share of the work its cost states (the rest its own recomputation), where given, as its custom call's
+    frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads, and the operands it
+    reads ahead of its wait, `settled` (`bodies.SETTLED`), which the compile point checks."""
     stated = {**({} if model_flops is None else {MODEL_FLOPS: str(model_flops)}),
               **({bodies.SETTLED: ",".join(map(str, settled))} if settled else {})}
 
@@ -161,11 +157,11 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
             raise ValueError(f"{kernel} adds into two refs of one shape and dtype ({kinds}): XLA may take "
                              "their zeros for one value and pass one buffer for both (row 3180); stack them "
                              "into one ref (`stacked_zeros`)")
-        token = _RESIDENT.set(resident)
+        token = bodies.RESIDENT.set(resident)
         try:
             return built(*operands)
         finally:
-            _RESIDENT.reset(token)
+            bodies.RESIDENT.reset(token)
 
     return launch
 
@@ -313,8 +309,10 @@ class Pieces(tuple):
 class Rows:
     """A block's rows in runs at a table's entries, the toolkit's one table-indexed row form: its run `i`,
     `rows` rows, at run `table[start + i]` of the array's rows (`table` an int32 ref, its entries in runs),
-    its other block indices `rest`, each run a copy of its own (`viewed`'s `Pieces`). A paged pool's key
-    tile across the pages it spans takes a run a page."""
+    its other block indices `rest`: a gathered stream's (`Transport.gathers_rows`), each run copied by the
+    loading warpgroup (`gathered.Ring`), or interpreted where no lane-level copy runs, a piece of its own
+    (`viewed`'s `Pieces`). A paged pool's key tile across the pages it spans takes a run a key
+    (`attention_mosaic_forward.paged_reads`)."""
 
     table: Any
     start: Any
@@ -959,6 +957,17 @@ def plain(shape: tuple, dtype):
     return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
 
 
+def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
+    """A ref a launch writes in place and reads back, no declared output (a balanced tail's partials, a split
+    decode's slices' states), started uninitialized: on a GPU XLA's AllocateBuffer (`lax.empty`, no memset,
+    as no slot is read before a program writes it); interpreted, NaN, as the interpreter starts an output
+    (`uninitialized_memory='nan'`), so a slot read before any program writes it reaches the outputs as NaN
+    (`tests/kernel_outputs.py`'s sentinel), which a CPU's zeroed allocation would hide."""
+    if interpret:
+        return jax.new_ref(jnp.full(shape, jnp.nan, dtype))
+    return jax.new_ref(lax.empty(shape, dtype))
+
+
 def laid(condition, like: jax.Array) -> jax.Array:
     """The scalar `condition` laid over `like`, a vector predicate of its shape: Mosaic GPU's warpgroup
     semantics select under no scalar predicate (`jnp.where` passes a scalar condition as it is; the fused
@@ -1014,40 +1023,6 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
     if swizzle is None:
         return plgpu.SMEM(shape, dtype)
     return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
-
-
-def roles(wg, consumers: int, consumer, producer) -> None:
-    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)`, the last
-    `producer()` (`tabled`'s one row)."""
-    tabled(wg, ((consumers, consumer),), producer)
-
-
-def tabled(wg, table: tuple, producer) -> None:
-    """Each warpgroup's role in a cooperative block from a role table: each of `table`'s rows, `(count,
-    body)` in turn, its `count` warpgroups running `body(index)` (`index` the warpgroup's own among
-    them), every one with its register budget raised to its share at the launch's residency
-    (`resources.raised_registers`, `_RESIDENT`); the warpgroup after them runs `producer()` with its
-    lowered to `resources.producer_floor`, where the GPU's compile honors them
-    (`resources.RAISES_HONORED`)."""
-    total = sum(count for count, _ in table)
-    first = 0
-    for count, body in table:
-        # The first row's warpgroups are those below its count, each its own index: no bound and no shift
-        # is traced for it, so a one-row table builds the same kernel `roles` built (an attention
-        # forward's spill-free registers on an H100 turn on it, test_attention_mosaic's compile gate).
-        within = wg < first + count if first == 0 else (wg >= first) & (wg < first + count)
-
-        @pl.when(within)
-        def _(body=body, first=first):
-            plgpu.set_max_registers(resources.raised_registers(total, _RESIDENT.get()), action="increase")
-            body(wg if first == 0 else wg - first)
-
-        first += count
-
-    @pl.when(wg == total)
-    def _():
-        plgpu.set_max_registers(resources.producer_floor(), action="decrease")
-        producer()
 
 
 class Slots:
@@ -1640,14 +1615,27 @@ class Issuer[Accumulator](abc.ABC):
         return plgpu.layout_cast(value, self.layout)
 
 
+MERGED_REGISTERS = 64
+"""The registers a thread of a merging role holds the partials it reads ahead of combining them in
+(`Family.fixed_up`): as many partials as fit, at least one (an H100's 16-row decode's at 64 columns 10, its
+tile's 8 and its two statistics' 1 each; a GEMM's 128 x 128 fp32 tile 128). One partial read at a time
+waited each read behind the last one's combine, 0.49 us a slice (a 16-row decode's 49, M-DD-12)."""
+
+
+def _selected(predicate, taken, other):
+    """`taken` where `predicate` holds, else `other`, leaf by leaf: a splat predicate's select, which keeps
+    each leaf in its own layout (an implicit broadcast lowers in no warpgroup semantics)."""
+    return jax.tree.map(lambda one, two: jnp.where(jnp.full(one.shape, predicate), one, two), taken, other)
+
+
 class Transport[Allocated, Opened](abc.ABC):
     """An execution policy (design §6): who loads a program's operands and how (`streams`, `opened`,
     `lifetimes`, `stream` the producer's, `fed` the consumers' own, `walk` and `passed` the consumer's),
     the roles and their launch (`roles`, `warpgroups`, `kernel`, `scoped`), the persistent walk over tiles and
-    its stores (`persist`, `stored`, `added`, `output_staging`), and a tile fixed up across programs
-    (`fixed_up`). A `Family` composes it with an `Issuer`; its walks read the issuer's home (`accumulated`,
-    `settled`). Generic in its streams' allocations (`Allocated`, `streams`') and its opened streams
-    (`Opened`, `opened`'s)."""
+    its stores (`persist`, `stored`, `added`, `output_staging`), and the semaphores a tile fixed up across
+    programs is signalled on (`partials_ready`). A `Family` composes it with an `Issuer`; its walks read the
+    issuer's home (`accumulated`, `settled`). Generic in its streams' allocations (`Allocated`, `streams`')
+    and its opened streams (`Opened`, `opened`'s)."""
 
     name: str
     """The family's name (`bundles.named`), which its refusals state."""
@@ -1678,15 +1666,10 @@ class Transport[Allocated, Opened](abc.ABC):
     (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
 
     copies_in_pieces: bool = True
-    """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`): TMA's each into
-    its own rows of the slot, awaited at the slot's one barrier; cp.async's each a block of its pipeline's
-    own, joined into one tile through registers (`mosaic_sm80.CpAsync.walk`): a paged call's key tile of
-    several pages takes a copy a page."""
-
-    pieces_of_views: bool = True
-    """Whether a block's pieces (`copies_in_pieces`) may be pieces of any view (a TMA ring's: an fp32
-    operand's parts, `Pieces`), where cp.async's are a table's runs alone (`mosaic.Rows`, a paged call's
-    pages: `mosaic_sm80._run`)."""
+    """Whether a step's block may arrive in several copies (`streams`' `copies`, `Pieces`), TMA's each into
+    its own rows of the slot, awaited at the slot's one barrier: an fp32 operand's parts, or an interpreted
+    gathered stream's rows where its copies gather none (`gathers_interpreted`). cp.async's pipeline loads
+    a step's block whole or gathers its rows, and a TPU's DMA a block in one copy."""
 
     gathers_rows: bool = False
     """Whether the warpgroup loading its rings gathers a step's rows from a table (a gathered stream's `Rows`
@@ -1747,7 +1730,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def warpgroups(self, consumers: int) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
         family streams from a role of its own (`roles`)."""
-        return consumers
+        return self.roles(consumers).warpgroups()
 
     def program_index(self, name: str) -> jax.Array:
         """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
@@ -1804,9 +1787,16 @@ class Transport[Allocated, Opened](abc.ABC):
         (`streams`), and what it returns: the program's one scope (`scoped`'s)."""
 
     @abc.abstractmethod
-    def roles(self, consumers: int, consumer, producer) -> None:
-        """Each role of a program: `consumer(index)` the compute roles', `producer()` the loads' where the
-        family streams from a role of its own."""
+    def roles(self, consumers: int) -> handoffs.Schedule:
+        """A program's roles: its `consumers` compute warpgroups ('consumer') and the producer's ('producer')
+        where the family streams from a role of its own."""
+
+    def scheduled(self, consumers: int, consumer, producer):
+        """The family's roles run (`roles`): `consumer(index)` on its compute roles and `producer()` on
+        its producer's where it has one; the consumers' value where they are its every warpgroup."""
+        schedule = self.roles(consumers)
+        bodies = {"consumer": consumer, "producer": producer}
+        return schedule.run(**{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,
@@ -1864,7 +1854,7 @@ class Transport[Allocated, Opened](abc.ABC):
             self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), walk.carry, (),
                       interpret)
 
-        self.roles(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
+        self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
@@ -2031,58 +2021,6 @@ class Transport[Allocated, Opened](abc.ABC):
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
-    def fixed_up(self, summed, partials, ready, program, first, gathered, store,
-                 combine=operator.add, firsts=None) -> None:
-        """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
-        (a balanced tail's, `tail.Tail`; a split walk's), `summed` from this program's steps: left in
-        `partials` (each program's, this consumer's; the tile's first program's in `firsts` where given, a
-        balanced tail's program first in one tile having left its partial of the tile before in its own
-        slot), and the program that arrives last at the tile's counter (`arrived`, on `ready`'s semaphore
-        of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
-        whichever arrives last, and stores it (`store`). No program waits on another, which the GPU may
-        never have scheduled (row 4732). `combine(running, partial)` is the algebra's merge of two partials
-        of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
-        the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
-        `partials` is then a ref a leaf, in its structure. Interpreted (`ready` None), the tile's first
-        program combines, which the interpreter walks after every other (`tail.ordered`). `partials` and
-        `firsts` are a workspace, a slot written only where programs share a tile (none where one program
-        walks it, nor the combining program's own interpreted): refs the launch takes in place (a
-        `lax.empty` ref, `gemm.mosaic_gpu._workspace`), never declared outputs, which would be left
-        partly unwritten (NSNAN-2)."""
-        opening = partials if firsts is None else firsts
-
-        def left(refs) -> None:
-            # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
-            # 64 bytes), which an optimized global transfer refuses.
-            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
-
-        def read(refs, other):
-            # The partials' structure read off the running value's: a ref may itself be a tree.
-            return jax.tree.map(lambda _, ref: plgpu.load(ref.at[other], optimized=False), summed, refs)
-
-        def combined(running) -> None:
-            store(lax.fori_loop(first + 1, gathered,
-                                lambda other, running: combine(running, read(partials, other)), running))
-
-        if ready is None:
-            pl.when(program != first)(lambda: left(partials))
-            pl.when(program == first)(lambda: combined(summed))
-            return
-        pl.when(gathered - first == 1)(lambda: store(summed))
-
-        @pl.when(gathered - first > 1)
-        def _():
-            pl.when(program != first)(lambda: left(partials))
-            pl.when(program == first)(lambda: left(opening))
-            last = across.arrived(ready.at[gathered - 1], gathered - first)
-            # The first program's partial its own value where it arrives last, read back where another
-            # does, a splat predicate's select keeping the running value in the merger's own layout
-            # (an implicit broadcast lowers in no warpgroup semantics).
-            first_partial = jax.tree.map(
-                lambda own, left: jnp.where(jnp.full(own.shape, program == first), own, left), summed,
-                read(opening, first))
-            pl.when(last == 1)(lambda: combined(first_partial))
-
 
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):
     """An instruction family's bundle (design §6, one mainloop per overlap structure): an issuer and its
@@ -2168,6 +2106,70 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         (`resources.program_shared`), which may hold no tile at that many."""
         return resources.register_programs(self, consumers, registers)
 
+    def fixed_up(self, summed, partials, ready, program, first, gathered, store,
+                 combine=operator.add, firsts=None) -> None:
+        """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
+        (a balanced tail's, `tail.Tail`; a split walk's), `summed` from this program's steps: left in
+        `partials` (each program's, this consumer's; the tile's first program's in `firsts` where given, a
+        balanced tail's program first in one tile having left its partial of the tile before in its own
+        slot), and the program that arrives last at the tile's counter (`arrived`, on `ready`'s semaphore
+        of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
+        whichever arrives last, and stores it (`store`), reading as many partials as `MERGED_REGISTERS` holds
+        before combining them, so their reads wait together. No program waits on another, which the GPU may
+        never have scheduled (row 4732). `combine(running, partial)` is the algebra's merge of two partials
+        of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
+        the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
+        `partials` is then a ref a leaf, in its structure. Interpreted (`ready` None), the tile's first
+        program combines, which the interpreter walks after every other (`tail.ordered`). `partials` and
+        `firsts` are a workspace, a slot written only where programs share a tile (none where one program
+        walks it, nor the combining program's own interpreted): refs the launch takes in place (a
+        `lax.empty` ref, `gemm.mosaic_gpu._workspace`), never declared outputs, which would be left
+        partly unwritten (NSNAN-2)."""
+        opening = partials if firsts is None else firsts
+
+        def left(refs) -> None:
+            # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
+            # 64 bytes), which an optimized global transfer refuses.
+            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
+
+        def read(refs, other):
+            # The partials' structure read off the running value's: a ref may itself be a tree.
+            return jax.tree.map(lambda _, ref: plgpu.load(ref.at[other], optimized=False), summed, refs)
+
+        # A partial's registers a thread: a tile's words over the role's threads, a row vector's in the
+        # accumulator's row layout (`row_registers`), as the statistics of a split decode's merge.
+        held = sum(self.row_registers(leaf.shape[0], leaf.dtype) if leaf.ndim == 1
+                   else -(-leaf.size * leaf.dtype.itemsize // (4 * resources.THREADS))
+                   for leaf in jax.tree.leaves(summed))
+        ahead = max(1, MERGED_REGISTERS // held)
+
+        def combined(running) -> None:
+            def merged(chunk, running):
+                # A chunk's partials read before any is combined, a read past the last partial reading the
+                # last again, left out of the sum: the order stays the programs'.
+                start = first + 1 + chunk * ahead
+                reads = [read(partials, jnp.minimum(start + i, gathered - 1)) for i in range(ahead)]
+                running = combine(running, reads[0])
+                for i, partial in enumerate(reads[1:], 1):
+                    running = _selected(start + i < gathered, combine(running, partial), running)
+                return running
+
+            store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
+
+        if ready is None:
+            pl.when(program != first)(lambda: left(partials))
+            pl.when(program == first)(lambda: combined(summed))
+            return
+        pl.when(gathered - first == 1)(lambda: store(summed))
+
+        @pl.when(gathered - first > 1)
+        def _():
+            pl.when(program != first)(lambda: left(partials))
+            pl.when(program == first)(lambda: left(opening))
+            last = across.arrived(ready.at[gathered - 1], gathered - first)
+            # The first program's partial its own value where it arrives last, read back where another does.
+            pl.when(last == 1)(lambda: combined(_selected(program == first, summed, read(opening, first))))
+
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
         """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch
         (`product_scratch`) scoped beside `allocations`, `body` traced within it (`products_in`), where the
@@ -2206,9 +2208,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def depths(self, dtype) -> tuple[int, ...]:
         return (swizzle_columns(dtype, SWIZZLE_BYTES),)
 
-    def warpgroups(self, consumers: int) -> int:
-        return consumers + 1
-
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
@@ -2233,8 +2232,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
                              collective_axes="wg")
 
-    def roles(self, consumers: int, consumer, producer) -> None:
-        roles(lax.axis_index("wg"), consumers, consumer, producer)
+    def roles(self, consumers: int) -> handoffs.Schedule:
+        return handoffs.Schedule((handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0)))
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
@@ -2291,7 +2290,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
                                in_flight=in_flight, unrolled=unrolled)
 
-        pl.run_scoped(lambda *smems: self.roles(consumers, consuming(smems), producer), *staging,
+        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), producer), *staging,
                       collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,

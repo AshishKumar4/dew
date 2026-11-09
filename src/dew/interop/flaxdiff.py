@@ -57,7 +57,6 @@ tokens after (`scan_projection`)."""
 def scan_projection(kernel: np.ndarray, patch_size: int) -> np.ndarray:
     """FlaxDiff's scan-order projection kernel (`SCAN_PROJECTION`) as Dew's patch convolution's,
     `[p, p, C, D]`: the same matrix reshaped."""
-    kernel = np.asarray(kernel)
     return kernel.reshape(patch_size, patch_size, -1, kernel.shape[-1])
 
 _HYBRID_MOVED = {"time_embed": ("conditioning", "time_embed"),
@@ -251,7 +250,7 @@ def _towers(clip: str, unconditional: str, vae: str, dtype: DtypeName):
     """A run's CLIP condition and SD VAE, computing in `dtype`; FlaxDiff read
     the VAE's main branch."""
     from dew.inputs import TextCondition
-    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
 
     return (TextCondition(checkpoint=clip, dtype=dtype, unconditional=unconditional).build(),
             PretrainedAutoencoder(modelname=vae, revision="main", dtype=dtype).build())

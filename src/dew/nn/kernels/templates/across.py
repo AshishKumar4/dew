@@ -17,7 +17,7 @@ from dew.nn.kernels.templates import resources
 
 def arrived(counter, contributors) -> jax.Array:
     """1 where this consumer warpgroup is the last of `contributors` to arrive at `counter` (a GPU-scope
-    semaphore each arrives at once, `Transport.fixed_up`'s), else 0, an int32 scalar: one of its threads adds
+    semaphore each arrives at once, `Family.fixed_up`'s), else 0, an int32 scalar: one of its threads adds
     one to the count by an atomic that releases the warpgroup's writes before it (a barrier first, so every
     thread's are) and acquires every earlier arrival's; the last, which reads `contributors - 1` before its
     add, sets the count back to zero for the next launch, and a barrier's reduction tells every thread of

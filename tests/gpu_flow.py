@@ -18,16 +18,19 @@ from collections.abc import Callable, Iterable
 
 import lane_environment
 import pytest
-from generation_support import runnable
+from generation_support import lowers_as, runnable
 
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
-    """One native route's property: `run` asserts it, under `generation` where it names one."""
+    """One native route's property: `run` asserts it, under `generation` where it names one, its kernels
+    Mosaic GPU's where `mosaic` (run only where the device runs them as the generation lowers them,
+    `generation_support.lowers_as`)."""
 
     label: str
     run: Callable[[], None]
     generation: str | None = None
+    mosaic: bool = False
 
 
 class CellsFailed(AssertionError):
@@ -67,7 +70,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     passed = 0
     try:
         for cell in cells:
-            if cell.generation is not None and not runnable(cell.generation):
+            if cell.generation is not None and not (lowers_as if cell.mosaic else runnable)(cell.generation):
                 skipped.append(cell.label)
                 continue
             print(f"cell: {cell.label}", flush=True)

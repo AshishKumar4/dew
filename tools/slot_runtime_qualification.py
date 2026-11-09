@@ -235,8 +235,8 @@ def request(seed, *, questions, short_words, long_words):
 
 
 def make_pool(args):
-    from check1_wire import staged_units
-    from reference_error import SIZING_FROM
+    from dew.parity import SIZING_FROM
+    from dew.parity_stages import staged_units
 
     if args.count < 8 or args.short_words < 1 or args.long_words < args.short_words:
         raise ValueError("the pool needs at least eight verdict draws and positive ordered state lengths")
@@ -594,15 +594,10 @@ def verdict(args, pool):
     shared part does not set leaves the verdict's interval unresolved, which is Inconclusive."""
     import numpy as np
     import torch
-    from reference_error import (
-        Inconclusive,
-        as_given,
-        assert_as_exact,
-        leaf_summary,
-        recorded_pilots,
-        seeds_for,
-    )
+    from reference_error import Inconclusive, as_given, assert_as_exact, recorded_pilots, seeds_for
     from reference_source import dew_revision
+
+    from dew.parity import leaf_summary
 
     if not pool.get("commit"):
         raise ValueError("the pool names no commit, so its phases cannot be held to one")
