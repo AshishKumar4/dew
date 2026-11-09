@@ -39,7 +39,7 @@ from dew import _cache
 from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program, rules, terms
 from dew.algebra.forms import aval
 from dew.nn.kernels import generation
-from dew.nn.programs import bodies, jax_name
+from dew.nn.programs import bodies, jax_name, named
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -222,8 +222,9 @@ def _holds(equation: jcore.JaxprEqn, name: str) -> bool:
 
 
 def _binds(equation: jcore.JaxprEqn, names: frozenset[str]) -> bool:
-    """Whether `equation` binds one of the primitives `names`, at any depth of the programs it nests."""
-    return jax_name(equation.primitive) in names or any(
+    """Whether `equation` binds one of the primitives `names` (JAX's operations and the program holders,
+    `dew.nn.programs.named`), at any depth of the programs it nests."""
+    return named(equation.primitive) in names or any(
         _binds(nested, names) for body in bodies(equation) for nested in body.eqns)
 
 
