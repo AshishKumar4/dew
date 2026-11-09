@@ -1292,6 +1292,22 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
+LAUNCHED_TRIPS = ('cuda', 'rocm')
+"""The lowering platforms whose XLA loops run each trip's kernels as launches of their own (a GPU's: a binary
+search's log2(K) trips cost a speculative verify 284 us beside its 22 us attention, M-DD-10), so a loop
+unrolled into one program saves a launch a trip; a CPU's and a TPU's loop runs within its one program."""
+
+
+def by_trips[T](branch: Callable[..., Callable[[], T]]) -> T:
+    """`branch(launched=...)()` for the platform a program lowers for (`jax.lax.platform_dependent`),
+    `launched` whether that platform's loop trips are launches of their own (`LAUNCHED_TRIPS`): a loop's
+    choice to unroll where that saves the launches, and to stay a loop elsewhere."""
+    import jax
+
+    return jax.lax.platform_dependent(**{platform: branch(launched=True) for platform in LAUNCHED_TRIPS},
+                                      default=branch(launched=False))
+
+
 def placed_platform() -> str:
     """The platform of the devices the context places a call on: the set mesh's, else the default
     device's (`jax.default_device`), else `jax.default_backend()`, 'gpu' for CUDA's and ROCm's. A
