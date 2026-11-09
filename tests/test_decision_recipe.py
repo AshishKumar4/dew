@@ -691,6 +691,51 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
             looping(qwen, steps, layers)
 
 
+def test_a_checkpoint_gains_a_loop_whose_exit_gate_starts_at_zeros():
+    """--loop-exit-gate and --loop-exit-threshold give the tiny Qwen, which does not loop, a loop over a
+    block of its own layers whose exit gate is drawn at zeros beside its loaded weights, each pass's exit
+    weighed alike until training moves it, its tokens exiting at the threshold asked."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.config import looping
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+
+    qwen = Pretrained.load(QWEN, dtype="float32")
+    gated = looping(qwen, 2, (1, 2), exit_gate=True, exit_threshold=0.9)
+    assert gated.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2), exit_gate=True,
+                                                   exit_threshold=0.9)
+    loaded, drawn = flatten_dict(qwen.variables["params"]), flatten_dict(gated.variables["params"])
+    gate = {path: value for path, value in drawn.items() if path not in loaded}
+    assert sorted(gate) == [("language_model", "early_exit_gate", name) for name in ("bias", "kernel")]
+    assert all(not np.asarray(value).any() for value in gate.values())
+    assert all(drawn[path] is value for path, value in loaded.items())
+
+
+def test_a_wrapped_decoders_gated_loop_trains_under_the_exit_objective():
+    """The tiny Qwen loads as a wrapper around its language model (`MultimodalTransformer`), whose gated
+    loop the exit objective weighs through it (`Looped`): its loop is the language model's, the passes'
+    exits are read from the language model's own scope of what the forward gathered, and the loss over
+    every pass is finite, with the expectation and the entropy reported beside it."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.batch import TEXT_KEY
+    from dew.config import looping
+    from dew.interop import Pretrained
+    from dew.objectives.base import Step
+    from dew.objectives.lm import LMObjective
+
+    gated = looping(Pretrained.load(QWEN, dtype="float32"), 2, (1, 2), exit_gate=True)
+    objective = LMObjective(gated.model, 8, exit_entropy=0.1, token_accuracy=False)
+    assert gated.model.loop == gated.model.language_model.loop
+    ids = np.random.default_rng(0).integers(0, gated.model.language_model.vocab_size, (2, 9)).astype(np.int32)
+    statistic, aux = objective.loss(gated.variables, {TEXT_KEY: ids},
+                                    Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
+    loss, _ = statistic.mean()
+    assert np.isfinite(float(loss)) and {"exit_ce", "exit_entropy"} <= set(aux.metrics)
+
+
 @pytest.mark.parametrize("fields,checkpoint,message", [
     ({"loop_backprop_steps": 1}, QWEN, "has no loop"),
     ({"loop_remat": True}, QWEN, "has no loop"),

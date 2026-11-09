@@ -1,5 +1,5 @@
-"""A GPU's numerics and its kernels' configs (G14, the owner's rule: no unit tests on GPUs), run in one
-process (`gpu_flow`), each cell its own file's property:
+"""A GPU's numerics and its kernels' configs (G14, the owner's rule: no unit tests on GPUs), run as flows
+(`gpu_flow`), one a group of cells (`GROUPS`), each cell its own file's property:
 
 - The GPU divides fp32 to the nearest float, as `import dew` sets (test_precision_policy).
 - A frozen FP8 site's products take no FP8 GEMM whose sum is narrower than fp32's, on a GPU of FP8
@@ -44,11 +44,9 @@ pytestmark = pytest.mark.gpu(reason="a GPU's own numerics, its kernels' configs 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 
 
-def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(tmp_path_factory):
-    """Every numerics and config cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and
-    all raised together."""
-    pallas = "needs a GPU the Pallas kernels compile for"
-    run_cells([
+def numerics_cells(tmp_path_factory) -> list[Cell]:
+    """The GPU's own arithmetic and driver facts, its encoders' compiles and a Dense layer's float64 terms."""
+    return [
         Cell("the GPU divides fp32 to the nearest float",
              precision_policy.the_gpu_divides_fp32_to_the_nearest_float),
         Cell("a frozen FP8 site's products take no FP8 GEMM whose sum is narrower",
@@ -58,6 +56,19 @@ def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(tmp_path_factory):
                lambda kind=kind: audio.encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(
                    audio._audio(kind)))
           for kind in ("gemma3n", "gemma4")),
+        Cell("a GPU reports its block and multiprocessors whether or not a row names it",
+             lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it),
+        Cell("a GPU reports its clock and memory bandwidth from its driver",
+             lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver),
+        Cell("a Dense layer's float64 terms are its placement's own on a GPU host",
+             isolated(tmp_path_factory)(
+                 float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed")),
+    ]
+
+
+def norm_cells(_) -> list[Cell]:
+    """Every config of the norm and SwiGLU kernels."""
+    return [
         *(Cell(f"every config of {kernel.__name__} holds the float64 gate: {dtype.__name__} {operands}",
                functools.partial(norm_swiglu_tests.every_config_of_the_norm_kernels_holds_the_float64_gate,
                                  kernel, dtype, operands))
@@ -67,6 +78,13 @@ def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(tmp_path_factory):
                functools.partial(norm_swiglu_tests.every_config_of_the_swiglu_kernels_holds_the_float64_gate,
                                  kernel, dtype))
           for kernel in (norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward) for dtype in DTYPES),
+    ]
+
+
+def grouped_cells(_) -> list[Cell]:
+    """Every tile of the grouped matmuls, and a projection on a GPU host's CPU without their kernels."""
+    pallas = "needs a GPU the Pallas kernels compile for"
+    return [
         *(Cell(f"every tile of {kernel.__name__} holds the float64 gate",
                when(triton_runs(), pallas, functools.partial(
                    moe_precision.every_tile_of_the_grouped_kernels_holds_the_float64_gate,
@@ -80,18 +98,27 @@ def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(tmp_path_factory):
                    moe_precision.a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels,
                    implementation)))
           for implementation in ("auto", "pallas")),
-        Cell("a GPU reports its block and multiprocessors whether or not a row names it",
-             lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it),
-        Cell("a GPU reports its clock and memory bandwidth from its driver",
-             lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver),
-        Cell("a Dense layer's float64 terms are its placement's own on a GPU host",
-             isolated(tmp_path_factory)(
-                 float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed")),
-        *(Cell(f"a Gemma-sized vocabulary is as exact as the whole logits: {chunks} chunks, {softcap}",
-               functools.partial(chunked_cross_entropy.a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits,
-                                 chunks, softcap))
-          for chunks in (4, 16) for softcap in (None, 30.0)),
-    ])
+    ]
+
+
+def vocabulary_cells(_) -> list[Cell]:
+    """A Gemma-sized vocabulary's chunked cross entropy."""
+    check = chunked_cross_entropy.a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits
+    return [Cell(f"a Gemma-sized vocabulary is as exact as the whole logits: {chunks} chunks, {softcap}",
+                 functools.partial(check, chunks, softcap))
+            for chunks in (4, 16) for softcap in (None, 30.0)]
+
+
+GROUPS = {"numerics": numerics_cells, "norms": norm_cells, "grouped": grouped_cells,
+          "vocabulary": vocabulary_cells}
+"""The cells above by group, each group one flow: a tier runs the groups as parts of their own."""
+
+
+@pytest.mark.parametrize("group", list(GROUPS))
+def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(group, tmp_path_factory):
+    """Every cell of `group` on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
+    together."""
+    run_cells(GROUPS[group](tmp_path_factory))
 
 
 def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops):

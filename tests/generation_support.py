@@ -5,8 +5,8 @@ the routed kernels needs a process that can: a CPU interprets any generation's k
 own generation's and an older one's (Triton's sm80 kernels on an H100), not a newer one's (Mosaic GPU's
 Hopper kernels on an A100, which refuse its pre-Hopper pipelines). The Mosaic GPU interpreter itself
 runs in a CPU process only: on a GPU host it reads the device and refuses as the compiler does; and
-Mosaic GPU's lowering checks a kernel against the process's own device, so lowering for a newer GPU runs
-on a CPU or on that GPU.
+Mosaic GPU's lowering checks a kernel against the process's own device and lowers its copies for it, so
+lowering a generation's Mosaic GPU kernels runs on a CPU or on a GPU that copies as it does (`lowers_as`).
 """
 
 import importlib.util
@@ -54,11 +54,26 @@ def runs(name: str):
                               reason=f"runs {name}'s kernels, which this process's device does not")
 
 
+def lowers_as(name: str) -> bool:
+    """Whether this process runs `name`'s Mosaic GPU kernels as `name` lowers them: where it runs them
+    (`runnable`), on a CPU, or on a GPU that copies as `name` does. Mosaic GPU lowers a kernel for the
+    process's own device, each copy by its architecture (TMA from Hopper, cp.async before:
+    `plgpu.copy_gmem_to_smem`), so an A100's pipelines on an H100 are another kernel, and their cp.async
+    waits are refused there ("wait_gmem_to_smem is only supported on pre-Hopper GPUs", main's GH200 tier,
+    709ddea7a)."""
+    if not runnable(name):
+        return False
+    here = generation.device_generation()
+    return here == "cpu" or generation.architecture(name).tma == generation.architecture(here).tma
+
+
 def lowers(name: str):
-    """A mark skipping a test that lowers `name`'s Mosaic GPU kernels where this process cannot run
-    them (`runnable`): Mosaic GPU checks a kernel against the process's own device (an A100's 166912
-    bytes of shared memory refuse an H100's tile)."""
-    return runs(name)
+    """A mark skipping a test that lowers `name`'s Mosaic GPU kernels where this process does not run
+    them as `name` lowers them (`lowers_as`): Mosaic GPU checks a kernel against the process's own device
+    (an A100's 166912 bytes of shared memory refuse an H100's tile) and lowers its copies for it."""
+    return pytest.mark.skipif(not lowers_as(name),
+                              reason=f"lowers {name}'s Mosaic GPU kernels, which this process's device "
+                                     "does not run as they lower")
 
 
 COMPILES_FOR_TPU = pytest.mark.skipif(

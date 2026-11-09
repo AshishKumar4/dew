@@ -30,6 +30,30 @@
             "model.layers.0.mlp.down_proj": {
                 "quant_algo": "W4A16_NVFP4",
                 "group_size": 16
+            },
+            "model.layers.1.self_attn.q_proj": {
+                "quant_algo": "FP8"
+            },
+            "model.layers.1.self_attn.k_proj": {
+                "quant_algo": "FP8"
+            },
+            "model.layers.1.self_attn.v_proj": {
+                "quant_algo": "FP8"
+            },
+            "model.layers.1.self_attn.o_proj": {
+                "quant_algo": "FP8"
+            },
+            "model.layers.1.mlp.gate_proj": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16
+            },
+            "model.layers.1.mlp.up_proj": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16
+            },
+            "model.layers.1.mlp.down_proj": {
+                "quant_algo": "W4A16_NVFP4",
+                "group_size": 16
             }
         }
     }

@@ -30,7 +30,7 @@ from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
 from dew.interop.families.lfm3 import LFM3
 from dew.interop.families.llama import GRANITEMOE, LLAMA, MINISTRAL, MISTRAL, MIXTRAL
 from dew.interop.families.llama4 import LLAMA4_TEXT
-from dew.interop.families.mamba import MAMBA, MAMBA2
+from dew.interop.families.mamba import MAMBA, MAMBA2, MAMBA3
 from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA, LLADA2_MOE, LLADA_MOE_V2
 from dew.interop.families.mimo import MIMO_V2, MIMO_V2_FLASH
 from dew.interop.families.minimax import MINIMAX
@@ -53,6 +53,7 @@ from dew.interop.families.qwen import (
     QWEN3_VL_MOE_TEXT,
 )
 from dew.interop.families.qwen4_exp import QWEN4_EXP_TEXT
+from dew.interop.families.sensenova import SENSENOVA_LOOP_TEXT
 from dew.interop.families.starcoder2 import STARCODER2
 
 ENTRIES = (
@@ -60,6 +61,9 @@ ENTRIES = (
     # (Qwen 3.5's output gate, Ministral's sliding layers).
     LFM3,
     DORY,
+    # Its loop over a block under streams over it is its own: its layers would read as Qwen 3.5's, and
+    # its loop as Ouro's, which matches any loop.
+    SENSENOVA_LOOP_TEXT,
     OURO,
     BLOOM,
     GPT_NEO,
@@ -124,6 +128,7 @@ ENTRIES = (
     MISTRAL,
     MAMBA,
     MAMBA2,
+    MAMBA3,
     MINISTRAL,
     LLAMA,
 )

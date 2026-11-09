@@ -1,0 +1,9 @@
+{
+ "bytes": 2116231,
+ "license": "Apache-2.0",
+ "path": "recordings/0503edd58499b2b11b93a9c840f878206e4b8ccaa8d43c47f0e9c4c6b59df41b.npz",
+ "reference": "huggingface/transformers 5.16.1",
+ "repo": "dewml/fixtures",
+ "revision": "47a7fd73302112ed367c355d536dbf54d87a2a1d",
+ "sha256": "0503edd58499b2b11b93a9c840f878206e4b8ccaa8d43c47f0e9c4c6b59df41b"
+}

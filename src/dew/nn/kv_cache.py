@@ -156,12 +156,18 @@ class KVCache:
     its whole capacity, and a smaller pool is for a server to assign
     (`dew.inference.serving.Server`). `groups` splits a paged pool among equal
     groups of rows, so the row count and `pages` must both divide by it.
+    `offloaded` keeps the keys and values (`POOLED`, a paged pool's or each
+    row's) in host memory, as Hugging Face's offloaded cache keeps them: each
+    layer's is brought to the device for its step and written back after it
+    (`pool_on_device`, `pool_back`), so a server's cache is bounded by the
+    host's memory rather than the device's.
     """
 
     quantized: KVDtype | None = None
     page_size: int | None = None
     pages: int | None = None
     groups: int = 1
+    offloaded: bool = False
 
     def __post_init__(self) -> None:
         if self.quantized is not None and self.quantized not in _LIMITS:
@@ -395,11 +401,92 @@ def cache_from_layer(cache: Mapping, written: Mapping, layer: jax.Array | int) -
                         else jax.lax.dynamic_update_index_in_dim(leaf, value, layer, 0), cache, written)
 
 
+def _on_host(leaf: jax.Array) -> bool:
+    return jax.typeof(leaf).memory_space is jax.memory.Space.Host
+
+
+def pool_on_device(leaf: jax.Array) -> jax.Array:
+    """A pool leaf as a program computes with it: brought to device memory where an offloaded cache keeps
+    it on the host (`KVCache.offloaded`), as it is elsewhere."""
+    return jax.device_put(leaf, jax.memory.Space.Device) if _on_host(leaf) else leaf
+
+
+def pool_back(leaf: jax.Array, value: jax.Array) -> jax.Array:
+    """`value`, the pool leaf `leaf` as a program rewrote it, back where `leaf` lies: in host memory for
+    an offloaded cache (`KVCache.offloaded`)."""
+    return jax.device_put(value, jax.memory.Space.Host) if _on_host(leaf) else value
+
+
+def on_device(fn: Callable[..., jax.Array], leaf: jax.Array, *others: jax.Array, banked: bool = False
+              ) -> jax.Array:
+    """`fn` of one layer's `leaf` and `others` (alike in shape and place), its result where `leaf` lies:
+    under a run's bank (`banked`, its layers first) of each layer's slices, mapped over the layers on the
+    device and, for an offloaded bank (`KVCache.offloaded`), a layer at a time, so no more than a layer's
+    keys and values reach the device at once; an offloaded layer's leaf brought over whole."""
+    leaves = (leaf, *others)
+    if not banked:
+        return pool_back(leaf, fn(*map(pool_on_device, leaves))) if _on_host(leaf) else fn(*leaves)
+    if not _on_host(leaf):
+        return jax.vmap(fn)(*leaves)
+
+    def layer(index: jax.Array) -> jax.Array:
+        parts = [pool_on_device(jax.lax.dynamic_index_in_dim(held, index, 0, keepdims=False))
+                 for held in leaves]
+        return pool_back(leaf, fn(*parts))
+
+    # Stacked as the layers come back, whatever shape `fn` gives a layer (a regrouping of its rows).
+    return jax.lax.map(layer, jnp.arange(leaf.shape[0]))
+
+
+def pages_read(leaf: jax.Array, places: jax.Array, axis: int) -> jax.Array:
+    """The pool leaf's pages at `places` along `axis`, `[len(places), ...]`, its every other axis after
+    them, on the device: an offloaded pool's (`KVCache.offloaded`) a page at a time, so no more than the
+    pages asked for come over; a place past the pool reads its last page, which a write of it drops."""
+    if not _on_host(leaf):
+        return jnp.moveaxis(jnp.take(leaf, places, axis=axis), axis, 0)
+    def page(place: jax.Array) -> jax.Array:
+        return pool_on_device(jax.lax.dynamic_index_in_dim(leaf, place, axis, keepdims=False))
+
+    return jax.lax.map(page, jnp.minimum(places, leaf.shape[axis] - 1))
+
+
+def pages_written(leaf: jax.Array, places: jax.Array, values: jax.Array, axis: int) -> jax.Array:
+    """The pool leaf with its pages at `places` along `axis` set to `values`, `[len(places), ...]` as
+    `pages_read` reads them; a place past the pool dropped. An offloaded pool's (`KVCache.offloaded`) are
+    written a page at a time where it lies, a dropped place moving nothing."""
+    if not _on_host(leaf):
+        flat = jnp.moveaxis(values, 0, axis)
+        return leaf.at[(*(slice(None),) * axis, places)].set(flat.astype(leaf.dtype), mode="drop")
+    last = leaf.shape[axis] - 1
+
+    def page(index: jax.Array, pool: jax.Array) -> jax.Array:
+        place = places[index]
+
+        def write(held: jax.Array) -> jax.Array:
+            return jax.lax.dynamic_update_index_in_dim(
+                held, pool_back(held, values[index].astype(leaf.dtype)), place, axis)
+
+        return jax.lax.cond(place <= last, write, lambda held: held, pool)
+
+    return jax.lax.fori_loop(0, places.shape[0], page, leaf)
+
+
+def offloaded(cache: Mapping[str, object], layout: KVCache) -> Mapping[str, object]:
+    """`cache` with its keys and values (`POOLED`) in host memory where `layout` offloads them
+    (`KVCache.offloaded`), every other leaf where it lies: the one place a cache a program allocates
+    moves to the host, which its layers bring to the device as they run (`pool_on_device`)."""
+    if not layout.offloaded:
+        return cache
+    return jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.device_put(leaf, jax.memory.Space.Host) if leaf_name(path) in POOLED else leaf,
+        cache)
+
+
 def cache_leaf(module: nn.Module, name: str) -> jax.Array:
     """`module`'s cache leaf `name`, its own, or read at its layer where its run's bank holds it
-    (`Banked`)."""
+    (`Banked`), on the device (`pool_on_device`)."""
     held = module.get_variable("cache", name)
-    return held.read() if isinstance(held, Banked) else held
+    return pool_on_device(held.read() if isinstance(held, Banked) else held)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -496,10 +583,15 @@ class KVStore:
         or its run's bank and the layer (`Banked`), which `write` writes at the layer in place, so a
         step's tokens move and nothing else of the bank does."""
         held = self.module.get_variable("cache", name)
-        if isinstance(held, Banked):
+        if isinstance(held, Banked) and _on_host(held.bank):
+            # An offloaded bank: the layer's slice written on the device, then back into the host bank.
+            written = pool_back(held.bank, write(pool_on_device(held.read()), None))
+            self._put(name, held.replace(bank=jax.lax.dynamic_update_index_in_dim(
+                held.bank, written, held.layer, 0)))
+        elif isinstance(held, Banked):
             self._put(name, held.replace(bank=write(held.bank, held.layer)))
         else:
-            self._put(name, write(held, None))
+            self._put(name, pool_back(held, write(pool_on_device(held), None)))
 
     def write(self, key: jax.Array, value: jax.Array, positions: jax.Array) -> None:
         """Store `key` and `value` at `positions`, `value` once where it is the keys (`payloads`)."""
@@ -1201,7 +1293,8 @@ def gather_cache_rows(cache, rows):
         raise ValueError("beam search and speculative decoding regroup cache rows, which a "
                          "paged cache's shared pool cannot do; decode them with a dense cache")
     return jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.take(leaf, rows, axis=row_axis(path)), cache)
+        lambda path, leaf: on_device(lambda held: jnp.take(held, rows, axis=0), leaf,
+                                     banked=bool(row_axis(path))), cache)
 
 
 def cache_positions(module: nn.Module, batch: int, length: int, valid):

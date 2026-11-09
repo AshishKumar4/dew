@@ -32,11 +32,20 @@ def pytest_collection_finish(session) -> None:
 
 
 _called: dict[str, float] = {}
+_session: dict[str, str | None] = {}
+"""The task's own artifacts (ARMADA_ARTIFACTS), named once its session starts (`pytest_configure`)."""
+
+
+def pytest_configure(config) -> None:
+    """The task's artifacts as its session starts: a test that changes the environment as it runs (one
+    that runs CI's tools apart from the task, tests/armada_support.py's `loaded`) moves none of the task's
+    progress."""
+    _session["artifacts"] = os.environ.get("ARMADA_ARTIFACTS")
 
 
 def pytest_runtest_logreport(report) -> None:
     """A test's call passed is kept once its teardown passed too; one whose teardown failed is no progress."""
-    artifacts = os.environ.get("ARMADA_ARTIFACTS")
+    artifacts = _session.get("artifacts")
     if not artifacts:
         return
     if report.when == "call" and report.passed:

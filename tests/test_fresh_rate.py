@@ -6,6 +6,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 from test_optim import assert_updates_as
@@ -111,6 +112,45 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     assert decision(variables=declared.init(jax.random.key(0))).fresh_modules() == ()
 
 
+def test_a_parameter_a_loaded_module_gains_starts_at_its_draw_and_trains_in_the_fresh_group():
+    """A loaded decoder whose modules gain parameters of their own, an exit gate a loop gives it
+    (`Pretrained.with_model`), starts each at its initializer's draw, the loaded weights as they were, and
+    names each by its path among what it drew fresh (`Pretrained.fresh`): a fresh group claims that
+    parameter alone, by its own path, as it claims a fresh module's (`OptimConfig.with_fresh`), and the
+    loaded parameters stay in the base group. A model that gains none keeps the source's tree; one that
+    drops a parameter the source holds is refused."""
+    from flax.core.meta import unbox
+    from flax.traverse_util import flatten_dict
+    from test_decision_context import LLAMA
+
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+    from dew.nn.inputs import request_key
+
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
+    gated = source.with_model(dataclasses.replace(source.model, loop=Loop(steps=2, exit_gate=True)), key=3)
+    assert gated.fresh == ("early_exit_gate/bias", "early_exit_gate/kernel")
+    drawn = flatten_dict(unbox(gated.model.init(request_key(3), jnp.zeros((1, 1), jnp.int32)))["params"])
+    held = flatten_dict(gated.variables["params"])
+    for path in (("early_exit_gate", "kernel"), ("early_exit_gate", "bias")):
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(drawn[path]))
+    for path, leaf in flatten_dict(source.variables["params"]).items():
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(leaf))
+    once = source.with_model(dataclasses.replace(source.model, loop=Loop(steps=2)), key=3)
+    assert once.fresh == () and once.variables is source.variables
+    claimed = OptimConfig(param_groups=(FRESH, BASE)).with_fresh((), gated.fresh).param_groups
+    labels = labelled(claimed, gated.variables["params"])
+    assert {"/".join(path) for path, label in labels.items() if label == "fresh"} == set(gated.fresh)
+    with pytest.raises(ValueError):
+        gated.with_model(source.model, key=3)
+    # A source a LoRA adapter froze holds its base weights apart, as its model declares them: in its place
+    # it is its own.
+    from dew.lora import LoRA
+
+    adapted = source.adapt(LoRA(rank=2, modules=("q_proj",)), key=1)
+    assert adapted.with_model(adapted.model, key=3).variables is adapted.variables
+
+
 def groups(root, name: str) -> tuple[ParamGroup, ...]:
     """The param groups the run `name` under `root` records."""
     from dew.config import RunConfig
@@ -166,6 +206,33 @@ def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
     claimed(labelled(groups(tmp_path, "named"), named.variables["params"]))
     resumed, _ = trained(run, tmp_path, "named", trainer={**SAVING, "steps": 2})
     assert int(resumed.step) == 2 and groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_naming_groups_none_of_them_fresh_steps_its_fresh_modules_at_the_fresh_rate(tmp_path):
+    """A run that names its groups but none that claims the modules it draws fresh, as a decision context
+    arm did with a base group of every parameter, steps its cross-attention block and its head at the
+    fresh rate in a group ahead of its catch-all, the adapter's factors in the base group; a group it
+    names ahead of the catch-all that claims the head states the head's own rate; resumed, it reads the
+    groups its record names (row 5246: such an arm's gates moved 3e-4 in 1,063 steps)."""
+    from run_kinds import trained
+
+    run = dataclasses.replace(context_run(tmp_path), validation=None)
+    fresh = run.optim.fresh_groups()[0]
+    based = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(BASE,)))
+    state, _ = trained(based, tmp_path, "based", trainer=SAVING)
+    recorded = groups(tmp_path, "based")
+    assert [group.name for group in recorded] == ["fresh", "base"] and recorded[1] == BASE
+    assert recorded[0].learning_rate_multiplier == fresh.learning_rate_multiplier > 1
+    claimed(labelled(recorded, state.variables["params"]))
+    head = ParamGroup("head", ("head/*",), learning_rate_multiplier=2.0)
+    headed = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(head, BASE)))
+    state, _ = trained(headed, tmp_path, "headed")
+    labels = labelled(groups(tmp_path, "headed"), state.variables["params"])
+    assert {label for path, label in labels.items() if path[0] == "head"} == {"head"}
+    assert {label for path, label in labels.items() if crossing(path)} == {"fresh"}
+    resumed, _ = trained(based, tmp_path, "based", trainer={**SAVING, "steps": 2})
+    assert int(resumed.step) == 2 and groups(tmp_path, "based") == recorded
 
 
 @pytest.mark.mesh(devices=8)
