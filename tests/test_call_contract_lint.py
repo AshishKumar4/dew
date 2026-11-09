@@ -5,7 +5,16 @@ from pathlib import Path
 
 import pytest
 
-INPUTS = 'MIXING = ("pairwise_mask", "position_bias", "admitted")\n'
+INPUTS = textwrap.dedent("""
+    class AttentionMetadata:
+        pairwise_mask: object = struct.field(default=None, metadata={MIXES: True})
+        position_bias: object = struct.field(default=None, metadata={MIXES: True})
+        token_ids: object = None
+
+        @mixing_property
+        def admitted(self):
+            return None
+    """)
 CASES = {
     "a call argument taken and deleted": ("""
         class Layer:

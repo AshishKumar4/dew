@@ -942,20 +942,35 @@ def imports(module: Module) -> Iterator[Finding]:
 
 
 def _mixing(module: Module) -> frozenset[str]:
-    """The `MIXING` names the package's `nn/inputs.py` assigns, or none where it has none."""
+    """The `MIXING` names the package's `nn/inputs.py` marks, or none where it has none."""
     root = module.path.parents[len(Path(module.relative).parents) - 1]
     return _assigned_mixing(root / "src" / module.package / "nn" / "inputs.py")
 
 
 @functools.cache
 def _assigned_mixing(inputs: Path) -> frozenset[str]:
+    """The `AttentionMetadata` fields `inputs` marks as mixing tokens, where each is declared: a field whose
+    metadata holds `MIXES`, and a `mixing_property` (`dew.nn.inputs.MIXING`)."""
     if not inputs.is_file():
         return frozenset()
     for node in ast.parse(inputs.read_text()).body:
-        if (isinstance(node, ast.Assign) and any(scopes.dotted(target) == "MIXING" for target in node.targets)
-                and isinstance(node.value, ast.Tuple)):
-            return frozenset(item.value for item in node.value.elts if isinstance(item, ast.Constant))
+        if isinstance(node, ast.ClassDef) and node.name == "AttentionMetadata":
+            return frozenset(_marked_mixing(node))
     return frozenset()
+
+
+def _marked_mixing(metadata: ast.ClassDef) -> Iterator[str]:
+    for item in metadata.body:
+        if (isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+                and isinstance(item.value, ast.Call)):
+            marked = (keyword.value for keyword in item.value.keywords
+                      if keyword.arg == "metadata" and isinstance(keyword.value, ast.Dict))
+            if any(isinstance(key, ast.Name) and key.id == "MIXES" for value in marked for key in value.keys):
+                yield item.target.id
+        elif isinstance(item, ast.FunctionDef) and any(
+                isinstance(decorator, ast.Name) and decorator.id == "mixing_property"
+                for decorator in item.decorator_list):
+            yield item.name
 
 
 def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
