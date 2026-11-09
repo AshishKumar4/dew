@@ -66,7 +66,7 @@ from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
-from .kernels.templates import attention as template, attention_route
+from .kernels.templates import attention as template, attention_quantized, attention_route
 from .precision import (
     asks_default_precision,
     at_least_fp32,
@@ -298,6 +298,11 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
+    rule = attention_quantized.owner()
+    quantized = rule is not None and not attention_quantized.whole(rule)
+    if quantized and (not attention_quantized.takes(rule) or sinks is not None or dropout_rate):
+        raise ValueError("the template computes a quantized model's attention under an int8 rule of Qwix's "
+                         "dynamic absmax, no sinks and no dropout; the reference path computes the rest")
 
     def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None,
               block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
@@ -326,6 +331,9 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
             score_params=params,
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
+        if quantized:
+            # A quantized model's products, which the template forms as its rule does (row 4858).
+            return attention_quantized.attend(query, key, value, spans, hooks)
         return attention_route.attend(query, key, value, spans, hooks)
 
     # The GPU arms are Pallas launches, which have no partitioning rule, so each shard runs them on its own

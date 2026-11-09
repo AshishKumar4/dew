@@ -261,15 +261,15 @@ def parts(update: Program, readout: Program) -> Parts:
         raise Refused("the update is not a decayed state, exp(z) a scalar's or each key's, plus a rank-one "
                       "input and corrections of the decayed state along the input's vector")
     readout_args = get_callable_args(read, Affine.readout)
-    applied_args = get_callable_args(read, Affine.applied)
-    if readout_args is None and applied_args is None:
+    values_read = readout_args is None
+    found = get_callable_args(read, Affine.applied) if values_read else readout_args
+    if found is None:
         raise Refused("the readout is not the state contracted with a vector over its keys or its values "
                       "plus a part free of it")
     base2, per_key, exponent, left, right, *correction = args
     return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
                  bool(terms.integer(per_key)), exponent, left, right,
-                 correction[0] if correction else None, *(readout_args or applied_args),
-                 values_read=readout_args is None)
+                 correction[0] if correction else None, *found, values_read=values_read)
 
 
 _KEEPING = frozenset({"copy", "copy_p"})

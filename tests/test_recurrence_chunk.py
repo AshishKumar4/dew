@@ -128,6 +128,14 @@ independently by `seeds_for` on armada (2026-10-21), on the draw with a memory e
 document starting on a chunk's first token."""
 
 
+def marked(documents, length: int) -> np.ndarray:
+    """Each row's `documents` (its documents' first tokens) as the `[rows, length]` marks of those tokens."""
+    starts = np.zeros((len(documents), length), bool)
+    for row, firsts in enumerate(documents):
+        starts[row, list(firsts)] = True
+    return starts
+
+
 def hosted(x, dtype=jnp.float32) -> jax.Array:
     """A float64 NumPy draw rounded once to fp32, then to `dtype`, as JAX takes it. A recorded site's draws
     (`fla_sites`) are NumPy's, their arithmetic float64's, the same bits on any host and jaxlib: JAX's
@@ -197,12 +205,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.output is not None:
         epilogue = {'z': hosted(normal((ROWS, length, value_heads, width))[..., value_order]),
                     'weight': hosted((1.0 + 0.1 * normal((width,)))[value_order])}
-    starts = None
-    if packed:
-        starts = np.zeros((ROWS, length), bool)
-        starts[0, [0, 23, 40]] = True
-        starts[1, [9, 48]] = True
-        starts = jnp.asarray(starts)
+    starts = jnp.asarray(marked(((0, 23, 40), (9, 48)), length)) if packed else None
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
     return (Chunk(hosted(query), hosted(key), hosted(value), log_decay=hosted(log_decay) if plain else None,

@@ -57,6 +57,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, staged_parts, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BACKWARD_CONSUMERS,
+    ROUNDED,
     BackwardTiles,
     Tiles,
     _block,
@@ -324,12 +325,19 @@ class MosaicForward(_Mainloop[Tiles]):
     """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
     each 16-bit (attention.md 4b). One for a 16-bit call."""
+    rounds: float | None = None
+    """A quantized model's weights' bound (`Hooks.rounds`), which the anchored training walk rounds them to
+    at each row's maximum: a call that keeps its split residuals' alone. None where its weights stay whole."""
+
+    def _hooks(self, score_params, output_params, initial, drop) -> Hooks:
+        """The call's hooks from its parameters, state and draw, its static hooks the op's."""
+        return Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
+                     self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop, self.rounds)
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
              drop=None, table=None, sources=None, scales=None, *, residuals: Kept, interpret: bool,
              config: Tiles, return_residuals: bool = False):
-        hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
-                      self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
+        hooks = self._hooks(score_params, output_params, initial, drop)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
@@ -623,10 +631,12 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
-        hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
-                      ba.arguments["initial"], self.output_mod,
-                      tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
-                      ba.arguments["drop"])
+        hooks = self._hooks(ba.arguments["score_params"], ba.arguments["output_params"],
+                            ba.arguments["initial"], ba.arguments["drop"])
+        if self.rounds is not None and (self.parts > 1 or ba.arguments["residuals"] is not Kept.SPLIT
+                                        or ba.arguments["table"] is not None):
+            # A quantized model's weights round at the row's maximum, which the anchored walk alone knows.
+            return ROUNDED
         if self.parts > 1 and (ba.arguments["table"] is not None or ba.arguments["sources"] is not None
                                or ba.arguments["residuals"] is Kept.SPLIT or hooks.drop is not None):
             # A training forward's natural rewalk of parts spills past its model (an H100's at 64 x 64, width
@@ -937,7 +947,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
-                       merges=merges and splits > 1, parts=parts)
+                       merges=merges and splits > 1, parts=parts, rounds=hooks.rounds)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,

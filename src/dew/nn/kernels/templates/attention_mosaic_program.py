@@ -439,6 +439,12 @@ def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
             and tiles.block_q % family.rows == 0 and tiles.block_k % family.rows == 0)
 
 
+ROUNDED = Refusal('rounds', "a quantized model's weights round at their row's maximum in the anchored "
+                  "training walk's forward alone (`Hooks.rounds`), no dropping or resumed call's, and its "
+                  "backward is its quantization's own (`attention_quantized`)")
+"""Why the mainloops take a quantized call's forward alone, of neither a dropping nor a resumed call."""
+
+
 def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool,
             family: mosaic.Family) -> Refusal | None:
     """Why this mainloop takes no call of `dtype` operands, head widths `width` and `value_width` and `hooks`
@@ -447,6 +453,8 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     suite read."""
     hooks = Hooks() if hooks is None else hooks
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+    if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
+        return ROUNDED
     if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
     if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):

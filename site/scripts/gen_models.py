@@ -84,6 +84,7 @@ DECODERS = {
     "qwen4_exp_text": ("Qwen4-Exp (Qwen3.8-Flash-Next), text", "Hybrid and linear attention"),
     "mamba": ("Mamba", "Hybrid and linear attention"),
     "mamba2": ("Mamba-2", "Hybrid and linear attention"),
+    "mamba3": ("Mamba-3", "Hybrid and linear attention"),
     "llada": ("LLaDA", "Diffusion language models"),
     "llada_moe_v2": ("LLaDA-MoE v2", "Diffusion language models"),
     "llada2_moe": ("LLaDA2 MoE", "Diffusion language models"),
