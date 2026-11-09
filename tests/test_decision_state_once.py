@@ -266,6 +266,28 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     assert all(answers[name].choice in question.options for name, question in QUESTIONS.items())
 
 
+def test_a_run_read_by_a_plan_from_before_rows_shared_a_state_declares_a_question_a_row(tmp_path):
+    """A lettered decision run whose layout states no sharing, read by a data plan from before a request's
+    questions shared a state (`dew.data.plan.SHARED_STATE`), trains a question a row, and the task loaded
+    from the step it saves lays a request's three questions in three rows, as it trained; the same run
+    under this Dew's plan lays them in one row over one state (`DecisionObjective.bind_plan`: a saved run
+    resumed under its earlier plan declared, at the step the resume saved, the sharing the code derived,
+    so its task forked the requests of a run that read none)."""
+    from run_kinds import lettered, trained
+
+    from dew.data import Memory
+    from dew.data.plan import IN_ORDER
+    from dew.decision import Decide, decisions
+
+    rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
+    run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None)
+    for name, version, laid in (("earlier", IN_ORDER, len(QUESTIONS)), ("shared", None, 1)):
+        trained(dataclasses.replace(run, data_plan_version=version), tmp_path, name,
+                trainer={"checkpoint_final": True})
+        decide = Decide.from_run(str(tmp_path / "runs" / name))
+        assert len(decide.layout.rows(decide.tokenizer, decide.specials, STATES[0], QUESTIONS)) == laid, name
+
+
 class Merging(ByteTokenizer):
     """Bytes, but for "B. y", one token (256): a lettered row's tokens then depend on which option its second
     slot shows, as a BPE vocabulary's do."""
