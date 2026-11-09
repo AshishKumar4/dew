@@ -44,11 +44,15 @@ def whole(rule) -> bool:
 
 def takes(rule) -> bool:
     """Whether this module computes `rule`'s attention: activations quantized to int8 by Qwix's dynamic
-    absmax per channel (no static scale, no tile of the contraction), its gradients unquantized, so its
-    backward is the straight-through one over the original residuals (`use_original_residuals`)."""
+    absmax per channel (no static scale, no tile of the contraction, no channel's axis disabled), its
+    gradients unquantized, so its backward is the straight-through one over the original residuals
+    (`use_original_residuals`), and no configuration of Qwix's own over it (`additional_qt_config`, which
+    may replace any of these: qwix/_src/providers/qt.py's `_create_dot_general_qt_config`)."""
     return (jnp.dtype(rule.act_qtype) == jnp.dtype(jnp.int8)
             and rule.act_calibration_method in (None, "absmax") and not rule.act_static_scale
-            and rule.tile_size is None and getattr(rule, "bwd_qtype", None) is None)
+            and rule.tile_size is None and getattr(rule, "bwd_qtype", None) is None
+            and not getattr(rule, "disable_channelwise_axes", False)
+            and not getattr(rule, "additional_qt_config", None))
 
 
 BOUND = 127.5
@@ -110,12 +114,13 @@ def _attending(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpa
 
 def _straight_through(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                       hooks: Hooks) -> jax.Array:
-    """The call densely, valued as the quantized products and differentiated as the unquantized ones (Qwix's
-    straight-through rule over its original residuals): each product the whole one plus its quantized
-    one's difference from it, held constant."""
+    """The call densely as Qwix's straight-through rule over its original residuals differentiates it, whose
+    derivative alone the backward takes (`_attend_backward`): the logits the whole product plus its
+    quantized one's difference from it, held constant, so the weights are the quantized logits'; the
+    values' product the whole one, its weights' and values' gradients each the other's original operand."""
     batch, queries, heads, width = query.shape
     kv_heads, keys = key.shape[2], spans.keys
-    query_codes, key_codes, value_codes, query_scale, key_scale, columns = _operands(query, key, value)
+    query_codes, key_codes, _, query_scale, key_scale, _ = _operands(query, key, value)
     scaled = query / jnp.sqrt(width).astype(query.dtype)
 
     def products(left: jax.Array, right: jax.Array) -> jax.Array:
@@ -137,11 +142,7 @@ def _straight_through(query: jax.Array, key: jax.Array, value: jax.Array, spans:
                               preferred_element_type=jnp.float32).reshape(batch, heads, queries, -1)
 
     seen = jnp.where(total > 0, total, 1.0)
-    out = valued(weights / seen, value)
-    codes_out = valued(jax.lax.stop_gradient(jnp.minimum(jnp.round(BOUND * weights), 127.0)) / seen,
-                       value_codes) * jnp.swapaxes(columns, 1, 2)
-    out = out + jax.lax.stop_gradient(codes_out - out)
-    return jnp.swapaxes(out, 1, 2).astype(query.dtype)
+    return jnp.swapaxes(valued(weights / seen, value), 1, 2).astype(query.dtype)
 
 
 def _attend_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
