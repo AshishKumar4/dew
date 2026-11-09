@@ -74,11 +74,11 @@ from typing import ClassVar, NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.custom_derivatives import SymbolicZero
 from jax.core import ShapedArray
-from jax.extend import core
+from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from jax.extend import core
 
 from dew.mesh import logical_spec
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
