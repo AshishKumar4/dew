@@ -2143,7 +2143,31 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                    for leaf in jax.tree.leaves(summed))
         ahead = max(1, MERGED_REGISTERS // held)
 
-        def combined(running) -> None:
+        # A partial past the registers a merge reads ahead (a GEMM tile's) is added into the running value
+        # a slice of columns at a time, so the running value and one slice are live, not two whole tiles: read
+        # whole beside the running sum, a dense kernel gradient's balanced tail held 267 registers live at its
+        # 128 x 256 and 128 x 128 tiles (the GEMM compile gate's liveness pass, EM-probe2), which ptxas
+        # interleaved into 240 and 255.
+        leaves = jax.tree.leaves(summed)
+        sliced = (combine is operator.add and len(leaves) == 1 and leaves[0].ndim == 2
+                  and held > MERGED_REGISTERS)
+        if sliced:
+            columns = leaves[0].shape[1]
+            width = max(8, columns * MERGED_REGISTERS // held)
+            while columns % width:
+                width //= 2
+
+            def merged(chunk, running):
+                other = first + 1 + chunk
+                (ref,) = jax.tree.leaves(partials)
+                return jnp.concatenate(
+                    [running[:, start:start + width]
+                     + plgpu.load(ref.at[other, :, pl.ds(start, width)], optimized=False)
+                     for start in range(0, columns, width)], axis=1)
+
+            def combined(running) -> None:
+                store(lax.fori_loop(0, gathered - first - 1, merged, running))
+        else:
             def merged(chunk, running):
                 # A chunk's partials read before any is combined, a read past the last partial reading the
                 # last again, left out of the sum: the order stays the programs'.
@@ -2154,7 +2178,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                     running = _selected(start + i < gathered, combine(running, partial), running)
                 return running
 
-            store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
+            def combined(running) -> None:
+                store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
 
         if ready is None:
             pl.when(program != first)(lambda: left(partials))
