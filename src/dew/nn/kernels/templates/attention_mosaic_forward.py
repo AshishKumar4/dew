@@ -134,7 +134,7 @@ def forward_products(tiles: Tiles, value_width: int, dtype, *, peaks: bool = Fal
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
                          page: int | None = None, certified: bool = False, codes=None, parts: int = 1,
-                         interpret: bool = False) -> tuple[list, Any, list]:
+                         interpret: bool = False) -> tuple[list, dict, list]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order, and those it
     scopes after its walks (`after_walks`): its consumers' query stages and their rows' status; each one's
     output stage where the value is not as wide as the query and as narrow, `out_dtype`, the query's by

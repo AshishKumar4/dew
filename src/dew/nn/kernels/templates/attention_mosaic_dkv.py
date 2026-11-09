@@ -551,6 +551,18 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     dk, dv = (jnp.concatenate([out[place] for out in launched], axis=-1) for place in (0, 1))
     return dk, dv, *launched[0][2:]
 
+def _keys_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, after: Callable | None, *,
+                 index, widths: bool, interpret: bool) -> None:
+    """A consumer's dK, dV and key gradients `sums` stored to their `views` (`_dkv_stored`) through the
+    program's `stages`, or through those a scope `after` the walks holds (`stages_after_walks`, dK's and dV's
+    one where the head `widths` agree, `_output_stages`)."""
+    stored = functools.partial(_dkv_stored, family, sums, views, index=index, interpret=interpret)
+    if after is None:
+        stored(stages)
+    else:
+        after(lambda *scoped: stored(_output_stages(scoped, widths=widths)))
+
+
 @tuning.lowered_once(("walk", "shares", "name"))
 def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
                  score_params: tuple, drop: Dropout | None, scaled: jax.Array, *, walk: _Backward,
@@ -647,13 +659,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             out = (row, pl.ds(k_first, block_k), head)
             key_views = tuple(ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, block_k)]
                               for ref in key_refs)
-            stored = functools.partial(_dkv_stored, family, (dk, dv, *key_sums),
-                                       (dk_ref.at[out], dv_ref.at[out], *key_views), index=index,
-                                       interpret=walk.interpret)
-            if after is None:
-                stored((out_smem, dv_smem, rows_smem))
-            else:
-                after(lambda *stages: stored(_output_stages(stages, widths=value_width == width)))
+            _keys_stored(family, (dk, dv, *key_sums), (dk_ref.at[out], dv_ref.at[out], *key_views),
+                         (out_smem, dv_smem, rows_smem), after, index=index, widths=value_width == width,
+                         interpret=walk.interpret)
             return None
 
         producer = functools.partial(_dkv_producer, walk, streams, views, streamed, dq_ref, (row, head),
