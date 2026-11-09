@@ -75,6 +75,7 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
+from dew.nn.fake_quant import fp4_codes, fp8_codes, straight_through
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
 from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
@@ -733,8 +734,6 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     RN, and dequantizes by that reciprocal. Keeping both divisions holds
     the scale's last bits to the author's fake quantizer. Backward is Dew's STE.
     """
-    from dew.nn.fake_quant import straight_through
-
     qwix = _qwix()
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
     amax = jnp.asarray(spec.scale, jnp.float32) * jnp.float32(448)
@@ -752,14 +751,20 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
 
 
 def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
-    """`quotients`, already divided by their scales, cast to `qtype` as a Qwix QArray of unit scale:
-    a fixed range of the type's own bound gives a scale of exactly one (448 over E4M3's 448, 6 over
-    E2M1's 6), so the cast is the type's rounding alone and the caller sets the real scale. NVFP4
-    names its 16-wide blocks along the last axis, which Qwix requires of it and a fixed range,
-    always per tensor, leaves unread."""
+    """`quotients`, already divided by their scales, rounded to the type's nearest values, ties to even,
+    clamped to its bound (`dew.nn.fake_quant.fp8_codes`, `fp4_codes`), and cast to `qtype` as a Qwix
+    QArray of unit scale: a fixed range of the type's own bound gives a scale of exactly one (448 over
+    E4M3's 448, 6 over E2M1's 6), so the cast takes values the type holds, exactly on every backend, and
+    the caller sets the real scale. The type's rounding is Dew's arithmetic, not the cast's: XLA:CPU
+    converts a hoisted small loop's float32 to E2M1 through float16, rounding twice (-0.25004873 to
+    -0.25, then to -0, where E2M1's nearest is -0.5), and XLA GPU's default excess precision deletes a
+    float32 -> narrow -> float32 convert pair (`dew.nn.fake_quant`). NVFP4 names its 16-wide blocks
+    along the last axis, which Qwix requires of it and a fixed range, always per tensor, leaves
+    unread."""
     if qtype == jnp.float8_e4m3fn:
-        return qwix.quantize(quotients, qtype, calibration_method="fixed,448")
-    return qwix.quantize(quotients, qtype, tiled_axes={quotients.ndim - 1: 16}, calibration_method="fixed,6")
+        return qwix.quantize(fp8_codes(quotients), qtype, calibration_method="fixed,448")
+    return qwix.quantize(fp4_codes(quotients), qtype, tiled_axes={quotients.ndim - 1: 16},
+                         calibration_method="fixed,6")
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
@@ -782,7 +787,6 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     Dew deliberately uses the identity's straight-through gradient; the
     reference parity claim here covers the forward, not that backward.
     """
-    from dew.nn.fake_quant import straight_through
     from dew.nn.precision import rounded_operand
 
     qwix = _qwix()
@@ -800,7 +804,7 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     overall = jnp.full(scale.shape, spec.scale, jnp.float32)
     scale = scale * overall
     if spec.e4m3_scale:
-        scale = jnp.clip(scale, 0, 448).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+        scale = fp8_codes(scale)
     eps = jnp.finfo(jnp.float8_e4m3fn if spec.e4m3_scale else jnp.float32).eps
     scale = jnp.where(scale == 0, jnp.asarray(eps, jnp.float32), scale)
     scale = correctly_rounded_divide(scale, overall)
@@ -828,8 +832,6 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) ->
     negative-zero FMA yields +0 for a zero code. The 32 pinned real q_proj
     rows and the author's exporter fixture hold this order bit for bit.
     """
-    from dew.nn.fake_quant import straight_through
-
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
     groups = values.reshape(*x.shape[:-1], -1, 16)
     largest = jnp.max(jnp.abs(groups), -1)
@@ -839,7 +841,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) ->
     denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
     normalized = largest * correctly_rounded_divide(jnp.ones_like(largest), denominator)
     saturated = jnp.minimum(normalized, 448)
-    scales = saturated.astype(jnp.float8_e4m3fn).astype(jnp.float32) * global_scale
+    scales = fp8_codes(saturated) * global_scale
     scales = jnp.where(scales >= 1e-5, scales, 1)
     spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)
     quotients = values * correctly_rounded_divide(jnp.ones_like(values), spread)
