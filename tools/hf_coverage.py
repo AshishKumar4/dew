@@ -152,7 +152,7 @@ def _route(config: dict, verified, admitted, qualified) -> tuple[str, str]:
                 verified.translate(config, ())
             except ValueError as error:
                 return "refused", str(error)[:300]
-            return "tier 2", f"{verified.family} on par over {verified.seeds} draws"
+            return "tier 2", f"{verified.family}, its float64 mapping agreeing over {verified.draws} draws"
         case TorchRoute():
             return "tier 3", "transformers' own forward, run by torchax"
 

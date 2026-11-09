@@ -290,48 +290,50 @@ SEED_OSS = {"architectures": ["SeedOssForCausalLM"], "attention_bias": True, "at
 def test_a_deep_release_verifies_at_its_probes_cut_depth_as_at_its_own():
     """Seed-OSS-36B's release, 64 identical layers, probes as its first two (`verify.shallow`) at its
     probe's widths, and verifies as Qwen2's convention there as at full depth: the probe holds the
-    candidate's logits to the source's float64 twin on par with the source's own (`verify.logits_parity`,
-    check 1), which rounding meets at any depth and width, where a fixed rounding per layer measured on
-    narrow fixtures refused it at two layers. The load's route reads it so (`source_route`), before any
-    weight downloads."""
+    candidate's float64 logits to the source's float64 twin's within the source's own float32 rounding
+    (`verify.logits_mapped`), which a computation of the same function meets at any depth and width,
+    where a fixed rounding per layer measured on narrow fixtures refused it at two layers. The load's
+    route reads it so (`source_route`), before any weight downloads."""
     from dew.interop.pretrained import VerifiedRoute, source_route
 
     route = source_route(SEED_OSS)
     assert isinstance(route, VerifiedRoute) and route.verified.family == "qwen2"
 
 
-def test_a_source_computing_the_candidates_own_float32_as_users_run_it_is_on_par():
-    """The probe's candidate runs its float32 as a user's process runs it (`precision.FP32_SUMS`), not
-    under the test process's wide CPU sums (`precision.WIDE_CPU_ARITHMETIC`, on here): a source whose
-    logits are the candidate's own as users compute them rounds as the candidate does, so check 1 finds
-    its distance to any float64 truth the candidate's, on par (`verify.logits_parity`)."""
+def test_a_candidate_departing_from_the_sources_function_is_named_and_one_computing_it_is_not():
+    """Tier 2's verdict (`verify.logits_mapped`): the candidate's float64 logits against the source's
+    float64 twin's, within the source's own float32 rounding of them. A source computing the candidate's
+    function, its float32 run the candidate's float32 and its twin the candidate's float64, departs
+    nowhere; one whose function moves a single position's logits by a part in ten thousand, which no
+    float32 rounding does, is named."""
     import jax
     import numpy as np
     from interop_support import tiny_config
 
-    from dew import parity
     from dew.interop import decoder_parts, verify
     from dew.interop.decoder_families import ENTRIES
-    from dew.nn.precision import FP32_SUMS, wide_cpu_arithmetic
     from dew.registry import models
 
-    assert wide_cpu_arithmetic()
     family = next(entry for entry in ENTRIES if "llama" in entry.model_types)
     record = decoder_parts.translate_family_config(tiny_config("llama").to_dict(), family)[0]
     model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
     variables = model.init(jax.random.key(0), verify.probe_ids(record["vocab_size"]))
     wide = models.build("causal_transformer", {**record, "dtype": "float64", "attention_impl": "reference"})
 
-    def users(ids):
-        with jax.default_matmul_precision(FP32_SUMS):
-            theirs = np.asarray(model.apply(variables, ids), np.float64)
-        with jax.enable_x64(new_val=True):
-            widened = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
-            truth = np.asarray(wide.apply(widened, ids))
-        return theirs, truth
+    def source(moved):
+        def run(ids):
+            theirs = np.array(model.apply(variables, ids), np.float64)
+            with jax.enable_x64(new_val=True):
+                widened = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), variables)
+                truth = np.array(wide.apply(widened, ids))
+            theirs[0, 3] *= 1 + moved
+            truth[0, 3] *= 1 + moved
+            return theirs, truth
+        return run
 
-    seeds = verify.logits_parity(users, model, variables, "the candidate against itself")
-    assert seeds >= parity.FEWEST_SEEDS
+    assert verify.logits_mapped(source(0.0), record, variables) == []
+    departed = verify.logits_mapped(source(1e-4), record, variables)
+    assert departed and departed[0].startswith("logits at draw 0")
 
 
 def test_a_probe_keeps_the_depth_of_code_not_transformers_own():
@@ -395,9 +397,8 @@ def test_a_change_to_the_twins_package_verifies_a_mapping_again(tmp_path):
 
 
 def test_a_first_verification_says_it_runs_and_a_recorded_one_does_not(tmp_path, monkeypatch, caplog):
-    """Verifying a type no registered family reads runs the source and Dew over check 1's draws, which
-    takes minutes for some types on a CPU: the load says so before it starts, once a type, its record
-    read silently by the next load."""
+    """Verifying a type no registered family reads runs the source and Dew over the probe's draws: the
+    load says so before it starts, once a type, its record read silently by the next load."""
     import logging
 
     from dew.interop.verify import verify_mapping
