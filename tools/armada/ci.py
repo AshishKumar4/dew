@@ -700,7 +700,7 @@ def parted_record() -> dict[str, dict[str, float]]:
 def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
     """Of file `name`'s recorded `tests`, those but its check-1 sites', which run apart (`sites`)."""
     held = sites(name)
-    return {node: seconds for node, seconds in tests.items() if session.test_name(node) not in held}
+    return {node: seconds for node, seconds in tests.items() if session.site_name(node, held) not in held}
 
 
 def durations_record() -> dict[str, float]:
@@ -944,8 +944,10 @@ def sites(name: str) -> dict[str, Mark]:
     method's `Class.test_name`) with its mark (`Mark`). Read from the source, as `gangs` reads its models: the
     plan runs under a Python with no pytest (`pinned`) and imports no test, so it reads the mark on the test's
     own decorator, `@pytest.mark.check1_shards(seeds=S, per_task=P)` or `@pytest.mark.shards(units=N,
-    per_task=P)`, of literal counts above zero, one a test. A mark written otherwise (on a class or a module,
-    in a parameter's marks, of counts computed, two on one test) would set its site aside from its file's
+    per_task=P)`, of literal counts above zero, one a test, or a parameter's of the test's one literal
+    parametrize list, `pytest.param(..., id="<id>", marks=pytest.mark.check1_shards(...))`, its site
+    `test[id]`. A mark written otherwise (on a class or a module, on a parameter with no literal id or of a
+    test parametrized twice, of counts computed, two on one test) would set its site aside from its file's
     tasks (`selected`) and plan none of its own, so nothing would run it: its file is refused, by the lines
     that hold it."""
     path = Path(name)
@@ -963,23 +965,49 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         return {}
     found: dict[str, Mark] = {}
     read: set[int] = set()
-    for test, mark in session.decorated_tests(tree.body):
+
+    def marked(site: str, mark: ast.Call) -> None:
         kind = ast.unparse(mark.func).removeprefix("pytest.mark.")
         if kind not in session.SHARDS:
-            continue
+            return
         counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
                   if isinstance(keyword.value, ast.Constant)}
         allowed = [{session.SHARDS[kind], "per_task"}]
         if kind == "check1_shards":
             allowed.append({session.SHARDS[kind], "per_task", "conditioning", "conditioning_per_task"})
         if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
-                and all(type(count) is int and count > 0 for count in counts.values()) and test not in found):
+                and site not in found and all(type(count) is int and count > 0 for count in counts.values())):
             declared = counts[session.SHARDS[kind]]
             units = _loaded(PARITY_STAGES).staged_units(declared) if kind == "check1_shards" else declared
             weighed = _loaded(PARITY_STAGES).staged_units(counts.get("conditioning", 0))
-            found[test] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
+            found[site] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
                                counts.get("conditioning_per_task", 0))
             read.add(id(mark.func))
+
+    decorated = list(session.decorated_tests(tree.body))
+    for test, mark in decorated:
+        marked(test, mark)
+    # A marked parameter of a test's one literal parametrize list, `pytest.param(..., id="<id>", marks=...)`,
+    # is a site of its own, `test[id]` (session.SITE), its marks read as a test's (Main's ruling, 2026-11-09:
+    # test_recurrence's ~60 hook combinations, each a check-1 site of its own seeds).
+    lists = {test: [mark for each, mark in decorated if each == test
+                    and ast.unparse(mark.func) == "pytest.mark.parametrize"] for test, _ in decorated}
+    for test, parametrized in lists.items():
+        if len(parametrized) != 1:
+            continue
+        given = parametrized[0].args[1] if len(parametrized[0].args) > 1 else next(
+            (keyword.value for keyword in parametrized[0].keywords if keyword.arg == "argvalues"), None)
+        for value in given.elts if isinstance(given, (ast.List, ast.Tuple)) else ():
+            if not (isinstance(value, ast.Call) and ast.unparse(value.func) == "pytest.param"):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in value.keywords}
+            named, marks = keywords.get("id"), keywords.get("marks")
+            if not (isinstance(named, ast.Constant) and isinstance(named.value, str)
+                    and session.PARAM_ID.fullmatch(named.value)):
+                continue
+            for mark in marks.elts if isinstance(marks, (ast.List, ast.Tuple)) else [marks]:
+                if isinstance(mark, ast.Call) and test not in found:
+                    marked(f"{test}[{named.value}]", mark)
     unread = sorted(node.lineno for node in ast.walk(tree)
                     if isinstance(node, ast.Attribute) and node.attr in session.SHARDS
                     and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)
@@ -987,8 +1015,11 @@ def marked_sites(name: str, text: str) -> dict[str, Mark]:
         raise SystemExit(f"{name}, line {', '.join(map(str, unread))}: check1_shards and shards mark a test "
                          f"once, on its own decorator, as @pytest.mark.check1_shards(seeds=S, per_task=P), "
                          f"with conditioning=C, conditioning_per_task=Q where it declares a weighed check, "
-                         f"or @pytest.mark.shards(units=N, per_task=P), of literal counts above zero, "
-                         f"which the plan reads from the source (tools/armada/ci.py `sites`)")
+                         f"or @pytest.mark.shards(units=N, per_task=P), of literal counts above zero, or a "
+                         f"parameter of its one literal parametrize list once, as pytest.param(..., "
+                         f"id=\"<id>\", marks=pytest.mark.check1_shards(...)) of a literal id of letters, "
+                         f"digits, _ and -, which the plan reads from the source "
+                         f"(tools/armada/ci.py `sites`)")
     return found
 
 
@@ -2190,7 +2221,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
         # whole run then packed cold).
         aside = {node for row_ in held for node in row_.get("whole_suite", [])} - observed.keys()
         own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name
-               and session.test_name(node) not in marked and node not in aside}
+               and session.site_name(node, marked) not in marked and node not in aside}
         if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
             kept = {node: seconds for node, seconds in kept.items() if node not in own}
             kept.update({node: round(seconds, 3) for node, seconds in observed.items()})

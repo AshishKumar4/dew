@@ -79,10 +79,15 @@ per_task=P)` on a test whose work is N units of its own, split the same way (a w
 either as armada's map and judge (ci.py's `site_entries`): map tasks of P units each over the units its
 stages or its work take, and one judge."""
 
-SITE = re.compile(r"(?P<test>(?:\w+\.)*test\w*)(?:\.draws-(?P<start>\d+)-(?P<stop>\d+))?")
+SITE = re.compile(r"(?P<test>(?:\w+\.)*test\w*(?:\[[\w-]+\])?)"
+                  r"(?:\.draws-(?P<start>\d+)-(?P<stop>\d+))?")
 """A check-1 site's group in its rows' names (ci.py's `row`), which its tasks' split carries: its test's name
-in its file (ci.py's `sites`), its judge's, whose row is the site's verdict; or that and the seeds one of its
-map tasks draws, `<test>.draws-<start>-<stop>`."""
+in its file (ci.py's `sites`), with its parameter's id where the mark is a `pytest.param`'s (`test[id]`), its
+judge's, whose row is the site's verdict; or that and the seeds one of its map tasks draws,
+`<test>.draws-<start>-<stop>`."""
+PARAM_ID = re.compile(r"[\w-]+")
+"""A marked parameter's id (`pytest.param(..., id=...)`), as a site's name carries it (`SITE`): letters,
+digits, `_` and `-`, so its node id, its rows' names and its tasks' split hold it whole."""
 
 
 def selected(command: list[str], network: bool, whole: bool = False, release: bool = False,
@@ -147,6 +152,14 @@ def test_name(node: str) -> str:
     """Test node `node`'s test's name in its file: its function's, or a class's method's
     `Class.test_name`, its parameters' ids aside."""
     return node.partition("::")[2].split("[")[0].replace("::", ".")
+
+
+def site_name(node: str, sites: Container[str]) -> str:
+    """Test node `node`'s name among a file's `sites` (ci.py's `sites`): its parameter's site's, `test[id]`,
+    where that parameter is marked one, else its test's (`test_name`)."""
+    named = test_name(node)
+    held = f"{named}[{node.partition('[')[2][:-1]}]" if "[" in node else named
+    return held if held in sites else named
 
 
 def shared_setups(name: str) -> dict[str, str]:
