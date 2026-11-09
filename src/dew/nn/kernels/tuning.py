@@ -1224,3 +1224,20 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
     and for a lab that times one."""
     with _cache.KERNEL_PINS(tuple(configs.items())):
         yield
+
+
+@contextlib.contextmanager
+def pinned_where_taken(op: KernelOp, ba: tokamax.BoundArguments) -> Iterator[None]:
+    """A launch of `op` over `ba` traced within takes an enclosing pin of its
+    kind (`pinned`) where it can take it (`KernelOp.pinnable`), else its own
+    config, that pin set aside and every other kind's kept: a launch a pinned
+    one makes of another of its kind, whose resources the pin was not chosen
+    for (a scaled attention forward, `attention_mosaic.MosaicForward.scaled`)."""
+    kind = type(op)
+    pins = dict(_cache.KERNEL_PINS.value)
+    if kind not in pins or op.pinnable(ba, op.completed(ba, pins[kind])):
+        yield
+        return
+    with _cache.KERNEL_PINS(tuple((pinned_kind, config) for pinned_kind, config in _cache.KERNEL_PINS.value
+                                  if pinned_kind is not kind)):
+        yield

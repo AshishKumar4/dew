@@ -77,9 +77,12 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
         functions = {ir.StringAttr(op.attributes["sym_name"]).value: op.operation
                      for op in module.body.operations if op.operation.name == "func.func"}
         assert "main" in functions, "a lowered program's entry is its module's main"
+        # Each function's stated FLOPs, computed once, which its conditionals' branches are ranked by, and
+        # each function's conditionals' largest branches in program order (`_Branches`).
+        branches = _Branches(functions)
         callees: dict[str, dict[str, float]] = {name: {} for name in functions}
         for name, function in functions.items():
-            for operation, times in _walked(function, 1.0):
+            for operation, times in _walked(function, 1.0, branches.of(name)):
                 if operation.name == "func.call":
                     callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
                     callees[name][callee] = callees[name].get(callee, 0.0) + times
@@ -90,7 +93,7 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
             entered.add(name)
             if not runs.get(name, 0.0) and not unrun:
                 return
-            for operation, times in _walked(functions[name], runs.get(name, 0.0)):
+            for operation, times in _walked(functions[name], runs.get(name, 0.0), branches.of(name)):
                 if (made := read(operation)) is not None:
                     found.append((made, times))
                 if operation.name == "func.call":
@@ -105,20 +108,86 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
     return found
 
 
-def _walked(operation: ir.Operation, times: float) -> Iterator[tuple[ir.Operation, float]]:
+def _walked(operation: ir.Operation, times: float, largest: Iterator[int]
+            ) -> Iterator[tuple[ir.Operation, float]]:
     """`operation`, which runs `times`, and every operation its regions hold, in program order, each with
     the times it runs: a `stablehlo.while`'s condition as often as the loop, its body its trips more
-    (`_trips`), as `hlo_flops` weighs a while's condition and body; any other region (a branch, a
-    reduction's body) as often as its operation, every branch counted, which bounds the one that runs."""
+    (`_trips`), as `hlo_flops` weighs a while's condition and body; of a conditional's branches (a
+    `stablehlo.case`'s or `stablehlo.if`'s regions) the one `largest` gives next (`_Branches.of`, its
+    conditionals' in this order: the branch whose kernels state the most FLOPs) as often as the
+    conditional and every other none, as `hlo_flops` counts a conditional's largest branch: it runs one;
+    any other region (a reduction's body) as often as its operation."""
     yield operation, times
+    chosen = next(largest) if _branched(operation) else None
     for index, region in enumerate(operation.regions):
         within = times
         if operation.name == "stablehlo.while" and index == 1:
             trips = _trips(operation)
             within = 0.0 if not trips or not times else times * trips
+        if chosen is not None and index != chosen:
+            within = 0.0
         for block in region.blocks:
             for nested in block.operations:
-                yield from _walked(nested.operation, within)
+                yield from _walked(nested.operation, within, largest)
+
+
+def _branched(operation: ir.Operation) -> bool:
+    """Whether `operation` is a conditional of more than one branch, which runs one (`_walked`)."""
+    return operation.name in ("stablehlo.case", "stablehlo.if") and len(operation.regions) > 1
+
+
+class _Branches:
+    """A module's `functions`' stated FLOPs (`KernelCall.flops`, a library call's none) a run, each
+    function's computed once with every function it calls, and each function's conditionals' largest
+    branches, in the program order `_walked` meets them: a loop's body counted its trips, a conditional
+    its branch of the most stated FLOPs, a call its callee's own."""
+
+    def __init__(self, functions: dict[str, ir.Operation]):
+        self.functions = functions
+        self.flops: dict[str, float] = {}
+        self.chosen: dict[str, list[int]] = {}
+
+    def of(self, name: str) -> Iterator[int]:
+        """Function `name`'s conditionals' largest branches, in program order."""
+        self._function(name)
+        return iter(self.chosen[name])
+
+    def _function(self, name: str) -> float:
+        """Function `name`'s stated FLOPs a run, computed once (a recursive call's 0 while it is)."""
+        if name not in self.flops:
+            self.flops[name] = 0.0
+            chosen: list[int] = []
+            self.flops[name] = self._stated(self.functions[name], chosen)
+            self.chosen[name] = chosen
+        return self.flops[name]
+
+    def _stated(self, operation: ir.Operation, chosen: list[int]) -> float:
+        """`operation`'s stated FLOPs a run, its conditionals' largest branches appended to `chosen` in
+        program order, a conditional's before those its branches hold."""
+        total = 0.0
+        if operation.name == "stablehlo.custom_call":
+            target = ir.StringAttr(operation.attributes["call_target_name"]).value
+            kind = custom_call_kind(target)
+            if kind != "no_matmul":
+                total = _kernel_call(kind, target, operation).flops or 0.0
+        elif operation.name == "func.call":
+            callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
+            if callee in self.functions:
+                total = self._function(callee)
+        slot = None
+        if _branched(operation):
+            slot = len(chosen)
+            chosen.append(0)
+        regions = [sum(self._stated(nested.operation, chosen) for block in region.blocks
+                       for nested in block.operations) for region in operation.regions]
+        if slot is not None:
+            chosen[slot] = regions.index(max(regions))
+            return total + max(regions)
+        if operation.name == "stablehlo.while":
+            trips = _trips(operation)
+            body = 0.0 if not trips or not regions[1] else regions[1] * trips
+            return total + regions[0] + body
+        return total + sum(regions)
 
 
 def _trips(loop: ir.Operation) -> float:

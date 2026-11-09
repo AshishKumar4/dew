@@ -110,8 +110,9 @@ def _forward_of(query, key, value, *, causal: bool = False, **options):
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 def test_the_blackwell_forward_keeps_finite_the_sums_that_pass_fp32s_largest_interpreted(natural):
     """Two keys of zero queries and keys weigh their values of 2^127 equally: their sum passes fp32's
-    largest though their mean does not. The rows whose sums overflowed walk again shifting
-    (`algebra.walked_launches`), so the output is the mean, 2^127, not infinity."""
+    largest though their mean does not. A call some row of which can be scaled walks with its rows' sums
+    scaled (`algebra.SCALED_WALK`, the Mosaic template's scaled kernel), so the output is the mean, 2^127,
+    not infinity."""
     width = 64
     query = jnp.zeros((1, 128, 1, width), jnp.bfloat16)
     key = jnp.zeros((1, 2, 1, width), jnp.bfloat16)

@@ -201,6 +201,45 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     assert record["unsized"] == flops.unsized
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_conditional_launches_its_branch_of_the_most_stated_flops(generation):
+    """A grouped GEMM's forward in nested conditionals, a branch of one call beside one of two conditionals
+    whose branches make two and three, each call the one function its kernels lower once in
+    (`tuning.lowered_once`): the kernel report counts the branch of the most stated FLOPs alone, three
+    calls of one call's launches, and the FLOP count of the same program counts the same, as a run takes
+    one branch of each (the scaled attention forward's kernels beside the common ones,
+    `attention_algebra.may_scale`)."""
+    from dew.nn.kernels import gemm
+    from dew.telemetry.instrumentation import hlo_flops
+
+    def calls(x, w, sizes, count):
+        return sum(gemm.gemm(x * (index + 1), w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+                   for index in range(count))
+
+    def step(x, w, sizes, taken, inner):
+        def nested():
+            return jax.lax.cond(inner, lambda: calls(x, w, sizes, 2), lambda: calls(x, w, sizes, 3))
+
+        return jax.lax.cond(taken, lambda: calls(x, w, sizes, 1), nested)
+
+    x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes, flag = jax.ShapeDtypeStruct((2,), jnp.int32), jax.ShapeDtypeStruct((), jnp.bool_)
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+
+    def lowered_report(fn, *shapes):
+        with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+            lowered = jax.jit(fn).trace(*shapes).lower(lowering_platforms=("cuda",))
+        return lowered, kernel_report(found, lowered).record()
+
+    lowered, record = lowered_report(step, x, w, sizes, flag, flag)
+    _, alone = lowered_report(lambda x, w, sizes: calls(x, w, sizes, 1), x, w, sizes)
+    once = templated_calls(alone)
+    assert once and templated_calls(record) == {name: 3 * count for name, count in once.items()}
+    templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None and flops.hardware == sum(entry["flops"] for entry in templated) > 0
+
+
 @pytest.mark.parametrize(("start", "bound", "step", "bits", "signed", "trips"), [
     (0, 12, 1, 32, True, 12), (0, 12, 5, 32, True, 3), (4, 2, 1, 32, True, 0), (0, 12, 0, 32, True, math.inf),
     (0, 127, 1, 8, True, 127), (0, 128, 1, 8, True, math.inf), (0, 128, 1, 8, False, 128),

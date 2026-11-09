@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import tokamax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import generation, launches
+from dew.nn.kernels import generation, launches, tuning
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
@@ -155,14 +155,13 @@ def _held(kind: Kind) -> tuple[str, ...]:
 
 def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                     output_kinds: tuple[Kind, ...], initial: bool, residuals: Kept, output_mod, block_k: int,
-                    interpret: bool, guard: str):
+                    interpret: bool, maxima: bool):
     """The forward's Triton mainloop: one program a query block and head walks the key tiles its form
     gives it (every tile, the causal diagonal's, or the spans' block map), issuing the tile's two
-    products and calling the algebra between them (`attention_algebra`), under the default's guards over
-    whole launches (`algebra.walked_launches`): the plain launch (`guard` 'flag') also writes each row's
-    running maximum and whether its weighted values overflowed, and a guarded launch (`guard` 'rewalk')
-    reads the rows to walk again, each shifting as it needs, walking only the programs one of whose rows
-    is; 'none' where the call's form takes no guard."""
+    products and calling the algebra between them (`attention_algebra`), its rows' sums scaled where its
+    spec is (`algebra.SCALED_WALK`, the scaled op's, `TritonForward.scaled`); with `maxima` it also writes
+    each row's running maximum, which the fold's guard over whole launches reads
+    (`algebra.walked_launches`)."""
     refs = list(refs)
     spans = bounds = ids = None
     if spec.form == "spans":
@@ -177,11 +176,9 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     score_refs = [refs.pop(0) for _ in score_kinds]
     output_refs = [refs.pop(0) for _ in output_kinds]
     initial_refs = [refs.pop(0) for _ in range(3 if initial else 0)]
-    live_ref = refs.pop(0) if guard == "rewalk" else None
     out_ref, *residual_refs = refs
-    # A plain launch's rows' running maxima and overflows follow its outputs.
-    flag_refs = residual_refs[-2:] if guard == "flag" else []
-    residual_refs = residual_refs[:len(residual_refs) - len(flag_refs)]
+    # A plain launch's rows' running maxima follow its outputs.
+    maxima_ref = residual_refs.pop() if maxima else None
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
     first_query = pl.program_id(0) * block_q
@@ -209,10 +206,10 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     resumed = (initial_refs[0][...], initial_refs[1][...], initial_refs[2][...]) if initial else None
     training = residuals is Kept.SPLIT
 
-    def walk(form: algebra.Forward, live):
-        # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows shifting.
+    def walk(form: algebra.Forward):
+        # The walk in `form`: the call's, or the fold's rewalk's.
         return program.walk(form, lo, hi, functools.partial(keys_at, form), rows, resumed, block_q,
-                            value_ref.shape[-1], live=live, training=training)
+                            value_ref.shape[-1], training=training)
 
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
@@ -220,45 +217,19 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     def finished(form: algebra.Forward, carry):
         # A walk's outputs in `form` (`program.finished`): the normalized output, its maximum and
         # denominator, and a training walk's (`Kept.SPLIT`) anchors and split sums.
-        return program.finished(form, carry, keys_at=functools.partial(keys_at, form), rows=rows,
-                                bounds=(lo, hi), resumed=resumed, training=training, output_mod=output_mod,
-                                output_params=output_params)
+        return program.finished(form, carry, rows=rows, resumed=resumed, training=training,
+                                output_mod=output_mod, output_params=output_params)
 
-    def written(walked):
-        if flag_refs:
-            # A training walk's weighted values are its split sums joined, where they overflow.
-            if isinstance(walked, algebra.Partial):
-                state, weighted = walked, walked.acc
-            else:
-                state, weighted = walked[0], algebra.joined(walked, rows).acc
-            flag_refs[0][...] = state.m
-            flag_refs[1][...] = algebra.overflowed(weighted).astype(jnp.float32)
-        out, m, denominator, *kept = finished(spec, walked)
-        out_ref[...] = out.astype(out_ref.dtype)
-        if residuals is not Kept.NONE:
-            residual_refs[0][...] = m
-            residual_refs[1][...] = denominator
-        for ref, part in zip(residual_refs[2:7], kept, strict=True):
-            ref[...] = part
-
-    if live_ref is None:
-        written(walk(spec, None))
-        return
-    live = live_ref[...] > 0
-    walks = jnp.max(live.astype(jnp.int32)) > 0
-
-    @pl.when(walks)
-    def _():
-        # Only a program one of whose rows walks again does: each of those rows shifts as it needs; every
-        # other row's outputs are the plain launch's (`_fwd`'s `kept`).
-        written(walk(spec, live))
-
-    @pl.when(jnp.logical_not(walks))
-    def _():
-        # A program none of whose rows walks again writes its outputs zero, which `kept` takes the plain
-        # launch's in place of: no output is left unwritten (NSNAN-2).
-        for ref in (out_ref, *residual_refs):
-            ref[...] = jnp.zeros(ref.shape, ref.dtype)
+    walked = walk(spec)
+    if maxima_ref is not None:
+        maxima_ref[...] = (walked if isinstance(walked, algebra.Partial) else walked[0]).m
+    out, m, denominator, *kept = finished(spec, walked)
+    out_ref[...] = out.astype(out_ref.dtype)
+    if residuals is not Kept.NONE:
+        residual_refs[0][...] = m
+        residual_refs[1][...] = denominator
+    for ref, part in zip(residual_refs[2:7], kept, strict=True):
+        ref[...] = part
 
 
 @dataclasses.dataclass(frozen=True)
@@ -286,12 +257,39 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
     output_width: int = TRACED_TILE
     scale: float = 1.0
     natural: bool = NATURAL
+    scaled: bool = False
+    """Whether its kernel walks scaled (`algebra.SCALED_WALK`): the op a call some row of which can be scaled
+    launches in its common op's place (`_fwd`, `algebra.may_scale`), its own tiles derived from its own
+    registers and shared memory (`registers`, `staged_bytes`)."""
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
              acc0, *, residuals: bool | Kept, interpret: bool, config: Tiles, return_residuals: bool = False):
-        from jax.experimental.pallas import triton as plgpu
-
         residuals = _kept(residuals)
+        arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0,
+                     total0, acc0)
+        walk = functools.partial(self._walk, *arguments, residuals=residuals, interpret=interpret,
+                                 config=config)
+        if self.scaled or not algebra.headroom(value.dtype):
+            return walk(scaled=self.scaled), None
+        # A call some row of which can be scaled (`algebra.may_scale`) launches the scaled op's kernel (its
+        # own tiles, `scaled`), every other call, every ordinary input's, this op's unscaled one, bit for bit
+        # the scaled walk's there.
+        scaled_op = dataclasses.replace(self, scaled=True)
+
+        def rare():
+            # A pin of this op's where the scaled op can take it, else its own tiles
+            # (`tuning.pinned_where_taken`): its registers and shared memory are not the common op's.
+            with tuning.pinned_where_taken(scaled_op, scaled_op.bind(*arguments, residuals=residuals,
+                                                                     interpret=interpret)):
+                return scaled_op(*arguments, residuals=residuals, interpret=interpret)
+
+        return jax.lax.cond(algebra.may_scale(value, keys_axis=1, initial=acc0), rare,
+                            functools.partial(walk, scaled=False)), None
+
+    def _walk(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0,
+              total0, acc0, *, residuals: Kept, interpret: bool, config: Tiles, scaled: bool):
+        """The call's launch at `config`, its walk `scaled` where its values can pass fp32's largest."""
+        from jax.experimental.pallas import triton as plgpu
 
         # The query taken by its scale's power of two before its products (`prescale`).
         query, scale, power = prescaled(query, self.scale)
@@ -338,11 +336,12 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
                           *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 3]
             per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
             out_specs += [per_row, per_value, per_row, per_row, per_row]
-        # A call's own key count, none included; an op built without one counts its launch's keys.
-        # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), as the
-        # plain-JAX and Mosaic mainloops do: the template's production route runs this one on a GPU.
+        # A call's own key count, none included; an op built without one counts its launch's keys. A scaled
+        # walk scales its rows' sums where they can pass fp32's largest (`algebra.Forward.headroom`,
+        # `algebra.SCALED_WALK`).
+        headroom = scaled and algebra.headroom(value.dtype)
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, scale,
-                               self.score_mod, self.natural, algebra.headroom(value.dtype), initial,
+                               self.score_mod, self.natural, headroom, initial,
                                compensated=algebra.compensates(value.dtype), prescale=power)
         kernel = functools.partial(
             _forward_kernel, score_kinds=self.score_kinds, output_kinds=self.output_kinds, initial=initial,
@@ -351,38 +350,24 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             launches.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
         rowed = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
+        # A scaled walk's launch named apart: a call compiles it beside its unscaled form (`scaled`).
+        name = report.named("attention_forward_scaled" if spec.headroom else "attention_forward")
 
         def launched(form: algebra.Forward, live: jax.Array | None, into=None):
-            # The call in `form` (`algebra.walked_launches`' launch): plain, its outputs, its rows' running
-            # maxima and overflows; with `live`, those rows walked again, the programs none of whose rows walk
-            # writing their outputs zero (`_forward_kernel`).
-            del into
-            if live is None:
-                *out, maxima, over = launch(
-                    functools.partial(kernel, spec=form, guard="flag"), in_specs=in_specs,
-                    out_specs=[*out_specs, per_row, per_row], out_shape=[*out_shape, rowed, rowed],
-                    name=report.named("attention_forward"))(*arrays)
-                return tuple(out), maxima, over > 0
-            out = launch(functools.partial(kernel, spec=form, guard="rewalk"), in_specs=[*in_specs, per_row],
-                         out_specs=out_specs, out_shape=out_shape,
-                         name=report.named("attention_forward_headroom"))(*arrays, live.astype(jnp.float32))
-            return tuple(out), None, None
+            # The call in `form` (`algebra.walked_launches`' launch): its outputs and its rows' running
+            # maxima, which the fold's guard reads.
+            del live, into
+            *out, maxima = launch(functools.partial(kernel, spec=form, maxima=True), in_specs=in_specs,
+                                  out_specs=[*out_specs, per_row], out_shape=[*out_shape, rowed],
+                                  name=name)(*arrays)
+            return tuple(out), maxima, None
 
-        def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
-            # The guarded launch's outputs at its rows `live` `[B, H, Qp]`, the plain one's elsewhere: the
-            # output's rows lie `[B, Qp, H, Dv]`, every residual's `[B, H, Qp, ...]`.
-            masks = [jnp.swapaxes(live, 1, 2)[..., None],
-                     *(live.reshape(live.shape + (1,) * (array.ndim - 3)) for array in guarded[1:])]
-            return tuple(jnp.where(mask, ours, theirs) for mask, ours, theirs in zip(masks, guarded, plain,
-                                                                                   strict=True))
-
-        if spec.headroom or spec.reaches:
-            out = algebra.walked_launches(spec, launched, kept)
+        if spec.reaches:
+            out = algebra.walked_launches(spec, launched)
         else:
-            out = launch(functools.partial(kernel, spec=spec, guard="none"), in_specs=in_specs,
-                         out_specs=out_specs, out_shape=out_shape,
-                         name=report.named("attention_forward"))(*arrays)
-        return (tuple(out) if residuals is not Kept.NONE else out[0]), None
+            out = launch(functools.partial(kernel, spec=spec, maxima=False), in_specs=in_specs,
+                         out_specs=out_specs, out_shape=out_shape, name=name)(*arrays)
+        return tuple(out) if residuals is not Kept.NONE else out[0]
 
     GENERATES = True
 
@@ -396,28 +381,17 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         every stage but the one in use, the query tile, and the weights' tile on its way to the second
         product, which shares the query tile's memory where the block is 128 queries of heads at most
         128 wide. Fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: equal on all 48
-        configs it refused on either GPU, and every config it compiled within the budget).
-
-        A training forward whose sums can overflow (`algebra.headroom`) launches again where a row did
-        (`_forward_kernel`'s guard 'rewalk'), and its live rows take their split sums from a second walk of
-        the keys (`algebra.normalized_pass`), whose key and value tiles Triton stages beside the query and
-        weights tiles and the first walk's key stages (its IR at 32 x 64, width 256: Q, the first walk's
-        K stage, the second's K and V, 114688 bytes, past a 99 KB block, where the plain launch asks 90112):
-        the larger of the two launches. Exact at 32 x 32 and 64 x 32, width 256; the A100's compile-only
-        device asked up to 512 bytes more at width 128 and 8192 at 128 x 64, width 64, each within every
-        GPU's block (et-fsmem-cpu); a compile's refusal steps the launch down (`report.kept`)."""
+        configs it refused on either GPU, and every config it compiled within the budget)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
         streamed = (config.stages - 1) * config.block_k * (width + value_width) * size
         query_tile, weights = config.block_q * width * size, config.block_q * config.block_k * size
         shared = config.block_q >= 128 and width <= 128
-        plain = streamed + (max(query_tile, weights) if shared else query_tile + weights)
-        if not (_split(ba) and algebra.headroom(value.dtype)):
-            return plain
-        key_stages = (config.stages - 1) * config.block_k * width * size
-        normalized = config.block_k * (width + value_width) * size
-        return max(plain, query_tile + weights + key_stages + normalized)
+        # A scaled walk's small weights' parts (`algebra.small_parts`: fp32's one in fp32, a 16-bit dtype's
+        # three) each a weights' tile of its own on its way to its product.
+        small = _small_parts(value.dtype) * weights if self._scaled(ba) else 0
+        return streamed + (max(query_tile, weights) if shared else query_tile + weights) + small
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         """The fp32 words a thread holds live across the walk, the program's spread over its threads: the
@@ -432,10 +406,24 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         words = sums * rows * value.shape[-1] + rows * config.block_k
         if _split(ba):
             words += rows * value.shape[-1]
+        if self._scaled(ba):
+            # A scaled walk's small weights fp32 and their products' sums (`algebra.at_scale`).
+            words += rows * config.block_k + rows * value.shape[-1]
         return words // (32 * config.warps)
+
+    def _scaled(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether its kernel walks scaled (`scaled`, values that can pass fp32's largest), which its
+        resources price."""
+        return self.scaled and algebra.headroom(ba.arguments["value"].dtype)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
+
+
+def _small_parts(dtype) -> int:
+    """The parts a scaled walk's small weights take for their product with values of `dtype`
+    (`algebra.small_parts`): fp32's one, a 16-bit dtype's three."""
+    return 1 if jnp.dtype(dtype) == jnp.dtype(jnp.float32) else 3
 
 
 def _kept(residuals: bool | Kept | None) -> Kept:
@@ -1047,8 +1035,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                                    residuals=Kept.SPLIT, natural=natural, interpret=interpret)
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
-    # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
-    # pass cannot recompute without the forward's denominator: D comes from them, in either form.
+    # Values whose sums the forward may scale (`algebra.headroom`, `algebra.SCALED_WALK`) take D from the
+    # split sums at their rows' scale (`attention_gradient.split_delta`), the pass their tiles are derived
+    # for, in either form.
     split = split or algebra.headroom(value.dtype)
     launch = functools.partial(_launch, split=split, natural=natural, accurate=accurate, initial=initial,
                                interpret=interpret)
