@@ -430,9 +430,9 @@ def test_a_hoppers_gpt_oss_kernel_gradient_takes_a_cooperative_tile_its_depth_le
 def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain_product_takes():
     """A paired product's input gradient (row 2164) adds its first product into the second's epilogue
     (`gemm._added`) where that hook keeps the second on the launch its plain product takes (`_keeps_launch`:
-    an H100's warpgroup MMA counts the hook), else in XLA (an A100's mma.sync counts none, so the hook would
-    move it to Triton); either way the same sum rounded once: interpreted on an H100 through the template,
-    the paired projection's input gradient bitwise the two products' fp32 sum rounded to the rows' dtype."""
+    an H100's warpgroup MMA and an A100's mma.sync both count the hook); the same sum rounded once:
+    interpreted on an H100 and an A100 through the template, the paired projection's input gradient bitwise
+    the two products' fp32 sum rounded to the rows' dtype."""
     rng = np.random.default_rng(41)
     tokens = jnp.asarray(rng.integers(-3, 4, size=(200, 128)), jnp.bfloat16)
     first, second = (jnp.asarray(rng.integers(-3, 4, size=(3, 128, 128)), jnp.bfloat16) for _ in range(2))
@@ -441,24 +441,20 @@ def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain
     prior = jnp.zeros((200, 128), jnp.float32)
     options = {"interpret_on_cpu": True, "precision": None, "transpose_rhs": True, "dense": False,
                "first": None, "gather": None}
-    for generation_name, keeps in (("sm90", True), ("sm80", False)):
-        with generation.assumed(generation_name):
-            assert gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
-                                      options) is keeps
-    # The template named on an A100: the hooked call is refused, so the parts are added in XLA, no error.
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
-        assert not gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
-                                      options)
-
     def paired(tokens):
         return gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16,) * 2,
                          paired=second, interpret_on_cpu=True)
 
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
-        [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
     wide = sum(jax.lax.ragged_dot(d.astype(jnp.float32), jnp.swapaxes(m, 1, 2).astype(jnp.float32), sizes)
                for d, m in zip(cotangents, (first, second), strict=True))
-    np.testing.assert_array_equal(np.asarray(d_tokens), np.asarray(wide.astype(jnp.bfloat16)))
+    for generation_name in ("sm90", "sm80"):
+        with generation.assumed(generation_name):
+            assert gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
+                                      options), generation_name
+        with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
+            [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
+        np.testing.assert_array_equal(np.asarray(d_tokens), np.asarray(wide.astype(jnp.bfloat16)),
+                                      err_msg=generation_name)
 
 
 def ragged_draw(seed):

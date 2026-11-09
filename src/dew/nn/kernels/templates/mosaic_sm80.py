@@ -9,7 +9,7 @@ Its layouts are its operands' dtype's (`Layout.MMA_ACC(dtype)`), so a bundle is 
 import abc
 import dataclasses
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, Self
 
 import jax
@@ -181,11 +181,11 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     rows = 16
 
-    # Its kernels take hooks and exact sums (their side loads, vector reads and running sum lower), but
-    # its register model does not count what a hook holds, and its derived tiles spilled (ns-regs2: sm86's
-    # normed forward 16 bytes). Its running sum is counted beside the fragments its products hold and one
-    # step's fresh product (`summed_apart`, `grouped_matmul._Mosaic.registers`).
-    counts_hooks = False
+    # Its kernels take hooks and exact sums: an epilogue's side values read in its accumulator's layouts
+    # (`side_tile`, `chunks`), its running sum counted beside the fragments its products hold and one
+    # step's fresh product (`summed_apart`, `grouped_matmul._Mosaic.registers`); no prologue over a side
+    # tile (`takes_prologue_tiles`).
+    takes_prologue_tiles = False
 
     role_rows = 4 * 16
 
@@ -304,6 +304,21 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     @property
     def lhs(self):
         return plgpu.Layout.MMA_LHS(self.dtype, m_warps=self.m_warps)
+
+    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+        # The accumulators in their own layout, stated: an epilogue's broadcast of a side vector across one
+        # takes the accumulator's layout as its result's (`side_tile`'s vectors its reductions), where left to
+        # inference it took the vector's ("Tiling rank different than broadcast result rank, (16,) vs
+        # (64, 128)", a scaled forward on sm80, EM-hooks6).
+        yield 0, tuple(plgpu.layout_cast(acc, self.layout) for acc in accumulators)
+
+    def side_tile(self, ref, held_axes: tuple):
+        # In the accumulator's layout, or the accumulator's vector layout of
+        # the axis it follows. Read back unannotated, Mosaic GPU's layout inference exhausted its search on
+        # every epilogue over a side vector (a scaled and a row-scaled forward on sm80, EM-hooks5).
+        if len(ref.shape) > 1:
+            return plgpu.load(ref, layout=self.layout, optimized=False)
+        return plgpu.load(ref, layout=self.row if held_axes == ('rows',) else self.column, optimized=False)
 
     @property
     def rhs(self):

@@ -682,8 +682,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         merged = (min(accumulator, across.MERGED_REGISTERS)
                   if ba.arguments.get('dense') and mosaic_gpu.fixes_up(config, dtype) else 0)
         phases = [staged, prologue, merged, self._epilogue_registers(ba, config, stored)]
-        # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`).
-        plain += accumulator if ba.arguments.get('paired') is not None else 0
+        # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`): in
+        # registers its whole share, in tensor memory the epilogue chunk read beside the first's
+        # (`Issuer.chunk_columns`).
+        held_second = -(-config.block_m * family.chunk_columns(config.block_n) // config.warpgroups
+                        // resources.THREADS)
+        plain += held_second if ba.arguments.get('paired') is not None else 0
         if ba.arguments.get('exact_sums'):
             # The running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is carried as a
             # loop value beside each step's product (`mosaic.Issuer.summed_apart`), awaited before its add:
@@ -712,7 +716,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         stored = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         in_flight = 0 if self.STAGED_ROWS else family.in_flight
-        return -(-share * ((1 + tiles) * 4 + (1 + in_flight) * stored) // (4 * resources.THREADS))
+        # A family whose products read registers casts the result into its left operand's fragments
+        # (`MmaIssuer._left`) beside the result itself: a cast forward's least spill-free cap on sm80 was 136
+        # at 64 x 128 x 64, its model 127 without the cast's copy (EM-least4).
+        copies = 1 + in_flight + (family.operands_in_registers and not self.STAGED_ROWS)
+        return -(-share * ((1 + tiles) * 4 + copies * stored) // (4 * resources.THREADS))
 
     @staticmethod
     def _epilogue_registers(ba, config: mosaic_gpu.Tiles, stored: tuple) -> int:
@@ -741,7 +749,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if held_axes(axes) == ('columns',))
         vectors += family.column_registers(columns, jnp.float32) if hooks.accumulators > 1 else 0
-        accumulator = -(-config.block_m * columns // config.warpgroups // resources.THREADS)
+        # A side tile and an output held beside the next are an epilogue chunk's (`Issuer.chunk_columns`: the
+        # whole accumulator's where its registers hold it, tensor memory's chunk on tcgen05).
+        accumulator = -(-config.block_m * family.chunk_columns(columns) // config.warpgroups
+                        // resources.THREADS)
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
@@ -801,14 +812,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def _takes(self, ba, family: mosaic.Family) -> bool:
         """Whether `family`'s bundle runs the call: 16-bit operands, or FP8 ones it takes (`_fp8`); gathered
         rows where its producer gathers them beside the matrix's whole loads (`Transport.gathers_rows`,
-        `gathers_alone`); a hooked or exactly summed call
-        where its register model counts what they hold (a paired product's epilogue over its two
-        accumulators alone every family's counts, `registers`); a step that prepares its operands (a
-        prologue's rewrite, a consumer's own share of the rows' stage, an exactly summed step's product
+        `gathers_alone`); a prologue over a side tile where its kernels lower one (`takes_prologue_tiles`); a
+        paired product where it takes a pair (`takes_pairs`); a step that prepares its operands (a prologue's
+        rewrite, a consumer's own share of the rows' stage, an exactly summed step's product
         apart, but where its persistent walk sums the windows itself, `sums_in_persist`, or rewrites the
         stage in a role of its own, `rewrites_in_persist`) where its consumers issue their products."""
         dtype = ba.arguments['tokens'].dtype
-        hooked = ba.arguments['hooks'] != NO_HOOKS and not _pair_alone(ba, family)
         summed = bool(ba.arguments.get('exact_sums'))
         prepared = (ba.arguments['hooks'].prologue is not None
                     or (self.STAGED_ROWS and not self.unstaged(ba) and not self.rewritten(ba, family))
@@ -822,7 +831,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and (not tabled or (family.gathers_rows and family.gathers_alone))
                 and (not gathered or ba.arguments['hooks'].prologue is None)
                 and (family.issues_in_consumers or not prepared)
-                and (family.counts_hooks or not hooked))
+                and (family.takes_prologue_tiles or not _prologue_tiled(ba))
+                and (family.takes_pairs or ba.arguments.get('paired') is None))
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -932,8 +942,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
             most = min(most, max(2, steps))
-        # A family fixing its rings' slots streams them whatever the stages (`mosaic.Transport.ring_slots`).
-        most = family.ring_slots or most
+        # A family fixing its rings' slots streams them whatever the stages (`mosaic.Transport.ring_slots`);
+        # one whose deeper rings spill takes no more than it holds (`mosaic.Transport.most_stages`).
+        most = family.ring_slots or min(most, family.most_stages or most)
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
@@ -968,14 +979,16 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
+        # No deeper ring than its family's launches hold (`mosaic.Transport.most_stages`), a pin or a
+        # tuning neighbour's as the derivation's.
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
-                or not self._divides(ba, config) or report.refused(self, ba, config)):
+                or not self._divides(ba, config) or config.stages > (family.most_stages or config.stages)
+                or report.refused(self, ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
         # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
         accumulators = 1 if ba.arguments.get('paired') is None else 2
-        if ((accumulators > 1 and not family.takes_pairs)
-                or family.accumulator_rows not in (None, config.block_m // config.warpgroups)
+        if (family.accumulator_rows not in (None, config.block_m // config.warpgroups)
                 or family.tensor_columns(mosaic_gpu.tile_columns(config, family), accumulators,
                                          bool(ba.arguments.get('exact_sums'))) > (target.tmem_columns or 0)):
             return False
@@ -1008,7 +1021,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if not layouts:
             return ba
         family, dtype = layouts[0], ba.arguments['tokens'].dtype
-        units = {'depth': self._depth_unit(ba, family, dtype), 'width': family.column_unit(dtype)}
+        # The width in whole column units and whole units of the call's column vectors (`_vector_units`: an
+        # mma.sync bias's 64, where its column unit is 32; a 200-wide input gradient padded to 224 took no
+        # tile, EM-unal2).
+        width_unit = math.lcm(family.column_unit(dtype), self._vector_units(ba, family)[1])
+        units = {'depth': self._depth_unit(ba, family, dtype), 'width': width_unit}
         extents = self._padded_extents(ba)
         grown = {axis: -(-extent // units[axis]) * units[axis] for axis, extent in extents.items()}
         if grown == extents:
@@ -1130,8 +1147,13 @@ class MosaicGmm(_Mosaic):
         return depth % config.block_k == 0 and width % columns == 0
 
     def _depth_unit(self, ba, family: mosaic.Family, dtype) -> int:
-        # The least step its stage takes.
-        return min(self.STEPS or family.depths(dtype))
+        # The least step its stage takes, in whole units of a prologue's depth vectors (`candidate`'s, the
+        # depth mask's among them, `_aligned`): sm89's mma.sync pads 200 to 224 by its least step alone, which
+        # no step of its 64-element vector unit divides (EM-unal).
+        step = min(self.STEPS or family.depths(dtype))
+        if ba.arguments['hooks'].prologue is None:
+            return step
+        return math.lcm(step, family.vector_unit(jnp.float32), self._vector_units(ba, family)[2])
 
     def _aligned(self, ba):
         # A prologue never sees the depth's padding: its result zeroed past the call's depth by a side vector
@@ -1844,6 +1866,11 @@ def _side_dims(sides: tuple, axes_of: tuple, padded: dict[str, str]) -> tuple:
                  for side, axes in zip(sides, axes_of, strict=True))
 
 
+def _prologue_tiled(ba) -> bool:
+    """Whether the call's prologue reads a side operand's tile (`mosaic.Family.takes_prologue_tiles`)."""
+    return any(len(held_axes(axes)) > 1 for axes in ba.arguments['hooks'].prologue_axes)
+
+
 def _multiprocessors(target: generation.GpuTarget) -> int:
     """`target`'s multiprocessors, which the persistent Mosaic GPU launches spread their tiles over."""
     if target.multiprocessors is None:
@@ -1974,25 +2001,12 @@ dense products the template's launches cannot run."""
 
 def _takes_pair(name: str, case: GroupedCase) -> bool:
     """Whether the launches `name` take the paired product `case` whole: Mosaic GPU's where a bundle takes it
-    (`MosaicGmm._takes`: one whose register model counts its hooks, `mosaic.Family.counts_hooks`, or any
-    where its only hook is the epilogue over its two accumulators, `_pair_alone`: mma.sync's SwiGLU, 254 to
-    255 registers and no spill at Qwen3-30B-A3B's and Qwen3.5-4B's gate|up on sm80, row 2100); every other
-    hands it on (`APART`)."""
+    (`MosaicGmm._takes`); every other hands it on (`APART`)."""
     bound = case.call.bound.get(name)
     if name != MosaicGmm.name or bound is None:
         return False
     return bool(MosaicGmm()._families(bound[1], case.call.target))
 
-
-def _pair_alone(ba, family: mosaic.Family) -> bool:
-    """Whether `ba` is a paired product whose only hook is the epilogue over its two accumulators (no
-    prologue, no side operand, no exact sums) on a family whose model counts it: one that takes a pair
-    (`mosaic.Issuer.takes_pairs`) whose consumers issue no ring's loads (`Family.feeds_itself`: sm120's fed
-    mma.sync spilled 208 and 280 bytes at the paired 128 x 64 x 64 tile its model admitted, NS2100-1)."""
-    hooks = ba.arguments['hooks']
-    return (ba.arguments.get('paired') is not None and hooks.prologue is None and family.takes_pairs
-            and not family.feeds_itself and not ba.arguments.get('epilogue_operands')
-            and not ba.arguments.get('exact_sums'))
 
 class Apart:
     """`launched`'s answer for a paired product no launch takes whole: its two products run apart
