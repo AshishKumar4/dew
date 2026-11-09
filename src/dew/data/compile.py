@@ -138,7 +138,7 @@ from dew.data.pipeline import (
     with_stores,
 )
 from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
-from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
+from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import (
     Read,
     Rows,
@@ -154,6 +154,9 @@ from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 
 _DEFAULT_LOADING = Loading()
+_TRAINING_LOADING = Loading(workers="auto")
+"""A training read's loading where its chain names none (`compile`): automatic workers (`Loading.resolved`),
+which read its records' Python off the training process where it has some (`_Build.tuned`)."""
 
 
 @runtime_checkable
@@ -754,6 +757,7 @@ def compile(
     measured: _Measured | None = None,
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
+    steps: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
@@ -769,7 +773,7 @@ def compile(
     read_by(plan_version)
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
-    loading = loading or train._loading or _DEFAULT_LOADING
+    loading = loading or train._loading or _TRAINING_LOADING
     if isinstance(train.source, Phases) and examples is None:
         return _compile_phases(
             train,
@@ -783,11 +787,14 @@ def compile(
             rejections=rejections,
             resume=resume,
             plan_version=plan_version,
+            steps=steps,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs, version=plan_version)
-    loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
+    # Automatic loading sizes its workers for the run's batches: its `steps`, else an `examples` bound's.
+    batches = steps if steps is not None or examples is None else -(-examples // staged.build.batch)
+    loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
                                    pass_examples=staged.passes, bound_ends=_bound_ends(staged.original))
@@ -1044,6 +1051,7 @@ def _compiled(
     *,
     host: tuple[HostStep, ...],
     resume: Literal["exact", "non-exact"],
+    batches: int | None = None,
 ) -> Loader:
     """The readers of `staged`, each training batch's packed windows laid out
     as `packed` declares them and each validation batch's as its own packs do
@@ -1083,7 +1091,7 @@ def _compiled(
         stores=tuple(store for source in sources for store in _token_stores(source)),
         version=build.version,
     )
-    tuned = build.tuned(train)
+    tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
     build = tuned.pooled(train)
     train_host, device = _batch_steps(train)
@@ -1242,10 +1250,20 @@ def _compile_phases(
     rejections: Literal["drop", "mask"],
     resume: Literal["exact", "non-exact"],
     plan_version: int = PLAN_VERSIONS[-1],
+    steps: int | None = None,
 ) -> Loader:
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
+
+    def planned(index: int) -> int | None:
+        """The batches phase `index` reads of a run of `steps`, which automatic loading sizes its workers
+        for (`Loading.resolved`): its own steps on the step clock, else the run's."""
+        if steps is None or tokens:
+            return steps
+        start = source.ends[index - 1] if index else 0
+        until = source.ends[index]
+        return max(0, (steps if until is None else min(until, steps)) - (start or 0))
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
     def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
@@ -1279,7 +1297,7 @@ def _compile_phases(
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
-        loaded = _compiled(phase, packed, host=host, resume=resume)
+        loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index))
         if loaded.plan is None or loaded.plan.lowering != "global":
             raise ValueError(
                 f"phase {index} needs a global order; "
@@ -1301,7 +1319,7 @@ def _compile_phases(
         consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
         if not any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
             return built[index][0]
-        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume)
+        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume, batches=planned(index))
 
     batches = tuple(phase.build.batch for phase, _ in staged)
     stages = () if tokens else phase_stages(batches, (0, *(end for _, end in staged[:-1] if end is not None)))
@@ -1415,26 +1433,39 @@ def _training_reader(
     else:
         if build.elastic:
             _refuse_inelastic(pipeline)
-        own_plan = dataclasses.replace(
-            plan,
-            # An elastic read's order is one reader's at any count, its position every reader's.
-            topology={"elastic": True} if build.elastic else {
-                "shares": partition.count,
-                "share": partition.index,
-                "workers": _workers(pipeline, build.loading),
-                "row_multiple": partition.row_multiple,
-                "cycle_lengths": [
-                    stage.cycle_length for stage in _steps(pipeline) if isinstance(stage, Interleave)
-                ],
-                # Where a read that drops records reads in workers of each corpus's own (`pooled`),
-                # each worker's position is that corpus's, saved in that many.
-                **({} if build.pool is None else {"pools": build.pools(pipeline)}),
-            },
-        )
+
+        def per_share(chosen: _Build) -> tuple[Opener, Plan]:
+            """The reader `chosen` opens over this share and the plan its positions name."""
+            return functools.partial(chosen.batches, pipeline, partition), dataclasses.replace(
+                plan, version=chosen.version,
+                # An elastic read's order is one reader's at any count, its position every reader's.
+                topology={"elastic": True} if chosen.elastic else {
+                    "shares": partition.count,
+                    "share": partition.index,
+                    # A read in its inputs' order in any count of workers (`_Build.in_order`) names none.
+                    **({} if chosen.in_order else {"workers": _workers(pipeline, chosen.loading)}),
+                    "row_multiple": partition.row_multiple,
+                    "cycle_lengths": [
+                        stage.cycle_length for stage in _steps(pipeline) if isinstance(stage, Interleave)
+                    ],
+                    # Where a read that drops records reads in workers of each corpus's own (`pooled`),
+                    # each worker's position is that corpus's, saved in that many.
+                    **({} if chosen.pool is None or chosen.in_order else {"pools": chosen.pools(pipeline)}),
+                })
+
+        def saved_as(version: int, workers: int) -> tuple[Opener, Plan]:
+            """This share read as a position saved under plan `version` reads, in the `workers` it names:
+            this build at that version, its workers pooled again (`_Build.pooled`)."""
+            loading = dataclasses.replace(build.loading, workers=workers)
+            return per_share(dataclasses.replace(build, version=version, loading=loading, pool=None
+                                                 ).pooled(pipeline))
+
+        opener, own_plan = per_share(build)
         opened = _PerShare(
-            functools.partial(build.batches, pipeline, partition),
+            opener,
             own_plan,
             resume,
+            saved_as=saved_as,
             stop_seconds=build.loading.stop_seconds,
             endless=build.lowering.endless,
             replicated=build.elastic,
@@ -1764,6 +1795,7 @@ def fitted[Entry](
     examples: int | None = None,
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
+    steps: int | None = None,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -1810,7 +1842,8 @@ def fitted[Entry](
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
-                         epochs=epochs if examples is None else None, plan_version=plan_version)
+                         epochs=epochs if examples is None else None, plan_version=plan_version,
+                         steps=steps)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

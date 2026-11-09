@@ -63,8 +63,8 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
     delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
     (the accurate forms, or a form without the delta rule on its route, `recurrence_chunk.chunk_rounding`)
-    take none. A decay a key dimension's form takes either pair factoring its layer's
-    floor gives (`algebra.factored_range`, `algebra.key_diagonal_pairs_back`)."""
+    take none. A decay a key dimension's form takes each sub-chunk's own pairs each their own decay
+    (`algebra.key_diagonal_pairs_back`)."""
     if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
     if per_key:
@@ -119,7 +119,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, **options):
 def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
                   max_segments: int | None = None, scale: float | None = None,
                   family: mosaic.Family | None = None, interpret: bool = False,
-                  inverse=None, kept=None, delta: bool = True, floor: float | None = None,
+                  inverse=None, kept=None, delta: bool = True,
                   rounded: bool = False, ranged: bool = False,
                   skip=None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
@@ -142,7 +142,7 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                                   "under the run's fast forms, an fp32 call's under them alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, floor=floor, rounded=rounded, ranged=ranged)
+                   firsts=firsts, rounded=rounded, ranged=ranged)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))

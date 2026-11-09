@@ -125,7 +125,9 @@ def evaluated(function, tree: str):
     def run(*args):
         closed, shapes = jax.make_jaxpr(function, return_shape=True)(*args)
         leaves = jax.tree.leaves(args)
-        with evaluated_on(leaves):
+        # Each equation bound at the types its jaxpr states: a float64 sum Dew's CPU arithmetic traced under
+        # x64 (`dew.nn.precision.float64_sum`) is one again, not a float32 one.
+        with evaluated_on(leaves), jax.enable_x64(new_val=True):
             found = walked(closed.jaxpr, closed.consts, leaves, Summed(tree))
         return jax.tree.unflatten(jax.tree.structure(shapes), found)
 

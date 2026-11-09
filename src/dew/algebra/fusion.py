@@ -101,11 +101,10 @@ class Index:
     of the equations that read it), the values the body returns (`escaping`) and its constants' values where
     it holds them (`consts`): what the region finders read (`_regions`, `recognize.recognized`)."""
 
-    def __init__(self, jaxpr: jcore.Jaxpr | jcore.ClosedJaxpr):
+    def __init__(self, jaxpr: jcore.Jaxpr):
         self.jaxpr = jaxpr
-        values = jaxpr.consts if isinstance(jaxpr, jcore.ClosedJaxpr) else ()
-        held = len(values) == len(jaxpr.constvars)
-        self.consts = dict(zip(jaxpr.constvars, values, strict=True)) if held else {}
+        held = len(jaxpr.consts) == len(jaxpr.constvars)
+        self.consts = dict(zip(jaxpr.constvars, jaxpr.consts, strict=True)) if held else {}
         self.producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
         self.readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
         for place, equation in enumerate(jaxpr.eqns):
@@ -317,7 +316,12 @@ def _takes(fused_gemm, jaxpr: jcore.Jaxpr, region: Region) -> bool:
     launch measured slower than XLA's dot (`grouped_matmul.DECLARED`, every dense cell: DENSE1, 1.05 to 2.9
     times XLA's) they favour fusion more than measurement does, so a region whose launch the selector gives
     XLA is never fused by price alone; a call naming the template (an A/B's arm) fuses it."""
-    found = fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *_shapes(region.inputs))
+    inputs = _shapes(region.inputs)
+    # A region of a program staged under x64 (the CPU arithmetic's float64 sums) is analyzed under it, its
+    # 64-bit values as it states them.
+    wide = any(shape.dtype.itemsize == 8 for shape in (*inputs, *_shapes(region.outputs)))
+    with jax.enable_x64(new_val=wide):
+        found = fused_gemm.analysis(_replayed(jaxpr, region, fused_gemm), *inputs)
     if found.epilogue is None:
         # No epilogue to weigh (a bare product, a kernel gradient's): its launch's selector decides alone.
         return found.launch is not None and found.launch.refusal is None and found.launch.kernel != "xla"

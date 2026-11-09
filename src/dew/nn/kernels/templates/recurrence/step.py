@@ -148,9 +148,10 @@ class _Halves:
     the query's read of the write in it)."""
 
     count: int
-    index: object
-    partials: object
-    joined: object
+    index: jax.Array | int
+    partials: jax.Ref | None
+    """None for one warpgroup (`_joining`'s none), as `joined`."""
+    joined: jax.Ref | None
 
     def first(self, effect) -> None:
         """`effect()` by the first half alone (a store both halves would make alike)."""
@@ -167,7 +168,7 @@ class _Halves:
     def joined_sums(self, part: jax.Array, slot: int, layout, interpret: bool) -> jax.Array:
         """`part`, this half's sum over its keys `[heads, columns]`, joined with the other half's: their sum
         the earlier half's on the left, XLA's pairwise order's top (each half a subtree of it)."""
-        if self.count == 1:
+        if self.partials is None or self.joined is None:
             return part
         plgpu.store(self.partials.at[slot, self.index], part, optimized=False)
         mosaic.synced(interpret)
@@ -245,7 +246,8 @@ def _program(hooks, inputs, active_ref, state_out, moved, out_ref, scratch, *, b
         else:
             windows = conv.windows()
             convolved = conv.convolved(windows)
-            halves.first(lambda: conv.write([window[1:] for window in windows]))
+            write_history = conv.write
+            halves.first(lambda: write_history([window[1:] for window in windows]))
             keyed = [convolved[1 + 2 * p:3 + 2 * p] for p in range(block.heads)]
             # The block's heads' values, a thread a channel as the block lays them (`_Block.layout`).
             value = convolved[0].reshape(block.heads, block.columns)
@@ -448,12 +450,7 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
     def read(k, tile):
         return (entry(0, k) * entry(2, k)) * tile
 
-    corrected, before = value, None
-    if hooks.delta:
-        sums = _summed_keys(span, row, lambda k, tile: (read(k, tile), (entry(1, k) * entry(2, k)) * tile),
-                            value, count=2)
-        before, keyed = (halves.joined_sums(part, slot, layout, interpret) for slot, part in enumerate(sums))
-        corrected = value - keyed
+    corrected = value
 
     def updated(k, tile):
         written = (entry(1, k) * write) * corrected
@@ -467,7 +464,13 @@ def _stepped(hooks, state_ref, state_out, value, vectors, write, token: _Token, 
         return entry(0, k) * written if hooks.delta else (read(k, tile), entry(0, k) * written)
 
     if hooks.delta:
-        return before + halves.joined_sums(_summed_keys(span, row, updated, value), 2, layout, interpret)
+        sums = _summed_keys(span, row, lambda k, tile: (read(k, tile), (entry(1, k) * entry(2, k)) * tile),
+                            value, count=2)
+        before, keyed = (halves.joined_sums(part, slot, layout, interpret) for slot, part in enumerate(sums))
+        # The update's writes take the corrected value (`updated` reads it when the walk below calls it).
+        corrected = value - keyed
+        (written,) = _summed_keys(span, row, updated, value)
+        return before + halves.joined_sums(written, 2, layout, interpret)
     after = _summed_keys(span, row, updated, value, count=2)
     state_read, write_read = (halves.joined_sums(part, slot, layout, interpret)
                               for slot, part in enumerate(after))
@@ -480,13 +483,13 @@ their loads overlap: a key a turn, each row's load latency was the step's, one r
 
 
 def _summed_keys(key_width: int, read, term, like: jax.Array, count: int = 1):
-    """`sum_k term(k, read(k))` over the keys, each `like`'s shape (`count` of them where `term` returns a
-    tuple, each summed apart), in XLA's pairwise order, `UNROLLED` keys a turn of a rolled loop, each turn's
-    reads issued before its first use: a turn's terms by a pairwise tree of its own (each an aligned subtree
-    of the whole), the turns' sums added into the tree above them by the turn's index (`_tree_added`), the
-    index's choices a turn's rather than a key's; the subtrees a count of turns not a power of two leaves
-    held (each set bit's level) summed last, the earlier on the left. The top subtree alone dropped the last
-    128 of 384 keys (audit 2026-11-07, A18)."""
+    """`sum_k term(k, read(k))` over the keys, each `like`'s shape, a tuple of `count` (each of `term`'s
+    `count` terms summed apart, `term` returning a tuple where `count` is more than one), in XLA's pairwise
+    order, `UNROLLED` keys a turn of a rolled loop, each turn's reads issued before its first use: a turn's
+    terms by a pairwise tree of its own (each an aligned subtree of the whole), the turns' sums added into the
+    tree above them by the turn's index (`_tree_added`), the index's choices a turn's rather than a key's; the
+    subtrees a count of turns not a power of two leaves held (each set bit's level) summed last, the earlier
+    on the left. The top subtree alone dropped the last 128 of 384 keys (audit 2026-11-07, A18)."""
     def terms_of(k, tile):
         found = term(k, tile)
         return found if count > 1 else (found,)
@@ -510,7 +513,7 @@ def _summed_keys(key_width: int, read, term, like: jax.Array, count: int = 1):
         for level in levels[1:]:
             total = total + sums[level]
         totals.append(total)
-    return tuple(totals) if count > 1 else totals[0]
+    return tuple(totals)
 
 
 def _walked_keys(key_width: int, read, body) -> None:

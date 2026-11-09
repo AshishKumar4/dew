@@ -57,6 +57,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, staged_parts, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BACKWARD_CONSUMERS,
+    ROUNDED,
     BackwardTiles,
     Tiles,
     _block,
@@ -315,21 +316,23 @@ class MosaicForward(_Mainloop[Tiles]):
     splits: int = 1
     """The slices each query tile's keys are cut into, each a program of its own (`_Program.splits`): a
     split-KV inference launch's, its outputs each slice's (`attention_decode` merges them)."""
-    merges: bool = False
-    """Whether a split launch merges its slices itself, the last slice's program to arrive each query
-    block's, the initial state's among them (`attention_mosaic_forward._Merge`, `Family.fixed_up`): its
-    outputs the rows' whole, no merge in XLA after it. Legal on a family whose programs fix a tile up across
-    programs (`Family.fixes_up`), none waiting on another."""
     parts: int = 1
     """The bf16 parts each of an fp32 call's operands enters as (`product.EXACT_PARTS`, `product.formed`),
     stacked along the batch axis, part `p`'s rows from `p·B`: every product its parts' (`product.terms`),
     each 16-bit (attention.md 4b). One for a 16-bit call."""
+    rounds: float | None = None
+    """A quantized model's weights' bound (`Hooks.rounds`), which the anchored training walk rounds them to
+    at each row's maximum: a call that keeps its split residuals' alone. None where its weights stay whole."""
+
+    def _hooks(self, score_params, output_params, initial, drop) -> Hooks:
+        """The call's hooks from its parameters, state and draw, its static hooks the op's."""
+        return Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
+                     self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop, self.rounds)
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
              drop=None, table=None, sources=None, scales=None, *, residuals: Kept, interpret: bool,
              config: Tiles, return_residuals: bool = False):
-        hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
-                      self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
+        hooks = self._hooks(score_params, output_params, initial, drop)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
@@ -345,7 +348,7 @@ class MosaicForward(_Mainloop[Tiles]):
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
                                       table=table, sources=sources, subtracted=self.subtracted,
-                                      merges=self.merges, scales=scales, parts=self.parts,
+                                      scales=scales, parts=self.parts,
                                       **form), None
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
@@ -395,10 +398,6 @@ class MosaicForward(_Mainloop[Tiles]):
         if not (family.shares_rows(config.block_k, config.consumers)
                 and family.shares_rows(config.relaunch_k or config.block_k,
                                        config.relaunch_consumers or config.consumers)):
-            return False
-        if self.merges and self.splits > 1 and not family.fixes_up:
-            # A family whose programs merge their slices (`Family.fixes_up`); a guarded rewalk merges nothing
-            # (`_inference_walk`).
             return False
         # A paged call's key tiles (the launch's, its natural rewalk's) whole in its pages or its pages whole
         # in them (`_pages_hold`).
@@ -623,10 +622,12 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
-        hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
-                      ba.arguments["initial"], self.output_mod,
-                      tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
-                      ba.arguments["drop"])
+        hooks = self._hooks(ba.arguments["score_params"], ba.arguments["output_params"],
+                            ba.arguments["initial"], ba.arguments["drop"])
+        if self.rounds is not None and (self.parts > 1 or ba.arguments["residuals"] is not Kept.SPLIT
+                                        or ba.arguments["table"] is not None):
+            # A quantized model's weights round at the row's maximum, which the anchored walk alone knows.
+            return ROUNDED
         if self.parts > 1 and (ba.arguments["table"] is not None or ba.arguments["sources"] is not None
                                or ba.arguments["residuals"] is Kept.SPLIT or hooks.drop is not None):
             # A training forward's natural rewalk of parts spills past its model (an H100's at 64 x 64, width
@@ -831,7 +832,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None,
             masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-            sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False,
+            sources: jax.Array | None = None, subtracted: bool = False,
             scales: tuple[jax.Array, jax.Array] | None = None) -> jax.Array:
     ...
 
@@ -841,7 +842,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
             out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
-            sources: jax.Array | None = None, subtracted: bool = False, merges: bool = False,
+            sources: jax.Array | None = None, subtracted: bool = False,
             scales: tuple[jax.Array, jax.Array] | None = None
             ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
@@ -851,7 +852,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
             table: jax.Array | None = None, sources: jax.Array | None = None, subtracted: bool = False,
-            merges: bool = False, scales: tuple[jax.Array, jax.Array] | None = None):
+            scales: tuple[jax.Array, jax.Array] | None = None):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -866,19 +867,19 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     a row]` int32: row `b`'s key `s` at offset `s % page` of page `table[b, s // page]`. With `sources`
     `[B]` int32 (a call of rows of keys, inference), batch row `b` reads key row `sources[b]` of `key` and
     `value` `[R, K, Hk, D]`: a serving step's work list over its cache's rows, no row copied. `subtracted`
-    an inference walk's fold of raw products (`MosaicForward.subtracted`). With `splits` and `merges`, the
-    launch merges its slices (`MosaicForward.merges`), `hooks`' initial state among them: the rows' output
-    `[B, Q, H, Dv]` in `out_dtype`, and with `Kept.OUTPUT` their finished maxima and denominators `[B, H, Q]`.
-    With `scales` (an inference walk's), `key` and `value` are quantized codes, int8 or an FP8, and `scales`
-    the keys' and the values' `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads
-    the keys and values they dequantize to, each converted to the query's dtype in its program (`_Codes`).
+    an inference walk's fold of raw products (`MosaicForward.subtracted`). With `splits`, each query tile's
+    keys are cut into that many slices, every output the slices' own along the query axis
+    (`MosaicForward.splits`), which XLA merges (`attention_decode`). With `scales` (an inference walk's),
+    `key` and `value` are quantized codes, int8 or an FP8, and `scales` the keys' and the values'
+    `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads the keys and values they
+    dequantize to, each converted to the query's dtype in its program (`_Codes`).
     """
     if residuals is Kept.SPLIT:
         # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
         spans = spans.per_query()
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
-                             subtracted=subtracted, merges=merges, scales=scales)
+                             subtracted=subtracted, scales=scales)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -912,7 +913,7 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
                   splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
-                  subtracted: bool = False, merges: bool = False,
+                  subtracted: bool = False,
                   scales: tuple[jax.Array, jax.Array] | None = None) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
     (`refused`)."""
@@ -937,7 +938,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
-                       merges=merges and splits > 1, parts=parts)
+                       parts=parts, rounds=hooks.rounds)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,

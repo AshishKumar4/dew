@@ -957,6 +957,17 @@ def plain(shape: tuple, dtype):
     return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
 
 
+def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
+    """A ref a launch writes in place and reads back, no declared output (a balanced tail's partials, a split
+    decode's slices' states), started uninitialized: on a GPU XLA's AllocateBuffer (`lax.empty`, no memset,
+    as no slot is read before a program writes it); interpreted, NaN, as the interpreter starts an output
+    (`uninitialized_memory='nan'`), so a slot read before any program writes it reaches the outputs as NaN
+    (`tests/kernel_outputs.py`'s sentinel), which a CPU's zeroed allocation would hide."""
+    if interpret:
+        return jax.new_ref(jnp.full(shape, jnp.nan, dtype))
+    return jax.new_ref(lax.empty(shape, dtype))
+
+
 def laid(condition, like: jax.Array) -> jax.Array:
     """The scalar `condition` laid over `like`, a vector predicate of its shape: Mosaic GPU's warpgroup
     semantics select under no scalar predicate (`jnp.where` passes a scalar condition as it is; the fused
@@ -1604,14 +1615,27 @@ class Issuer[Accumulator](abc.ABC):
         return plgpu.layout_cast(value, self.layout)
 
 
+MERGED_REGISTERS = 64
+"""The registers a thread of a merging role holds the partials it reads ahead of combining them in
+(`Family.fixed_up`): as many partials as fit, at least one (an H100's 16-row decode's at 64 columns 10, its
+tile's 8 and its two statistics' 1 each; a GEMM's 128 x 128 fp32 tile 128). One partial read at a time
+waited each read behind the last one's combine, 0.49 us a slice (a 16-row decode's 49, M-DD-12)."""
+
+
+def _selected(predicate, taken, other):
+    """`taken` where `predicate` holds, else `other`, leaf by leaf: a splat predicate's select, which keeps
+    each leaf in its own layout (an implicit broadcast lowers in no warpgroup semantics)."""
+    return jax.tree.map(lambda one, two: jnp.where(jnp.full(one.shape, predicate), one, two), taken, other)
+
+
 class Transport[Allocated, Opened](abc.ABC):
     """An execution policy (design §6): who loads a program's operands and how (`streams`, `opened`,
     `lifetimes`, `stream` the producer's, `fed` the consumers' own, `walk` and `passed` the consumer's),
     the roles and their launch (`roles`, `warpgroups`, `kernel`, `scoped`), the persistent walk over tiles and
-    its stores (`persist`, `stored`, `added`, `output_staging`), and a tile fixed up across programs
-    (`fixed_up`). A `Family` composes it with an `Issuer`; its walks read the issuer's home (`accumulated`,
-    `settled`). Generic in its streams' allocations (`Allocated`, `streams`') and its opened streams
-    (`Opened`, `opened`'s)."""
+    its stores (`persist`, `stored`, `added`, `output_staging`), and the semaphores a tile fixed up across
+    programs is signalled on (`partials_ready`). A `Family` composes it with an `Issuer`; its walks read the
+    issuer's home (`accumulated`, `settled`). Generic in its streams' allocations (`Allocated`, `streams`')
+    and its opened streams (`Opened`, `opened`'s)."""
 
     name: str
     """The family's name (`bundles.named`), which its refusals state."""
@@ -1997,58 +2021,6 @@ class Transport[Allocated, Opened](abc.ABC):
         interpreted, where the programs' order stands in for them (`tail.ordered`)."""
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
 
-    def fixed_up(self, summed, partials, ready, program, first, gathered, store,
-                 combine=operator.add, firsts=None) -> None:
-        """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
-        (a balanced tail's, `tail.Tail`; a split walk's), `summed` from this program's steps: left in
-        `partials` (each program's, this consumer's; the tile's first program's in `firsts` where given, a
-        balanced tail's program first in one tile having left its partial of the tile before in its own
-        slot), and the program that arrives last at the tile's counter (`arrived`, on `ready`'s semaphore
-        of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
-        whichever arrives last, and stores it (`store`). No program waits on another, which the GPU may
-        never have scheduled (row 4732). `combine(running, partial)` is the algebra's merge of two partials
-        of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
-        the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
-        `partials` is then a ref a leaf, in its structure. Interpreted (`ready` None), the tile's first
-        program combines, which the interpreter walks after every other (`tail.ordered`). `partials` and
-        `firsts` are a workspace, a slot written only where programs share a tile (none where one program
-        walks it, nor the combining program's own interpreted): refs the launch takes in place (a
-        `lax.empty` ref, `gemm.mosaic_gpu._workspace`), never declared outputs, which would be left
-        partly unwritten (NSNAN-2)."""
-        opening = partials if firsts is None else firsts
-
-        def left(refs) -> None:
-            # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
-            # 64 bytes), which an optimized global transfer refuses.
-            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
-
-        def read(refs, other):
-            # The partials' structure read off the running value's: a ref may itself be a tree.
-            return jax.tree.map(lambda _, ref: plgpu.load(ref.at[other], optimized=False), summed, refs)
-
-        def combined(running) -> None:
-            store(lax.fori_loop(first + 1, gathered,
-                                lambda other, running: combine(running, read(partials, other)), running))
-
-        if ready is None:
-            pl.when(program != first)(lambda: left(partials))
-            pl.when(program == first)(lambda: combined(summed))
-            return
-        pl.when(gathered - first == 1)(lambda: store(summed))
-
-        @pl.when(gathered - first > 1)
-        def _():
-            pl.when(program != first)(lambda: left(partials))
-            pl.when(program == first)(lambda: left(opening))
-            last = across.arrived(ready.at[gathered - 1], gathered - first)
-            # The first program's partial its own value where it arrives last, read back where another
-            # does, a splat predicate's select keeping the running value in the merger's own layout
-            # (an implicit broadcast lowers in no warpgroup semantics).
-            first_partial = jax.tree.map(
-                lambda own, left: jnp.where(jnp.full(own.shape, program == first), own, left), summed,
-                read(opening, first))
-            pl.when(last == 1)(lambda: combined(first_partial))
-
 
 class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allocated, Opened]):
     """An instruction family's bundle (design §6, one mainloop per overlap structure): an issuer and its
@@ -2133,6 +2105,70 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         (`resources.consumer_registers`). Each stages its share of the multiprocessor's shared memory
         (`resources.program_shared`), which may hold no tile at that many."""
         return resources.register_programs(self, consumers, registers)
+
+    def fixed_up(self, summed, partials, ready, program, first, gathered, store,
+                 combine=operator.add, firsts=None) -> None:
+        """A consumer's share of a tile that programs `first` to `gathered` (exclusive) each walk a part of
+        (a balanced tail's, `tail.Tail`; a split walk's), `summed` from this program's steps: left in
+        `partials` (each program's, this consumer's; the tile's first program's in `firsts` where given, a
+        balanced tail's program first in one tile having left its partial of the tile before in its own
+        slot), and the program that arrives last at the tile's counter (`arrived`, on `ready`'s semaphore
+        of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
+        whichever arrives last, and stores it (`store`), reading as many partials as `MERGED_REGISTERS` holds
+        before combining them, so their reads wait together. No program waits on another, which the GPU may
+        never have scheduled (row 4732). `combine(running, partial)` is the algebra's merge of two partials
+        of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
+        the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
+        `partials` is then a ref a leaf, in its structure. Interpreted (`ready` None), the tile's first
+        program combines, which the interpreter walks after every other (`tail.ordered`). `partials` and
+        `firsts` are a workspace, a slot written only where programs share a tile (none where one program
+        walks it, nor the combining program's own interpreted): refs the launch takes in place (a
+        `lax.empty` ref, `gemm.mosaic_gpu._workspace`), never declared outputs, which would be left
+        partly unwritten (NSNAN-2)."""
+        opening = partials if firsts is None else firsts
+
+        def left(refs) -> None:
+            # Unoptimized: a partial's leaf may move less than a cache line (a 16-row decode's statistics,
+            # 64 bytes), which an optimized global transfer refuses.
+            jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
+
+        def read(refs, other):
+            # The partials' structure read off the running value's: a ref may itself be a tree.
+            return jax.tree.map(lambda _, ref: plgpu.load(ref.at[other], optimized=False), summed, refs)
+
+        # A partial's registers a thread: a tile's words over the role's threads, a row vector's in the
+        # accumulator's row layout (`row_registers`), as the statistics of a split decode's merge.
+        held = sum(self.row_registers(leaf.shape[0], leaf.dtype) if leaf.ndim == 1
+                   else -(-leaf.size * leaf.dtype.itemsize // (4 * resources.THREADS))
+                   for leaf in jax.tree.leaves(summed))
+        ahead = max(1, MERGED_REGISTERS // held)
+
+        def combined(running) -> None:
+            def merged(chunk, running):
+                # A chunk's partials read before any is combined, a read past the last partial reading the
+                # last again, left out of the sum: the order stays the programs'.
+                start = first + 1 + chunk * ahead
+                reads = [read(partials, jnp.minimum(start + i, gathered - 1)) for i in range(ahead)]
+                running = combine(running, reads[0])
+                for i, partial in enumerate(reads[1:], 1):
+                    running = _selected(start + i < gathered, combine(running, partial), running)
+                return running
+
+            store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
+
+        if ready is None:
+            pl.when(program != first)(lambda: left(partials))
+            pl.when(program == first)(lambda: combined(summed))
+            return
+        pl.when(gathered - first == 1)(lambda: store(summed))
+
+        @pl.when(gathered - first > 1)
+        def _():
+            pl.when(program != first)(lambda: left(partials))
+            pl.when(program == first)(lambda: left(opening))
+            last = across.arrived(ready.at[gathered - 1], gathered - first)
+            # The first program's partial its own value where it arrives last, read back where another does.
+            pl.when(last == 1)(lambda: combined(_selected(program == first, summed, read(opening, first))))
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
         """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch

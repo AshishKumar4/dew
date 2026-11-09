@@ -4,7 +4,7 @@ compared with itself does not, and a fault still fails at the count they declare
 
 import numpy as np
 import pytest
-from reference_error import GateFailure, as_given, assert_as_exact, seeds_for
+from reference_error import GateFailure, Inconclusive, as_given, assert_as_exact, seeds_for
 
 
 @pytest.fixture(scope="module")
@@ -35,9 +35,9 @@ def _truth(x):
 def test_a_shared_heavy_tail_resolves_paired_and_not_against_itself(heavy):
     reference, twin = _summed(0), _summed(1)
     seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, dew_fn=twin)
-    with pytest.raises(AssertionError) as raised:
+    # The reference compared with itself resolves no count within the pair's: the site left undecided.
+    with pytest.raises(Inconclusive):
         seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, most=seeds)
-    assert raised.type is AssertionError
     assert_as_exact(twin, reference, heavy, "heavy sums", seeds=seeds, truth_fn=_truth)
 
 

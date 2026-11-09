@@ -21,7 +21,7 @@ from native_certificates import (
     native_dot_holds,
 )
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, equations, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
@@ -251,7 +251,9 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
                 jax.random.normal(keys[2], (136, 256)).astype(jnp.float32))
 
     def product(dtype):
-        return lambda x, w: gemm.gemm(x.astype(dtype), w.astype(dtype), group_sizes, out_dtype=jnp.float32)
+        # fp32 out of 16-bit products, float64 out of the truth's, whose cotangent is float64.
+        out = jnp.promote_types(dtype, jnp.float32)
+        return lambda x, w: gemm.gemm(x.astype(dtype), w.astype(dtype), group_sizes, out_dtype=out)
 
     def through_template(x, w, dy):
         with generation.chosen(grouped_matmul="mosaic_gpu"):
@@ -264,6 +266,8 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
     assert_as_exact(jax.jit(through_template), jax.jit(through_xla), draw,
                     f"16-bit products into fp32 {depth}", seeds=SEEDS,
                     truth_fn=with_gradients(product(jnp.float64)))
+
+
 def the_template_takes_a_gpt_oss_width_as_exactly_as_xla():
     """On this GPU the template named (`mosaic_gpu`) for a projection 2880 wide, gpt-oss-120b's (every tile
     width dividing it an odd multiple of 64), its groups' rows odd, so each group's last tile stores a
@@ -336,6 +340,21 @@ def test_tritons_tile_counts_every_stage_where_its_mma_reads_shared_memory_async
         assert launch.staged_bytes(ba, tile, target) >= tile.stages * step
         assert tile.stages * step <= generation.shared_budget(target)
 
+
+
+def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
+    """A dense kernel gradient the selector gives XLA (an A100's declared cell, `grouped_matmul.DECLARED`,
+    which DENSE1 timed as XLA's dot) runs XLA's own dot over its rows, as a dense forward does (`xla_dot`): no
+    ragged dot of one group, which took an A100's gate_up weight gradient 470 ms against the template's 11.4
+    (W121-a100)."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with generation.assumed("sm80"), generation.routes() as routes:
+        graph = jax.make_jaxpr(lambda x, dy: gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16))(
+            bf16((512, 256)), bf16((512, 384)))
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
+    names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
+    assert "dot_general" in names and "ragged_dot_general" not in names, names
+    assert graph.out_avals[0].shape == (1, 256, 384)
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
 def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):

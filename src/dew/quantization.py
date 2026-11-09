@@ -77,7 +77,7 @@ from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
-from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide
+from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
 from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
@@ -1505,9 +1505,10 @@ def _complex_in_float() -> type:
 
         def einsum(self, einsum_str, *operands, **kwargs):
             # Qwix 0.1.8 quantizes a two-operand einsum alone and raises on any other
-            # (qwix/_src/providers/qt.py:119-121), which runs here as the unwrapped model runs it.
+            # (qwix/_src/providers/qt.py:119-121), which stays float here and sums as the unwrapped
+            # model sums it (`float32_einsum`: Dew's sums govern a product Qwix does not quantize).
             if len(operands) != 2 or not _real(*(operand.dtype for operand in operands)):
-                return jnp.einsum(einsum_str, *operands, **kwargs)
+                return float32_einsum(einsum_str, *operands, **kwargs)
             if not self._matched("einsum"):
                 return super().einsum(einsum_str, *operands, **kwargs)
             preferred = kwargs.pop("preferred_element_type", None)

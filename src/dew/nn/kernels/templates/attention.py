@@ -800,6 +800,14 @@ class Dropout:
         return 1.0 / (1.0 - self.rate)
 
 
+def coded(p: jax.Array, bound: float) -> jax.Array:
+    """Weights `p` at most 1 (at their row's maximum) as a quantized model's codes of them: Qwix's symmetric
+    integer quantization by the row's largest weight, 1, `round(bound p)` clipped to the type's largest,
+    `floor(bound)` (int8's bound 127.5, `qwix/_src/core/numerics.py`'s `get_symmetric_bound`, and largest
+    127)."""
+    return jnp.minimum(jnp.round(bound * p), math.floor(bound))
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Hooks:
@@ -809,7 +817,11 @@ class Hooks:
     normalized output `[..., q, Dv]`, pointwise in its entries too (a gate, a scale): a kernel applies it
     to an output tile whose head width pads to a power of two. A pytree whose callables are static and
     whose parameters and state are its leaves, so a compiled call takes new values of them. `drop` is
-    probability dropout's weights hook (`Dropout`), absent where None."""
+    probability dropout's weights hook (`Dropout`), absent where None. `rounds`, static, is a quantized
+    model's weights hook: each weight in the value product its code at its row's maximum
+    (`coded`, `round(rounds p)` clipped, a Qwix int8 rule's bound 127.5, whose weights
+    quantize by each row's largest, 1 at the maximum), the denominator the weights themselves, absent where
+    None."""
 
     score_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     score_params: tuple[Param, ...] = ()
@@ -817,6 +829,7 @@ class Hooks:
     output_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     output_params: tuple[Param, ...] = ()
     drop: Dropout | None = None
+    rounds: float | None = dataclasses.field(default=None, metadata={"static": True})
 
 
 def shared_place(shape: tuple[int, ...], row, head) -> tuple:
@@ -986,7 +999,11 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                               preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
 
     drop = hooks.drop
-    if drop is None:
+    if hooks.rounds is not None:
+        # The codes at the row's maximum (`Hooks.rounds`), its denominator the weights' own.
+        acc = acc0 * carried[..., None] + valued(coded(p, hooks.rounds))
+        normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+    elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
     else:
@@ -1064,6 +1081,18 @@ def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
 
     declared = product.declared(products_dtype(a, b), None, outputs=(jnp.float32,))
     return product.interpreted(declared, a, b, (((a.ndim - 1,), (0,)), ((), ())))
+
+
+def interpreted_rows(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Each row's `a · b` over the last axis, fp32, as `interpreted_dot` issues a product off a GPU: D's and
+    the anchor's products with dO (`attention_gradient.off_anchor_delta`'s `rows`), summed as the CPU arm's
+    dP is, so the anchor key's dP and c cancel exactly."""
+    from dew.nn.kernels.templates import product
+    from dew.nn.precision import products_dtype
+
+    declared = product.declared(products_dtype(a, b), None, outputs=(jnp.float32,))
+    batch = tuple(range(a.ndim - 1))
+    return product.interpreted(declared, a, b, (((a.ndim - 1,), (b.ndim - 1,)), (batch, batch)))
 
 
 def power_of_two(width: int) -> int:

@@ -212,8 +212,10 @@ def main():
     sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
     import numpy as np
     import torch
-    from reference_error import FEWEST_SEEDS, MOST_SEEDS, as_given, seeds_for
+    from reference_error import FEWEST_SEEDS, as_given, seeds_for
     from reference_source import git_head
+
+    from dew.parity import MOST_SEEDS
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("site", choices=("forward", "long", "bfloat16", "backward", "cached",

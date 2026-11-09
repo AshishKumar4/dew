@@ -23,6 +23,7 @@ import pytest
 from lane_environment import without_flags
 from flax import linen as nn
 from flax.core import FrozenDict
+from interop_support import token_draw
 from model_support import parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
@@ -192,9 +193,7 @@ def test_a_pattern_that_matches_nothing_quantizes_nothing():
     pytest.importorskip("qwix")
     model, qmodel, variables, _ = quantized_forward(Quantization(patterns=(".*does_not_exist.*",)))
 
-    def draw(seed):
-        return (np.random.default_rng([0x5E1, seed]).integers(0, VOCAB, (BATCH, SEQ_LEN)).astype(np.int32),)
-
+    draw = token_draw(0x5E1, VOCAB, (BATCH, SEQ_LEN))
     assert_as_exact(jax.jit(lambda ids: qmodel.apply(variables, ids)),
                     jax.jit(lambda ids: model.apply(variables, ids)), draw, "a pattern that matches nothing",
                     seeds=NOTHING_SEEDS,
@@ -1487,6 +1486,62 @@ def test_an_einsum_of_three_operands_runs_as_the_unquantized_model_runs_it():
     with jax.default_matmul_precision(FP32_SUMS):
         plain = model.apply({}, x)
     np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), plain)
+
+
+QUANTIZED_ATTENTION_SEEDS = 24
+"""Check 1's declared seeds for an int8 attention block on the template against the reference path."""
+
+
+def test_an_int8_attention_block_on_the_template_is_on_par_with_the_reference_path():
+    """A causal attention block quantized to int8 (`Quantization`, Qwix's training rule) computing its
+    attention on the template (`attention_quantized`, row 4858: the query's, keys' and values' codes, the
+    weights rounded at each row's maximum, Qwix's straight-through backward), its output and its
+    gradients, its input's and each projection's under a drawn cotangent, on par (check 1) with the block
+    computing it on the reference path, whose products Qwix quantizes itself, the truth that path in
+    float64."""
+    from dew.nn.mixers import MixerContext
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    pytest.importorskip("qwix")
+
+    def block(implementation: str) -> nn.Module:
+        context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=32, max_seq_len=64,
+                               attention_impl=implementation)
+        return Quantization(dtype="int8").apply(CausalSelfAttention(ctx=context))
+
+    params = block("reference").init(jax.random.key(4), jnp.zeros((2, 32, 64)))
+
+    def arm(implementation: str):
+        # The output and the gradients of the input and of each projection, the query's, keys' and values'
+        # apart, under a drawn cotangent.
+        def run(x, cotangent):
+            out, pullback = jax.vjp(lambda params, x: block(implementation).apply(params, x), params, x)
+            return out, pullback(cotangent)
+
+        return run
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed))
+        return (jax.random.normal(streams[0], (2, 32, 64)) * 2, jax.random.normal(streams[1], (2, 32, 64)))
+
+    assert_as_exact(arm("template"), arm("reference"), draw, "an int8 attention block",
+                    seeds=QUANTIZED_ATTENTION_SEEDS)
+
+
+@pytest.mark.parametrize("options", [{}, {"disable_channelwise_axes": True},
+                                     {"additional_qt_config": {"use_original_residuals": False}},
+                                     {"bwd_qtype": "int8"}, {"tile_size": 8}],
+                         ids=["int8", "no-channels", "own-config", "quantized-gradients", "tiled"])
+def test_the_template_takes_only_the_int8_rule_whose_attention_it_computes(options):
+    """The template computes a quantized model's attention under Qwix's int8 rule of dynamic absmax per
+    channel over the original residuals (`attention_quantized.takes`), and leaves to the reference path a
+    rule that disables a channel's axis, quantizes the gradients, tiles the contraction or configures Qwix's
+    products itself, each of which changes the values or the gradients the template computes."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.kernels.templates import attention_quantized
+
+    rule = qwix.QtRule(module_path=".*", weight_qtype="int8", act_qtype="int8", **options)
+    assert attention_quantized.takes(rule) is (not options)
 
 
 HOST_SEEDS = 8

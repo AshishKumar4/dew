@@ -14,7 +14,7 @@ step's the prefill's, a packed document's its own row's (its partial sums move `
 bytes: on armada's EPYC, NS4863-PROF2, 0.55-0.67 of XLA's time at 1-16 rows of 1024-4096 deep, 5-11 times
 it at 256 rows; a float64 sum for many rows, cheaper there, made a row's product depend on its batch's
 rows, row 4863's base reds). A product's gradients are products too, each summed
-over its own contraction (`_matmul`'s reverse pass). On another platform the product is XLA's own
+over its own contraction (`pairwise_dot_general`'s reverse pass). On another platform the product is XLA's own
 (`accumulated`'s `platform_dependent`).
 """
 
@@ -140,40 +140,51 @@ def _blocked(a: jax.Array, b: jax.Array, precision) -> jax.Array:
     return jnp.moveaxis(summed, 0, 2).reshape(a.shape[0], a.shape[1], runs * width)[..., :columns]
 
 
-def _matmul(a: jax.Array, b: jax.Array, precision) -> jax.Array:
-    """`_blocked`, its reverse pass blocked over each cotangent's own contraction: the rows' cotangent sums
-    over the columns, the matrix's over the rows, each a product of its own (`generation.linear_tangent`,
-    Protected: a reassociation would undo the tree it sums by); forward mode and a higher order through
-    `_blocked`'s own tangent."""
+def pairwise_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision=None) -> jax.Array:
+    """`jax.lax.dot_general` of float32 `lhs` and `rhs` into float32, summed by `_blocked`: each operand laid
+    out as `[batch, free, contracted]` and `[batch, contracted, free]`, the result in `dot_general`'s order
+    (batch, `lhs`'s free axes, `rhs`'s). Its reverse pass is the plain contraction's, its operands alone
+    saved, each cotangent a product of its own blocked over its own contraction (the rows' over the columns,
+    the matrix's over the rows; `generation.linear_tangent`, Protected: a reassociation would undo the tree
+    it sums by); forward mode and a higher order through the forward's own tangent."""
     from dew.nn.kernels.generation import linear_tangent
 
+    (contracted_axes, against), (batched, batched_rhs) = (tuple(map(tuple, pair))
+                                                          for pair in dimension_numbers)
+    free = tuple(axis for axis in range(lhs.ndim) if axis not in contracted_axes + batched)
+    free_rhs = tuple(axis for axis in range(rhs.ndim) if axis not in against + batched_rhs)
+    order, order_rhs = batched + free + contracted_axes, batched_rhs + against + free_rhs
+
+    def shape(array, axes):
+        return tuple(array.shape[axis] for axis in axes)
+
+    def laid(left, right):
+        # Each operand as `[batch, free, contracted]` and `[batch, contracted, free]`.
+        sizes = [math.prod(shape(lhs, axes)) for axes in (batched, free, contracted_axes)]
+        sizes_rhs = [math.prod(shape(rhs, axes)) for axes in (batched_rhs, against, free_rhs)]
+        return jnp.transpose(left, order).reshape(sizes), jnp.transpose(right, order_rhs).reshape(sizes_rhs)
+
+    def summed(left, right):
+        out = _summed(*laid(left, right), precision)
+        return out.reshape(*shape(lhs, batched + free), *shape(rhs, free_rhs))
+
     def pulled(saved, operands, cotangent, live):
-        left, right = operands
-        gradients = {0: lambda: _summed(cotangent, jnp.swapaxes(right, 1, 2), precision),
-                     1: lambda: _summed(jnp.swapaxes(left, 1, 2), cotangent, precision)}
+        left, right = laid(*operands)
+        flat = cotangent.reshape(left.shape[0], left.shape[1], right.shape[2])
+        gradients = {
+            0: lambda: jnp.transpose(_summed(flat, jnp.swapaxes(right, 1, 2), precision).reshape(
+                shape(lhs, order)), _inverse(order)),
+            1: lambda: jnp.transpose(_summed(jnp.swapaxes(left, 1, 2), flat, precision).reshape(
+                shape(rhs, order_rhs)), _inverse(order_rhs)),
+        }
         return tuple(gradients[index]() for index in live)
 
-    summed = functools.partial(_summed, precision=precision)
     product = contracted("test_a_cpu_pairwise_dense_product_holds_every_order")(
         linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
                        kind=Protected()))
-    return product(a, b)
+    return product(lhs, rhs)
 
 
-def pairwise_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision=None) -> jax.Array:
-    """`jax.lax.dot_general` of float32 `lhs` and `rhs` into float32, as `_matmul` sums it: each operand
-    laid out as `[batch, free, contracted]` and `[batch, contracted, free]`, the result in `dot_general`'s
-    order (batch, `lhs`'s free axes, `rhs`'s)."""
-    (contracted, against), (batched, batched_rhs) = (tuple(map(tuple, pair)) for pair in dimension_numbers)
-    free = tuple(axis for axis in range(lhs.ndim) if axis not in contracted + batched)
-    free_rhs = tuple(axis for axis in range(rhs.ndim) if axis not in against + batched_rhs)
-
-    def size(array, axes):
-        return math.prod(array.shape[axis] for axis in axes)
-
-    a = jnp.transpose(lhs, batched + free + contracted).reshape(
-        size(lhs, batched), size(lhs, free), size(lhs, contracted))
-    b = jnp.transpose(rhs, batched_rhs + against + free_rhs).reshape(
-        size(rhs, batched_rhs), size(rhs, against), size(rhs, free_rhs))
-    return _matmul(a, b, precision).reshape(*(lhs.shape[axis] for axis in batched + free),
-                                            *(rhs.shape[axis] for axis in free_rhs))
+def _inverse(permutation: tuple) -> tuple:
+    """The permutation undoing `permutation`."""
+    return tuple(sorted(range(len(permutation)), key=permutation.__getitem__))

@@ -643,7 +643,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post68
+jax==0.12.0.1.post71
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -654,17 +654,11 @@ jax==0.12.0.1.post68
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda13-pjrt==0.12.0.1.post45 ; platform_machine == 'aarch64'
+jax-cuda13-pjrt==0.12.0.1.post67
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda13-plugin
-jax-cuda13-pjrt==0.12.0.1.post67 ; platform_machine == 'x86_64'
-    # via
-    #   dewml (pyproject.toml)
-    #   jax-cuda13-plugin
-jax-cuda13-plugin==0.12.0.1.post45 ; platform_machine == 'aarch64'
-    # via dewml (pyproject.toml)
-jax-cuda13-plugin==0.12.0.1.post67 ; platform_machine == 'x86_64'
+jax-cuda13-plugin==0.12.0.1.post67
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1
     # via
@@ -947,50 +941,50 @@ numpy==2.5.4
     #   torchvision
     #   transformers
     #   treescope
-nvidia-cublas==13.8.1.7 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cublas==13.8.1.7 ; sys_platform == 'linux'
     # via
     #   jax-cuda13-plugin
     #   nvidia-cudnn-cu13
     #   nvidia-cusolver
-nvidia-cuda-cccl==13.3.4.3.1 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cuda-cccl==13.3.4.3.1 ; sys_platform == 'linux'
     # via nvidia-nvshmem-cu13
-nvidia-cuda-crt==13.4.92 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cuda-crt==13.4.92 ; sys_platform == 'linux'
     # via nvidia-cuda-nvcc
-nvidia-cuda-cupti==13.4.92 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cuda-cupti==13.4.92 ; sys_platform == 'linux'
     # via jax-cuda13-plugin
-nvidia-cuda-nvcc==13.4.92 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cuda-nvcc==13.4.92 ; sys_platform == 'linux'
     # via jax-cuda13-plugin
 nvidia-cuda-nvdisasm==13.4.92 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
     # via dewml (pyproject.toml)
-nvidia-cuda-nvrtc==13.4.92 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cuda-nvrtc==13.4.92 ; sys_platform == 'linux'
     # via
     #   jax-cuda13-plugin
     #   nvidia-cublas
-nvidia-cuda-runtime==13.4.92 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cuda-runtime==13.4.92 ; sys_platform == 'linux'
     # via
     #   jax-cuda13-plugin
     #   nvidia-cuda-nvcc
-nvidia-cudnn-cu13==9.27.0.42 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cudnn-cu13==9.27.0.42 ; sys_platform == 'linux'
     # via jax-cuda13-plugin
-nvidia-cufft==12.4.0.43 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cufft==12.4.0.43 ; sys_platform == 'linux'
     # via jax-cuda13-plugin
-nvidia-cusolver==12.3.4.7 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cusolver==12.3.4.7 ; sys_platform == 'linux'
     # via jax-cuda13-plugin
-nvidia-cusparse==12.8.6.72 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-cusparse==12.8.6.72 ; sys_platform == 'linux'
     # via
     #   jax-cuda13-plugin
     #   nvidia-cusolver
-nvidia-nccl-cu13==2.32.3 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-nccl-cu13==2.32.3 ; sys_platform == 'linux'
     # via jax-cuda13-plugin
-nvidia-nvjitlink==13.4.92 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-nvjitlink==13.4.92 ; sys_platform == 'linux'
     # via
     #   jax-cuda13-plugin
     #   nvidia-cufft
     #   nvidia-cusolver
     #   nvidia-cusparse
-nvidia-nvshmem-cu13==3.8.0 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+nvidia-nvshmem-cu13==3.8.0 ; sys_platform == 'linux'
     # via jax-cuda13-plugin
-nvidia-nvvm==13.4.92 ; platform_machine == 'aarch64' or platform_machine == 'x86_64'
+nvidia-nvvm==13.4.92
     # via
     #   jax-cuda13-plugin
     #   nvidia-cuda-nvcc
@@ -1376,7 +1370,7 @@ pywin32==312 ; sys_platform == 'win32'
     #   mcp
 pywin32-ctypes==0.2.3 ; sys_platform == 'win32'
     # via keyring
-pywinpty==3.0.5 ; (os_name == 'nt' and platform_machine == 'aarch64' and sys_platform == 'darwin') or (os_name == 'nt' and platform_machine == 'x86_64' and sys_platform == 'darwin') or (os_name == 'nt' and sys_platform != 'darwin' and sys_platform != 'linux')
+pywinpty==3.0.5 ; os_name == 'nt' and sys_platform != 'darwin' and sys_platform != 'linux'
     # via
     #   jupyter-server
     #   jupyter-server-terminals
@@ -1665,7 +1659,7 @@ tomlkit==0.14.0
     # via
     #   gradio
     #   pylint
-torch==2.14.1 ; platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'darwin'
+torch==2.14.1 ; sys_platform == 'darwin'
     # via
     #   dewml (pyproject.toml)
     #   accelerate
@@ -1673,7 +1667,7 @@ torch==2.14.1 ; platform_machine != 'aarch64' and platform_machine != 'x86_64' a
     #   lm-eval
     #   peft
     #   torchvision
-torch==2.14.1+cpu ; platform_machine == 'aarch64' or platform_machine == 'x86_64' or sys_platform != 'darwin'
+torch==2.14.1+cpu ; sys_platform != 'darwin'
     # via
     #   dewml (pyproject.toml)
     #   accelerate
@@ -1683,9 +1677,9 @@ torch==2.14.1+cpu ; platform_machine == 'aarch64' or platform_machine == 'x86_64
     #   torchvision
 torchax==0.0.14.dev20260922
     # via dewml (pyproject.toml)
-torchvision==0.29.1 ; platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'darwin'
+torchvision==0.29.1 ; sys_platform == 'darwin'
     # via dewml (pyproject.toml)
-torchvision==0.29.1+cpu ; platform_machine == 'aarch64' or platform_machine == 'x86_64' or sys_platform != 'darwin'
+torchvision==0.29.1+cpu ; sys_platform != 'darwin'
     # via dewml (pyproject.toml)
 tornado==6.5.10
     # via
