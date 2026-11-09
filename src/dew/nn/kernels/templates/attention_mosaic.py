@@ -26,6 +26,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     product,
     resources,
+    swizzling,
 )
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
@@ -1321,7 +1322,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 or (config.staged_logits and not keys_first)):
             return False
         dtype = ba.arguments["query"].dtype
-        # The one launch stages its weights and score cotangents for its products (`mosaic.staged`): fp16's
+        # The one launch stages its weights and score cotangents for its products (`swizzling.staged`): fp16's
         # as two parts at the walk's running scale (`attention_mosaic_fused._sixteen_step`), queries first,
         # each consumer its own keys or its share of a block they share (`attention_mosaic_coop`'s, every
         # share's scale joined): row 3886, its two launches 4.1 times the bf16 step on an H100.
@@ -1354,7 +1355,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                     and share % family.column_unit(dtype) == 0)
         if config.shared_keys:
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
-            # (`mosaic.swizzle_for`), its share of the columns whole swizzled rows (`attention_mosaic_coop`).
+            # (`swizzling.swizzle_for`), its share of the columns whole swizzled rows
+            # (`attention_mosaic_coop`).
             share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
             narrowest = family.narrowest_columns(dtype)
             return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
@@ -1369,7 +1371,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         def unit(width: int) -> int:
             if not family.operands_in_registers:
                 return family.column_unit(dtype)
-            tile = mosaic.swizzle_columns(dtype, mosaic.swizzle_for(dtype, width))
+            tile = swizzling.swizzle_columns(dtype, swizzling.swizzle_for(dtype, width))
             return max(family.column_unit(dtype), tile)
 
         units = [unit(width) for width in widths]

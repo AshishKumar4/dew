@@ -65,6 +65,7 @@ from dew.nn.kernels.templates import (
     cost as unit_cost,
     mosaic,
     resources,
+    swizzling,
     tail as tail_of,
 )
 from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, scattered, sides_extended, sides_padded
@@ -200,7 +201,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # (M-FS-1, W3-a100); a narrower call (a swapped decode product's few rows) at its column unit.
     widest = min(width, family.widest_product or width)
     unit = family.column_unit(dtype)
-    swizzled = math.lcm(unit, mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
+    swizzled = math.lcm(unit, swizzling.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
     columns = ([block_n for block_n in range(widest - widest % swizzled, 0, -swizzled)
                 if width % block_n == 0]
                or [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0])
@@ -515,7 +516,7 @@ def _scale_blocks(block_m: int, block_n: int) -> dict:
     return {'row_scales': ((1, block_m), jnp.float32), 'column_scales': ((1, block_n), jnp.float32)}
 
 
-SCALE_SWIZZLES = {'row_scales': mosaic.UNSWIZZLED, 'column_scales': mosaic.UNSWIZZLED}
+SCALE_SWIZZLES = {'row_scales': swizzling.UNSWIZZLED, 'column_scales': swizzling.UNSWIZZLED}
 """Dew: the scale streams' swizzles (`_scale_blocks`): rows of fp32 a step, read a row at a time."""
 
 
@@ -1221,7 +1222,7 @@ def _zeroed_atoms(dtype, block_n: int, consumers: int) -> tuple[int, int]:
     """Dew: the columns of a swizzled row of the cotangent's stage and how many of them each consumer zeroes
     (`_zeroed_share`): whole swizzled rows, as many each as the stage's divide among them, the last's share
     short where they do not divide evenly."""
-    atom = mosaic.swizzle_columns(dtype, mosaic.SWIZZLE_BYTES)
+    atom = swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES)
     return atom, -(-(block_n // atom) // consumers)
 
 
@@ -1756,7 +1757,7 @@ def _rewritten_stage(family: mosaic.Family, starts_gmem, ends_gmem, block_k: int
     by its family's rewriting role (`mosaic.Family.persist`'s `prepared`), in the layouts it reads them in
     (`rewriting`)."""
     g_i, _, _, steps, start, *_ = tile
-    widths = [(stage, mosaic.swizzle_columns(stage.dtype, mosaic.SWIZZLE_BYTES))
+    widths = [(stage, swizzling.swizzle_columns(stage.dtype, swizzling.SWIZZLE_BYTES))
               for stage in (slots['ring_0'], slots['ring_1'])]
     shares = [(stage.at[:, pl.ds(column, width)], None) for stage, width in widths
               for column in range(0, stage.shape[1], width)]
@@ -2045,7 +2046,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
         tiles_of = (dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
                     | read_refs)
         _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
-    atom = mosaic.swizzle_columns(cotangent_stage.dtype, mosaic.SWIZZLE_BYTES)
+    atom = swizzling.swizzle_columns(cotangent_stage.dtype, swizzling.SWIZZLE_BYTES)
     atoms = cotangent_stage.shape[1] // atom
     # Its depth half's swizzled rows, each its own, and its share of the cotangent's, the last consumer's
     # past the stage's end held (`atoms_each` rounds the share up).

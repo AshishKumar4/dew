@@ -393,7 +393,7 @@ keys launch a key block a program and its query/key launch's memory sum a produc
 on an H100 2.46 ms against the port's 3.12
 on Qwen3.5-27B's gated delta net and 1.92 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an
 A100 SXM4 40GB 3.46 against 4.21 and 2.50 against 3.24 (JS-2075cellsd-a100-863706e94).
-An A100's forward is the template's, its walks' 16-bit stores coalesced (`mosaic.coalesced`): 0.931 ms
+An A100's forward is the template's, its walks' 16-bit stores coalesced (`swizzling.coalesced`): 0.931 ms
 against the port's 0.981 on Qwen3.5-27B's gated delta net and 0.692 against 0.759 on Qwen3-Next's, each in a
 process of its own, three rounds (JS-2075cellsd-a100-863706e94; the port's Qwen3-Next forward took 0.650 in
 two runs that followed a training run in one process, JS-2075cells-a100-491c05798).

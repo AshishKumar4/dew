@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic
+from dew.nn.kernels.templates import across, handoffs, mosaic, swizzling
 
 pytestmark = pytest.mark.kernel
 
@@ -146,12 +146,12 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     """`p @ x` and `2 * p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
-    contraction, its blocks staged at `mosaic.swizzle_for`'s 64 bytes), and their sums meet before one
+    contraction, its blocks staged at `swizzling.swizzle_for`'s 64 bytes), and their sums meet before one
     store each, twice in one scope reused (`across.summed_across`), in a scope after the rings'
     (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`)."""
     from dew.nn.kernels.templates import mosaic_sm90
     family, share = mosaic_sm90.FED, FED_ROWS // consumers
-    swizzle = mosaic.swizzle_for(jnp.bfloat16, share)
+    swizzle = swizzling.swizzle_for(jnp.bfloat16, share)
 
     def body(p_gmem, x_gmem, out_gmem, doubled_gmem):
         allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
@@ -755,7 +755,7 @@ def _relayed_products(q, k, v, *, interpret):
             handoffs.Schedule((handoffs.Role("relay"), *mosaic_sm100.ISSUING)).run(relay=relay, load=load,
                                                                                 mma=products)
 
-        smem = [plgpu.SMEM(each.shape, each.dtype, transforms=mosaic.swizzle_transforms(each.dtype, 128))
+        smem = [plgpu.SMEM(each.shape, each.dtype, transforms=swizzling.swizzle_transforms(each.dtype, 128))
                 for each in (q, k, v)]
         signals = [family.signals().scratch(), family.signals(by_products=False).scratch(),
                    family.signals().scratch()]
@@ -1027,20 +1027,21 @@ def _chained(a, b, c, *, m_warps: int, interpret: bool):
     def body(a_gmem, b_gmem, c_gmem, out_gmem):
         def scoped(a_smem, b_smem, c_smem, relay, out_smem):
             for source, staged in ((a_gmem, a_smem), (b_gmem, b_smem), (c_gmem, c_smem)):
-                mosaic.copied(source, staged)
+                swizzling.copied(source, staged)
             mosaic.synced(interpret)
             issuer = family.relaying(relay)
             first = issuer.product(plgpu.load(a_smem, optimized=False), b_smem, (rows, RELAYED))
             out = issuer.product(first.astype(jnp.bfloat16), c_smem, (rows, RELAYED))
             plgpu.store(out_smem, out, optimized=False)
             mosaic.synced(interpret)
-            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
+            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(RELAYED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, RELAYED)
-        pl.run_scoped(scoped, mosaic.plain((rows, RELAYED), jnp.bfloat16),
-                      *(mosaic.staged((RELAYED, RELAYED), jnp.bfloat16, swizzle) for _ in range(2)),
-                      mosaic.plain((rows, RELAYED), jnp.bfloat16), mosaic.plain((rows, RELAYED), jnp.float32))
+        pl.run_scoped(scoped, swizzling.plain((rows, RELAYED), jnp.bfloat16),
+                      *(swizzling.staged((RELAYED, RELAYED), jnp.bfloat16, swizzle) for _ in range(2)),
+                      swizzling.plain((rows, RELAYED), jnp.bfloat16),
+                      swizzling.plain((rows, RELAYED), jnp.float32))
 
     out = jax.ShapeDtypeStruct((rows, RELAYED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -1067,8 +1068,8 @@ def _negated(a, b, *, path: str, interpret: bool):
 
     def body(a_gmem, b_gmem, out_gmem):
         def scoped(a_smem, b_smem, out_smem):
-            mosaic.copied(a_gmem, a_smem)
-            mosaic.copied(b_gmem, b_smem)
+            swizzling.copied(a_gmem, a_smem)
+            swizzling.copied(b_gmem, b_smem)
             if not interpret:
                 # Written through registers (the generic proxy), read by warpgroup MMA (the async one).
                 plgpu.commit_smem()
@@ -1097,12 +1098,12 @@ def _negated(a, b, *, path: str, interpret: bool):
                 # Written through registers, read by the store's copy.
                 plgpu.commit_smem()
             mosaic.synced(interpret)
-            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED, copy=mosaic.coalesced,
-                              widest=resources.copied_rows(LANDED, jnp.float32))
+            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED,
+                              copy=swizzling.coalesced, widest=resources.copied_rows(LANDED, jnp.float32))
 
         swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
-        pl.run_scoped(scoped, *(mosaic.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
-                      mosaic.plain(shape, jnp.float32), collective_axes="wg")
+        pl.run_scoped(scoped, *(swizzling.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
+                      swizzling.plain(shape, jnp.float32), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((LANDED, LANDED), jnp.float32)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
@@ -1170,18 +1171,19 @@ def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = 
 
     def body(codes_gmem, scale_gmem, out_gmem):
         def scoped(codes_smem, into):
-            mosaic.copied(codes_gmem, codes_smem)
+            swizzling.copied(codes_gmem, codes_smem)
             mosaic.synced(interpret is not False)
             row_scale = scale_gmem[...] if interpret is not False else family.rows_of(scale_gmem)
             family.converted(codes_smem, into, interpret is not False,
                              row_scale=row_scale if scaled else None)
             mosaic.synced(interpret is not False)
-            mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0], copy=mosaic.coalesced,
-                              widest=resources.copied_rows(CODES[1], jnp.bfloat16))
+            mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0],
+                              copy=swizzling.coalesced, widest=resources.copied_rows(CODES[1], jnp.bfloat16))
 
         # A fed family's kernel runs on a thread axis, which its scoped allocations name.
         threaded = {"collective_axes": "wg"} if generation_name == "sm90" else {}
-        pl.run_scoped(scoped, mosaic.plain(CODES, codes.dtype), mosaic.plain(CODES, jnp.bfloat16), **threaded)
+        pl.run_scoped(scoped, swizzling.plain(CODES, codes.dtype), swizzling.plain(CODES, jnp.bfloat16),
+                      **threaded)
 
     out = jax.ShapeDtypeStruct(CODES, jnp.bfloat16)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,

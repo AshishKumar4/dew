@@ -48,7 +48,7 @@ from ..precision import accumulated, at_least_fp32, rounded_operand
 from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import across, base, bundles, mosaic, report, resources
+from .templates import across, base, bundles, mosaic, report, resources, swizzling
 from .templates.axes import GROUPS, held as held_axes
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
@@ -651,7 +651,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if self.STAGED_ROWS and not family.operands_in_registers and not self.unstaged(ba):
             words = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
                       // 4 // resources.THREADS)
-            atom = (config.block_k, mosaic.swizzle_columns(dtype, mosaic.SWIZZLE_BYTES))
+            atom = (config.block_k, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
             tiles = [((config.block_k, config.block_m // config.warpgroups), dtype)] + [(atom, dtype)] * 3
             rewritten = family.scalar_registers(tiles) - family.scalar_registers()
             staged = max(0, words - family.held_registers) + rewritten
