@@ -775,6 +775,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     again = compiled("--trainer.compile-ahead.multiprocessors", "114")
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
+    assert pcie.built.memory == pcie.target.memory == int(0.0007 * 2**30)
     assert pcie.sampled is not None and again.built == pcie.built
     assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
     held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
@@ -782,6 +783,24 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     with pytest.raises(ValueError):
         pcie.derived_for(gpu_target("sm90"))
     assert len(list(records.rglob("*.json"))) == 2
+
+
+def test_a_build_holds_a_call_to_the_memory_it_states_else_to_its_least_part_and_loads_where_that_is_held():
+    """A program compiled ahead for an A100 holds a call's footprint (`device_memory`) to the memory its build
+    states, else to the least an A100 holds, 40 GB, not the 80 GB part's (a build that kept an attention only
+    that part holds failed to load on the other); a device holding less than a build's stated memory is
+    refused it, one holding more or stating none runs it."""
+    from dew.nn.kernels.generation import assumed, built_target, device_memory
+    from dew.training.ahead import BuildTarget
+
+    with assumed(built_target("sm80")):
+        assert device_memory() == 40 * 10**9
+    with assumed(built_target("sm80", memory=36 * 2**30)):
+        assert device_memory() == 36 * 2**30
+    build = BuildTarget("sm80", 108, 1, "0", "0", (), "x86_64", 36 * 2**30)
+    assert build.differences(dataclasses.replace(build, memory=30 * 2**30))
+    assert not build.differences(dataclasses.replace(build, memory=76 * 2**30))
+    assert not build.differences(dataclasses.replace(build, memory=None))
 
 
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):

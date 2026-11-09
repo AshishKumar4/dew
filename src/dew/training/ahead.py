@@ -164,7 +164,8 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     attached: XLA compiles over them as over that host's GPUs, the SKU's memory, clocks and multiprocessors
     its own, so a program compiled here keys the persistent cache as that host's compile of it does (its
     backend's platform version and topology fingerprint are the host's) and the host's run reads it. A
-    canonical target (`compile_only_gpus`) keys another entry: an A100's 80 GB against a 40 GB host's."""
+    canonical target (`compile_only_gpus`) keys another entry: the 80 GB A100 it names against a 40 GB
+    host's."""
     # The CUDA plugin, which a serialized topology deserializes through, initialized as the generation's
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
@@ -428,32 +429,42 @@ class BuildTarget:
     jaxlib: str
     flags: tuple[str, ...]
     host: str
+    memory: int | None = None
+    """The bytes a device holds that the build's plan held each call to, where the build stated them (its
+    capacity: `built_target`'s `memory`): a device holding fewer (its allocator's limit) runs past what the
+    plan kept and is refused; a build stating none planned for the least of its target's parts."""
 
     @staticmethod
-    def built(target: GpuTarget, devices: int) -> BuildTarget:
-        """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), under
-        this process's JAX, jaxlib, computing XLA flags and host: the one place a build's environment is
-        read."""
+    def built(target: GpuTarget, devices: int, memory: int | None = None) -> BuildTarget:
+        """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), each
+        holding the `memory` its plan states, under this process's JAX, jaxlib, computing XLA flags and host:
+        the one place a build's environment is read."""
         return BuildTarget(target.generation, target.multiprocessors, devices,
                            importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
-                           computation_flags(), platform.machine())
+                           computation_flags(), platform.machine(), memory)
 
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
-        """The target `devices` are, each by its own facts whatever `assumed` says (`device_target`), under
-        this process's JAX, XLA flags and host; refused where they are not all of one generation and
-        multiprocessors."""
+        """The target `devices` are, each by its own facts whatever `assumed` says (`device_target`), the
+        least allocator limit among them its memory where they state one, under this process's JAX, XLA
+        flags and host; refused where they are not all of one generation and multiprocessors."""
         found = {(target.generation, target.multiprocessors) for target in map(device_target, devices)}
         if len(found) != 1:
             raise ValueError(f"these devices are of several targets, {sorted(found, key=str)}: programs "
                              "compiled ahead load onto devices of one")
-        return BuildTarget.built(device_target(devices[0]), len(devices))
+        limits = [stats["bytes_limit"] for device in devices
+                  if "bytes_limit" in (stats := device.memory_stats() or {})]
+        return BuildTarget.built(device_target(devices[0]), len(devices), min(limits, default=None))
 
     def differences(self, other: BuildTarget) -> list[str]:
-        """Each field `other` holds otherwise, said as this one's and other's."""
-        named = [field.name for field in dataclasses.fields(self)]
-        return [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
-                if getattr(self, name) != getattr(other, name)]
+        """Each field `other` holds otherwise, said as this one's and other's: memory where other's is
+        known and below this one's (a device holding more than a build planned for runs it)."""
+        named = [field.name for field in dataclasses.fields(self) if field.name != "memory"]
+        found = [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
+                 if getattr(self, name) != getattr(other, name)]
+        if self.memory is not None and other.memory is not None and other.memory < self.memory:
+            found.append(f"memory {self.memory} bytes, not {other.memory}")
+        return found
 
     def held(self, devices: Sequence) -> None:
         """Refused, naming what differs, where `devices` under this process's JAX, XLA flags and host are not
@@ -783,7 +794,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     (generation,) = generations
     on_tpus = platforms == {"tpu"}
     # The GPU XLA compiles for, as its compile-only devices state it.
-    stated = None if on_tpus else built_target(generation, devices[0].core_count)
+    stated = None if on_tpus else built_target(generation, devices[0].core_count, capacity)
     if capacity is not None and on_tpus:
         raise ValueError(f"a TPU topology states its own memory; compile it ahead for {generation} with no "
                          "capacity")
@@ -826,7 +837,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget.built(target, len(devices)),
+        built=BuildTarget.built(target, len(devices), capacity),
         refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing), starts=starts)
 
 
