@@ -72,6 +72,17 @@ ONE_TAP_SEEDS = {jnp.float32: 256, jnp.bfloat16: 256}
 """Each one-tap operand dtype's seeds, sized by `seeds_for` on armada (2026-10-20) on the whole tree."""
 
 
+def hook_id(form) -> str:
+    """A test id for a hook combination (`recurrence.Hooks`, or a form nested in it): its fields that differ
+    from their defaults, each `name=value`, so a field added or removed at its default renames no test (each
+    id the durations record holds; the whole repr renamed every id with `Hooks.floor`)."""
+    def value(given):
+        return f"{type(given).__name__}({hook_id(given)})" if dataclasses.is_dataclass(given) else str(given)
+
+    return ",".join(f"{field.name}={value(getattr(form, field.name))}" for field in dataclasses.fields(form)
+                    if field.default is dataclasses.MISSING or getattr(form, field.name) != field.default)
+
+
 def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32,
              value_width: int = VALUE_WIDTH, key_width: int = KEY_WIDTH, rows: int = ROWS) -> recurrence.Step:
     """A decode token's operands for `hooks` over `rows` rows, `value_width` values and `key_width` keys a
@@ -187,7 +198,7 @@ def summed(hooks: recurrence.Hooks):
     return run
 
 
-@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
+@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=hook_id)
 def test_every_hook_combination_steps_as_its_float64_form(hooks):
     """A decode token through the launch, the recurrence template's step on Mosaic GPU
     (`templates.recurrence.step`, interpreted off a GPU), within tests/reference_error.py's rule of the XLA
@@ -217,7 +228,7 @@ x, B and C with their bias, its step's gates and skip), over heads of 64 values,
 seeds."""
 
 
-@pytest.mark.parametrize('hooks', NARROW, ids=str)
+@pytest.mark.parametrize('hooks', NARROW, ids=hook_id)
 def test_heads_narrower_than_a_warpgroup_step_as_their_float64_form(hooks):
     """A decode token over value heads 64 wide (Mamba2's, its state 128 keys by 64 values a head), two heads a
     program's warpgroup (`templates.recurrence.step._block`): its output and state within
@@ -250,7 +261,7 @@ def test_a_decode_token_over_three_warpgroups_of_keys_reads_its_last_keys():
 
 
 @pytest.mark.parametrize('route', ROUTES)
-@pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)
+@pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=hook_id)
 def test_a_bf16_state_steps_as_its_float64_form(hooks, route):
     """A bf16 state is read and stepped in fp32 and written once, rounded stochastically by
     `round_to_bf16` from the token's key and value: within the rule of the XLA form's own bf16 run
