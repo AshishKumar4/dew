@@ -1,9 +1,9 @@
 """Automatic loading sized by its host: the CPUs this process may run on and the memory it may take,
 each bounded by its cgroup's limits, read through the one cgroup reader a tool loads before Dew."""
 
-import dataclasses
 import json
 import os
+import time
 
 import grain.python as grain
 import numpy as np
@@ -95,24 +95,69 @@ def test_a_process_reads_its_cgroups_limits_through_the_reader_a_tool_loads_befo
     assert json.loads(done.stdout) == ["session", [None, 3], [3 * 2**30, None], False]
 
 
+class _Filled:
+    """A step that makes four batches' rows at once: every fourth row takes 40 ms, the rest none, as a
+    packer fills its bins."""
+
+    def __call__(self, index: int, row):
+        if index % 4 == 0:
+            time.sleep(0.04)
+        return row
+
+
+def test_automatic_loading_pays_a_step_that_makes_several_batches_at_once_in_their_mean():
+    """Automatic loading weighs the Python a batch takes as the run pays it, over the sampled batches after
+    the first: where a step makes four batches' rows at once, 40 ms every fourth batch is 10 ms a batch,
+    though three batches of four take none, and it starts as many workers as cost the run least, the
+    square root of the starts that Python pays for, at most the CPUs (row 4862: a decision run's packer
+    filled four batches in one of 115 ms and served three in about 1 ms each, and the read stayed in the
+    training process; sized by its CPUs, a 1,500-step run started 64 workers and took 168 s against 100 s
+    in the process)."""
+    from dew.data.dataset import Host
+
+    rows = grain.MapDataset.source([{"x": np.zeros(4, np.float32)}] * 64).map_with_index(_Filled())
+    auto = Loading(workers="auto", host=Host(4, 2**40, worker_start=1.0))
+
+    def resolved(batches: int) -> int:
+        # Read in turn, as automatic loading reads its sample (`_Build.tuned`): no thread reading ahead.
+        sampled = rows.to_iter_dataset(grain.ReadOptions(num_threads=0, prefetch_buffer_size=0))
+        return auto.resolved(sampled, reads=1, batches=batches).workers
+
+    # At least 10 ms a batch over starts of a second: 2,500 batches cost least in five workers, which the
+    # four CPUs cap, 500 in two (up to 12 ms a batch), and 50 pay for none.
+    assert (resolved(2500), resolved(500), resolved(50)) == (4, 2, 0)
+
+
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
     """Each worker holds its `worker_buffer` batches and its `read_buffer` reads in a process of its
-    own, within half the memory the process may take; a read is a batch where the order is read by
-    batch, a record where it streams. Eight 64 KiB rows make a 512 KiB batch: 2 MiB holds four reads
-    of a batch and no worker, and half a host's memory that holds two and a half workers holds two,
-    reading by the batch or by the record. Workers take each CPU where there is more than one, at
-    most `max_workers`."""
+    own, within half the memory its host leaves the process (`Loading.host`); a read is a batch where
+    the order is read by batch, a record where it streams. Eight 64 KiB rows make a 512 KiB batch:
+    2 MiB holds four reads of a batch and no worker, and half a host's memory that holds two and a half
+    workers holds two, reading by the batch or by the record. Workers take each CPU where there is more
+    than one, at most `max_workers`. That is over a run whose batches' Python pays for the workers'
+    start, a second each on these hosts (`batches`); a run too short for it, or of no stated length,
+    reads in the process, its reads sized alike (row 4862)."""
     from dew.data.dataset import WORKER_PROCESS_BYTES, Host
 
+    paid = 10**12  # A run long enough to pay for any start.
     rows = grain.MapDataset.source([{"x": np.zeros((8, 16384), np.float32)}] * 6).to_iter_dataset()
-    auto = Loading(workers="auto", worker_buffer=2)
-    small = dataclasses.replace(auto, ram_budget_mb=2).resolved(rows, reads=1, host=Host(8, 2**40))
-    assert (small.workers, small.read_buffer) == (0, 4)
     held = WORKER_PROCESS_BYTES + 2 * 2**19 + 16 * 2**19
-    roomy = auto.resolved(rows, reads=1, host=Host(8, 2 * (2 * held + held // 2)))
+
+    def on(cpus: int, memory: int, **fields) -> Loading:
+        return Loading(workers="auto", worker_buffer=2, host=Host(cpus, memory, worker_start=1.0), **fields)
+
+    small = on(8, 2**40, ram_budget_mb=2).resolved(rows, reads=1, batches=paid)
+    assert (small.workers, small.read_buffer) == (0, 4)
+    roomy = on(8, 2 * (2 * held + held // 2)).resolved(rows, reads=1, batches=paid)
     assert (roomy.workers, roomy.read_buffer) == (2, 16)
-    streamed = auto.resolved(rows, reads=8, host=Host(8, 2 * (2 * held + held // 2)))
+    streamed = on(8, 2 * (2 * held + held // 2)).resolved(rows, reads=8, batches=paid)
     assert streamed.workers == 2 and streamed.read_buffer == 16
-    assert auto.resolved(rows, reads=1, host=Host(3, 2**40)).workers == 3
-    assert auto.resolved(rows, reads=1, host=Host(1, 2**40)).workers == 0
-    assert dataclasses.replace(auto, max_workers=1).resolved(rows, reads=1, host=Host(8, 2**40)).workers == 1
+    assert on(3, 2**40).resolved(rows, reads=1, batches=paid).workers == 3
+    assert on(1, 2**40).resolved(rows, reads=1, batches=paid).workers == 0
+    assert on(8, 2**40, max_workers=1).resolved(rows, reads=1, batches=paid).workers == 1
+    for batches in (1, None):
+        unpaid = on(8, 2 * (2 * held + held // 2)).resolved(rows, reads=1, batches=batches)
+        assert (unpaid.workers, unpaid.read_buffer) == (0, 16)
+    # A host whose workers start at no cost takes as many as its CPUs hold over any stated run.
+    free = Loading(workers="auto", worker_buffer=2, host=Host(3, 2**40, worker_start=0.0))
+    assert free.resolved(rows, reads=1, batches=1).workers == 3

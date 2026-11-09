@@ -2,6 +2,6 @@
   "_from_model_config": true,
   "output_attentions": false,
   "output_hidden_states": false,
-  "transformers_version": "5.16.1",
+  "transformers_version": "5.17.0",
   "use_cache": true
 }

@@ -209,6 +209,33 @@ def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_run_naming_groups_none_of_them_fresh_steps_its_fresh_modules_at_the_fresh_rate(tmp_path):
+    """A run that names its groups but none that claims the modules it draws fresh, as a decision context
+    arm did with a base group of every parameter, steps its cross-attention block and its head at the
+    fresh rate in a group ahead of its catch-all, the adapter's factors in the base group; a group it
+    names ahead of the catch-all that claims the head states the head's own rate; resumed, it reads the
+    groups its record names (row 5246: such an arm's gates moved 3e-4 in 1,063 steps)."""
+    from run_kinds import trained
+
+    run = dataclasses.replace(context_run(tmp_path), validation=None)
+    fresh = run.optim.fresh_groups()[0]
+    based = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(BASE,)))
+    state, _ = trained(based, tmp_path, "based", trainer=SAVING)
+    recorded = groups(tmp_path, "based")
+    assert [group.name for group in recorded] == ["fresh", "base"] and recorded[1] == BASE
+    assert recorded[0].learning_rate_multiplier == fresh.learning_rate_multiplier > 1
+    claimed(labelled(recorded, state.variables["params"]))
+    head = ParamGroup("head", ("head/*",), learning_rate_multiplier=2.0)
+    headed = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(head, BASE)))
+    state, _ = trained(headed, tmp_path, "headed")
+    labels = labelled(groups(tmp_path, "headed"), state.variables["params"])
+    assert {label for path, label in labels.items() if path[0] == "head"} == {"head"}
+    assert {label for path, label in labels.items() if crossing(path)} == {"fresh"}
+    resumed, _ = trained(based, tmp_path, "based", trainer={**SAVING, "steps": 2})
+    assert int(resumed.step) == 2 and groups(tmp_path, "based") == recorded
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_run_resumes_its_groups_where_its_record_holds_a_chain_only_its_python_holds(tmp_path):
     """A run whose validation chain only its Python holds resumes in the groups its record names, which
     it reads alone, rebuilding nothing of the chain (row 2391's review): its default fresh group, over its
