@@ -3,6 +3,7 @@ a refit or a resume in the same process reads the step its equal traced (row 387
 whose loss reads another setting, module or held tree, or a head at another policy."""
 
 import jax
+import jax.numpy as jnp
 import pytest
 
 from dew.diffusion.discrete import MDLM
@@ -41,6 +42,25 @@ def test_two_objectives_built_alike_trace_by_one_key_and_another_setting_by_its_
     held = built()
     held.variables = jax.eval_shape(held.init, jax.random.key(0))
     assert stated_trace(held) != key
+
+
+def test_an_objective_holding_arrays_traces_by_their_shapes_whatever_their_values():
+    """A held tree's arrays pass to the trace as arguments (`held_variables`), so two objectives holding
+    trees of the same shapes and dtypes state one key whatever the arrays' values, one whose tree is stored
+    in another dtype a key of its own, and each apart from the objective that draws its tree from a key
+    (the train whose every objective holding device arrays failed at its key: `held_shapes` converted each
+    array to a dtype)."""
+    def holding(seed: int, dtype=None) -> LMObjective:
+        held = LMObjective(tiny(), 8)
+        tree = held.init(jax.random.key(seed))
+        held.variables = tree if dtype is None else jax.tree.map(
+            lambda leaf: leaf.astype(dtype) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
+        return held
+
+    key = stated_trace(holding(0))
+    assert key is not None and key == stated_trace(holding(1)) and hash(key) == hash(stated_trace(holding(1)))
+    assert stated_trace(holding(0, jnp.bfloat16)) != key
+    assert stated_trace(LMObjective(tiny(), 8)) != key
 
 
 def test_a_head_at_another_policy_and_a_subclass_trace_by_keys_of_their_own():
