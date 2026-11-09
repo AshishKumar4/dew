@@ -684,7 +684,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         roles = self.persist_schedule(consumers, width, summed=bool(summed), rewrites=prepared is not None)
 
         def scoped(*allocated):
-            tensor = roles.opened(allocated[:1])["accumulators"]
+            (tensor,) = roles.opened(allocated[:1])
             # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
             # slot's `masked` barrier in its loads' place.
             masked = dict(zip(rings, allocated[1:1 + len(rewrites)], strict=True)) if rewrites else {}
@@ -743,12 +743,15 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
                 tensor.drain(computed)
 
-            def rewrite(index):
-                del index
-                persistent.tiled(tiles, schedule, functools.partial(_rewritten, rings, masked, prepared),
-                                 axis=axis)
+            rewriting = {}
+            if prepared is not None:
+                rewritten = functools.partial(_rewritten, rings, masked, prepared)
 
-            rewriting = {"rewrite": rewrite} if prepared is not None else {}
+                def rewrite(index):
+                    del index
+                    persistent.tiled(tiles, schedule, rewritten, axis=axis)
+
+                rewriting["rewrite"] = rewrite
             roles.run(epilogue=epilogue, load=load, mma=issue_all, **rewriting)
 
         (accumulated,) = roles.scratch(generation.gpu_target())
@@ -769,7 +772,6 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 turn = None if summed else tensor.turn(done_turns)
                 if turn is not None:
                     tensor.freed(turn)
-                into = None if turn is None else held(turn)
 
                 def walked(lo, hi, start, shapes, accumulators: tuple, step):
                     def stepped(at, slots, carry, accs):
@@ -781,8 +783,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 def walk(step, start, shapes, *, initial=None):
                     if initial is not None:
                         raise NotImplementedError(f"{self._HOME}; a walk starts it from no value")
-                    if not summed:
-                        return walked(counter, counter + steps, start, shapes, into, step)
+                    if turn is not None:
+                        return walked(counter, counter + steps, start, shapes, held(turn), step)
 
                     def window(index, carry):
                         each = tensor.turn(done_turns + index)
@@ -880,7 +882,7 @@ def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, s
         lax.fori_loop(0, steps, step, None)
 
 
-class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator]):
+class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | jax.Array]):
     """tcgen05's issuer for 64-row tiles a consumer holds in registers (the recurrence's chunks, row 4747):
     each product into a scoped 64-row fp32 accumulator in tensor memory (one CTA's M=64 MMA, the half-lane
     layout `tcgen05.tmem_half_lane_layout`), its left operand from shared memory or, written there first,

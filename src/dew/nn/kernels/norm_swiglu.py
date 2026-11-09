@@ -74,9 +74,11 @@ from typing import ClassVar, NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import ShapedArray
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from jax.extend import core
 
 from dew.mesh import logical_spec
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
@@ -287,37 +289,36 @@ def elementwise(function, shape: tuple[int, ...]) -> bool:
         return False
     lowered = set(lowering.triton_lowering_rules)
 
-    def mapped(jaxpr: jax.extend.core.Jaxpr) -> bool:
+    def mapped(jaxpr: core.Jaxpr) -> bool:
+        # An array it closes over, at any depth, is read by position: a scalar alone is every element's (a
+        # Jaxpr carries its own constants on JAX 0.12).
+        if any(np.ndim(const) != 0 for const in jaxpr.consts):
+            return False
         for equation in jaxpr.eqns:
-            shapes = [variable.aval.shape for variable in (*equation.invars, *equation.outvars)]
+            avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
             # A custom reverse derivative has no forward one to state the tile's (`_tangents`).
             if (equation.primitive.name in _POSITIONAL or equation.primitive not in lowered
                     or equation.primitive.name.startswith("custom_vjp")
-                    or any(each not in (tuple(shape), ()) for each in shapes)):
+                    or any(not isinstance(aval, ShapedArray) or aval.shape not in (tuple(shape), ())
+                           for aval in avals)):
                 return False
-            nested = [value for value in equation.params.values()
-                      if isinstance(value, (jax.extend.core.ClosedJaxpr, jax.extend.core.Jaxpr))]
-            if not all(closed_mapped(inner) if isinstance(inner, jax.extend.core.ClosedJaxpr)
-                       else mapped(inner) for inner in nested):
+            if not all(mapped(inner) for inner in equation.params.values() if isinstance(inner, core.Jaxpr)):
                 return False
         return True
 
-    def closed_mapped(closed: jax.extend.core.ClosedJaxpr) -> bool:
-        # An array it closes over, at any depth, is read by position: a scalar alone is every element's.
-        return all(np.ndim(const) == 0 for const in closed.consts) and mapped(closed.jaxpr)
-
     outs = closed.out_avals
-    return len(outs) == 1 and outs[0].shape == tuple(shape) and closed_mapped(closed)
+    return (len(outs) == 1 and isinstance(outs[0], ShapedArray) and outs[0].shape == tuple(shape)
+            and mapped(closed))
 
 
 @functools.lru_cache(maxsize=256)
-def _traced(function, shape: tuple[int, ...]) -> jax.extend.core.ClosedJaxpr:
+def _traced(function, shape: tuple[int, ...]) -> core.Jaxpr:
     """`function`'s graph at an fp32 input of the call's logical `shape`, once a function and shape."""
     return jax.make_jaxpr(function)(jax.ShapeDtypeStruct(shape, jnp.float32))
 
 
 @functools.lru_cache(maxsize=256)
-def _tangents(function, shape: tuple[int, ...]) -> jax.extend.core.ClosedJaxpr:
+def _tangents(function, shape: tuple[int, ...]) -> core.Jaxpr:
     """`function`'s forward derivative at an fp32 input of the call's logical `shape`, `(y, t) -> (out,
     t_out)`, as JAX derives it (a custom derivative's rule applied, a relu's 0 at 0), once a function and
     shape."""
@@ -340,12 +341,12 @@ class _Logical:
         traced = _traced(self.function, self.shape)
 
         def applied(y):
-            (out,) = _on_tile(traced.jaxpr, traced.consts, self.shape, y.shape, y)
+            (out,) = _on_tile(traced, traced.consts, self.shape, y.shape, y)
             return out
 
         def tangent(primals, tangents):
             derived = _tangents(self.function, self.shape)
-            out, tangent = _on_tile(derived.jaxpr, derived.consts, self.shape, primals[0].shape, *primals,
+            out, tangent = _on_tile(derived, derived.consts, self.shape, primals[0].shape, *primals,
                                     *tangents)
             return out, tangent
 
@@ -353,7 +354,7 @@ class _Logical:
             declared_tangent(KernelGlue(), applied, tangent))(y)
 
 
-def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
+def _on_tile(jaxpr: core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
     """`jaxpr`, traced at the `logical` shape, evaluated on `args` of the `tile` shape as
     `jax.core.eval_jaxpr` evaluates it: each equation bound by its primitive (`get_bind_params`), a shape
     parameter that is the logical shape the tile's, and a program a parameter holds (a jit's, a custom
@@ -362,16 +363,16 @@ def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, 
     values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
 
     def read(atom):
-        return atom.val if isinstance(atom, jax.extend.core.Literal) else values[atom]
+        return atom.val if isinstance(atom, core.Literal) else values[atom]
 
     def retargeted(value):
         if isinstance(value, tuple) and tuple(value) == logical:
             return tuple(tile)
-        if isinstance(value, jax.extend.core.ClosedJaxpr):
-            avals = [jax.ShapeDtypeStruct(tile if var.aval.shape == logical else var.aval.shape,
-                                          var.aval.dtype) for var in value.jaxpr.invars]
+        if isinstance(value, core.Jaxpr):
+            avals = [jax.ShapeDtypeStruct(tile if aval.shape == logical else aval.shape, aval.dtype)
+                     for aval in value.in_avals if isinstance(aval, ShapedArray)]
             return jax.make_jaxpr(
-                lambda *operands: _on_tile(value.jaxpr, value.consts, logical, tile, *operands))(*avals)
+                lambda *operands: _on_tile(value, value.consts, logical, tile, *operands))(*avals)
         return value
 
     for equation in jaxpr.eqns:

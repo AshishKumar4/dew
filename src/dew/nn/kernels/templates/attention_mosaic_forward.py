@@ -1043,14 +1043,17 @@ class _Codes(NamedTuple):
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool,
             held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
-            interpret: bool = False, codes: _Codes | None = None) -> tuple:
+            interpret: bool = False, codes: _Codes | None = None, training: bool = False) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
     bit; its places read by the walk's dropout where it draws it (`drawn`). A tile every query sees whole
     takes no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
     loops, faulted on an H100 under jax 0.11.2's lowering). The tile's `Q Kᵀ` its own fresh product, or
-    `product()`'s where the walk issues it."""
+    `product()`'s where the walk issues it. A training forward's walks' query places (`training`: its peak
+    walk's and its anchored one's), where its hook reads them, are in the accumulator's layout
+    (`Family.as_tile`): a hook's term of a slice of them (a row-indexed one's `q_pos[:, :1]`) found no
+    layout on mma.sync, whose reductions' inference offers no accumulator layout (row 5279)."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -1078,6 +1081,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                                padded=spec.keys % tiles.block_k != 0)
     coords = _coords(family, spans, row, first, k_first, shape, read=read,
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
+    if training and score_places(hooks)[0]:
+        coords = coords._replace(q_pos=family.as_tile(coords.q_pos))
     params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
                    for ref, param in zip(hooked.score, hooks.score_params, strict=True))
     logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
@@ -1224,7 +1229,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
-                       interpret=interpret, codes=codes)
+                       interpret=interpret, codes=codes, training=residuals is not None)
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
     # fp32 call's its parts (`_Program.parted`).
@@ -1611,7 +1616,8 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     def step(index, slots, arg, accumulators):
         # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place[:2], whole,
-                                       turn, hooks=hooks, drawn=False, held=held, interpret=interpret)
+                                       turn, hooks=hooks, drawn=False, held=held, interpret=interpret,
+                                       training=True)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
