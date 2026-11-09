@@ -2153,6 +2153,9 @@ class RunConfig:
                 self.trainer.resume) is not None and saved.exists() else None
             if recorded is not None and not named:
                 return to_record(recorded, tuple[ParamGroup, ...])
+            if recorded is not None and partitioned(named) == partitioned(recorded):
+                # The record's own groups named again (a saved run's config), fresh claims and all.
+                return to_record(named, tuple[ParamGroup, ...])
             modules, leaves = trained_modules(objective, objective.fresh_modules())
             # A group named fresh claims what the run draws, or is refused where it draws none (`with_fresh`).
             groups = self.optim.fresh_groups() if modules or leaves else named

@@ -224,10 +224,15 @@ def test_a_resumed_run_trains_in_the_groups_it_names_refused_a_changed_partition
         slower, BASE))), tmp_path, "named", trainer={**SAVING, "steps": 2})
     assert int(resumed.step) == 2
     assert groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER / 4
+    # The record's own groups named again, as a saved run's config names them, resume as they stand.
+    recorded = groups(tmp_path, "named")
+    again, _ = trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=recorded)),
+                       tmp_path, "named", trainer={**SAVING, "steps": 3})
+    assert int(again.step) == 3 and groups(tmp_path, "named") == recorded
     renamed = ParamGroup("rest", ("*",), spared=True)
     with pytest.raises(ValueError):
         trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, renamed))),
-                tmp_path, "named", trainer={**SAVING, "steps": 3})
+                tmp_path, "named", trainer={**SAVING, "steps": 4})
 
 
 @pytest.mark.mesh(devices=8)
