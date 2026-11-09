@@ -16,6 +16,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
     PLAIN_SPELLING,
+    ROPE_SPELLINGS,
     DecoderFields,
     ExportRefused,
     Ropes,
@@ -417,8 +418,7 @@ def plain_rope_part(spelling: RopeSpelling | None = PLAIN_SPELLING, *, default_f
     and `rotary_pct`) or its rope_parameters entry, the class's `default_factor` where unstated (None for
     a class with none, whose config states it), the whole head none; written flat."""
     def read(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-        used.update((theta_field, factor_field, 'rope_theta', 'rope_parameters', 'rope_scaling',
-                     'partial_rotary_factor'))
+        used.update((theta_field, factor_field, *ROPE_SPELLINGS, 'partial_rotary_factor'))
         theta, factor = plain_partial_rope(hf_config, spelling, default_factor=default_factor,
                                            reference=reference, factor_field=factor_field,
                                            theta_field=theta_field)

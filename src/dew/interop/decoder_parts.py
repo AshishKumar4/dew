@@ -551,6 +551,12 @@ class Ropes:
     full_only: bool = False
 
 
+ROPE_SPELLINGS = frozenset({'rope_theta', 'rope_parameters', 'rope_scaling'})
+"""The config fields a rotary record is read from (`rope_records`): transformers' `rope_parameters` and the
+legacy `rope_theta` and `rope_scaling` its configs still convert (`convert_rope_params_to_dict`,
+modeling_rope_utils.py:742-760)."""
+
+
 def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
                   ) -> tuple[tuple[str, dict], tuple[str, dict] | None]:
     """The full layers' and the sliding layers' effective rope records, each
@@ -609,7 +615,7 @@ def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling
     family's `defaults`, as `_rope_entry` describes. `ramps` names the
     scaling types the family computes; `per_kind=False` refuses nested records.
     """
-    used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
+    used.update(ROPE_SPELLINGS)
     stated = hf_config.get('max_position_embeddings')
     yarn_max_pos = None if stated is None else _records.integer(stated, 'max_position_embeddings')
     if spelling.local_field is not None:
@@ -657,7 +663,7 @@ def read_partial_rope(hf_config: Mapping[str, object], used: set, spelling: Rope
     Qwen3_5TextRotaryEmbedding do: the record as the class resolves it (`rope_records`, a legacy
     rope_scaling replacing rope_parameters whole), its fraction else the config's flat one else
     `default_factor` (`convert_rope_params_to_dict`, modeling_rope_utils.py:742-760)."""
-    used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'partial_rotary_factor'))
+    used.update((*ROPE_SPELLINGS, 'partial_rotary_factor'))
     (field, record), sliding = rope_records(hf_config, spelling)
     if sliding is not None:
         refuse(sliding[0], 'this family reads one rotary record for every layer')

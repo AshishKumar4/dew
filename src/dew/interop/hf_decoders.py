@@ -45,6 +45,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
     NO_AUDIO,
+    ROPE_SPELLINGS,
     SLICED,
     AudioFields,
     DecoderFamily,
@@ -165,21 +166,25 @@ def typed_part(hf_config: Mapping[str, object], nested: Mapping[str, object],
     return {"model_type": default, **nested}
 
 
-_QWEN_VL_TEXT_FIELDS = frozenset({
-    "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
-    "num_key_value_heads", "hidden_act", "max_position_embeddings", "initializer_range", "rms_norm_eps",
-    "use_cache", "use_sliding_window", "sliding_window", "max_window_layers", "layer_types",
-    "attention_dropout", "rope_parameters", "rope_scaling", "rope_theta", "bos_token_id", "eos_token_id",
-    "pad_token_id"})
-"""The decoder fields Qwen2-VL's and Qwen2.5-VL's configs read off the wrapper's root, as the Hub's flat
-configs state them (`Qwen2_5_VLConfig.__post_init__`, transformers 5.17: its text config's fields and
-the rope's spellings): the text_config where none is nested, else ignored beside the nested one."""
+@functools.cache
+def _flat_text_fields(model_type: str) -> frozenset[str]:
+    """The decoder fields a Qwen2-VL's or Qwen2.5-VL's config reads off the wrapper's root, as the Hub's flat
+    configs state them, as its class reads them (`Qwen2_5_VLConfig.__post_init__`): each field its text
+    config's class declares that its own does not, and the rotary record's spellings (`ROPE_SPELLINGS`);
+    the text_config where none is nested, else ignored beside the nested one."""
+    from transformers import CONFIG_MAPPING
+
+    wrapper = CONFIG_MAPPING[model_type]
+    own = {field.name for field in dataclasses.fields(wrapper)}
+    text = {field.name for field in dataclasses.fields(wrapper.sub_configs["text_config"])}
+    return frozenset(text - own) | ROPE_SPELLINGS
+
 
 _FLAT_TEXT_TYPES = ("qwen2_vl", "qwen2_5_vl")
 _TEXT_VLMS = (*_FLAT_TEXT_TYPES, "qwen3_vl", "qwen3_vl_moe")
 """The VLMs whose text decoder a registered family computes and whose vision tower Dew has no port of
 (`TEXT_FAMILIES`, `_text_vlm_wrapper`)."""
-"""The VLM wrappers whose config reads a flat root as its text config (`_QWEN_VL_TEXT_FIELDS`)."""
+"""The VLM wrappers whose config reads a flat root as its text config (`_flat_text_fields`)."""
 
 
 def text_scope(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -201,11 +206,11 @@ def vlm_text(hf_config: Mapping[str, object], used: set[str]) -> Mapping[str, ob
     class decides (`vlm_tied`)."""
     model_type = _records.text(hf_config["model_type"], "model_type")
     flat = model_type in _FLAT_TEXT_TYPES
-    if flat:
-        used.update(field for field in _QWEN_VL_TEXT_FIELDS if field in hf_config)
+    fields = _flat_text_fields(model_type) if flat else frozenset()
+    used.update(field for field in fields if field in hf_config)
     nested = hf_config.get("text_config")
     if flat and nested is None:
-        text = {field: hf_config[field] for field in _QWEN_VL_TEXT_FIELDS if field in hf_config}
+        text = {field: hf_config[field] for field in fields if field in hf_config}
         dtype = hf_config.get("torch_dtype", hf_config.get("dtype"))
         nested = {**text, **({} if dtype is None else {"torch_dtype": dtype})}
     return {**dict(typed_part(hf_config, _records.record(nested, "text_config"), "text")),
