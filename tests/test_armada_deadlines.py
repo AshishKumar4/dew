@@ -17,12 +17,15 @@ def ci(tmp_path, monkeypatch):
     return loaded(tmp_path, monkeypatch)
 
 
-def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
+def test_a_task_past_its_deadline_is_interrupted_its_hung_file_red_and_the_rest_run_again(ci, tmp_path):
     """A hang is graded: the task interrupts pytest at its deadline, short of
     armada's own timeout, kills its process group where the interrupt is not
-    heard, and writes a red row for each of its files, the one that finished
-    first included."""
+    heard, and writes the file it was spent in red, the deadline's; a file
+    pytest left no report of, before the hang or after it, is not graded but
+    said stale, which the queue runs again, never a red of its tests (Main,
+    2026-11-09: train 745 filed six files packed beside a hung one as reds)."""
     (tmp_path / "tests/test_quick.py").write_text("def test_ok(): pass\n")
+    (tmp_path / "tests/test_zlast.py").write_text("def test_after(): pass\n")
     # A hang that ignores ^C, beside a child that holds pytest's output open:
     # neither may keep the task from writing its verdict.
     (tmp_path / "tests/test_hangs.py").write_text(
@@ -34,12 +37,15 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
+    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py", "tests/test_zlast.py"], "", out, 3.0,
+            grace=2.0)
     # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
     assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
-    assert {name: row["exitCode"] for name, row in rows.items()} == {
-        "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+    assert {name: (row["exitCode"], row["kind"]) for name, row in rows.items()} == {
+        "3.12:tests/test_quick.py": (1, ci.STALE), "3.12:tests/test_hangs.py": (1, "deadline"),
+        "3.12:tests/test_zlast.py": (1, ci.STALE)}
+    assert "spent in tests/test_hangs.py" in rows["3.12:tests/test_zlast.py"]["output"]
 
 
 STALLS = {

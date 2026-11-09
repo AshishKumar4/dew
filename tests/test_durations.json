@@ -7263,7 +7263,7 @@
 "tests/test_armada_ci.py::test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it[the test session]": 0.049,
 "tests/test_armada_ci.py::test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it[thresh's annotations]": 0.045,
 "tests/test_armada_ci.py::test_whole_suite_tests_run_on_a_whole_suite_run_alone": 2.38,
-"tests/test_armada_deadlines.py::test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red": 5.252,
+"tests/test_armada_deadlines.py::test_a_task_past_its_deadline_is_interrupted_its_hung_file_red_and_the_rest_run_again": 5.252,
 "tests/test_armada_deadlines.py::test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was[in native code holding the GIL-a release check's]": 15.191,
 "tests/test_armada_deadlines.py::test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was[in native code holding the GIL-pytest]": 8.215,
 "tests/test_armada_deadlines.py::test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was[in native code-a release check's]": 15.271,
