@@ -32,7 +32,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
 from dew._records import JSON
-from dew.batch import UNIT_ROWS, Batch
+from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
@@ -110,61 +110,20 @@ def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, 
     where the run fixes one, else 1, the batch whole, and every count that
     cuts each batch the run reads, of `rows` (`batch`'s own where None), into
     microbatches whose rows the mesh's row shards divide (`batch_divisor`),
-    every device holding whole rows of each, and some order of the rows
-    keeping each unit's rows in one part (`UNIT_ROWS`, `unit_order`, in which
-    the step lays them); a batch of step-wide fields alone is read whole. A fixed
-    split that leaves some device without whole rows is refused."""
+    every device holding whole rows of each; a batch of step-wide fields
+    alone is read whole. A fixed split that leaves some device without whole
+    rows is refused."""
     rows, divisor = rows or (rows_of(batch),), batch_divisor(mesh, microbatches)
     whole = [split for split in range(1, min(rows) // divisor + 1)
-             if all(count % (split * divisor) == 0 for count in rows)
-             and keeps_units(batch, split * microbatches, divisor // microbatches)]
+             if all(count % (split * divisor) == 0 for count in rows)]
     if fixed is None:
         return [1, *(split for split in whole if split > 1)]
     if fixed > 1 and fixed not in whole:
         raise LayoutRefused(
             f"this run reads each step's batch in {fixed} microbatches, and the batches it reads, of "
             f"{sorted(set(rows))} rows over {divisor} row shards of {dict(mesh.shape)}, cut into whole rows "
-            f"on every device, each unit's rows together (UNIT_ROWS: a preference pair's two windows, an "
-            f"even count a part), only in {whole}; read them in one of those, or leave the split to the plan")
+            f"on every device only in {whole}; read them in one of those, or leave the split to the plan")
     return [fixed]
-
-
-def keeps_units(batch: Batch, strides: int, shards: int) -> bool:
-    """Whether some order of `batch`'s rows keeps each unit's rows in one part (`unit_order`): every one
-    where it states no units."""
-    return UNIT_ROWS not in batch or unit_order(batch, strides, shards) is not None
-
-
-def unit_order(batch: Batch, strides: int, shards: int) -> np.ndarray | None:
-    """The order of `batch`'s rows in which a step reading them in `strides` strided parts (each takes every
-    `strides`th row, `microbatched`) over `shards` blocks of consecutive rows keeps each unit's rows
-    (`UNIT_ROWS`, which it states) in one part, None where no order does: the rows as they stand where
-    they already do (or hold no values, as an abstract batch a lowering traces), else the units placed
-    first-fit, in their order, into the parts' slots."""
-    units = batch[UNIT_ROWS]
-    if isinstance(units, jax.ShapeDtypeStruct):
-        return np.arange(units.shape[0])
-    units = np.asarray(units).reshape(-1)
-    rows = len(units)
-    block = rows // shards
-    slots = [[shard * block + stride + strides * at for at in range(block // strides)]
-             for shard in range(shards) for stride in range(strides)]
-    owner = {slot: part for part, held in enumerate(slots) for slot in held}
-    members: dict[int, list[int]] = {}
-    for row, unit in enumerate(units.tolist()):
-        members.setdefault(unit, []).append(row)
-    if all(len({owner[row] for row in rows_of_unit}) == 1 for rows_of_unit in members.values()):
-        return np.arange(rows)
-    order, filled = np.empty(rows, np.int64), [0] * len(slots)
-    for rows_of_unit in members.values():
-        part = next((part for part, held in enumerate(slots)
-                     if len(held) - filled[part] >= len(rows_of_unit)), None)
-        if part is None:
-            return None
-        for row in rows_of_unit:
-            order[slots[part][filled[part]]] = row
-            filled[part] += 1
-    return order
 
 
 @dataclasses.dataclass(frozen=True)

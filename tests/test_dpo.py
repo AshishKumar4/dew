@@ -24,7 +24,7 @@ from tool_support import load
 from dew.data import Files, Loading, Memory, presets
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
-from dew.data.preferences import HALVES_KEY, IDS_KEY, MASK_KEY, REAL_KEY, PairIds, pair_windows, windows
+from dew.data.preferences import HALVES_KEY, IDS_KEY, MASK_KEY, REAL_KEY, pair_windows, windows
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 
@@ -309,8 +309,8 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
 
     assert data.records == 1
     batch = next(data.train(DataPartition()))
-    np.testing.assert_array_equal(np.asarray(batch[IDS_KEY]), [[1, 2, 3, 4, 5, 0, 0, 0]])
-    np.testing.assert_array_equal(np.asarray(batch[MASK_KEY]), [[0, 0, 1, 1, 1, 0, 0, 0]])
+    np.testing.assert_array_equal(np.asarray(batch[IDS_KEY]), [[1, 2, 3, 4, 5, 0, 0]])
+    np.testing.assert_array_equal(np.asarray(batch[MASK_KEY]), [[0, 0, 1, 1, 1, 0, 0]])
 
 @pytest.mark.parametrize("share", [True, False], ids=["shared", "whole"])
 def test_pairs_pack_into_windows_each_half_at_its_own_places(share):
@@ -367,7 +367,7 @@ def test_a_preference_pair_marks_each_halfs_real_tokens():
     marks: a chosen half ending in an unmarked token, a rejected half of no completion."""
     laid = windows([{"chosen": [1, 2, 3, 4], "rejected": [1, 2], "chosen_mask": [0, 0, 1, 0],
                      "rejected_mask": [0, 0]}], 5)
-    assert laid[REAL_KEY].tolist() == [[1, 1, 1, 1, 0, 0, 0, 0, 0, 0]]
+    assert laid[REAL_KEY].tolist() == [[1, 1, 1, 1, 0, 0, 0, 0, 0]]
 
 
 @pytest.mark.parametrize("share", [True, False], ids=["shared", "whole"])
@@ -468,16 +468,14 @@ def test_packed_pairs_train_as_each_pair_a_row(kind, share):
 def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
     """A trainer's step over windows of pairs, read in two microbatches over two data shards (`split=2`
     on a two-device data mesh), moves the policy as one SGD step on the loss of each pair laid out a row
-    (check 1, over drawn weights, float64 truth): the trainer lays a batch of windows of one half, a
-    pair's two in turn, so each pair's two stand in one part and shard (`UNIT_ROWS`,
-    `dew.training.planning.unit_order`), and a pair's halves reduce by its number however the windows hold
-    them. A split no order keeps the pairs whole in is refused."""
+    (check 1, over drawn weights, float64 truth): packed windows, or a pair a row, its halves a window each
+    (`segments=1`), which whatever deals the rows keeps whole, and a pair's halves reduce by its number
+    however the windows hold them."""
     import optax
     from flax import linen as nn
     from model_support import TINY_DECODER, float64_truth, float64_twin
 
     from dew.batch import coordinates
-    from dew.mesh import LayoutRefused
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm.objective import LMObjective
     from dew.rl.surrogate import preference_logsigmoid_terms
@@ -487,8 +485,8 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
     model = CausalTransformer(vocab_size=VOCAB, **{**TINY_DECODER, "max_seq_len": 2 * half}, dtype="float32")
     rng = np.random.default_rng(9)
     rows = []
-    # Eight windows either way: two pairs of at most seven tokens a window of sixteen, or a half each.
-    for index in range(4 if segments == 1 else 16):
+    # Eight rows either way: two pairs of at most seven tokens a window of sixteen, or a pair a row.
+    for index in range(8 if segments == 1 else 16):
         prompt = rng.integers(1, VOCAB, 2 + index % 2).tolist()
         chosen, rejected = (prompt + rng.integers(1, VOCAB, 2).tolist() for _ in range(2))
         rows.append({"chosen": chosen, "rejected": rejected,
@@ -548,34 +546,25 @@ def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
     assert_as_exact(lambda _, moved: moved, lambda params, _: plain(params), draw,
                     f"a split step over pairs, segments={segments}", seeds=8,
                     truth_fn=float64_truth(lambda params, _: wide(params)))
-    if segments == 1:
-        with pytest.raises(LayoutRefused):
-            trainer = trainer_for(0, split=8)
-            state = trainer.initial_state()
-            trainer.compile(state, laid)
 
 
-def test_pairs_of_one_half_a_window_are_numbered_across_the_batch_and_kept_whole_in_a_steps_parts():
-    """`PairIds` numbers each pair across its batch, a pair's two windows of one half the same pair and
-    unit; `unit_order` lays the rows so a step reading every `split`th row over its shards keeps each pair
-    whole, the rows as they stand where they already do, and none where no order does (a part of one
-    row). A batch opening on a pair's second window is refused."""
-    from dew.batch import UNIT_ROWS
+def test_pairs_are_numbered_across_the_windows_a_step_reads_whatever_numbers_they_carry():
+    """The DPO loss numbers each pair across the windows a step reads (`pair_numbers`): a pair a row's two
+    windows (`segments=1`, `[B, 2, W]`, read in turn) one pair, and rows stacked from two batches, whose
+    windows carry the same numbers, pairs of their own, packed or a pair a row."""
     from dew.data.preferences import PAIRS_KEY
-    from dew.training.planning import keeps_units, unit_order
+    from dew.objectives.rl.preference import pair_numbers
 
     rows = [{"chosen": [1, 2, 3], "rejected": [1, 2, 4], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1, 1]}
             for _ in range(4)]
-    laid = windows(rows, 3, segments=1)
-    assert laid[PAIRS_KEY].max(axis=1).tolist() == [1, 1, 2, 2, 3, 3, 4, 4]
-    assert laid[UNIT_ROWS].tolist() == [1, 1, 2, 2, 3, 3, 4, 4]
-    assert unit_order(laid, 1, 2).tolist() == list(range(8))
-    order = unit_order(laid, 2, 2)
-    units = laid[UNIT_ROWS][order]
-    for row in range(8):
-        part = (row // 4, row % 2)
-        assert all((other // 4, other % 2) == part for other in range(8) if units[other] == units[row])
-    assert unit_order(laid, 8, 1) is None and not keeps_units(laid, 8, 1)
-    assert keeps_units({"x": np.zeros(3)}, 2, 1)
-    with pytest.raises(ValueError):
-        PairIds()({key: value[1:] for key, value in laid.items()})
+    halved = windows(rows, 3, segments=1)[PAIRS_KEY]
+    assert halved.shape == (4, 2, 3)
+
+    def numbered(pairs):
+        flat = {PAIRS_KEY: pairs.reshape(-1, pairs.shape[-1])}
+        return np.asarray(pair_numbers(flat, halved=pairs.ndim == 3)[0]).max(axis=1)
+
+    assert numbered(halved).tolist() == [1, 1, 2, 2, 3, 3, 4, 4]
+    assert numbered(np.concatenate([halved, halved])).tolist() == [*np.repeat(np.arange(1, 9), 2)]
+    shared = windows(rows, 3)[PAIRS_KEY]
+    assert numbered(np.concatenate([shared, shared])).tolist() == list(range(1, 2 * len(shared) + 1))

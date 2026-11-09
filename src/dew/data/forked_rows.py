@@ -81,8 +81,9 @@ class ForkedRows:
     def needed(cls, rows: Sequence[Sequence[int]], width: int, *, share: bool = True,
                positions: Sequence[Sequence[int]] | None = None,
                fields: Mapping[str, Sequence[np.ndarray]] | None = None) -> int:
-        """How many windows of `width` slots `pack` lays `rows` out in, one block."""
-        return cls.pack(rows, width, share=share, positions=positions, fields=fields).tokens.shape[0]
+        """How many windows of `width` slots `pack` lays `rows` out in, one block (`windows_needed`)."""
+        laid, _, _, keys = _keyed(rows, positions, fields, share)
+        return windows_needed([row.size for row in laid], width, keys=keys)
 
     @classmethod
     def pack(cls, rows: Sequence[Sequence[int]], width: int, *, windows: int | None = None,
@@ -107,33 +108,22 @@ class ForkedRows:
         if width < 1 or blocks < 1:
             raise ValueError(f"windows hold at least one slot in at least one block, got width {width} and "
                              f"{blocks} blocks")
-        laid = [np.asarray(row, np.int64).reshape(-1) for row in rows]
-        if not laid or any(row.size == 0 for row in laid):
-            raise ValueError("forked rows pack at least one row, each of at least one token")
+        laid, places, extra, keys = _keyed(rows, positions, fields, share)
         if len(laid) % blocks:
             raise ValueError(f"{len(laid)} rows split into {blocks} blocks, and they do not divide")
-        places = ([np.arange(row.size, dtype=np.int64) for row in laid] if positions is None
-                  else [np.asarray(place, np.int64).reshape(-1) for place in positions])
-        extra = {name: [np.asarray(value) for value in values] for name, values in (fields or {}).items()}
-        for name, given in (("positions", places), *extra.items()):
-            if len(given) != len(laid) or any(len(value) != row.size for value, row in zip(given, laid,
-                                                                                            strict=True)):
-                raise ValueError(f"{name} holds one entry a token of each row")
         longest = max(row.size for row in laid)
         length = longest if length is None else length
         if longest > min(length, width):
             raise ValueError(f"a row of {longest} tokens fits neither the rows' length {length} nor a window "
                              f"of {width} slots")
-        keys = [_token_keys(row, place, [values[number] for values in extra.values()])
-                for number, (row, place) in enumerate(zip(laid, places, strict=True))]
         per_block = len(laid) // blocks
         plans = []
         for block in range(blocks):
             members = range(block * per_block, (block + 1) * per_block)
-            groups = (_groups([keys[number] for number in members], width) if share
-                      else [[at] for at in range(len(members))])
-            plans.append(_windows([[members[at] for at in group] for group in groups], keys, width,
-                                  None if share else documents))
+            planned = _planned([laid[number].size for number in members], width,
+                               None if keys is None else [keys[number] for number in members], documents)
+            plans.append([[(prefix, [members[at] for at in group]) for prefix, group in window]
+                          for window in planned])
         needed = max(len(plan) for plan in plans)
         held = needed if windows is None else windows // blocks
         if windows is not None and (windows % blocks or needed > held):
@@ -174,7 +164,44 @@ def window_forks(segments: np.ndarray, local: np.ndarray, parent: np.ndarray,
     return laid, parents
 
 
-def _token_keys(row: np.ndarray, places: np.ndarray, extra: Sequence[np.ndarray]) -> list[bytes]:
+def windows_needed(lengths: Sequence[int], width: int, *, keys: Sequence[Sequence[bytes]] | None = None,
+                   documents: int | None = None) -> int:
+    """How many windows of `width` slots `ForkedRows.pack` lays rows of `lengths` tokens out in, one block:
+    each group of rows that begin alike over one copy of their common prefix where `keys` gives each row's
+    tokens' keys (`token_keys`), else each row whole, at most `documents` a window. A planner that holds
+    its rows' keys counts windows with no layout written."""
+    return len(_planned(lengths, width, keys, documents))
+
+
+def _keyed(rows: Sequence[Sequence[int]], positions: Sequence[Sequence[int]] | None,
+           fields: Mapping[str, Sequence[np.ndarray]] | None, share: bool):
+    """`rows` as `pack` reads them: each row's ids, its tokens' places (its indices where `positions` is
+    None) and the per-token `fields`, and with `share` each row's tokens' keys (`token_keys`), else None:
+    a row laid whole is planned by its length alone."""
+    laid = [np.asarray(row, np.int64).reshape(-1) for row in rows]
+    if not laid or any(row.size == 0 for row in laid):
+        raise ValueError("forked rows pack at least one row, each of at least one token")
+    places = ([np.arange(row.size, dtype=np.int64) for row in laid] if positions is None
+              else [np.asarray(place, np.int64).reshape(-1) for place in positions])
+    extra = {name: [np.asarray(value) for value in values] for name, values in (fields or {}).items()}
+    for name, given in (("positions", places), *extra.items()):
+        if len(given) != len(laid) or any(len(value) != row.size for value, row in zip(given, laid,
+                                                                                        strict=True)):
+            raise ValueError(f"{name} holds one entry a token of each row")
+    keys = ([token_keys(row, place, [values[number] for values in extra.values()])
+             for number, (row, place) in enumerate(zip(laid, places, strict=True))] if share else None)
+    return laid, places, extra, keys
+
+
+def _planned(lengths: Sequence[int], width: int, keys: Sequence[Sequence[bytes]] | None,
+             documents: int | None) -> list[list[tuple[int, list[int]]]]:
+    """Rows of `lengths` planned into windows (`_windows`): grouped by their keys' common prefixes where
+    `keys` is given (`_groups`), else each a group of its own, at most `documents` a window."""
+    groups = _groups(keys, width) if keys is not None else [[at] for at in range(len(lengths))]
+    return _windows(groups, lengths, keys, width, None if keys is not None else documents)
+
+
+def token_keys(row: np.ndarray, places: np.ndarray, extra: Sequence[np.ndarray]) -> list[bytes]:
     """Each token's identity as a shared prefix compares it: its id, its place and every field it carries."""
     return [b"".join([np.int64(token).tobytes(), np.int64(place).tobytes(),
                       *(np.ascontiguousarray(values[at]).tobytes() for values in extra)])
@@ -209,10 +236,11 @@ def _groups(keys: Sequence[Sequence[bytes]], width: int) -> list[list[int]]:
     return groups[::-1]
 
 
-def _prefix(group: Sequence[int], keys: Sequence[Sequence[bytes]]) -> int:
+def _prefix(group: Sequence[int], lengths: Sequence[int], keys: Sequence[Sequence[bytes]] | None) -> int:
     """How many leading tokens every row of `group` shares; a row alone shares all of its own."""
-    prefix = len(keys[group[0]])
+    prefix = lengths[group[0]]
     for number in group[1:]:
+        assert keys is not None, "rows grouped by their keys"
         prefix = min(prefix, common_prefix(keys[group[0]], keys[number]))
     return prefix
 
@@ -222,12 +250,13 @@ def _documents(window: Sequence[tuple[int, Sequence[int]]], laid: Sequence[np.nd
     return sum((prefix > 0) + sum(len(laid[row]) > prefix for row in group) for prefix, group in window)
 
 
-def _windows(groups: Sequence[Sequence[int]], keys: Sequence[Sequence[bytes]], width: int,
-             documents: int | None = None) -> list[list[tuple[int, Sequence[int]]]]:
-    """`groups` packed first-fit, longest first, into windows of `width`, at most `documents` groups a
-    window where given: each window its groups in order, each as its prefix's length and its rows."""
-    planned = [(_prefix(group, keys), group) for group in groups]
-    sizes = np.asarray([prefix + sum(len(keys[number]) - prefix for number in group)
+def _windows(groups: Sequence[list[int]], lengths: Sequence[int], keys: Sequence[Sequence[bytes]] | None,
+             width: int, documents: int | None = None) -> list[list[tuple[int, list[int]]]]:
+    """`groups` of rows of `lengths` packed first-fit, longest first, into windows of `width`, at most
+    `documents` groups a window where given: each window its groups in order, each as its prefix's length
+    (`_prefix`, by `keys`) and its rows."""
+    planned = [(_prefix(group, lengths, keys), group) for group in groups]
+    sizes = np.asarray([prefix + sum(lengths[number] - prefix for number in group)
                         for prefix, group in planned], np.int64)
     order = np.argsort(-sizes, kind="stable")
     grouped, starts = first_fit(sizes[order], width, max(len(order), 1), documents)
