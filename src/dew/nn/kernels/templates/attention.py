@@ -756,12 +756,14 @@ class DropPlaces:
     """The global places a slice of a call draws its dropout at, where a sequence exchange holds a slice of
     its rows, heads, queries or keys (`dew.nn.attention_parallel.sequence_parallel_attention`): each local
     batch row's `rows` `[B]`, query head's `heads` `[H]`, query's `queries` `[Q]` and key's `keys` `[K]`
-    global index, so every device drops the weights one device holding the whole call drops."""
+    global index, so every device drops the weights one device holding the whole call drops; `queries` or
+    `keys` None where the slice holds them whole, its local places global (a heads exchange's, whose every
+    device holds every query and key)."""
 
     rows: jax.Array
     heads: jax.Array
-    queries: jax.Array
-    keys: jax.Array
+    queries: jax.Array | None = None
+    keys: jax.Array | None = None
 
 
 def dropout_keep(seed: jax.Array, rate: float, shape, places: DropPlaces | None = None) -> jax.Array:
@@ -772,11 +774,12 @@ def dropout_keep(seed: jax.Array, rate: float, shape, places: DropPlaces | None 
     own dtype."""
     *rows, heads, queries, keys = shape
     if places is None:
-        places = DropPlaces(jnp.arange(math.prod(rows)), jnp.arange(heads), jnp.arange(queries),
-                            jnp.arange(keys))
+        places = DropPlaces(jnp.arange(math.prod(rows)), jnp.arange(heads))
+    at_queries = jnp.arange(queries) if places.queries is None else places.queries
+    at_keys = jnp.arange(keys) if places.keys is None else places.keys
     draw = Draw((seed[0], seed[1]), places.rows.reshape(*rows, 1, 1, 1), places.heads.reshape(heads, 1, 1),
                 rate)
-    return draw.keep(places.queries[:, None], places.keys[None, :])
+    return draw.keep(at_queries[:, None], at_keys[None, :])
 
 
 @jax.tree_util.register_dataclass
