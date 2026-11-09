@@ -13,11 +13,20 @@ their operands bf16 instead (`bf16_dot_general`, which the dot family runs
 for it): an A100 computes the algorithm wrong where a dot has a vector side
 or sits below XLA's GEMM rewrite threshold.
 
-Dew's test processes run wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py
-sets): a CPU then sums every float32 product of the dot family, dot_general, einsum and matmul, in
-float64 and rounds once (`accumulated`), since XLA:CPU chooses its fp32 dot accumulation by shape,
-instruction set and release, and jax 0.12's summed twice numpy's error from float64 where 0.11's
-summed 0.6 of it. A library process's products are the plain products on every platform.
+On a CPU, every process sums each float32 contraction Dew forms (its dot family, `float32_dot_general`,
+`float32_einsum` and `float32_matmul`, a layer's projection, a grouped GEMM's ragged dot) whose
+precision keeps its float32 operands whole (DEFAULT, HIGH, HIGHEST, `FP32_SUMS`) in blocks, each
+block's products one FMA chain, the blocks' sums added as a pairwise tree (`dew.nn.pairwise`,
+`accumulated`), where XLA:CPU's one chain an output grew its error with the contraction (row 4863). The
+block is the longest whose rounding path is no longer than a vectorized dot's on the host, read from
+its float32 vector lanes (16 with AVX-512, 8 with AVX or AVX2 or an x86 CPU stating no flags, 4
+otherwise), so a product's bits are the host's vector width's, as a BLAS dot's are; every row of a call
+sums alike, whatever rows share it. A precision that narrows the operands (TF32, bf16 parts) or widens
+them (F64), a quantized module's product and a library's product that states its own derivative keep
+XLA's sum; a GPU's and a TPU's products are their backend's. Dew's test processes run wide CPU
+arithmetic instead (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py sets): a CPU sums those
+products in float64 and rounds once, outside a scope stating `FP32_SUMS`, which sums them as every
+process's CPU does.
 Convolutions, depthwise ones included, keep XLA's fp32 sum on a CPU: no convolution's check 1
 failed there, and XLA:CPU's float64 convolution cost a 3x3 one's training step 44 times (15.5 to
 675 ms on a 4x32x32x128 map), its best rewrite 2 to 4. Should a convolution's check 1 resolve above
@@ -567,7 +576,8 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     and its backward, read from the trace that gives the product's dtype (`_own_backward`).
 
     The wide sum is Dew's test setting, not a user option: a process without `WIDE_CPU_ARITHMETIC`
-    traces the plain product alone. Under it, it is real CPU execution's policy alone, chosen by the
+    traces the blocked sum on a CPU and the plain product elsewhere. Under it, it is real CPU execution's
+    policy alone, chosen by the
     platform the program is lowered for
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
     (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
