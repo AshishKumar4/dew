@@ -292,8 +292,8 @@ def test_compiled_flops_counts_every_iteration_of_a_scanned_body():
 def test_a_loop_bounded_by_a_counter_beside_a_predicate_counts_at_most_its_trips():
     """A loop whose condition is a counted bound and another predicate, `(i < 1) & taken`
     (`attention_algebra.once`, the guards' rare walk), runs its body at most the counted trips: its
-    matmul counted once, as a conditional's every branch is; a loop whose condition holds no counted
-    bound beside its predicate counts no FLOPs, unbounded."""
+    matmul counted once; a loop whose condition holds no counted bound beside its predicate counts no
+    FLOPs, unbounded."""
     rows, width = 8, 32
 
     def counted(kernel, values, taken):
@@ -309,6 +309,19 @@ def test_a_loop_bounded_by_a_counter_beside_a_predicate_counts_at_most_its_trips
     arguments = (jnp.ones((width, width)), jnp.ones((rows, width)), jnp.ones((), bool))
     assert compiled_flops(jax.jit(counted).lower(*arguments).compile()) == 2 * rows * width * width
     assert compiled_flops(jax.jit(uncounted).lower(*arguments).compile()) is None
+
+
+def test_a_conditional_counts_the_branch_of_the_most_flops():
+    """A conditional runs one of its branches (an XLA `conditional`): its FLOPs are its largest branch's,
+    two matmuls where the other branch runs one, not the three every branch summed counts (the scaled
+    attention forward's kernel beside its common one, `attention_algebra.may_scale`)."""
+    rows, width = 8, 32
+
+    def branched(kernel, values, taken):
+        return jax.lax.cond(taken, lambda: values @ kernel, lambda: (values @ kernel) @ kernel)
+
+    arguments = (jnp.ones((width, width)), jnp.ones((rows, width)), jnp.ones((), bool))
+    assert compiled_flops(jax.jit(branched).lower(*arguments).compile()) == 2 * (2 * rows * width * width)
 
 
 def test_fit_reports_throughput_to_the_tracker():

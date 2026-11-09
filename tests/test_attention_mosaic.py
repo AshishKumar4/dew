@@ -24,7 +24,7 @@ from attention_oracle import attention_terms
 from float64_terms import float64_terms
 from generation_support import INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -37,6 +37,7 @@ from dew.nn.kernels.templates import (
     attention_portable,
     attention_quantized,
     attention_triton,
+    bundles,
     mosaic_sm90,
     resources,
 )
@@ -178,7 +179,7 @@ ONE_FAMILY = frozenset({
     "test_a_tpu_cores_forward_is_on_par_interpreted", "test_a_tpu_cores_backward_is_on_par_interpreted",
     "test_the_forward_on_three_consumers_holds_check_1_interpreted",
     "test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted",
-    "test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_row_interpreted",
+    "test_the_training_forwards_rows_past_fp32s_largest_keep_their_mean_and_every_other_row_interpreted",
     "test_a_backward_whose_dkv_launch_holds_more_keys_than_its_dq_launch_writes_every_key_interpreted",
     "test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_tile_interpreted",
     "test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted",
@@ -900,14 +901,18 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
 
 
 @INTERPRETS
-def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_row_interpreted():
+def test_the_training_forwards_rows_past_fp32s_largest_keep_their_mean_and_every_other_row_interpreted():
     """A call as many queries as heads, one consumer's tile of them, whose head 0 sees two keys of equal
     logits past the fold's reach over values near bf16's largest: the call walks again unfolded, and head
-    0's rows, whose weighted values would pass fp32's largest, shift in that walk (`algebra.Argmax.shift`,
-    from the peak walk's reach), their residuals in its units. Head 0's output is its values' mean exactly,
-    its one value row (where the reference's fp32 sums overflow); every other head's rows are the bits they
-    take where head 0's values are ordinary (no row shifts for another's sake); and the backward from these
-    residuals gives head 0's values a gradient wherever the reference does, finite where it is."""
+    0's rows, whose weighted values' sum would pass fp32's largest, hold it at their scale in that walk
+    (`algebra.SCALED_WALK`), their residuals at it. Head 0's output is its values' mean exactly, its one
+    value row (where the reference's fp32 sums overflow); every other head's rows are the bits they take
+    where head 0's values are ordinary (a row's scale its own: the scaled op's kernel,
+    `MosaicForward.scaled`, takes them through its scaled arithmetic at the scale `2^0`, the unscaled
+    kernel's bits at one config, the fed mma.sync's both take, `tuning.pinned_where_taken`: the scaled
+    walk's small weights' parts hold a warpgroup MMA consumer's registers past a thread's); and the
+    backward from these residuals gives head 0's values a gradient wherever the reference does, finite
+    where it is."""
     queries, keys, width = 64, 2, 64
     spans = template.spans(queries, keys, 1)
     streams = jax.random.split(jax.random.key(0), 4)
@@ -916,7 +921,7 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
     # Head 0's logits, 128 * 128 * 64 / 8, past the fold's reach; its values overflow a sum of two or not.
     query, key = (array.at[:, :, 0].set(128.0) for array in (query, key))
     query, key, dout = (array.astype(jnp.bfloat16) for array in (query, key, dout))
-    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family=WGMMA)
+    tiles = attention_mosaic.Tiles(64, 32, 2, 1, family=bundles.MmaFed.name, columns=32)
 
     def trained(value):
         with _device(interpret=True), _pinned(tiles):
@@ -943,15 +948,14 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
 
 
 @pytest.mark.parametrize("held", ["keys", "start"])
-def test_a_training_forwards_row_whose_sums_stay_in_range_takes_no_shift_whatever_its_values_reach(held):
+def test_a_training_forwards_output_scales_exactly_with_its_values_however_large(held):
     """A training forward's head whose rows see 512 keys, the row's largest magnitude near fp32's largest
     under a weight near fp32's least normal at the row's maximum (`held`: a key's value, its logit 86.5
     below the row's peak; or a resumed state's sums, its maximum 120 binades below it), every other key
-    weighing nothing or holding zeros: its weighted values stay small, so no row shifts (`algebra.row_shift`
-    of its terms at the walk's maximum, `algebra.Reach`, `algebra.started_reach`), though its count times
-    its largest magnitude passes fp32's largest by 2^9, and its small weight is not shifted out of range.
-    Its output is exactly 2^64 times the call's over its values and sums at 2^-64, which no bound comes
-    near."""
+    weighing nothing or holding zeros: the row's scale (`algebra.SCALED_WALK`) is a power of two, and a
+    weight it takes below fp32's least normal enters the small weights' product raised (`algebra.at_scale`),
+    so its small weight keeps its bits. Its output is exactly 2^64 times the call's over its values and sums
+    at 2^-64."""
     queries, keys, width = 64, 512, 64
     spans = template.spans(queries, keys, 1)
     streams = jax.random.split(jax.random.key(1), 3)
@@ -1156,39 +1160,6 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
         else:
             _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, tiles=config,
                            training=_kept(launch), target=target)
-
-
-@INTERPRETS
-def test_a_guarded_launch_walks_its_own_key_tiles():
-    """A spans call (four documents over 256 keys, their ids from 1: 0 is padding) whose weighted values
-    pass fp32's largest, at a launch of 128-key tiles whose guarded walk takes its own key tiles
-    (`guarded_tiles`): the guarded launch runs on tiles its program takes, reads each block's
-    keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
-    attention, which normalizes its weights before their product (bf16 values near their largest, equal
-    logits)."""
-    tiles = attention_mosaic.Tiles(64, 128, 2, 1, family=WGMMA)
-    rows, queries, heads, kv_heads = 1, 256, 2, 1
-    documents = jnp.repeat(jnp.arange(1, 5, dtype=jnp.int32), queries // 4)[None]
-    spans = template.spans(queries, queries, rows, segment_ids=documents)
-    keep = (documents[:, :, None] == documents[:, None, :])[:, None]
-
-    def draw(seed):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        query = jnp.zeros((rows, queries, heads, 128), jnp.bfloat16)
-        key = jnp.zeros((rows, queries, kv_heads, 128), jnp.bfloat16)
-        value = jax.random.uniform(streams[2], (rows, queries, kv_heads, 128), jnp.float32, 2.9e38,
-                                   3.3e38).astype(jnp.bfloat16)
-        return query, key, value
-
-    def ours(query, key, value):
-        with _device(interpret=True), _pinned(tiles):
-            return attention_mosaic.forward(query, key, value, spans, interpret=True)
-
-    def reference(query, key, value):
-        return jax.nn.dot_product_attention(query, key, value, mask=keep, implementation="xla")
-
-    assert_as_exact(jax.jit(ours), as_given(jax.jit(reference)), draw, "mosaic guarded spans forward",
-                    seeds=SEEDS)
 
 
 @pytest.mark.parametrize("unseen", UNSEEN)
@@ -1943,9 +1914,8 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     The hardware's work is every tile its walk issues, whole: each 64 by 64 tile holding a reached pair over
     the padded rows (a padded consumer's and a causal diagonal tile's masked half computed with the rest, as
     an H100's tensor-pipe counts read them, row 3948's receipt), and one recomputed `Q K^T` more in the
-    training forward and in the backward; a rerun (the guarded launch, the fold's natural walk) adds none. The
-    launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX walk in a
-    conditional, whose products the count bounds apart."""
+    training forward and in the backward; a rerun (the fold's natural walk) adds none. The launches' own
+    statements are read."""
     from dew.telemetry.instrumentation import hlo_flops
 
     rows, heads, kv_heads, width = 1, 4, 2, 64

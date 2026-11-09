@@ -217,7 +217,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form))
     if mainloop == 'mosaic':
-        if kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
+        if kept is Kept.NONE and attention_decode.serves(query, key, value, spans, hooks,
+                                                         natural=config.natural, scale=config.scale,
                                                          target=generation.gpu_target()):
             # A memory-bound inference call (a decode step's, a verify block's) as the decode's work list.
             return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale)

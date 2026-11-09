@@ -857,6 +857,13 @@ def call_weights(calls: Mapping[str, Mapping[str, float]], entry: str) -> dict[s
     return weights
 
 
+def _branches(instruction: _Instruction) -> list[str]:
+    """The computations a conditional `instruction` runs one of, its branches; none for another
+    instruction."""
+    branches = _BRANCHES.search(instruction.attributes)
+    return [] if branches is None else _NAME.findall(branches.group(1))
+
+
 def _merged_call_counts(computation: _Computation,
                         computations: dict[str, _Computation]) -> dict[str, float]:
     """Per call of this computation, how often each computation it names runs."""
@@ -885,8 +892,8 @@ class StepFlops:
         return StepFlops(self.model + other.model, self.hardware + other.hardware,
                          self.unsized + other.unsized)
 
-    def __rmul__(self, calls: int) -> "StepFlops":
-        """The FLOPs of `calls` such calls (a step split into microbatches)."""
+    def __rmul__(self, calls: float) -> "StepFlops":
+        """The FLOPs of `calls` such calls (a step split into microbatches, a loop's trips)."""
         return StepFlops(calls * self.model, calls * self.hardware, calls * self.unsized)
 
     def utilizations(self, steps: int, step_time: float, peak: float | None = None) -> dict[str, float]:
@@ -968,22 +975,38 @@ def hlo_flops(text: str) -> StepFlops | None:
     computations, entry = _parse(text)
     if entry is None:
         return None
-    weights = _weights(computations, entry)
-    model = hardware = unsized = 0.0
-    for name, computation in computations.items():
-        if not weights[name]:
-            continue
-        counted = [(*_instruction_flops(instruction, computation.shapes), instruction.recomputed)
-                   for instruction in computation.instructions.values()]
-        launches = sum(_unsized(instruction) for instruction in computation.instructions.values())
-        unsized += weights[name] * launches if launches else 0.0
-        ran = sum(flops for _, flops, _ in counted)
-        if not ran:
-            continue
-        hardware += weights[name] * ran
-        model += weights[name] * sum(flops for flops, _, recomputed in counted if not recomputed)
-    totals = (model, hardware, unsized)
-    return StepFlops(*totals) if all(math.isfinite(total) for total in totals) else None
+    found = _inclusive(entry, computations, {})
+    totals = (found.model, found.hardware, found.unsized)
+    return found if all(math.isfinite(total) for total in totals) else None
+
+
+def _inclusive(name: str, computations: dict[str, _Computation], memo: dict[str, StepFlops]) -> StepFlops:
+    """The FLOPs of one call of computation `name` with every computation it runs (`hlo_flops`): its own
+    instructions', each computation it calls times the calls (`_call_counts`, a loop's body its trips), and
+    of each conditional's branches the one of the most hardware FLOPs, the most a run of it takes: a
+    conditional runs one branch, where every branch summed counted a rare walk's kernel beside the common
+    one's (the scaled attention forward's, `attention_algebra.may_scale`)."""
+    if name in memo:
+        return memo[name]
+    computation = computations[name]
+    counted = [(*_instruction_flops(instruction, computation.shapes), instruction.recomputed)
+               for instruction in computation.instructions.values()]
+    launches = sum(_unsized(instruction) for instruction in computation.instructions.values())
+    total = StepFlops(sum(flops for flops, _, recomputed in counted if not recomputed),
+                      sum(flops for _, flops, _ in counted), float(launches))
+    for instruction in computation.instructions.values():
+        branches = _branches(instruction)
+        for callee, times in _call_counts(instruction, computation, computations).items():
+            if callee in computations and times and callee not in branches:
+                called = _inclusive(callee, computations, memo)
+                # A call that runs none adds none, however many times its loop would.
+                if called != NO_FLOPS:
+                    total = total + times * called
+        ran = [_inclusive(branch, computations, memo) for branch in branches if branch in computations]
+        if ran:
+            total = total + max(ran, key=lambda flops: (flops.hardware, flops.model, flops.unsized))
+    memo[name] = total
+    return total
 
 
 def _unsized(instruction: _Instruction) -> bool:

@@ -4,6 +4,8 @@ CUDA backend for a compile-only A100 and H100 on the CPU (tests/kernel_compile.p
 registers as its model states them and spill-free; and an A100's launches counting the shared memory their
 lowering asks for. The mainloop's values are tests/test_attention_mosaic.py's."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -203,21 +205,26 @@ def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(acc
 
 def _forward_kernels(op, ba, config) -> dict:
     """The forward's register model by each name a launch of it takes (`attention_mosaic_forward._launch`:
-    `attention_{forward, training, peaks}`, then `_natural`, `_kept`, `_guarded`, `_columns{width}` and
-    `_split` where it is so), each the op's (`MosaicForward.registers`): a peak walk's its own, a natural
-    launch's at its own tiles (`Tiles.relaunch`), a launch over a block of the values' columns at that
-    block's width."""
-    family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
+    `attention_{forward, training, peaks}`, then `_natural`, `_scaled`, `_kept`, `_columns{width}` and
+    `_split` where it is so), each the op's (`MosaicForward.registers`) at its config: a scaled launch's the
+    scaled op's at the config it derives (`MosaicForward.scaled`, its own registers and shared memory), a
+    peak walk's its own, a natural launch's at its own tiles (`Tiles.relaunch`), a launch over a block of the
+    values' columns at that block's width."""
+    scaled_op = dataclasses.replace(op, scaled=True)
+    scaled_config = scaled_op.derived(ba, generation.gpu_target())
     found = {}
-    for natural, tiles in (("", config), ("_natural", config.relaunch)):
-        for kind in ("forward", "training", "peaks"):
-            for columns in (None, 64, 128, 256):
-                registers = op.registers(ba, tiles, peaks=kind == "peaks", columns=columns)
-                model = resources.register_model(family, tiles.consumers, registers)
-                named = "" if columns is None else f"_columns{columns}"
-                found.update({f"attention_{kind}{natural}{kept}{guarded}{named}{split}": model
-                              for kept in ("", "_kept") for guarded in ("", "_guarded")
-                              for split in ("", "_split")})
+    for scaled, of, at in (("", op, config), ("_scaled", scaled_op, scaled_config)):
+        if at is None:
+            continue
+        family = attention_mosaic_program.bundle_of(at, jnp.bfloat16)
+        for natural, tiles in (("", at), ("_natural", at.relaunch)):
+            for kind in ("forward", "training", "peaks"):
+                for columns in (None, 64, 128, 256):
+                    registers = of.registers(ba, tiles, peaks=kind == "peaks", columns=columns)
+                    model = resources.register_model(family, tiles.consumers, registers)
+                    named = "" if columns is None else f"_columns{columns}"
+                    found.update({f"attention_{kind}{natural}{scaled}{kept}{named}{split}": model
+                                  for kept in ("", "_kept") for split in ("", "_split")})
     return found
 
 

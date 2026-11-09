@@ -115,7 +115,7 @@ def sliced_walk(mask: str, merged: bool):
                                 lambda a, b: jnp.dot(a, b, preferred_element_type=jnp.float32))
 
         states = [algebra.plain_walk(spec, tile, tile + 1, keys_at,
-                                     algebra.started(spec, None, ROWS, WIDTH, None))
+                                     algebra.started(spec, None, ROWS, WIDTH))
                   for tile in range(KEYS // TILE)]
         if merged:
             state = algebra.merged(spec, jax.tree.map(lambda *parts: jnp.stack(parts), *states), 0)
