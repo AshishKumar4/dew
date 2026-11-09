@@ -600,12 +600,15 @@ def _attention_preferred(case: AttentionCase) -> str:
     W57-a100: bf16, 32/8 heads x 128, 2048 and 8192 tokens, B 1 and 4). An accurate call trains on the
     template whatever its bias, as 'inference' takes the fast form alone (xla's attention computes no
     other). A call only spans express (`AttentionCase.spans_only`: block groups, key validity, runs or counted
-    places) runs the template on every backend, which alone reads them: every other kernel refuses it and the
-    reference path builds its dense mask, `[B, 1, S, S]` (rows 1495, 1953). A call whose products a
-    quantized model's rule owns (`attention_quantized.owner`; an adapter's or an input quantizer's
-    interception owns its projections alone, never the attention's products) and quantizes runs the
-    template's quantized attention where it takes the rule and the call (`attention_quantized.takes`), else
-    the reference path, which forms each product whole before Qwix quantizes it; a rule quantizing no
+    places) runs the template on a GPU and a TPU, which alone reads them as spans: every fused kernel there
+    refuses it and the reference path builds its dense mask, `[B, 1, S, S]` (rows 1495, 1953); on a CPU it
+    runs as any call there does, jax.nn's xla attention over the dense mask they mean (`visibility_mask`)
+    where its scores fit, else the template (a forked decision row's call took the template's plain-JAX
+    mainloop, and a run recorded fast its accurate route, once its forks' runs reached the call). A call
+    whose products a quantized model's rule owns (`attention_quantized.owner`; an adapter's or an input
+    quantizer's interception owns its projections alone, never the attention's products) and quantizes runs
+    the template's quantized attention where it takes the rule and the call (`attention_quantized.takes`),
+    else the reference path, which forms each product whole before Qwix quantizes it; a rule quantizing no
     activation leaves them whole (`attention_quantized.whole`)."""
     backend = generation.backend()
     if (rule := attention_quantized.owner()) is not None and not attention_quantized.whole(rule):
@@ -615,7 +618,7 @@ def _attention_preferred(case: AttentionCase) -> str:
         if attention_quantized.takes(rule) and not (case.sinks or case.dropout):
             return 'template'
         return 'reference'
-    if case.spans_only:
+    if case.spans_only and backend in ('gpu', 'tpu'):
         return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
             and not (case.causal and generation.gpu_target().architecture.wgmma)):
