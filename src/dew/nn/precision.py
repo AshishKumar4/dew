@@ -744,15 +744,16 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
         params = equation.params
         inner = params.get("jaxpr")
         product = functools.partial(jax.lax.dot_general, out_sharding=params.get("out_sharding"))
-        if equation.primitive is jax.lax.dot_general_p and (made := projection_product(
-                product, given[0], given[1], params["dimension_numbers"], params["precision"],
-                params["preferred_element_type"])) is not None:
-            outputs = [made]
-        elif (equation.primitive.name == "ragged_dot_general" and params.get("group_offset") is None
-              and (made := projection_product(
-                  functools.partial(jax.lax.ragged_dot_general, out_sharding=params.get("out_sharding")),
-                  given[0], given[1], params["ragged_dot_dimension_numbers"], params["precision"],
-                  params["preferred_element_type"], group_sizes=given[2])) is not None):
+        made = None
+        if equation.primitive is jax.lax.dot_general_p:
+            made = projection_product(product, given[0], given[1], params["dimension_numbers"],
+                                      params["precision"], params["preferred_element_type"])
+        elif equation.primitive.name == "ragged_dot_general" and params.get("group_offset") is None:
+            made = projection_product(
+                functools.partial(jax.lax.ragged_dot_general, out_sharding=params.get("out_sharding")),
+                given[0], given[1], params["ragged_dot_dimension_numbers"], params["precision"],
+                params["preferred_element_type"], group_sizes=given[2])
+        if made is not None:
             outputs = [made]
         elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.Jaxpr):
             # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).

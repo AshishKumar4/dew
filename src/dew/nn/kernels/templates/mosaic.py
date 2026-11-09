@@ -2130,7 +2130,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         def read(refs, other, column=0, width=None):
             # The partials' structure read off the running value's: a ref may itself be a tree; the widest
             # leaf's slice of `width` columns from `column` alone where the merge is sliced.
-            leaves, tree = jax.tree.flatten(summed)
+            tree = jax.tree.structure(summed)
             loaded = [plgpu.load(ref.at[other] if place != widest or width is None
                                  else ref.at[other, :, pl.ds(column, width)], optimized=False)
                       for place, ref in enumerate(tree.flatten_up_to(refs))]
@@ -2142,9 +2142,9 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                    else -(-leaf.size * leaf.dtype.itemsize // (4 * resources.THREADS))
                    for leaf in jax.tree.leaves(summed))
         ahead = max(1, across.MERGED_REGISTERS // held)
-        # A partial past what a merge reads ahead (a GEMM tile's) is merged a slice of its widest leaf's columns
-        # at a time, its other leaves (a softmax merge's row statistics) read whole each slice, so the running
-        # value and one slice are live, not two whole tiles (`across.merge_slices`).
+        # A partial past what a merge reads ahead (a GEMM tile's) is merged a slice of its widest leaf's
+        # columns at a time, its other leaves (a softmax merge's row statistics) read whole each slice, so the
+        # running value and one slice are live, not two whole tiles (`across.merge_slices`).
         widest, slices = across.merge_slices(summed, held)
 
         def sliced(value, start, width):
