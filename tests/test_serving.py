@@ -1098,20 +1098,24 @@ def test_a_pooled_servers_host_tier_reads_each_processs_prefix_back_from_its_own
     assert [report["shared"] for report in reports] == [8, 8]
 
 
-@pytest.mark.parametrize("host_pages, hits", [(0, 0), (1, 4), (8, 8)], ids=["device", "one-slot", "host"])
-def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits):
+@pytest.mark.parametrize("host_pages, hits, offloaded",
+                         [(0, 0, False), (1, 4, False), (8, 8, False), (8, 8, True)],
+                         ids=["device", "one-slot", "host", "host beside an offloaded pool"])
+def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits, offloaded):
     """A prefix cache of eight pages of four tokens, one slot: a prompt's two shared pages are cached as it
     ends, then two other prompts take the pool's pages and it reclaims them. With a host tier the reclaimed
     pages go to host memory and the prompt again reads its 8 tokens back from there, or its first 4 where
     one host slot keeps the page reclaimed last; without one it prefills them again. Every request draws
     what its lone call draws (ledger 874); a hybrid stack's host tier is `assert_reads_a_shared_prefix`'s
-    `from-the-host` and `from-one-host-slot` sites, judged by check 1."""
+    `from-the-host` and `from-one-host-slot` sites, judged by check 1. A pool offloaded to host memory
+    itself (`KVCache.offloaded`) spills and reads back its pages a page at a time alike."""
     bound = task(Sampling(temperature=1.0))
     shared, others, budget = "123456781", ["987654329876", "555544443333"], 6
     requests = [shared, *others, shared]
     alone = [bound(held, budget, key=index) for index, held in enumerate(requests)]
     server = Server.from_task(bound, slots=1, capacity=64, admission=1, prefix_cache=True,
-                              kv_cache=KVCache(page_size=4, pages=8), host_pages=host_pages)
+                              kv_cache=KVCache(page_size=4, pages=8, offloaded=offloaded),
+                              host_pages=host_pages)
     drawn = []
     for index, held in enumerate(requests):
         ticket = server.submit(held, budget, key=index)
@@ -2029,3 +2033,46 @@ def test_a_padding_positions_value_is_not_part_of_a_served_row():
     server.run()
     expected = bound(jnp.array([[1, 2]], jnp.int32), 4, key=0)
     np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
+
+
+@pytest.mark.parametrize("kv_cache", [KVCache(page_size=16), KVCache()], ids=["paged", "dense"])
+def test_an_offloaded_cache_serves_what_a_resident_one_serves(kv_cache):
+    """A server whose keys and values live in host memory (`KVCache.offloaded`, Hugging Face's offloaded
+    cache), each layer's brought to the device for its step and written back after it, serves every
+    request what the same server over a resident cache serves, its pool held in pinned host memory: the
+    same program over the same values, moved and not recomputed, so the draws are the same bits; a prefix
+    cache's host tier beside it is `test_a_host_tier_keeps_prefix_pages_the_pool_reclaims`'s."""
+    bound = task()
+    resident, offloaded = (Server.from_task(bound, slots=4, capacity=128, admission=2,
+                                            kv_cache=dataclasses.replace(kv_cache, offloaded=held))
+                           for held in (False, True))
+    pooled = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(offloaded.cache)
+              if leaf_name(path) in POOLED]
+    assert pooled and all(leaf.sharding.memory_kind == "pinned_host" for leaf in pooled)
+    generations = []
+    for server in (resident, offloaded):
+        tickets = [server.submit(prompt, budget, key=index)
+                   for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+        server.run()
+        generations.append([ticket.result() for ticket in tickets])
+    for mine, theirs in zip(*generations, strict=True):
+        assert mine.text == theirs.text
+        assert_same_generation(mine, theirs)
+
+
+def test_a_sources_offloaded_cache_generates_what_a_resident_one_does():
+    """A source whose generation config names Hugging Face's offloaded cache (`cache_implementation`
+    "offloaded") generates over a cache whose keys and values live in host memory
+    (`generation_config.source_cache`), what the same task over a resident cache generates; a source
+    naming another cache Dew does not keep is refused."""
+    from dew.interop.generation_config import source_cache
+
+    bound = task()
+    offloaded = dataclasses.replace(bound, model=source_cache({}, {"cache_implementation": "offloaded"},
+                                                               bound.model))
+    assert offloaded.model.kv_cache.offloaded and not bound.model.kv_cache.offloaded
+    assert source_cache({}, {"cache_implementation": "static"}, bound.model) is bound.model
+    for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True)):
+        mine, theirs = offloaded(prompt, budget, key=index), bound(prompt, budget, key=index)
+        assert mine.text == theirs.text
+        assert_same_generation(mine, theirs)

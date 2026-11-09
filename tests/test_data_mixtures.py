@@ -16,6 +16,7 @@ the same claims in real processes with a real checkpoint between them.
 """
 
 import collections
+import contextlib
 import dataclasses
 import itertools
 import json
@@ -1357,14 +1358,63 @@ def test_a_fit_repeats_a_chain_only_where_its_read_can_end(tmp_path, name):
     assert_same(parameters(fitted), parameters(written), f"{name} as the fit reads it")
 
 
-def test_phases_of_another_batch_are_refused_before_their_step_ends_are_counted():
-    """Phases read until training steps, so each is of the run's one batch (`phases`): one batched by 4
-    between two batched by 8 is refused, where its end was counted at 4 records a step and the stream
-    moved on a step early under a loader declaring 8 (row 3940)."""
+def test_phases_of_other_batches_each_read_their_own_steps_in_their_own_rows():
+    """Phases read until training steps, each in batches of its own (`phases`): one batched by 4 between
+    two batched by 8 reads its three steps of 4 records, from step 1 to step 4, and the corpus it shares
+    with the others reads on where the phase before left it, each record once, in the corpus's own order
+    (rows 3940, 4812; it was refused, its end once counted at the first phase's 8 records a step)."""
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
-    with pytest.raises(ValueError):
-        compile(phases((first.batch(8), 1), (first.batch(4), 4), (first.batch(8), None)), read="memory",
-                loading=READ)
+    loader = compile(phases((first.batch(8), 1), (first.batch(4), 4), (first.batch(8), None)), read="memory",
+                     loading=READ)
+    read = ids(itertools.islice(loader.train(DataPartition()), 6))
+    alone = [value for batch in ids(itertools.islice(trained(first, batch=4).train(DataPartition()), 9))
+             for value in batch]
+    assert [len(batch) for batch in read] == [8, 4, 4, 4, 8, 8]
+    assert [value for batch in read for value in batch] == alone[:36]
+
+
+def test_a_fit_over_phases_of_other_batches_steps_each_in_updates_of_its_own():
+    """A fit accumulating updates of two steps over phases of 16, then 8, then 16 records a step, each phase's
+    end at an update's (`DataPartition.window`), steps each batch in a program of its own and trains as the
+    three phases fitted one after another from the state the one before left, each from its corpus's first
+    record: each update pools one batch's microbatches, and no update spans two phases (SGD keeps no state
+    of its own, so the fits chain exactly). A phase of another batch that begins inside an update is
+    refused, naming the update."""
+    from dew.telemetry.compiles import Compiles
+
+    corpora = [Pipeline(Memory(Indexed(tag, 64))).shuffle(tag).repeat() for tag in (1, 2, 3)]
+    batches, ends = (16, 8, 16), (2, 6, 8)
+
+    def accumulating() -> Trainer:
+        return Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
+                       layout=Layout(min_shard=1, tolerance=1.0), accumulation=2)
+
+    phased = phases(*((corpus.batch(batch), end) for corpus, batch, end in
+                      zip(corpora, batches, (*ends[:-1], None), strict=True)))
+    with Compiles("step") as compiles:
+        state = accumulating().fit(compile(phased, read="memory", loading=READ), steps=ends[-1])
+    assert int(state.step) == ends[-1] and compiles.count == 2
+    chained = None
+    for corpus, batch, end in zip(corpora, batches, ends, strict=True):
+        chained = accumulating().fit(compile(corpus.batch(batch), read="memory", loading=READ), steps=end,
+                                     state=chained)
+    assert_same(parameters(state), parameters(chained), "phases fitted one after another")
+    # A phase of another batch begins where an update does, at step 4 of updates of 2, and not at step 3.
+    for end, refused in ((4, False), (3, True)):
+        loader = compile(phases((corpora[0].batch(16), end), (corpora[0].batch(8), None)), read="memory",
+                         loading=READ)
+        with pytest.raises(ValueError) if refused else contextlib.nullcontext():
+            loader.train(DataPartition(window=2)).close()
+
+
+def test_an_epoch_over_phases_of_other_batches_counts_each_phases_steps_in_its_own_rows():
+    """A pass over one corpus of 64 records read on by phases of 8, then 4 records a step, the second from
+    step 2, takes its first 16 records in two steps and the other 48 in twelve (`Loader.stages`,
+    `steps_through`), as a ramp's stages count theirs: fourteen, where counting every step in the first
+    phase's batch took eight."""
+    corpus = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    loader = compile(phases((corpus.batch(8), 2), (corpus.batch(4), None)), read="memory", loading=READ)
+    assert loader.steps_per_epoch == 14
 
 
 class TokenCounted(Regression):

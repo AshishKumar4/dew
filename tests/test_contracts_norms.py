@@ -149,8 +149,9 @@ def test_a_surrogate_holds_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_fused_norms_and_products_hold_every_order(edge):
-    """`norm_swiglu`'s fused pre-norm seam, RMS norm, gated norm, SiLU product and packed SiLU product (each
-    through `generation.linear_tangent`), interpreted on a CPU as the norm tests call them: every order finite
+    """`norm_swiglu`'s fused pre-norm seam, RMS norm, RMS norm with an activation after it (its tangent on
+    the tile declared), gated norm, SiLU product and packed SiLU product (each through
+    `generation.linear_tangent`), interpreted on a CPU as the norm tests call them: every order finite
     wherever float64 is a normal float32 and the plain formula, the norm and the product as written, is."""
     import test_norm_swiglu as norms
 
@@ -165,6 +166,9 @@ def test_the_fused_norms_and_products_hold_every_order(edge):
                             (x, branch, scale), (dx, dbranch, dscale),
                             jnp.concatenate([cotangent, cotangent], axis=-1)),
         "an unweighted RMS norm": (norms.fused_unweighted(1e-6), plain_rms, (x,), (dx,), cotangent),
+        "an RMS norm with an activation": (norms.fused_activated(1e-6, jax.nn.swish),
+                                           lambda x, scale: jax.nn.swish(plain_rms(x) * scale), (x, scale),
+                                           (dx, dscale), cotangent),
         "a gated RMS norm": (norms.fused_gated(1e-6, jnp.float32, "silu"),
                              lambda x, gate, scale: plain_rms(x) * scale * jax.nn.silu(gate),
                              (x, gate, scale), (dx, dgate, dscale), cotangent),

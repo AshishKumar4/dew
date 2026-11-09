@@ -251,7 +251,9 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
                 jax.random.normal(keys[2], (136, 256)).astype(jnp.float32))
 
     def product(dtype):
-        return lambda x, w: gemm.gemm(x.astype(dtype), w.astype(dtype), group_sizes, out_dtype=jnp.float32)
+        # fp32 out of 16-bit products, float64 out of the truth's, whose cotangent is float64.
+        out = jnp.promote_types(dtype, jnp.float32)
+        return lambda x, w: gemm.gemm(x.astype(dtype), w.astype(dtype), group_sizes, out_dtype=out)
 
     def through_template(x, w, dy):
         with generation.chosen(grouped_matmul="mosaic_gpu"):
@@ -264,6 +266,8 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
     assert_as_exact(jax.jit(through_template), jax.jit(through_xla), draw,
                     f"16-bit products into fp32 {depth}", seeds=SEEDS,
                     truth_fn=with_gradients(product(jnp.float64)))
+
+
 def the_template_takes_a_gpt_oss_width_as_exactly_as_xla():
     """On this GPU the template named (`mosaic_gpu`) for a projection 2880 wide, gpt-oss-120b's (every tile
     width dividing it an odd multiple of 64), its groups' rows odd, so each group's last tile stores a

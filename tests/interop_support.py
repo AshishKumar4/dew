@@ -138,32 +138,51 @@ def assert_exported_decoder_follows_transformers(loaded, directory: Path, draw, 
     np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
 
 
-def transformers_arms(model, run, *, source=None, twin=None):
-    """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
-    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by the float64
-    twin (`tools.torch_precision.float64_twin`) of `source`, by default `model`, inside `float64`, each
-    run `as_given`, its tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly.
-    A narrower `model` (bfloat16) is measured from its stored weights' truth: `source`, the float32
-    load. `twin` is the twin itself where the reference builds its own (a PEFT model's)."""
+def torch_arms(reference, truth, *, widening=None):
+    """Check 1's reference and truth over torch: `reference(*inputs)` and `truth(*inputs)`, each run
+    `as_given` under `torch.no_grad`, the truth inside `widening` (`tools.torch_precision.float64` where
+    None), their tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly."""
     import torch
 
-    from tools.torch_precision import float64, float64_twin
+    from tools.torch_precision import float64
+
+    def as_numpy(out):
+        if not isinstance(out, torch.Tensor):
+            return out
+        held = out.detach()
+        return (held.float() if held.dtype == torch.bfloat16 else held).numpy()
+
+    def numpy(tree):
+        return jax.tree.map(as_numpy, tree)
+
+    def arm(call, context):
+        @as_given
+        def given(*inputs):
+            with context(), torch.no_grad():
+                return numpy(call(*inputs))
+        return given
+
+    return arm(reference, contextlib.nullcontext), arm(truth, float64 if widening is None else widening)
+
+
+def transformers_arms(model, run, *, source=None, twin=None):
+    """Check 1's reference and truth over the transformers `model` (`torch_arms`): `run(model, *inputs)` on
+    a draw's inputs as torch tensors (integers as int64), by `model` and by the float64 twin
+    (`tools.torch_precision.float64_twin`) of `source`, by default `model`. A narrower `model` (bfloat16)
+    is measured from its stored weights' truth: `source`, the float32 load. `twin` is the twin itself where
+    the reference builds its own (a PEFT model's)."""
+    import torch
+
+    from tools.torch_precision import float64_twin
 
     def tensor(value):
         value = np.asarray(value)
         return torch.from_numpy(value.astype(np.int64) if np.issubdtype(value.dtype, np.integer) else value)
 
-    def arm(network, precision):
-        @as_given
-        def given(*inputs):
-            with precision(), torch.no_grad():
-                return jax.tree.map(lambda out: (out.float() if out.dtype == torch.bfloat16 else out).numpy(),
-                                    run(network, *map(tensor, inputs)))
-        return given
-
     if twin is None:
         twin = float64_twin(model if source is None else source)
-    return arm(model, contextlib.nullcontext), arm(twin, float64)
+    return torch_arms(lambda *inputs: run(model, *map(tensor, inputs)),
+                      lambda *inputs: run(twin, *map(tensor, inputs)))
 
 
 def peft_twin(model):
@@ -475,6 +494,33 @@ def gemma_features(model_type, config, waveforms):
 
 
 NVFP4_QDQ = Path(__file__).parent / "fixtures" / "codecs" / "nvfp4_qdq"
+
+
+def stored_codec(directory: Path):
+    """A codec fixture's stored tensors and the codec its config names (`codecs.source_quantization`),
+    every layer's projections stored quantized (each a module's packed weight and scales), and nothing
+    else."""
+    from dew.interop import codecs
+    from dew.interop.safetensors_io import read_weights
+
+    stored = read_weights(directory)
+    codec = codecs.source_quantization(json.loads((directory / "config.json").read_text()))
+    assert codec is not None
+    assert sorted(codec.names(stored)) == sorted({name.rsplit(".", 1)[0] + ".weight" for name in stored
+                                                  if name.rsplit(".", 1)[0].endswith("_proj")})
+    return stored, codec
+
+
+def quantized_checkpoints() -> list[Path]:
+    """Every checkpoint fixture whose weights a codec stores: its config declares a format Dew reads
+    (`codecs.source_quantization`) and the fixture holds its weights, found from the fixtures as they are
+    (row 178)."""
+    from dew.interop.codecs import source_quantization
+
+    root = Path(__file__).parent / "fixtures"
+    return [config.parent for config in sorted(root.glob("**/config.json"))
+            if any(config.parent.glob("*.safetensors"))
+            and source_quantization(json.loads(config.read_text())) is not None]
 """Two compressed-tensors NVFP4 checkpoints of one tiny Qwen3 with input QDQ, one per local-scale
 rounding, each with the author's reference forward (`reference.npz`)."""
 
@@ -488,24 +534,25 @@ def nvfp4_qdq_case(kind: str) -> tuple[Path, dict[str, np.ndarray]]:
         return directory, dict(reference)
 
 
-def clearing_selections(loaded, draw, label: str, *, stable: bool = True, tries: int = 64):
+def clearing_selections(loaded, draw, label: str, *, stable: bool = True, tries: int = 64,
+                        margin: float | None = None):
     """`draw`, for a decoder that selects discontinuously (a mixture's routing, a lightning indexer's
-    top-k, Gemma 3n's gaussian top-k), redrawn until its selections clear `selection_margins.MARGIN`,
-    so the float32 runs and the float64 run select alike (`selection_margins.clearing`, at most `tries`
-    draws a seed); `draw` itself otherwise. A selection the compared runs could break a tie of
-    differently clears none where one of them is not `stable` (torch's `topk`,
-    `selection_margins.margin`)."""
+    top-k, Gemma 3n's gaussian top-k), redrawn until its selections clear `margin` (float32 runs'
+    `selection_margins.MARGIN` where None), so the narrow runs and the float64 run select alike
+    (`selection_margins.clearing`, at most `tries` draws a seed); `draw` itself otherwise. A selection the
+    compared runs could break a tie of differently clears none where one of them is not `stable` (torch's
+    `topk`, `selection_margins.margin`)."""
     import jax.numpy as jnp
     import selection_margins
 
     if not selection_margins.selects(loaded.model_config):
         return draw
     captured = selection_margins.capture(loaded.model)
+    least = selection_margins.MARGIN if margin is None else margin
 
     def clears(inputs):
         selections = captured(loaded.variables, jnp.asarray(inputs[0]))
-        return (selection_margins.margin(loaded.model_config, selections, label, stable=stable)
-                > selection_margins.MARGIN)
+        return selection_margins.margin(loaded.model_config, selections, label, stable=stable) > least
 
     return selection_margins.clearing(draw, clears, tries)
 

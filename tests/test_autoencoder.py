@@ -2,12 +2,12 @@
 
 Nothing here asserts reconstruction quality: what matters is the contract the
 samplers and input config depend on (the advertised latent geometry, video
-flattening, and the latent normalization seam). The Diffusers tests hold that
-contract to Diffusers' own VAE, posterior and SD3 pipeline normalization, run
-here over drawn clips against its float64 twin (check 1).
+flattening, and the latent normalization seam). The last tests hold that
+contract to Diffusers' own VAE, posterior and SD3 pipeline normalization over drawn clips, Diffusers run
+in the test.
 """
 
-import contextlib
+import functools
 import json
 import os
 import shutil
@@ -23,9 +23,9 @@ from reference_error import as_given, assert_as_exact
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
+from dew.interop.autoencoders.pretrained import REGISTRATIONS, load_kl_vae
 from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, LatentNormalization, StableDiffusionVAE
 from dew.nn.autoencoders.api import ModuleAutoEncoder
-from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Recorder, Step
 from dew.registry import to_record
@@ -88,121 +88,93 @@ def test_latent_normalization_is_inverted_by_decode(autoencoder, image):
                         autoencoder.decode(autoencoder.params, raw_latent), atol=1e-5)
 
 
-@pytest.fixture(scope="module")
-def sd3_tiny():
-    return StableDiffusionVAE(str(FIXTURES / "sd3-tiny"), dtype=jnp.float32)
-
-
+CONTRACT_SEEDS = 8
+"""The contract's declared seeds, sized by `seeds_for` paired as its check confirmed them."""
 CLIP = (2, 3, 16, 16)
-"""The clips the Diffusers comparisons draw: batch, frames, height, width."""
-
-DIFFUSERS_SEEDS = 8
-"""Each Diffusers comparison's declared draws (check 1), sized by `seeds_for` paired with Dew's VAE on the
-CPU."""
+"""A drawn clip's batch, frames, height and width."""
 
 
-@pytest.fixture(scope="module")
-def diffusers_sd3_tiny():
-    """Diffusers' own `AutoencoderKL` of the sd3-tiny fixture in float32, and its float64 twin."""
+@functools.cache
+def sd3_tiny():
+    return load_kl_vae(str(FIXTURES / "sd3-tiny"), jnp.float32, revision="bf16", subfolder=None)[0]
+
+
+def contract_draw(seed: int) -> tuple[dict[str, np.ndarray]]:
+    """A seed's clip of frames in [-1, 1], its key, and the standard normal Dew's encoder draws for that key
+    at the clip's latents (`noise`), which Diffusers' posterior samples from too."""
+    batch, frames, height, width = CLIP
+    clip = np.random.default_rng([71, seed]).uniform(-1, 1, (batch * frames, height, width, 3))
+    autoencoder = sd3_tiny()
+    shape = jax.eval_shape(lambda pixels: autoencoder.encode(autoencoder.params, pixels),
+                           jnp.zeros((batch, frames, height, width, 3))).shape
+    noise = jax.random.normal(jax.random.key(seed), (batch * frames, *shape[2:]), jnp.float32)
+    return ({"frames": clip.astype(np.float32), "key": np.asarray(seed, np.int32),
+             "noise": np.asarray(noise)},)
+
+
+@as_given
+def contract_run(inputs) -> dict:
+    """The clip's frames encoded as one `[B, T]` batch: the latents drawn for its key and normalized, the
+    normalized means, and the frames those means decode to, each frame by frame."""
+    autoencoder = sd3_tiny()
+    clip = jnp.asarray(inputs["frames"], jnp.float32).reshape(*CLIP, 3)
+    sampled = autoencoder.encode(autoencoder.params, clip, key=jax.random.key(int(inputs["key"])))
+    mean = autoencoder.encode(autoencoder.params, clip)
+    decoded = autoencoder.decode(autoencoder.params, mean)
+    return {name: np.asarray(value).reshape(-1, *value.shape[2:])
+            for name, value in (("latents", sampled), ("normalized_mean", mean), ("decoded", decoded))}
+
+
+def diffusers_contract(*, wide: bool):
+    """Diffusers' own VAE over a draw's frames, each encoded as its own image, in float32 or (its float64 twin
+    under `torch_precision.widened`) float64: the latents SD3's img2img pipeline draws and normalizes
+    (`pipeline_stable_diffusion_3_img2img.py:700-702`: `retrieve_latents` of `vae.encode`, its
+    `randn_tensor` handed the draw's `noise`, then `(z - shift_factor) * scaling_factor`), the normalized
+    mean, and the frames its `vae.decode` makes of that mean taken back SD3's way
+    (`pipeline_stable_diffusion_3.py:1128`: `z / scaling_factor + shift_factor`), channels last."""
+    import contextlib
+    from unittest import mock
+
+    import torch
     from diffusers import AutoencoderKL
+    from diffusers.models.autoencoders import vae as diffusers_vae
+    from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img import retrieve_latents
 
-    from tools.torch_precision import float64_twin
+    from tools.torch_precision import float64_twin, widened
 
-    narrow = AutoencoderKL.from_pretrained(FIXTURES / "sd3-tiny").eval()
-    return narrow, float64_twin(narrow)
+    model = AutoencoderKL.from_pretrained(FIXTURES / "sd3-tiny").eval()
+    model = float64_twin(model) if wide else model
+    dtype = torch.float64 if wide else torch.float32
+
+    def first(value):
+        return torch.from_numpy(np.ascontiguousarray(np.moveaxis(np.asarray(value), -1, 1))).to(dtype)
+
+    @as_given
+    def run(inputs):
+        config = model.config
+        with widened() if wide else contextlib.nullcontext(), torch.no_grad():
+            encoded = model.encode(first(inputs["frames"]))
+            epsilon = first(inputs["noise"])
+            with mock.patch.object(diffusers_vae, "randn_tensor", lambda shape, **options: epsilon):
+                drawn = retrieve_latents(encoded, sample_mode="sample")
+            mean = encoded.latent_dist.mean
+            normalized = (mean - config.shift_factor) * config.scaling_factor
+            outputs = {"latents": (drawn - config.shift_factor) * config.scaling_factor,
+                       "normalized_mean": normalized,
+                       "decoded": model.decode(
+                           normalized / config.scaling_factor + config.shift_factor).sample}
+        return {name: np.moveaxis(value.numpy(), 1, -1) for name, value in outputs.items()}
+    return run
 
 
-def _channels_first(value: np.ndarray):
-    import torch
-
-    return torch.from_numpy(np.ascontiguousarray(np.moveaxis(value, -1, 1)))
-
-
-def _channels_last(value) -> np.ndarray:
-    return np.moveaxis(value.detach().numpy(), 1, -1)
-
-
-def test_a_clip_samples_and_normalizes_as_diffusers_does_frame_by_frame(sd3_tiny, diffusers_sd3_tiny):
+def test_a_clip_samples_normalizes_and_decodes_as_diffusers_does_frame_by_frame():
     """A clip's frames encoded as one `[B, T]` batch draw the latent SD3's img2img pipeline draws for each
-    frame as an image (`retrieve_latents`: Diffusers' posterior's `sample`, its mean plus its deviation
-    times a standard normal draw, then `(z - shift) * scale`), from the standard normal draw Dew's encoder
-    takes of the same key, and their normalized means are its: on par (check 1) with Diffusers' own VAE
-    and posterior over drawn clips and keys, from its float64 twin's."""
-    import torch
-
-    from tools.torch_precision import float64
-
-    batch, frames, height, width = CLIP
-
-    def draw(seed):
-        clip = np.random.default_rng(seed).uniform(-1, 1, (batch, frames, height, width, 3))
-        return clip.astype(np.float32), np.int32(seed)
-
-    def ours(clip, seed):
-        sampled = sd3_tiny.encode(sd3_tiny.params, clip, key=jax.random.key(seed))
-        mean = sd3_tiny.encode(sd3_tiny.params, clip)
-        return sampled.reshape(-1, *sampled.shape[2:]), mean.reshape(-1, *mean.shape[2:])
-
-    # A clip's latents keep its batch and frame axes.
-    clip, seed = draw(0)
-    assert sd3_tiny.encode(sd3_tiny.params, clip, key=jax.random.key(seed)).shape[:2] == (batch, frames)
-
-    def theirs(model, precision, dtype):
-        config = model.config
-
-        @as_given
-        def run(clip, seed):
-            with torch.no_grad(), precision():
-                pixels = _channels_first(clip.reshape(-1, height, width, 3)).to(dtype)
-                posterior = model.encode(pixels).latent_dist
-                # Dew's draw for the key, channels last over the clip's frames, as its encoder takes it.
-                epsilon = jax.random.normal(jax.random.key(seed), _channels_last(posterior.mean).shape)
-                sampled = posterior.mean + posterior.std * _channels_first(np.asarray(epsilon)).to(dtype)
-                return (_channels_last((sampled - config.shift_factor) * config.scaling_factor),
-                        _channels_last((posterior.mean - config.shift_factor) * config.scaling_factor))
-
-        return run
-
-    narrow, wide = diffusers_sd3_tiny
-    assert_as_exact(ours, theirs(narrow, contextlib.nullcontext, torch.float32), draw,
-                    "a clip's sampled and mean latents", seeds=DIFFUSERS_SEEDS,
-                    truth_fn=theirs(wide, float64, torch.float64))
-
-
-def test_a_clip_decodes_as_diffusers_decodes_its_frames(sd3_tiny, diffusers_sd3_tiny):
-    """Normalized latents of a clip decode to what Diffusers' VAE decodes of each frame's latent taken
-    back SD3's way (`z / scale + shift`): on par (check 1) with it over drawn latents, from its float64
-    twin's."""
-    import torch
-
-    from tools.torch_precision import float64
-
-    batch, frames, height, width = CLIP
-    latent = sd3_tiny.encode(sd3_tiny.params, jnp.zeros((1, 1, height, width, 3), jnp.float32)).shape[2:]
-
-    def draw(seed):
-        return (np.random.default_rng(seed).standard_normal((batch, frames, *latent)).astype(np.float32),)
-
-    def ours(latents):
-        decoded = sd3_tiny.decode(sd3_tiny.params, latents)
-        return decoded.reshape(-1, *decoded.shape[2:])
-
-    def theirs(model, precision, dtype):
-        config = model.config
-
-        @as_given
-        def run(latents):
-            with torch.no_grad(), precision():
-                taken = _channels_first(latents.reshape(-1, *latent)).to(dtype)
-                taken = taken / config.scaling_factor + config.shift_factor
-                return _channels_last(model.decode(taken).sample)
-
-        return run
-
-    narrow, wide = diffusers_sd3_tiny
-    assert_as_exact(ours, theirs(narrow, contextlib.nullcontext, torch.float32), draw,
-                    "a clip's decoded frames", seeds=DIFFUSERS_SEEDS,
-                    truth_fn=theirs(wide, float64, torch.float64))
+    frame as an image (`retrieve_latents`, then `(z - shift) * scale`), from one standard normal draw, their
+    normalized means are its, and those means decode to what Diffusers' VAE decodes of each frame's latent
+    taken back SD3's way (`z / scale + shift`): on par with Diffusers' own VAE and posterior over drawn
+    clips (check 1), its float64 twin the truth."""
+    assert_as_exact(contract_run, diffusers_contract(wide=False), contract_draw, "the SD3 contract",
+                    seeds=CONTRACT_SEEDS, truth_fn=diffusers_contract(wide=True))
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"
@@ -222,7 +194,7 @@ def _published(kind: str, directory: Path):
     `PretrainedAutoencoder` builds it: by the class the fixture's config names."""
     from interop_support import extract_fixture
 
-    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
 
     archive, inside = ARCHIVES[kind]
     source = extract_fixture(FIXTURE_ROOT / archive, directory) / inside
@@ -400,25 +372,23 @@ def test_a_kl_loader_refuses_another_autoencoders_checkpoint(tmp_path, family):
     standalone one's, is refused by the class its config names, before its tensors meet the KL tree."""
     from interop_support import extract_fixture
 
-    from dew.nn.autoencoders.pretrained import load_kl_vae
 
     source = extract_fixture(Path(__file__).parent / "fixtures" / f"{family}.tar.xz", tmp_path)
     folder = next(path.parent for path in source.rglob("config.json"))
     with pytest.raises(ValueError):
         load_kl_vae(folder, subfolder="")
     with pytest.raises(ValueError):
-        StableDiffusionVAE(str(folder), dtype=jnp.float32)
+        load_kl_vae(str(folder), jnp.float32, revision="bf16", subfolder=None)
 
 
 def test_a_flax_layout_vae_binds_as_its_torch_layout_does(tmp_path):
     """One KL autoencoder's parameters as diffusers' Flax msgpack (the SD1-era layout) and as its torch
     safetensors (the committed sd3-tiny) bind into one tree through the one loader (`load_kl_vae`, which a
-    standalone load and `StableDiffusionVAE` reach): the same parameters, the msgpack's in the dtype it
+    standalone load and a pipeline's reach): the same parameters, the msgpack's in the dtype it
     stores, and the same source layouts, each written back as the torch tensor it reads from, so either
     exports as the torch checkpoint."""
     from flax.serialization import msgpack_serialize
 
-    from dew.nn.autoencoders.pretrained import load_kl_vae
 
     _, torch_params, torch_layouts, _ = load_kl_vae(FIXTURES / "sd3-tiny", jnp.float32, subfolder="")
     shutil.copy(FIXTURES / "sd3-tiny" / "config.json", tmp_path / "config.json")
@@ -432,14 +402,14 @@ def test_a_flax_layout_vae_binds_as_its_torch_layout_does(tmp_path):
 
     assert written(flax_layouts) == written(torch_layouts)
     latent = jax.random.normal(jax.random.key(0), (1, 2, 2, 16))
-    standalone = StableDiffusionVAE(str(tmp_path), dtype=jnp.float32)
+    standalone = load_kl_vae(str(tmp_path), jnp.float32, revision="bf16", subfolder=None)[0]
     np.testing.assert_array_equal(np.asarray(standalone.decode(standalone.params, latent)),
                                   np.asarray(vae.decode(flax_params, latent)))
 
 
 _PINNED_LOCATION = """
 import json, sys
-from dew.nn.autoencoders.vae import located_vae
+from dew.interop.autoencoders.vae import located_vae
 directory, config, weights = located_vae(sys.argv[1], sys.argv[2])
 print(json.dumps({"directory": str(directory), "weights": weights}))
 """
@@ -451,7 +421,7 @@ def test_a_pinned_vae_loads_its_own_revisions_weights_not_the_flax_branchs(tmp_p
     the flax branch's."""
     from interop_support import hub_cache
 
-    from dew.nn.autoencoders.vae import FLAX_WEIGHTS, TORCH_WEIGHTS
+    from dew.interop.autoencoders.vae import FLAX_WEIGHTS, TORCH_WEIGHTS
 
     config = json.dumps({"_class_name": "AutoencoderKL", "latent_channels": 4})
     pinned, flax = tmp_path / "pinned", tmp_path / "flax" / "vae"
@@ -478,8 +448,8 @@ def test_a_pinned_vae_loads_its_own_revisions_weights_not_the_flax_branchs(tmp_p
 
 def test_a_kl_config_naming_no_class_is_an_autoencoder_kls():
     """An older AutoencoderKL's config names no class; the KL loaders take it as one."""
-    from dew.nn.autoencoders.api import check_class
-    from dew.nn.autoencoders.vae import PUBLISHED
+    from dew.interop.autoencoders.common import check_class
+    from dew.interop.autoencoders.vae import PUBLISHED
 
     check_class({"block_out_channels": [64]}, PUBLISHED, "an old checkpoint", nameless=True)
     with pytest.raises(ValueError):
@@ -490,7 +460,7 @@ def test_a_local_pipelines_autoencoder_loads_from_its_vae_folder(tmp_path):
     """`load_autoencoder` given a local pipeline's root reads the AutoencoderKL in its `vae/` folder."""
     from interop_support import extract_fixture
 
-    from dew.nn.autoencoders.pretrained import load_autoencoder
+    from dew.interop.autoencoders.pretrained import load_autoencoder
 
     root = extract_fixture(FIXTURE_ROOT / "sd3_source.tar.xz", tmp_path)
     pipeline = next(path.parent.parent for path in root.rglob("vae/config.json"))

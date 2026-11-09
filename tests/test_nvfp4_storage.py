@@ -1,13 +1,10 @@
 """Weight-only compressed storage and the activation formats that it cannot compute."""
 
-import json
 from pathlib import Path
 
 import numpy as np
 import pytest
-
-from dew.interop import codecs
-from dew.interop.safetensors_io import read_weights
+from interop_support import stored_codec
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "storage"
 
@@ -21,8 +18,6 @@ def checkpoint(request):
 
 def test_weight_only_storage_decodes_as_the_same_file_reference_reader(checkpoint):
     directory, reference = checkpoint
-    stored = read_weights(directory)
-    codec = codecs.source_quantization(json.loads((directory / "config.json").read_text()))
-    assert codec is not None and len(codec.names(stored)) == 7
+    stored, codec = stored_codec(directory)
     for name in codec.names(stored):
         np.testing.assert_array_equal(codec.decode(stored, name), reference[name], err_msg=name)

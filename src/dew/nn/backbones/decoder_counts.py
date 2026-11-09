@@ -42,9 +42,9 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
     maps = decoder.projections()
     count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
                 if name.startswith(('altup_projections_', 'altup_unembed_projections_', 'project_in')))
-    if decoder.hyper_connections is not None and decoder.hyper_connections.head in ('weighted', 'gated'):
-        count += stream_head(decoder.hyper_connections, decoder.emb_features, decoder.norm_eps,
-                             parent=None).model_flops(lengths)
+    hc = decoder.hyper_connections
+    if hc is not None and decoder.streams_end_stack and hc.head in ('weighted', 'gated'):
+        count += stream_head(hc, decoder.emb_features, decoder.norm_eps, parent=None).model_flops(lengths)
     if decoder.attention_residuals is not None:
         sources = decoder.attention_residuals.blocks(decoder.num_layers) + 1
         count += depth_counter(DepthAttention(decoder.emb_features, parent=None), lengths, sources)
@@ -60,16 +60,20 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
 
 def final_norm_runs(decoder: CausalTransformer) -> int:
     """How many times a call runs the decoder's final norm (`norm`): after its last layer where it ends in
-    one, and in a loop (`dew.nn.backbones.looping`) before each later pass where its exit gate or its step
-    reads the normed state, and, under `reinject`, on each pass's input and after the passes. Under nGPT
-    none, its norm being the unit sphere's, which learns nothing."""
+    one, and in a loop (`dew.nn.backbones.looping`) before each later pass where its exit gate reads the
+    output through it (`normed_output`) or its step reads the normed state, and, under `reinject`, on
+    each pass's input and after the passes. Under nGPT none, its norm being the unit sphere's, which
+    learns nothing."""
     if decoder.ngpt is not None:
         return 0
     runs = int(decoder.final_norm)
     loop = decoder.loop
     if loop is not None:
         later = loop.steps - 1
-        runs += later * int(loop.step_norm or loop.exit_gate)
+        coda = loop.layers is not None and loop.layers[1] < decoder.num_layers
+        # The gate's norm of a pass's output serves its step norm too, where no coda runs between them.
+        gated = loop.exit_gate and decoder.normed_output
+        runs += later * (int(gated) + int(loop.step_norm and (coda or not gated)))
         if loop.reinject:
             runs += 1 + later + 1
     return runs
@@ -99,11 +103,12 @@ def _layer_flops(decoder: CausalTransformer, lengths, counter: Counter) -> float
 
 
 def layer_passes(decoder: CausalTransformer, index: int) -> int:
-    """How many times a call runs layer `index`: a loop's steps for a layer it repeats, else once."""
+    """How many times a call runs layer `index`: a loop's steps for a layer it repeats, and for one after
+    its block where an exit gate weighs every pass (`Loop.exit_gate`), else once."""
     if decoder.loop is None:
         return 1
     start, end = (0, decoder.num_layers) if decoder.loop.layers is None else decoder.loop.layers
-    return decoder.loop.steps if start <= index < end else 1
+    return decoder.loop.steps if start <= index < end or (decoder.loop.exit_gate and index >= end) else 1
 
 
 def logits_flops(decoder: CausalTransformer, lengths) -> float:

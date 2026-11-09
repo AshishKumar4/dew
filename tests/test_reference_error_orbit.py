@@ -6,7 +6,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import RESOLUTION, GateFailure, _drawn, as_given, assert_as_exact, seeds_for
+from reference_error import GateFailure, _drawn, as_given, assert_as_exact, seeds_for
+
+from dew.parity import RESOLUTION
 
 ROWS = 64
 
@@ -168,7 +170,9 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
     """The worst-row rule judged alone (`_judgement` on a leaf whose pooled ratio is one): Dew's worst
     row just inside its width's factor times the reference's passes and just past it fails, at one and
     two values a row (NARROW_FACTORS) and at three and eight (ROW_FACTOR)."""
-    from reference_error import NARROW_FACTORS, NO_ZERO_ROWS, ROW_FACTOR, _Draws, _judgement
+    from reference_error import NARROW_FACTORS, ROW_FACTOR
+
+    from dew.parity import NO_ZERO_ROWS, _Draws, _judgement
 
     for width in (1, 2, 3, 8):
         factor = NARROW_FACTORS.get(width, ROW_FACTOR)
@@ -187,8 +191,9 @@ def test_a_worst_row_one_element_rules_takes_one_values_factor():
     sixteen values a row: a worst row twenty times the reference's passes there, and fails where either
     arm's worst row is spread over its values (Dew's own row fault among them), or a share is unknown (a
     recording's summary)."""
-    from check1_statistics import RULED_SHARE
-    from reference_error import NARROW_FACTORS, NO_ZERO_ROWS, _Draws, _judgement
+    from reference_error import NARROW_FACTORS
+
+    from dew.parity import NO_ZERO_ROWS, RULED_SHARE, _Draws, _judgement
 
     worst = 20.0
     assert NARROW_FACTORS[1] > worst > NARROW_FACTORS[2]

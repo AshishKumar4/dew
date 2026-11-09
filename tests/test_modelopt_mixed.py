@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import stored_codec
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import read_weights
@@ -22,10 +23,7 @@ def reference():
 
 
 def test_each_mixed_weight_decodes_as_its_own_author_reader(reference):
-    stored = read_weights(FIXTURE)
-    codec = codecs.source_quantization(json.loads((FIXTURE / 'config.json').read_text()))
-    assert codec is not None
-    assert len(codec.names(stored)) == 7
+    stored, codec = stored_codec(FIXTURE)
     for name in codec.names(stored):
         expected = reference[name.removesuffix('.weight') + '/weight']
         np.testing.assert_array_equal(codec.decode(stored, name).view(np.uint32), expected.view(np.uint32))

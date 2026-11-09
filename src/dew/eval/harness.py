@@ -42,7 +42,7 @@ from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, po
 from dew.batch import BLOCKS_FIELD
 from dew.distributed.placement import Layout, MeshSpec
 from dew.inference.tasks import TextGeneration, cache_ceiling
-from dew.interop.generation_config import source_decoding
+from dew.interop.generation_config import source_cache, source_decoding
 from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.kernels.options import program
 from dew.nn.visibility import served_blocks
@@ -387,13 +387,15 @@ class DewLM(TemplateLM):
             task_ids = {"eos_token_id": self.task.sampling.eos_token_ids,
                         "pad_token_id": self.task.sampling.pad_token_id}
             sampling, chain, strategy = source_decoding(task_ids, controls, self.task.model, 1, None)
+            # The request's cache as its controls ask: offloaded to the host where they name it.
+            task = dataclasses.replace(self.task, model=source_cache(task_ids, controls, self.task.model))
             if budget >= self.max_length:
                 raise ValueError(
                     f"a budget of {budget} ids leaves no room for a context in this model's "
                     f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
             ids = self.tok_encode(context)[-(self.max_length - budget):]
             drawn_budget = budget if total is None else int(total) - len(ids)
-            text = "" if drawn_budget < 1 else self.task.decode(self.task(
+            text = "" if drawn_budget < 1 else task.decode(task(
                 [ids], drawn_budget, key=seed, sampling=sampling, logits=chain, strategy=strategy))[0]
             answers.append(postprocess_generated_text(text, stops, None))
         return answers

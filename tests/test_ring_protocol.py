@@ -112,7 +112,7 @@ def segmented(stages: int, consumers: int, segments: tuple, in_flight: int, unro
                                          for lo, count in zip(starts, segments, strict=True)),
                             None, (), interpret=False, first=first, in_flight=in_flight, unrolled=unrolled)
 
-            family.roles(consumers, consumer, lambda: family.stream(rings, views, first, first + total))
+            family.scheduled(consumers, consumer, lambda: family.stream(rings, views, first, first + total))
 
         family.scoped(scope, streams=family.streams({"a": (BLOCK, jnp.bfloat16)}, stages, consumers))
 

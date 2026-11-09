@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, mosaic
+from dew.nn.kernels.templates import across, handoffs, mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -43,7 +43,6 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                            collective_axes="wg")
         def _(smem, full, consumed, out_smem):
             ring = mosaic.Ring(smem, full, consumed)
-            wg = jax.lax.axis_index("wg")
 
             def producer():
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
@@ -80,7 +79,9 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     plgpu.copy_smem_to_gmem(out_smem.at[wg], mine)
                 plgpu.wait_smem_to_gmem(0)
 
-            mosaic.roles(wg, consumers, consumer, producer)
+            roles = (handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0))
+            handoffs.Schedule(roles).run(
+                consumer=consumer, producer=producer)
 
     return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, *BLOCK), jnp.float32), grid=(1,),
                         grid_names=("sm",), num_threads=consumers + 1, thread_name="wg",
@@ -275,6 +276,48 @@ def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, u
                     assert singly == hi - lo
 
 
+@pytest.mark.parametrize("weights", [(2, 1, 0), (1, 1, 0), (3, 1, 1, 0), (1, 0)])
+@pytest.mark.parametrize("programs", [1, 2])
+def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
+    """Each raised role's registers (`resources.role_registers`, a `Schedule`'s): none past the launch's pool
+    or setmaxnreg's ceiling, a heavier role never below a lighter one, and the pool spent to within a step
+    a role unless every role is at the ceiling (a capped role's share goes to the rest)."""
+    from dew.nn.kernels.templates import resources
+
+    with generation.assumed("sm90"):
+        held = resources.role_registers(weights, programs)
+        pool = resources.entry_registers(len(weights), programs) * len(weights)
+        step, ceiling = resources.facts().raises().step, resources.raise_ceiling()
+        floor = resources.producer_floor()
+    assert sum(held) <= pool
+    raised = [(weight, budget) for weight, budget in zip(weights, held, strict=True) if weight]
+    assert all(budget == floor for weight, budget in zip(weights, held, strict=True) if not weight)
+    assert all(budget <= ceiling and budget % step == 0 for _, budget in raised)
+    assert all(lighter <= heavier for (w1, heavier) in raised for (w2, lighter) in raised if w1 >= w2)
+    assert (all(budget == ceiling for _, budget in raised)
+            or pool - sum(held) < step * sum(weight for weight, _ in raised))
+
+
+def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
+    """A hand-off's barriers (`Schedule.scratch`) count the arrivals of the roles that fill and give it
+    back: a signal two softmax warpgroups fill counts two, and an accumulator ring the product warp fills
+    and two epilogue warpgroups give back counts one done arrival and two read ones. A role of weight 0
+    beside a warp role is refused, the last warpgroup holding one or the other."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    schedule = handoffs.Schedule(
+        (handoffs.Role("softmax", count=2), handoffs.Role("epilogue", count=2), *mosaic_sm100.ISSUING),
+        (handoffs.HandOff("scales", mosaic_sm100.Signals(count=2, tensor_core=False), "softmax"),
+         handoffs.HandOff("output", mosaic_sm100.Accumulators(2, 128, 64), "mma", ("epilogue",))))
+    scales, (_, done, read) = schedule.scratch(generation.gpu_target("sm100"))
+    assert scales.num_arrivals == 2
+    assert (done.num_arrivals, read.num_arrivals) == (1, 2)
+    assert schedule.warpgroups() == 5
+    with pytest.raises(ValueError):
+        handoffs.Schedule((handoffs.Role("consumer"), handoffs.Role("producer", weight=0),
+                           *mosaic_sm100.ISSUING))
+
+
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
     largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
@@ -416,6 +459,45 @@ def test_products_issue_in_place_into_a_carried_accumulator():
     a, b, c, d = (jax.random.randint(key, (ISSUED, ISSUED), -4, 4).astype(jnp.bfloat16) for key in keys)
     f32 = [np.asarray(x, np.float32) for x in (a, b, c, d)]
     np.testing.assert_array_equal(np.asarray(_carried_sums(a, b, c, d)), f32[0] @ f32[1] + f32[2] @ f32[3])
+
+
+def _merged(partials, combine):
+    """Each of `partials`' leading slices a program's partial of one tile, merged across the programs by
+    `combine` (`Family.fixed_up`), interpreted: the tile's first program, walked last, combines them."""
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    slices, block = partials.shape[0], partials.shape[1:]
+
+    def body(partials_gmem, out_gmem, slots_gmem):
+        # The interpreter walks the grid in order, so the tile's first program is its last.
+        program = slices - 1 - jax.lax.axis_index("programs")
+
+        def store(merged):
+            out_gmem[...] = merged
+
+        family.fixed_up(plgpu.load(partials_gmem.at[program], optimized=False), slots_gmem, None, program,
+                        0, slices, store, combine=combine)
+
+    out = (jax.ShapeDtypeStruct(block, jnp.float32), jax.ShapeDtypeStruct(partials.shape, jnp.float32))
+    return family.kernel(body, out_type=out, grid=(slices,), grid_names=("programs",), consumers=1,
+                         interpret=True, name="merged")(partials)[0]
+
+
+@INTERPRETS
+@pytest.mark.parametrize("slices", [2, 3, 5, 9])
+@pytest.mark.parametrize("block", [(16, 8), (64, 32), (128, 64)])
+def test_a_tiles_partials_merge_in_the_programs_order_whatever_their_count(block, slices):
+    """Interpreted: the programs' partials of one tile merged across the programs (`Family.fixed_up`) by
+    a merge that neither commutes nor associates, `3 * running + partial`: exactly its fold over the programs
+    in order, at tiles whose merger reads one partial at a time or several, and at counts of partials those
+    reads do not divide."""
+    def combine(running, partial):
+        return 3 * running + partial
+
+    partials = jax.random.randint(jax.random.key(4), (slices, *block), -4, 4).astype(jnp.float32)
+    np.testing.assert_array_equal(np.asarray(_merged(partials, combine)),
+                                  functools.reduce(combine, np.asarray(partials)))
 
 
 def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
@@ -584,12 +666,13 @@ def _persisted_operands(rows: int):
 def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_in_chunks():
     """Interpreted: a persistent walk on tcgen05's bundle (`mosaic_sm100.RINGS`), its product warp issuing
     each tile's steps into one of two accumulator turns in tensor memory and the epilogue reading each
-    tile's out in chunks, over three tiles (the turns wrap) with the middle one multiplying nothing: each
-    tile's rows exactly its product, the middle's zeros."""
+    tile's out in chunks, over three tiles (the turns wrap) with the middle one multiplying nothing, as a
+    Blackwell's tensor memory holds them: each tile's rows exactly its product, the middle's zeros."""
     from dew.nn.kernels.templates import mosaic_sm100
     family = mosaic_sm100.RINGS
     x, w = _persisted_operands(family.rows)
-    got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
+    with generation.assumed("sm100"):
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
     expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
     expected[family.rows:2 * family.rows] = 0
     np.testing.assert_array_equal(got, expected)
@@ -669,7 +752,8 @@ def _relayed_products(q, k, v, *, interpret):
                 family.products(o, p, v_smem)
                 summed.committed(first)
 
-            family.roles_of(((1, relay),), load=load, products=products)
+            handoffs.Schedule((handoffs.Role("relay"), *mosaic_sm100.ISSUING)).run(relay=relay, load=load,
+                                                                                mma=products)
 
         smem = [plgpu.SMEM(each.shape, each.dtype, transforms=mosaic.swizzle_transforms(each.dtype, 128))
                 for each in (q, k, v)]
@@ -1178,8 +1262,8 @@ def _chunks_products(x, w, *, interpret):
                 carried_gmem[...] = family.register_products(ones, (held,), slots['w'])
                 return carry, accumulators
 
-            family.roles(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
-                         lambda: family.stream(rings, views, 0, 1))
+            family.scheduled(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
+                              lambda: family.stream(rings, views, 0, 1))
 
         # The issuer's scratch, its staged left operand's tile among it (`Family.scoped`'s `products`).
         family.scoped(scope, streams=allocated, products=(1, (columns,), ((CHUNK_DEPTH, jnp.bfloat16),)))
