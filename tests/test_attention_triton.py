@@ -854,6 +854,31 @@ def test_the_derived_launches_compile_within_a_99_kb_block(generation_name, widt
     assert not failures(found), "\n".join(failures(found))
 
 
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("width", [128, 256])
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.SPLIT], ids=["inference", "training"])
+def test_a_scaled_triton_forward_derives_wherever_its_common_one_does(generation_name, dtype, width, kept):
+    """A rare call's scaled op (`TritonForward.scaled`) derives its own config, legal on the GPU, for every
+    call whose common op derives one, down to one mma.sync instruction's rows (`attention_triton.LEAST`):
+    an fp32 training walk at width 256 held no tile of a warp's rows, and its trace raised on an A100 and an
+    H100 (its small weights fp32 and their products' sums beside its compensated sums)."""
+    import dataclasses
+
+    import tokamax
+    shape = jax.ShapeDtypeStruct((2, 256, 8, width), dtype)
+    arrays = {"query": shape, "key": shape, "value": shape, "query_ids": None, "residuals": kept}
+    common = attention_triton.TritonForward()
+    scaled = dataclasses.replace(common, scaled=True)
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        assert common.derived(tokamax.BoundArguments(common, arrays), target) is not None
+        bound = tokamax.BoundArguments(scaled, arrays)
+        config = scaled.derived(bound, target)
+        assert config is not None
+        assert scaled.legal(bound, config, target)
+
+
 def test_a_program_whose_block_xla_refuses_steps_its_triton_launch_down():
     """A training step's backward at width 256 derived for an RTX PRO 6000 (sm120) said to hold an A100's
     block, and compiled for the GPU's own (a compile-only device on this CPU): XLA refuses the program,
