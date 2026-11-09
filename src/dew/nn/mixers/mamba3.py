@@ -417,16 +417,16 @@ class Mamba3(nn.Module):
                     for t, weight in ((x, self.mimo_x), (z, self.mimo_z)))
         return x, step, decay, *keys, nn.sigmoid(trap.astype(wide)), rates, z
 
-    def _cache(self, batch: int, dtype) -> tuple[bool, Carried]:
-        """Whether the cache was allocated before this call, and its four variables (`Carried`'s)."""
+    def _cache(self, batch: int, dtype) -> tuple[bool, tuple[nn.Variable, ...]]:
+        """Whether the cache was allocated before this call, and its four variables, `Carried`'s in order."""
         allocated = self.has_variable('cache', 'ssm_state')
         heads = (batch, self.num_heads)
         ranked = (*heads, self.mimo_rank)
         shapes = ((*heads, self.head_dim, self.state_size), (*heads, self.angles), (*ranked, self.state_size),
                   (*ranked, self.head_dim))
         names = ('ssm_state', 'angle_state', 'k_state', 'v_state')
-        return allocated, Carried(*(self.variable('cache', name, jnp.zeros, shape, dtype)
-                                    for name, shape in zip(names, shapes, strict=True)))
+        return allocated, tuple(self.variable('cache', name, jnp.zeros, shape, dtype)
+                                for name, shape in zip(names, shapes, strict=True))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
@@ -440,29 +440,30 @@ class Mamba3(nn.Module):
             x = jnp.where(valid[:, :, None], x, 0)
         projected = self.in_proj(x)
         wide = at_least_fp32(projected.dtype)
-        *operands, z = self._operands(projected)
-        carried = None
+        values, dt, A, B, C, lam, theta, z = self._operands(projected)
+        carried, cache = None, ()
         if call.decode:
             allocated, cache = self._cache(batch, wide)
             if not allocated:
                 # Allocation only: init_cache's dummy token leaves no state behind.
                 return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
-            carried = Carried(*(variable.value for variable in cache))
-        if call.decode and length == 1:
-            out, carried = step_mamba3(*(t[:, 0] for t in operands), carried,
-                                       valid=None if valid is None else valid[:, 0],
+            state, angle, key, value = (variable.value for variable in cache)
+            carried = Carried(state, angle, key, value)
+        if carried is not None and length == 1:
+            out, carried = step_mamba3(values[:, 0], dt[:, 0], A[:, 0], B[:, 0], C[:, 0], lam[:, 0],
+                                       theta[:, 0], carried, valid=None if valid is None else valid[:, 0],
                                        begins=None if tokens.starts is None else tokens.starts[:, 0])
             out = out[:, None]
         else:
-            out, carried = chunk_mamba3(*operands, carried, starts=tokens.starts, valid=valid,
-                                        chunk_size=self.chunk_size)
+            out, carried = chunk_mamba3(values, dt, A, B, C, lam, theta, carried, starts=tokens.starts,
+                                        valid=valid, chunk_size=self.chunk_size)
         if call.decode:
             for variable, value in zip(cache, carried, strict=True):
                 variable.value = value.astype(variable.value.dtype)
         # The scan's output under both names a remat policy reads it by (`RESIDUALS`), as `held_scan` marks
         # it.
         out = checkpoint_name(checkpoint_name(out, 'scan'), 'context')
-        out = out + self.D[:, None] * operands[0].astype(wide)
+        out = out + self.D[:, None] * values.astype(wide)
         ranks = (batch, length, self.mimo_rank, self.intermediate_size)
         if self.outproj_norm:
             out = self.norm(out.reshape(ranks), z.reshape(ranks)).astype(wide).reshape(out.shape)

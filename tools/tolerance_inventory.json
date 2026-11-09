@@ -354,7 +354,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {
-   "comparisons": 29,
+   "comparisons": 28,
    "lane": "Kernels"
   },
   "tests/test_llama4.py": {
