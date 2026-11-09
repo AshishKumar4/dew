@@ -142,7 +142,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             # The walk in `form`: the call's, or the fold's rewalk's (`algebra.walked`).
             tiles_of = _composed(functools.partial(keys_at, form), tile_of)
             return attention_program.walk(form, lo, hi, tiles_of, anchor_rows, resumed, block_q, value_width,
-                                          training=residuals, dropping=drop is not None)
+                                          training=residuals, dropping=drop is not None,
+                                          most=keys // block_k)
 
         def finished(form: algebra.Forward, carry):
             # A walk's outputs in `form` (`attention_program.finished`), as the Triton mainloop's.
@@ -339,7 +340,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 return gradient.below(logits, m, how), products, seen, columns[None, :]
 
             anchor, delta, chosen = gradient.dropout_centre(lo, hi, terms, keys, block_q, state_total,
-                                                           mean0)
+                                                           mean0, most=keys // block_k)
         else:
             # The forward took the first pass (`gradient.split_delta`).
             anchor, delta, chosen = gradient.split_delta(others, own, others_total, prior, state_total,
@@ -352,7 +353,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                     return columns[None, :], logits, v_tile
 
                 walked = attention_program.off_anchor_pass(lo, hi, logits_of, before, maxima, chosen, shifts,
-                                                           how, interpreted_dot)
+                                                           how, interpreted_dot, most=keys // block_k)
                 first = gradient.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
                                                  key_index[row, head, rows], shifts, rows=interpreted_rows)
                 kept = shifts < 0
@@ -369,7 +370,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             weighed, q, do, m, anchor, delta, prior, lo, hi, chosen,
             None if draw is None else functools.partial(draw, q_pos), hooked=score_mod is not None,
             score_kinds=score_kinds, summed=summed, prescale=prescale, grad_scale=grad_scale, how=how,
-            accurate=accurate, dot=interpreted_dot)
+            accurate=accurate, dot=interpreted_dot, most=keys // block_k)
         dq, delta, denominator, mass, grads = gradient.dq_finish(found, prior, state_total, peak0,
                                                                 (total0, mean0), m, anchor, delta,
                                                                 accurate=accurate)
@@ -474,7 +475,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         dk, dv, (tiled, *grads) = attention_program.dkv_sums(
             formed, k_tile, v_tile, ranges.q_lo[row, j], ranges.q_hi[row, j], pulled, hooks,
             hooked=score_mod is not None, dropped=draw is not None, grad_scale=grad_scale, how=how,
-            accurate=accurate, score_kinds=score_kinds, dot=interpreted_dot)
+            accurate=accurate, score_kinds=score_kinds, dot=interpreted_dot, most=queries // block_q)
         keyed = iter(grad for grad, kind in zip(grads, score_kinds, strict=True) if kind == Kind.KEY)
         columns_of = iter(tiled)
         return dk, dv, tuple(next(keyed) if kind == Kind.KEY else next(columns_of)
@@ -532,7 +533,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
             dk, dv, dq = attention_program.fused_sums(
                 formed, k_tile, v_tile, ranges.q_lo[row, j], ranges.q_hi[row, j], dq, add_dq,
-                hooked=score_mod is not None, grad_scale=grad_scale, how=how, dot=interpreted_dot)
+                hooked=score_mod is not None, grad_scale=grad_scale, how=how, dot=interpreted_dot,
+                most=queries // block_q)
             return (dq, jax.lax.dynamic_update_slice_in_dim(dk_all, dk, j * block_k, axis=0),
                     jax.lax.dynamic_update_slice_in_dim(dv_all, dv, j * block_k, axis=0))
 

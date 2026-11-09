@@ -1006,3 +1006,33 @@ def test_sinks_keep_their_own_wider_dtype():
         state = template.sinks(jnp.asarray([1 + 2 ** -30], jnp.float64), 1, 1, 1)
         assert state.m.dtype == state.total.dtype == state.acc.dtype == jnp.float64
         assert float(state.m[0, 0, 0]) == 1 + 2 ** -30
+
+
+@pytest.mark.parametrize("call", ["causal", "documents", "window", "dropout"])
+def test_a_training_step_on_the_plain_jax_mainloop_states_its_flops(call):
+    """A causal training step on the template's plain-JAX mainloop (this CPU's), over documents, under a
+    window and under dropout too: its compiled program states its FLOPs
+    (`dew.telemetry.instrumentation.hlo_flops`), each walk a loop of at most its call's tiles
+    (`attention_algebra.tiles_walked`), where the walks' traced bounds alone stated no trip count and a CPU
+    training step at 3,072 tokens on the mainloop reported no FLOPs (`Trainer.step_flops` None)."""
+    from dew.nn.kernels import generation
+    from dew.telemetry.instrumentation import hlo_flops
+
+    tokens = 512
+    query, key, value = (jax.random.normal(jax.random.key(seed), (2, tokens, heads, 32), jnp.float32)
+                         for seed, heads in ((0, 4), (1, 2), (2, 2)))
+    arguments = {
+        "causal": {},
+        "documents": {"segment_ids": jnp.repeat(jnp.arange(4), tokens // 4)[None].repeat(2, axis=0)},
+        "window": {"sliding_window": 64},
+        "dropout": {"dropout_rate": 0.25, "dropout_rng": jax.random.key(3), "deterministic": False},
+    }[call]
+
+    def loss(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation="template",
+                                            **arguments).sum()
+
+    with generation.chosen(attention_mainloop="portable"):
+        compiled = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(query, key, value).compile()
+    flops = hlo_flops(compiled.as_text())
+    assert flops is not None and flops.model > 0
