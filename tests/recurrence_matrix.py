@@ -157,6 +157,22 @@ CASES = (
 the suite's lane environment: at its 'highest' an fp32 training call is served by the portable math alone,
 the reference."""
 
+SEEDS = {
+    ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'): 512,
+    ('sm80', 'kimi delta attention', 'xla', 'bfloat16', 'packed'): 16,
+    ('sm90', 'rated scan', 'pallas', 'bfloat16', 'packed'): 64,
+    ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'): 32,
+    ('sm80', 'gated delta net', 'fla', 'bfloat16', 'packed'): 256,
+    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'): 64,
+    ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'): 256,
+    ('sm90', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'packed'): 8,
+    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'one'): 512,
+    ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'): 512,
+}
+"""Each cell's declared seeds, sized by `seeds_for` on its own GPU, paired against its reference arm (an H100
+and an A100, M-JS-69 at 96ec2552a): the gated delta net's head parameters (`log_a`, `bias`) left its
+mosaic_gpu cell inconclusive at 40 seeds, their intervals 0.6 to 1.7 (M-JS-68)."""
+
 TPU_CASES = (
     ('v6e', 'rated scan', 'tpu', 'bfloat16', 'one'),
     ('v5e', 'rated scan', 'tpu', 'float32', 'packed'),
@@ -192,8 +208,8 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
     generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
     for case in CASES], ids="-".join)
 def a_recurrences_training_step_is_on_par(case: tuple[str, ...]) -> None:
-    """`_on_par` of a GPU's case."""
-    _on_par("recurrence", case)
+    """`_on_par` of a GPU's case at its declared seeds (`SEEDS`)."""
+    _on_par("recurrence", case, SEEDS[case])
 
 
 @cell("recurrence_tpu", covers=lambda case: dict(zip(AXES["recurrence_tpu"], case, strict=True)))
