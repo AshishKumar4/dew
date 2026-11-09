@@ -12,7 +12,9 @@ and predicts each frame's clean latents (x-prediction).
 Choices the paper leaves open (docs/research/dreamer4.md, last section) are this module's: the
 widths and depths, `K_max` = 64, one attention over space and time in every layer, learned position
 embeddings, the ramp weight multiplying each frame's loss, no LPIPS term in the tokenizer's loss,
-and context frames at signal level 1 - `tau_ctx` when generating.
+and context frames at signal level 1 - `tau_ctx` when generating. One departs from Eq. 7: shortcut
+forcing takes the x-prediction's error at every step size, not the smallest alone
+(`shortcut_forcing_loss`, row 4802).
 """
 
 from __future__ import annotations
@@ -331,9 +333,17 @@ type Predictor = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 
 def shortcut_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau: jax.Array, d: jax.Array,
                           d_min: float) -> jax.Array:
-    """Eqs. 6-8: each frame's loss `[B, T]`, its x-prediction's squared error at the smallest step and
-    else its velocity's against the average of its own two half steps, held still and scaled back to
-    x-space by (1 - tau)^2, every frame weighted by the ramp."""
+    """Eqs. 6-8: each frame's loss `[B, T]`, its x-prediction's squared error at every step size, and past
+    the smallest its velocity's against the average of its own two half steps, held still and scaled back
+    to x-space by (1 - tau)^2, every frame weighted by the ramp.
+
+    Eq. 7 takes the x-prediction's error at the smallest step alone. The bootstrap's half steps advance
+    every frame, the context a frame reads among them (Eq. 7's vector form), and a predictor that ignores
+    its data, one constant, is consistent across its own half steps, so its bootstrap error is zero: with
+    the x-prediction's error on a seventh of the frames (`K_max` 64), the dynamics trained on still clips
+    forecast their next frame with 0.22 to 0.25 of the mean frame's error, where diffusion forcing leaves
+    0.048 (H100, 3,000 updates, row 4802). Its error at every step anchors each to the data: 0.055, the
+    bootstrap kept for few-step sampling."""
     level = tau.reshape(*tau.shape, *(1,) * (clean.ndim - tau.ndim))
     step = d.reshape(level.shape)
     noisy = (1 - level) * noise + level * clean
@@ -347,7 +357,7 @@ def shortcut_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau:
     axes = tuple(range(tau.ndim, clean.ndim))
     smallest = jnp.sum(jnp.square(predicted - clean), axes)
     bootstrap = jnp.sum(jnp.square(1 - level) * jnp.square((predicted - noisy) / (1 - level) - target), axes)
-    return ramp(tau) * jnp.where(d <= d_min, smallest, bootstrap)
+    return ramp(tau) * (smallest + jnp.where(d <= d_min, 0.0, bootstrap))
 
 
 def diffusion_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau: jax.Array,
