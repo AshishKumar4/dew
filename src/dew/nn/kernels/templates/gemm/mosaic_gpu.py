@@ -1025,8 +1025,8 @@ def _gmm_split_refused(tiles: Tiles, k: int, n: int, step_scales, *, dense: bool
     if tiles.raster and (not dense or exact_sums or tiles.splits > 1 or tiles.cluster > 1):
         raise ValueError(f"a met walk is a dense product's of no exact sums, split or cluster, not {tiles}")
     if tiles.splits > 1 and (hooked or not split_runs(k // tiles.block_k, tiles.splits)):
-        raise ValueError(f"a depth split is a product's of no hooks or pair, each run some steps, not {tiles} "
-                         f"of a {k}-deep one")
+        raise ValueError(f"a depth split is a product's of no hooks or pair, each run some steps, not "
+                         f"{tiles} of a {k}-deep one")
     if step_scales is not None and not _step_scaled_takes(step_scales, tiles, k, n, exact_sums=exact_sums,
                                                           plain=plain):
         raise ValueError(f"a step-scaled product sums each {STEP_SCALE_DEPTH}-deep step exactly with no "

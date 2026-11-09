@@ -1081,7 +1081,8 @@ class MosaicGmm(_Mosaic):
         (`mosaic_gpu.split_count` over each active expert's one row tile, its matrix's stream the walk): its
         one wave of tiles streamed each expert's matrix at a program's share of the memory rate, 1.28-1.46x
         Triton's time at the same DRAM bytes, 48% of the peak rate against Triton's 80% (FS-3622-NCU1,
-        FS-3622-WAVES1, row 3622). None, a dense call, exact sums (`legal`), hooks or a pair keep it unsplit."""
+        FS-3622-WAVES1, row 3622). None, a dense call, exact sums (`legal`), hooks or a pair keep it
+        unsplit."""
         hooks = ba.arguments['hooks']
         if (tile is None or ba.arguments['dense'] or ba.arguments['exact_sums']
                 or ba.arguments.get('paired') is not None or hooks.prologue is not None
@@ -1490,8 +1491,8 @@ CUTLASS_TILES = {
 grouped kernel at a `GemmShape<128, 128, 32>` tile of four warps, four stages, cp.async and mma.sync;
 grouped_sm90.cu's is CUTLASS 3's pointer-array cooperative kernel (two consumer warpgroups) at a
 `Shape<_128, _256, _64>` tile on a `Shape<_2, _1, _1>` cluster, its stages CUTLASS's own, fitted to the
-shared memory its epilogue leaves (`StageCountAutoCarveout`). Neither has a band of column tiles, so a record's
-`grid_block_n` (and the sm90 record's `stages`) describe no choice of the binary's."""
+shared memory its epilogue leaves (`StageCountAutoCarveout`). Neither has a band of column tiles, so a
+record's `grid_block_n` (and the sm90 record's `stages`) describe no choice of the binary's."""
 
 
 def cutlass_built_for(generation_name: str, built: tuple[str, ...]) -> str | None:

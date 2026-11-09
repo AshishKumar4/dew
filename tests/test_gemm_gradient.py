@@ -1,6 +1,5 @@
-"""The GEMM template's kernel gradient (`mosaic_gpu.tgmm`, dW = x^T dy) on each instruction family, interpreted on
-the CPU: a dense call's stages read as loaded, its exact sums promoted a window at a time, and an exactly summed
-gradient's depth split."""
+"""The GEMM template's kernel gradient (`mosaic_gpu.tgmm`, dW = x^T dy) on each instruction family,
+interpreted on the CPU: a dense call's stages read as loaded, and an exactly summed gradient's depth split."""
 
 import dataclasses
 import functools
