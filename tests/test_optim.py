@@ -837,6 +837,11 @@ def test_a_bounded_clipped_group_clamps_after_the_clip():
 CLIP_SEEDS = 8
 """Check 1's declared seeds for the QK-Clip against the paper's equations (`seeds_for`)."""
 
+GATED_CLIP_SEEDS = 128
+"""Check 1's declared seeds for the gated query's clip against the paper's, sized paired (`seeds_for` with
+Dew's clip as `dew_fn`) on armada at base 7853cfdf6 (job 20261109062353-1a4d7ce5): its two maxima a draw
+left 8 Inconclusive at the verdict's 40 (the pooled ratio 1.238's interval [0.962, 1.674])."""
+
 
 def test_the_clip_matches_the_paper_equations():
     """Per-head query and key rescale against the paper's equations in
@@ -898,6 +903,7 @@ def test_a_query_group_clips_as_megatron_clips_it(case):
                                        f"{case} {proj}", roundings=roundings)
 
 
+@pytest.mark.check1_shards(seeds=128, per_task=64)
 def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     """Qwen3.5's output gate doubles each query head to [query | gate]. The
     paper's QK-Clip rescales the query and key weights and nothing else, so
@@ -966,7 +972,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
             return maxima(of, {**variables, "params": {**variables["params"], "layers_0": layer}}, ids)[1]
         return clipped_then_read
 
-    assert_as_exact(read_after, paper(model), draw, "the gated query's clip", seeds=CLIP_SEEDS,
+    assert_as_exact(read_after, paper(model), draw, "the gated query's clip", seeds=GATED_CLIP_SEEDS,
                     truth_fn=paper(model.clone(dtype=jnp.float64)))
 
 

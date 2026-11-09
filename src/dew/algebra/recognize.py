@@ -710,7 +710,7 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
     farthest_first = sorted(((distance, var) for var, distance in _forward(index, made, 3).items()),
                             key=lambda pair: -pair[0])
     for q, k, v in itertools.product(*sources):
-        if aval(q).ndim != 4 or aval(k).ndim != 4 or aval(v).ndim != 4:
+        if not _attended(q, k, v):
             continue
         for _, output in farthest_first:
             if aval(output).shape != (*aval(q).shape[:-1], aval(v).shape[-1]):
@@ -719,6 +719,9 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
             if extras is None or len(extras) > 1:
                 continue
             logits_shape = (aval(q).shape[0], aval(q).shape[2], aval(q).shape[1], aval(k).shape[1])
+            # A mask or bias beside them reads the logits as the call does, broadcast to their shape.
+            if extras and not _broadcasts_to(aval(extras[0]).shape, logits_shape):
+                continue
             biases = [var for var in _addends(index, logits, anchor) if aval(var).shape == logits_shape]
             for extra in ([extras[0]] if extras else [None, *biases]):
                 given = () if extra is None else (extra,)
@@ -729,6 +732,27 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
                 yield from _attention_candidates(q, k, v, output, extra,
                                                  [None, *_scalars(index, region, frozenset({"div", "mul"}))],
                                                  [None, *fills], [None, *windows])
+
+
+def _attended(q: jcore.Var, k: jcore.Var, v: jcore.Var) -> bool:
+    """Whether Dew's attention takes `q`, `k` and `v` as its query `[B, S, H, D]`, keys `[B, T, K, D]` and
+    values `[B, T, K, E]`: one batch, keys and values of one length and head count, which divides the
+    queries' heads, and queries and keys of one width. A region over another layout (a model's `[B, H, S,
+    D]`) is no call of it: read so, a cross-attention's two query tokens over 127 keys were two heads over
+    127 (`dew.nn.attention_masks.repeat_kv_heads`' refusal)."""
+    if aval(q).ndim != 4 or aval(k).ndim != 4 or aval(v).ndim != 4:
+        return False
+    (batch, _, heads, width), (_, length, shared, keyed), (_, valued, held, _) = (
+        aval(q).shape, aval(k).shape, aval(v).shape)
+    return (batch == aval(k).shape[0] == aval(v).shape[0] and length == valued and shared == held
+            and width == keyed and shared > 0 and heads % shared == 0)
+
+
+def _broadcasts_to(shape: tuple[int, ...], target: tuple[int, ...]) -> bool:
+    """Whether `shape` broadcasts to `target` itself: no more dimensions, each 1 or `target`'s from the right
+    (a mask `[4, 1, 64, 64]` beside logits `[1, 1, 64, 256]` does not)."""
+    return len(shape) <= len(target) and all(
+        size in (1, wanted) for size, wanted in zip(reversed(shape), reversed(target), strict=False))
 
 
 def _addends(index: fusion.Index, logits: int, anchor: jcore.Var) -> list[jcore.Var]:

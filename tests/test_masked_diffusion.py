@@ -521,8 +521,14 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     expected = replace(live, solver=published.solver, block=published.block, steps=published.steps)(
         prompt, 8, key=7).host().tokens
     np.testing.assert_array_equal(published(prompt, 8, key=7).host().tokens, expected)
-    np.testing.assert_array_equal(pipeline(str(tmp_path / "published"), dtype="bfloat16")(
-        prompt, 8, key=7).host().tokens, expected)
+    # A pipeline loads its source on the automatic attention route, which the run's task is compared on
+    # too: two kernels' roundings part a near tie of sampled scores (a template's against the reference's
+    # on CPU), which check 1 qualifies across kernels, never a token (testing.md).
+    piped = pipeline(str(tmp_path / "published"), dtype="bfloat16")
+    routed = replace(live, model=live.model.clone(attention_impl=piped.model.attention_impl),
+                     solver=published.solver, block=published.block, steps=published.steps)
+    np.testing.assert_array_equal(piped(prompt, 8, key=7).host().tokens,
+                                  routed(prompt, 8, key=7).host().tokens)
     raw = restored(["a", "bc"], 3, key=7, steps=3)
     assert raw.text == restored.decode(raw)
 
