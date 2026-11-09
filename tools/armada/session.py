@@ -154,6 +154,71 @@ def test_name(node: str) -> str:
     return node.partition("::")[2].split("[")[0].replace("::", ".")
 
 
+def declared_marks(name: str, text: str) -> dict[str, tuple[str, dict[str, int], int]]:
+    """The sites test file `name`, whose source is `text`, declares (ci.py's `sites`), each by its name with
+    its mark's kind of `SHARDS`, its literal counts and the line that holds it: a test's own decorator, or a
+    parameter's of the test's one literal parametrize list, `pytest.param(..., id="<id>", marks=...)`, its
+    site `test[id]` (Main's ruling, 2026-11-09: test_recurrence's ~60 hook combinations, each a check-1 site
+    of its own seeds). A mark written otherwise would set its site aside from its file's tasks and plan none
+    of its own, so nothing would run it: its file is refused, by the lines that hold it. None for a source
+    that does not parse, whose collection fails its row, saying why."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {}
+    found: dict[str, tuple[str, dict[str, int], int]] = {}
+    read: set[int] = set()
+
+    def marked(site: str, mark: ast.Call) -> None:
+        kind = ast.unparse(mark.func).removeprefix("pytest.mark.")
+        if kind not in SHARDS:
+            return
+        counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
+                  if isinstance(keyword.value, ast.Constant)}
+        allowed = [{SHARDS[kind], "per_task"}]
+        if kind == "check1_shards":
+            allowed.append({SHARDS[kind], "per_task", "conditioning", "conditioning_per_task"})
+        if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
+                and site not in found and all(type(count) is int and count > 0 for count in counts.values())):
+            found[site] = (kind, counts, mark.lineno)
+            read.add(id(mark.func))
+
+    decorated = list(decorated_tests(tree.body))
+    for test, mark in decorated:
+        marked(test, mark)
+    lists = {test: [mark for each, mark in decorated if each == test
+                    and ast.unparse(mark.func) == "pytest.mark.parametrize"] for test, _ in decorated}
+    for test, parametrized in lists.items():
+        if len(parametrized) != 1:
+            continue
+        given = parametrized[0].args[1] if len(parametrized[0].args) > 1 else next(
+            (keyword.value for keyword in parametrized[0].keywords if keyword.arg == "argvalues"), None)
+        for value in given.elts if isinstance(given, (ast.List, ast.Tuple)) else ():
+            if not (isinstance(value, ast.Call) and ast.unparse(value.func) == "pytest.param"):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in value.keywords}
+            named, marks = keywords.get("id"), keywords.get("marks")
+            if not (isinstance(named, ast.Constant) and isinstance(named.value, str)
+                    and PARAM_ID.fullmatch(named.value)):
+                continue
+            for mark in marks.elts if isinstance(marks, (ast.List, ast.Tuple)) else [marks]:
+                if isinstance(mark, ast.Call) and test not in found:
+                    marked(f"{test}[{named.value}]", mark)
+    unread = sorted(node.lineno for node in ast.walk(tree)
+                    if isinstance(node, ast.Attribute) and node.attr in SHARDS
+                    and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)
+    if unread:
+        raise SystemExit(f"{name}, line {', '.join(map(str, unread))}: check1_shards and shards mark a test "
+                         f"once, on its own decorator, as @pytest.mark.check1_shards(seeds=S, per_task=P), "
+                         f"with conditioning=C, conditioning_per_task=Q where it declares a weighed check, "
+                         f"or @pytest.mark.shards(units=N, per_task=P), of literal counts above zero, or a "
+                         f"parameter of its one literal parametrize list once, as pytest.param(..., "
+                         f"id=\"<id>\", marks=pytest.mark.check1_shards(...)) of a literal id of letters, "
+                         f"digits, _ and -, which the plan reads from the source "
+                         f"(tools/armada/ci.py `sites`)")
+    return found
+
+
 def site_name(node: str, sites: Container[str]) -> str:
     """Test node `node`'s name among a file's `sites` (ci.py's `sites`): its parameter's site's, `test[id]`,
     where that parameter is marked one, else its test's (`test_name`)."""

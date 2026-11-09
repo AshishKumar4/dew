@@ -957,70 +957,14 @@ def sites(name: str) -> dict[str, Mark]:
 
 @functools.cache
 def marked_sites(name: str, text: str) -> dict[str, Mark]:
-    """`sites` of test file `name`, whose source is `text`, read once a text."""
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        # Its collection fails its row, saying why.
-        return {}
-    found: dict[str, Mark] = {}
-    read: set[int] = set()
-
-    def marked(site: str, mark: ast.Call) -> None:
-        kind = ast.unparse(mark.func).removeprefix("pytest.mark.")
-        if kind not in session.SHARDS:
-            return
-        counts = {keyword.arg: keyword.value.value for keyword in mark.keywords
-                  if isinstance(keyword.value, ast.Constant)}
-        allowed = [{session.SHARDS[kind], "per_task"}]
-        if kind == "check1_shards":
-            allowed.append({session.SHARDS[kind], "per_task", "conditioning", "conditioning_per_task"})
-        if (not mark.args and len(counts) == len(mark.keywords) and set(counts) in allowed
-                and site not in found and all(type(count) is int and count > 0 for count in counts.values())):
-            declared = counts[session.SHARDS[kind]]
-            units = _loaded(PARITY_STAGES).staged_units(declared) if kind == "check1_shards" else declared
-            weighed = _loaded(PARITY_STAGES).staged_units(counts.get("conditioning", 0))
-            found[site] = Mark(units, counts["per_task"], mark.lineno, declared, weighed,
-                               counts.get("conditioning_per_task", 0))
-            read.add(id(mark.func))
-
-    decorated = list(session.decorated_tests(tree.body))
-    for test, mark in decorated:
-        marked(test, mark)
-    # A marked parameter of a test's one literal parametrize list, `pytest.param(..., id="<id>", marks=...)`,
-    # is a site of its own, `test[id]` (session.SITE), its marks read as a test's (Main's ruling, 2026-11-09:
-    # test_recurrence's ~60 hook combinations, each a check-1 site of its own seeds).
-    lists = {test: [mark for each, mark in decorated if each == test
-                    and ast.unparse(mark.func) == "pytest.mark.parametrize"] for test, _ in decorated}
-    for test, parametrized in lists.items():
-        if len(parametrized) != 1:
-            continue
-        given = parametrized[0].args[1] if len(parametrized[0].args) > 1 else next(
-            (keyword.value for keyword in parametrized[0].keywords if keyword.arg == "argvalues"), None)
-        for value in given.elts if isinstance(given, (ast.List, ast.Tuple)) else ():
-            if not (isinstance(value, ast.Call) and ast.unparse(value.func) == "pytest.param"):
-                continue
-            keywords = {keyword.arg: keyword.value for keyword in value.keywords}
-            named, marks = keywords.get("id"), keywords.get("marks")
-            if not (isinstance(named, ast.Constant) and isinstance(named.value, str)
-                    and session.PARAM_ID.fullmatch(named.value)):
-                continue
-            for mark in marks.elts if isinstance(marks, (ast.List, ast.Tuple)) else [marks]:
-                if isinstance(mark, ast.Call) and test not in found:
-                    marked(f"{test}[{named.value}]", mark)
-    unread = sorted(node.lineno for node in ast.walk(tree)
-                    if isinstance(node, ast.Attribute) and node.attr in session.SHARDS
-                    and ast.unparse(node.value).rpartition(".")[2] == "mark" and id(node) not in read)
-    if unread:
-        raise SystemExit(f"{name}, line {', '.join(map(str, unread))}: check1_shards and shards mark a test "
-                         f"once, on its own decorator, as @pytest.mark.check1_shards(seeds=S, per_task=P), "
-                         f"with conditioning=C, conditioning_per_task=Q where it declares a weighed check, "
-                         f"or @pytest.mark.shards(units=N, per_task=P), of literal counts above zero, or a "
-                         f"parameter of its one literal parametrize list once, as pytest.param(..., "
-                         f"id=\"<id>\", marks=pytest.mark.check1_shards(...)) of a literal id of letters, "
-                         f"digits, _ and -, which the plan reads from the source "
-                         f"(tools/armada/ci.py `sites`)")
-    return found
+    """`sites` of test file `name`, whose source is `text`, read once a text: each site's mark as its source
+    declares it (`session.declared_marks`), its units staged as check 1 draws them (`PARITY_STAGES`)."""
+    staged = _loaded(PARITY_STAGES).staged_units
+    return {site: Mark(staged(declared) if kind == "check1_shards" else declared, counts["per_task"],
+                       line, declared, staged(counts.get("conditioning", 0)),
+                       counts.get("conditioning_per_task", 0))
+            for site, (kind, counts, line) in session.declared_marks(name, text).items()
+            for declared in [counts[session.SHARDS[kind]]]}
 
 
 def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | None = None
@@ -1652,6 +1596,43 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     return done.returncode, "".join(lines), expired, dump, None if left else closed, wrote
 
 
+def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: Mapping[str, int],
+           reported: bool, returncode: int, expired: float | None, running: str | None
+           ) -> tuple[list[str], list[tuple[ET.Element, str, ET.Element]], dict]:
+    """Test file `name`'s grade in its task (`tested`): what makes its row red, its failed cases, and what
+    turned it red (`red_as`). `own` its cases of the task's JUnit `cases`, `counted` its collection,
+    `reported` whether pytest wrote its report, `returncode` pytest's exit; `expired` the task's deadline
+    where it ran out of time, `running` the file its time was spent in (its executed log's last visit)."""
+    failed = [(case, kind, node) for case in own for kind in ("failure", "error")
+              if (node := case.find(kind)) is not None]
+    red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
+           for case, kind, node in failed]
+    skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
+               f"{node.get('message')}" for case in own for node in case.iter("skipped")
+               if "could not import" in f"{node.get('message')} {node.text}"]
+    deselected = bool(counted) and counted["collected"] == counted["deselected"]
+    spent = expired is not None and (name == running or running is None)
+    unreached = expired is not None and not spent and not own and not deselected
+    exited = [] if expired is not None and not spent else exit_red(returncode, cases, own, deselected, name)
+    unaccounted = ([] if exited or unreached or (reported and (own or deselected))
+                   else [f"no evidence {name} ran: " + ("pytest wrote no report" if not reported
+                                                        else "pytest reported none of its tests, and its "
+                                                             "collection shows them not all deselected")])
+    red += skipped + exited + unaccounted
+    if spent:
+        red.append(f"{INTERRUPTED} of {expired:.0f} s and was interrupted")
+    if unreached:
+        red.append(f"not graded: its task's {expired:.0f} s were spent in {running}, before pytest reported "
+                   "any test of it; it runs again")
+    # A failed case with no class path is a file that did not collect, no test of it.
+    nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
+    whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
+                                                                  for case, _, _ in failed)
+    cause = ({} if not red else red_as(STALE, []) if unreached else red_as("deadline", []) if spent
+             else red_as("whole", []) if whole else red_as("nodes", nodes))
+    return red, failed, cause
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
@@ -1725,36 +1706,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     running = stood[-1] if stood else None
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
-        failed = [(case, kind, node) for case in own for kind in ("failure", "error")
-                  if (node := case.find(kind)) is not None]
-        red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
-               for case, kind, node in failed]
-        skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
-                   f"{node.get('message')}" for case in own for node in case.iter("skipped")
-                   if "could not import" in f"{node.get('message')} {node.text}"]
-        counted = counts.get(name, {})
-        deselected = bool(counted) and counted["collected"] == counted["deselected"]
-        spent = expired and name == running
-        unreached = expired and running is not None and not spent and not own and not deselected
-        exited = [] if expired and not spent else exit_red(returncode, cases, own, deselected, name)
-        unaccounted = ([] if exited or unreached or (report.is_file() and (own or deselected))
-                       else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
-                                                            else "pytest reported none of its tests, and its "
-                                                                 "collection shows them not all deselected")])
-        red += skipped + exited + unaccounted
-        if spent or (expired and running is None):
-            red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
-        if unreached:
-            spender = running or "its other files"
-            red.append(f"not graded: its task's {deadline:.0f} s were spent in {spender}, before pytest "
-                       "reported any test of it; it runs again")
-        # A failed case with no class path is a file that did not collect, no test of it.
-        nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
-        whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
-                                                                      for case, _, _ in failed)
-        cause = ({} if not red else red_as(STALE, []) if unreached
-                 else red_as("deadline", []) if spent or (expired and running is None)
-                 else red_as("whole", []) if whole else red_as("nodes", nodes))
+        red, failed, cause = graded(name, own, cases, counts.get(name, {}), report.is_file(), returncode,
+                                    deadline if expired else None, running)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
