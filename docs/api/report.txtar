@@ -132,6 +132,7 @@ class Objective()  [dew.objectives.base]
   .averages(self, update: jax.Array) -> jax.Array
   .bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
+  .bind_plan(self, version: int) -> None
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
@@ -227,6 +228,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .averages(self, update: jax.Array) -> jax.Array
   .bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
+  .bind_plan(self, version: int) -> None
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
