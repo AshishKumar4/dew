@@ -107,13 +107,15 @@ def test_a_cpu_pairwise_dense_product_holds_every_order(edge):
 def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
     """`pairwise.pairwise_ragged_dot_general` (a CPU's float32 grouped product summed blocked and pairwise,
     row 4863's GEMM remainder): its rows grouped and their depth contracted, and each group's rows contracted
-    into the group's matrix, 96 deep and 136 rows so both take blocks and a partial last one, one group empty:
+    into the group's matrix, each contraction 96 long, as the dense form's, so both take blocks and a partial
+    last one, one group empty:
     every order runs in the float operands, the group sizes not differentiable, finite wherever float64 is a
     normal float32 and wherever the plain grouped product (by a mask, its float64 run the truth) is."""
     from dew.nn import pairwise
 
-    sizes = jnp.asarray([70, 0, 66], jnp.int32)
-    groups = jax.nn.one_hot(jnp.repeat(jnp.arange(3), sizes, total_repeat_length=136), 3)
+    sizes = jnp.asarray([70, 0, 66] if form == "rows" else [50, 0, 46], jnp.int32)
+    rows = int(sizes.sum())
+    groups = jax.nn.one_hot(jnp.repeat(jnp.arange(3), sizes, total_repeat_length=rows), 3)
     if form == "rows":
         numbers = jax.lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
         shapes, out = ((136, 96), (3, 96, 5)), (136, 5)
@@ -122,7 +124,7 @@ def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
             return jnp.einsum("rg,rk,gkn->rn", groups.astype(rows.dtype), rows, matrices)
     else:
         numbers = jax.lax.RaggedDotDimensionNumbers((((0,), (0,)), ((), ())), (0,), ())
-        shapes, out = ((136, 96), (136, 5)), (3, 96, 5)
+        shapes, out = ((rows, 4), (rows, 5)), (3, 4, 5)
 
         def plain(rows, cotangent):
             return jnp.einsum("rg,rk,rn->gkn", groups.astype(rows.dtype), rows, cotangent)
@@ -130,7 +132,7 @@ def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
     primals = normal_draw(4866, *shapes, scale=EDGES[edge])
     direction = normal_draw(4867, *shapes, scale=EDGES[edge])
     (cotangent,) = normal_draw(4868, out)
-    assert pairwise.contraction_block(96) < 96 and pairwise.contraction_block(136) < 136
+    assert pairwise.contraction_block(96) < 96
     assert_contract(lambda lhs, rhs: pairwise.pairwise_ragged_dot_general(lhs, rhs, sizes, numbers),
                     primals, direction, cotangent, f"a CPU pairwise grouped product {form} {edge}",
                     truth_fn=plain, plain_fn=plain)
