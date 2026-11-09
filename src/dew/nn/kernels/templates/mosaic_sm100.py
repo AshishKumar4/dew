@@ -493,22 +493,27 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool, initial: tuple | None = None
                        ) -> tuple[C, tuple]:
         # The accumulators stay in tensor memory, out of the loops' carries: a step's products add onto them
-        # but at the walk's first step.
+        # but at the walk's first step, which a flag the loops carry tells. A loop's index is no step's
+        # counter where the walk takes a rotation of its ring a trip (`mosaic.stepping`: the rotation's), so
+        # an index against the first step's counter restarted the sum at every rotation of a tile past the
+        # first whose steps no rotation's end meets (a 576-deep product at four stages lost its second
+        # tile's first three steps).
         del interpret
         accumulators = self.started(shapes, initial)
         if any(acc.ref is None for acc in accumulators):
             raise ValueError(f"{self._HOME}: a walk takes the tensor memory its persist gives it")
-        first = segments[0].lo if segments else 0
-        carry = start
+        # The flag counts no step before a walk's first and one after it.
+        state = (start, jnp.zeros((), jnp.int32))
         for loop in segments:
-            def stepped(index, carry, step=loop.step):
-                at = tuple(dataclasses.replace(acc, accumulate=index > first) for acc in accumulators)
-                return step(index, carry, at)[0]
+            def stepped(index, state, step=loop.step):
+                carry, taken = state
+                at = tuple(dataclasses.replace(acc, accumulate=taken > 0) for acc in accumulators)
+                return step(index, carry, at)[0], jnp.ones((), jnp.int32)
 
-            carry = lax.fori_loop(loop.lo, loop.hi, stepped, carry)
+            state = lax.fori_loop(loop.lo, loop.hi, stepped, state)
             if loop.then is not None:
                 loop.then()
-        return carry, accumulators
+        return state[0], accumulators
 
     def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True
                  ) -> Accumulator:
