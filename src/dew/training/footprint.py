@@ -361,10 +361,10 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     entry = slicing is None and not carried
     beside, spans, spanned = siblings(frontier, program) if entry and platform == "gpu" else ({}, [], {})
     begun: dict = {}
-    if platform != "gpu":
+    if platform == "cpu":
         beside, spans, spanned, begun = cpu_layouts(frontier, program)
     laid = laid_copies(frontier, program) if entry else []
-    if platform != "gpu":
+    if platform == "cpu":
         # A copy of an input reads nothing XLA must wait on: a CPU's schedule makes it at the program's
         # start (row 5290), so a bound holds it from there.
         laid = [(0, ended, size) for _, ended, size in laid]
@@ -395,7 +395,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
             # An operand made beside an earlier product's is held from there (`siblings`), not made here.
             made_for = unfused(frontier, equation) - spanned.get(index, set())
             operands = sum(map(device_share, made_for)) + beside.get(index, 0)
-            if platform != "gpu":
+            if platform == "cpu":
                 # The arrays the fusions making its operands read apart (`laid_inputs`), a shared one's
                 # where it is made, before its first reader.
                 starting = {value for value in spanned.get(index, set()) if begun[value] == index}
