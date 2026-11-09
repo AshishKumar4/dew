@@ -75,6 +75,7 @@ from .attention_masks import max_attention_logits, visibility_mask
 from .documents import CrossDocuments, holds_keys
 from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
+from .norms import NormSite
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, projection_role, sqrt_or_zero
 
 if TYPE_CHECKING:
@@ -454,7 +455,7 @@ class GatedCrossAttention(nn.Module):
     """
 
     reads_layer: ClassVar[bool] = False
-    norms: ClassVar[tuple[str, ...]] = ("input_layernorm", "post_attention_layernorm")
+    norms: ClassVar[tuple[str, ...]] = (NormSite.INPUT, NormSite.POST_ATTENTION)
     """The norms the block builds by name (`norm`): before its attention, and before its feed-forward."""
     """It reads the context with an attention of its own (`CrossBlocks`)."""
 

@@ -5,6 +5,7 @@
 input's.
 """
 
+import enum
 import functools
 import math
 from collections.abc import Callable
@@ -19,6 +20,22 @@ from .dense import Dense
 from .kernels import norm_swiglu
 from .precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted, rounded_to
 from .sharding import LogicalAxes, declared
+
+
+class NormSite(enum.StrEnum):
+    """The decoder's norms, each by the module name it is built under
+    (`dew.nn.backbones.decoder_block.decoder_norm`), the one place each is named: a block's
+    (`DecoderBlock._built_norms`), a cross-attention block's, and the model's own. A `NormSpec` may change
+    any of them (`CausalTransformer.norms`)."""
+
+    INPUT = 'input_layernorm'
+    POST_ATTENTION = 'post_attention_layernorm'
+    ATTENTION_OUTPUT = 'attention_output_norm'
+    MLP_OUTPUT = 'mlp_output_norm'
+    PER_LAYER_INPUT = 'post_per_layer_input_norm'
+    EMBEDDING = 'embedding_layernorm'
+    FINAL = 'norm'
+    HEAD = 'head_norm'
 
 
 def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):

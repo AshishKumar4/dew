@@ -84,7 +84,7 @@ from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..ngpt import NGPT, gain
-from ..norms import RMSNorm
+from ..norms import NormSite, RMSNorm
 from ..precision import (
     at_least_fp32,
     capped_logits,
@@ -258,7 +258,7 @@ class CausalTransformer(LinearProducts):
     norm_bias: bool = False
     norms: Mapping[str, NormSpec] | None = None
     """The norms that differ from the model's others, by module name
-    (`decoder_block.NORM_SITES`): K2 Horizon's grouped statistics, an
+    (`decoder_block.NormSite`): K2 Horizon's grouped statistics, an
     epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
@@ -914,7 +914,7 @@ class CausalTransformer(LinearProducts):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='head_norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name=NormSite.HEAD)
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', declared(nn.initializers.zeros_init(), DECODER_AXES['head_bias']),
@@ -2190,7 +2190,7 @@ class CausalTransformer(LinearProducts):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='embedding_layernorm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name=NormSite.EMBEDDING)
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_rows,
@@ -2211,7 +2211,7 @@ class CausalTransformer(LinearProducts):
             self.norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name=NormSite.FINAL)
 
     @nn.nowrap
     def with_kv_cache(self, layout: KVCache) -> Self:

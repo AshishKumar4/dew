@@ -63,6 +63,7 @@ from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
+from dew.nn.norms import NormSite
 from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTraining
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
@@ -728,7 +729,7 @@ def convolution_tap(equation, producers):
     return tapped and shifted
 
 
-GATED_NORM_SITES = ("embedding_layernorm", "norm", "input_layernorm", "post_attention_layernorm")
+GATED_NORM_SITES = (NormSite.EMBEDDING, NormSite.FINAL, NormSite.INPUT, NormSite.POST_ATTENTION)
 
 
 @pytest.mark.parametrize("fields", [
