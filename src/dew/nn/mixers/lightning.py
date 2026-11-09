@@ -38,7 +38,7 @@ from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
-from dew.nn.linear import forked_scan
+from dew.nn.linear import fork_start, forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -171,9 +171,9 @@ class LightningAttention(nn.Module):
                                               state=state, starts=starts, entered=entered),
                              chunk_size=self.chunk_size, max_segments=tokens.max_segments)
 
-            out = forked_scan((query, key, value), forked_rule, tokens,
-                              (self.num_heads, self.head_dim, self.head_dim),
-                              held=None if held is None else held.value, state_dtype=wide)
+            start = fork_start(None if held is None else held.value,
+                               (batch, self.num_heads, self.head_dim, self.head_dim), wide)
+            out = forked_scan((query, key, value), forked_rule, tokens, start)
             out = self.norm(out.reshape(batch, length, self.features))
             return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
         if held is not None and length == 1:
