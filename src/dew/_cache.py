@@ -127,12 +127,19 @@ def default_compilation_cache_dir() -> str:
     older interpreter sharing the directory would read those bytes with the
     wrong codec. Hosts of every CPU class share it: Dew's JAX build keys a
     CPU program by the host's CPU (0.12.0.1.post13), which XLA:CPU compiles
-    for, so no host reads a program that does not link there. Explicit paths
-    passed to enable_compilation_cache remain unchanged.
+    for, so no host reads a program that does not link there. Each build of
+    the CUDA PJRT plugins installed has its own (`plugin_builds`): JAX keys
+    an executable by jax's, jaxlib's and CUDA's versions, not the plugin that
+    compiled it, so a plugin rebuilt under one jax read the executables its
+    earlier build's XLA compiled, a miscompile it fixed included (row 5275).
+    A directory a run names, or JAX_COMPILATION_CACHE_DIR, is its own to keep
+    apart across plugin builds. Explicit paths passed to
+    enable_compilation_cache remain unchanged.
     """
     if jax.config.jax_compilation_cache_dir:
         return jax.config.jax_compilation_cache_dir
-    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
+    return os.path.join(dew_cache_dir(), 'xla',
+                        f"python{sys.version_info.major}.{sys.version_info.minor}{plugin_builds()}")
 
 
 def beside_compilation_cache(variable: str, name: str) -> Path | None:
@@ -261,22 +268,6 @@ def autotune_dir(path: str) -> str:
     per fusion, and Dew's kernels' beside them (`kernel_picks_path`), each pick's speed the plugin's
     compile's."""
     return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}{plugin_builds()}")
-
-
-def _keyed_by_plugin_builds() -> None:
-    """JAX's persistent cache key with each CUDA PJRT plugin's build in it (`plugin_builds`, through the key's
-    custom hook, any hook set before kept in front): JAX keys an executable by jax's and jaxlib's versions
-    and the backend's platform version (CUDA's), not the plugin that compiled it, so a plugin rebuilt under
-    one jax served the executables its earlier build's XLA compiled, a miscompile it fixed included
-    (IG-P0-CANDIDATE: an A100's candidate plugin read its control's executables, row 5275)."""
-    from jax._src import cache_key
-
-    before = cache_key.custom_hook
-    builds = plugin_builds()
-    cache_key.custom_hook = lambda: before() + builds
-
-
-_keyed_by_plugin_builds()
 
 
 def kernel_picks_path(device_kind: str) -> str:

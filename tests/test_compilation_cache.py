@@ -35,8 +35,10 @@ print(json.dumps({"directory": run()}))
 def test_a_run_caches_its_compilations_under_the_users_cache_directory(tmp_path, entry, enabled):
     """A run readied by `prepare_process` with no directory of its own, or by a `Trainer.fit` no
     `prepare_process` came before, writes its compiled programs under $XDG_CACHE_HOME/dew/xla, in its
-    Python minor's directory, so its restart reads them; JAX_ENABLE_COMPILATION_CACHE=false leaves it
-    without the cache."""
+    Python minor's and installed CUDA plugin builds' directory (`plugin_builds`), so its restart reads them;
+    JAX_ENABLE_COMPILATION_CACHE=false leaves it without the cache."""
+    from dew._cache import plugin_builds
+
     env = {key: value for key, value in os.environ.items()
            if key not in ("JAX_COMPILATION_CACHE_DIR", "JAX_ENABLE_COMPILATION_CACHE")}
     env.update(JAX_PLATFORMS="cpu", XDG_CACHE_HOME=str(tmp_path))
@@ -49,7 +51,7 @@ def test_a_run_caches_its_compilations_under_the_users_cache_directory(tmp_path,
     assert done.returncode == 0, done.stderr[-2000:]
     directory = json.loads(done.stdout.strip().splitlines()[-1])["directory"]
     minor = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    expected = tmp_path / "dew" / "xla" / minor
+    expected = tmp_path / "dew" / "xla" / f"{minor}{plugin_builds()}"
     if enabled:
         assert directory == str(expected)
         assert any(path.is_file() and "autotune" not in path.parts for path in expected.rglob("*"))
@@ -155,15 +157,15 @@ def test_a_rebuilt_cuda_plugin_reads_no_picks_its_earlier_build_measured(tmp_pat
 
 
 def test_a_rebuilt_cuda_plugin_reads_no_executable_its_earlier_build_compiled(tmp_path):
-    """JAX keys a persistent cache entry by jax's, jaxlib's and the platform's versions, not the PJRT plugin
-    that compiled it; a plugin rebuilt under one jax served its earlier build's executables, the miscompile it
-    fixed included (row 5275). A process beside another build of a plugin compiles the same program into
-    an entry of its own, and the same build reads the entry back."""
+    """JAX keys a persistent cache entry by jax's, jaxlib's and CUDA's versions, not the PJRT plugin that
+    compiled it; a plugin rebuilt under one jax read its earlier build's executables, the miscompile it fixed
+    included (row 5275). A process beside another build of a plugin compiles into a directory of its own by
+    default, and the same build reads back the one it compiled into."""
     from process_support import fresh
 
-    cache = tmp_path / "cache"
+    home = tmp_path / "home"
 
-    def compiled_beside(version):
+    def cached_beside(version):
         site = tmp_path / version
         (site / "jax_plugins" / "xla_cuda12").mkdir(parents=True, exist_ok=True)
         # A plugin JAX's discovery imports and initializes, registering no backend (JAX_PLATFORMS=cpu).
@@ -171,13 +173,19 @@ def test_a_rebuilt_cuda_plugin_reads_no_executable_its_earlier_build_compiled(tm
         info = site / f"jax_cuda12_pjrt-{version}.dist-info"
         info.mkdir(exist_ok=True)
         (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: jax-cuda12-pjrt\nVersion: {version}\n")
-        fresh(f"import sys; sys.path.insert(0, {str(site)!r}); import jax; "
-              f"from dew._cache import enable_compilation_cache; enable_compilation_cache({str(cache)!r}); "
-              "jax.jit(lambda x: x * 3 + 1)(2).block_until_ready(); print('null')", platforms="cpu")
-        return {path.name for path in cache.glob("*-cache")}
+        directory = fresh(f"import json, os, sys; sys.path.insert(0, {str(site)!r}); "
+                          f"os.environ['XDG_CACHE_HOME'] = {str(home)!r}; "
+                          "os.environ.pop('JAX_COMPILATION_CACHE_DIR', None); import jax; "
+                          "from dew._cache import default_compilation_cache_dir, enable_compilation_cache; "
+                          "enable_compilation_cache(default_compilation_cache_dir()); "
+                          "jax.jit(lambda x: x * 3 + 1)(2).block_until_ready(); "
+                          "print(json.dumps(jax.config.jax_compilation_cache_dir))", platforms="cpu")
+        return pathlib.Path(directory)
 
-    earlier = compiled_beside("0.12.0.1.post71")
-    assert len(earlier) == 1
-    assert compiled_beside("0.12.0.1.post71") == earlier
-    later = compiled_beside("0.12.0.1.post72")
-    assert len(later) == 2 and earlier < later
+    earlier = cached_beside("0.12.0.1.post71")
+    entries = {path.name for path in earlier.glob("*-cache")}
+    assert len(entries) == 1
+    assert cached_beside("0.12.0.1.post71") == earlier
+    assert {path.name for path in earlier.glob("*-cache")} == entries
+    later = cached_beside("0.12.0.1.post72")
+    assert later != earlier and len(list(later.glob("*-cache"))) == 1
