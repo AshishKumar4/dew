@@ -149,8 +149,9 @@ class _Halves:
 
     count: int
     index: jax.Array | int
-    partials: jax.Ref
-    joined: jax.Ref
+    partials: jax.Ref | None
+    """None for one warpgroup (`_joining`'s none), as `joined`."""
+    joined: jax.Ref | None
 
     def first(self, effect) -> None:
         """`effect()` by the first half alone (a store both halves would make alike)."""
@@ -167,7 +168,7 @@ class _Halves:
     def joined_sums(self, part: jax.Array, slot: int, layout, interpret: bool) -> jax.Array:
         """`part`, this half's sum over its keys `[heads, columns]`, joined with the other half's: their sum
         the earlier half's on the left, XLA's pairwise order's top (each half a subtree of it)."""
-        if self.count == 1:
+        if self.partials is None or self.joined is None:
             return part
         plgpu.store(self.partials.at[slot, self.index], part, optimized=False)
         mosaic.synced(interpret)
