@@ -1097,6 +1097,55 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     assert described(fused) == described(unfused)
 
 
+@pytest.mark.parametrize("value_width", [128, 512, 64])
+def test_a_gated_delta_nets_decode_token_takes_the_step_wherever_its_value_heads_fit_it(value_width):
+    """A gated delta net's decode token with a conv, gates and a gated norm on an H100's route (`assumed`):
+    the step takes it wherever its own widths hold (`step.fits` not whole), the fused step's (a value head a
+    warpgroup, its norm reading a head whole) no rule of the step's: at fla's default value heads of 512 or
+    64 the step takes the token, as main's step kernel did, not the portable math."""
+    from dew.nn.kernels.generation import assumed
+    from dew.nn.kernels.selection import select
+    from dew.nn.linear import DELTA_DECODE, DecodeCase
+
+    with assumed("sm90"):
+        chosen = select(DELTA_DECODE, DecodeCase((8, 16, 128, value_width), jnp.dtype(jnp.bfloat16),
+                                                 fuses=True)).kernel
+    assert chosen == "step"
+
+
+@pytest.mark.parametrize("value_width", [128, 512, 64])
+def test_a_token_with_nothing_to_fuse_naming_the_fused_step_takes_the_step_at_its_widths(value_width):
+    """A decode token whose caller has no conv, gates or gated norm to fuse naming the fused step
+    (`generation.chosen`) on an H100's route: the fused step hands it to the step wherever the step's own
+    widths hold, refusing it by no width the fused step's gated norm alone asks."""
+    from dew.nn.kernels.generation import assumed, chosen
+    from dew.nn.kernels.selection import select
+    from dew.nn.linear import DELTA_DECODE, DecodeCase
+
+    with assumed("sm90"), chosen(delta_decode="fused"):
+        kernel = select(DELTA_DECODE, DecodeCase((8, 16, 128, value_width), jnp.dtype(jnp.bfloat16),
+                                                 fuses=False)).kernel
+    assert kernel == "step"
+
+
+@pytest.mark.parametrize(("value_heads", "kernel"), [(2, "xla"), (4, "step")])
+def test_a_decode_token_over_a_tensor_mesh_takes_the_step_where_each_shards_heads_fit_it(value_heads, kernel):
+    """A gated delta net's decode token of 64-wide value heads over two key heads on an H100's route, its
+    heads split over a two-way tensor mesh (`stepped_per_shard`): the step's programs take two such heads
+    each (`step.fits`), so a shard of one head is no launch of the step's and the token takes the portable
+    math, a shard of two the step."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.kernels.generation import assumed
+    from dew.nn.linear import decode_kernel
+
+    mesh = AbstractMesh((2,), ("tensor",), axis_types=(AxisType.Explicit,))
+    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        chosen = decode_kernel(jax.ShapeDtypeStruct((8, value_heads, 128, 64), jnp.bfloat16), groups=2,
+                               fuses=True)
+    assert chosen == kernel
+
+
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
 def test_the_fused_step_compiles_within_each_gpus_resources(target):
     """The fused decode step, the recurrence template's step on Mosaic GPU, at Qwen3.5-0.8B's widths (16
