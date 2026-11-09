@@ -29,6 +29,7 @@ import pytest
 import recurrence_witness as rw
 from attention_witness import assert_faults_refused, assert_witnessed
 from gpu_flow import Cell, run_cells
+from interval_certificates import Lane, exp2_reach
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from native_certificates import (
@@ -571,20 +572,20 @@ def mosaic_exp2(semantics: str):
 
 
 @functools.cache
-def mosaic_lane() -> rw.Lane:
+def mosaic_lane() -> Lane:
     """The arithmetic the recurrence mainloop's launches run in on this GPU, probed natively in each lowering
-    its bundles take: `exp2`'s reach (`recurrence_witness.exp2_reach`), at most PTX's (`PTX_EX2`, past it a
+    its bundles take: `exp2`'s reach (`interval_certificates.exp2_reach`), at most PTX's (`PTX_EX2`, past it a
     finding), and whether an fp32 product below the normal range flushes (2^-30 times 2^-100); a 16-bit
     call's. Its fp32 adds, multiplies, contractions and casts to bf16 and fp16 round to nearest, subnormals
     kept (row 2084's link 3 probe, both GPUs and lowerings)."""
     reaches, flushes = [], False
     for semantics in ("Lane", "Warpgroup"):
         run = mosaic_exp2(semantics)
-        reaches.append(rw.exp2_reach(lambda x, run=run: run(x)[0]))
+        reaches.append(exp2_reach(lambda x, run=run: run(x)[0]))
         flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
     # The witness takes the ISA's stated reach, the probes within it, not the sampled one.
     assert max(reaches) <= PTX_EX2, reaches
-    return rw.Lane(PTX_EX2, flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)))
+    return Lane(PTX_EX2, flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)))
 
 
 def the_recurrence_templates_records_certify_natively_a_step_at_a_time(generation_name, regime):
