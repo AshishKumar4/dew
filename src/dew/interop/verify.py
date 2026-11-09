@@ -823,13 +823,13 @@ _TWIN: dict[str, PreTrainedModel] = {}
 """The twin process's float64 twin (`_twin_built`), built once."""
 
 
-def _twin_built(origin: ModelSource, config: PretrainedConfig, weights: Mapping[str, np.ndarray],
-                registered: tuple[type, object] | None) -> None:
-    """In the twin's process: the reference's float32 model of `config` and `weights` and its float64 twin,
-    each built by the source's own constructor (`origin`, `source_twin`) as the probe built the reference,
-    so whatever its code attaches to what it builds (a hook on a gradient) is attached here too.
-    `registered` is the config class and causal LM a process registered with transformers' auto classes
-    at runtime, which this process registers alike."""
+def _twin_built(origin: ModelSource, kind: type[PretrainedConfig], stated: Mapping[str, object],
+                weights: Mapping[str, np.ndarray], registered: tuple[type, object] | None) -> None:
+    """In the twin's process: the reference's float32 model of the config `kind` reads off `stated` (its
+    `to_dict`) and `weights`, and its float64 twin, each built by the source's own constructor (`origin`,
+    `source_twin`) as the probe built the reference, so whatever its code attaches to what it builds (a
+    hook on a gradient) is attached here too. `registered` is the config class and causal LM a process
+    registered with transformers' auto classes at runtime, which this process registers alike."""
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -837,6 +837,7 @@ def _twin_built(origin: ModelSource, config: PretrainedConfig, weights: Mapping[
 
     if registered is not None:
         AutoModelForCausalLM.register(*registered, exist_ok=True)
+    config = kind.from_dict(dict(stated))
     reference = origin.causal_lm(copy.deepcopy(config)).float()
     reference.load_state_dict({name: torch.from_numpy(np.asarray(value)) for name, value in weights.items()})
     _TWIN['twin'] = source_twin(reference, lambda: origin.causal_lm(widened_config(copy.deepcopy(config))))
@@ -1167,9 +1168,6 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         # The probe runs whether or not a candidate is left, so a type no convention computes is
         # one whose shrunken model ran (`Unmapped`), and one whose model does not run is
         # `ProbeUnavailable`, whatever the candidates.
-        # As the reference's constructor received it: its build resolves implementations onto the config
-        # it is given (its experts', its attention's), which the twin's process resolves for itself.
-        stated = copy.deepcopy(config)
         try:
             reference = source.causal_lm(config).float()
             scatter_weights(reference)
@@ -1181,7 +1179,9 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             probed = _Source(reference, twin)
             try:
                 weights = {key: value.detach().cpu().numpy() for key, value in reference.state_dict().items()}
-                twin.call(_twin_built, source, stated, weights, registered)
+                # The config as it serializes, without the implementations a build resolved onto it (its
+                # experts', its attention's), which the twin's process resolves for itself.
+                twin.call(_twin_built, source, type(config), config.to_dict(), weights, registered)
                 probed.logits(probe_ids(_VOCAB))
             except Exception as error:
                 raise _unavailable(model_type, f"{name} does not run its shrunken config "
