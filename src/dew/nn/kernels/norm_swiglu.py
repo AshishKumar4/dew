@@ -290,7 +290,9 @@ def elementwise(function, shape: tuple[int, ...]) -> bool:
     def mapped(jaxpr: jax.extend.core.Jaxpr) -> bool:
         for equation in jaxpr.eqns:
             shapes = [variable.aval.shape for variable in (*equation.invars, *equation.outvars)]
+            # A custom reverse derivative has no forward one to state the tile's (`_tangents`).
             if (equation.primitive.name in _POSITIONAL or equation.primitive not in lowered
+                    or equation.primitive.name.startswith("custom_vjp")
                     or any(each not in (tuple(shape), ()) for each in shapes)):
                 return False
             nested = [value for value in equation.params.values()
@@ -314,28 +316,50 @@ def _traced(function, shape: tuple[int, ...]) -> jax.extend.core.ClosedJaxpr:
     return jax.make_jaxpr(function)(jax.ShapeDtypeStruct(shape, jnp.float32))
 
 
+@functools.lru_cache(maxsize=256)
+def _tangents(function, shape: tuple[int, ...]) -> jax.extend.core.ClosedJaxpr:
+    """`function`'s forward derivative at an fp32 input of the call's logical `shape`, `(y, t) -> (out,
+    t_out)`, as JAX derives it (a custom derivative's rule applied, a relu's 0 at 0), once a function and
+    shape."""
+    aval = jax.ShapeDtypeStruct(shape, jnp.float32)
+    return jax.make_jaxpr(lambda y, t: jax.jvp(function, (y,), (t,)))(aval, aval)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Logical:
     """An `elementwise` activation as the kernels apply it: its graph traced once at the call's logical
-    `shape` (`_traced`), evaluated on a tile of any shape. Each shape a parameter states that is the logical
-    one (a scalar broadcast to it) is the tile's; every value the activation derived from the shape is a
-    literal of the logical one, so `y / y.shape[-1]` divides a padded tile's row by the row's width; and a
-    custom derivative's call is bound as itself (`get_bind_params`, as `jax.core.eval_jaxpr` binds it), its
-    rule kept. Keyed by the activation and the shape, as a launch's static arguments are."""
+    `shape` (`_traced`), evaluated on a tile of any shape (`_on_tile`). Each shape a parameter states that is
+    the logical one (a scalar broadcast to it) is the tile's, and every value the activation derived from the
+    shape a literal of the logical one, so `y / y.shape[-1]` divides a padded tile's row by the row's width.
+    Its derivative is its own, derived at the logical shape (`_tangents`, a custom rule kept) and evaluated
+    on the tile alike. Keyed by the activation and the shape, as a launch's static arguments are."""
     function: Callable[[jax.Array], jax.Array]
     shape: tuple[int, ...]
 
     def __call__(self, y: jax.Array) -> jax.Array:
         traced = _traced(self.function, self.shape)
-        (out,) = _on_tile(traced.jaxpr, traced.consts, self.shape, y.shape, y)
-        return out
+
+        @jax.custom_jvp
+        def applied(y):
+            (out,) = _on_tile(traced.jaxpr, traced.consts, self.shape, y.shape, y)
+            return out
+
+        @applied.defjvp
+        def _(primals, tangents):
+            derived = _tangents(self.function, self.shape)
+            out, tangent = _on_tile(derived.jaxpr, derived.consts, self.shape, primals[0].shape, *primals,
+                                    *tangents)
+            return out, tangent
+
+        return applied(y)
 
 
 def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
     """`jaxpr`, traced at the `logical` shape, evaluated on `args` of the `tile` shape as
     `jax.core.eval_jaxpr` evaluates it: each equation bound by its primitive (`get_bind_params`), a shape
     parameter that is the logical shape the tile's, and a program a parameter holds (a jit's, a custom
-    derivative's primal) retraced at the tile's shapes, the equation kept."""
+    derivative's primal) retraced at the tile's shapes, the equation kept. Its values alone: `_Logical`
+    states the derivative."""
     values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
 
     def read(atom):
