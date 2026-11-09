@@ -52,10 +52,11 @@ class Saturation:
 class AlgebraReport:
     """What one region's rewrite did: the equations it read, the sets admitted and the matches each fired,
     its limits, its iterations and nodes, whether a limit stopped it, the region's price before and after in
-    seconds (`cost.model`), the seconds this program's rewrite of it took, the roots whose cheaper form the
-    program took (`spliced`, `_splices`: a picked form that does not land, a value another window's form made
-    or a form of another type, is none), and whether an earlier window of its structure derived its forms
-    (`reused`, `_derived`: its seconds a lookup's)."""
+    seconds (`cost.model`; None for a region no rule may fire in, `rules.reorderable`, whose terms are never
+    built and so never priced), the seconds this program's rewrite of it took, the roots whose cheaper form
+    the program took (`spliced`, `_splices`: a picked form that does not land, a value another window's form
+    made or a form of another type, is none), and whether an earlier window of its structure derived its
+    forms (`reused`, `_derived`: its seconds a lookup's)."""
 
     equations: int
     admitted: tuple[str, ...]
@@ -64,8 +65,8 @@ class AlgebraReport:
     iterations: int
     nodes: int
     limited: bool
-    before: float
-    after: float
+    before: float | None
+    after: float | None
     seconds: float
     spliced: int = 0
     reused: bool = False
@@ -142,12 +143,18 @@ def rewritten_program(closed: jcore.Jaxpr, *, saturation: Saturation) -> jcore.J
     and its regions written as Dew's kernels where the switch is on (`passes`, `rewrite`'s walks,
     `kernels`): `closed` itself where no rule changes it, so the trace jit made lowers as it is, never
     staged again (a Dory-4B training step's replay of its unchanged program, 1.8 seconds of its
-    compile). The pass's whole seconds, its walks among them, recorded (`report.record_pass`)."""
+    compile). The pass's whole seconds are recorded (`_passed`)."""
     if not ALGEBRA.value.on:
         return closed
-    accurate = generation.numerics().forms == "accurate"
+    return _passed(closed, generation.numerics().forms == "accurate", saturation, kernels=True)
+
+
+def _passed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
+    """One program's pass (`_rewritten`), its whole seconds, its walks of the program among them, recorded
+    beside the regions' own (`report.record_pass`): where both entries run it, a jit's trace at the compile
+    point (`rewritten_program`) and a function's own (`rewritten`'s `rewrite`)."""
     began = time.perf_counter()
-    made = _rewritten(closed, accurate, saturation, kernels=True)
+    made = _rewritten(closed, accurate, saturation, kernels)
     kernel_report.record_pass(time.perf_counter() - began)
     return made
 
@@ -192,7 +199,7 @@ def rewrite(closed: jcore.Jaxpr, arguments: list, *, accurate: bool, saturation:
     """The outputs of `closed` (a jaxpr and its constants) over `arguments` (flattened), its bodies rewritten
     in place first (`_within`), then its own math (`_windowed`), then, with `kernels`, its regions written as
     Dew's kernels (`fusion.fused_program`)."""
-    rewritten = _rewritten(closed, accurate, saturation, kernels)
+    rewritten = _passed(closed, accurate, saturation, kernels)
     return eval_jaxpr(rewritten, rewritten.consts, *arguments)
 
 
@@ -425,7 +432,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     if not rules.reorderable(skeleton):
         fired = dict.fromkeys((sets.name for sets in admitted), 0)
         report = AlgebraReport(skeleton.equations, tuple(fired), fired, saturation.limits(skeleton),
-                               iterations=0, nodes=0, limited=False, before=0.0, after=0.0,
+                               iterations=0, nodes=0, limited=False, before=None, after=None,
                                seconds=time.perf_counter() - began)
         return Rewrite(skeleton, {}, report)
     region = terms.region(closed)
