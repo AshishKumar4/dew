@@ -69,10 +69,13 @@ class Isolated:
 
 def main() -> dict:
     """The load's script as `multiprocessing`'s spawn reads it to import it in another process, which
-    `Isolated.call(multiprocessing.spawn.prepare, main())` imports there."""
+    `Isolated.call(multiprocessing.spawn.prepare, main())` imports there: all but the process's
+    authentication key, which no process but spawn's own child may be sent (an `AuthenticationString`
+    refuses to pickle elsewhere) and which this process, connecting to none, has no use for."""
     import multiprocessing.spawn
 
-    return multiprocessing.spawn.get_preparation_data('isolated')
+    prepared = multiprocessing.spawn.get_preparation_data('isolated')
+    return {key: value for key, value in prepared.items() if key != 'authkey'}
 
 
 class IsolatedFailure(RuntimeError):
