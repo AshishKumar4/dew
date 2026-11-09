@@ -289,8 +289,12 @@ def elementwise(function) -> bool:
 def _alike(first, second, shape, other) -> bool:
     """Whether two traces of one function, at input `shape` and `other`, are one program but for those
     shapes: equation by equation the same primitives, literals and constants, and the same parameters, a
-    parameter that is the input's shape at each taken as one, nested programs alike."""
+    parameter that is the input's shape at each taken as one, nested programs alike; a rule a parameter
+    holds as a function (a custom derivative's) is the function's own, traced apart."""
     def same(a, b) -> bool:
+        programs_of = (jax.extend.core.ClosedJaxpr, jax.extend.core.Jaxpr)
+        if callable(a) and callable(b) and not isinstance(a, programs_of):
+            return True
         if isinstance(a, jax.extend.core.ClosedJaxpr) and isinstance(b, jax.extend.core.ClosedJaxpr):
             return programs(a, b)
         if isinstance(a, jax.extend.core.Jaxpr) and isinstance(b, jax.extend.core.Jaxpr):
