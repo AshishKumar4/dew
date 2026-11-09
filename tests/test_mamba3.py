@@ -46,7 +46,7 @@ held to the reference's own residue there, zero; tracing the recurrence's float6
 and 10 GB a packed site (jsf-m3prof1)."""
 NARROW_ROUTES = tuple(route for route in ROUTES if route in (None, "sm80"))
 """The routes the bf16 layer's chunked form runs on the template (`on_route`): the interpreter's and an
-A100's; tcgen05's launches take no call of its 8-wide values (`KernelRefused`, jsf-m3route)."""
+A100's. sm100's template takes no form without the delta rule (`KernelRefused`), a gap (ledger 5355)."""
 NARROW_SEEDS = {None: 8, "sm80": 8}
 """The bf16 layer's chunked-form site's declared seeds by route (`NARROW_ROUTES`), sized by `seeds_for` on
 armada, paired."""
