@@ -1,8 +1,11 @@
-"""Pure-CPU regressions for ptxas 12.9's register allocation as the compile gate decides on it."""
+"""Pure-CPU regressions for ptxas 12.9's register allocation as the compile gate decides on it, and the
+register facts a family states that ptxas holds it to."""
 import dataclasses
 
+import jax.numpy as jnp
 import kernel_compile as kc
 import pytest
+from generation_support import COMPILES_ON_CPU
 
 from dew.nn.kernels.templates import resources
 
@@ -122,3 +125,64 @@ def _assembled_record(kernel: str, read) -> dict:
     return {"name": kernel, "generation": "sm90", "limit": 232448, "tmem_limit": 0,
             "kernels": [{"kernel": kernel, "shared": 1024, "tmem": 0, "registers": read.registers,
                          "spilled": read.spilled, "losses": read.losses, "unread": []}]}
+
+
+def _minimal_wgmma(columns: int):
+    """One warpgroup MMA, bf16 operands from shared memory into a `[64, columns]` fp32 accumulator, beside a
+    producer warpgroup loading them: a consumer raising its registers and a producer lowering them, as a
+    ring family's launches run (`Family.roles`)."""
+    import jax
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    from dew.nn.kernels.templates import mosaic, swizzling
+
+    def body(a, b, out, staged_a, staged_b, barriers):
+        @pl.when(lax.axis_index("wg") == 0)
+        def consumer():
+            plgpu.set_max_registers(resources.raise_ceiling(), action="increase")
+            plgpu.barrier_wait(barriers.at[0])
+            plgpu.barrier_wait(barriers.at[1])
+
+            def accumulate(accumulator):
+                plgpu.wgmma(accumulator, staged_a.T, staged_b)
+                return accumulator[...]
+
+            value = pl.run_scoped(accumulate, plgpu.WGMMAAccumulatorRef((64, columns), jnp.float32))
+            plgpu.store(out, value, optimized=False)
+
+        @pl.when(lax.axis_index("wg") == 1)
+        def producer():
+            plgpu.set_max_registers(resources.producer_floor(), action="decrease")
+            plgpu.copy_gmem_to_smem(a, staged_a, barriers.at[0])
+            plgpu.copy_gmem_to_smem(b, staged_b, barriers.at[1])
+
+    body.__name__ = f"minimal_wgmma_{columns}"
+    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64, columns), jnp.float32), num_threads=2,
+                          thread_name="wg", compiler_params=mosaic.compiler_params(),
+                          scratch_types=[swizzling.staged((16, 64), jnp.bfloat16, 32),
+                                         swizzling.staged((16, columns), jnp.bfloat16, 32),
+                                         plgpu.Barrier(num_barriers=2)])
+    return kernel, (jax.ShapeDtypeStruct((16, 64), jnp.bfloat16),
+                    jax.ShapeDtypeStruct((16, columns), jnp.bfloat16))
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("columns", [16, 32, 64, 128])
+def test_a_warpgroup_mma_assembles_at_the_entry_its_issuer_states(columns):
+    """A program of one `[64, columns]` warpgroup MMA (`_minimal_wgmma`), assembled by ptxas for an H100
+    with its entry capped at the registers wgmma's issuer states its accumulator needs
+    (`Issuer.entry_floor`): taken spill-free, whatever its consumer's raise. A ptxas or target needing more
+    fails here, not in a launch the plan sized to the floor (the values' backward at 32, M-JS-63)."""
+    from dew.nn.kernels.templates import bundles
+
+    kernel, operands = _minimal_wgmma(columns)
+    lowered = kc.lowered_for(kernel, operands, "sm90")
+    with kc._printed(MOSAIC_GPU_DUMP_PTX="1") as printed:
+        lowered.compile()
+    (ptx,) = ["//\n" + kc.PTX_MODULE + part for part in "".join(printed).split(kc.PTX_MODULE)[1:]
+              if f"minimal_wgmma_{columns}" in part]
+    floor = bundles.of("sm90", jnp.bfloat16, scoped=True).entry_floor([(64, columns, jnp.float32)])
+    _, spilled, took = kc._ptxas(ptx, "sm90", cap=floor, relocatable=False)
+    assert took and not spilled, f"{columns} columns at {floor} registers"

@@ -468,6 +468,11 @@ class Held:
         addresses into the shared tiles it stages and lands itself (`addressed`, `_addressed`)."""
         return resources.live_registers(family, self.carried, *self.phases, addressed=addressed)
 
+    def entry(self, family: mosaic.Family) -> int:
+        """The registers a thread of its program launches with at least, its fp32 tiles its products'
+        accumulators (`Issuer.entry_floor`)."""
+        return family.entry_floor([*self.carried, *(tile for phase in self.phases for tile in phase)])
+
 
 def _addressed(staging: tuple, landing: dict) -> list:
     """The shared tiles a launch's consumer thread reads and writes through its registers, each `(shape,
@@ -674,20 +679,20 @@ def _landed(landing: dict, family: mosaic.Family) -> dict:
 
 
 def _planned_launch(call: Call, scope: Callable[[int], resources.Scope], registers: int, *, floor: int,
-                    most: int, consumers: int = 1,
-                    producer: int | None = None) -> resources.LaunchPlan | None:
+                    most: int, consumers: int = 1, producer: int | None = None,
+                    entry: int = 0) -> resources.LaunchPlan | None:
     """A launch's ring depth and the programs a multiprocessor holds of it (`resources.plan`, at its stated
     `registers` and its streams `scope`d at each depth from `floor` to `most`), None where it holds at none: a
     config past the device, whose record says so (`Launch.resident` zero) and `template.Mosaic.legal`
-    refuses."""
+    refuses. Its programs launch with `entry` registers a thread at least (`resources.Launch.entry`)."""
     found = resources.plan([resources.Launch(scope, consumers, registers, floor=floor, most=most,
-                                             producer=producer)], call.family, call.target)
+                                             producer=producer, entry=entry)], call.family, call.target)
     return found[0] if found else None
 
 
 def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | tuple[int, int] | None, consumers: int = 1,
-          producer: int | None = None) -> tuple[resources.LaunchPlan | None, int]:
+          stages: int | tuple[int, int] | None, consumers: int = 1, producer: int | None = None,
+          entry: int = 0) -> tuple[resources.LaunchPlan | None, int]:
     """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
     holds at once, at most its `tiles`, its rings up to two deep where they run on across its tiles (a
     family's whose walks do not scope their streams apart, `Family.walks_scoped`), at the plan that hides the
@@ -697,14 +702,15 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
     any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
     most)` pair's; None where no multiprocessor holds it (`_planned_launch`), a persistent launch then a
-    program a multiprocessor; its producer lowered to `producer` (`resources.Launch.producer`)."""
+    program a multiprocessor; its producer lowered to `producer` (`resources.Launch.producer`), its programs
+    launching with `entry` registers a thread at least (`resources.Launch.entry`)."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
-        found = _planned_launch(call, scope, registers, floor=1, most=most, producer=producer)
+        found = _planned_launch(call, scope, registers, floor=1, most=most, producer=producer, entry=entry)
         return found, min(tiles, (call.target.multiprocessors or 1) * (found.programs if found else 1))
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
     return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers,
-                           producer=producer), tiles
+                           producer=producer, entry=entry), tiles
 
 
 def _stated(work: Work, tiles: int, hardware: float, arrays, out_type) -> pl.CostEstimate:
@@ -751,7 +757,9 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     where it runs its own roles (`sequence_walk`'s). `held` is what a consumer thread holds in registers
     (`Held`). Where `template.planned` collects launches, the launch's record (`Launch`, its
     `work`) and zeros. `work` states the model's products a tile, `hardware` their FLOPs as issued
-    (`issued_flops`, the held operand's pairs where None), which its cost and Dew's FLOP count state.
+    (`issued_flops`, the held operand's pairs where None), which its cost and Dew's FLOP count state. Its
+    producer is lowered to `producer` (`resources.Launch.producer`), and its programs launch with the
+    registers its products assemble at least (`Held.entry`, `resources.Launch.entry`).
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`): the family's `persist` takes each
@@ -772,7 +780,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     threads = 128 * family.warpgroups(consumers)
 
     found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
-                            consumers=consumers, producer=producer)
+                            consumers=consumers, producer=producer, entry=held.entry(family))
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.
