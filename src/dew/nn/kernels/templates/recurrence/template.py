@@ -33,13 +33,14 @@ from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloo
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
             ) -> tuple[int, int, jnp.dtype]:
-    """The call's keys' and values' widths padded to whole tiles of `family`'s bundle (`mainloop.block_of`),
-    a forward's values (not `training`) to whole value tiles (`mainloop.value_unit`), and the dtype its
-    tiles hold (the operands', fp32 in an fp32 call)."""
+    """The call's keys' widths padded to whole tiles of `family`'s bundle (`mainloop.block_of`), its values'
+    to whole value tiles (`mainloop.value_unit`) but a training call's under a decay a key dimension, to
+    whole tiles (`mainloop.values_unit`), and the dtype its tiles hold (the operands', fp32 in an fp32
+    call)."""
     arguments = ba.arguments
     dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
     pad = mainloop.block_of(family)
-    unit = pad if training else mainloop.value_unit(family)
+    unit = mainloop.values_unit(family, kept=training, per_key=arguments["g"].ndim == 4)
     return (-(-arguments["key"].shape[-1] // pad) * pad, -(-arguments["value"].shape[-1] // unit) * unit,
             jnp.dtype(dtype))
 
@@ -435,7 +436,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 return None
             alone = self._derive(ba, target, chunk, training=False, refused=refused[False])
             family = bundle(target, _dtype(ba))
-            # A forward alone pads its values narrower than a training call does (`_widths`): its own tiles.
+            # A forward alone may pad its values narrower than a training call does (`_widths`): its own
+            # tiles.
             narrower = family is not None and (_widths(ba, family, training=False)[1]
                                                < _widths(ba, family)[1])
             if alone is not None and target.multiprocessors is not None and not narrower and (

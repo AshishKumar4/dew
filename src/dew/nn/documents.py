@@ -59,6 +59,19 @@ def with_documents(mask, segment_ids):
     return inside if mask is None else jnp.logical_and(mask, inside)
 
 
+def within_documents(values: jax.Array, begins: jax.Array) -> jax.Array:
+    """Each token's sum of `values` `[B, S, ...]` over its document up to it, `begins` `[B, S]` marking each
+    document's first token: a sum that restarts at each, one associative scan. A later document's sums never
+    pass through an earlier one's, so a difference of two within a document keeps the document's own digits
+    (a running sum across documents took them from the row's prefix)."""
+    def combined(first: tuple, second: tuple) -> tuple:
+        (opened, summed), (opens, adds) = first, second
+        restarts = opens.reshape(*opens.shape, *(1,) * (adds.ndim - opens.ndim))
+        return opened | opens, jnp.where(restarts, adds, summed + adds)
+
+    return jax.lax.associative_scan(combined, (begins, values), axis=1)[1]
+
+
 def document_offsets(segment_ids, max_segments: int) -> jax.Array:
     """FlashAttention's cumulative offsets, `[B * (max_segments + 1) + 1]`, of
     packed rows `segment_ids` `[B, S]` whose documents run in ascending id

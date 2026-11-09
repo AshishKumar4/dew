@@ -473,15 +473,14 @@ def test_an_output_launch_lowers_at_a_value_block_narrower_than_its_keys(key_wid
 
 
 @lowers('sm80')
-def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu():
+@pytest.mark.parametrize('target', ['sm80', 'sm86'])
+def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(target):
     """A decay a key dimension 16 wide over values 8 wide (the recurrence stability sites' geometry), its
-    gradient through the template lowered for an A100: the key memory backward copies the entered memory's 8
-    rows of 64 bf16 columns in with cp.async, one 8-row tile at its rows' 128-byte swizzle, whose copy layout
-    Mosaic GPU refuses ('Number of tiles is not a multiple of 4', stab-floorless-a100-deba5b564); staged at
-    the swizzle the copy tiles it lowers. An sm86's 99 KB holds no per-key fast backward at these widths
-    (its key pairs' backward stages 119 KB with each sub-chunk's own pairs' shifted tiles), so the template
-    takes no training call there."""
-    target = 'sm80'
+    gradient through the template lowered for an Ampere GPU: the key memory backward copies the entered
+    memory's 8 rows of 64 bf16 columns in with cp.async, one 8-row tile at its rows' 128-byte swizzle, whose
+    copy layout Mosaic GPU refuses ('Number of tiles is not a multiple of 4', stab-floorless-a100-deba5b564);
+    staged at the swizzle the copy tiles it lowers. An sm86's 99 KB holds its pairs' backward again with each
+    sub-chunk's own pairs' shifted tiles a launch of their own (`own_pairs`, row 5282)."""
     rows, length, value_heads, width, value_width = 2, 70, 16, 16, 8
     operands = [jax.ShapeDtypeStruct((rows, length, 1, width), jnp.bfloat16)] * 2 + [
         jax.ShapeDtypeStruct((rows, length, value_heads, value_width), jnp.bfloat16),
