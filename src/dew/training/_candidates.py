@@ -149,7 +149,9 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
-        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, launches,
+        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
+        # No launch record lowers as an empty one (`_candidate`'s untuned lowering).
+        launches or "[]",
         lowering, mesh, platforms, capacity, _footprinted(footprint), derived, stepping.rows, stepping.split,
         stepping.prefetch, stepping.examples, report.refused_launches(), trace_context())
     if key is not None:
