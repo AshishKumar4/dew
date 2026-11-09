@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, grouped_matmul
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -79,3 +79,22 @@ def test_blackwells_products_run_the_shared_mainloop_on_tcgen05():
 def the_shared_mainloop_runs_exactly_on_blackwell():
     """`_on_tcgen05` on a B200 or a B300 itself (tests/test_gpu_gemm.py's cell)."""
     _on_tcgen05(interpret=False)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("depth", [576, 1088], ids=["nine steps", "seventeen steps"])
+def test_a_blackwell_tiles_sum_holds_every_step_however_its_rotations_fall(depth):
+    """A dense product on tcgen05's bundle at a depth whose steps (64 deep, a ring of four stages) no tile's
+    rotations divide: its walk takes a rotation of the ring a trip (`mosaic.stepping`), so a tile past the
+    first starts within a rotation, and each step's products add onto the tile's sum but at its first step
+    (the tensor-memory accumulator's `accumulate`), over integers from -1 to 1 bitwise numpy's at every
+    tile; interpreted as an sm100."""
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    keys = jax.random.split(jax.random.key(3), 2)
+    x = jax.random.randint(keys[0], (256, depth), -1, 2).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (depth, 512), -1, 2).astype(jnp.bfloat16)
+    with generation.assumed("sm100"):
+        got = mosaic_gpu.gmm(x, w[None], jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=False,
+                             out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
+                             dense=True)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(x, np.float32) @ np.asarray(w, np.float32))
