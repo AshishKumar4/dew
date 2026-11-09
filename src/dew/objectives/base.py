@@ -25,7 +25,6 @@ from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import (
     TYPE_CHECKING,
-    Any,
     ClassVar,
     Generic,
     Literal,
@@ -974,7 +973,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         names = vars(type(self)).get("traced")
         return None if names is None else self.traced_by(*(getattr(self, name) for name in names))
 
-    def traced_by(self, *settings: object) -> Hashable | None:
+    def traced_by(self, *settings: TracedSetting) -> Hashable | None:
         """A trace key (`trace_key`) of the objective's `settings` (`frozen_value`) beside what every
         objective's trace reads: the modules its programs execute as they stand (`program_key`: after a
         rung's substitute, at its head's policy), its held tree's shapes (`held_shapes`), whose arrays pass
@@ -1823,7 +1822,7 @@ def held_shapes(tree) -> Hashable:
     return jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes))
 
 
-def stated_trace(objective: Objective[Any, Any]) -> Hashable | None:
+def stated_trace[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> Hashable | None:
     """`objective.trace_key()` where its own class states its settings (`Objective.traced`) or its key,
     else None: a subclass reads what its own loss adds (a counter, a term), which a key it inherited does
     not state."""
@@ -1837,8 +1836,14 @@ class _Unkeyed:
 
 UNKEYED = _Unkeyed()
 
+type TracedSetting = (Hashable | Mapping[str, TracedSetting] | Sequence[TracedSetting] | DataclassInstance
+                      | None)
+"""A setting an objective's trace reads (`Objective.traced`): a hashable value (a number, a string, a Flax
+module, a frozen dataclass), a mapping or sequence of such, or a dataclass of them, which `frozen_value`
+reads as a value, or refuses as none where any part is a function or an object compared by identity."""
 
-def frozen_value(value: object) -> Hashable:
+
+def frozen_value(value: TracedSetting) -> Hashable:
     """`value` as a value a trace can be kept by: a mapping as its sorted entries, a sequence as a tuple, a
     dataclass as its type and fields, recursively, a number, string or other hashable value as itself (a
     Flax module by its fields); `UNKEYED` where any part is a function, or an object of no value (one
