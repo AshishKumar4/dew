@@ -1813,13 +1813,26 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     return accumulated[0] / accumulated[1]
 
 
-def held_shapes(tree) -> Hashable:
-    """`tree`'s structure and each leaf's shape and dtype, what a trace reads of a tree its arrays pass to
-    as arguments; None for none."""
-    if tree is None:
-        return None
-    shapes = jax.tree.map(lambda leaf: (np.shape(leaf), np.result_type(leaf)), tree)
+def traced_shapes(tree):
+    """`tree` with each leaf the shape, dtype and weak type of its abstract value (`jax.typeof`): what a
+    trace reads of arrays that pass to it as arguments, as `jax.eval_shape` would give them (a key's dtype,
+    a weak type), tracing nothing and converting no array."""
+    def shaped(leaf) -> jax.ShapeDtypeStruct:
+        aval = jax.typeof(leaf)
+        return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
+
+    return jax.tree.map(shaped, tree)
+
+
+def shapes_key(shapes) -> Hashable:
+    """A tree of shapes (`traced_shapes`) as a value: its structure and its leaves."""
     return jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes))
+
+
+def held_shapes(tree) -> Hashable:
+    """`tree`'s structure and each leaf's shape, dtype and weak type (`traced_shapes`), what a trace reads
+    of a tree its arrays pass to as arguments; None for none."""
+    return None if tree is None else shapes_key(traced_shapes(tree))
 
 
 def stated_trace[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> Hashable | None:
@@ -1884,14 +1897,8 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     batches keep theirs traces once."""
     from dew.nn.flops import traced_flops
 
-    # The batch's shapes read off its leaves' abstract values, as `jax.eval_shape` would give them (a
-    # key's dtype, a weak type), tracing nothing.
-    def shaped(leaf) -> jax.ShapeDtypeStruct:
-        aval = jax.typeof(leaf)
-        return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
-
-    shapes = jax.tree.map(shaped, batch)
-    signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
+    shapes = traced_shapes(batch)
+    signature = shapes_key(shapes)
     kept = _TRACED.setdefault(objective, {})
     if (key := stated_trace(objective)) is not None and signature not in kept:
         counted = _KEYED_FLOPS.get((type(objective), key, signature))
