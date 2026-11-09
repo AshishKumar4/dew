@@ -98,7 +98,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
     def entry_floor(self, tiles) -> int:
         widest = max((columns for _, columns, dtype in tiles if jnp.dtype(dtype) == jnp.float32), default=0)
-        accumulator = min(widest, self.widest_product) * self.rows // resources.THREADS
+        accumulator = min(widest, self.widest_product or widest) * self.rows // resources.THREADS
         return accumulator + self.assembled if widest else 0
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
