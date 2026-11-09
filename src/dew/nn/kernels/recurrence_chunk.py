@@ -565,6 +565,97 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
 
 
+def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *, scale: float | None = None,
+                         chunk_size: int = CHUNK_SIZE, dtype=None):
+    """Oja's rule with a gate a value dimension (fla's `chunk_gated_oja_rule`, fla/ops/gated_oja_rule, its
+    `beta` a head's): each value head's memory `h` `[Dk, Dv]` decayed along its values, its values erased
+    from it and written, `h = h D (I - beta v v^T) + beta k v^T` with `D = diag(exp(gv))`, each token read
+    `scale q^T h` (`scale` `Dk^-1/2` where None). `query` and `key` `[B, S, Hk, Dk]`, `value` and `gv` `[B, S,
+    Hv, Dv]`, `beta` `[B, S, Hv]`; `state` `[B, Hv, Dk, Dv]` the memory entering (zero where None), `starts`
+    `[B, S]` each packed document's first token, which enters a zero memory. Returns `(output [B, S, Hv, Dv]
+    in dtype (the operands' where None), final memory [B, Hv, Dk, Dv] in at least fp32)`.
+
+    On the transposed memory `h^T` it is the delta rule of keys `v`, values `beta k` and a decay a key
+    dimension `gv`, read along its values (`scan.Scan`'s readout `h^T (scale q)`): the chunk forms the token
+    update derives (`dew.algebra.scan`, `linear_scan.Parts.values_read`), walked as the delta rule's portable
+    math walks them (`_walk`), their derivative the token update replayed a chunk at a time."""
+    from dew.algebra import SATURATION, scan
+
+    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
+    work = at_least_fp32(jnp.result_type(query, key, value))
+    group = value.shape[2] // key.shape[2]
+    if group > 1:
+        query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    rows, length, heads, columns = value.shape
+    width = key.shape[-1]
+    scale = width ** -0.5 if scale is None else scale
+
+    def update(h, q, k, v, g, beta):
+        del q
+        decayed = jnp.exp(g).reshape(-1, 1) * h
+        return decayed + v[:, None] * (beta * k - beta * (v @ decayed))[None, :]
+
+    def readout(h, q, k, v, g, beta):
+        del k, v, g, beta
+        return h @ (scale * q)
+
+    axes = {"q": ("time", "value"), "k": ("time", "value"), "v": ("time", "key"), "g": ("time", "key"),
+            "beta": ("time",)}
+    reset = None if starts is None else RESET
+    declared = axes if reset is None else {**axes, reset: ("time",)}
+    declaration = scan.Scan(update, readout, declared, walked="time", state=((columns, width), work),
+                            reset=reset, ranges={"g": (-math.inf, 0.0)})
+    forms = scan.derive_scan(declaration, saturation=SATURATION)
+    chunks = -(-length // chunk_size)
+    padded = chunks * chunk_size - length
+
+    def laid(x):
+        # [B, S, H, ...] padded with tokens that leave the memory as it was, laid out [B, H, chunks, C, ...].
+        x = jnp.pad(x, [(0, 0), (0, padded)] + [(0, 0)] * (x.ndim - 2))
+        x = jnp.moveaxis(x, 2, 1)
+        return x.reshape(rows, heads, chunks, chunk_size, *x.shape[3:])
+
+    given = (query, key, value, gv, beta)
+    operands = {name: laid(x.astype(work)) for name, x in zip(axes, given, strict=True)}
+    if starts is not None:
+        operands[RESET] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
+    varying = (query, key, value, gv, beta, starts)
+    entering = varying_like(rows_like(jnp.zeros((rows, heads, columns, width), work), value) if state is None
+                            else jnp.swapaxes(state.astype(work), -1, -2), *varying)
+    outputs, final = _walk(forms, columns, recomputed_memory())(operands, entering)
+    out = outputs.reshape(*outputs.shape[:2], -1, columns)
+    return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), jnp.swapaxes(final, -1, -2)
+
+
+def recurrent_gated_oja_rule(query, key, value, gv, beta, state=None, *, starts=None,
+                             scale: float | None = None):
+    """`chunk_gated_oja_rule`'s rule a token at a time as fla's reference states it
+    (tests/ops/test_oja.py `recurrent_oja_ref`): the memory decayed along its values, `k' = k - h v` erased
+    from it, `h += k' (beta v)^T`, read `scale q^T h`, in at least fp32 (float64 where the operands are);
+    operands and results as `chunk_gated_oja_rule`'s."""
+    dtype = jnp.result_type(query, key, value)
+    work = at_least_fp32(dtype)
+    group = value.shape[2] // key.shape[2]
+    query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    query, key, value, gv, beta = (x.astype(work) for x in (query, key, value, gv, beta))
+    query = query * (key.shape[-1] ** -0.5 if scale is None else scale)
+
+    def one_token(h, step):
+        h = jnp.where(step['start'][:, None, None, None], 0.0, h) * jnp.exp(step['g'])[:, :, None, :]
+        erased = step['k'] - jnp.einsum('bhkv,bhv->bhk', h, step['v'])
+        h = h + erased[..., :, None] * (step['beta'][..., None] * step['v'])[..., None, :]
+        return h, jnp.einsum('bhk,bhkv->bhv', step['q'], h)
+
+    if state is None:
+        state = jnp.zeros((*value.shape[:1], value.shape[2], key.shape[-1], value.shape[-1]), work)
+    starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
+    state, out = jax.lax.scan(
+        one_token, state.astype(work),
+        {name: jnp.moveaxis(x, 1, 0) for name, x in
+         (('q', query), ('k', key), ('v', value), ('g', gv), ('beta', beta), ('start', starts))})
+    return jnp.moveaxis(out, 0, 1).astype(dtype), state
+
+
 def _walk(forms, width: int, recomputed: bool):
     """`xla_mainloop`'s walk over every row's and head's chunks (`[rows, heads, chunks, C, ...]` operands and
     the memory entering), by the token update's derived `forms` (`dew.algebra.scan`): each chunk's values
