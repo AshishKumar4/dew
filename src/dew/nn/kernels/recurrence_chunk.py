@@ -118,7 +118,7 @@ class Chunk(recurrence.Gated):
     packed document enters a memory of
     its own: `state` is `[B, D, Hv, Dk, Dv]`, a memory a slot, and a row's `d`-th document enters its
     `entered[d]`-th slot (one-based; zero, a zero memory); the final memory is each document's own, `[B, D,
-    Hv, Dk, Dv]` (`DocumentRows`)."""
+    Hv, Dk, Dv]` (`entered_memories`)."""
     query: jax.Array
     key: jax.Array
     value: jax.Array
@@ -174,19 +174,17 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     g = jnp.zeros(value.shape[:3], work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
     state, starts, firsts = operands.state, operands.starts, operands.firsts
-    rows = None
-    if operands.entered is not None:
-        rows = DocumentRows.of(starts, operands.entered, firsts)
-    if rows is not None:
+    documents = operands.entered is not None
+    if documents:
         # Each document's own memory `[B, D, Hv, Dk, Dv]` beside the packed rows, which the template, the
-        # port and the portable walk walk (`chunk_forward.prepared`, `_blocked_rule`, `xla_mainloop`) and the
-        # rated scan's ports take as rows of their own (`_documents_apart`).
-        state = rows.entering(state).reshape(*rows.begins.shape, *state.shape[2:])
-        firsts, max_segments = rows.begins, rows.begins.shape[1]
+        # port and the portable walk walk (`chunk_forward.prepared`, `_blocked_rule`, `xla_mainloop`); the
+        # rated scan's ports take none (`ScanCase.documents`).
+        state, firsts = entered_memories(state, operands.entered, starts, firsts)
+        max_segments = firsts.shape[1]
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
-                                 work, dtype, max_segments=max_segments, rows=rows)
+                                 work, dtype, max_segments=max_segments)
     else:
         # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
         # over to the portable math there, reported as the call's route. A kernel's output unrounded, as the
@@ -226,85 +224,20 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
-def _documents_apart(rows: "DocumentRows", run: Callable, query, key, value, g, beta, state):
-    """`run` over a packed call's documents each a row of its own from its own memory (`state` `[B, D, Hv,
-    Dk, Dv]`, `DocumentRows`), its output back in the packed rows and each document's final `[B, D, Hv, Dk,
-    Dv]`: the kernels that walk no document from a memory of its own."""
-    out, final = run(*rows.laid(query, key, value, g, beta), state.reshape(-1, *state.shape[2:]))
-    return rows.unlaid(out), rows.leaving(final)
-
-
-@dataclasses.dataclass(frozen=True)
-class DocumentRows:
-    """A packed call's documents each a row of its own, `[B * D, S]`, the row's tokens from a document's
-    first, past its end written nothing (its decay one, its write gate zero), so its final memory is the
-    document's: each document enters its own memory (`Chunk.entered`) on a kernel that walks no document
-    from a memory of its own, as a row of its own enters its call's `state`. A call holds `D` rows a row of
-    `S` tokens, its work `D` times a packed row's where its documents are short: the template, the port and
-    the portable walk walk the packed rows instead, each document's sequence from its own memory
-    (`chunk_forward.prepared`, `_blocked_rule`, `xla_mainloop`'s aligned documents); the rated scan's ports
-    take these rows (row 5288)."""
-
-    begins: jax.Array
-    """Each row's documents' first slots `[B, D]` (`dew.batch.document_firsts`), `S` past its last."""
-    ends: jax.Array
-    """Each document's end `[B, D]`, the next one's first slot or the row's length."""
-    entered: jax.Array
-    """The slot each document enters `[B, D]`, one-based, zero for a zero memory."""
-
-    @classmethod
-    def of(cls, starts, entered, firsts=None) -> "DocumentRows":
-        """`starts` `[B, S]`' documents (or their first slots, `firsts`), each entering its `entered` slot."""
-        documents = entered.shape[1]
-        begins = document_firsts(starts, documents) if firsts is None else firsts[:, :documents]
-        length = starts.shape[1]
-        ends = jnp.concatenate([begins[:, 1:], jnp.full_like(begins[:, :1], length)], axis=1)
-        return cls(begins, jnp.minimum(ends, length), jnp.asarray(entered, jnp.int32))
-
-    def _index(self, length: int):
-        """Each document row's token's slot in its packed row `[B, D, S]` and whether it is the document's."""
-        offsets = jnp.arange(length, dtype=jnp.int32)
-        slots = self.begins[..., None] + offsets
-        return jnp.minimum(slots, length - 1), slots < self.ends[..., None]
-
-    def laid(self, *operands):
-        """The operands `[B, S, ...]` as the documents' rows `[B * D, S, ...]`, zero past a document's end:
-        a decay one (`g` zero, a step zero), a write gate zero, its queries, keys and values zero."""
-        slots, own = self._index(operands[0].shape[1])
-
-        def taken(x):
-            picked = jax.vmap(lambda row, at: row[at])(x, slots)
-            kept = own.reshape(*own.shape, *(1,) * (picked.ndim - own.ndim))
-            picked = jnp.where(kept, picked, jnp.zeros((), x.dtype))
-            return picked.reshape(-1, *picked.shape[2:])
-
-        return tuple(taken(x) for x in operands)
-
-    def entering(self, state):
-        """Each document row's memory `[B * D, ...]`: its slot's of `state` `[B, D, ...]` (`[B, D, Hv, Dk,
-        Dv]`, a selective scan's `[B, D, C, N]`), zero for slot zero."""
-        if state is None:
-            raise ValueError("documents entering memories of their own (`Chunk.entered`) read the slots' "
-                             "memories, `state` `[B, D, Hv, Dk, Dv]`")
-        picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(state, self.entered)
-        kept = (self.entered > 0).reshape(*self.entered.shape, *(1,) * (state.ndim - 2))
-        return jnp.where(kept, picked, 0.0).reshape(-1, *state.shape[2:])
-
-    def unlaid(self, out):
-        """The documents' rows' output `[B * D, S, ...]` back as the packed rows' `[B, S, ...]`: each token's
-        its document's row's at its offset from the document's first."""
-        rows, documents = self.begins.shape
-        length = out.shape[1]
-        out = out.reshape(rows, documents, *out.shape[1:])
-        offsets = jnp.arange(length, dtype=jnp.int32)
-        document = jnp.sum(offsets[None, :, None] >= self.begins[:, None, :], axis=-1) - 1
-        document = jnp.clip(document, 0, documents - 1)
-        at = offsets[None, :] - jnp.take_along_axis(self.begins, document, axis=1)
-        return jax.vmap(lambda row, d, t: row[d, t])(out, document, jnp.clip(at, 0, length - 1))
-
-    def leaving(self, final):
-        """The documents' rows' final memories `[B * D, ...]` as each document's, `[B, D, ...]`."""
-        return final.reshape(*self.begins.shape, *final.shape[1:])
+def entered_memories(state, entered, starts, firsts=None):
+    """A packed call's documents entering memories of their own (`Chunk.entered`): each document's memory
+    `[B, D, ...]`, its `entered` slot's of `state` `[B, D', ...]` (one-based, zero a zero memory), and each
+    one's first slot `[B, D]` (`firsts`, else `starts`' documents, `dew.batch.document_firsts`), `S` past a
+    row's last."""
+    if state is None:
+        raise ValueError("documents entering memories of their own (`Chunk.entered`) read the slots' "
+                         "memories, `state` `[B, D, ...]`")
+    entered = jnp.asarray(entered, jnp.int32)
+    documents = entered.shape[1]
+    begins = document_firsts(starts, documents) if firsts is None else firsts[:, :documents]
+    picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(state, entered)
+    kept = (entered > 0).reshape(*entered.shape, *(1,) * (state.ndim - 2))
+    return jnp.where(kept, picked, jnp.zeros((), picked.dtype)), begins
 
 
 @dataclasses.dataclass(frozen=True)
@@ -566,7 +499,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     aligned = None
     if state is not None and state.ndim == 5:
         assert firsts is not None, "documents entering memories of their own name their first slots"
-        aligned = _Aligned.of(firsts[:, :state.shape[1]], length, config.chunk)
+        aligned = AlignedDocuments.of(firsts[:, :state.shape[1]], length, config.chunk)
         query, key, value, g, beta = aligned.laid(query, key, value, g, beta)
         starts = None
     width = key.shape[-1]
@@ -614,12 +547,12 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
 
 
 @dataclasses.dataclass(frozen=True)
-class _Aligned:
+class AlignedDocuments:
     """A packed call's documents laid from chunks' edges (`xla_mainloop`'s documents entering memories of
     their own): each document's tokens moved past the tokens before it to the next multiple of the chunk,
     the slots between tokens that leave the memory as it was (zero keys, values and write gates, a unit
     decay), so the walk takes up each document's memory at its first chunk's edge. At most `chunk - 1` slots
-    a document, against a row of the call's length a document laid apart (`DocumentRows`)."""
+    a document, against a row of the call's length were each document laid out apart."""
 
     slots: jax.Array
     """Each token's slot on the aligned grid `[B, S]`."""
@@ -629,7 +562,7 @@ class _Aligned:
     """The aligned grid's slots, the chunks' a row."""
 
     @classmethod
-    def of(cls, firsts, length: int, chunk: int) -> "_Aligned":
+    def of(cls, firsts, length: int, chunk: int) -> "AlignedDocuments":
         """`firsts` `[B, D]`' documents (`S` past a row's last) of a call of `length` tokens on `chunk`."""
         firsts = jnp.asarray(firsts, jnp.int32)
         documents = firsts.shape[1]
@@ -775,7 +708,7 @@ def _walk(forms, width: int, recomputed: bool):
 
         carried, (entering, left) = jax.lax.scan(loading, (decayed, jnp.zeros_like(memories[0])),
                                                  (prepared, loads))
-        return prepared, entering, _finals(memories, loads, left, carried[1])
+        return prepared, entering, document_finals(memories, loads, left, carried[1])
 
     def walking_one(operands, h):
         prepared, entering, last = entered(operands, h)
@@ -799,7 +732,7 @@ def _walk(forms, width: int, recomputed: bool):
             return after, (outputs, h)
 
         h, (outputs, left) = jax.lax.scan(loading, jnp.zeros_like(memories[0]), (operands, loads))
-        return outputs, _finals(memories, loads, left, h)
+        return outputs, document_finals(memories, loads, left, h)
 
     def adjoint_one(operands, h, entering, d_outputs, d_final):
         if entering is None:
@@ -851,7 +784,7 @@ def _walk(forms, width: int, recomputed: bool):
                                   live_cotangents=True))
 
 
-def _finals(memories, loads, left, last):
+def document_finals(memories, loads, left, last):
     """Each document's final memory `[D, Dk, Dv]` of a walk taking documents up (`_walk`): the memory the
     walk leaves before the next document's first chunk (`left`, each chunk's entering memory as the walk
     carried it), the last document's the walk's last, and one the row holds none of its own memory."""
@@ -1196,8 +1129,7 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 
 
 def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, state, starts, firsts,
-                chunk_size: int, work, dtype, *, max_segments: int | None = None,
-                rows: "DocumentRows | None" = None):
+                chunk_size: int, work, dtype, *, max_segments: int | None = None):
     """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
     `C` the queries, `dt` the write gate and `A` the rate) on the kernel the scan's selector gives each
     product (`SCAN`, `scan_kernel`): the recurrence template; the port of mamba_ssm's kernels, which adds
@@ -1210,8 +1142,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     6.89 ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
     rounded to no narrower than `dtype`, the caller's (unrounded where it asks it wide, Mamba-2's mixer for
     the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`; documents entering memories of
-    their own (`rows`, `state` each one's `[B, D, Hv, Dk, Dv]`) on the template's and the portable math's
-    packed rows, on the ports each its own row (`_documents_apart`)."""
+    their own (`state` each one's `[B, D, Hv, Dk, Dv]`, first at `firsts`) on the template's and the portable
+    math's packed rows, which the ports take no form of (`ScanCase.documents`)."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
     # Under the fast forms the skip in the template's own output and walk (`mainloop._output`, `_reverse`),
@@ -1233,9 +1165,6 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
                            wide=not narrow)
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
-        if rows is not None and kernel not in ('mosaic_gpu', 'xla'):
-            return _documents_apart(rows, lambda *laid: launched(kernel, *laid[:5], rate, skip, laid[5], None,
-                                                                 None), query, key, value, g, beta, state)
         return launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts)
 
     def launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
@@ -1330,12 +1259,19 @@ class ScanCase:
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
+    documents: bool = False
+    """Whether the call's documents enter memories of their own (`Chunk.entered`), which the template and
+    the portable math walk on the packed rows and the ports, walking each document from a zero memory, take
+    no form of."""
 
     @property
     def cell(self) -> tuple[str | None, str]:
         """The call's cell, its device's instruction family and its product (`SCAN_CELLS`)."""
         return self.family, self.product
 
+
+_DOCUMENTS = ("documents entering memories of their own (`Chunk.entered`), which the scan's ports walk "
+              "from zero memories alone: the template and the portable math walk them on the packed rows")
 
 SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
@@ -1348,6 +1284,7 @@ SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
     Requirement('precision', _port_precision, _PORT_PRECISION, row=INHERENT, kind='handoff'),
+    Requirement('documents', lambda case: not case.documents, _DOCUMENTS, row='ledger 5288'),
 )
 """What mamba_ssm's kernels (`mamba_ssd.ssd_scan`) need of a scan: no caller's `shard_map` that checks
 varying axes over operands that vary,
@@ -1365,13 +1302,14 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('precision', lambda case: exact_products(None, at_least_fp32(case.dtype)),
                 "a dot algorithm the run declares that narrows the scan's fp32 products, which the TPU's "
                 "scan takes whole (`ssd._mm`, HIGHEST)", row=INHERENT, kind='handoff'),
+    Requirement('documents', lambda case: not case.documents, _DOCUMENTS, row='ledger 5288'),
 )
 """What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
 (`ssd_kernel_runs`), and a declaration its whole fp32 products compute (`exact_products`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
-              product: str = 'forward') -> ScanCase:
+              product: str = 'forward', documents: bool = False) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU, the platform its Pallas scan builds for
@@ -1384,7 +1322,7 @@ def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | 
                     dtype=jnp.dtype(x.dtype), widths=widths,
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
                          if generation.backend() == 'tpu' else None),
-                    call=call, family=family, product=product)
+                    call=call, family=family, product=product, documents=documents)
 
 
 def fast_rounding(dtype) -> bool:
@@ -1428,7 +1366,8 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
                      max_segments=max_segments, scale=1.0, delta=False, wide=wide,
                      rounded=fast_rounding(jnp.result_type(query, key, value)),
                      skip=skip, recomputed=recomputed_memory())
-    case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
+    case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
+                     documents=state is not None and state.ndim == 5)
     return select(SCAN, case).kernel
 
 
@@ -1492,7 +1431,8 @@ class SelectiveCase:
     its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
     shorter), its tokens, channels and states, whether the run's forms are the fast ones (its template forms
     its products whole in fp32 whatever the run's precision)
-    and its device's instruction family (None off a GPU); the forward and the training step route alike."""
+    and its device's instruction family (None off a GPU), and whether its documents enter states of their
+    own (`documents`); the forward and the training step route alike."""
 
     varying: bool
     dtype: np.dtype
@@ -1502,6 +1442,7 @@ class SelectiveCase:
     states: int
     fast: bool
     family: str | None = None
+    documents: bool = False
 
 
 def _selective():
@@ -1547,6 +1488,9 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('forms', lambda case: case.fast,
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
+    Requirement('documents', lambda case: not case.documents,
+                "documents entering states of their own (`Chunk.entered`), which the template walks from a "
+                "zero state alone: the portable scan takes each up at its chunk's edge", row='ledger 5288'),
 )
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
@@ -1563,9 +1507,10 @@ atomically, took 11.3 ms at 8x2048x5120 and 9.22 at 4x2048x8192 (W3-a100-3-selec
 44bec4713f, whose backward base's is again)."""
 
 
-def selective_kernel(x, A, B, C) -> str:
+def selective_kernel(x, A, B, C, *, documents: bool = False) -> str:
     """The kernel the selective scan's selector (`SELECTIVE`) gives a scan over `x` `[B, S, D]` with rates
-    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]`, on the target, reported as its route."""
+    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]`, its documents entering states of their own where
+    `documents`, on the target, reported as its route."""
     from .templates import bundles
 
     # A GPU's family where a bundle claims it (consumer Blackwell's, mma.sync fed by TMA, has one; tcgen05
@@ -1578,7 +1523,7 @@ def selective_kernel(x, A, B, C) -> str:
                                          key=lambda dtype: dtype.itemsize),
                          length=x.shape[1], channels=x.shape[-1], states=A.shape[-1],
                          fast=generation.numerics().forms == 'fast',
-                         family=family)
+                         family=family, documents=documents)
     return select(SELECTIVE, case).kernel
 
 
@@ -1589,13 +1534,13 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, ente
     serve every channel, so the channels stay whole); or `portable(x, dt, A, B, C, D, state, starts)`,
     the portable math. Where `entered` `[B, Dc]` is given, each of `starts`' documents enters its own
     state, `state` `[B, Dc, D, N]` a state a slot, as `Chunk.entered` takes them, and the final state is
-    each document's (`DocumentRows`)."""
+    each document's: on the portable math's packed rows, each document laid from a chunk's edge and its
+    state taken up there (`portable`'s `firsts`, `AlignedDocuments`), which the template takes no form of
+    (`SelectiveCase.documents`).
+    """
+    firsts = None
     if entered is not None:
-        rows = DocumentRows.of(starts, entered)
-        x_rows, dt_rows, b_rows, c_rows = rows.laid(x, dt, B, C)
-        out, final = selective_scan(x_rows, dt_rows, A, b_rows, c_rows, D, rows.entering(state), None,
-                                    portable=portable)
-        return rows.unlaid(out), rows.leaving(final)
+        state, firsts = entered_memories(state, entered, starts)
     from .templates.recurrence import selective
 
     def template(x, dt, A, B, C, D, state, *starts):
@@ -1604,7 +1549,8 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, ente
 
     def run(kernel, x, dt, A, B, C, D, state):
         if kernel != 'mosaic_gpu':
-            return portable(x, dt, A, B, C, D, state, starts)
+            laid = {} if firsts is None else {'firsts': firsts}
+            return portable(x, dt, A, B, C, D, state, starts, **laid)
         rows, _ = grouped_heads((*x.shape[:2], 1, x.shape[-1]), 1)
         three = P(rows, None, None)
         held = state if state is not None else jnp.zeros((x.shape[0], x.shape[-1], A.shape[-1]), x.dtype)
@@ -1612,5 +1558,5 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, ente
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, B, C), run, x, dt, A, B, C, D,
-                        state)
+    return _per_product(lambda product: selective_kernel(x, A, B, C, documents=firsts is not None), run, x,
+                        dt, A, B, C, D, state)
