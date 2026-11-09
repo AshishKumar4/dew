@@ -1123,7 +1123,8 @@ class MosaicGmm(_Mosaic):
         # A packed, step-scaled or block-scaled matrix's layout is its own: such a call is not padded.
         if self.STEPS is not None or self.STEP_SCALED or self.BLOCK_SCALED:
             return {}
-        _, depth, width = self._generated_extents(ba)
+        kernel = ba.arguments['kernel']
+        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
         return {'depth': depth, 'width': width}
 
     def _padded_dims(self, ba) -> list[_PaddedArgument]:
@@ -1747,7 +1748,7 @@ class CutlassTgmm(_Cutlass):
 def _grown(value, dims: dict | tuple, extents: dict):
     """`value` (an array, a stand-in for one, or a tuple of them, each with its own `dims`) with zeros past
     its own along each dimension `dims` names (by padded axis, `_Mosaic._aligned`) to `extents`."""
-    if isinstance(value, tuple):
+    if isinstance(value, tuple) or isinstance(dims, tuple):
         return tuple(_grown(each, each_dims, extents) for each, each_dims in zip(value, dims, strict=True))
     shape = list(value.shape)
     for dim, axis in dims.items():
