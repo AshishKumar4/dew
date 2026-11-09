@@ -18,9 +18,10 @@ def _on_tcgen05(*, interpret: bool) -> None:
     of 16-bit products is exactly summed, `templates.product.promoted`, whose step tcgen05's launch does not
     take, its products issued by one warp): a grouped forward, a grouped
     input gradient (its matrix read transposed) and a dense forward, each exactly numpy's, routed to the
-    template on a 128-row tile of tcgen05's; a kernel gradient, whose step prepares its operands, which
-    tcgen05's bundle refuses, on the template's next issuer, mma.sync on TMA rings (`bundles.groups`, row
-    4727), exactly numpy's too. Interpreted as an sm100 on a CPU, or run on the Blackwell GPU itself."""
+    template on a 128-row tile of tcgen05's; a grouped kernel gradient, its stages rewritten by a role of
+    their own, and a dense one into bf16 and into fp32, its stages read as loaded (row 5209), each routed to
+    the template and exactly numpy's too. Interpreted as an sm100 on a CPU, or run on the Blackwell GPU
+    itself."""
     sizes = jnp.asarray([128, 200, 56], jnp.int32)
     starts = np.cumsum([0, *np.asarray(sizes)])
 
@@ -66,6 +67,16 @@ def _on_tcgen05(*, interpret: bool) -> None:
     expected = np.stack([np.asarray(x[starts[g]:starts[g + 1]], np.float32).T
                          @ np.asarray(dy[starts[g]:starts[g + 1]], np.float32) for g in range(3)])
     np.testing.assert_array_equal(got, expected, err_msg="kernel gradient")
+    # 256 rows: every sum at most 256, which a bf16 output holds exactly.
+    rows = 256
+    for out_dtype in (jnp.bfloat16, jnp.float32):
+        with generation.routes() as routes:
+            got = np.asarray(jax.jit(lambda out_dtype=out_dtype: gemm.gemm_t(
+                x[:rows], dy[:rows], None, out_dtype=out_dtype, precision="default",
+                interpret_on_cpu=interpret)[0])(), np.float32)
+        assert {route.kernel for route in routes} == {"mosaic_gpu"}, out_dtype
+        expected = np.asarray(x[:rows], np.float32).T @ np.asarray(dy[:rows], np.float32)
+        np.testing.assert_array_equal(got, expected, err_msg=f"dense kernel gradient into {out_dtype}")
 
 
 @INTERPRETS
