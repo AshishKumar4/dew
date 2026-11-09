@@ -111,7 +111,8 @@ def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
     float32's largest passes it where its total does not), so both take blocks and a partial last one, one
     group empty:
     every order runs in the float operands, the group sizes not differentiable, finite wherever float64 is a
-    normal float32 and wherever the plain grouped product (by a mask, its float64 run the truth) is."""
+    normal float32 and wherever the plain grouped product is (by a mask, its float64 run the truth; each
+    group's rows contracted by the dense form, whose tree the grouped form's is)."""
     from dew.nn import pairwise
 
     sizes = jnp.asarray([70, 0, 66] if form == "rows" else [20, 0, 16], jnp.int32)
@@ -127,8 +128,19 @@ def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
         numbers = jax.lax.RaggedDotDimensionNumbers((((0,), (0,)), ((), ())), (0,), ())
         shapes, out = ((rows, 4), (rows, 5)), (3, 4, 5)
 
-        def plain(rows, cotangent):
+        def masked(rows, cotangent):
             return jnp.einsum("rg,rk,rn->gkn", groups.astype(rows.dtype), rows, cotangent)
+
+        def plain(rows, cotangent):
+            # Each group's rows summed as the dense form sums a contraction (`pairwise_dot_general`), whose
+            # partial sums near float32's largest pass it where they pass it (the same tree, bitwise:
+            # tests/test_cpu_dense_sums.py), where XLA's chain sums them in another order; float64 the
+            # masked product's.
+            if rows.dtype == jnp.float64:
+                return masked(rows, cotangent)
+            starts, numbers = np.cumsum([0, *np.asarray(sizes)]), (((1,), (0,)), ((), ()))
+            return jnp.stack([pairwise.pairwise_dot_general(rows[a:b].T, cotangent[a:b], numbers)
+                              for a, b in zip(starts[:-1], starts[1:], strict=True)])
 
     primals = normal_draw(4866, *shapes, scale=EDGES[edge])
     direction = normal_draw(4867, *shapes, scale=EDGES[edge])
@@ -136,7 +148,7 @@ def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
     assert pairwise.contraction_block(96) < 96 and pairwise.contraction_block(36) < 36
     assert_contract(lambda lhs, rhs: pairwise.pairwise_ragged_dot_general(lhs, rhs, sizes, numbers),
                     primals, direction, cotangent, f"a CPU pairwise grouped product {form} {edge}",
-                    truth_fn=plain, plain_fn=plain)
+                    truth_fn=plain if form == "rows" else masked, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
