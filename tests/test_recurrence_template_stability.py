@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 import reference_error as gate
 from fla_sites import LEAVES, RECORDED, the_template_is_as_exact_as_fla
+from generation_support import COMPILES_ON_CPU
 from reference_error import FEWEST_SEEDS, assert_as_exact, recording, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
@@ -264,3 +265,26 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     assert gate.within(mine, gate.FACTOR * theirs), (
         f"the template, {regime}, its log decay gradient on a draw: {mine:.3e} from float64 (rms), recorded "
         f"fla-core {theirs:.3e} (ratio {mine / theirs:.2f}, allowed {gate.FACTOR})")
+
+
+@COMPILES_ON_CPU
+def test_the_narrow_gated_delta_gradient_compiles_for_an_h100():
+    """The gated delta rule's bf16 gradient at the suite's narrow widths (16-wide keys, 8-wide values, its
+    gradient arms' heads), compiled for an H100 on this CPU (`kernel_compile.compile_mosaic_kernels`) with no
+    kernel failing: its values' backward, 8 programs a multiprocessor at its model, launched each thread
+    at 32 registers, under the 34 its 16-column warpgroup MMAs assemble at (`Issuer.entry_floor`, M-JS-63)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    operands, (d_out, d_final) = cotangents(HOOKS, 'decays near one', 0)
+    operands = bf16(operands, HOOKS)
+
+    def loss(operands):
+        out, final = chunk_on('mosaic_gpu', HOOKS, operands)
+        return jnp.sum(out * d_out) + jnp.sum(final * d_final)
+
+    def call():
+        return jax.grad(loss), (jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), operands),)
+
+    found = compile_mosaic_kernels([KernelCase('the narrow gated delta gradient', call)], 'sm90')
+    assert mosaic_failures(found) == []
