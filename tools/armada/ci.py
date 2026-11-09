@@ -1504,7 +1504,7 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
 
 
 def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselected: bool,
-             name: str) -> list[str]:
+             name: str, reached: str | None = None) -> list[str]:
     """Why pytest's exit `code` reddens file `name`'s row, whose own cases are `own` among the process's
     `cases`, and every one of whose tests the selection set aside where `deselected`. pytest exits 1 for
     failed tests and 5 for none collected; any other exit (a crash, a signal, an internal error) leaves even
@@ -1515,7 +1515,9 @@ def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselect
     if code == 1 and cases and not failed:
         return ["the process ended 1 after its tests passed"]
     if code not in (0, 1, 5) or (not own and not deselected and code == 1):
-        return [f"pytest exited {code}" + ("" if own else f" with no report of {name}")]
+        ended = f"pytest was killed by signal {-code}" if code < 0 else f"pytest exited {code}"
+        return [ended + ("" if own else f" with no report of {name}")
+                + (f", the last file a test of began in {reached}" if reached and not own else "")]
     return []
 
 
@@ -1597,12 +1599,18 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
 
 
 def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: Mapping[str, int],
-           reported: bool, returncode: int, expired: float | None, running: str | None
-           ) -> tuple[list[str], list[tuple[ET.Element, str, ET.Element]], dict]:
+           reported: bool, returncode: int, expired: float | None, running: str | None, started: bool = True,
+           reached: str | None = None) -> tuple[list[str], list[tuple[ET.Element, str, ET.Element]], dict]:
     """Test file `name`'s grade in its task (`tested`): what makes its row red, its failed cases, and what
     turned it red (`red_as`). `own` its cases of the task's JUnit `cases`, `counted` its collection,
     `reported` whether pytest wrote its report, `returncode` pytest's exit; `expired` the task's deadline
-    where it ran out of time, `running` the file its time was spent in (its executed log's last visit)."""
+    where it ran out of time, `running` the file its time was spent in (its executed log's last visit).
+    `started` whether pytest began (executed.py wrote its pid as pytest loaded it): a task whose pytest never
+    began failed in its runner (its environment, its launch, an install before pytest), with no verdict of any
+    test, so its row is said stale and run again (`STALE`), never a red of its tests; one that began and ended
+    with no report is a red of its file whole, the file it `reached` last and its exit, a signal's named,
+    kept for whoever it routes to (Main, 2026-11-09: a write the runner could not make filed 43 GPU tier
+    parts' files as reds)."""
     failed = [(case, kind, node) for case in own for kind in ("failure", "error")
               if (node := case.find(kind)) is not None]
     red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
@@ -1613,8 +1621,10 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
     deselected = bool(counted) and counted["collected"] == counted["deselected"]
     spent = expired is not None and (name == running or running is None)
     unreached = expired is not None and not spent and not own and not deselected
-    exited = [] if expired is not None and not spent else exit_red(returncode, cases, own, deselected, name)
-    unaccounted = ([] if exited or unreached or (reported and (own or deselected))
+    unstarted = expired is None and not started and not reported and returncode != 0
+    exited = [] if (expired is not None and not spent) or unstarted else \
+        exit_red(returncode, cases, own, deselected, name, reached)
+    unaccounted = ([] if exited or unreached or unstarted or (reported and (own or deselected))
                    else [f"no evidence {name} ran: " + ("pytest wrote no report" if not reported
                                                         else "pytest reported none of its tests, and its "
                                                              "collection shows them not all deselected")])
@@ -1624,11 +1634,15 @@ def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: M
     if unreached:
         red.append(f"not graded: its task's {expired:.0f} s were spent in {running}, before pytest reported "
                    "any test of it; it runs again")
+    if unstarted:
+        red.append(f"not graded: pytest never began (its runner exited {returncode} before pytest loaded its "
+                   "plugins: the environment, the launch or an install before it); it runs again")
     # A failed case with no class path is a file that did not collect, no test of it.
     nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
     whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
                                                                   for case, _, _ in failed)
-    cause = ({} if not red else red_as(STALE, []) if unreached else red_as("deadline", []) if spent
+    cause = ({} if not red else red_as(STALE, []) if unreached or unstarted
+             else red_as("deadline", []) if spent
              else red_as("whole", []) if whole else red_as("nodes", nodes))
     return red, failed, cause
 
@@ -1702,12 +1716,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # its tests (Main, 2026-11-09: train 745 filed six files packed beside a hung one as reds "at 0.0 s").
     # A task stalled before any test started (its collection) has no such file: each of its rows is the
     # deadline's.
-    stood = followed.visited(followed.log_events(log)) if expired else []
+    stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
     running = stood[-1] if stood else None
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         red, failed, cause = graded(name, own, cases, counts.get(name, {}), report.is_file(), returncode,
-                                    deadline if expired else None, running)
+                                    deadline if expired else None, running, pid.is_file(), running)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
@@ -1722,6 +1736,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      # Where the task ran out of time, a file that never started: no seconds to time it by.
                      **({"unobserved": True} if unobserved else {}),
+                     # A pytest a signal ended, its file's red whole: the signal, for whoever it routes to.
+                     **({"signal": -returncode} if red and returncode < 0 and not expired else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if node.split("::", 1)[0] == name},
                                **{node_of(case): float(case.get("time") or 0) for case in own}},
