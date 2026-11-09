@@ -606,7 +606,7 @@ def preference_batch(segments: int | None = None) -> dict:
     ids[:, 1, :SEQ // 2] = ids[:, 0, :SEQ // 2]
     mask = np.zeros(ids.shape, np.int32)
     mask[:, :, SEQ // 2:] = 1
-    return pair_windows(ids, mask, segments=segments, count=ids.shape[0] * (2 if segments == 1 else 1))
+    return pair_windows(ids, mask, segments=segments, count=ids.shape[0])
 
 
 def dpo(family: Family, directory: Path) -> None:

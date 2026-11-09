@@ -1028,8 +1028,9 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
                     version: int | None = None, truncation: str = "mask") -> dict[str, float]:
     """Host-side agentic telemetry for one packed batch and the sessions behind it.
 
-    - `merge/calls_per_chain`: trainable calls over packed chains, 1.0 when
-      nothing merged; `pack/fill` is the share of row slots holding ids.
+    - `merge/calls_per_chain`: trainable calls over packed chains, each a document
+      no other continues (a shared prompt is none), 1.0 when nothing merged;
+      `pack/fill` is the share of row slots holding ids.
     - `status/<name>`: share of sessions per status, and
       `masked/<name>`: share of all sampled ids that status masked, under
       the `truncation` policy `pack` used.
@@ -1059,8 +1060,11 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
         if not _trains(status, truncation):
             metrics[f"masked/{status.value}"] = sampled[status] / everything
     segments = np.asarray(batch[SEGMENT_IDS_KEY])
-    rows = np.arange(segments.shape[0])[:, None] * (segments.shape[1] + 1) + segments
-    chain_count = np.unique(rows[segments > 0]).size
+    # Each chain ends in a document no other continues; a shared prompt (`FORK_PARENTS_KEY`) is none.
+    parents = batch.get(FORK_PARENTS_KEY)
+    chain_count = sum(len(set(np.unique(row[row > 0]).tolist())
+                           - (set() if parents is None else set(np.asarray(parents)[at].tolist())))
+                      for at, row in enumerate(segments))
     calls = sum(len(session.calls) for session, reward in zip(sessions, rewards_of, strict=True)
                 if reward is not None)
     metrics["merge/calls_per_chain"] = calls / chain_count if chain_count else 0.0

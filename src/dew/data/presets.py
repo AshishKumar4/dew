@@ -285,36 +285,32 @@ def preferences(dataset: Dataset, *, seq_len: int, batch: int | None, share: boo
                 records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Preference pairs of token ids, chosen and rejected, each half at most `seq_len` tokens with its
     completion's mask, each pair one document, with `share` its halves' shared prompt once
-    (`preferences.PreferencePair`), packed first-fit with `bins` open windows into windows of `2 * seq_len`
-    tokens (`preferences.PreferenceWindows`), in batches of `batch` windows (`batch=None`, `records`,
-    `host` and `cache` as `images` takes them). A run whose model draws dropout in training lays its halves
-    whole (`share=False`, `TokenScorer.shares_prefixes`). `segments` bounds the documents a window holds, as
-    a decision run's does: `segments=1`, for a model that reads one document a row, lays each half in a
-    window of `seq_len` of its own, a pair's two windows in turn, so a batch of an even number of windows
-    holds whole pairs. No tokenizer: a pair of raw text is tokenized by a step before it."""
+    (`preferences.PreferencePair`), packed first-fit with `bins` open windows into windows of
+    `2 * seq_len - 1` tokens (`preferences.PreferenceWindows`), in batches of `batch` windows
+    (`batch=None`, `records`, `host` and `cache` as `images` takes them). A run whose model draws
+    dropout in training lays its halves whole (`share=False`, `TokenScorer.shares_prefixes`). `segments`
+    bounds the documents a window holds, as a decision run's does: `segments=1`, for a model that reads
+    one document a row, lays each pair a record, its halves each in a window of `seq_len` on an axis of
+    the pair's (`preferences.PairWindows`), so whatever deals a batch's rows deals whole pairs, in batches
+    of `batch` pairs. No tokenizer: a pair of raw text is tokenized by a step before it."""
     from dew.data.preferences import (
         TOKEN_FIELDS,
-        PairHalves,
-        PairIds,
+        PairWindows,
         PreferencePair,
         PreferenceWindows,
         window_documents,
         window_width,
     )
 
-    if segments == 1 and batch is not None and batch % 2:
-        raise ValueError(f"windows of one half each hold a pair in two, so a batch holds an even number of "
-                         f"them, not {batch}")
     shared = share and segments != 1
     laid = _cached(dataset.map(PreferencePair(seq_len, share=shared)), cache)
     if segments == 1:
-        laid = laid.flat_map(PairHalves())
+        return _finished(laid.map(PairWindows(seq_len)), batch=batch, records=records, host=host)
     width, documents = window_width(seq_len, segments), window_documents(seq_len, segments)
     packed = laid.pack(width, fields=TOKEN_FIELDS, bins=bins, policy="first-fit",
                        segments=segments or width // 2)
-    # Each batch's pairs numbered across it (`PairIds`), as the DPO objective's own batch step numbers them.
     return _finished(packed.map(PreferenceWindows(width, documents, shared)), batch=batch, records=records,
-                     host=host if batch is None else (PairIds(), *host))
+                     host=host)
 
 
 def canvas(dataset: Dataset, tokenizer: str | SavedTokenizer, *, prompt_length: int,

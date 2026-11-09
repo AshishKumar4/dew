@@ -131,15 +131,18 @@ def test_the_prompt_presets_facts_are_its_first_batchs_rows():
 
 
 def test_the_preference_presets_facts_are_its_first_batchs_rows():
-    """Chosen and rejected completions packed into windows of two halves of twelve: the facts shape the
-    ids, the completion mask and the windows' documents as the first batch holds them."""
+    """Chosen and rejected completions packed into windows of two halves of twelve less the token they
+    share, or a pair a row, its halves a window each (`segments=1`): the facts shape the ids, the
+    completion mask and the windows' documents as the first batch holds them, and name a half's
+    longest."""
     rows = Memory([{"chosen": [1, 2, 3], "rejected": [4, 5]} for _ in range(4)])
-    chain = rows.repeat().pipe(presets.preferences, seq_len=12, batch=2)
-    facts = chain.facts()
-    held = _held_fields(chain)
-    assert all(held[name] == shape for name, shape in facts["fields"].items())
-    assert facts["fields"]["input_ids"] == [24] and facts["fields"]["fork_parents"] == [36]
-    assert facts["seq_len"] == 12
+    for segments, ids in ((None, [23]), (1, [2, 12])):
+        chain = rows.repeat().pipe(presets.preferences, seq_len=12, batch=2, segments=segments)
+        facts = chain.facts()
+        held = _held_fields(chain)
+        assert all(held[name] == shape for name, shape in facts["fields"].items())
+        assert facts["fields"]["input_ids"] == ids and facts["seq_len"] == 12
+    assert facts["fields"].get("fork_parents") is None
 
 
 def test_a_tokenized_stores_facts_name_its_end_of_document():
