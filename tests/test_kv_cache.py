@@ -314,14 +314,13 @@ def _decode_drawn(rows: int, capacity: int, kv_heads: int, width: int):
 
 
 @pytest.mark.parametrize("starts", [None, (3, 17)], ids=["whole", "window"])
-def test_a_paged_templates_gradient_lowers_in_forward_mode_for_h100(monkeypatch, starts):
+def test_a_paged_templates_gradient_lowers_in_forward_mode_for_h100(starts):
     """The compiled paged decode's forward-over-reverse derivative lowers with traced row lengths."""
     from jax.sharding import Mesh
 
     from dew.nn.kernels import generation
     from dew.nn.kv_cache import template_paged
 
-    monkeypatch.setattr(generation, "placed_platform", lambda: "gpu")
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
     lengths = jnp.asarray([69, 128], jnp.int32)
     starts = None if starts is None else jnp.asarray(starts, jnp.int32)

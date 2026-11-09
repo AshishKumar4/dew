@@ -21,7 +21,7 @@ from native_certificates import (
     native_dot_holds,
 )
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, equations, with_gradients
 
 from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
@@ -340,6 +340,21 @@ def test_tritons_tile_counts_every_stage_where_its_mma_reads_shared_memory_async
         assert launch.staged_bytes(ba, tile, target) >= tile.stages * step
         assert tile.stages * step <= generation.shared_budget(target)
 
+
+
+def test_a_dense_kernel_gradient_xla_takes_is_its_own_dot():
+    """A dense kernel gradient the selector gives XLA (an A100's declared cell, `grouped_matmul.DECLARED`,
+    which DENSE1 timed as XLA's dot) runs XLA's own dot over its rows, as a dense forward does (`xla_dot`): no
+    ragged dot of one group, which took an A100's gate_up weight gradient 470 ms against the template's 11.4
+    (W121-a100)."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with generation.assumed("sm80"), generation.routes() as routes:
+        graph = jax.make_jaxpr(lambda x, dy: gemm.gemm_t(x, dy, None, out_dtype=jnp.bfloat16))(
+            bf16((512, 256)), bf16((512, 384)))
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}, routes
+    names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
+    assert "dot_general" in names and "ragged_dot_general" not in names, names
+    assert graph.out_avals[0].shape == (1, 256, 384)
 
 @pytest.mark.parametrize("product", ["forward", "input gradient", "kernel gradient"])
 def test_an_amperes_gpt_oss_projection_routes_to_a_kernel_that_lowers(product):
