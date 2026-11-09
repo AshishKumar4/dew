@@ -95,7 +95,7 @@ def assert_equal(got, expected):
         np.testing.assert_array_equal(np.asarray(value, np.float32), np.asarray(reference, np.float32))
 
 
-ARMS = [("sm90", {"grouped_matmul": "mosaic_gpu"}), ("sm80", {"grouped_matmul": "mosaic_gpu"}), ("sm90", {}),
+ARMS = [("sm90", {"grouped_matmul": "mosaic"}), ("sm80", {"grouped_matmul": "mosaic"}), ("sm90", {}),
         ("sm80", {})]
 """Each GPU and the kernels a call names: an H100's template named for its projections (an A/B's arm, where
 the pass fuses their consumers into its epilogue), an A100's (whose template takes no side operand, so the
@@ -144,7 +144,7 @@ def test_a_layers_gradient_under_the_pass_is_its_gradient_as_written(layer):
         return lambda *xs: jnp.sum((f(*xs) * cotangent).astype(jnp.float32))
 
     grad = jax.grad(loss(layer), argnums=(0, 1, 2))
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         assert_equal(jax.jit(algebra.rewritten(grad))(*operands), jax.jit(grad)(*operands))
 
 
@@ -158,21 +158,21 @@ def test_a_plain_programs_product_runs_the_template_its_call_names(layer, forms)
     the program as written runs XLA's dot; under the accurate forms too, which limit the pass's
     reassociation alone (row 4730)."""
     operands = draw()
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"),
           generation.run_precision(Numerics(forms=forms))):
         with generation.routes() as written:
             jax.jit(layer).trace(*operands)
         with generation.routes() as passed:
             jax.jit(algebra.rewritten(layer, kernels=True)).trace(*operands)
     assert not any(route.choice == "grouped_matmul" for route in written)
-    assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic_gpu" for route in passed)
+    assert any(route.choice == "grouped_matmul" and route.kernel == "mosaic" for route in passed)
 
 
 def _template_routes(trace) -> list:
     """The grouped matmul's routes `trace()` reports that run the template."""
     with generation.routes() as found:
         trace()
-    return [route for route in found if route.choice == "grouped_matmul" and route.kernel == "mosaic_gpu"]
+    return [route for route in found if route.choice == "grouped_matmul" and route.kernel == "mosaic"]
 
 
 def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew_jit():
@@ -194,7 +194,7 @@ def test_a_plain_programs_gradient_runs_the_template_in_either_order_through_dew
     plain = jax.grad(loss, argnums=(0, 1))
     outside = jax.jit(jax.grad(dew.jit(loss), argnums=(0, 1)))
     inside = dew.jit(jax.grad(loss, argnums=(0, 1)))
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         assert not _template_routes(lambda: jax.jit(plain).trace(*operands))
         assert _template_routes(lambda: outside.trace(*operands))
         assert _template_routes(lambda: inside.trace(*operands))

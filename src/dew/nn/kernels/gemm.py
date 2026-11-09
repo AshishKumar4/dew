@@ -635,7 +635,7 @@ class BlockwiseCase:
 
 
 BLOCKWISE_FP8: selection.Op[BlockwiseCase] = selection.Op('blockwise_fp8', (
-    selection.Kernel('mosaic_gpu', (
+    selection.Kernel('mosaic', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no step-scaled tile here: an "
             "FP8 product on warpgroup MMA, its matrix K-major, a step 128 deep, its column scales each a "
@@ -646,7 +646,7 @@ BLOCKWISE_FP8: selection.Op[BlockwiseCase] = selection.Op('blockwise_fp8', (
     selection.Kernel('xla', (), generic=True)))
 """A blockwise-scaled FP8 product's selector (`blockwise_fp8_product`): the template's exactly summed walk,
 each step's partial scaled before its add (`mosaic_gpu.gmm`'s `step_scales`), where named
-(`generation.chosen(blockwise_fp8='mosaic_gpu')`) and planned, past the measured requirement no receipt has
+(`generation.chosen(blockwise_fp8='mosaic')`) and planned, past the measured requirement no receipt has
 met yet; else the scaled blocks summed in XLA (`grouped_matmul.step_scaled`)."""
 
 
@@ -669,7 +669,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     per = kernel.shape[1] // column_scales.shape[-1]
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
     tile = _planned(launch, bound) if per == 1 or per % mosaic_gpu.STEP_SCALE_DEPTH == 0 else None
-    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
+    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         summed = mosaic_gpu.gmm(lhs, kernel, group_sizes.astype(jnp.int32), tiles=tile, transpose_rhs=True,
                                 out_dtype=jnp.float32,
@@ -705,7 +705,7 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
                                         jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), rhs_t.dtype),
                                         jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
                                         interpret=interpret_on_cpu, exact_sums=True))
-    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic_gpu':
+    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         launched = launch._launched(tile, interpret_on_cpu)
         summed = mosaic_gpu.tgmm(lhs_t, rhs_t, sizes, tiles=tile, out_dtype=jnp.float32,
@@ -961,7 +961,7 @@ class MxCase:
 
 
 MXFP8: selection.Op[MxCase] = selection.Op('mxfp8', (
-    selection.Kernel('mosaic_gpu', (
+    selection.Kernel('mosaic', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "
             "an MX product on a family whose products take block scales (tcgen05's), whole 128s of rows, "
@@ -971,7 +971,7 @@ MXFP8: selection.Op[MxCase] = selection.Op('mxfp8', (
             "operands' product", MXFP8_ROW, kind='measured'))),
     selection.Kernel('xla', (), generic=True)))
 """An MX product's selector (`mxfp8_product`): the template's products scaling each block in the instruction
-(`mosaic_gpu.gmm`'s `mx_scales`) where named (`generation.chosen(mxfp8='mosaic_gpu')`) and planned, past the
+(`mosaic_gpu.gmm`'s `mx_scales`) where named (`generation.chosen(mxfp8='mosaic')`) and planned, past the
 measured requirement no receipt has met yet; else the decoded operands' product in XLA."""
 
 
@@ -1006,7 +1006,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
                                         abstract(matrices.codes.shape, matrices.codes.dtype),
                                         abstract(sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
                                         interpret=interpret))
-    if selection.select(op, MxCase(tile)).kernel != 'mosaic_gpu':
+    if selection.select(op, MxCase(tile)).kernel != 'mosaic':
         values = lhs.decoded() if gather is None else lhs.decoded()[gather]
         return grouped_matmul.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
@@ -1125,7 +1125,7 @@ class NvFp4Block:
 
 
 NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op('nvfp4_block', (
-    selection.Kernel('mosaic_gpu', (
+    selection.Kernel('mosaic', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "
             "an NVFP4 product on a family whose products take block scales (tcgen05's), whole 128s of rows, "
@@ -1135,7 +1135,7 @@ NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op('nvfp4_block', (
             "operands' product", MXFP8_ROW, kind='measured'))),
     selection.Kernel('xla', (), generic=True)))
 """An NVFP4 block product's selector (`nvfp4_block_product`): the template's products scaling each block in
-the instruction where named (`generation.chosen(nvfp4_block='mosaic_gpu')`) and planned, past the measured
+the instruction where named (`generation.chosen(nvfp4_block='mosaic')`) and planned, past the measured
 requirement no receipt has met yet; else the decoded operands' product in XLA."""
 
 

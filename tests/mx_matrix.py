@@ -35,7 +35,7 @@ SEEDS = 8
 CHOICES = frozenset({"mxfp8", "nvfp4_block"})
 """The `generation.CHOICES` entries the cells run: each cell asserts that the routes it records run its
 format's choice `mosaic_gpu` and every choice outside `CHOICES` at XLA."""
-KERNELS = {"mxfp8": frozenset({"mosaic_gpu"}), "nvfp4_block": frozenset({"mosaic_gpu"})}
+KERNELS = {"mxfp8": frozenset({"mosaic"}), "nvfp4_block": frozenset({"mosaic"})}
 """The kernels under test of each choice the cells run: the template's block-scaled products."""
 FORMATS = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product, gemm.MX_BLOCK),
            "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product, gemm.NVFP4_BLOCK)}
@@ -71,9 +71,9 @@ def supported(case: dict[str, str]) -> bool:
     choice = FORMATS[case["format"]][0]
     with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
           generation.routes() as routes):
-        jax.eval_shape(_product(case["format"], int(case["groups"]), case["out_dtype"], "mosaic_gpu"), rows,
+        jax.eval_shape(_product(case["format"], int(case["groups"]), case["out_dtype"], "mosaic"), rows,
                        matrices)
-    return [route.kernel for route in routes if route.choice == choice] == ["mosaic_gpu"]
+    return [route.kernel for route in routes if route.choice == choice] == ["mosaic"]
 
 
 CASES = (
@@ -122,13 +122,13 @@ def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["mxfp8"], case, strict=True))
     format_, groups, out_dtype = combination["format"], int(combination["groups"]), combination["out_dtype"]
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(_product(format_, groups, out_dtype, "mosaic_gpu")),
+        assert_as_exact(jax.jit(_product(format_, groups, out_dtype, "mosaic")),
                         jax.jit(_product(format_, groups, out_dtype, "xla")),
                         lambda seed: _operands(combination, seed), "-".join(case), seeds=SEEDS,
                         truth_fn=_truth(format_, groups))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
-    assert (FORMATS[format_][0], "mosaic_gpu") in recorded and not unnamed, (sorted(recorded), unnamed)
+    assert (FORMATS[format_][0], "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)
 
 
 def mx_values(x: jax.Array) -> jax.Array:

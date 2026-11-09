@@ -312,21 +312,26 @@ def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_un
 
 
 def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
-    """The TPU grouped GEMM's two launches, lowered for a TPU on this CPU, state their products'
-    FLOPs (`templates.cost.estimate`), which the kernel report and the FLOP count both read."""
-    from dew.nn.kernels.templates.gemm import mosaic_tpu
+    """The grouped GEMM's two launches on a TPU core (the template's, on the MXU's bundle), lowered for a TPU
+    on this CPU, state their products' FLOPs (`templates.cost.estimate`), which the kernel report and the
+    FLOP count both read."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
     from dew.telemetry.instrumentation import hlo_flops
 
-    blocks = mosaic_tpu.Blocks(128, 128, 128)
+    tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family='mxu')
     lhs, rhs = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128),
                                                                                     jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
 
     def step(lhs, rhs, sizes):
-        out = mosaic_tpu.gmm(lhs, rhs, sizes, blocks=blocks, transpose_rhs=False, out_dtype=jnp.bfloat16)
-        return out, mosaic_tpu.tgmm(lhs, out, sizes, blocks=blocks, out_dtype=jnp.bfloat16)
+        out = mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                             multiprocessors=1)
+        return out, mosaic_gpu.tgmm(lhs, out, sizes, tiles=tiles, out_dtype=jnp.bfloat16, multiprocessors=1)
 
-    with assumed("v6e"):
+    device = jax.sharding.AbstractDevice(device_kind=TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    mesh = jax.sharding.AbstractMesh((1,), ("data",), axis_types=(jax.sharding.AxisType.Auto,),
+                                     abstract_device=device)
+    with assumed("v5e"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(step).trace(lhs, rhs, sizes).lower(lowering_platforms=("tpu",))
     record = kernel_report((), lowered).record()
     assert {(entry["kind"], entry["name"]): entry["flops"] for entry in record["launches"]} == {

@@ -183,7 +183,7 @@ def test_the_portable_branch_writes_each_gradient_from_the_rounded_operands():
     np.testing.assert_array_equal(np.asarray(d_kernel), np.full((1, 1, 1), 2.0 ** -16, np.float16))
 
 @INTERPRETS
-@pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
+@pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic")])
 def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,
                                                                                implementation: str):
     """The projection's kernels, interpreted on a CPU as the named generation runs them
@@ -202,7 +202,7 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     with generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation):
         operands_ = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
-        y, dx, dw = (products if implementation == "mosaic_gpu" else jax.jit(products))(*operands_)
+        y, dx, dw = (products if implementation == "mosaic" else jax.jit(products))(*operands_)
     assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
     routed(y, group, forward_products(x[:sum(sizes)], w, sizes), BFLOAT16, "y")
     routed(dx, group, input_gradient_products(dy[:sum(sizes)], w, sizes), BFLOAT16, "dx")
@@ -256,7 +256,7 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
         return lambda x, w: gemm.gemm(x.astype(dtype), w.astype(dtype), group_sizes, out_dtype=out)
 
     def through_template(x, w, dy):
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.chosen(grouped_matmul="mosaic"):
             return with_gradients(product(jnp.bfloat16))(x, w, dy)
 
     def through_xla(x, w, dy):
@@ -285,7 +285,7 @@ def the_template_takes_a_gpt_oss_width_as_exactly_as_xla():
         return with_gradients(lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None))
 
     def through_template(x, w, dy):
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.chosen(grouped_matmul="mosaic"):
             return projection("pallas")(x, w, dy)
 
     assert_as_exact(jax.jit(through_template), jax.jit(projection("xla")), draw, "template gpt-oss width",
@@ -446,7 +446,7 @@ def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain
             assert gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
                                       options) is keeps
     # The template named on an A100: the hooked call is refused, so the parts are added in XLA, no error.
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
         assert not gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
                                       options)
 
@@ -454,7 +454,7 @@ def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain
         return gemm.gemm(tokens, first, sizes, out_dtype=jnp.bfloat16, out_dtypes=(jnp.bfloat16,) * 2,
                          paired=second, interpret_on_cpu=True)
 
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
     wide = sum(jax.lax.ragged_dot(d.astype(jnp.float32), jnp.swapaxes(m, 1, 2).astype(jnp.float32), sizes)
                for d, m in zip(cotangents, (first, second), strict=True))
@@ -525,7 +525,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     # At a Qwen3 MoE projection's extents, traced (never run): each launch takes the tile it derives on
     # the GPU's facts.
     budget = generation.shared_budget(target)
-    with (generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"),
+    with (generation.assumed(target), generation.chosen(grouped_matmul="mosaic"),
           tuning.seen() as launches):
         for product, shapes in products(65536, 2048, 1536, 128):
             jax.jit(product).trace(*shapes)
@@ -549,7 +549,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
         return lambda x, w: expert_projection(x, held(w), group_sizes, dtype, "xla", None)
 
     def through_mosaic(x, w, dy):
-        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic"):
             return with_gradients(lambda x, w: gemm.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
                                                              precision="default",
                                                              interpret_on_cpu=True))(x, w, dy)
@@ -579,7 +579,7 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
         return frozen(lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None))
 
     def through_mosaic(x, w, dy):
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
             return with_gradients(frozen(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
                                                                     interpret_on_cpu=True)))(x, w, dy)
 
@@ -688,7 +688,7 @@ def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(size
         return gemm.gemm(x, w, group_sizes, out_dtype=out_dtype, precision="default",
                              interpret_on_cpu=True)
 
-    for named in ("triton", "mosaic_gpu"):
+    for named in ("triton", "mosaic"):
         with ampere(), generation.chosen(grouped_matmul=named):
             got = jax.jit(forward)(lhs, rhs)
         assert got.dtype == out_dtype
@@ -701,7 +701,7 @@ def test_an_mma_sync_forward_of_no_depth_is_zero():
     """A product of no depth through mma.sync's tile, named on an Ampere GPU, is zero: it sums nothing,
     and no launch runs."""
     lhs, rhs = jnp.zeros((128, 0), jnp.bfloat16), jnp.zeros((1, 0, 256), jnp.bfloat16)
-    with ampere(), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with ampere(), generation.chosen(grouped_matmul="mosaic"):
         got = jax.jit(lambda x, w: gemm.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
                                                  precision="default", interpret_on_cpu=True))(lhs, rhs)
     assert not np.any(np.asarray(got))
@@ -868,7 +868,7 @@ def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scatt
     rng = np.random.default_rng(5)
     tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 128)), jnp.bfloat16)
     matrices = jnp.asarray(rng.integers(-3, 4, size=(2, 3, 128, 128)), jnp.bfloat16)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
         a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
                                                               interpret_on_cpu=True)
 

@@ -44,7 +44,7 @@ REFERENCE = "xla"
 CHOICES = frozenset({"grouped_matmul"})
 """The `generation.CHOICES` entries the cells run: each cell asserts that its routes run its case's kernel
 (`KERNELS`) and that any choice outside `CHOICES` runs at XLA, which none does."""
-KERNELS = {"grouped_matmul": frozenset({"mosaic_gpu", "triton", "cutlass", "mosaic_tpu"})}
+KERNELS = {"grouped_matmul": frozenset({"mosaic", "triton", "cutlass"})}
 """The kernels under test of each choice the cells run, a cell its case's `kernel`: the template's Mosaic GPU
 launches, Dew's Triton launch, CUTLASS's grouped GEMM (the Hopper GPU tier's dew-cutlass) and the TPU's Mosaic
 launches (the TPU tier)."""
@@ -238,19 +238,19 @@ def supported(case: dict[str, str]) -> bool:
 
 
 CASES = (
-    ('sm90', 'mosaic_gpu', 'dense', 'n-major', 'plain', 'bfloat16'),
+    ('sm90', 'mosaic', 'dense', 'n-major', 'plain', 'bfloat16'),
     ('sm90', 'triton', 'grouped', 'k-major', 'bias', 'float16'),
-    ('v5e', 'mosaic_tpu', 'dense', 'k-major', 'row-scale', 'bfloat16'),
-    ('sm80', 'mosaic_gpu', 'grouped', 'n-major', 'paired', 'float16'),
+    ('v5e', 'mosaic', 'dense', 'k-major', 'row-scale', 'bfloat16'),
+    ('sm80', 'mosaic', 'grouped', 'n-major', 'paired', 'float16'),
     ('sm80', 'triton', 'dense', 'n-major', 'bias', 'bfloat16'),
     ('sm90', 'cutlass', 'grouped', 'k-major', 'plain', 'bfloat16'),
-    ('v5e', 'mosaic_tpu', 'grouped', 'n-major', 'plain', 'bfloat16'),
-    ('sm90', 'mosaic_gpu', 'grouped', 'n-major', 'row-scale', 'float16'),
-    ('sm80', 'mosaic_gpu', 'dense', 'k-major', 'plain', 'float16'),
-    ('sm90', 'mosaic_gpu', 'grouped', 'k-major', 'paired', 'bfloat16'),
+    ('v5e', 'mosaic', 'grouped', 'n-major', 'plain', 'bfloat16'),
+    ('sm90', 'mosaic', 'grouped', 'n-major', 'row-scale', 'float16'),
+    ('sm80', 'mosaic', 'dense', 'k-major', 'plain', 'float16'),
+    ('sm90', 'mosaic', 'grouped', 'k-major', 'paired', 'bfloat16'),
     ('sm80', 'triton', 'grouped', 'n-major', 'row-scale', 'bfloat16'),
-    ('v5e', 'mosaic_tpu', 'dense', 'n-major', 'bias', 'bfloat16'),
-    ('sm90', 'mosaic_gpu', 'dense', 'n-major', 'bias', 'bfloat16'),
+    ('v5e', 'mosaic', 'dense', 'n-major', 'bias', 'bfloat16'),
+    ('sm90', 'mosaic', 'dense', 'n-major', 'bias', 'bfloat16'),
     ('sm90', 'triton', 'dense', 'n-major', 'plain', 'bfloat16'),
     ('sm90', 'cutlass', 'grouped', 'n-major', 'plain', 'bfloat16'),
 )

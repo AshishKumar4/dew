@@ -1109,6 +1109,19 @@ class Issuer[Accumulator](abc.ABC):
     """The rows of a consumer's accumulator its products issue into, where the family fixes them (tcgen05's
     M on one CTA); None where a tile takes any whole roles of rows."""
 
+    operand_dtypes: tuple | None = None
+    """The 16-bit dtypes its products multiply where not every one (a v5e's MXU, bf16 alone)."""
+
+    def held_area(self, consumers: int) -> int | None:
+        """The fp32 accumulator elements `consumers` consumers hold where scratch memory rather than registers
+        bounds them (`resources.held_area`: a TPU core's VMEM); None where registers do."""
+        return None
+
+    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
+        """The `(shape, dtype)` stand-ins of the values it keeps in scratch memory beside a program's
+        allocations (`gemm.mosaic_gpu.Allocations.scope`): none where they live in registers."""
+        return ()
+
     issues_in_consumers: bool = True
     """Whether a walk's step runs in the consumer that issues its products, so it can prepare their operands
     first: a prologue's rewrite, a kernel gradient's zeroed neighbouring rows, an exactly summed step's own
@@ -1560,6 +1573,14 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
+    ring_slots: int | None = None
+    """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
+    TPU core's two); None where the ring is the launch's stages."""
+
+    copies_tiled_rows: bool = False
+    """Whether its copies' rows start at whole tiles of its layout (a TPU core's DMAs: 8 sublanes of 32-bit
+    words), so a GEMM tiles from such rows and stores whole tiles of them (`gemm.mosaic_gpu.row_unit`)."""
+
     feeds_itself: bool = False
     """Whether its consumers issue their own rings' loads, no producer beside them (`ConsumerFed`): every
     consumer walks every step, so a template may split a step's work between them (attention's dK and dV:
@@ -1891,6 +1912,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     name: str
 
+    def vector_unit(self, dtype) -> int:
+        """The elements a side vector's block along its axis is whole numbers of: any its transport copies
+        (`copies_vectors`), else its issuer's role rows, in whose row tiles a vector read from global memory
+        loads (ns-regs: a 32-element depth vector on sm86 failed to cast to the 64-row layout)."""
+        return 1 if self.copies_vectors else self.role_rows
+
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
@@ -1971,7 +1998,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
         whichever arrives last, and stores it (`store`), reading as many partials as
         `across.MERGED_REGISTERS` holds before combining them, so their reads wait together, and a partial
-        past it a slice of its widest leaf's columns at a time (`across.merge_slices`). No program waits on
+        past it a slice of its widest leaf's columns at a time (`across.merge_spans`). No program waits on
         another, which the GPU may never have scheduled (row 4732). `combine(running, partial)` is the
         algebra's merge of two partials of one tile (a sum's addition by default; a split walk's softmax
         merge, a scan's composition), separable over the widest leaf's columns, which the work's declaration
@@ -2006,26 +2033,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         ahead = max(1, across.MERGED_REGISTERS // held)
         # A partial past what a merge reads ahead (a GEMM tile's) is merged a slice of its widest leaf's
         # columns at a time, its other leaves (a softmax merge's row statistics) read whole each slice, so the
-        # running value and one slice are live, not two whole tiles (`across.merge_slices`).
-        widest, slices = across.merge_slices(summed, held)
-
-        def sliced(value, start, width):
-            leaves, tree = jax.tree.flatten(value)
-            return jax.tree.unflatten(tree, [leaf[:, start:start + width] if place == widest else leaf
-                                             for place, leaf in enumerate(leaves)])
-
-        def joined(parts):
-            # Each slice's widest leaf side by side; a merge separable over the columns leaves every slice's
-            # other leaves alike, the last's kept.
-            flat = [jax.tree.flatten(part)[0] for part in parts]
-            tree = jax.tree.structure(parts[0])
-            return jax.tree.unflatten(tree, [jnp.concatenate([each[place] for each in flat], axis=1)
-                                             if place == widest else flat[-1][place]
-                                             for place in range(len(flat[0]))])
-
-        columns = jax.tree.leaves(summed)[widest].shape[1] if widest is not None else 0
-        spans = ([(0, None)] if widest is None
-                 else [(column, columns // slices) for column in range(0, columns, columns // slices)])
+        # running value and one slice are live, not two whole tiles (`across.merge_spans`).
+        widest, spans = across.merge_spans(summed, held)
 
         def combined(running) -> None:
             def merged(chunk, running):
@@ -2037,13 +2046,13 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                 others = [jnp.minimum(start + i, gathered - 1) for i in range(ahead)]
                 parts = []
                 for column, width in spans:
-                    value = running if width is None else sliced(running, column, width)
+                    value = running if width is None else across.sliced(running, widest, column, width)
                     reads = [read(partials, other, column, width) for other in others]
                     value = combine(value, reads[0])
                     for i, partial in enumerate(reads[1:], 1):
                         value = _selected(start + i < gathered, combine(value, partial), value)
                     parts.append(value)
-                return parts[0] if len(parts) == 1 else joined(parts)
+                return parts[0] if len(parts) == 1 else across.joined(parts, widest)
 
             store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
 
@@ -2058,10 +2067,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             pl.when(program != first)(lambda: left(partials))
             pl.when(program == first)(lambda: left(opening))
             last = across.arrived(ready.at[gathered - 1], gathered - first)
-            # The first program's partial read back from its slot whoever arrives last, the tile's first
-            # too, whose own value it left there: chosen against its value by a select, both were live beside
-            # each other through the merge, 267 registers at a dense kernel gradient's 128 x 256 tile
-            # (EM-probe2), past the 240 ptxas held it in.
+            # The first program's partial read back from its slot by any last arriver: selected against its
+            # own value, both stayed live through the merge (267 registers at a 128 x 256 dW tile, EM-probe2).
             pl.when(last == 1)(lambda: combined(read(opening, first)))
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):

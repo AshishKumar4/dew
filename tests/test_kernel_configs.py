@@ -776,23 +776,23 @@ def libtpu_shared(monkeypatch):
 @pytest.mark.usefixtures("libtpu_shared")
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
-    """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
-    at the block their launch derives from the TPU's facts, compiled by libtpu for a compile-only TPU of
-    the generation on this CPU; a generation whose scoped VMEM no measurement states takes none of them
-    (`MosaicTpuGmm.eligible`)."""
+    """The GEMM template's launches on a TPU core (the MXU's bundle: `MosaicGmm` forward and input gradient,
+    `MosaicTgmm`), at the tile each derives from the TPU's facts, compiled by libtpu for a compile-only TPU
+    of the generation on this CPU; a generation whose scoped VMEM no measurement states takes none of them
+    (`MosaicGmm.eligible`)."""
     from kernel_compile import compile_tpu_kernels
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     # A Qwen3 MoE gate-up's widths, rows a few tiles a group.
     rows, depth, width, groups = 4096, 2048, 1536, 8
     sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
-    calls = [("forward", grouped_matmul.MosaicTpuGmm(),
+    calls = [("forward", grouped_matmul.MosaicGmm(),
               (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
               {"out_dtype": "bfloat16", "trans_rhs": False}),
-             ("input gradient", grouped_matmul.MosaicTpuGmm(),
+             ("input gradient", grouped_matmul.MosaicGmm(),
               (bf16((rows, width)), bf16((groups, depth, width)), sizes),
               {"out_dtype": "bfloat16", "trans_rhs": True}),
-             ("kernel gradient", grouped_matmul.MosaicTpuTgmm(),
+             ("kernel gradient", grouped_matmul.MosaicTgmm(),
               (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "bfloat16"})]
     cases = []
     with generation.assumed(tpu):
@@ -809,7 +809,7 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
         assert generation.gpu_target(tpu).scoped_vmem is None
         pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
     forms = {"forward", "input gradient", "kernel gradient"}
-    assert {case.name.split(" Blocks(")[0] for case in cases} == forms
+    assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_tpu_kernels(cases, tpu)
     failed = [f"{record['name']}: {record['error']}" for record in found if "error" in record]
     assert not failed, "\n".join(failed)
@@ -843,7 +843,7 @@ def _projected(local: bool):
         # Mapped as it traces, on the mesh its program lowers for (`manual_map` reads the mesh in context).
         specs = (PartitionSpec("data"), PartitionSpec())
         forward = sharding.manual_map(projected, specs, PartitionSpec("data")) if local else projected
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.chosen(grouped_matmul="mosaic"):
             return jax.grad(lambda x, w: forward(x, w).astype(jnp.float32).sum(), argnums=(0, 1))(x, w)
 
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -881,7 +881,7 @@ def _gpt_oss_projected():
         def projected(x, w):
             return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
 
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.chosen(grouped_matmul="mosaic"):
             return jax.grad(projected, argnums=(0, 1))(x, w)
 
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -909,7 +909,7 @@ def _blockwise_projected():
     from dew.nn.kernels import gemm
 
     def product(rows, matrices, sizes, row_scales, column_scales):
-        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+        with generation.chosen(blockwise_fp8="mosaic"):
             return gemm.blockwise_fp8_product(rows, matrices, sizes, row_scales, column_scales,
                                               out_dtype=jnp.bfloat16)
 
@@ -1050,7 +1050,7 @@ def _blockwise_gradient():
     from dew.nn.kernels import gemm
 
     def gradient(lhs_t, rhs_t, row_scales, column_scales):
-        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+        with generation.chosen(blockwise_fp8="mosaic"):
             return gemm.blockwise_fp8_kernel_gradient(lhs_t, rhs_t, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
                                                       row_scales, column_scales, out_dtype=jnp.float32)
 
@@ -1082,7 +1082,7 @@ def _mx_projection():
     from dew.nn.kernels import gemm
 
     def product(rows, matrices):
-        with generation.chosen(mxfp8="mosaic_gpu"):
+        with generation.chosen(mxfp8="mosaic"):
             return gemm.mxfp8_product(gemm.MxFp8.quantized(rows), gemm.MxFp8.quantized(matrices),
                                       jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]), out_dtype=jnp.bfloat16)
 
@@ -1103,7 +1103,7 @@ def _nvfp4_block_projection():
     from dew.nn.kernels import gemm
 
     def product(rows, matrices):
-        with generation.chosen(nvfp4_block="mosaic_gpu"):
+        with generation.chosen(nvfp4_block="mosaic"):
             operands = (gemm.NvFp4Block.quantized(rows), gemm.NvFp4Block.quantized(matrices))
             return gemm.nvfp4_block_product(*operands, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
                                             out_dtype=jnp.bfloat16)

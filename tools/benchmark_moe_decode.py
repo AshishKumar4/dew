@@ -27,7 +27,7 @@ MODELS = {
 
 TOKENS = (1, 2, 4, 8, 16, 32, 64)
 """A decode step's tokens, the default; `--tokens` names others (a prefill's or a small batch's)."""
-ROUTES = ("mosaic_gpu", "triton", "cutlass", "xla")
+ROUTES = ("mosaic", "triton", "cutlass", "xla")
 ROUTINGS = 32
 """The routings drawn a cell, each call its own."""
 
