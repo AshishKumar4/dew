@@ -415,8 +415,10 @@ def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
 
 def products_dtype(*operands) -> jnp.dtype | None:
     """The dtype `operands` multiply in, by jax's implicit promotion; None where an 8-bit float
-    takes part, which jax promotes with nothing and whose product has no precision to resolve."""
-    dtypes = [jnp.dtype(operand.dtype) for operand in operands]
+    takes part, which jax promotes with nothing and whose product has no precision to resolve. An integer
+    operand (a ragged product's group sizes) counts rows, multiplies nothing, and is left out."""
+    dtypes = [jnp.dtype(operand.dtype) for operand in operands
+              if not jnp.issubdtype(operand.dtype, jnp.integer)]
     if any(jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 16 for dtype in dtypes):
         return None
     return jnp.result_type(*dtypes)
@@ -511,7 +513,8 @@ def _widened(operands) -> list[jax.Array]:
     """`operands` as the float64 operands of their float32 product: each converted to the dtype they
     multiply in (`products_dtype`), as the product converts them, then widened exactly."""
     dtype = products_dtype(*operands)
-    return [operand.astype(dtype).astype(jnp.float64) for operand in operands]
+    return [operand if jnp.issubdtype(operand.dtype, jnp.integer) else operand.astype(dtype).astype(jnp.float64)
+            for operand in operands]
 
 
 def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
@@ -583,7 +586,7 @@ def accumulated(product: Callable[..., jax.Array], *operands,
 
 
 def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
-                       preferred_element_type) -> jax.Array | None:
+                       preferred_element_type, group_sizes=None) -> jax.Array | None:
     """A layer's projection (`product`, its own `jax.lax.dot_general`, as `gemm.dot_general` takes a layer's
     product past the template) of float32 operands into float32, summed as a vectorized dot sums it where a
     CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other platform;
@@ -591,14 +594,26 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
     sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
     product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
-    takes it too (`_paired`)."""
+    takes it too (`_paired`). With `group_sizes`, `product` is a ragged dot (`jax.lax.ragged_dot_general`, its
+    `dimension_numbers` the ragged ones) of a grouped GEMM's form (`pairwise.ragged_form`), summed so by
+    `pairwise.pairwise_ragged_dot_general`; None for any other form."""
     from dew.nn import pairwise
 
     if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
             or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
             or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
-                       for operand in (lhs, rhs))):
+                       for operand in (lhs, rhs))
+            or (group_sizes is not None and pairwise.ragged_form(lhs, rhs, dimension_numbers) is None)):
         return None
+
+    if group_sizes is not None:
+        def plain_grouped(lhs, rhs, sizes):
+            return product(lhs, rhs, sizes, dimension_numbers, precision=precision,
+                           preferred_element_type=preferred_element_type)
+
+        blocked_grouped = functools.partial(pairwise.pairwise_ragged_dot_general,
+                                            ragged_dot_dimension_numbers=dimension_numbers, precision=precision)
+        return jax.lax.platform_dependent(lhs, rhs, group_sizes, cpu=blocked_grouped, default=plain_grouped)
 
     def plain(lhs, rhs):
         return product(lhs, rhs, dimension_numbers, precision=precision,
@@ -623,7 +638,8 @@ def projected(product: Callable) -> Callable:
     return summed
 
 
-CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
+CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general,
+                jax.lax.ragged_dot_general)
 """The contractions `accumulated` traces once a call (`_contraction`): JAX's own, whose trace states no
 derivative of its own (`_own_backward`) and depends on its operands' types and its arguments alone."""
 
@@ -697,8 +713,8 @@ def _summed_pairwise(product: Callable, preferred_element_type, *operands) -> ja
 
 def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
     """`jaxpr` evaluated on `operands`, each `dot_general` in it, a jit's program's included (`jnp.einsum`'s),
-    the product `projection_product` takes where it takes it: a CPU's vectorized-dot sum of float32
-    operands into float32."""
+    and each grouped GEMM's `ragged_dot_general`, the product `projection_product` takes where it takes it: a
+    CPU's vectorized-dot sum of float32 operands into float32."""
     values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, operands, strict=True))
 
     def read(atom):
@@ -712,6 +728,12 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
         if equation.primitive is jax.lax.dot_general_p and (made := projection_product(
                 product, given[0], given[1], params["dimension_numbers"], params["precision"],
                 params["preferred_element_type"])) is not None:
+            outputs = [made]
+        elif (equation.primitive.name == "ragged_dot_general" and params.get("group_offset") is None
+              and (made := projection_product(
+                  functools.partial(jax.lax.ragged_dot_general, out_sharding=params.get("out_sharding")),
+                  given[0], given[1], params["ragged_dot_dimension_numbers"], params["precision"],
+                  params["preferred_element_type"], group_sizes=given[2])) is not None):
             outputs = [made]
         elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.Jaxpr):
             # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).

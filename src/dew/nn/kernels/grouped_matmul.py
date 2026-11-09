@@ -44,7 +44,7 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 
 from ..derivatives import Protected, contracted, declared_tangent, marked_call_p
-from ..precision import at_least_fp32, rounded_operand
+from ..precision import accumulated, at_least_fp32, rounded_operand
 from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
@@ -2141,10 +2141,12 @@ def xla_dot(tokens: jax.Array, matrix: jax.Array, *, precision: PrecisionLike = 
             preferred_element_type: Dtype | None = None) -> jax.Array:
     """A dense product, every row through one matrix (`[depth, width]`), as `xla_ragged_dot` multiplies a
     group's rows (`_as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
-    trace or to expand (a dense call's portable branch, `gemm`'s)."""
+    trace or to expand (a dense call's portable branch, `gemm`'s), summed as `precision.accumulated` sums a
+    contraction (a CPU's float32 product as a vectorized dot sums it, row 4863)."""
     tokens, matrix, precision = _as_multiplied(tokens, matrix, precision)
-    return jax.lax.dot_general(tokens, matrix, (((1,), (0,)), ((), ())), precision=precision,
-                               preferred_element_type=preferred_element_type)
+    return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (0,)), ((), ())),
+                                         precision=precision),
+                       tokens, matrix, preferred_element_type=preferred_element_type)
 
 
 def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
@@ -2159,7 +2161,8 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     XLA's TPU kernel writes values into the rows past the groups, where
     other backends write zeros, and its lhs cotangent is the same kernel.
     Those rows are zeroed going in and coming out, so neither the output
-    nor a dropped row's gradient carries them.
+    nor a dropped row's gradient carries them. Its sums are `precision.accumulated`'s (a CPU's float32
+    product as a vectorized dot sums it, row 4863).
     """
     tokens, kernel, precision = _as_multiplied(tokens, kernel, precision)
     # bincount widens under x64; TPU ragged-dot only lowers int32 counts.
@@ -2170,11 +2173,17 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     grouped = jnp.arange(tokens.shape[0], dtype=index_dtype)[:, None] < jnp.sum(
         group_sizes, dtype=index_dtype
     )
-    out = jax.lax.ragged_dot(
-        jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
-        preferred_element_type=preferred_element_type,
-        out_sharding=ragged_placement(((tokens, 0), (kernel, kernel.ndim - 1))))
+    product = functools.partial(jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_GROUPED_ROWS,
+                                precision=precision,
+                                out_sharding=ragged_placement(((tokens, 0), (kernel, kernel.ndim - 1))))
+    out = accumulated(product, jnp.where(grouped, tokens, 0), kernel, group_sizes,
+                      preferred_element_type=preferred_element_type)
     return jnp.where(grouped, out, 0)
+
+
+_GROUPED_ROWS = jax.lax.RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(((1,), (1,)), ((), ())), lhs_ragged_dimensions=(0,), rhs_group_dimensions=(0,))
+"""`jax.lax.ragged_dot`'s own: each group's rows of `[rows, depth]` times its `[depth, width]` matrix."""
 
 
 def ragged_placement(sources: tuple) -> jax.sharding.NamedSharding | None:
