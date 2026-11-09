@@ -30,11 +30,11 @@ def test_a_blockwise_fp8_product_through_the_template_is_on_par(columns, groups)
                                               interpret_on_cpu=True)
 
     with generation.assumed("sm90"), generation.routes() as routes:
-        assert_as_exact(jax.jit(functools.partial(product, "mosaic_gpu")),
+        assert_as_exact(jax.jit(functools.partial(product, "mosaic")),
                         jax.jit(functools.partial(product, "xla")),
                         lambda seed: blockwise_matrix._operands(case, seed), f"blockwise {columns} {groups}",
                         seeds=blockwise_matrix.SEEDS, truth_fn=blockwise_matrix.truth(sizes))
-    assert ("blockwise_fp8", "mosaic_gpu") in {(route.choice, route.kernel) for route in routes}
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
 def test_a_blockwise_fp8_kernel_gradient_through_the_template_is_on_par():
@@ -75,10 +75,10 @@ def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
         return out
 
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(functools.partial(gradient, "mosaic_gpu")),
+        assert_as_exact(jax.jit(functools.partial(gradient, "mosaic")),
                         jax.jit(functools.partial(gradient, "xla")), draw, "blockwise kernel gradient",
                         seeds=blockwise_matrix.SEEDS, truth_fn=truth)
-    assert ("blockwise_fp8", "mosaic_gpu") in {(route.choice, route.kernel) for route in routes}
+    assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 
 def test_a_blockwise_fp8_projections_training_step_is_on_par():
@@ -96,7 +96,7 @@ def test_a_blockwise_fp8_projections_training_step_is_on_par():
         return with_gradients(projection)
 
     with generation.assumed("sm90"):
-        assert_as_exact(jax.jit(step("mosaic_gpu")), jax.jit(step("xla")), blockwise_matrix.step_operands,
+        assert_as_exact(jax.jit(step("mosaic")), jax.jit(step("xla")), blockwise_matrix.step_operands,
                         "blockwise fp8 training step",
                         seeds=blockwise_matrix.SEEDS,
                         truth_fn=with_gradients(blockwise_matrix.recipe_truth(group_blocks)))

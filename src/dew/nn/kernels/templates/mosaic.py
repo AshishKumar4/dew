@@ -32,12 +32,21 @@ from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
-from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments, utils as mgpu_utils
+from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import across, bodies, handoffs, persistent, product, report, resources
+from dew.nn.kernels.templates import (
+    across,
+    bodies,
+    handoffs,
+    persistent,
+    product,
+    report,
+    resources,
+    swizzling,
+)
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -123,8 +132,6 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
     # Its settled operands are checked where its programs read them before their wait (`waits`): a launch
     # that does not wait is ordered after the one before it, whatever it reads first.
     return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else ())
-
-
 
 
 def _is_ref(operand) -> bool:
@@ -606,81 +613,6 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, leas
         start = start + (stored & rung)
 
 
-def copied(source, destination) -> None:
-    """`source` (in shared memory) to `destination` (in global memory) through registers: a GPU without
-    TMA's `store_rows` copy, explicitly unoptimized. JAX 0.12 takes a transfer with no `optimized` flag as
-    optimized-only (0.11 downgraded it), which a ladder rung of a row or two cannot be, so its layout
-    inference searched every rung's layouts to exhaustion (ns-gate1: the sm80 forward failed after about
-    1000 s; without the ladder, or with these transfers unoptimized, it lowers in seconds:
-    ns-noladder2, ns-abort1). A block whose elements no warpgroup's strided layout holds, a multiple of its
-    threads (a ragged store's one row of an odd multiple of 64 columns, as every tile of gpt-oss's 2880-wide
-    outputs: row 4474), is copied in a row's layout (`_row_layout`)."""
-    strided = math.prod(source.shape) % resources.THREADS == 0
-    layout = None if strided else _row_layout(source.shape, source.dtype)
-    plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
-
-
-def _row_layout(shape: tuple[int, ...], dtype) -> plgpu_core.SomeLayout:
-    """A `[rows, columns]` block's layout a row at a time (`copied`'s): each row's columns over a warp's
-    lanes, as many adjacent ones a lane as a whole number of them takes up to 16 bytes, and every warp of
-    the warpgroup holding the same; their stores race, writing the same values, which the CUDA memory model
-    allows (`fragmented_array`'s tiled store). `columns` a multiple of a warp's lanes."""
-    lanes = mgpu_fragments.WARP_SIZE
-    vector = math.gcd(shape[-1] // lanes, 16 // jnp.dtype(dtype).itemsize)
-    return plgpu.Layout.TILED(mgpu_fragments.Tiling(((1, lanes * vector), (vector,))),
-                              warp_dims=(mgpu_fragments.Replicated(mgpu_fragments.WARPS_IN_WARPGROUP),),
-                              lane_dims=(-2,), vector_dim=-1)
-
-
-def coalesced(source, destination) -> None:
-    """`copied`, through registers in Mosaic GPU's shared-to-global copy layout (`Layout.SMEM_GMEM_COPY`)
-    where `source` tiles it: each lane 16 bytes of a row, a warp's lanes along tiles of 8 rows and the
-    widest swizzle a row's bytes are a multiple of, so its stores write whole sectors. The layout
-    inference's own choice was the MMA fragment's, a lane's 4 bytes a row, so a warp wrote half sectors: an
-    A100's forward of Qwen3.5-27B's gated delta net took 1.162 ms against 0.941 with every store so, its
-    states launch 0.422 against 0.314 and its output launch 0.299 against 0.258, the port's 0.984
-    (JS-a100copy-a100-0b4eb412b). A walk's 16-bit stores alone (`Mma.stored`): the attention template's
-    forward, whose `persist` stores its output so, took 19% longer (JS-2075cells-a100-491c05798), and an fp32
-    tile's copy so spilled 48 bytes in the training query/key launch (the recurrence resource gate, sm80)."""
-    layout = _copy_layout(source.shape, source.dtype)
-    if layout is None:
-        copied(source, destination)
-    else:
-        plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
-
-
-def _copy_layout(shape: tuple[int, ...], dtype) -> plgpu_core.SomeLayout | None:
-    """`coalesced`'s layout for a 16-bit tile of `shape`, None where the copy layout tiles none of it."""
-    if len(shape) != 2 or jnp.dtype(dtype).itemsize != 2:
-        return None
-    swizzle = next((swizzle for swizzle in (128, 64, 32, 16) if copy_tiles(shape, dtype, swizzle)), None)
-    return None if swizzle is None else plgpu.Layout.SMEM_GMEM_COPY(tuple(shape), jnp.dtype(dtype), swizzle)
-
-
-def copy_tiles(shape: tuple[int, ...], dtype, swizzle: int) -> bool:
-    """Whether Mosaic GPU's tiled copy layout (cp.async's into a swizzled block, and `coalesced`'s) tiles a
-    `[rows, columns]` block of `dtype` staged at `swizzle` bytes: its 8-row tiles as wide as the swizzle,
-    a warpgroup's four warps' tiles four down the rows, two by two, or four across
-    (fragmented_array.tiled_copy_smem_gmem_layout, which refuses any other)."""
-    rows, width = shape[-2], shape[-1] * jnp.dtype(dtype).itemsize
-    if rows % 8 or width % swizzle:
-        return False
-    row_tiles, column_tiles = rows // 8, width // swizzle
-    return row_tiles % 4 == 0 or (row_tiles % 2 == 0 and column_tiles % 2 == 0) or column_tiles % 4 == 0
-
-
-def copied_swizzle(shape: tuple[int, ...], dtype) -> int:
-    """The swizzle, in bytes, a `[rows, columns]` block of `dtype` a program copies in with cp.async stages
-    at: its rows' widest (`resources.widest_swizzle`), or the widest narrower one the copy layout tiles the
-    block at (`copy_tiles`) where it tiles none at that, as an A100's key memory backward's 8 rows of 64 bf16
-    columns, one tile at 128 bytes, four at 32 (a decay a key dimension 16 wide, the recurrence stability
-    sites)."""
-    widest = resources.widest_swizzle(dtype, shape[-1])
-    narrower = (swizzle for swizzle in (widest, widest // 2, widest // 4)
-                if swizzle >= NARROWEST_SWIZZLE_BYTES)
-    return next((swizzle for swizzle in narrower if copy_tiles(shape, dtype, swizzle)), widest)
-
-
 @dataclasses.dataclass(frozen=True)
 class Turn:
     """Step `counter`'s turn of a ring of `stages` slots (`Ring`), the counter running from the ring's first
@@ -863,13 +795,14 @@ def piece_copies(block: tuple, dtype, swizzle: int | None, rows: int) -> int:
     else once. Counted apart from `parts`, a 256-deep gathered step's barrier waited forever (row 4516)."""
     if swizzle is None or not split(swizzle, rows):
         return 1
-    return rows * (block[1] // swizzle_columns(dtype, swizzle))
+    return rows * (block[1] // swizzling.swizzle_columns(dtype, swizzle))
 
 
 def split(swizzle: int | None, rows: int) -> bool:
     """Whether `Ring.parts` copies a piece of `rows` rows apart, a row's tile at a time: rows no whole tiles
     (`TILE_ROWS`) of a swizzled slot (a stated swizzle of 32 bytes or more; 16 only tiles)."""
-    return swizzle not in (None, UNSWIZZLED) and swizzle >= NARROWEST_SWIZZLE_BYTES and rows % TILE_ROWS != 0
+    return (swizzle not in (None, swizzling.UNSWIZZLED) and swizzle >= swizzling.NARROWEST_SWIZZLE_BYTES
+            and rows % swizzling.TILE_ROWS != 0)
 
 
 def drained(barriers, end, stages: int) -> None:
@@ -896,65 +829,8 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: boo
                                         num_barriers=stages)
     else:
         consumed = plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)
-    return {'smem': staged((stages, *block), dtype, swizzle),
+    return {'smem': swizzling.staged((stages, *block), dtype, swizzle),
             'full': plgpu.Barrier(num_arrivals=copies, num_barriers=stages), 'consumed': consumed}
-
-
-SWIZZLE_BYTES = 128
-"""The widest swizzle a shared-memory block's rows are staged at, which an MMA reads conflict-free."""
-
-NARROWEST_SWIZZLE_BYTES = 32
-"""The narrowest swizzle Mosaic GPU stages a block's rows at (`plgpu.find_swizzle`'s least)."""
-
-UNSWIZZLED = 0
-"""A stream's swizzle (`Family.streams`' `swizzles`) where a step reads its tile a row at a time, at a traced
-row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU indexes at any row."""
-
-
-def swizzle_columns(dtype, swizzle: int) -> int:
-    """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
-    slice a load of a block swizzled along that axis takes (a packed dtype's two a byte)."""
-    return swizzle * 8 // resources.element_bits(dtype)
-
-
-def swizzle_for(dtype, *contractions: int) -> int:
-    """The widest swizzle, in bytes, a shared-memory block of `dtype` takes whose group of elements (the
-    swizzle over the itemsize: Mosaic's wgmma issues a product's contraction in groups of it, one swizzle
-    for both its shared operands, wgmma.py's `k_group_elems`) divides each of `contractions`, the elements
-    the products it takes part in contract over a step. A product contracting over 32 rows of 16-bit
-    operands so stages them at 64 bytes, at which its partner block must stage too (K32SWZ3: S = K Qᵀ
-    over a 128-wide head lowers with both at 64 and both at 128, not mixed; dV += P dO over 32 rows lowers
-    at 64, not 128)."""
-    return next((swizzle for swizzle in (SWIZZLE_BYTES, SWIZZLE_BYTES // 2, NARROWEST_SWIZZLE_BYTES)
-                 if all(contraction % swizzle_columns(dtype, swizzle) == 0 for contraction in contractions)),
-                NARROWEST_SWIZZLE_BYTES)
-
-
-TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
-SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
-"""Mosaic GPU's tile transforms, which it declares as protocol classes (a type checker takes them for
-uninstantiable)."""
-
-
-TILE_ROWS = 8
-"""The rows of a swizzled shared-memory tile (`swizzle_transforms`): a block's rows are sliced in whole
-multiples of them (a ring slot's `Pieces`)."""
-
-
-def swizzle_transforms(dtype, swizzle: int) -> tuple:
-    """A shared-memory tile's transforms at `swizzle` bytes: `TILE_ROWS`-row tiles a swizzle's row wide,
-    swizzled; a row narrower than the narrowest swizzle (16 bytes: an NVFP4 stage's block scales, row 3621)
-    tiled alone, a 16-byte swizzle being no permutation, which Mosaic GPU's swizzle transform refuses."""
-    tiling = TILING((TILE_ROWS, swizzle_columns(dtype, swizzle)))
-    return (tiling,) if swizzle < NARROWEST_SWIZZLE_BYTES else (tiling, SWIZZLE(swizzle))
-
-
-def plain(shape: tuple, dtype):
-    """A shared-memory block laid out plainly, neither tiled nor swizzled, stated so (`plgpu.PlainTransform`):
-    one read at row offsets no tiling divides, which layout inference would otherwise search every tiling
-    and swizzle for, each subview of it apart (a Kimi delta attention intra launch's out of its fuel at 32-
-    and 64-key blocks on an H100)."""
-    return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
 
 
 def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
@@ -1001,28 +877,6 @@ def converts(dtype) -> bool:
         return True
     architecture = generation.architecture(generation.gpu_target().generation)
     return architecture is not None and "8bit" in architecture.tensor_rates
-
-
-def swizzle_of(ref) -> int:
-    """The swizzle, in bytes, a shared-memory ref's rows are staged at (`staged`): 0 where it is staged plain
-    (`UNSWIZZLED`)."""
-    if not isinstance(ref, state_types.TransformedRef):
-        return UNSWIZZLED
-    return max((transform.swizzle for transform in ref.transforms
-                if isinstance(transform, plgpu_core.UnswizzleRef)), default=UNSWIZZLED)
-
-
-def staged(shape: tuple, dtype, swizzle: int | None = None):
-    """A shared-memory block of `shape` whose rows are staged at `swizzle` bytes: as layout inference stages
-    them where unstated (the widest that fits); otherwise in 8-row tiles of the swizzle's row, explicitly,
-    which inference does not take for a block whose products contract over fewer elements than the widest
-    swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so); plain where
-    `UNSWIZZLED`."""
-    if swizzle == UNSWIZZLED:
-        return plain(shape, dtype)
-    if swizzle is None:
-        return plgpu.SMEM(shape, dtype)
-    return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
 
 
 class Slots:
@@ -1255,6 +1109,19 @@ class Issuer[Accumulator](abc.ABC):
     """The rows of a consumer's accumulator its products issue into, where the family fixes them (tcgen05's
     M on one CTA); None where a tile takes any whole roles of rows."""
 
+    operand_dtypes: tuple | None = None
+    """The 16-bit dtypes its products multiply where not every one (a v5e's MXU, bf16 alone)."""
+
+    def held_area(self, consumers: int) -> int | None:
+        """The fp32 accumulator elements `consumers` consumers hold where scratch memory rather than registers
+        bounds them (`resources.held_area`: a TPU core's VMEM); None where registers do."""
+        return None
+
+    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
+        """The `(shape, dtype)` stand-ins of the values it keeps in scratch memory beside a program's
+        allocations (`gemm.mosaic_gpu.Allocations.scope`): none where they live in registers."""
+        return ()
+
     issues_in_consumers: bool = True
     """Whether a walk's step runs in the consumer that issues its products, so it can prepare their operands
     first: a prologue's rewrite, a kernel gradient's zeroed neighbouring rows, an exactly summed step's own
@@ -1316,7 +1183,7 @@ class Issuer[Accumulator](abc.ABC):
         (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, which both families' products read (wgmma's N in
         eights, mma.sync's n of 8 twice through ldmatrix). A template splitting its columns finer than its
         stores' `column_unit` to fill the multiprocessors (the recurrence's value blocks) steps by it."""
-        return swizzle_columns(dtype, NARROWEST_SWIZZLE_BYTES)
+        return swizzling.swizzle_columns(dtype, swizzling.NARROWEST_SWIZZLE_BYTES)
 
     @property
     @abc.abstractmethod
@@ -1706,6 +1573,14 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
+    ring_slots: int | None = None
+    """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
+    TPU core's two); None where the ring is the launch's stages."""
+
+    copies_tiled_rows: bool = False
+    """Whether its copies' rows start at whole tiles of its layout (a TPU core's DMAs: 8 sublanes of 32-bit
+    words), so a GEMM tiles from such rows and stores whole tiles of them (`gemm.mosaic_gpu.row_unit`)."""
+
     feeds_itself: bool = False
     """Whether its consumers issue their own rings' loads, no producer beside them (`ConsumerFed`): every
     consumer walks every step, so a template may split a step's work between them (attention's dK and dV:
@@ -1932,7 +1807,7 @@ class Transport[Allocated, Opened](abc.ABC):
         """A scoped allocation of `shape` in the memory a program stages tiles in: a GPU's shared memory, its
         rows at `swizzle` bytes (`staged`: the widest that fits where None, plain where `UNSWIZZLED`); a
         TPU's VMEM, which its compiler tiles."""
-        return staged(shape, dtype, swizzle)
+        return swizzling.staged(shape, dtype, swizzle)
 
     def meeting(self, consumers: int) -> plgpu.Barrier:
         """The scoped allocation two consumers `meet` at: two barriers of `consumers` arrivals each."""
@@ -2037,6 +1912,12 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
 
     name: str
 
+    def vector_unit(self, dtype) -> int:
+        """The elements a side vector's block along its axis is whole numbers of: any its transport copies
+        (`copies_vectors`), else its issuer's role rows, in whose row tiles a vector read from global memory
+        loads (ns-regs: a 32-element depth vector on sm86 failed to cast to the 64-row layout)."""
+        return 1 if self.copies_vectors else self.role_rows
+
     consumers: int
     """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
@@ -2117,7 +1998,7 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
         whichever arrives last, and stores it (`store`), reading as many partials as
         `across.MERGED_REGISTERS` holds before combining them, so their reads wait together, and a partial
-        past it a slice of its widest leaf's columns at a time (`across.merge_slices`). No program waits on
+        past it a slice of its widest leaf's columns at a time (`across.merge_spans`). No program waits on
         another, which the GPU may never have scheduled (row 4732). `combine(running, partial)` is the
         algebra's merge of two partials of one tile (a sum's addition by default; a split walk's softmax
         merge, a scan's composition), separable over the widest leaf's columns, which the work's declaration
@@ -2152,26 +2033,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         ahead = max(1, across.MERGED_REGISTERS // held)
         # A partial past what a merge reads ahead (a GEMM tile's) is merged a slice of its widest leaf's
         # columns at a time, its other leaves (a softmax merge's row statistics) read whole each slice, so the
-        # running value and one slice are live, not two whole tiles (`across.merge_slices`).
-        widest, slices = across.merge_slices(summed, held)
-
-        def sliced(value, start, width):
-            leaves, tree = jax.tree.flatten(value)
-            return jax.tree.unflatten(tree, [leaf[:, start:start + width] if place == widest else leaf
-                                             for place, leaf in enumerate(leaves)])
-
-        def joined(parts):
-            # Each slice's widest leaf side by side; a merge separable over the columns leaves every slice's
-            # other leaves alike, the last's kept.
-            flat = [jax.tree.flatten(part)[0] for part in parts]
-            tree = jax.tree.structure(parts[0])
-            return jax.tree.unflatten(tree, [jnp.concatenate([each[place] for each in flat], axis=1)
-                                             if place == widest else flat[-1][place]
-                                             for place in range(len(flat[0]))])
-
-        columns = jax.tree.leaves(summed)[widest].shape[1] if widest is not None else 0
-        spans = ([(0, None)] if widest is None
-                 else [(column, columns // slices) for column in range(0, columns, columns // slices)])
+        # running value and one slice are live, not two whole tiles (`across.merge_spans`).
+        widest, spans = across.merge_spans(summed, held)
 
         def combined(running) -> None:
             def merged(chunk, running):
@@ -2183,13 +2046,13 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
                 others = [jnp.minimum(start + i, gathered - 1) for i in range(ahead)]
                 parts = []
                 for column, width in spans:
-                    value = running if width is None else sliced(running, column, width)
+                    value = running if width is None else across.sliced(running, widest, column, width)
                     reads = [read(partials, other, column, width) for other in others]
                     value = combine(value, reads[0])
                     for i, partial in enumerate(reads[1:], 1):
                         value = _selected(start + i < gathered, combine(value, partial), value)
                     parts.append(value)
-                return parts[0] if len(parts) == 1 else joined(parts)
+                return parts[0] if len(parts) == 1 else across.joined(parts, widest)
 
             store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
 
@@ -2204,10 +2067,8 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             pl.when(program != first)(lambda: left(partials))
             pl.when(program == first)(lambda: left(opening))
             last = across.arrived(ready.at[gathered - 1], gathered - first)
-            # The first program's partial read back from its slot whoever arrives last, the tile's first
-            # too, whose own value it left there: chosen against its value by a select, both were live beside
-            # each other through the merge, 267 registers at a dense kernel gradient's 128 x 256 tile
-            # (EM-probe2), past the 240 ptxas held it in.
+            # The first program's partial read back from its slot by any last arriver: selected against its
+            # own value, both stayed live through the merge (267 registers at a 128 x 256 dW tile, EM-probe2).
             pl.when(last == 1)(lambda: combined(read(opening, first)))
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
@@ -2243,10 +2104,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return resources.consumer_registers(consumers, programs)
 
     def column_unit(self, dtype) -> int:
-        return swizzle_columns(dtype, SWIZZLE_BYTES)
+        return swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES)
 
     def depths(self, dtype) -> tuple[int, ...]:
-        return (swizzle_columns(dtype, SWIZZLE_BYTES),)
+        return (swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES),)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,

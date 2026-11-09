@@ -18,6 +18,7 @@ from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_gradient as gradient,
     mosaic,
+    swizzling,
 )
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -59,11 +60,11 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     streams, and its logits' queries' unless staged, in `stages` slots (`Family.streams`). On a layout whose
     consumers feed their rings (`split_queries`) the consumers share one key block, held once, and each takes
     its share of a slot's queries: every block a product of theirs reads staged at the swizzle their share's
-    contraction takes (`mosaic.swizzle_for`)."""
+    contraction takes (`swizzling.swizzle_for`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     split = split_queries(family)
     holders, rows = (1, block_q // consumers) if split else (consumers, block_q)
-    swizzle = mosaic.swizzle_for(dtype, rows, width, value_width) if split else None
+    swizzle = swizzling.swizzle_for(dtype, rows, width, value_width) if split else None
     # Each holder's output stages, where it stores its own sums: the consumers sharing a key block store
     # theirs summed once, in a scope of their own after the walk's (`_summed_stored`).
     # A shared dQ's (`BackwardTiles.shared_dq`) dK and dV staged a chunk of their columns at a time

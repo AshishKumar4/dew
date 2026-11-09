@@ -620,7 +620,7 @@ def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus
     assert not found["substituted"], found["substituted"]
     kernels = {tuple(kernel) for kernel in found["kernels"]}
     assert {("attention", "template"), ("gated_delta_rule", "mosaic_gpu"),
-            ("grouped_matmul", "mosaic_gpu")} <= kernels, kernels
+            ("grouped_matmul", "mosaic")} <= kernels, kernels
 
 
 @pytest.mark.parametrize("implementation", ["auto", "template"])

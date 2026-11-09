@@ -677,14 +677,21 @@ DEAD_MMA_LISTING = """
 dropped for one writing no register, the stored tile a constant."""
 
 
-@pytest.mark.parametrize(("listing", "found"), [(WATERFALL_LISTING, "waterfall"),
-                                               (DEAD_MMA_LISTING, "warpgroup MMA writing no register")])
+DEAD = "warpgroup MMA writing no register"
+
+
+@pytest.mark.parametrize(("listing", "found"), [
+    (WATERFALL_LISTING, "waterfall"),
+    (DEAD_MMA_LISTING, DEAD),
+    (DEAD_MMA_LISTING.replace("HGMMA.64x8x16.F16", "QGMMA.64x8x32.F32.E4M3.E4M3"), DEAD),
+    (DEAD_MMA_LISTING.replace("HGMMA.64x8x16.F16", "@P0 IGMMA.64x8x32.S32.S8.S8"), DEAD),
+])
 def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     """The compile gate's SASS rules read nvdisasm's listing of a kernel (row 4071, the kernel challenge's
     harness/ptxas checks): an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
-    operand ptxas could not prove uniform, and a warpgroup MMA writing no register (`HGMMA ... RZ`) is what
-    ptxas leaves of products it found never read (row 4346); each is one finding the gate fails, and a loop's
-    conversion with neither is none."""
+    operand ptxas could not prove uniform, and a warpgroup MMA writing no register (an HGMMA, an fp8 QGMMA or
+    an integer IGMMA whose destination is RZ) is what ptxas leaves of products it found never read (row 4346);
+    each is one finding the gate fails, and a loop's conversion with neither is none."""
     (finding,) = report.sass_findings_of(listing)
     assert found in finding
     assert report.sass_findings_of(CONVERTING_LISTING) == ()

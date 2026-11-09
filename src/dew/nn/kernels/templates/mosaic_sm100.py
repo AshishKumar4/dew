@@ -30,7 +30,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import handoffs, mosaic, mosaic_sm90, persistent, resources
+from dew.nn.kernels.templates import handoffs, mosaic, mosaic_sm90, persistent, resources, swizzling
 from dew.nn.kernels.templates.mosaic import Ref
 
 ISSUING = (handoffs.Role("load", warp=True, weight=0), handoffs.Role("mma", warp=True, weight=0))
@@ -150,7 +150,7 @@ TCGEN05 = Tcgen05()
 def swizzled(dtype, contraction: int) -> tuple:
     """A stage's transforms for an operand block of `dtype` contracting `contraction` elements a step: 8-row
     tiles of the widest swizzle its rows take, swizzled (tcgen05 reads its shared operands so)."""
-    return mosaic.swizzle_transforms(dtype, resources.widest_swizzle(dtype, contraction))
+    return swizzling.swizzle_transforms(dtype, resources.widest_swizzle(dtype, contraction))
 
 
 def operand(shape: tuple[int, int], dtype, contraction: int):
@@ -923,9 +923,10 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         # right operand's swizzle (Mosaic GPU: "the M or N MMA instruction size was chosen to be 96, which is
         # not a multiple of the tiling of the non-contracting dimension 64" at 192 columns, jsf-trace100b).
         half = columns // 2
-        return next((swizzle for swizzle in (mosaic.SWIZZLE_BYTES, mosaic.SWIZZLE_BYTES // 2,
-                                             mosaic.NARROWEST_SWIZZLE_BYTES)
-                     if half % mosaic.swizzle_columns(dtype, swizzle) == 0), mosaic.NARROWEST_SWIZZLE_BYTES)
+        return next((swizzle for swizzle in (swizzling.SWIZZLE_BYTES, swizzling.SWIZZLE_BYTES // 2,
+                                             swizzling.NARROWEST_SWIZZLE_BYTES)
+                     if half % swizzling.swizzle_columns(dtype, swizzle) == 0),
+                    swizzling.NARROWEST_SWIZZLE_BYTES)
 
     def product_scratch(self, consumers: int, widths: tuple[int, ...], lefts: tuple = ()) -> dict:
         # A role's accumulator of each product width: a half-lane tile's columns split between its two lane
@@ -937,11 +938,12 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         return {"tmem": {width: tuple(accumulator_columns(self.rows, width) for _ in range(consumers))
                          for width in widths},
                 "padded": tuple(plgpu.SMEM((self.rows, PADDED), jnp.bfloat16,
-                                           transforms=mosaic.swizzle_transforms(jnp.bfloat16, PADDED))
+                                           transforms=swizzling.swizzle_transforms(jnp.bfloat16, PADDED))
                                 for _ in range(consumers)),
                 "lefts": {_left_key(depth, dtype): tuple(
                     plgpu.SMEM((self.rows, depth), dtype,
-                               transforms=mosaic.swizzle_transforms(dtype, mosaic.swizzle_for(dtype, depth)))
+                               transforms=swizzling.swizzle_transforms(
+                                   dtype, swizzling.swizzle_for(dtype, depth)))
                     for _ in range(consumers)) for depth, dtype in dict.fromkeys(lefts)},
                 "done": plgpu.Barrier(num_barriers=consumers, orders_tensor_core=True)}
 
@@ -1107,7 +1109,7 @@ class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
         # transposed right operand (Kimi delta attention's memories, 32 of their rows its columns) whole
         # tiles of its narrower side's halves (the debugging's SSD and KDA cases).
         capped = {name: min((swizzles or {}).get(name, resources.widest_swizzle(dtype, shape[-1])),
-                            mosaic.SWIZZLE_BYTES // 2, self.right_swizzle(dtype, shape[-1] // consumers),
+                            swizzling.SWIZZLE_BYTES // 2, self.right_swizzle(dtype, shape[-1] // consumers),
                             self.right_swizzle(dtype, min(shape)))
                   for name, (shape, dtype) in blocks.items() if len(shape) == 2}
         return super().streams(blocks, stages, consumers, multicast, {**(swizzles or {}), **capped}, copies,

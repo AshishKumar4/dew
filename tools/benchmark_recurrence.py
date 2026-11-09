@@ -141,20 +141,19 @@ def operands(shape: Shape, seed: int = 0) -> dict[str, np.ndarray]:
             'dfinal': normal(batch, shape.value_heads, shape.key_width, shape.value_width)}
 
 
-def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> list[dict]:
-    """The JAX arm `only`'s times and peak memory on `shape`, forward and forward plus backward, its peak
-    the process's after each (`_jax_peak`), which `main` gives the arm alone."""
-    import jax
+def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, object]:
+    """`shape`'s JAX arms by name (functions of its inputs), each arm's refusal where it does not take the
+    shape, its inputs and its cotangents: `jax_arms` times them; a window of every family's cells
+    (`forward_backward`) takes them as cases. `host` keeps the operands host arrays, so building them
+    launches nothing on a device."""
     import jax.numpy as jnp
 
     from dew.nn import linear
     from dew.nn.kernels import generation, mamba_ssd, recurrence
-    from dew.nn.kernels.options import program
     from dew.nn.kernels.recurrence_chunk import SCAN, Chunk, chunk, fla_rule, scan_case
     from dew.nn.mixers.mamba2 import SSD
-    from dew.telemetry.benchmark import samples
 
-    given = {key: jnp.asarray(value) for key, value in operands(shape).items()}
+    given = {key: (np.asarray if host else jnp.asarray)(value) for key, value in operands(shape).items()}
     bf16 = jnp.bfloat16
     refusals = {}
     if shape.kind == 'conv':
@@ -206,15 +205,29 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> l
                 return template(*args)
 
         arms = {'template': template, 'mosaic': mosaic, 'hand': hand, 'xla': xla}
+    return arms, refusals, inputs, cotangents
 
-    # The cotangents are an argument: `program` keeps each function it compiled, and a closure over them
-    # would keep every shape's until the sweep ended.
-    def forward_backward(fn):
-        def run(cotangents, *args):
-            outputs, pull = jax.vjp(fn, *args)
-            return outputs, pull(jax.tree.map(lambda c, o: c.astype(o.dtype), cotangents, outputs))
-        return run
 
+def forward_backward(fn):
+    """`fn`'s forward and backward of `cotangents`, which are an argument: `program` keeps each function it
+    compiled, and a closure over them would keep every shape's until the sweep ended."""
+    import jax
+
+    def run(cotangents, *args):
+        outputs, pull = jax.vjp(fn, *args)
+        return outputs, pull(jax.tree.map(lambda c, o: c.astype(o.dtype), cotangents, outputs))
+    return run
+
+
+def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> list[dict]:
+    """The JAX arm `only`'s times and peak memory on `shape`, forward and forward plus backward, its peak
+    the process's after each (`_jax_peak`), which `main` gives the arm alone."""
+    import jax
+
+    from dew.nn.kernels.options import program
+    from dew.telemetry.benchmark import samples
+
+    arms, refusals, inputs, cotangents = jax_parts(shape)
     rows = []
     for arm, fn in arms.items():
         if arm != only:

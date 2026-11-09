@@ -251,7 +251,7 @@ class NFTRollout(GroupedRollout):
         count = _source(objective.inputs, batch).shape[0]
         x_T = process.noise(noise_key, (count, *objective.latent_shape))
         spatial = objective._spatial(params, batch, key)
-        denoise = objective.denoiser(params, {**objective.encoded_conditions(params, batch), **spatial}, None,
+        denoise = objective.denoiser(params, {**self.encoded_conditions(params, batch), **spatial}, None,
                                      process)
         autoencoder, published = objective.published_autoencoder(params)
         images, latents = walk_and_decode(denoise, autoencoder, published, x_T, solver=objective.solver,

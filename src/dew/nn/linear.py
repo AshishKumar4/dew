@@ -247,11 +247,11 @@ def entered_conv1d(x, kernel, valid, documents, held, entered, *, bias=None, par
                    activation: bool = True):
     """`causal_conv1d` of packed documents of which each convolves after a history of its own: a tap that
     reaches before its document's first real token reads `held` `[B, D, K - 1, C]` at the document the
-    document enters (`entered` `[B, D]`, numbered from 1 as `dew.batch.Entered` numbers them, 0 for none,
+    document enters (`entered` `[B, D]`, one-based slots of `held`, 0 for none,
     which reads the zeros `causal_conv1d` reads), where
     `documents` `[B, S]` numbers each token's document from 1 (0 on padding) and `valid` marks the real
-    tokens, each document's a run of them: the questions of a row over one state, each convolving after
-    its state's last `K - 1` tokens (`document_tails`; row 1506). XLA's arithmetic, `xla_conv1d`'s."""
+    tokens, each document's a run of them: a call over forks, each document convolving after its chain's
+    last `K - 1` tokens (`forked_conv`). XLA's arithmetic, `xla_conv1d`'s."""
     dtype = x.dtype if dtype is None else jnp.dtype(dtype)
     batch, length, _ = x.shape
     taps_count = kernel.shape[1]
@@ -441,167 +441,123 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 
-def entered_scan(mixed, taps, bias, rule, coordinates: Coordinates, state_shape: tuple[int, ...], *,
-                 parts=None, dtype=None, state_dtype=None):
-    """The conv and scan of a recurrent mixer over packed documents of which some enter another
-    (`Coordinates.entered`), in two calls over the whole row: the documents that enter none, from a zero
-    memory and no history, each one's final memory and last `K - 1` tokens kept (`document_tails`); then
-    the documents that enter one, each from that one's memory and after its history (`entered_conv1d`).
-    Each call's scan lays the row's documents out one a row (`chunk_gated_delta_rule`'s `entered`), so a
-    layer's work is twice a per-document scan's over its row: the price of reading a shared part once and
-    each document from it. `rule(convolved, *, valid, starts, state, entered)` runs a call's scan over
-    the tokens `valid` marks, a document's memory a slot of `state` `[B, D, *state_shape]`, returning
-    `(output, finals)`. The gradient of a memory or history entered sums over the documents entering it."""
-    entered = coordinates.entered
-    assert entered is not None
-    real = jnp.ones(entered.documents.shape, bool) if coordinates.valid is None else coordinates.valid
-    roots = entered.roots & real
-    branches = real & (entered.documents > 0) & ~roots
-    documents, count, width = entered.documents, entered.count, taps.shape[1] - 1
-    batch, length = documents.shape
-    turned = documents[:, 1:] != documents[:, :-1]
-    begins = jnp.concatenate([jnp.ones_like(documents[:, :1], bool), turned], axis=1)
-    # A call's scan numbers its documents by their first slots in the row, the row's first slot beginning
-    # one whatever it holds (`dew.batch.document_firsts`): as many as the row has slots, and one past its
-    # documents where no root of it begins there.
-    slots = min(count + 1, length)
-    zero = jnp.zeros((batch, slots, *state_shape), state_dtype or mixed.dtype)
-    convolved = causal_conv1d(mixed, taps, bias=bias, valid=roots, segments=documents, parts=parts,
-                              dtype=dtype)
-    first, finals = rule(convolved, valid=roots, starts=begins & roots, state=zero,
-                         entered=jnp.zeros((batch, slots), jnp.int32))
-    held = document_tails(mixed, roots, documents, width, count)
-    convolved = entered_conv1d(mixed, taps, branches, documents, held, entered.entered, bias=bias,
-                               parts=parts, dtype=dtype)
-    # Each document's slot in its call, its first slot's rank among the call's beginnings: a branch enters
-    # the finals of its root's slot in the first.
+def fork_histories(x, coordinates: Coordinates, width: int, history=None):
+    """Each document's conv history after it `[B, D + 1, width, C]`, the row's start's first: the last
+    `width` tokens of its chain, its parent's history then its own real tokens (`Coordinates.forks`), so a
+    document continuing it convolves after them (`forked_conv`). The row's start holds `history`
+    `[B, width, C]` (a cached call's conv state) or zeros. Built level by level of the forks' chains, a
+    gather each."""
+    forks = coordinates.forks
+    assert forks is not None and coordinates.segments is not None
+    documents = jnp.asarray(coordinates.segments, jnp.int32)
+    batch, length, channels = x.shape
+    count = forks.count
+    real = (jnp.ones((batch, length), bool) if coordinates.valid is None
+            else jnp.asarray(coordinates.valid, bool)) & (documents > 0)
+    start = jnp.zeros((batch, width, channels), x.dtype) if history is None else history.astype(x.dtype)
+    held = jnp.concatenate([start[:, None], jnp.zeros((batch, count, width, channels), x.dtype)], axis=1)
+    if width == 0:
+        return held
+    own = document_tails(x, real, documents, width, count)
     rows = jnp.arange(batch)[:, None]
-    positions = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-    firsts = jnp.full((batch, count), length, jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].min(
-        jnp.where(documents > 0, positions, length))
+    sizes = jnp.zeros((batch, count), jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].add(
+        real.astype(jnp.int32))
+    levels = forks.levels()
+    parents = jnp.asarray(forks.parents, jnp.int32)
+    columns = jnp.arange(width)[None, None, :]
+    for level in range(forks.depth + 1):
+        prior = jnp.take_along_axis(held, parents.reshape(batch, count, 1, 1), axis=1)
+        # A column the document's own tokens do not reach reads its parent's history, shifted by its length.
+        shifted = jnp.take_along_axis(prior, jnp.minimum(columns + sizes[..., None], width - 1)[..., None],
+                                      axis=2)
+        chained = jnp.where((columns >= width - sizes[..., None])[..., None], own, shifted)
+        at = (levels == level)[..., None, None]
+        held = held.at[:, 1:].set(jnp.where(at, chained, held[:, 1:]))
+    return held
+
+
+def forked_conv(x, kernel, coordinates: Coordinates, *, history=None, bias=None, parts=None, dtype=None,
+                activation: bool = True):
+    """`causal_conv1d` of a call over forks (`Coordinates.forks`): each document convolved after the last
+    `K - 1` tokens of its chain of ancestors (`fork_histories`), a root after the row's start (`history`
+    `[B, K - 1, C]`, a cached call's conv state, or zeros), as its own row of its ancestors and itself
+    convolves it; padding zero. `parts`, `dtype` and `activation` are `causal_conv1d`'s."""
+    forks = coordinates.forks
+    assert forks is not None and coordinates.segments is not None
+    documents = jnp.asarray(coordinates.segments, jnp.int32)
+    real = (jnp.ones(documents.shape, bool) if coordinates.valid is None
+            else jnp.asarray(coordinates.valid, bool)) & (documents > 0)
+    held = fork_histories(x, coordinates, kernel.shape[1] - 1, history)
+    # Each document enters its parent's history, the row's start's at slot 1 (`entered_conv1d`).
+    return entered_conv1d(x, kernel, real, documents, held, jnp.asarray(forks.parents, jnp.int32) + 1,
+                          bias=bias, parts=parts, dtype=dtype, activation=activation)
+
+
+def forked_scan(convolved, rule, coordinates: Coordinates, state_shape: tuple[int, ...], *, held=None,
+                state_dtype=None):
+    """The recurrence of a call over forks (`Coordinates.forks`) after its conv (`forked_conv`): each
+    document from the state its parent's tokens leave, a root from the row's start (`held` `[B,
+    *state_shape]`, a cached call's state, or zero), as its own row of its ancestors and itself runs it. One
+    call of `rule` a level of the forks' chains, roots first, over the whole row: `rule(convolved, *, valid,
+    starts, state, entered)` runs the tokens `valid` marks, each document numbered by its first slot among
+    the call's `starts` (the row's first slot beginning one), the `d`-th entering slot `entered[d]` of
+    `state` (one-based) and its final state its own (`recurrence_chunk.Chunk.entered`), returning `(output,
+    finals)`. The gradient of a state entered sums over the documents continuing it. A cached call leaves
+    the cache as it was: no document's final state is the row's."""
+    forks = coordinates.forks
+    assert forks is not None and coordinates.segments is not None
+    documents = jnp.asarray(coordinates.segments, jnp.int32)
+    batch, length = documents.shape
+    count = forks.count
+    real = (jnp.ones((batch, length), bool) if coordinates.valid is None
+            else jnp.asarray(coordinates.valid, bool)) & (documents > 0)
+    first = convolved[0] if isinstance(convolved, tuple) else convolved
+    dtype = state_dtype or first.dtype
+    start = jnp.zeros((batch, *state_shape), dtype) if held is None else held.astype(dtype)
+    states = jnp.concatenate([start[:, None], jnp.zeros((batch, count, *state_shape), dtype)], axis=1)
+    rows = jnp.arange(batch)[:, None]
+    number = jnp.maximum(documents - 1, 0)
+    levels = forks.levels()
+    level_of = jnp.where(documents > 0, jnp.take_along_axis(levels, number, axis=1), -1)
+    slots_of = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+    # Each document's first real slot, `length` for one holding none, which passes its parent's state on
+    # as a padded token passes its own.
+    firsts = jnp.full((batch, count), length, jnp.int32).at[rows, number].min(
+        jnp.where(real, slots_of, length))
+    holding = firsts < length
+    begins = real & (slots_of == jnp.take_along_axis(firsts, number, axis=1))
     at = jnp.minimum(firsts, length - 1)
-
-    def ranked(begun):
-        begun = begun.at[:, 0].set(True).astype(jnp.int32)
-        return jnp.take_along_axis(jnp.cumsum(begun, axis=1) - begun, at, axis=1)
-
-    root_slot, branch_slot = ranked(begins & roots), ranked(begins & branches)
-    branched = (firsts < length) & (entered.entered > 0)
-    root = jnp.take_along_axis(root_slot, jnp.maximum(entered.entered - 1, 0), axis=1) + 1
-    entering = jnp.zeros((batch, slots), jnp.int32).at[rows, jnp.where(branched, branch_slot, slots)].set(
-        jnp.where(branched, root, 0), mode="drop")
-    second, _ = rule(convolved, valid=branches, starts=begins & branches, state=finals, entered=entering)
-    out = jnp.where(roots[:, :, *([None] * (first.ndim - 2))], first, second)
+    # A call numbers its documents by their first slots in the row, the row's first slot beginning one
+    # whatever it holds (`dew.batch.document_firsts`): as many as the row has slots.
+    slots = min(count + 1, length)
+    parents = jnp.asarray(forks.parents, jnp.int32)
+    lifted = (batch, count, *(1,) * len(state_shape))
+    out = None
+    for level in range(forks.depth + 1):
+        valid = real & (level_of == level)
+        begun = (begins & valid).at[:, 0].set(True).astype(jnp.int32)
+        slot = jnp.take_along_axis(jnp.cumsum(begun, axis=1) - begun, at, axis=1)
+        here = (levels == level) & holding
+        entering = jnp.zeros((batch, slots), jnp.int32).at[rows, jnp.where(here, slot, slots)].set(
+            parents + 1, mode="drop")
+        found, finals = rule(convolved, valid=valid, starts=begins & valid, state=states, entered=entering)
+        taken = jnp.take_along_axis(finals, jnp.minimum(slot, slots - 1).reshape(lifted), axis=1)
+        prior = jnp.take_along_axis(states, parents.reshape(lifted), axis=1)
+        passed = ((levels == level) & ~holding).reshape(lifted)
+        states = states.at[:, 1:].set(jnp.where(here.reshape(lifted), taken.astype(dtype),
+                                                jnp.where(passed, prior, states[:, 1:])))
+        out = found if out is None else jnp.where(valid.reshape(*valid.shape, *(1,) * (found.ndim - 2)),
+                                                  found, out)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
-def tree_paths(tree: tuple[int, ...], width: int) -> np.ndarray:
-    """Each tree token's whole path, `[S, width + depth + 1]` indices into the held history then the call's
-    tokens (`tree_conv`), oldest first: -1 past its start where its path is shorter than the deepest, the
-    history's `width` columns, its ancestors from the tree's root, then itself."""
-    paths = []
-    for token in range(len(tree)):
-        path, parent = [width + token], tree[token]
-        while parent >= 0:
-            path.append(width + parent)
-            parent = tree[parent]
-        paths.append([*range(width), *path[::-1]])
-    longest = max(len(path) for path in paths)
-    return np.asarray([[-1] * (longest - len(path)) + path for path in paths], np.int32)
 
-
-def tree_windows(tree: tuple[int, ...], width: int, valid: jax.Array) -> jax.Array:
-    """Each tree token's conv window per row, `[B, S, width + 1]` indices into the held history then the
-    call's tokens (`tree_conv`): the `width` real tokens before it on its path (`valid` `[B, S]`), its
-    ancestors and past the tree's root the history's last columns, oldest first, then itself, as a cached
-    call's conv skips a token it does not hold without advancing its history (`held_conv1d`)."""
-    paths = tree_paths(tree, width)
-    held = jnp.concatenate([jnp.ones((valid.shape[0], width), bool), valid], axis=1)
-    real = (jnp.asarray(paths >= 0) & held[:, np.maximum(paths, 0)]).at[..., -1].set(values=True)
-    # The token itself counts 1, its nearest real predecessor 2, and so on back from the path's end.
-    behind = jnp.cumsum(real[..., ::-1], axis=-1)[..., ::-1]
-    picked = jnp.stack([jnp.argmax(real & (behind == width + 1 - place), axis=-1)
-                        for place in range(width + 1)], axis=-1)
-    return jnp.take_along_axis(jnp.broadcast_to(paths, (*valid.shape, paths.shape[-1])), picked, axis=-1)
-
-
-def tree_conv(mixed, taps, bias, history, tree: tuple[int, ...], *, valid=None, parts=None, dtype=None,
-              activation: bool = True):
-    """A tree call's causal conv (`dew.nn.inputs.AttentionMetadata.tree_parents`): each token of `mixed`
-    `[B, S, D]` convolved over the `K-1` real tokens before it on its path (`valid` `[B, S]`, every token
-    where None), its ancestors, and past the root the held `history` `[B, K-1, D]`, as `causal_conv1d`
-    convolves the window it ends (`tree_windows`), a token the row does not hold zero as `_masked_conv1d`
-    leaves it; its `parts`, `dtype` and `activation` are `causal_conv1d`'s."""
-    batch, length, features = mixed.shape
-    width = taps.shape[1] - 1
-    valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
-    gathered = jnp.concatenate([history.astype(mixed.dtype), mixed], axis=1)
-    windows = jax.vmap(lambda row, index: row[index])(gathered, tree_windows(tree, width, valid))
-    convolved = causal_conv1d(windows.reshape(batch * length, width + 1, features), taps, activation,
-                              bias=bias, parts=parts, dtype=dtype)
-
-    # A token the row does not hold convolves nothing, as a cached call's masked conv leaves it.
-    def held(piece):
-        return jnp.where(valid[:, :, None], piece[:, -1].reshape(batch, length, -1), 0)
-
-    return held(convolved) if parts is None else tuple(held(piece) for piece in convolved)
-
-
-def call_tree(parents: tuple[int, ...] | None, key_runs, key_positions) -> tuple[int, ...] | None:
-    """A recurrent mixer's call's tree (`dew.nn.inputs.AttentionMetadata.tree_parents`), None for none: the
-    call's key runs and key positions are the tree's attention mask and the places a windowed attention
-    layer windows it over, which a recurrence following the parents has no use for; either without a
-    tree is refused, which it would run as if unset."""
-    if parents is None and (key_runs is not None or key_positions is not None):
-        raise ValueError("a recurrent mixer reads key runs and key positions only beside a tree call's "
-                         "tree, and would run them as if unset")
-    return parents
-
-
-def tree_scan(module: nn.Module, mixed, taps, bias, tree: tuple[int, ...], rule,
-              sequence: Sequence[jax.Array], *, valid=None, state: str = 'ssm_state', state_dtype=None,
-              parts=None, dtype=None):
-    """`held_scan`'s conv and scan over a tree call (`tree_conv`, `tree_rule`): each token convolved over
-    its path's real tokens (`valid` `[B, S]`, every token where None) from the row's held `conv_state`,
-    and advanced by `rule(convolved, *sequence, held)` (each `[B, 1, ...]`, the convolved `parts` where
-    given) from its parent's state, the held `state` past the root, in `state_dtype`, a token the row does
-    not hold passing its parent's state on; the cache left as it was, which a verify replays its accepted
-    path into."""
+def fork_cache(module: nn.Module, state: str):
+    """A cached call over forks' row start (`forked_scan`, `forked_conv`): the layer's held conv history
+    and state, read and left as they were. A forks call continues a cache a decode call allocated."""
     if not module.has_variable('cache', state):
-        raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
-    held = module.get_variable('cache', state)
-    convolved = tree_conv(mixed, taps, bias, module.get_variable('cache', 'conv_state'), tree, valid=valid,
-                          parts=parts, dtype=dtype)
-    pieces = convolved if isinstance(convolved, tuple) else (convolved,)
-    count = len(pieces)
-
-    def step(*operands):
-        pieced, rest, prior = operands[:count], operands[count:-1], operands[-1]
-        return rule(pieced if parts is not None else pieced[0], *rest, prior)
-
-    out = tree_rule(step, tree, (*pieces, *sequence), held.astype(state_dtype or held.dtype), valid=valid)
-    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
-
-
-def tree_rule(rule, tree: tuple[int, ...], operands: Sequence[jax.Array], held: jax.Array, *, valid=None):
-    """A tree call's recurrence: each token advanced by `rule(*its operands [B, 1, ...], state)` from its
-    parent's state, the held `held` past the root, in tree order: its outputs `[B, S, ...]`. A token a row
-    does not hold (`valid` `[B, S]`) passes its parent's state to its children, as a cached call's scan
-    leaves its state past such a token. The tokens' own states are not kept: a verify replays its accepted
-    path into the cache it was called on."""
-    parents = jnp.asarray(tree, jnp.int32)
-
-    def advance(states, token):
-        parent = parents[token]
-        prior = jnp.where(parent >= 0, states[jnp.maximum(parent, 0)], held)
-        out, final = rule(*(jax.lax.dynamic_slice_in_dim(operand, token, 1, 1) for operand in operands),
-                          prior)
-        if valid is not None:
-            kept = jnp.asarray(valid, bool)[:, token].reshape((-1,) + (1,) * (prior.ndim - 1))
-            final = jnp.where(kept, final.astype(prior.dtype), prior)
-        return states.at[token].set(final.astype(held.dtype)), out[:, 0]
-
-    _, outs = jax.lax.scan(advance, jnp.zeros((len(tree), *held.shape), held.dtype), jnp.arange(len(tree)))
-    return jnp.moveaxis(outs, 0, 1)
+        raise ValueError("a cached call over forks continues a row's cache, which a decode call allocates "
+                         "first")
+    return module.get_variable('cache', 'conv_state'), module.get_variable('cache', state)
 
 
 def over_sequence(local, shards: int, tokens: tuple, whole: tuple):
@@ -1033,12 +989,11 @@ class GatedDeltaNet(nn.Module):
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"entered", "tree_parents", "key_runs", "key_positions"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that enter another
-    (`dew.batch.Entered`), each read from the memory and the conv history the one it enters ends with
-    (`entered_scan`), and a tree's, with the key runs and positions of its attention beside it (`call_tree`):
-    on a tree each token's path (`tree_scan`); no mask or bias, which a recurrence reading every earlier
-    token of its document has no way to narrow."""
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that continue another
+    (`dew.batch.Forks`), each read from the memory and the conv history its parent leaves (`forked_conv`,
+    `forked_scan`); no mask, runs or bias, which a recurrence reading every earlier token of its document
+    has no way to narrow."""
 
     emb_features: int
     num_k_heads: int
@@ -1201,18 +1156,6 @@ class GatedDeltaNet(nn.Module):
             per_head={'log_a': self.A_log, 'bias': self.dt_bias},
             weight=lambda: self.norm.variables['params']['weight'], valid=valid, dtype=self.norm.dtype)
 
-    def _tree(self, mixed, g, beta, tree: tuple[int, ...], heads, widths, wide, valid):
-        """A tree call's convolved tokens and recurrence (`tree_scan`): each token on its path, from the
-        row's held history and state past the root, the cache left as it was."""
-        def rule(convolved, g, beta, held):
-            query, key, value = (self._split_heads(part, width)
-                                 for part, width in zip(convolved, widths, strict=True))
-            query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
-            return recurrent_gated_delta_rule(query, key, value, g, beta, held)
-
-        return tree_scan(self, mixed, self.conv1d()[0], None, tree, rule, (g, beta), valid=valid,
-                         state='recurrent_state', state_dtype=wide, parts=heads, dtype=wide)
-
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
         decode, attention_metadata = call.decode, call.metadata
@@ -1223,10 +1166,8 @@ class GatedDeltaNet(nn.Module):
         key_dim = self.key_features
         operand = mixed.dtype
         token, stepped = None, False
-        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
-        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
-        # A one-token tree takes the tree's path (`_tree`), whose output the common norm reads.
-        if decode and S == 1 and tree is None:
+        forked = tokens.forks is not None
+        if decode and S == 1 and not forked:
             kernel = self._decode_kernel(x, operand)
             token = self._fused_token(z, b, a, valid) if kernel == 'fused' else None
             stepped = kernel == 'step'
@@ -1282,14 +1223,12 @@ class GatedDeltaNet(nn.Module):
         stored, conv = self._stored(operand)
         heads = ((key_dim, self.head_k_dim), (key_dim, self.head_k_dim), (self.value_features, None))
         shards = sequence_shards()
-        if tree is not None:
-            out = self._tree(mixed, g, beta, tree, heads, widths, wide, valid)
-        elif tokens.entered is not None:
-            if decode or shards > 1:
-                raise LayoutRefused("documents that enter another are read whole in their rows by a training "
-                                    "or scoring call; a decode step or a sequence axis splits them")
+        if forked:
+            if shards > 1:
+                raise LayoutRefused("documents that continue another are read whole in their rows; a "
+                                    "sequence axis splits them")
 
-            def entered_rule(convolved, *, valid, starts, state, entered):
+            def forked_rule(convolved, *, valid, starts, state, entered):
                 query, key, value = (self._split_heads(part, width)
                                      for part, width in zip(convolved, widths, strict=True))
                 # A call's other tokens keep its memory, as padding does (exp(0)=1, beta=0).
@@ -1299,9 +1238,12 @@ class GatedDeltaNet(nn.Module):
                                               starts=starts, max_segments=tokens.max_segments,
                                               write_bound=1.0, entered=entered)
 
-            out = entered_scan(mixed, self.conv1d()[0], None, entered_rule, tokens,
-                               (self.num_v_heads, self.head_k_dim, self.head_v_dim), parts=heads,
-                               dtype=operand if ported else wide, state_dtype=wide)
+            history, held = fork_cache(self, 'recurrent_state') if decode else (None, None)
+            convolved = forked_conv(mixed, self.conv1d()[0], tokens, history=history, parts=heads,
+                                    dtype=operand if ported else wide)
+            out = forked_scan(convolved, forked_rule, tokens,
+                              (self.num_v_heads, self.head_k_dim, self.head_v_dim), held=held,
+                              state_dtype=wide)
         elif shards > 1:
             if decode:
                 raise LayoutRefused(f"a gated delta net under a sequence axis of {shards} runs whole "

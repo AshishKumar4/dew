@@ -14,6 +14,7 @@ import numpy as np
 
 from dew._records import ADDED, integer, record
 from dew.batch import Batch, coordinates
+from dew.data.forked_rows import window_forks
 from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
 from dew.decision.data import Example, GroupedExamples
@@ -205,6 +206,8 @@ def model_row(encoded: Encoded, width: int, context_length: int | None = None) -
         row["blocks"] = np.asarray(encoded.blocks, np.int32)
     if encoded.streams is not None:
         row["streams"] = np.asarray(encoded.streams, np.int32)
+    if encoded.forked is not None:
+        row["forked"] = np.asarray(encoded.forked, np.int32)
     if context_length is not None:
         row["context"] = np.asarray(encoded.context or (), np.int32)
     return row
@@ -716,8 +719,10 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     `trained` row carries its gold along its questions; a scored one
     (`model_row`) carries the model's fields alone."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
-    # A row of questions over one state lays each at its own row's positions (`QuestionLayout.shared_state`).
-    positioned = parallel or (isinstance(layout, QuestionLayout) and layout.shared_state is not None)
+    # A row of questions over one state lays each at its own row's positions, each question's own part a
+    # document continuing the shared part (`QuestionLayout.shares`, `Encoded.forked`).
+    forked = isinstance(layout, QuestionLayout) and layout.shares
+    positioned = parallel or forked
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
     streamed = layout.attention is not None
     along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))
@@ -731,7 +736,8 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
         along = (*along, ("unit_rows", bounds.segments))
     fields = ("tokens", *(("positions",) if positioned else ()), *(("slots",) if parallel else ()),
               *(("blocks",) if blocked else ()),
-              *(("streams",) if streamed else ()), *(("row",) if grouped else ()))
+              *(("streams",) if streamed else ()), *(("forked",) if forked else ()),
+              *(("row",) if grouped else ()))
     return Pack(layout.max_len, fields, segments=bounds.segments, along=along)
 
 
@@ -808,6 +814,15 @@ def _row_starts(along: np.ndarray, owners: np.ndarray) -> np.ndarray:
     return np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
 
 
+def forked_documents(layout: Layout, bounds: Bounds) -> int | None:
+    """The most documents a window of `layout`'s rows holds where they ask questions over one state
+    (`QuestionLayout.shares`): a shared part a row and an own part a question, within `bounds`; None for
+    rows of one document."""
+    if not (isinstance(layout, QuestionLayout) and layout.shares):
+        return None
+    return bounds.segments + bounds.questions
+
+
 @dataclass(frozen=True)
 class PackedRows(pygrain.MapTransform):
     """A window of packed rows (`packing`) as `DecisionInputs` reads it: each
@@ -821,6 +836,9 @@ class PackedRows(pygrain.MapTransform):
     max_length: int
     option_slots: int | None = None
     spans_in_context: bool = False
+    documents: int | None = None
+    """The most documents a window of rows over one state holds (`Encoded.forked`): its rows' shared parts
+    and their questions' own parts, a shape a window keeps fixed (`DecisionInputs.parents`)."""
 
     def map(self, element: Batch) -> Batch:
         units = np.asarray(element["tokens_segment_ids"])
@@ -854,6 +872,13 @@ class PackedRows(pygrain.MapTransform):
         if "streams" in element:
             # Each row keeps its tokens' streams where the window packed it; the padding is in none.
             laid["streams"] = np.where(segments > 0, np.asarray(element["streams"]), -1).astype(np.int32)
+        if "forked" in element:
+            if self.documents is None:
+                raise ValueError("a window of rows over one state states the most documents it holds")
+            # Each row's shared part its document 1, each question's own part continuing it.
+            forked = np.asarray(element["forked"])
+            laid["documents"], laid["parents"] = window_forks(segments, forked, (forked > 1).astype(np.int32),
+                                                              self.documents)
         if contexts is not None:
             laid["context"] = element["context"]
             laid["context_segments"] = contexts

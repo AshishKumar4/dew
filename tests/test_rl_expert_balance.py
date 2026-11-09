@@ -20,7 +20,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from moe_support import BALANCED_EXPERTS, BALANCED_VOCAB, balanced_decoder, favour_expert_zero, uniform_gates
 
 from dew.config import ObjectiveConfig
-from dew.data.preferences import IDS_KEY as PAIRS_KEY, MASK_KEY as PAIR_MASK_KEY
+from dew.data.preferences import MASK_KEY as PAIR_MASK_KEY, pair_windows
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
@@ -128,8 +128,8 @@ def policy_batch(kind, tokens, marks):
     chain, chosen and rejected alike."""
     rows = tokens.shape[0]
     if kind == "dpo":
-        return {PAIRS_KEY: np.broadcast_to(tokens[:, None, :], (rows, 2, WIDTH)).astype(np.int32),
-                PAIR_MASK_KEY: np.broadcast_to(marks, (rows, 2, WIDTH)).astype(np.float32)}
+        return pair_windows(np.broadcast_to(tokens[:, None, :], (rows, 2, WIDTH)).astype(np.int32),
+                            np.broadcast_to(marks, (rows, 2, WIDTH)).astype(np.int32), count=rows)
     batch = {
         IDS_KEY: tokens.astype(np.int32),
         SEGMENT_IDS_KEY: np.broadcast_to(CHAIN.astype(np.int32), (rows, WIDTH)),
@@ -169,14 +169,18 @@ def load(pattern):
 
 
 def widened(batch, pad):
-    """`batch` with `pad` padding columns after its last: no segment, response mark or target."""
-    return {name: np.concatenate([value, np.zeros((*value.shape[:-1], pad), value.dtype)], axis=-1)
+    """`batch` with `pad` padding columns after its last: no segment, response mark or target; a DPO
+    window of two halves `2 * pad`, its documents' parents as they were."""
+    windowed = "fork_parents" in batch
+    columns = 2 * pad if windowed else pad
+    return {name: value if name == "fork_parents" else
+            np.concatenate([value, np.zeros((*value.shape[:-1], columns), value.dtype)], axis=-1)
             for name, value in batch.items()}
 
 
 def untrained(batch, kind):
     """`batch` with every response mark cleared, so its loss trains no token."""
-    mark = PAIR_MASK_KEY if kind == "dpo" else RESPONSE_MASK_KEY
+    mark = PAIR_MASK_KEY if kind == "dpo" else RESPONSE_MASK_KEY  # the windows' completion marks
     return {**batch, mark: np.zeros_like(batch[mark])}
 
 

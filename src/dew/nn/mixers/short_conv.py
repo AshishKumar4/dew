@@ -16,7 +16,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.linear import DepthwiseConv1d, call_tree, held_conv1d, tree_conv
+from dew.nn.linear import DepthwiseConv1d, forked_conv, held_conv1d
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scatter import gather_positions
@@ -36,10 +36,10 @@ class GatedShortConv(nn.Module):
     bias product, its code zeroing a padded slot's input before them alone. Parameter names are the
     checkpoint's (`conv/weight` the `[D, 1, K]` taps)."""
 
-    reads: ClassVar[frozenset[str]] = frozenset({"tree_parents", "key_runs", "key_positions"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a tree's and the key runs and positions
-    of its attention beside it (`dew.nn.linear.call_tree`): a convolution reads the K-1 tokens before each of
-    its document, on a tree the K-1 on its path (`tree_conv`)."""
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that continue another
+    (`dew.batch.Forks`): a convolution reads the K-1 tokens before each token of its document, then of its
+    chain of ancestors (`dew.nn.linear.forked_conv`)."""
 
     emb_features: int
     kernel: int = 3
@@ -102,14 +102,11 @@ class GatedShortConv(nn.Module):
             if not allocated:
                 # The allocation-only call (`open_kv_cache`'s dummy token) consumes nothing.
                 return self.out_proj(jnp.zeros_like(mixed))
-        given = call.metadata  # A tree call's parents, and its attention's runs and places beside them.
-        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
-        if tree is not None:
-            # Each token over its path, from the held history; the cache left as it was for the replay.
-            if held is None:
-                raise ValueError("a tree call reads a row's cache, which a decode call allocates first")
-            convolved = tree_conv(mixed, taps, bias, held.value, tree, valid=valid, dtype=mixed.dtype,
-                                  activation=False)
+        if tokens.forks is not None:
+            # Each document after its chain's last tokens, a root after the held history; a cached call's
+            # cache left as it was.
+            convolved = forked_conv(mixed, taps, tokens, history=None if held is None else held.value,
+                                    bias=bias, dtype=mixed.dtype, activation=False)
             return self.out_proj(gate_out * checkpoint_name(convolved, 'conv'))
         if started is not None:
             started.value = started.value | (jnp.ones((batch,), bool) if valid is None
@@ -217,6 +214,8 @@ class ShortConvMixer(MixerBase):
     the layer has no keys to cache, no rope and no window."""
 
     residuals = ('conv',)
+    # Each document after the conv history its parent leaves (`dew.nn.linear.forked_conv`).
+    reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
     packed_cache = True
 

@@ -56,13 +56,13 @@ def _on_tcgen05(*, interpret: bool) -> None:
         with generation.routes() as routes, pytest.MonkeyPatch.context() as patched:
             patched.setattr(mosaic_gpu, "gmm", recorded)
             got = np.asarray(jax.jit(call)(), np.float32)
-        assert {route.kernel for route in routes} == {"mosaic_gpu"}, name
+        assert {route.kernel for route in routes} == {"mosaic"}, name
         assert {(tile.family, tile.block_m // tile.warpgroups) for tile in derived} == {("tcgen05", 128)}
         np.testing.assert_array_equal(got, expected, err_msg=name)
     with generation.routes() as routes:
         got = np.asarray(jax.jit(lambda: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="default",
                                                      interpret_on_cpu=interpret))())
-    assert {route.kernel for route in routes} == {"mosaic_gpu"}
+    assert {route.kernel for route in routes} == {"mosaic"}
     expected = np.stack([np.asarray(x[starts[g]:starts[g + 1]], np.float32).T
                          @ np.asarray(dy[starts[g]:starts[g + 1]], np.float32) for g in range(3)])
     np.testing.assert_array_equal(got, expected, err_msg="kernel gradient")
@@ -73,7 +73,7 @@ def _on_tcgen05(*, interpret: bool) -> None:
             got = np.asarray(jax.jit(lambda out_dtype=out_dtype: gemm.gemm_t(
                 x[:rows], dy[:rows], None, out_dtype=out_dtype, precision="default",
                 interpret_on_cpu=interpret)[0])(), np.float32)
-        assert {route.kernel for route in routes} == {"mosaic_gpu"}, out_dtype
+        assert {route.kernel for route in routes} == {"mosaic"}, out_dtype
         expected = np.asarray(x[:rows], np.float32).T @ np.asarray(dy[:rows], np.float32)
         np.testing.assert_array_equal(got, expected, err_msg=f"dense kernel gradient into {out_dtype}")
 

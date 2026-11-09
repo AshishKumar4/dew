@@ -10,10 +10,11 @@ from process_support import run_pool
 from reference_error import assert_as_exact
 from test_indexer_training import SEQ, VOCAB, deepseek_stack
 
-from dew.data.preferences import MASK_KEY
+from dew.data.preferences import pair_windows
 from dew.nn.backbones.decoder_block import Mixture
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective, GRPOObjective
+from dew.objectives.rl.preference import window_coordinates
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -36,8 +37,9 @@ def scored_batch(objective, seed: int = 0) -> tuple[dict, jax.Array]:
     mask = np.ones((2, SEQ + 1), np.float32)
     mask[:, :4] = 0
     if objective is DPOObjective:
-        pair = {IDS_KEY: jnp.asarray(ids[None]), MASK_KEY: jnp.asarray(mask[None], jnp.int32)}
-        return pair, jnp.asarray(ids)
+        # An indexed latent attention reads its keys in the row's order, so its halves are laid whole.
+        pair = pair_windows(ids[None], mask[None].astype(np.int32), share=False)
+        return pair, jnp.asarray(pair[IDS_KEY])
     drawn = np.where(mask != 0, -rng.random((2, SEQ + 1)), 0).astype(np.float32)
     return {
         IDS_KEY: jnp.asarray(ids),
@@ -100,8 +102,10 @@ def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_
     variables, reference, batch = draw(0)
     assert trained(plain)(variables, reference, batch)[1] is None
     _, qk = trained(headed, qk_stats=True)(variables, reference, batch)
-    rows = scored_batch(objective)[1]
-    own, frozen = (plain.token_scores(tree, rows, qk_stats=True).qk for tree in (variables, reference))
+    held, rows = scored_batch(objective)
+    laid = {} if objective is not DPOObjective else {"coordinates": window_coordinates(held)}
+    own, frozen = (plain.token_scores(tree, rows, qk_stats=True, **laid).qk
+                   for tree in (variables, reference))
     jax.tree.map(np.testing.assert_array_equal, qk, own)
     assert not all(np.array_equal(found, other) for found, other in zip(
         jax.tree.leaves(qk), jax.tree.leaves(frozen), strict=True))

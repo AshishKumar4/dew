@@ -395,13 +395,15 @@ GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 
                "deepseek-v3 decode down": (64, 2048, 7168, 256),
                "llama up": (4096, 4096, 14336, 1), "qwen3.5-4b up": (24576, 2560, 9216, 1),
                "qwen3.5-4b down": (24576, 9216, 2560, 1), "qwen3.5-4b key": (24576, 2560, 1024, 1),
-               "qwen3.5-4b gates": (24576, 2560, 64, 1), "narrow kernel gradient": (4096, 64, 256, 1)}
+               "qwen3.5-4b gates": (24576, 2560, 64, 1), "narrow kernel gradient": (4096, 64, 256, 1),
+               "unaligned": (4096, 200, 100, 4)}
 """Real projections' extents `(rows, depth, width, groups)` for the GEMM mainloops' compile gate, over which
 the derived tiles move: MoE expert products (Qwen3-30B-A3B's, Mixtral's and DeepSeek-V3's: rows a few tiles a
 group, or less than one, a wide and a deep product, and a decode step's, 8 tokens' top-8 rows over 256
 experts), dense ones (Llama 3 8B's up, and Qwen3.5-4B's training step at its 24,576 rows a device: its widest,
 deepest, narrow key and narrowest gate products, its HLO 10-28), and a kernel gradient of 64 output rows,
-which one consumer computes."""
+which one consumer computes, and a grouped product of a depth and width no tile divides, run padded to
+whole tiles (`grouped_matmul._Mosaic._aligned`)."""
 
 PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "input gradient fp16",
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16", "dense kernel gradient")
@@ -611,16 +613,15 @@ def _derived_and_refused(launch, ba, target) -> tuple:
     return config, list(refused.values())
 
 
-def _emitted_forms(family, shape: str | None = None) -> set[str]:
+def _emitted_forms(family) -> set[str]:
     """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `EXACT_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`):
     none without a bundle, the exactly summed ones where its register model counts a running sum
     (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the
     paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
     take FP8 (`Family.takes_fp8`); where its consumers do not issue their products, none whose step prepares
     them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
-    first, an exactly summed step takes its product apart);
-    at a projection `shape`, each whose output's width steps by the family's column unit and whose
-    contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
+    first, an exactly summed step takes its product apart); at every projection, its widths padded to whole
+    tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
     if family is None:
         return set()
     paired = family.takes_pairs and (family.counts_hooks or not family.feeds_itself)
@@ -631,21 +632,7 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
         # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`).
         forms = {form for form in forms
                  if form.startswith("dense") or ("kernel gradient" not in form and form not in EXACT_FORMS)}
-    if shape is None:
-        return forms
-    _, depth, width, _ = GEMM_SHAPES[shape]
-
-    def takes(form: str) -> bool:
-        # Each form at its operands' units: an FP8 product's column unit and narrowest step are FP8's (128
-        # elements a 128-byte swizzle), the others' bf16's.
-        dtype = jnp.float8_e4m3fn if form in FP8_FORMS else jnp.bfloat16
-        unit, step = family.column_unit(dtype), min(family.depths(dtype))
-        # An input gradient's output is the depth wide, contracting the width; every other form's output
-        # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
-        columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
-        return columns % unit == 0 and ("kernel gradient" in form or contracted % step == 0)
-
-    return {form for form in forms if takes(form)}
+    return forms
 
 
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
@@ -661,7 +648,7 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     for group in bundles.groups(generation_name, jnp.bfloat16, stated=True):
         own = _emitted_forms(group[0]) - taken
         taken |= own
-        forms |= own & _emitted_forms(group[0], shape)
+        forms |= own
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
@@ -776,23 +763,23 @@ def libtpu_shared(monkeypatch):
 @pytest.mark.usefixtures("libtpu_shared")
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
-    """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
-    at the block their launch derives from the TPU's facts, compiled by libtpu for a compile-only TPU of
-    the generation on this CPU; a generation whose scoped VMEM no measurement states takes none of them
-    (`MosaicTpuGmm.eligible`)."""
+    """The GEMM template's launches on a TPU core (the MXU's bundle: `MosaicGmm` forward and input gradient,
+    `MosaicTgmm`), at the tile each derives from the TPU's facts, compiled by libtpu for a compile-only TPU
+    of the generation on this CPU; a generation whose scoped VMEM no measurement states takes none of them
+    (`MosaicGmm.eligible`)."""
     from kernel_compile import compile_tpu_kernels
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     # A Qwen3 MoE gate-up's widths, rows a few tiles a group.
     rows, depth, width, groups = 4096, 2048, 1536, 8
     sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
-    calls = [("forward", grouped_matmul.MosaicTpuGmm(),
+    calls = [("forward", grouped_matmul.MosaicGmm(),
               (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
               {"out_dtype": "bfloat16", "trans_rhs": False}),
-             ("input gradient", grouped_matmul.MosaicTpuGmm(),
+             ("input gradient", grouped_matmul.MosaicGmm(),
               (bf16((rows, width)), bf16((groups, depth, width)), sizes),
               {"out_dtype": "bfloat16", "trans_rhs": True}),
-             ("kernel gradient", grouped_matmul.MosaicTpuTgmm(),
+             ("kernel gradient", grouped_matmul.MosaicTgmm(),
               (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "bfloat16"})]
     cases = []
     with generation.assumed(tpu):
@@ -809,7 +796,7 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
         assert generation.gpu_target(tpu).scoped_vmem is None
         pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
     forms = {"forward", "input gradient", "kernel gradient"}
-    assert {case.name.split(" Blocks(")[0] for case in cases} == forms
+    assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_tpu_kernels(cases, tpu)
     failed = [f"{record['name']}: {record['error']}" for record in found if "error" in record]
     assert not failed, "\n".join(failed)
@@ -843,7 +830,7 @@ def _projected(local: bool):
         # Mapped as it traces, on the mesh its program lowers for (`manual_map` reads the mesh in context).
         specs = (PartitionSpec("data"), PartitionSpec())
         forward = sharding.manual_map(projected, specs, PartitionSpec("data")) if local else projected
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.chosen(grouped_matmul="mosaic"):
             return jax.grad(lambda x, w: forward(x, w).astype(jnp.float32).sum(), argnums=(0, 1))(x, w)
 
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -881,7 +868,7 @@ def _gpt_oss_projected():
         def projected(x, w):
             return gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
 
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.chosen(grouped_matmul="mosaic"):
             return jax.grad(projected, argnums=(0, 1))(x, w)
 
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -894,7 +881,7 @@ def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     reading the experts' matrices whole (`kernel_compile.Expected`, its route evidence). Every tile width
     dividing 2880 is an odd multiple of 64, whose ragged store's one-row rung no warpgroup's strided layout
     holds: the template refused each such tile, so the call it was named for (row 4474), until that rung was
-    copied in a row's layout (`mosaic.copied`)."""
+    copied in a row's layout (`swizzling.copied`)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
     expected = Expected(axes=(("data", 1),), specs=(None, None, None),
@@ -909,7 +896,7 @@ def _blockwise_projected():
     from dew.nn.kernels import gemm
 
     def product(rows, matrices, sizes, row_scales, column_scales):
-        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+        with generation.chosen(blockwise_fp8="mosaic"):
             return gemm.blockwise_fp8_product(rows, matrices, sizes, row_scales, column_scales,
                                               out_dtype=jnp.bfloat16)
 
@@ -1050,7 +1037,7 @@ def _blockwise_gradient():
     from dew.nn.kernels import gemm
 
     def gradient(lhs_t, rhs_t, row_scales, column_scales):
-        with generation.chosen(blockwise_fp8="mosaic_gpu"):
+        with generation.chosen(blockwise_fp8="mosaic"):
             return gemm.blockwise_fp8_kernel_gradient(lhs_t, rhs_t, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
                                                       row_scales, column_scales, out_dtype=jnp.float32)
 
@@ -1082,7 +1069,7 @@ def _mx_projection():
     from dew.nn.kernels import gemm
 
     def product(rows, matrices):
-        with generation.chosen(mxfp8="mosaic_gpu"):
+        with generation.chosen(mxfp8="mosaic"):
             return gemm.mxfp8_product(gemm.MxFp8.quantized(rows), gemm.MxFp8.quantized(matrices),
                                       jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]), out_dtype=jnp.bfloat16)
 
@@ -1103,7 +1090,7 @@ def _nvfp4_block_projection():
     from dew.nn.kernels import gemm
 
     def product(rows, matrices):
-        with generation.chosen(nvfp4_block="mosaic_gpu"):
+        with generation.chosen(nvfp4_block="mosaic"):
             operands = (gemm.NvFp4Block.quantized(rows), gemm.NvFp4Block.quantized(matrices))
             return gemm.nvfp4_block_product(*operands, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
                                             out_dtype=jnp.bfloat16)

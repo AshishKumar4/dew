@@ -51,6 +51,7 @@ import test_gemm_blockwise as gemm_blockwise
 import test_gemm_gather as gemm_gather
 import test_gemm_tcgen05 as gemm_tcgen05
 import test_gemm_template as gemm_template
+import test_gemm_widths as gemm_widths
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
@@ -139,6 +140,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for depth in (128, 512)),
         Cell("the template takes a gpt-oss width as exactly as XLA",
              grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla),
+        *(Cell(f"the template runs widths no tile divides: {depth}x{width}",
+               functools.partial(gemm_widths.unaligned_widths_run_on_the_template, depth, width,
+                                 interpret=False))
+          for depth, width in gemm_widths.WIDTHS),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90"),
         *(Cell(f"a gathered grouped product is on par{': paired and scattered' if paired else ''}",

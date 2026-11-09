@@ -7,6 +7,19 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A shared prefix is computed once in the backbone call (`dew.batch.Forks`): a row's documents may continue
+  another, each reading its chain of ancestors as its own beginning, attention their keys and every recurrent
+  mixer (gated delta net, Kimi delta attention, Mamba, Mamba-2, the short conv) the state and conv history
+  they leave, each token at its own row's place. `dew.data.forked_rows.ForkedRows` packs rows that begin
+  alike over one copy of their prefix and maps each row's outputs back. A decision layout asks a request's
+  questions over one copy of its state by default (`QuestionLayout.shared_state` None: as many as a row
+  holds; 1, a row a question), on hybrids too; `label_scores`, the lm-eval adapter and a GRPO pack
+  (`share`) lay their prompts once; a flow rollout encodes each prompt once for its group. A tree verify
+  states its tree as forks, so a hybrid verifies trees. `siblings`, `attention_tree`, `chain_lengths` and
+  `rows_needed` are gone (`packed_rows` counts a pack's rows). DPO packs its pairs into windows of two halves'
+  tokens, several pairs a window, a pair's shared prompt once (`presets.preferences`, `preferences.windows`):
+  a batch is `[B, 2 * seq_len]` windows, its loss reduced per pair; `pad_id` is gone.
+
 - FlashAttention's wrapper, `dew-flash-attn` 0.3.8, lowers its call for the GPU a host states (`targeting`), so a
   host with no GPU, the CPU lock's `kernel-compile` extra with the CUDA runtime its library loads, compiles a
   step ahead as the GPU's program with FlashAttention's kernel in it.

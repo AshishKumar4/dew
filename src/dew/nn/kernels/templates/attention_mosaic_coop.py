@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, swizzling
 from dew.nn.kernels.templates.attention_mosaic_fused import staged_parts, walked_sums
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -37,7 +37,7 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     """The shared-keys launch's allocations as `Family.scoped` takes them, in `_coop_launch`'s order: the
     program's resident keys and values; a tile's weights and score cotangents, every consumer's share of
     the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
-    over the tile's queries and keys (`mosaic.swizzle_for`: 64 bytes at a share of 32), fp16's two parts
+    over the tile's queries and keys (`swizzling.swizzle_for`: 64 bytes at a share of 32), fp16's two parts
     each (`staged_parts`); each consumer's fp32 stage of its adds a chunk of its columns at a time
     (`mosaic.staged_columns`: width 256's two stages of its 64 x 256 slots fit beside it); the two loads'
     barriers and the exchange's (`Family.exchange`); fp16's shares' exponents, a row each of the weights'
@@ -45,7 +45,7 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = mosaic.staged_columns(width // consumers, (jnp.float32,))
-    swizzle = mosaic.swizzle_for(dtype, block_k // consumers, block_q, block_k)
+    swizzle = swizzling.swizzle_for(dtype, block_k // consumers, block_q, block_k)
     parts = staged_parts(dtype)
     scoped = [family.staged_memory((block_k, width), dtype), family.staged_memory((block_k, width), dtype),
               family.staged_memory((2 * parts, block_q, block_k), dtype, swizzle),

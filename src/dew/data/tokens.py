@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from typing import overload
 
 import grain.python as pygrain
@@ -249,3 +249,13 @@ class _WrappingDataset(pygrain.MapDataset[Batch]):
         if isinstance(index, slice):
             return self.slice(index)
         return self.record(index % len(self))
+
+
+def common_prefix(first: Sequence[Hashable], second: Sequence[Hashable]) -> int:
+    """How many leading entries `first` and `second` share."""
+    count = 0
+    for mine, theirs in zip(first, second, strict=False):
+        if mine != theirs:
+            break
+        count += 1
+    return count

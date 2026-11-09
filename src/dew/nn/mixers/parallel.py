@@ -194,8 +194,15 @@ class ParallelMixer(MixerBase):
                      if (refusal := branch.mixer.mixed_refusal(ctx)) is not None), None)
 
     def packed_cache_refusal(self) -> str | None:
+        return self._branch_refusal(lambda mixer: mixer.packed_cache_refusal())
+
+    def fork_refusal(self) -> str | None:
+        return self._branch_refusal(lambda mixer: mixer.fork_refusal())
+
+    def _branch_refusal(self, refusal_of) -> str | None:
+        """The first branch's refusal `refusal_of(mixer)` says, named by its branch, or None."""
         return next((f"branch {branch.name!r}: {refusal}" for branch in self.branches
-                     if (refusal := branch.mixer.packed_cache_refusal()) is not None), None)
+                     if (refusal := refusal_of(branch.mixer)) is not None), None)
 
     def generation_refusal(self) -> str | None:
         return next((refusal for branch in self.branches

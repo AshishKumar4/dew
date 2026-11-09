@@ -345,7 +345,7 @@ TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
 """The runs here of an objective that records each saved task's settings, and the objective's name: a
 decision release's, which exports, a fresh head's over a backbone that reads blocks, a fresh letter
 readout's, whose labels its layout takes, a fresh head's over a tokenizer that merges, whose unit a row
-shows, and a letter readout's whose rows ask a request's questions over one state, whose siblings it reads;
+shows, and a letter readout's whose rows ask a request's questions over one state, each continuing it;
 a masked run over a release, whose walk it takes; a JEPA encoder's, whose native release records no settings
 of its own (`dew.inference.models.ModelSettings`)."""
 

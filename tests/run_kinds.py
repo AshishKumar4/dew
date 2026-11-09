@@ -315,7 +315,7 @@ def requested(task) -> object:
         # unless its layout reads the question there (`spans_in_context`), which reads no other.
         reads = task.context_length is not None and not task.layout.spans_in_context
         context = {"plan": "enterprise"} if reads else None
-        if isinstance(task.layout, QuestionLayout) and task.layout.shared_state is not None:
+        if isinstance(task.layout, QuestionLayout) and task.layout.shares:
             # Two questions, which a row over one state asks together, each reading the state once.
             question = {**question,
                         "urgent": Choice("how urgent", {"now": "blocks work", "later": "can wait"})}

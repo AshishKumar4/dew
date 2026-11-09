@@ -152,3 +152,32 @@ def test_a_rebuilt_cuda_plugin_reads_no_picks_its_earlier_build_measured(tmp_pat
     both = picks_beside(cuda13="0.12.0.1.post45", cuda12="0.12.0.1.post61")
     assert both.endswith("-cuda12-0.12.0.1.post61-cuda13-0.12.0.1.post45")
     assert picks_beside(cuda13="0.12.0.1.post62", cuda12="0.12.0.1.post61") != both
+
+
+def test_a_rebuilt_cuda_plugin_reads_no_executable_its_earlier_build_compiled(tmp_path):
+    """JAX keys a persistent cache entry by jax's, jaxlib's and the platform's versions, not the PJRT plugin
+    that compiled it; a plugin rebuilt under one jax served its earlier build's executables, the miscompile it
+    fixed included (row 5275). A process beside another build of a plugin compiles the same program into
+    an entry of its own, and the same build reads the entry back."""
+    from process_support import fresh
+
+    cache = tmp_path / "cache"
+
+    def compiled_beside(version):
+        site = tmp_path / version
+        (site / "jax_plugins" / "xla_cuda12").mkdir(parents=True, exist_ok=True)
+        # A plugin JAX's discovery imports and initializes, registering no backend (JAX_PLATFORMS=cpu).
+        (site / "jax_plugins" / "xla_cuda12" / "__init__.py").write_text("def initialize():\n    pass\n")
+        info = site / f"jax_cuda12_pjrt-{version}.dist-info"
+        info.mkdir(exist_ok=True)
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: jax-cuda12-pjrt\nVersion: {version}\n")
+        fresh(f"import sys; sys.path.insert(0, {str(site)!r}); import jax; "
+              f"from dew._cache import enable_compilation_cache; enable_compilation_cache({str(cache)!r}); "
+              "jax.jit(lambda x: x * 3 + 1)(2).block_until_ready(); print('null')", platforms="cpu")
+        return {path.name for path in cache.glob("*-cache")}
+
+    earlier = compiled_beside("0.12.0.1.post71")
+    assert len(earlier) == 1
+    assert compiled_beside("0.12.0.1.post71") == earlier
+    later = compiled_beside("0.12.0.1.post72")
+    assert len(later) == 2 and earlier < later

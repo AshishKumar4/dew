@@ -4,8 +4,9 @@ A TPU core has no warps, warpgroups or registers a kernel budgets: its products 
 accumulated into values Mosaic TPU keeps in vregs or spills to VMEM, and its operand blocks arrive in VMEM by
 DMA. So its issuer (`MxuIssuer`) multiplies a step's VMEM blocks into an fp32 value, and its transport
 (`VmemRings`) streams each step's blocks into a ring of VMEM slots by asynchronous copies a step ahead (two
-slots, double buffered, each awaited at its DMA semaphore), stores an output by copies from VMEM in a ladder
-of static extents (`mosaic.store_rows`), and runs a persistent launch's tiles round-robin over the launch's
+slots, double buffered, each awaited at its DMA semaphore), stores an output tile's rows as one whole window
+of them from VMEM, read back first and its rows past the tile's own kept (its DMAs start at whole tiles of
+the layout, `copies_tiled_rows`), and runs a persistent launch's tiles round-robin over the launch's
 programs, one a core. A program is one role: no producer runs beside it, and nothing is multicast."""
 
 import contextvars
@@ -19,12 +20,16 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from dew.nn.kernels import launches
+from dew.nn.kernels import generation, launches
 from dew.nn.kernels.templates import handoffs, mosaic, persistent
 
 STAGES = 2
 """The slots a stream's ring holds: a step's blocks arrive while the step before it multiplies (Pallas
 TPU's own pipeline's double buffering)."""
+
+VALUES = 2
+"""The fp32 values of a tile's shape Mosaic TPU holds in VMEM beside a program's allocations: its accumulator
+and a step's product (`MxuIssuer.value_scratch`)."""
 
 _GRID_NAMES: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("tpu_grid_names", default=())
 """The launch grid's axis names while its entry traces (`VmemRings.kernel`), which `program_index` reads."""
@@ -79,6 +84,8 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
 
     role_rows = 128
 
+    operand_dtypes = (jnp.dtype(jnp.bfloat16),)  # a v5e's MXU multiplies bf16, not fp16
+
     operands_in_registers = False
 
     products_overlap = False
@@ -102,6 +109,22 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
     @property
     def lane_columns(self) -> int:
         raise NotImplementedError(self._VALUES)
+
+    def held_area(self, consumers: int) -> int:
+        # Its accumulator and each step's product beside it, both fp32 values Mosaic TPU holds in VMEM: the
+        # scoped VMEM's of them (`value_scratch`), the derivation's planner then fitting its rings beside.
+        _one(consumers)
+        return generation.shared_budget(generation.gpu_target()) // (VALUES * 4)
+
+    def value_scratch(self, blocks: dict, outputs: tuple) -> tuple:
+        # Mosaic TPU holds a step's operand blocks as values and the fp32 accumulator and product tile
+        # beside them in VMEM (`VALUES`): a v5e refused 20.33 and 20.95 MiB at a 1024 x 512 x 2048 product
+        # and kernel gradient, 16.12 at a 256 x 512 x 4096 gradient, whose buffers alone counted 16.00, 16.00
+        # and 13.0 (the compile gate's libtpu runs of the launch this one replaced).
+        operands = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in blocks.values())
+        values = tuple(jax.ShapeDtypeStruct(shape, jnp.float32)
+                       for shape, _ in outputs for _ in range(VALUES))
+        return operands + values
 
     # A tile, a row and a column are values: the members the GPU's issuers lay out are plain reads.
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
@@ -197,6 +220,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     budgets_registers = False
 
+    ring_slots = STAGES
+
+    copies_tiled_rows = True
+
     def registers(self, consumers: int, programs: int = 1) -> int:
         raise NotImplementedError("a TPU core budgets no registers: its values spill to VMEM")
 
@@ -205,10 +232,19 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         del dtype
         return 128
 
+    def vector_unit(self, dtype) -> int:
+        # Mosaic TPU lays a one-dimensional block out in rows of 128 32-bit lanes (`_check_block_mappings` in
+        # jax's Pallas TPU lowering): 256 elements of a 16-bit vector.
+        return 128 * 4 // jnp.dtype(dtype).itemsize
+
     def depths(self, dtype) -> tuple[int, ...]:
-        # A step's depth in whole lanes, the MXU's side on a v5e.
-        del dtype
-        return (128,)
+        # A step's depth in doublings of the MXU's side, widest first, as the launch this one replaced took
+        # any dividing the contraction (a grid step's fixed cost spread over the deepest its VMEM holds): to
+        # the deepest whose rings, at a role's rows of each operand, the scoped VMEM holds, the derivation's
+        # planner then fitting each tile's.
+        budget = generation.shared_budget(generation.gpu_target())
+        deepest = budget // (STAGES * 2 * self.role_rows * jnp.dtype(dtype).itemsize)
+        return tuple(128 << shift for shift in range(max(0, (deepest // 128).bit_length() - 1), -1, -1))
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
@@ -293,9 +329,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         return tuple(ring['slots'] for ring in streams.values()), ()
 
     def output_staging(self, outputs: tuple, consumers: int) -> list:
-        # Each output's tile staged whole in VMEM.
+        # Each output's tile staged in VMEM twice its rows: a store's window shifted back to the output's
+        # last rows holds the tile at the shift (`persist`'s `store`).
         _one(consumers)
-        return [pltpu.VMEM(shape, dtype) for shape, dtype in outputs]
+        return [pltpu.VMEM((2 * shape[0], *shape[1:]), dtype) for shape, dtype in outputs]
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -320,9 +357,23 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
         def run(*staging):
             def store(output, value, ref, place):
+                # A DMA's HBM rows start at whole tiles of the layout (`copies_tiled_rows`): a tile's rows of
+                # the output stored as a whole window of them, read back first and its rows outside
+                # `first`'s `stored` kept (another group's); a window past the output's last row shifted
+                # back to end there, the tile staged at the shift (the output's rows at least a tile's,
+                # `gemm.mosaic_gpu._walked_rows`).
+                row_start, first, stored, column, *_ = place
                 staged = staging[output]
-                staged[...] = value.astype(staged.dtype)
-                mosaic.store_rows(staged, ref, *place, copy=_copied)
+                rows, unit = staged.shape[0] // 2, 8 * 4 // staged.dtype.itemsize
+                start = pl.multiple_of(jnp.minimum(row_start, ref.shape[0] - rows), unit)
+                shift = pl.multiple_of(row_start - start, unit)
+                window, held = ref.at[pl.ds(start, rows), pl.ds(column, staged.shape[1])], staged.at[:rows]
+                pltpu.sync_copy(window, held)
+                kept = held[...]
+                staged[pl.ds(shift, rows)] = value.astype(staged.dtype)
+                tile_row = lax.broadcasted_iota(jnp.int32, kept.shape, 0) - shift
+                held[...] = jnp.where((tile_row >= first) & (tile_row < first + stored), held[...], kept)
+                pltpu.sync_copy(held, window)
 
             def visit(turn, carry):
                 index = _unravel(program + turn * programs, tiles)
@@ -479,7 +530,10 @@ def _product(lhs, rhs) -> jax.Array:
     left, left_transposed = _operand(lhs)
     right, right_transposed = _operand(rhs)
     contracting = ((0 if left_transposed else 1,), (1 if right_transposed else 0,))
-    return lax.dot_general(left, right, (contracting, ((), ())), preferred_element_type=jnp.float32)
+    # At the default precision whatever the context's: the MXU multiplies its bf16 operands whole (Mosaic
+    # TPU refused a bf16 matmul at an fp32 contract precision, "Bad lhs type", the compile gate's libtpu).
+    return lax.dot_general(left, right, (contracting, ((), ())), precision=lax.Precision.DEFAULT,
+                           preferred_element_type=jnp.float32)
 
 
 def _unravel(flat, extents: tuple[int, ...]) -> tuple:
@@ -489,11 +543,6 @@ def _unravel(flat, extents: tuple[int, ...]) -> tuple:
         index.append(flat % extent)
         flat = flat // extent
     return tuple(reversed(index))
-
-
-def _copied(source, destination) -> None:
-    """`source` (in VMEM) to `destination` (in HBM): `mosaic.store_rows`' copy on a TPU."""
-    pltpu.sync_copy(source, destination)
 
 
 def _awaited(view, ref, semaphore) -> None:
