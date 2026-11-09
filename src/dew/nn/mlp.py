@@ -15,6 +15,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
+from dew.nn.residuals import Residual
 
 from .activations import (
     UNGATED,
@@ -239,7 +240,8 @@ class GatedMLP(nn.Module):
         activation = self._activation()
         axes = self._axes(x)
         if not isinstance(activation, (str, Situ)):
-            out = self._down(activation(checkpoint_name(self._placed(self.up_proj(x)), 'up_proj')), train)
+            up = checkpoint_name(self._placed(self.up_proj(x)), Residual.UP_PROJ)
+            out = self._down(activation(up), train)
             return activation(out) if self.activation_after else out
         # A SiTU, the clamp, the gate's top-k and nGPT's gains take the halves apart.
         if (isinstance(activation, str) and self.swiglu_limit is None and not self.activation_sparsity
@@ -253,7 +255,7 @@ class GatedMLP(nn.Module):
                 # Both names on the one output: a remat policy that keeps either keeps it whole.
                 if axes is not None:
                     gate_up = constrain(gate_up, PACKED_HIDDEN)
-                gate_up = checkpoint_name(checkpoint_name(gate_up, 'gate_proj'), 'up_proj')
+                gate_up = checkpoint_name(checkpoint_name(gate_up, Residual.GATE_PROJ), Residual.UP_PROJ)
                 return self._down(packed_gated_product(activation, axes=axes)(gate_up), train)
         if self._packed():
             group = self._group()
@@ -261,8 +263,8 @@ class GatedMLP(nn.Module):
             gate, up = halves['gate_proj'], halves['up_proj']
         else:
             gate, up = self.gate_proj(x), self.up_proj(x)
-        gate = checkpoint_name(self._placed(gate), 'gate_proj')
-        up = checkpoint_name(self._placed(up), 'up_proj')
+        gate = checkpoint_name(self._placed(gate), Residual.GATE_PROJ)
+        up = checkpoint_name(self._placed(up), Residual.UP_PROJ)
         if self.ngpt is not None:
             return self._down(self._ngpt_hidden(self.ngpt, gate, up, activation), train)
         gate, up = swiglu_clamped(scaled(gate, self.gate_multiplier), up, self.swiglu_limit)
@@ -293,7 +295,7 @@ class GatedMLP(nn.Module):
     def _down(self, hidden, train: bool):
         if self.dropout_rate:
             hidden = self.dropout(hidden, deterministic=not train)
-        return scaled(checkpoint_name(self.down_proj(hidden), 'down_proj'), self.down_multiplier)
+        return scaled(checkpoint_name(self.down_proj(hidden), Residual.DOWN_PROJ), self.down_multiplier)
 
     def _gate_up(self, x):
         """The gate and up projections as one `[..., 2, H]` output: the packed

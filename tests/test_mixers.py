@@ -35,9 +35,10 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.cross_attention import CrossAttention
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall
 from dew.nn.memory import Gate, InContextMemory, MLPMemory
-from dew.nn.mixer_base import MLP_RESIDUALS, MixerRefused
+from dew.nn.mixer_base import MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.nn.residuals import MLP_RESIDUALS
 from dew.registry import mixers, models
 
 VOCAB = 37

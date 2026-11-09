@@ -67,12 +67,13 @@ from dew.nn.kv_cache import (
     rotated,
 )
 from dew.nn.local_attention import local_attention
-from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, divided, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
+from dew.nn.residuals import QKV_RESIDUALS
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
 from dew.nn.value_experts import RoutedValues

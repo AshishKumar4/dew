@@ -40,6 +40,7 @@ from dew.batch import Variables, leaves_by_path
 from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.derivatives import KernelGlue, Protected, contracted, declared_tangent
+from dew.nn.residuals import Residual
 
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
@@ -1300,16 +1301,16 @@ class ExpertMLP(nn.Module):
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (mixer_base.RESIDUALS).
         if self.activation == 'relu2':
-            up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
+            up = checkpoint_name(linear(tokens, kernels[0]), Residual.UP_PROJ)
             hidden = relu2(up)
-            return checkpoint_name(linear(hidden, kernels[1], slots), 'down_proj')
+            return checkpoint_name(linear(hidden, kernels[1], slots), Residual.DOWN_PROJ)
         # The gate and up projections read the same rows: one paired product (`paired_projections`).
         gate, up = paired_projections(tokens, kernels[0], kernels[1], sizes, dtype, self.implementation,
                                       self.precision)
-        gate, up = checkpoint_name(gate, 'gate_proj'), checkpoint_name(up, 'up_proj')
+        gate, up = checkpoint_name(gate, Residual.GATE_PROJ), checkpoint_name(up, Residual.UP_PROJ)
         gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         hidden = gated_product(self.activation)(gate, up)
-        return checkpoint_name(linear(hidden, kernels[2], slots), 'down_proj')
+        return checkpoint_name(linear(hidden, kernels[2], slots), Residual.DOWN_PROJ)
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         wide = at_least_fp32(slots.dtype)

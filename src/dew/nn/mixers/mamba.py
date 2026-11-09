@@ -49,6 +49,7 @@ from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
+from dew.nn.residuals import Residual
 from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
 
@@ -322,7 +323,7 @@ class MambaMixer(MixerBase):
     SSM has no keys to cache or positions to rotate.
     """
 
-    residuals = ('context', 'scan', 'conv')
+    residuals = (Residual.CONTEXT, Residual.SCAN, Residual.CONV)
     # Each document from the state and conv history its parent leaves (`dew.nn.linear.forked_scan`).
     reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).

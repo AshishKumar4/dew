@@ -42,6 +42,7 @@ from dew.nn.linear import fork_start, forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.residuals import Residual
 from dew.nn.sharding import sequence_shards
 
 LIGHTNING = recurrence.Hooks(decay='scalar', delta=False)
@@ -189,7 +190,7 @@ class LightningAttention(nn.Module):
         if held is not None:
             held.value = final.astype(held.value.dtype)
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
-        out = checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+        out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         out = self.norm(out.reshape(batch, length, self.features))
         return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
 
@@ -202,7 +203,7 @@ class LightningAttentionMixer(MixerBase):
     recurrence runs in, which changes no value but its rounding. The heads and their width are the
     context's: the layer's attention geometry, without its key/value heads, rotary or window."""
 
-    residuals = ('context', 'scan')
+    residuals = (Residual.CONTEXT, Residual.SCAN)
     reads_depth = True
     # Each document from the memory its parent leaves (`dew.nn.linear.forked_scan`).
     reads_forks = True

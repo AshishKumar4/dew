@@ -41,11 +41,7 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
-
-# dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
-# contracts from base avoids importing the kind hub back during this module's
-# initialization, so either kind can be the first imported.
-from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import (
@@ -55,6 +51,11 @@ from dew.nn.precision import (
     float32_dot_general,
     float32_einsum,
 )
+
+# dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
+# contracts from base avoids importing the kind hub back during this module's
+# initialization, so either kind can be the first imported.
+from dew.nn.residuals import ATTENTION_CONTEXT_RESIDUALS, Residual
 from dew.nn.rope import (
     LongRopeScaling,
     Scaling,
@@ -558,7 +559,7 @@ class MultiHeadLatentAttention(LinearProducts):
         else:
             q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, place))), place)
             queries = self.q_b_proj(constrain(q_resid, RESIDUAL))
-        queries = checkpoint_name(queries, 'q_proj')
+        queries = checkpoint_name(queries, Residual.Q_PROJ)
         return queries.reshape(batch, length, self.num_heads, qk_head_dim), q_resid, gate
 
     def _latents(self, x, place: LogicalAxes):
@@ -595,7 +596,7 @@ class MultiHeadLatentAttention(LinearProducts):
         """Latent and rope head into per-head keys and values."""
         batch, length = latent.shape[0], latent.shape[1]
         width = self.qk_nope_head_dim + self.v_head_dim
-        kv = checkpoint_name(self.kv_b_proj(latent), 'kv_proj').reshape(
+        kv = checkpoint_name(self.kv_b_proj(latent), Residual.KV_PROJ).reshape(
             batch, length, self.num_heads, width)
         nope, values = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
         rot = jnp.broadcast_to(
@@ -641,7 +642,7 @@ class MultiHeadLatentAttention(LinearProducts):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax, implementation=self.attention_impl,
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
-            max_segments=max_segments), 'context')
+            max_segments=max_segments), Residual.CONTEXT)
         return self._output(attention, gate)
 
     @nn.nowrap
@@ -1050,7 +1051,7 @@ class MultiHeadLatentAttention(LinearProducts):
         layer's input's, under `output_gate`; by `gating`'s own sigmoid, the gate's logits, under
         `query_gate`, in at least float32 and rounded once (modeling_axk2.py:670)."""
         batch, length = attention.shape[:2]
-        context = checkpoint_name(attention, "context").reshape(
+        context = checkpoint_name(attention, Residual.CONTEXT).reshape(
             batch, length, self.num_heads * self.v_head_dim
         )
         if self.query_gate:
@@ -1058,7 +1059,7 @@ class MultiHeadLatentAttention(LinearProducts):
             context = (context.astype(wide) * nn.sigmoid(gating.astype(wide))).astype(context.dtype)
         elif self.output_gate:
             context = context * nn.sigmoid(self.g_proj(gating))
-        return checkpoint_name(self.o_proj(context), 'o_proj')
+        return checkpoint_name(self.o_proj(context), Residual.O_PROJ)
 
 
 def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:

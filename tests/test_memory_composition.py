@@ -734,8 +734,8 @@ def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
-    from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
     from dew.nn.mixers.memory import InContextMemoryMixer
+    from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
     from dew.quantization import QUANTIZATION, InputQuantization
 
     ids = jax.random.randint(jax.random.key(3), (2, LENGTH), 0, 37)

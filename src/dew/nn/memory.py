@@ -89,7 +89,7 @@ from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS
-from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
+from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.quantization import (

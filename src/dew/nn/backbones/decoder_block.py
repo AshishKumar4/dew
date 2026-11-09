@@ -52,13 +52,13 @@ from ..inputs import (
     routing_blocks,
 )
 from ..kernels.recurrence_chunk import recomputing
-from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
+from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..sharding import RESIDUAL, constrain, declared
 
 if TYPE_CHECKING:

@@ -60,10 +60,11 @@ from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.flops import cross_attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
 from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, open_kv_cache, write_cache
-from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mla import IndexerFront, sow_selection
 from dew.nn.norms import RMSNorm, unweighted_rmsnorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.residuals import ATTENTION_CONTEXT_RESIDUALS, Residual
 from dew.nn.rope import LongRopeScaling, Scaling, rotary_freqs, rotate
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import RESIDUAL, constrain, down_projection
@@ -893,7 +894,7 @@ class DeepseekV4Attention(FakeQuantizing):
         a context, which has no positions): the ordinary forward's and DSpark's draft step's alike.
         Returns them with the normed query latent, which a compressor's indexer reads."""
         q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
-        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
+        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), Residual.Q_PROJ).reshape(
             *x.shape[:2], self.num_heads, self.head_dim)
         if self.query_norm:
             query = unweighted_rmsnorm(query, self.norm_eps)
@@ -903,7 +904,7 @@ class DeepseekV4Attention(FakeQuantizing):
         """The shared key head, projected where `place` puts it and gathered
         for the query heads the tensor axis splits, rotated by `cos` and `sin` (None for a context's)."""
         projected = checkpoint_name(constrain(self.kv_norm(self.kv_proj(constrain(x, place))), place),
-                                    'kv_proj')
+                                    Residual.KV_PROJ)
         keys = constrain(projected if cos is None else _rotate_rope(projected, cos, sin), RESIDUAL)
         return self.fp8(keys, 32) if self.kv_qat else keys
 
@@ -915,7 +916,7 @@ class DeepseekV4Attention(FakeQuantizing):
                                       sinks=self.sinks, precision=self.precision, wide_logits=True)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
-        return self._output(_rotate_rope(checkpoint_name(context, 'context'), cos, -sin))
+        return self._output(_rotate_rope(checkpoint_name(context, Residual.CONTEXT), cos, -sin))
 
     def _output(self, context):
         """The heads' context `[B, S, H, head_dim]` through the grouped output projection: each head
@@ -923,7 +924,7 @@ class DeepseekV4Attention(FakeQuantizing):
         batch, length = context.shape[:2]
         grouped = jnp.moveaxis(context.reshape(batch, length, self.o_groups, -1), 2, 0)
         mixed = jnp.moveaxis(self.o_a_proj(grouped), 0, 2)
-        return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
+        return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), Residual.O_PROJ)
 
     @property
     def reads_context(self) -> bool:
@@ -962,7 +963,7 @@ class DeepseekV4Attention(FakeQuantizing):
         seen = context_mask(query, key, jnp.maximum(lengths, 1), queries, segments)
         context = reference_attention(query, key, value, mask=seen, sinks=self.sinks,
                                       precision=self.precision, wide_logits=True)
-        return self._output(checkpoint_name(context, 'context'))
+        return self._output(checkpoint_name(context, Residual.CONTEXT))
 
     @nn.nowrap
     def context_flops(self, lengths, context_lengths) -> float:

@@ -79,7 +79,6 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
 from ..kv_cache import DecodeCursor, KVCache
-from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
@@ -106,6 +105,7 @@ from ..protocols import (
     QuantizesInputs,
     declared_groups,
 )
+from ..residuals import MLP_RESIDUALS, RESIDUALS
 from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts

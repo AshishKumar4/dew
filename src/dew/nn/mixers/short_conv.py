@@ -19,6 +19,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.linear import DepthwiseConv1d, forked_conv, held_conv1d
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
 
 
@@ -107,7 +108,7 @@ class GatedShortConv(nn.Module):
             # cache left as it was.
             convolved = forked_conv(mixed, taps, tokens, history=None if held is None else held.value,
                                     bias=bias, dtype=mixed.dtype, activation=False)
-            return self.out_proj(gate_out * checkpoint_name(convolved, 'conv'))
+            return self.out_proj(gate_out * checkpoint_name(convolved, Residual.CONV))
         if started is not None:
             started.value = started.value | (jnp.ones((batch,), bool) if valid is None
                                              else jnp.asarray(valid, bool).any(axis=1))
@@ -117,7 +118,7 @@ class GatedShortConv(nn.Module):
                                          activation=False)
         if held is not None:
             held.value = history.astype(held.value.dtype)
-        return self.out_proj(gate_out * checkpoint_name(convolved, 'conv'))
+        return self.out_proj(gate_out * checkpoint_name(convolved, Residual.CONV))
 
 
 class _GridTaps(nn.Module):
@@ -202,7 +203,7 @@ class GatedGridConv(nn.Module):
                 neighbour = gather_positions(slot, jnp.where(inside, place(frame, row, column), 0))
                 read = jnp.where(inside[..., None], gather_positions(mixed, neighbour), 0)
                 convolved = convolved + read.astype(wide_dtype) * taps[across, along, 0].astype(wide_dtype)
-        convolved = checkpoint_name(convolved.astype(mixed.dtype), 'conv')
+        convolved = checkpoint_name(convolved.astype(mixed.dtype), Residual.CONV)
         return dense(width, name='out_proj')(gate_out * convolved)
 
 
@@ -213,7 +214,7 @@ class ShortConvMixer(MixerBase):
     product (`GatedShortConv.padding_holds_bias`, LFM2's). The context's attention geometry is not read:
     the layer has no keys to cache, no rope and no window."""
 
-    residuals = ('conv',)
+    residuals = (Residual.CONV,)
     # Each document after the conv history its parent leaves (`dew.nn.linear.forked_conv`).
     reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
