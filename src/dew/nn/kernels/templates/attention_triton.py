@@ -93,6 +93,53 @@ EXTENTS = tuple(ROWS << power for power in range((BLOCK // ROWS).bit_length()))[
 """The extents a tile takes along its queries or its keys, largest first: powers of two from `BLOCK` down to
 `ROWS`."""
 
+WARPGROUP_ROWS = WARPS * 16
+"""The rows a warpgroup's product takes at least (PTX ISA: wgmma's and tcgen05's M of 64, four warps of 16
+rows), and the rows four warps' mma.sync products tile (sixteen a warp)."""
+
+MBARRIER_BYTES = 8
+"""An mbarrier object's bytes in shared memory (PTX ISA: a 64-bit opaque object)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _Staged:
+    """How Triton stages a launch's products on a target, as its compiles allocate shared memory
+    (et-tritonsweep3: 4320 launches compiled for an A100, an A10, an RTX 4090, an H100, a B200 and an RTX
+    5090, the bytes each asked read beside the config it traced): a product of 16-bit operands of
+    `WARPGROUP_ROWS` rows at least on warpgroup MMA where the target issues it (`warpgroup`: Hopper's wgmma,
+    Blackwell's tcgen05, `tensor_memory`), each stream's tiles loaded by TMA a buffer every stage; else on
+    mma.sync, loaded by cp.async a buffer every stage but the one in use; fp32 operands on mma.sync's tf32
+    form (`fp32`)."""
+
+    warpgroup: bool
+    tensor_memory: bool
+    fp32: bool
+
+    @classmethod
+    def of(cls, target: generation.GpuTarget, dtype, rows: int) -> "_Staged":
+        issuer = (target.architecture.issuers or ("",))[0]
+        fp32 = jnp.dtype(dtype).itemsize == 4
+        warpgroup = not fp32 and rows >= WARPGROUP_ROWS and issuer in ("wgmma", "tcgen05")
+        return cls(warpgroup, warpgroup and issuer == "tcgen05", fp32)
+
+    def buffers(self, stages: int) -> int:
+        """The tiles a stream of `stages` holds in shared memory."""
+        return stages if self.warpgroup else stages - 1
+
+    def barrier_bytes(self, products: int) -> int:
+        """The bytes of the barriers a program's `products` wait on: tcgen05's two a product."""
+        return 2 * MBARRIER_BYTES * products if self.tensor_memory else 0
+
+
+@dataclasses.dataclass(frozen=True)
+class Staging:
+    """A launch's shared memory as its model counts it: its `bytes`, equal to what Triton allocates where
+    `whole` is False, and where True at or above it, some tile of it counted whole that Triton's allocator
+    overlaps with others by their liveness."""
+
+    bytes: int
+    whole: bool = False
+
 
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
     """Whether a launch runs on `target`: a CUDA GPU, one dtype of `DTYPES` on the queries, keys and
@@ -377,21 +424,49 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
                         held=ba.arguments["query"].shape[1], walked=ba.arguments["key"].shape[1])
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
-        """The shared memory Triton gives a program, in the operands' dtype: the key and value tiles of
-        every stage but the one in use, the query tile, and the weights' tile on its way to the second
-        product, which shares the query tile's memory where the block is 128 queries of heads at most
-        128 wide. Fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: equal on all 48
-        configs it refused on either GPU, and every config it compiled within the budget)."""
+        return self.staging(ba, config, target).bytes
+
+    def staging(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Staging:
+        """The shared memory Triton gives a program, as its compiles allocate it (`_Staged`): the key and
+        value tiles a stream buffers (an fp32 call's keys every stage, its tf32 products reading them where
+        they land), the query tile, and the weights' tile where it reaches the second product through shared
+        memory: an fp32 call's, and on mma.sync where Triton gives the two chained products their warps
+        along the values (the values' product's, converted first, along its longer side: fewer query rows
+        than value columns), the weights otherwise staying in registers; tcgen05's barriers. A training
+        walk converts its anchor's value row `[bq, Dv]` through shared memory, Triton's tile of it at most
+        four warps' rows (warpgroup MMA's at most 64 columns; tcgen05 stages a query tile a buffered stage
+        and a row's word). Each equal to the bytes Triton asked on every launch compiled but one form: a
+        training walk on mma.sync with fewer query rows than value columns, whose row's tile Triton
+        allocates in part, counted whole. Counted whole too, where Triton's allocator overlaps them with
+        other buffers by their liveness (et-tritonsweep3: at or above every compile): a scaled walk's small
+        weights' parts and its weights at the scale fp32, a per-key and a per-tile score parameter's tile
+        on its way to the logits' layout. tcgen05 stages a head's and a query's parameters, a word a row."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
-        streamed = (config.stages - 1) * config.block_k * (width + value_width) * size
-        query_tile, weights = config.block_q * width * size, config.block_q * config.block_k * size
-        shared = config.block_q >= 128 and width <= 128
-        # A scaled walk's small weights' parts (`algebra.small_parts`: fp32's one in fp32, a 16-bit dtype's
-        # three) each a weights' tile of its own on its way to its product.
-        small = _small_parts(value.dtype) * weights if self._scaled(ba) else 0
-        return streamed + (max(query_tile, weights) if shared else query_tile + weights) + small
+        rows, keys, stages = config.block_q, config.block_k, config.stages
+        staged = _Staged.of(target, query.dtype, rows)
+        held = staged.buffers(stages)
+        elements = (stages if staged.fp32 else held) * keys * width + held * keys * value_width + rows * width
+        if staged.fp32 or (not staged.warpgroup and rows < value_width):
+            elements += rows * keys
+        extra, whole = staged.barrier_bytes(2), False
+        if _split(ba) and not staged.fp32:
+            if staged.tensor_memory:
+                elements += (stages - 1) * rows * width
+                extra += rows * 4
+            elif staged.warpgroup:
+                elements += WARPGROUP_ROWS * min(value_width, WARPGROUP_ROWS)
+            else:
+                elements += min(rows, WARPGROUP_ROWS) * value_width
+                whole = rows < value_width
+        if self._scaled(ba):
+            extra += (_small_parts(value.dtype) * size + 4) * rows * keys
+            whole = True
+        for kind in self.score_kinds:
+            extra += _param_staged(kind, rows, keys, stages, tensor_memory=staged.tensor_memory)
+            whole |= kind in (Kind.KEY, Kind.TILE)
+        return Staging(elements * size + extra, whole)
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         """The fp32 words a thread holds live across the walk, the program's spread over its threads: the
@@ -418,6 +493,25 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
+
+
+def _param_staged(kind: Kind, rows: int, keys: int, stages: int, *, tensor_memory: bool,
+                  summed: bool = False) -> int:
+    """The shared memory a score parameter of `kind` takes in a program of `rows` by `keys` streamed at
+    `stages`, its fp32 words (`TritonForward.staging`): a per-key one its keys' vector and a per-tile one its
+    tile, each on its way to the logits' layout, counted whole; where its gradient is `summed` in the
+    program (dK/dV's), a key's its tile and a tile's two, its gradient's beside it. On tcgen05
+    (`tensor_memory`) a head's word and a query's rows' each buffered stage (a dK/dV program streams its
+    queries' with its rows, `_dkv_staging`)."""
+    if kind is Kind.KEY:
+        return 4 * (rows * keys if summed else keys)
+    if kind is Kind.TILE:
+        return 4 * rows * keys * (2 if summed else 1)
+    if tensor_memory and kind is Kind.HEAD:
+        return 4 * (stages - 1)
+    if tensor_memory and kind is Kind.QUERY and not summed:
+        return 4 * rows * (stages - 1)
+    return 0
 
 
 def _small_parts(dtype) -> int:
@@ -799,22 +893,10 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:
-        """The shared memory Triton gives a program of either launch, the larger, in the operands' dtype: a
-        dQ program its query and output-gradient tiles and the key and value tiles of every stage but the
-        one in use; a dK/dV program its key and value tiles and the query and output-gradient tiles of
-        every stage but the one in use; and two `block_q` by `block_k` tiles on their way between
-        products. fp32 operands, which Triton's products take as tf32, stage the one in use too. A bound
-        fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21, 16-bit: at or above them on
-        every config it refused, within the budget on all but two of the A10's compiled ones; fp32 at 64-
-        and 128-wide heads on every config of the space compiled for an A100, 2026-10-28: at or above them,
-        where the 16-bit count fell up to 19968 bytes short)."""
-        query, value = ba.arguments["query"], ba.arguments["value"]
-        size = jnp.dtype(query.dtype).itemsize
-        width, value_width = query.shape[-1], value.shape[-1]
-        held = 1 if size >= 4 else 0
-        rows = max(config.block_q + (config.dq_stages - 1 + held) * config.block_k,
-                   config.block_k + (config.dkv_stages - 1 + held) * config.block_q)
-        return (rows * (width + value_width) + 2 * config.block_q * config.block_k) * size
+        """The shared memory Triton gives a program of either launch, the larger, as its compiles allocate
+        it (`_dq_staging`, `_dkv_staging`)."""
+        return max(_dq_staging(ba, config, target, self.score_kinds).bytes,
+                   _dkv_staging(ba, config, target, self.score_kinds).bytes)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
         """The larger of its two launches' registers a thread (`_backward_registers`)."""
@@ -822,6 +904,75 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
+
+
+def _dq_staging(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget,
+                score_kinds: tuple[Kind, ...]) -> Staging:
+    """The shared memory Triton gives a dQ program (`_Staged`, `Staging`): the key and value tiles a stream
+    buffers, the query and output-gradient tiles, and the score cotangents' tile where it reaches dQ's
+    product through shared memory (an fp32 call's; on mma.sync where the chained products' warps run along
+    the values, as the forward's weights do, `TritonForward.staging`); tcgen05's barriers. Each equal to the
+    bytes
+    Triton asked on every bf16 and fp32 launch compiled on mma.sync and wgmma (et-tritonsweep3). Counted
+    whole where Triton's allocator overlaps them by liveness (at or above every compile): an fp16 call's
+    cotangents' tile, which Triton stages in part; tcgen05's key tile and cotangents' tile beside its
+    streams; a per-key and per-tile score parameter's."""
+    query, value = ba.arguments["query"], ba.arguments["value"]
+    size = jnp.dtype(query.dtype).itemsize
+    width, value_width = query.shape[-1], value.shape[-1]
+    rows, keys, stages = config.block_q, config.block_k, config.dq_stages
+    staged = _Staged.of(target, query.dtype, rows)
+    elements = (staged.buffers(stages) * keys * (width + value_width) + rows * (width + value_width))
+    if staged.fp32 or (not staged.warpgroup and rows < value_width):
+        elements += rows * keys
+    fp16 = jnp.dtype(query.dtype) == jnp.dtype(jnp.float16)
+    if fp16:
+        elements += rows * keys
+    if staged.tensor_memory:
+        elements += keys * width + rows * keys
+    extra = staged.barrier_bytes(3) + sum(
+        _param_staged(kind, rows, keys, stages, tensor_memory=staged.tensor_memory) for kind in score_kinds)
+    whole = fp16 or staged.tensor_memory or any(kind in (Kind.KEY, Kind.TILE) for kind in score_kinds)
+    return Staging(elements * size + extra, whole)
+
+
+def _dkv_staging(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget,
+                 score_kinds: tuple[Kind, ...]) -> Staging:
+    """The shared memory Triton gives a dK/dV program (`_Staged`, its products' rows its keys): the query and
+    output-gradient tiles a stream buffers, the key and value tiles, the weights' tile on its way to dV's
+    product, and its query rows' words a buffered stage (`_dkv_launch`'s per-query operands: the spans'
+    start and end, the forward's five rows, a query's ids and per-query score parameters, a word each).
+    Equal to the bytes Triton asked on every bf16 launch compiled on mma.sync before Hopper and on a
+    B200's (et-tritonsweep3). An fp16 or fp32 call's, Hopper's and warpgroup MMA's stage more tiles of
+    the walk, which Triton's allocator overlaps by their liveness (fp16's on identical shapes up to 1.7
+    times bf16's): counted whole, the walk's widest tile, its query rows by its keys or its widths, fp32
+    (an fp32 call's within 2% of every compile, at or above it; an fp16 call's four score tiles and two of
+    it); a per-key and per-tile score parameter's with its gradient's."""
+    query, value = ba.arguments["query"], ba.arguments["value"]
+    size = jnp.dtype(query.dtype).itemsize
+    width, value_width = query.shape[-1], value.shape[-1]
+    rows, keys, stages = config.block_q, config.block_k, config.dkv_stages
+    staged = _Staged.of(target, query.dtype, keys)
+    # The spans' start and end, the forward's peak, total, anchor, delta and key index, a query's ids and
+    # each per-query score parameter.
+    words = 7 + (ba.arguments.get("query_ids") is not None) + sum(kind is Kind.QUERY for kind in score_kinds)
+    streamed = staged.buffers(stages) * rows * (width + value_width)
+    elements = streamed + keys * (width + value_width) + rows * keys
+    extra = 4 * words * (stages - 1) * rows
+    issuers = target.architecture.issuers
+    whole = jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16) or staged.warpgroup or "wgmma" in issuers
+    if whole:
+        # The walk's widest tile between its products, its query rows by its keys or its widths, fp32 (an
+        # fp16 call's four score tiles and two of it), and a query row's word a buffered stage.
+        widest = rows * max(width, value_width, keys)
+        fp16 = jnp.dtype(query.dtype) == jnp.dtype(jnp.float16)
+        extra += 4 * ((4 * rows * keys + 2 * widest) if fp16 else widest) + 4 * 2 * (stages - 1) * rows
+    # A head's parameter staged where a product of its query rows issues on tcgen05.
+    queried = _Staged.of(target, query.dtype, rows).tensor_memory
+    extra += sum(_param_staged(kind, rows, keys, stages, tensor_memory=queried, summed=True)
+                 for kind in score_kinds)
+    whole |= any(kind in (Kind.KEY, Kind.TILE) for kind in score_kinds)
+    return Staging(elements * size + extra, whole)
 
 
 def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq: bool) -> int:

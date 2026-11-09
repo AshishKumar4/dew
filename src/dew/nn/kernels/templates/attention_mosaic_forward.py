@@ -70,6 +70,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     refused,
     scopes_products,
     score_places,
+    staged_after,
+    stages_after_walks,
     stated,
     transposed_swizzles,
 )
@@ -132,11 +134,13 @@ def forward_products(tiles: Tiles, value_width: int, dtype, *, peaks: bool = Fal
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
                          residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None,
                          page: int | None = None, certified: bool = False, codes=None, parts: int = 1,
-                         interpret: bool = False) -> tuple[list, dict]:
-    """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order: its consumers'
-    query stages and their rows' status; each one's output stage where the value is not as wide as the query
-    and as narrow, `out_dtype`, the query's by default (the output stores through the query's stage where it
-    is), a training forward's its split sums' fp32 (`_Residuals`); a training forward's or a peak walk's
+                         interpret: bool = False) -> tuple[list, Any, list]:
+    """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order, and those it
+    scopes after its walks (`after_walks`): its consumers' query stages and their rows' status; each one's
+    output stage where the value is not as wide as the query and as narrow, `out_dtype`, the query's by
+    default (the output stores through the query's stage where it is), a training forward's its split sums'
+    fp32 (`_Residuals`), after the walks where the family scopes them apart (`stages_after_walks`); a
+    training forward's or a peak walk's
     anchor keys' stage; the query loads' barriers and
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
     peak walk's keys alone, a paged call's tile of several pages of `page` keys loaded as `paged_reads` reads
@@ -149,10 +153,16 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [family.staged_memory((consumers, parts * block_q, width), dtype, query_swizzle(family)),
               family.staged_memory((consumers, block_q), jnp.float32)]
+    # The output's stage (a training walk's split sums', fp32), which no walk reads: after the walks on a
+    # family that scopes them apart, in their slots (`stages_after_walks`).
+    stage = None
     if residuals:
-        scoped.append(family.staged_memory((consumers, block_q, value_width), jnp.float32))
+        stage = family.staged_memory((consumers, block_q, value_width), jnp.float32)
     elif not peaks and not _stores_through_query(family, width, value_width, dtype, out_dtype):
-        scoped.append(family.staged_memory((consumers, block_q, value_width), out_dtype or dtype))
+        stage = family.staged_memory((consumers, block_q, value_width), out_dtype or dtype)
+    after = [stage] if stage is not None and stages_after_walks(family) else []
+    if stage is not None and not after:
+        scoped.append(stage)
     if residuals or peaks:
         scoped.append(family.staged_memory((consumers, block_q), jnp.int32))
     if certified:
@@ -175,15 +185,17 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     # The logits' product reads the keys transposed.
     swizzles = transposed_swizzles(tiles, "keys")
     if page is None or page >= tiles.block_k:
-        return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles,
-                                      copies=dict.fromkeys(blocks, parts))
-    if not interpret or family.gathers_interpreted:
-        return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
-    # A copy a row of each swizzled tile's columns (`mosaic.Ring.parts`), where no lane-level copy runs.
-    unit = {name: swizzling.swizzle_columns(stored, swizzles.get(name, swizzling.SWIZZLE_BYTES))
-            for name in blocks}
-    copies = {name: shape[0] * max(1, shape[1] // unit[name]) for name, (shape, _) in blocks.items()}
-    return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
+        streams = family.streams(blocks, stages, consumers, swizzles=swizzles,
+                                 copies=dict.fromkeys(blocks, parts))
+    elif not interpret or family.gathers_interpreted:
+        streams = family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
+    else:
+        # A copy a row of each swizzled tile's columns (`mosaic.Ring.parts`), where no lane-level copy runs.
+        unit = {name: swizzling.swizzle_columns(stored, swizzles.get(name, swizzling.SWIZZLE_BYTES))
+                for name in blocks}
+        copies = {name: shape[0] * max(1, shape[1] // unit[name]) for name, (shape, _) in blocks.items()}
+        streams = family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
+    return scoped, streams, after
 
 
 def paged_reads(table: jax.Array, page: int, block_k: int) -> tuple[jax.Array, int]:
@@ -637,13 +649,16 @@ class _Refs(NamedTuple):
 
 class _Layout(NamedTuple):
     """How `_launched` lays its kernel's refs out: its read arrays' tree, its outputs' count, the stages'
-    count (`_forward_allocations`'), and whether the output stores through the query's stage."""
+    count (`_forward_allocations`'), and whether the output stores through the query's stage or one scoped
+    after the walks."""
     treedef: Any
     outputs: int
     arrays: int
     reuse: bool
     relays: bool = False
     converts: bool = False
+    after: bool = False
+    """Whether the output's stage is scoped after the walks (`stages_after_walks`), none of the program's."""
 
     def unpacked(self, q_ref, k_ref, v_ref, *refs) -> _Refs:
         """A program's refs, its kernel's then its scoped allocations': the weights' relay tile last where
@@ -655,7 +670,10 @@ class _Layout(NamedTuple):
         relay = stages.pop() if self.relays else None
         converted = (stages[-2], stages[-1]) if self.converts else None
         stages = stages[:-2] if self.converts else stages
-        out_smem, stages = (q_smem, stages) if self.reuse else (stages[0], stages[1:])
+        if self.reuse or self.after:
+            out_smem = q_smem if self.reuse else None
+        else:
+            out_smem, stages = stages[0], stages[1:]
         return _Refs(q_ref, k_ref, v_ref, self.treedef.unflatten(read), tuple(written), q_smem, row_smem,
                      out_smem, tuple(stages), q_loaded, schedule, relay, converted)
 
@@ -911,15 +929,16 @@ def _dot(family: mosaic.Family, interpret: bool, lhs: jax.Array, rhs) -> jax.Arr
     return family.registers_product(lhs, rhs)
 
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
-              q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
+              q_loaded, out_stage: Callable, row_smem, streams, views: dict, turn, streamed: tuple, first,
               spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks,
               residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
               finished: tuple | None = None, certified: tuple | None = None, kept=None, relay=None,
-              codes: _Codes | None = None):
+              codes: _Codes | None = None, value_width: int):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
-    under the output hook stored through `out_smem` (the query's stage where the widths agree), and its rows'
+    under the output hook, `value_width` wide, stored through its stage (`out_stage(store)`: the query's
+    where the widths agree, one scoped after the walks where the family scopes them apart), and its rows'
     maxima through `row_smem` to `status_views` (`algebra.walked_launches`' fold guard). The walk's running
     sums are the family's accumulator, issued into in place, at its rows' scale where they could pass fp32's
     largest (`algebra.SCALED_WALK`). With `residuals` the walk is the training step's at the `anchors` a
@@ -938,9 +957,6 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         family = family.relaying(relay)
     lo, hi, whole = program.reach(first, spans, row)
     q = _query_of(program, q_view, q_smem, q_loaded)
-    # The output's sums are as wide as its stage (a training walk's its split sums'), the values' width
-    # whatever the query's.
-    value_width = out_smem.shape[-1]
     # The weighted values' running sums live in the family's accumulator (`Family.walk`), from the initial
     # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
@@ -1005,12 +1021,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     keep = None if kept is None else _kept_of(program, kept, rows=(row, head, first))
     if residuals is not None:
         # The split sums as the walk left them (at its rows' scale, `algebra.split_residuals`).
-        family.stored((_kept_rows(family, keep, state.acc, residuals.others),), (residuals.others,),
-                      smem=out_smem)
+        out_stage(lambda stage: family.stored((_kept_rows(family, keep, state.acc, residuals.others),),
+                                              (residuals.others,), smem=stage))
     pl.when(consumer == 0)(turn)
     _status_stored(family, spec, state, status_views, row_smem)
     _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, residuals=residuals,
-                 out=(out_view, out_smem), rows=(finished, row_smem), keep=keep)
+                 out=(out_view, out_stage), rows=(finished, row_smem), keep=keep)
 
 
 def _written_views(family: mosaic.Family, block: _Block, written: tuple, stages: tuple, *, training: bool,
@@ -1100,20 +1116,21 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                  hooked: _Hooked, place: tuple, *, hooks: Hooks, residuals: _Residuals | None, out: tuple,
                  rows: tuple, keep: jax.Array | None = None) -> None:
     """A consumer's walk's result stored (`_consumer`): its output under the output hook through `out` (its
-    view and stage), its finished rows through `rows` (their views, None where the launch finishes none, and
-    their stage); a training walk's (`trained`, its anchor's terms) its residual rows and anchor keys
-    instead, no output. `place` its batch row, head and first query; with `keep`, each written at those rows
-    alone, every other row of its view as it was (`_kept_rows`)."""
+    view and its stage's `out_stage`), its finished rows through `rows` (their views, None where the launch
+    finishes none, and their stage); a training walk's (`trained`, its anchor's terms) its residual rows and
+    anchor keys instead, no output. `place` its batch row, head and first query; with `keep`, each written
+    at those rows alone, every other row of its view as it was (`_kept_rows`)."""
     family = program.family
     row, head, first = place
-    (out_view, out_smem), (finished, row_smem) = out, rows
+    (out_view, out_stage), (finished, row_smem) = out, rows
     if residuals is None or trained is None:
         out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
 
         output, maximum, denominator = algebra.finish(spec, state, initial=hooked.initial is not None,
                                                       output_mod=hooks.output_mod, output_params=out_params)
-        family.stored((_kept_rows(family, keep, output, out_view),), (out_view,), smem=out_smem)
+        out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
+                                              smem=stage))
         if finished is not None:
             # Its rows as the backward reads them beside the output (`Output`): the maximum and denominator
             # `finish` leaves.
@@ -1474,10 +1491,11 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
     """A forward launch's kernel entry (`_launched`'s): its `body` in its scoped allocations and rings, where
     a masked launch walks it alone (`_walked_program`: else its program loads and writes nothing; its
     `walk_rows` the walks' granule, which a masked launch states)."""
-    scoped, rings, products = allocations
+    scoped, rings, after, products = allocations
 
     def scoped_body():
-        program.family.scoped(functools.partial(body, *refs), *scoped, streams=rings, products=products)
+        program.family.scoped(functools.partial(body, *refs), *scoped, streams=rings, products=products,
+                              after_walks=tuple(after))
 
     walks = layout.read(refs).walks
     if walks is None:
@@ -1520,7 +1538,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
     reuse = _stores_through_query(family, width, value_width, query.dtype, out_dtype)
     # A paged call's key tile of several pages loaded as its table reads it (`paged_reads`, `_paged_views`).
-    scoped, rings = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
+    scoped, rings, after = _forward_allocations(family, tiles, width, value_width, query.dtype, training,
                                          program.stages, peaks=peaks, out_dtype=out_dtype, page=page,
                                          certified=certified, codes=_codes_of(key, read.hooked.scales),
                                          parts=parts, interpret=bool(interpret))
@@ -1529,9 +1547,10 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                           certified=steps if certified else 0, flags=flags,
                           in_place=read.into is not None)
     layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training),
-                     relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None)
+                     relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
+                     bool(after))
 
-    def body(*refs, streams):
+    def body(*refs, streams, after=None):
         refs = layout.unpacked(*refs)
         read = refs.read
         row, head, column, views = _program_views(family, refs, read, peaks=peaks, group=group, page=page,
@@ -1562,8 +1581,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
             status, out_view, finished, residuals, certify = _written_views(
                 family, block, written, tuple(stage.at[index] for stage in refs.stages), training=training,
                 finishes=finishes, columns_at=columns_at, certified=certified)
+            out_stage = functools.partial(staged_after, after, None if after else refs.out_smem, index)
             _consumer(program, spec, index, q_view, out_view,
-                      status, *stages, refs.out_smem.at[index], refs.row_smem.at[index], streams, views, turn,
+                      status, *stages, out_stage, refs.row_smem.at[index], streams, views, turn,
                       streamed, block.first, read.spans, read.hooked,
                       (row, head, lax.div(head, group)), hooks=hooks, residuals=residuals,
                       anchors=read.anchors, interpret=interpret, finished=finished, certified=certify,
@@ -1572,7 +1592,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                       codes=None if refs.converted is None or read.hooked.scales is None else _Codes.of(
                           family, tuple(tile.at[index] for tile in refs.converted), read.hooked.scales,
                           row if read.sources is None else read.sources[row], lax.div(head, group),
-                          tiles.block_k, interpret))
+                              tiles.block_k, interpret), value_width=value_width)
 
         def producer():
             # Its streamed range formed where it streams: captured before the roles' split, the range's
@@ -1589,7 +1609,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                      if scopes_products(family) else consumer), producer)
 
     products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts)
-    entry = functools.partial(_entry, program, layout, body, (scoped, rings, products),
+    entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
                               column_blocks=column_blocks,
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
