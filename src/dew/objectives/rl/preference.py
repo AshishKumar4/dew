@@ -29,7 +29,7 @@ from dew.data.preferences import (
     PARENTS_KEY,
     POSITIONS_KEY,
     REAL_KEY,
-    window_width,
+    window_shape,
 )
 from dew.inputs import Field, InputSpec
 from dew.nn.inspection import watched_positions
@@ -40,10 +40,11 @@ from dew.rl.surrogate import preference_logsigmoid_terms
 from ..lm.objective import TokenScorer
 
 
-def window_coordinates(batch) -> Coordinates | None:
+def window_coordinates(batch, finals: int) -> Coordinates | None:
     """A batch's windows laid out as the model reads them: each pair's documents, each token at its own
-    half's place, a half's rest continuing the prompt it shares (`dew.data.preferences`); halves laid out
-    whole (`share=False`, no `PARENTS_KEY`) are documents of their own; a window of one half (no
+    half's place, a half's rest continuing the prompt it shares (`dew.data.preferences`), each half's
+    final id in the windows' tail of `finals` (`Coordinates.finals`); halves laid out whole
+    (`share=False`, no `PARENTS_KEY`) are documents of their own; a window of one half (no
     `DOCUMENTS_KEY`) is a plain row, its half first and padding after, None, as a model that reads one
     document a row takes it."""
     if DOCUMENTS_KEY not in batch:
@@ -52,9 +53,9 @@ def window_coordinates(batch) -> Coordinates | None:
     positions = jnp.asarray(batch[POSITIONS_KEY], jnp.int32)
     held = batch.get(PARENTS_KEY)
     documents = jnp.asarray(batch[DOCUMENTS_KEY], jnp.int32)
-    laid = coordinates(segments=documents, valid=real, positions=positions,
-                       max_segments=documents.shape[1] if held is None else jnp.shape(held)[1],
-                       right_padded=True)
+    laid = replace(coordinates(segments=documents, valid=real, positions=positions,
+                               max_segments=documents.shape[1] if held is None else jnp.shape(held)[1],
+                               right_padded=True), finals=finals)
     return laid if held is None else replace(laid, forks=Forks(jnp.asarray(held, jnp.int32), depth=1))
 
 
@@ -69,21 +70,18 @@ def _completions(batch, scored: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def pair_numbers(batch, halved: bool = False) -> tuple[jax.Array, int]:
     """Each token's pair among the batch's windows `[R, W]`, from 1, 0 on padding, and the most pairs a
-    batch of its shape holds: each window's pairs (`PAIRS_KEY`, its tokens' spans of one pair) in their
-    order, the windows' in theirs; where `halved`, each odd window the rejected half of the pair the one
-    before it opened (`DPOObjective.windows`, a pair's halves a window each). Numbered from the windows a
-    step reads alone, whatever numbers they carry, so rows stacked from several batches or repeated to
-    fill one stay pairs of their own."""
-    pair = jnp.asarray(batch[PAIRS_KEY], jnp.int32)
-    rows, width = pair.shape
+    batch of its shape holds: each window's own pairs (`PAIRS_KEY`, numbered from 1 in the window, its
+    tail's finals by their pair's number) after the windows' before it; where `halved`, each odd window
+    the rejected half of the pair the one before it opened (`DPOObjective.windows`, a pair's halves a
+    window each). Numbered from the windows a step reads alone, so rows stacked from several batches or
+    repeated to fill one stay pairs of their own."""
+    local = jnp.asarray(batch[PAIRS_KEY], jnp.int32)
+    rows, width = local.shape
     count = rows * max(width // 2, 1)
-    real = pair > 0
-    # A pair's span opens where a real token's pair is not the one before it.
-    before = jnp.pad(pair[:, :-1], ((0, 0), (1, 0)))
-    local = jnp.cumsum(real & (pair != before), axis=1, dtype=jnp.int32)
+    real = local > 0
     continued = (jnp.arange(rows, dtype=jnp.int32) % 2 if halved else jnp.zeros(rows, jnp.int32))
     # The pairs a window opens, and the last number before it: its first pair the one before it continues.
-    opened = local[:, -1] - continued
+    opened = jnp.max(local, axis=1) - continued
     base = jnp.cumsum(opened) - opened - continued
     return jnp.where(real, base[:, None] + local, 0), count
 
@@ -145,19 +143,28 @@ class DPOObjective(TokenScorer):
     layout keys whole (`_evaluation_scores`)."""
 
     def __init__(self, model, seq_len: int, beta: float = 0.1, *, balance: ExpertBalance | None = None,
-                 segments: int | None = None, **options):
+                 segments: int | None = None, pairs: int = 1, **options):
         if beta <= 0:
             raise ValueError(f"beta scales the KL term, so it is positive, got {beta}")
-        if segments is not None and segments < 1:
-            raise ValueError(f"a window holds at least one document; got segments={segments}")
-        width = window_width(seq_len + 1, segments)
-        super().__init__(model, width - 1, balance=balance, **options)
+        if segments not in (None, 1):
+            raise ValueError(f"segments=1 lays a pair a row, its halves a window each; got {segments}")
+        if pairs < 1:
+            raise ValueError(f"a window holds at least one pair; got pairs={pairs}")
+        # A token's place is its own half's, at most `seq_len`, which the model's positions cover.
+        super().__init__(model, seq_len, balance=balance, **options)
+        inputs, self.finals = window_shape(seq_len + 1, pairs=pairs, segments=segments)
+        # A window reads its inputs, its finals a tail of targets no input reads (`Coordinates.finals`).
+        self.context = inputs
+        width = inputs + self.finals
         self.ema = EMASpec.constant(1.0)
         # The batch is windows of packed pairs, two halves' tokens a window, or a pair a row, its halves
-        # a window each (`segments=1`).
-        self.inputs = InputSpec(sample=Field(IDS_KEY, (2, width) if segments == 1 else (width,)))
+        # a window each (`segments=1`); windows of pairs a caller holds are as wide as their pairs read
+        # (`preferences.windows`), at most this.
+        self.inputs = InputSpec(sample=Field(IDS_KEY, (2, width)) if segments == 1
+                                else Field(IDS_KEY, (width,), variable_axes=(0,)))
         self.beta = beta
         self.segments = segments
+        self.pairs = pairs
 
     @property
     def halved(self) -> bool:
@@ -165,14 +172,15 @@ class DPOObjective(TokenScorer):
         return self.segments == 1
 
     def windows(self, batch):
-        """The batch as the windows `[R, W]` the loss reads, refused unless they are the objective's width:
-        a pair a row (`halved`) as its two windows in turn, each row's weight its windows'
-        (`VALID_ROWS`)."""
+        """The batch as the windows `[R, W]` the loss reads, each its inputs, at most the objective's
+        (`context`), and its finals' tail: a pair a row (`halved`) as its two windows in turn, each row's
+        weight its windows' (`VALID_ROWS`)."""
         ids = jnp.asarray(batch[IDS_KEY])
-        shape = (2, self.seq_len + 1) if self.halved else (self.seq_len + 1,)
-        if ids.shape[1:] != shape:
-            raise ValueError(f"a DPO batch holds windows of packed pairs [{IDS_KEY} shape (batch, "
-                             f"{', '.join(map(str, shape))})] (dew.data.preferences), got {tuple(ids.shape)}")
+        if ids.ndim != (3 if self.halved else 2) or (self.halved and ids.shape[1] != 2) or (
+                ids.shape[-1] <= self.finals):
+            shape = "batch, 2, W" if self.halved else "batch, W"
+            raise ValueError(f"a DPO batch holds windows of packed pairs [{IDS_KEY} shape ({shape}), W past "
+                             f"its {self.finals} finals] (dew.data.preferences), got {tuple(ids.shape)}")
         keys = (IDS_KEY, MASK_KEY, REAL_KEY, PAIRS_KEY, HALVES_KEY, POSITIONS_KEY,
                 *((DOCUMENTS_KEY,) if DOCUMENTS_KEY in batch else ()))
         for key in keys:
@@ -205,7 +213,7 @@ class DPOObjective(TokenScorer):
                 "a DPO run always freezes one")
         batch = self.windows(batch)
         ids = jnp.asarray(batch[IDS_KEY])
-        laid = window_coordinates(batch)
+        laid = window_coordinates(batch, self.finals)
         # The policy and its reference score the windows in one forward each, through the same function,
         # so a policy equal to its reference earns zero rewards wherever the two compile alike.
         real = jnp.asarray(batch[REAL_KEY])[:, :-1] > 0
@@ -239,17 +247,17 @@ class DPOObjective(TokenScorer):
                                           inspected=policy.inspected), policy
 
     def _routed_queries(self, batch) -> jax.Array:
-        """The router positions that count, `[B, W - 1]`: each half's completion tokens among the inputs, none
-        in a repeat window (`VALID_ROWS`)."""
+        """The router positions that count, `[B, W - finals]`: each half's completion tokens among the
+        inputs, none in a repeat window (`VALID_ROWS`)."""
         mask = jnp.asarray(batch[MASK_KEY])
         rows = self.row_weights(batch, mask.shape[0]) > 0
-        return (mask[:, :-1] != 0) & rows[:, None]
+        return (mask[:, :-self.finals] != 0) & rows[:, None]
 
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The chosen responses' per-token cross entropies, with their completion marks as weights."""
         laid = self.windows(batch)
-        scores = self.token_scores(params, jnp.asarray(laid[IDS_KEY]), coordinates=window_coordinates(laid),
-                                   predict=True)
+        scores = self.token_scores(params, jnp.asarray(laid[IDS_KEY]),
+                                   coordinates=window_coordinates(laid, self.finals), predict=True)
         assert scores.correct is not None
         return self._chosen(scores.losses, scores.correct, scores.weights, batch)
 
