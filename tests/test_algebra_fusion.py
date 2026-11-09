@@ -884,3 +884,34 @@ def test_a_plain_program_near_a_norm_computes_as_written(program):
     assert_as_exact(jax.jit(with_gradients(lambda *x: written(*x)[0])), jax.jit(with_gradients(fn)), draw,
                     f"dew.jit {program}", seeds=8,
                     truth_fn=with_gradients(lambda *x: fn(*(a.astype(jnp.float64) for a in x))))
+
+
+@pytest.mark.parametrize("enclosing", ["jit", "grad"])
+def test_a_norm_whose_epsilon_an_enclosing_trace_closes_over_compiles_through_dew_jit(enclosing):
+    """A plain RMSNorm in `dew.jit` whose epsilon an enclosing `jax.jit` or `jax.grad` traces (a value with no
+    number until it runs, which no fused call takes as its own) compiles on an H100, and on this host
+    computes what the program as written computes, bitwise."""
+    import dew
+
+    def norm(x, w, epsilon):
+        widened = x.astype(jnp.float32)
+        inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + epsilon)
+        return (widened * inverse * w).astype(x.dtype)
+
+    x = jax.random.normal(jax.random.key(5), ROWS, jnp.bfloat16)
+    w = jax.random.normal(jax.random.key(6), WEIGHT, jnp.bfloat16)
+
+    def enclosed(compiled):
+        """The enclosing program, its norm compiled by `compiled` over the epsilon it traces."""
+        def normed(epsilon):
+            return compiled(lambda x, w: norm(x, w, epsilon))(x, w)
+
+        if enclosing == "jit":
+            return jax.jit(normed)
+        return jax.jit(jax.grad(lambda epsilon: normed(epsilon).astype(jnp.float32).sum()))
+
+    through, written = enclosed(dew.jit), enclosed(jax.jit)
+    epsilon = jnp.float32(1e-6)
+    with generation.assumed("sm90"):
+        through.trace(epsilon)
+    np.testing.assert_array_equal(np.asarray(through(epsilon)), np.asarray(written(epsilon)))

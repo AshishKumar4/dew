@@ -490,13 +490,16 @@ def _constants(index: fusion.Index) -> frozenset[jcore.Var]:
 
 def _scalars(index: fusion.Index, places: Sequence[int], primitives: frozenset[str]) -> list[float]:
     """The scalar floating constants the equations at `places` binding one of `primitives` read, each once:
-    the static arguments a family's call may take (an epsilon a sum adds)."""
+    the static arguments a family's call may take (an epsilon a sum adds). A traced one (a value an enclosing
+    trace closes over) holds no number until it runs, so no call takes it as its own (`_digest`)."""
     found: dict[float, None] = {}
     for place in places:
         if jax_name(index.jaxpr.eqns[place].primitive) not in primitives:
             continue
         for atom in index.jaxpr.eqns[place].invars:
             value = atom.val if isinstance(atom, jcore.Literal) else index.consts.get(atom)
+            if isinstance(value, jax_core.Tracer):
+                continue
             if value is not None and np.ndim(value) == 0 and jnp.issubdtype(np.asarray(value).dtype,
                                                                             jnp.floating):
                 found[float(value)] = None
