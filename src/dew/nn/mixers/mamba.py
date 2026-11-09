@@ -75,11 +75,13 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, channels = x.shape
-    aligned = None
+    # Documents entering states of their own: their layout from each chunk's edge, and the skip each
+    # token adds at its own slot.
+    entered = None
     if state is not None and state.ndim == 4:
         assert firsts is not None, "documents entering states of their own name their first slots"
         aligned = recurrence_chunk.AlignedDocuments.of(firsts, length, chunk_size)
-        skipped = x * D
+        entered = (aligned, x * D)
         x, dt, B, C = aligned.laid(x, dt, B, C)
         starts, length = None, aligned.length
     chunk_size = min(chunk_size, length)
@@ -104,12 +106,13 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
-    if aligned is None:
+    if entered is None:
         carried = (rows_like(jnp.zeros((batch, channels, A.shape[-1]), work), x) if state is None
                    else jnp.asarray(state, work))
         final, out = jax.lax.scan(scanned, carried, steps)
         out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
         return out.astype(dtype), final.astype(dtype)
+    aligned, skipped = entered
     memories = jnp.asarray(state, work)
 
     def loading(h, step):
