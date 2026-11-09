@@ -12,17 +12,10 @@ import numpy as np
 from jax._src.pallas import mpmd, pallas_call as pallas_call_module
 from jax.extend import core
 
+from dew.nn import programs
+
 LAUNCHES = (pallas_call_module.pallas_call_p, mpmd.mpmd_map_p)
 """The primitives a Pallas launch binds: `pallas_call`, and `mpmd_map` (`pl.kernel`, `plgpu.kernel`)."""
-
-NESTED = {"jit": "jaxpr", "pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
-          "marked_call": "call_jaxpr", "remat": "jaxpr", "checkpoint": "jaxpr",
-          "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
-          "custom_vjp_call_jaxpr": "fun_jaxpr", "custom_vmap_call": "call"}
-"""The primitives whose body runs once on their operands, and the parameter holding it: walked into
-(`jit` is a nested `jax.jit`'s; `marked_call` a contracted derivative's, `dew.nn.derivatives`;
-`custom_vmap_call` wraps a Mosaic GPU kernel's `mpmd_map`). Loops and branches are run as the program runs
-them (`LOOPS`); a launch inside any other body is refused, so no launch goes unread."""
 
 
 def launched_outputs(function, *args) -> list[tuple[str, list[np.ndarray]]]:
@@ -60,16 +53,14 @@ def _evaluated(jaxpr: core.Jaxpr, consts, args, found: list) -> list:
             outs = list(launched)
         elif name in LOOPS and any(_launches(inner) for inner in _bodies(equation)):
             outs = LOOPS[name](equation, values, found)
-        elif name in NESTED and NESTED[name] in equation.params:
-            body = equation.params[NESTED[name]]
-            inner, inner_consts = ((body.jaxpr, body.consts) if isinstance(body, core.ClosedJaxpr)
-                                   else (body, ()))
-            # A custom rule's body takes its operands past the rule's own (`num_consts` leading ones too).
-            outs = _evaluated(inner, inner_consts, values[len(values) - len(inner.invars):], found)
+        elif (body := programs.called(equation)) is not None:
+            # A call runs its program on its operands one for one (`programs.called`): a jit's, a contracted
+            # derivative's, a custom rule's, a Mosaic GPU kernel's `custom_vmap_call` around its `mpmd_map`.
+            outs = _evaluated(body, body.consts, values, found)
         else:
             if any(_launches(inner) for inner in _bodies(equation)):
                 raise NotImplementedError(f"a launch inside {name}'s body, which the audit does not walk "
-                                          f"(`NESTED`)")
+                                          "(a loop or branch `LOOPS` runs, a call `programs.called` reads)")
             outs = equation.primitive.bind(*values, **equation.primitive.get_bind_params(equation.params))
             outs = list(outs) if equation.primitive.multiple_results else [outs]
         env.update(zip(equation.outvars, outs, strict=True))
