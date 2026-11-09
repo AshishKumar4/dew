@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.precision import accumulated, asks_default_precision, exact_products, products_dtype
+from dew.nn.precision import accumulated, asks_default_precision, exact_products, float64_sum, products_dtype
 
 HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The 16-bit dtypes the kernels multiply exactly."""
@@ -107,13 +107,12 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
     if product.compute in EIGHT:
         return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,
                                    preferred_element_type=jnp.float32)
+    contraction = functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers)
     if product.compute == jnp.dtype(jnp.float32) and product.promoted:
-        with jax.enable_x64(new_val=True):
-            wide = jax.lax.dot_general(lhs.astype(jnp.float64), rhs.astype(jnp.float64), dimension_numbers,
-                                       preferred_element_type=jnp.float64)
-            return wide.astype(jnp.float32)
+        # In float64 at HIGHEST, whatever fp32 algorithm the caller bound (`precision.float64_sum`): under
+        # check 1's `FP32_SUMS` a float64 dot stating none narrowed its operands back to fp32.
+        return float64_sum(contraction, lhs, rhs, dtype=jnp.float32)
     if products_dtype(lhs, rhs) == jnp.dtype(jnp.float32):
-        contraction = functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers)
         return accumulated(contraction, lhs, rhs, preferred_element_type=jnp.float32)
     return jax.lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32)
 
