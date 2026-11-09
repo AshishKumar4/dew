@@ -43,9 +43,10 @@ RECURRENT = {
     "kimi_delta_attention": {"linear_num_heads": 2, "linear_head_dim": 8, "linear_conv_kernel_dim": 4},
     "mamba": {"intermediate_size": 32, "state_size": 4, "time_step_rank": 2},
     "mamba2": {"num_heads": 4, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4},
-    "short_conv": {"conv_L_cache": 3}}
+    "short_conv": {"conv_L_cache": 3},
+    "lightning_attention": {"block_size": 4}}
 """The mixers holding row state that read forks, at toy size: Qwen3.5's gated delta net, Kimi's delta
-attention, Mamba-1 and -2, and LFM2's gated short convolution."""
+attention, Mamba-1 and -2, LFM2's gated short convolution and MiniMax's lightning attention."""
 
 MLA = {"q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8}
 """DeepSeek's latent attention at toy size, dense (no indexer), as Kimi Linear's full-attention layers
@@ -138,18 +139,15 @@ def test_forked_rows_lay_each_prefix_once_and_each_row_back_at_its_tokens():
 
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
     """A decoder that reads its tokens in their row's order beyond its mixers (engram's n-gram hashes, a
-    block router, an expert capacity), whose mixer reads no forks (lightning attention), that reads each
-    token's later ones (a bidirectional decoder, whose prefix would read its branches), or that draws
+    block router, an expert capacity), whose mixer reads no forks (Mamba-3, whose carried state is four
+    parts), that reads each token's later ones (a bidirectional decoder, whose prefix would read its
+    branches), or that draws
     dropout in a training step, says why a call over forks would not compute each row as its own
     (`ForkedCalls`): its objective lays its rows whole (`shares_prefixes`), and a call over forks is
     refused, where the same decoder without the cause runs it."""
     from dew.nn.engram import Engram
 
     forks = ForkedRows.pack(ROWS, WIDTH)
-    lightning = CausalTransformer(
-        vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
-        max_seq_len=WIDTH, dtype="float32", layer_types=("linear_attention", "full_attention"),
-        kinds={"linear_attention": {"mixer": {"class": "lightning_attention", "fields": {"block_size": 4}}}})
     refusing = {
         "engram": attention_model(engram=Engram(layer_ids=(0,), num_embeddings=(168,), max_ngram_size=3,
                                                 vocab_size=VOCAB, n_heads=2, head_dim=4,
@@ -159,7 +157,12 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
                                                          routing_block=2, block_experts=2)),
         "capacity": attention_model(mixture=Mixture(experts=4, top_k=2, expert_features=16,
                                                     capacity_factor=1.0)),
-        "lightning": lightning}
+        "mamba3": CausalTransformer(
+            vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
+            max_seq_len=WIDTH, dtype="float32", layer_types=("linear_attention", "full_attention"),
+            kinds={"linear_attention": {"mixer": {"class": "mamba3", "fields": {
+                "head_dim": 8, "state_size": 8, "chunk_size": 4}}}}),
+    }
     for name, model in refusing.items():
         assert not LMObjective(model, WIDTH - 1).shares_prefixes(), name
         params = model.init(jax.random.key(0), jnp.ones((1, WIDTH), jnp.int32))
