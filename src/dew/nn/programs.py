@@ -95,15 +95,11 @@ def opaque(equation: jcore.JaxprEqn) -> bool:
 
 
 def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
-    """The programs `equation` runs within it: a call's, a loop's, a branch's or a checkpoint's. A
-    native Pallas kernel runs none XLA sees (`opaque`)."""
+    """The programs `equation` runs within it (JAX's own finder, `jax.extend.core.jaxprs_in_params`): a
+    call's, a loop's, a branch's or a checkpoint's. A native Pallas kernel runs none XLA sees (`opaque`)."""
     if opaque(equation):
         return []
-    found = []
-    for value in equation.params.values():
-        found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
-                     if isinstance(each, jcore.Jaxpr))
-    return found
+    return list(jcore.jaxprs_in_params(equation.params))
 
 
 

@@ -255,20 +255,28 @@ def _attention_routes(trace) -> list[str]:
 @pytest.mark.parametrize("spelling", list(SPELLINGS))
 def test_a_plain_programs_attention_runs_dews_kernel_through_dew_jit(spelling):
     """A plain JAX or Flax program's softmax attention (`dew.algebra.recognize`) compiled through
-    `dew.jit` on an H100 runs the kernel Dew's selector gives the call (FlashAttention, or the template a call
-    names), where the program as written runs XLA's; on this host, its output and gradients under the
-    template (its portable mainloop) on par with the program as written (check 1)."""
+    `dew.jit` on an H100 runs the kernels Dew's own attention call routes to (`scaled_dot_product_attention`,
+    or the template a call names), where the program as written runs XLA's; on this host, its output and
+    gradients under the template (its portable mainloop) on par with the program as written (check 1)."""
     from attention_oracle import attention_on_par, kept
     from contract_support import normal_drawn
 
     import dew
+    from dew.algebra.recognize import KEPT
+    from dew.nn.attention import scaled_dot_product_attention
 
     attend, key_heads, causal = SPELLINGS[spelling]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),
               *(jax.ShapeDtypeStruct((2, 128, key_heads, 64), jnp.bfloat16),) * 2)
+
+    def own(q, k, v):
+        return scaled_dot_product_attention(q, k, v, scale_logits=True, causal=causal)
+
     with generation.assumed("sm90"):
         assert not _attention_routes(lambda: jax.jit(attend).trace(*shapes))
-        assert "flash" in _attention_routes(lambda: dew.jit(attend).trace(*shapes))
+        expected = {kernel for kernel in _attention_routes(lambda: jax.jit(own).trace(*shapes))
+                    if kernel not in KEPT}
+        assert expected and set(_attention_routes(lambda: dew.jit(attend).trace(*shapes))) == expected
         with generation.chosen(attention="template"):
             assert "template" in _attention_routes(lambda: dew.jit(attend).trace(*shapes))
     draw = normal_drawn(37, (2, 64, 4, 32), (2, 64, key_heads, 32), (2, 64, key_heads, 32), (2, 64, 4, 32),
