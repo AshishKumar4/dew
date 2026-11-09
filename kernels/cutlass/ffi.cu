@@ -1,6 +1,7 @@
 // CUTLASS's grouped GEMMs as exported XLA FFI handlers, which dew_cutlass registers through ctypes, so the
 // library carries no Python ABI. Each handler dispatches on the compute capability of the device its stream
-// runs on, to the kernel built for it (grouped_sm90.cu, ...), and answers an error naming any other. Problem
+// runs on, to the kernel built for it (grouped_sm80.cu for every 8.x, grouped_sm90.cu for 9.0), and answers
+// an error naming any other. Problem
 // shapes are set up on the device from the group sizes, in scratch from XLA's allocator, so a call never
 // synchronizes with the host and stays jit- and graph-safe.
 #include <cuda_runtime.h>
@@ -136,7 +137,10 @@ ffi::Error GroupedGemm(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::
                                   out->untyped_data(), m, k, n, static_cast<int>(w_dims[0]), transpose_w,
                                   *operands, *result};
   const char* why = "no kernel is built for this device's compute capability";
-  if (device->capability / 10 == 9) {
+  if (device->capability / 10 == 8) {
+    why = dew_cutlass::sm80_grouped(call, stream, dew_cutlass::allocator(scratch), device->index,
+                                    device->multiprocessors);
+  } else if (device->capability == 90) {
     why = dew_cutlass::sm90_grouped(call, stream, dew_cutlass::allocator(scratch), device->index,
                                     device->multiprocessors);
   }
@@ -173,7 +177,10 @@ ffi::Error GroupedGemmK(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi:
                                    out->untyped_data(), m, k, n, static_cast<int>(out_dims[0]), *operands,
                                    *result};
   const char* why = "no kernel is built for this device's compute capability";
-  if (device->capability / 10 == 9) {
+  if (device->capability / 10 == 8) {
+    why = dew_cutlass::sm80_grouped_k(call, stream, dew_cutlass::allocator(scratch), device->index,
+                                      device->multiprocessors);
+  } else if (device->capability == 90) {
     why = dew_cutlass::sm90_grouped_k(call, stream, dew_cutlass::allocator(scratch), device->index,
                                       device->multiprocessors);
   }
