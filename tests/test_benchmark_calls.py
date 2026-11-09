@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from sampling_gate import FALSE_RED
+from tool_support import run_from
 
 from dew.telemetry.benchmark import CuptiHeld, behind, benchmark, device_time, eviction
 
@@ -313,3 +314,31 @@ def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however
         with pytest.raises(CuptiHeld):
             device.kernels(matmul, x)
     assert program_kernels(profiler.captures[-1], ["squared"])["squared"]
+
+
+def test_a_projection_benchmark_names_a_grouped_matmul_kernel_and_runs_it(monkeypatch):
+    """`tools/benchmark_kernels.py projection` names its grouped matmul by kernel (`--kernel`, `--against`):
+    a kernel of the grouped selector's or the selector's own ('auto') is taken, any other name refused at the
+    command line (the documented `--implementation mosaic_gpu --against cutlass` raised inside
+    `expert_projection`), and a named arm's projection traces its grouped products under that kernel's choice
+    (`generation.chosen`), on a CPU XLA's by name, at every call (a benchmark calls each arm again and
+    again)."""
+    from dew.nn.kernels import generation, grouped_matmul
+
+    with run_from("benchmark_kernels", "tools") as tool:
+        parse = tool.argparse.ArgumentParser()
+        parse.add_argument("--kernel", type=tool.kernel_name)
+        named = {kernel.name for kernel in grouped_matmul.GROUPED.kernels}
+        assert named >= {"mosaic", "triton", "cutlass", "xla"}
+        for name in ("auto", "mosaic", "cutlass", "xla"):
+            assert parse.parse_args(["--kernel", name]).kernel == name
+        with pytest.raises(SystemExit):
+            parse.parse_args(["--kernel", "mosaic_gpu"])
+        forward, _ = tool.projections("xla")
+        x = jnp.ones((16, 8), jnp.bfloat16)
+        kernel = jnp.ones((2, 8, 4), jnp.float32)
+        with generation.routes() as routes:
+            out = forward(x, kernel, jnp.asarray([10, 6], jnp.int32))
+        again = forward(x, kernel, jnp.asarray([6, 10], jnp.int32))
+        assert np.asarray(out).shape == np.asarray(again).shape == (16, 4)
+        assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"xla"}
