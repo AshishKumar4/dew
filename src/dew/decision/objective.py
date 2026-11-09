@@ -41,7 +41,16 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, ProjectionGroup, TokenModel
+from dew.nn.protocols import (
+    CountedDecisions,
+    CountedLogits,
+    CountedLogitsTraining,
+    CountedTraining,
+    CrossAttending,
+    Lacks,
+    ProjectionGroup,
+    TokenModel,
+)
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -123,7 +132,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     canonical options (`categorical.group_divergence`), reported as the
     `consistency` metric; a group's members stand in one row, so a layout of a
     question a row refuses an example with groups under it. At 0 the groups
-    are not read, and the loss is the label loss alone.
+    are not read, and the loss is the label loss alone. With `input_lm` w > 0 it adds w
+    times the mean next-token cross entropy of the rows' own tokens, the backbone reading each row
+    again in its tokens' order, causally and alone, whatever its layout reads both ways or in streams
+    (a backbone that attends both ways read as its causal twin, the same weights), through its own
+    vocabulary head (`input_terms`), reported as the `input_ce` metric over the tokens
+    it counts apart from the questions; the head's logits a tile at a time, as a language model's
+    tiled head scores them (`chunked_tile`). The pass reads no context and no images, the row's
+    tokens alone. At 0 there is no second pass.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -159,12 +175,30 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def model_flops(self, model, batch: Batch) -> float:
         """One backbone pass, its cross-attention over each row's context where rows carry one
-        (`CrossAttending.cross_flops`), plus the head's real question/option geometry. Forming the
-        vocabulary rows a head reads (an adapter's update merged into them) is execution, as
-        recompute is."""
+        (`CrossAttending.cross_flops`), plus the head's real question/option geometry, and with
+        `input_lm` the backbone's second pass over the rows (`input_terms`). Forming the vocabulary
+        rows a head reads (an adapter's update merged into them) is execution, as recompute is."""
         model = self.model if model is None else model
-        return (counted_flops(model.backbone, self.real_lengths(batch)) + self._context_flops(model, batch)
-                + self._cross_flops(model, batch) + self._head_flops(model, batch))
+        passes = 2 if self.input_lm else 1
+        return (passes * counted_flops(model.backbone, self.real_lengths(batch))
+                + self._context_flops(model, batch) + self._cross_flops(model, batch)
+                + self._head_flops(model, batch) + self._input_head_flops(model, batch))
+
+    def _input_head_flops(self, model, batch: Batch, *, training: bool = False) -> float:
+        """The vocabulary head's work on the rows' own next tokens (`input_terms`), each row's tokens after
+        its first; none without `input_lm`."""
+        if not self.input_lm:
+            return 0.0
+        targets = np.maximum(self.real_lengths(batch) - 1, 0)
+        if training:
+            if not isinstance(model.backbone, CountedLogitsTraining):
+                raise MissingFlopsCount(f"{type(model.backbone).__name__} has no logits_training_flops for "
+                                        "input_lm's head")
+            return model.backbone.logits_training_flops(targets)
+        if not isinstance(model.backbone, CountedLogits):
+            raise MissingFlopsCount(f"{type(model.backbone).__name__} has no logits_flops for input_lm's "
+                                    "head")
+        return model.backbone.logits_flops(targets)
 
     def _context_lengths(self, batch: Batch) -> np.ndarray | None:
         """Each window row's context length where the backbone reads the context in a pass of its own,
@@ -225,17 +259,22 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         lengths = self.real_lengths(batch)
         context = self._context_lengths(batch)
         trained = 3 * (self._cross_flops(model, batch) + self._head_flops(model, batch))
+        # The rows' second pass where `input_lm` reads them again (`input_terms`), trained as the first.
+        passes = 2 if self.input_lm else 1
         if isinstance(model.backbone, CountedTraining):
             # An adapter trains through the context's pass too.
             own = 0.0 if context is None else model.backbone.training_flops(context)
-            return model.backbone.training_flops(lengths) + own + trained
+            return (passes * model.backbone.training_flops(lengths) + own + trained
+                    + self._input_head_flops(model, batch, training=True))
         if self._backbone_frozen():
             # A context's pass trains nothing, so it runs forward alone (`encode_context`); a block's
             # reads through the backbone's own matrices take no weight gradient (`held_flops`).
             forward = counted_flops(model.backbone, lengths)
             held = self._cross_flops(model, batch, held=True)
-            return (frozen_training_flops(forward, parameter_flops(model.backbone, lengths))
-                    + self._context_flops(model, batch) + trained - held)
+            # The vocabulary head is the backbone's, frozen with it: its input's gradient, no weight's.
+            head = self._input_head_flops(model, batch)
+            return (passes * frozen_training_flops(forward, parameter_flops(model.backbone, lengths))
+                    + frozen_training_flops(head, head) + self._context_flops(model, batch) + trained - held)
         return super().training_flops(model, batch)
 
     def _backbone_frozen(self) -> bool:
@@ -254,7 +293,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None,
-                 none_of_the_above_options: int = 3):
+                 none_of_the_above_options: int = 3, input_lm: float = 0.0):
         held: Variables | None = None
         widths: tuple[int | None, int] | None = None
         self.image_processor = None
@@ -327,6 +366,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if not consistency >= 0.0:
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
         self.consistency = consistency
+        if not input_lm >= 0.0:
+            raise ValueError(f"input_lm weighs a cross entropy, so it is nonnegative, got {input_lm}")
+        self.input_lm = input_lm
+        if input_lm:
+            self._causal_backbone()
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.none_of_the_above_options = none_of_the_above_options
@@ -412,8 +456,59 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             progress=self.progress(step), opened=step.sown())
         loss, aux = self._charged(logits, inputs, batch)
+        loss, term = self._with_input_term(loss, variables, inputs, batch, step)
+        if term is not None:
+            aux = replace(aux, metrics={**aux.metrics, "input_ce": term.mean()[0]})
         qk, inspected = step.observed(sown)
         return loss, replace(aux, qk_stats=qk, inspected=inspected)
+
+    def _with_input_term(self, loss: Ratio | Weighted, variables: Variables, inputs: DecisionInputs,
+                         batch: Batch, step: Step) -> tuple[Ratio | Weighted, Ratio | None]:
+        """`loss` with the rows' own next-token term beside it at `input_lm`'s weight, and the term;
+        `loss` alone at 0. A validation's loss weighs it as training's does (`_validation_scores`)."""
+        if not self.input_lm:
+            return loss, None
+        term = self.input_terms(variables, inputs, batch, step)
+        terms, weights = (loss.terms, loss.weights) if isinstance(loss, Weighted) else ((loss,), (1.0,))
+        return Weighted((*terms, term), (*weights, self.input_lm)), term
+
+    def _causal_backbone(self) -> nn.Module:
+        """The backbone the rows' own next-token term reads (`input_terms`): itself where it attends
+        causally, else its causal twin, the same weights read each token after the ones before it alone;
+        a backbone that attends both ways and states no `causal` setting to read it so is refused."""
+        backbone = self.model.backbone
+        if not isinstance(backbone, TokenModel) or backbone.causal:
+            return backbone
+        if "causal" not in {field.name for field in dataclasses.fields(backbone)}:
+            raise Lacks("causal", f"input_lm reads the rows causally, and a {type(backbone).__name__} that "
+                        "attends both ways states no causal setting to read them so")
+        return backbone.clone(causal=True)
+
+    def input_terms(self, variables: Variables, batch_inputs: DecisionInputs, batch: Batch,
+                    step: Step) -> Ratio:
+        """The next-token cross entropy of each row's own tokens (`input_lm`): the backbone reads every
+        row of a window again, in its tokens' order, causally and apart from the window's other rows,
+        their places counted along it, and each token after a row's first is scored as the next token of
+        the one before it, through the backbone's vocabulary head a tile at a time; its `Ratio` over
+        those tokens, apart from the questions'. The layout's other reads (blocks read both ways, option
+        slots, streams) and the row's context are not this pass's."""
+        from dew.batch import coordinates
+        from dew.nn.progress import progressed
+        from dew.objectives.lm.chunked import chunked_tile, final_read, head_cross_entropy
+
+        backbone, held = self._causal_backbone(), thaw(part(variables, "backbone"))
+        tokens, segments = batch_inputs.tokens, batch_inputs.segments
+        # The tokens that precede another, as a language model reads its inputs: all but the last.
+        laid = coordinates(segments=segments[:, :-1], max_segments=batch_inputs.max_segments,
+                           right_padded=True)
+        read = final_read(backbone, held, tokens[:, :-1], train=step.training, coordinates=laid,
+                          rngs=model_rngs(step.key, training=step.training),
+                          **progressed(backbone, self.progress(step)))
+        # A token's successor in its own row: none after a row's last token or on the padding.
+        scored = ((segments[:, 1:] == segments[:, :-1]) & (segments[:, :-1] > 0)).astype(jnp.float32)
+        losses, _, _ = head_cross_entropy(backbone, held, read, tokens[:, 1:], 4, tile=chunked_tile(),
+                                          predict=False)
+        return self.row_mean(losses, batch, weights=scored)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
                  ) -> tuple[Ratio | Weighted, Aux]:
@@ -452,7 +547,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
         logits = self.model.logits(params, inputs)
-        return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
+        loss, _ = self._with_input_term(self._charged(logits, inputs, batch)[0], params, inputs, batch, step)
+        return loss, self._decisions(logits, inputs, batch)
 
     def _decisions(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> Decisions:
         """The questions' option probabilities, each at its type's temperature, with what scores them."""
