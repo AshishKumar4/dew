@@ -1379,10 +1379,13 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
             "dew._cleanup.signal_group.", "dew._cleanup.exit_code.", "dew._cleanup.groups_ended.",
             "dew._cleanup.end_group.", "dew._cleanup.process_group.",
-            "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
+            "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.",
+            "dew.telemetry.benchmark.resident_memory.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
-representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals)."""
+representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals), or
+the kernel's own accounting of it (the pages it holds, `resident_memory`), which no work of the process
+orders or wakes: a region's high-water is sampled."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
