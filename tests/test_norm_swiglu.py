@@ -242,26 +242,71 @@ def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_
     """Row 821: the fused norm applies an activation after it (`RMSNorm.activation`, a U-Net's output norm's
     swish) where `norm_swiglu.elementwise` holds: every equation maps each element alone and Pallas's Triton
     lowering takes it. Activations of one element each, exact gelu's erfc aside, take the kernel; one that
-    reads other elements, positions or its operand's extents (`y / y.shape[-1]`, which a padded tile divides
-    by its own width) takes XLA's."""
+    reads other elements or positions takes XLA's; one reading its operand's extents (`y / y.shape[-1]`)
+    takes the kernel, read at the call's shape."""
     from dew.nn import activations
 
     for function in (jax.nn.silu, jax.nn.swish, activations.silu, jax.nn.relu, activations.gelu_tanh,
-                     jax.nn.sigmoid, jnp.tanh):
-        assert norm_swiglu.elementwise(function), function
+                     jax.nn.sigmoid, jnp.tanh, lambda x: x / x.shape[-1], lambda x: x * x.size,
+                     lambda x: x + jnp.ones((2, 3), x.dtype)):
+        assert norm_swiglu.elementwise(function, (2, 3)), function
     positions = jnp.arange(6.0).reshape(2, 3)
     jitted = jax.jit(lambda x: x * positions)
     for function in (activations.gelu_exact, jax.nn.softmax, lambda x: jnp.cumsum(x, -1), lambda x: x.T,
                      lambda x: x + jnp.arange(3.0), lambda x: x.sum(-1), lambda x: x * positions,
-                     lambda x: jitted(x), lambda x: x + jnp.ones((2, 3), x.dtype), lambda x: x / x.shape[-1],
-                     lambda x: x * x.size):
-        assert not norm_swiglu.elementwise(function), function
+                     lambda x: jitted(x)):
+        assert not norm_swiglu.elementwise(function, (2, 3)), function
     x = jnp.ones((4, 64), jnp.bfloat16)
     with generation.assumed("sm90"):
         assert norm_swiglu.rms_kernel("auto", x, jnp.ones((64,)), jnp.bfloat16, fp32_statistics=True,
                                       epilogue=jax.nn.swish) == "pallas"
         assert norm_swiglu.rms_kernel("auto", x, jnp.ones((64,)), jnp.bfloat16, fp32_statistics=True,
                                       epilogue=jax.nn.softmax) == "xla"
+
+
+def _fused_norm(activation):
+    """The fused norm in fp32 with `activation` after it, its arithmetic in XLA where it differentiates."""
+    def portable(x, branch, scale):
+        return stream_rms_normalized(x, branch, scale, 1e-5, jnp.float32, scale_offset=False,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla",
+                                     activation=activation)
+
+    def fused(x, scale):
+        return norm_swiglu.stream_rms_norm(x, None, scale, 1e-5, jnp.float32, offset=False, after_cast=False,
+                                           portable=portable, epilogue=activation)[1]
+
+    def plain(output_dtype, x, scale):
+        return stream_rms_normalized(x, None, scale, 1e-5, output_dtype, scale_offset=False,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla",
+                                     activation=activation)[1]
+
+    return fused, plain
+
+
+@pytest.mark.parametrize("activation", [lambda y: y / y.shape[-1],
+                                        lambda y: y / (y.shape[-1] if y.shape[-1] > 8 else 1)])
+def test_a_norms_activation_reading_its_width_divides_by_the_rows_not_a_padded_tiles(activation):
+    """An activation reading its operand's shape after the fused norm, interpreted on a CPU at a width no
+    tile divides (9 columns, a 16-wide tile): its output and its input's and weight's gradients on par with
+    XLA's (check 1), which reads the row's 9 columns, as the kernel reads the activation's graph traced at
+    the call's shape, where a tile's 16 put every output off by 9/16."""
+    fused, plain = _fused_norm(activation)
+    compare((functools.partial(plain, jnp.float32), fused, functools.partial(plain, jnp.float64)),
+            lambda draw: norm_operands((2, 3, 9), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),
+            SEEDS[(2, 3, 31)])
+
+
+def test_a_norms_activation_keeps_its_own_derivative():
+    """A custom derivative after the fused norm stays its own: relu's is 0 at 0, where its primal's maximum
+    splits its slope in half. A row of zeros norms to zeros, whose cotangent relu stops: the fused norm's
+    input gradient there is XLA's, zeros, bit for bit."""
+    fused, plain = _fused_norm(jax.nn.relu)
+    x = jnp.concatenate([jnp.zeros((1, 9)), jax.random.normal(jax.random.key(0), (1, 9))]).astype(jnp.float32)
+    scale, cotangent = jnp.ones((9,), jnp.float32), jnp.ones((2, 9), jnp.float32)
+    ours = jax.vjp(fused, x, scale)[1](cotangent)[0]
+    theirs = jax.vjp(functools.partial(plain, jnp.float32), x, scale)[1](cotangent)[0]
+    np.testing.assert_array_equal(np.asarray(ours[0]), np.asarray(theirs[0]))
+    assert not np.any(np.asarray(ours[0]))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
