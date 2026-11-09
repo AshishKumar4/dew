@@ -176,14 +176,15 @@ def xla_backward(form: str):
 def forward_rows(form: str):
     """The template's forward on this mainloop at the backward's tiles, its residual rows: each query's
     maximum and denominator, natural, and rowsum(dO O), which both backwards read, so they differ in their
-    own forms alone."""
+    own forms alone: summed as the walk's dP is (`attention.interpreted_rows`), as the template's backward
+    takes it (`attention_gradient.off_anchor_delta`), so a row of one key's dP and D cancel exactly."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
 
     def run(q, k, v, d):
         q4, k4, v4 = (x[None, :, None] for x in (q, k, v))
         out, m, total, anchor, split = attention_portable.xla_mainloop(TILES, q4, k4, v4, spans,
                                                                        residuals=True, scale=SCALE)
-        delta = jnp.sum(d * out[0, :, 0].astype(jnp.float32), axis=-1)
+        delta = template.interpreted_rows(d, out[0, :, 0].astype(jnp.float32))
         return (m, total, anchor, split), m[0, 0], total[0, 0], delta
 
     return run
