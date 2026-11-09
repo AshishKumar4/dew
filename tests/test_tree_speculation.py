@@ -146,8 +146,9 @@ def _ranked(ranks):
     from dew.sampling.trees import TreeDraft
 
     def drafting(ops):
-        def draft(state, root, shape, keys):
-            del keys
+        def draft(state, root, shape, keys, base):
+            # The target's own walk places each token by its cache.
+            del keys, base
             every = jnp.ones(root.shape[0], bool)
             held = [ops.advance(state, root, every)]
             tokens = []
@@ -234,7 +235,8 @@ def _sampled(sharpness: float):
     from dew.sampling.trees import TreeDraft
 
     def drafting(ops):
-        def draft(state, root, shape, keys):
+        def draft(state, root, shape, keys, base):
+            del base
             every = jnp.ones(root.shape[0], bool)
             held = [ops.advance(state, root, every)]
             tokens, log_q = [], []
