@@ -172,6 +172,12 @@ def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: 
                      state.own + taken(own))
 
 
+def summed_rows(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Each row's `a · b` over the last axis, as a kernel's body sums it: D's and the anchor's products with
+    dO where the body's issuer forms dP (`off_anchor_delta`'s `rows`)."""
+    return jnp.sum(a * b, axis=-1)
+
+
 def nearer_centre(anchor: jax.Array, about_anchor: jax.Array, about_zero: jax.Array, key_index: jax.Array
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """D's centre, the nearer to D of the anchor key's `dP` (`anchor`) and zero, each sum's difference from
@@ -183,8 +189,9 @@ def nearer_centre(anchor: jax.Array, about_anchor: jax.Array, about_zero: jax.Ar
 
 
 def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array, state_total: jax.Array,
-                     mean0: jax.Array, key_index: jax.Array,
-                     shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                     mean0: jax.Array, key_index: jax.Array, shift: jax.Array, *,
+                     rows: Callable[[jax.Array, jax.Array], jax.Array]
+                     ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each query's anchor c (`v_c · dO`, or 0), `D - c`, and the anchor key's index (-1 where c is 0),
     from the first pass. D two ways: about 0, `sum_j p_j v_j · dO`, as the output's own product with dO
     rounds it, which suits a query whose weights spread over many keys; and about `c = v_c · dO`,
@@ -192,24 +199,26 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     c. Each query takes the one nearer its D, the one whose terms cancel less. The pass's sums are at each
     row's `2^-shift` (`room`), and each is taken over the total before its product with dO, as the
     reference's output is, so none overflows where the sums are near fp32's largest; the initial state's
-    share is its weight over the total times its values' mean's product with dO (`mean0`)."""
+    share is its weight over the total times its values' mean's product with dO (`mean0`). Each row's
+    product with dO is `rows`', the issuer's own that forms dP (`summed_rows` in a kernel's body,
+    `interpreted_rows` off a GPU), so c and the anchor key's dP sum alike and cancel exactly."""
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
-    anchor = jnp.sum(anchor_value * cotangent, axis=-1)
+    anchor = rows(anchor_value, cotangent)
     over = inverse(state.total)
     state_weight = power2(state_total, -shift) * over
     others = state.others * expand(over, state.others)
     own = expand(state.own * over, anchor_value)
     others_total = expand(state.others_total * over, anchor_value)
-    about_zero = jnp.sum((others + own * anchor_value) * cotangent, axis=-1) + state_weight * mean0
-    about_anchor = (jnp.sum((others - others_total * anchor_value) * cotangent, axis=-1)
-                    + state_weight * (mean0 - anchor))
+    about_zero = rows(others + own * anchor_value, cotangent) + state_weight * mean0
+    about_anchor = rows(others - others_total * anchor_value, cotangent) + state_weight * (mean0 - anchor)
     return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
                 state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
-                key_index: jax.Array, shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                key_index: jax.Array, shift: jax.Array, *,
+                rows: Callable[[jax.Array, jax.Array], jax.Array]) -> tuple[jax.Array, jax.Array, jax.Array]:
     """`off_anchor_delta` from a training forward's split sums (`training_step`), the backward's first
     pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
     sum, the anchor's own weight, the denominator `total` and the initial state's own `state_total`, all
@@ -219,18 +228,18 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     sums are at each row's `2^-shift` (`room`), and `total` is taken there; a row at the shift `NORMALIZED`
     holds normalized sums (`split_residuals`, `normalized_rows`), its total 1. Each sum is taken over the
     total before its product with dO, as the reference's output is, so none overflows where the sums are
-    near fp32's largest (a state's)."""
+    near fp32's largest (a state's). Each row's product with dO is `rows`' (`off_anchor_delta`'s)."""
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
-    anchor = jnp.sum(anchor_value * cotangent, axis=-1)
+    anchor = rows(anchor_value, cotangent)
     others = others * expand(over, others)
     own, others_total = own * over, others_total * over
-    about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
-    about_anchor = (jnp.sum((others - expand(others_total, anchor_value) * anchor_value) * cotangent, axis=-1)
+    about_zero = rows(split_output(others, own, anchor_value), cotangent)
+    about_anchor = (rows(others - expand(others_total, anchor_value) * anchor_value, cotangent)
                     - state_weight * anchor)
     return nearer_centre(anchor, about_anchor, about_zero, key_index)
 

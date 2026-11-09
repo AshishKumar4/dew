@@ -176,14 +176,15 @@ def xla_backward(form: str):
 def forward_rows(form: str):
     """The template's forward on this mainloop at the backward's tiles, its residual rows: each query's
     maximum and denominator, natural, and rowsum(dO O), which both backwards read, so they differ in their
-    own forms alone."""
+    own forms alone: summed as the walk's dP is (`attention.interpreted_rows`), as the template's backward
+    takes it (`attention_gradient.off_anchor_delta`), so a row of one key's dP and D cancel exactly."""
     spans = template.spans(LENGTH, LENGTH, 1, **SPANS[form])
 
     def run(q, k, v, d):
         q4, k4, v4 = (x[None, :, None] for x in (q, k, v))
         out, m, total, anchor, split = attention_portable.xla_mainloop(TILES, q4, k4, v4, spans,
                                                                        residuals=True, scale=SCALE)
-        delta = jnp.sum(d * out[0, :, 0].astype(jnp.float32), axis=-1)
+        delta = template.interpreted_rows(d, out[0, :, 0].astype(jnp.float32))
         return (m, total, anchor, split), m[0, 0], total[0, 0], delta
 
     return run
@@ -194,14 +195,14 @@ def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
     unseen, and D about no anchor (its whole `delta`), each step's products the template's CPU mainloop's
-    issuer (`attention.interpreted_dot`), scheduled as a mainloop tiles the walk: keys first, a key tile's dK
-    and dV the walk's over the query tiles; queries first, each query tile walking the key tiles, its dQ the
-    walk's and each key tile's dK and dV its share, summed over the query tiles in order (row 3310: one
-    contraction over a key tile's every query at once, no mainloop's schedule, erred 1.63 times the
-    template's in dV). The `accurate` form's under the accurate numerics, no key its query's anchor; its
-    weights recomputed in `how`'s units (raw products scaled after their difference, their maximum the raw
-    one, or an exact largest weight); dV's operands the normalized weights against dO where
-    `normalized_values` (bf16's order, `softmax_gradients`)."""
+    issuer (`attention.interpreted_dot`), its outputs along the walk the step's own, scheduled as a mainloop
+    tiles the walk: keys first, a key tile's dK and dV the walk's over the query tiles; queries first, each
+    query tile walking the key tiles, its dQ the walk's and each key tile's dK and dV its share, summed over
+    the query tiles in order (row 3310: one contraction over a key tile's every query at once, no
+    mainloop's schedule, erred 1.63 times the template's in dV). The `accurate` form's under the accurate
+    numerics, no key its query's anchor; its weights recomputed in `how`'s units (raw products scaled after
+    their difference, their maximum the raw one, or an exact largest weight); dV's operands the normalized
+    weights against dO where `normalized_values` (bf16's order, `softmax_gradients`)."""
     forms = derive.derive(attention_backward_algebra.backward_declaration(
         scale=SCALE, walked=along, how=how, accurate=accurate, normalized_values=normalized_values),
         accurate=accurate, saturation=SATURATION)
@@ -222,11 +223,17 @@ def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.
 
         return {name: part_of(name, value) for name, value in values.items()}
 
+    # Each tile's outputs along the walk (dQ keys first, dK and dV queries first), the step's own, its
+    # products the issuer's too, as a mainloop forms them (`derive.Derived.step`'s `outputs`).
+    indices = (0,) if along == "rows" else (1, 2)
+
     def walk(values: dict):
         parts = [tile(values, index) for index in range(tiles)]
-        mapped = [forms.mapped(part) for part in parts]
-        return forms.finish(walked(forms, parts, template.interpreted_dot), values,
-                            shapes=shaped(parts[0])), mapped
+        state, mapped = forms.init(shaped(parts[0])), []
+        for part in parts:
+            state, outputs = forms.step(state, part, product=template.interpreted_dot, outputs=indices)
+            mapped.append(dict(zip(indices, outputs, strict=True)))
+        return forms.finish(state, values, shapes=shaped(parts[0])), mapped
 
     def run(q, k, v, d):
         _, peak, total, delta = rows_of(q, k, v, d)
