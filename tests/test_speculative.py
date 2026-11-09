@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 from model_support import decoder
 
-from dew.sampling import Sampling, Speculative, decoding, generate
+from dew.sampling import Sampling, Speculative, TreeShape, TreeSpeculative, decoding, generate
 
 VOCAB = 13
 def predictor(kind="attention", **overrides):
@@ -336,6 +336,70 @@ def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_doe
                     truth_fn=truth)
 
 
+TREES = {"two-two-one": TreeShape.widths(2, 2, 1), "three": TreeShape.widths(3),
+         "chain": TreeShape.widths(1, 1), "ragged": TreeShape((-1, -1, 0, 0, 2, 4))}
+"""The trees a model drafts of its own picks (`chain_tree`): a full one two wide and three deep, its last
+level a child a node; the root's three children alone; a chain, a child a node; and a ragged one, the
+root's first child with two children, the first of those a chain two deeper, every other node a leaf: 10,
+3, 2 and 6 nodes."""
+
+
+@pytest.mark.parametrize("depths", [1, 2])
+@pytest.mark.parametrize("shape", TREES)
+def test_tree_speculation_reproduces_the_greedy_walk_to_the_end_of_its_cache(shape, depths):
+    """`generate` under `TreeSpeculative` drafts each tree with the model's own prediction depths, a node's
+    children their picks by rank (`chain_tree`), and at zero temperature the target is a point mass, so
+    the walk keeps the greedy picks its tree holds and emits the target's own token after them: the draws
+    are the greedy walk's, token for token, whatever the tree's widths and depths, and whether one depth
+    drafts every level or two take them in turn. The prompt and its budget fill the row's cache, so its
+    last tokens, where the tree has no room, walk a block each, within the blocks the plan counts
+    (`TreeSpeculative.walks`): a count too few would leave the rows short."""
+    model = predictor(num_nextn_predict_layers=depths)
+    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompts)
+    budget = model.max_seq_len - prompts.shape[1]
+    drawn = generate(model, params, prompts, budget, key=jax.random.key(1), sampling=Sampling(temperature=0),
+                     strategy=TreeSpeculative(TREES[shape]))
+    np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, prompts.shape[1]:],
+                                  greedy_walk(model, params, prompts, budget))
+    np.testing.assert_array_equal(np.asarray(drawn.lengths), budget)
+
+
+@pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
+def test_tree_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
+    """A tree drafted by a prediction depth's picks or by a block drafter's, a pass a leaf's path
+    (`chain_tree`), verified across a LongRoPE crossing at zero temperature, emits the greedy walk: a row
+    whose tree would cross the change keeps none of it and walks its block's one token, as a chain's
+    block does (`test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk`)."""
+    model, params = longrope_speculator(kind)
+    held, steps = LONGROPE_CASES[0]
+    prompts = jnp.asarray(held)
+    speculated = generate(model, params, prompts, steps, key=jax.random.key(1),
+                          sampling=Sampling(temperature=0), strategy=TreeSpeculative(TreeShape.widths(2, 1)))
+    np.testing.assert_array_equal(np.asarray(speculated.tokens)[:, prompts.shape[1]:],
+                                  greedy_walk(model, params, prompts, steps))
+    np.testing.assert_array_equal(np.asarray(speculated.lengths), steps)
+
+
+def test_a_tree_plans_no_more_walks_than_a_row_can_take():
+    """The blocks a tree's plan adds for rows that walk (`TreeSpeculative.walks`) are the most tokens any
+    row draws where its root and tree pass its cache's end, counted here over every prompt length and
+    budget a cache of sixteen holds: as many as the tree has nodes, or the budget where that is fewer,
+    never the whole budget of a row that is nowhere near its cache's end."""
+    from dew.sampling.text import decode_ops
+
+    model = predictor()
+    params = jax.jit(model.init)(jax.random.key(0), jnp.ones((1, 3), jnp.int32))
+    ops = decode_ops(model, params, 0, 1)
+    capacity = model.max_seq_len
+    assert ops.capacity == capacity and ops.crosses is None
+    for shape in TREES.values():
+        for budget in range(1, capacity):
+            walked = max(sum(cursor + shape.nodes + 1 > capacity for cursor in range(prompt, prompt + budget))
+                         for prompt in range(1, capacity - budget + 1))
+            assert TreeSpeculative(shape).walks(ops, budget) == walked, (shape, budget)
+
+
 def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
     """A block commits its tokens in order, so an EOS drawn at the second of
     three candidates is emitted with its likelihoods and every later slot of
@@ -392,6 +456,31 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 
     assert_draws_as_declared(counts, chances, "a speculative block's first two tokens", seeds=LAW_SEEDS)
+
+
+def test_a_trees_tokens_are_drawn_as_the_target_draws_them():
+    """A tree changes how a token is drawn, never its law: its root is the target's own draw, and the
+    token after it is the first of the root's three children the walk accepts, each the draft's pick
+    (its `q` a point mass) taken at the target's chance of it among what the rejections before it left,
+    or the draw from what all three leave (`TreeSpeculative`). The pair is drawn at the chance the
+    target's float64 run gives the first token times the second's given it, over every pair of a 13-token
+    vocabulary (the sampling gate). The drafter is the model's own prediction depth, untrained, so its
+    picks are off the target's law and the residuals have to undo them."""
+    from sampling_gate import assert_draws_as_declared
+
+    model = predictor()
+    prompt, params, chances = pair_law(model)
+    vocab = model.vocab_size
+    rows = jnp.broadcast_to(prompt, (LAW_ROWS, 3))
+
+    def counts(seed):
+        drawn = generate(model, params, rows, 2, key=jax.random.key(seed),
+                         sampling=Sampling(temperature=LAW_TEMPERATURE),
+                         strategy=TreeSpeculative(TreeShape.widths(3, 2)))
+        tokens = np.asarray(drawn.tokens)[:, 3:5]
+        return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
+
+    assert_draws_as_declared(counts, chances, "a tree's first two tokens", seeds=LAW_SEEDS)
 
 
 def pair_law(model):
