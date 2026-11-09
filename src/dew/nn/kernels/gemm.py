@@ -49,7 +49,7 @@ from dew.nn.kernels.templates import axes as side_axes_of, mosaic
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import declared
-from dew.nn.precision import at_least_fp32, projected, refuse_recipe
+from dew.nn.precision import accumulated, at_least_fp32, projected, refuse_recipe
 from dew.nn.sharding import explicit_spec, seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -289,15 +289,19 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # as the rows' and the cotangent's columns are. A dense call's is XLA's own dot over the rows, as the
         # forward's (`grouped_matmul.xla_dot`): its ragged dot of one group took an A100's gate_up weight
         # gradient 470 ms against the template's 11.4 (W121-a100), where DENSE1 timed XLA's dot.
+        # Each summed as `precision.accumulated` sums a contraction (a CPU's float32 product as a vectorized dot
+        # sums it, row 4863).
         if dense:
-            return jax.lax.dot_general(
-                lhs, rhs.astype(lhs.dtype), (((0,), (0,)), ((), ())), precision=precision,
-                preferred_element_type=wide,
-                out_sharding=grouped_matmul.ragged_placement(((lhs, 1), (rhs, 1))))[None].astype(out_dtype)
-        return jax.lax.ragged_dot_general(
-            lhs, rhs.astype(lhs.dtype), group_sizes, _CONTRACTED_ROWS,
-            precision=precision, preferred_element_type=wide,
-            out_sharding=grouped_matmul.ragged_placement((None, (lhs, 1), (rhs, 1)))).astype(out_dtype)
+            product = functools.partial(jax.lax.dot_general, dimension_numbers=(((0,), (0,)), ((), ())),
+                                        precision=precision,
+                                        out_sharding=grouped_matmul.ragged_placement(((lhs, 1), (rhs, 1))))
+            return accumulated(product, lhs, rhs.astype(lhs.dtype),
+                               preferred_element_type=wide)[None].astype(out_dtype)
+        product = functools.partial(
+            jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_CONTRACTED_ROWS, precision=precision,
+            out_sharding=grouped_matmul.ragged_placement((None, (lhs, 1), (rhs, 1))))
+        return accumulated(product, lhs, rhs.astype(lhs.dtype), group_sizes,
+                           preferred_element_type=wide).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays, tables)
 

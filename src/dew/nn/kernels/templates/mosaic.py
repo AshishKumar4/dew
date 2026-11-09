@@ -2196,8 +2196,11 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             pl.when(program != first)(lambda: left(partials))
             pl.when(program == first)(lambda: left(opening))
             last = across.arrived(ready.at[gathered - 1], gathered - first)
-            # The first program's partial its own value where it arrives last, read back where another does.
-            pl.when(last == 1)(lambda: combined(_selected(program == first, summed, read(opening, first))))
+            # The first program's partial read back from its slot whoever arrives last, the tile's first
+            # too, whose own value it left there: chosen against its value by a select, both were live beside
+            # each other through the merge, 267 registers at a dense kernel gradient's 128 x 256 tile
+            # (EM-probe2), past the 240 ptxas held it in.
+            pl.when(last == 1)(lambda: combined(read(opening, first)))
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = (), products: tuple | None = None):
         """`Transport.scoped`, and with `products`, `(consumers, widths, lefts)`, the issuer's product scratch
