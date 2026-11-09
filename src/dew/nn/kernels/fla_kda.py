@@ -56,6 +56,7 @@ from dew.nn.kernels.chunked_launch import (
     write_rows,
 )
 from dew.nn.kernels.fla_gdn import _dot, _weighted_values
+from dew.nn.residuals import Residual
 
 SUB = algebra.SUB
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over, the algebra's own."""
@@ -932,11 +933,11 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     g, g_lo = g
     aqk, akk = intra_solve(q, k, g, beta, scale=scale, g_lo=g_lo, **kernels)
-    akk = checkpoint_name(akk, 'delta_inverse')
+    akk = checkpoint_name(akk, Residual.DELTA_INVERSE)
     w, u, kg, qg = recompute_w_u(k, v, beta, akk, g, q if keep else None, g_lo=g_lo, **kernels)
     h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, g_lo=g_lo, **kernels)
     o = chunk_fwd_o(q, corrected, g, aqk, h, scale=scale, g_lo=g_lo, wide=wide, **kernels)
-    memory = checkpoint_name((w, kg, qg, h, corrected), 'delta_memory') if keep else None
+    memory = checkpoint_name((w, kg, qg, h, corrected), Residual.DELTA_MEMORY) if keep else None
     return (o, final), (q, k, v, (g, g_lo), beta, aqk, akk, h0, memory, spans)
 
 

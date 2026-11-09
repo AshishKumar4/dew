@@ -29,6 +29,7 @@ from dew.nn import derivatives
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward
+from dew.nn.residuals import Residual
 
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
@@ -249,8 +250,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide,
                                                             rounded=rounded, skip=operands[8], **run)
-        kept = None if recomputed else checkpoint_name(kept, 'delta_memory')
-        return (out, final), (operands, (checkpoint_name(inverse, 'delta_inverse'), kept))
+        kept = None if recomputed else checkpoint_name(kept, Residual.DELTA_MEMORY)
+        return (out, final), (operands, (checkpoint_name(inverse, Residual.DELTA_INVERSE), kept))
 
     def backward(saved, grads):
         operands, (inverse, kept) = saved
