@@ -44,9 +44,12 @@ RESET_TERMS = False
 their gradients are exactly zero in the recurrence and in the chunked form alike (`chunk_mamba3` drops them),
 held to the reference's own residue there, zero; tracing the recurrence's float64 terms for them took 244 s
 and 10 GB a packed site (jsf-m3prof1)."""
+NARROW_ROUTES = tuple(route for route in ROUTES if route in (None, "sm80"))
+"""The routes the bf16 layer's chunked form runs on the template (`on_route`): the interpreter's and an
+A100's; tcgen05's launches take no call of its 8-wide values (`KernelRefused`, jsf-m3route)."""
 NARROW_SEEDS = {None: 8, "sm80": 8}
-"""The bf16 layer's chunked-form site's declared seeds by route (`on_route`), sized by `seeds_for` on armada,
-paired."""
+"""The bf16 layer's chunked-form site's declared seeds by route (`NARROW_ROUTES`), sized by `seeds_for` on
+armada, paired."""
 MIMO_DECODER_SEEDS = {"mamba3 mimo raw": 16, "mamba3 mimo policy": 16}
 """The MIMO decoder's draws' declared seeds, raw and under the policy, sized by `seeds_for` on armada."""
 
@@ -161,7 +164,7 @@ def test_the_chunked_form_is_as_exact_as_the_recurrence(packed, rank):
                     seeds=SEEDS[packed, rank], terms=RESET_TERMS)
 
 
-@pytest.mark.parametrize('route', ROUTES)
+@pytest.mark.parametrize('route', NARROW_ROUTES)
 def test_a_bf16_layers_chunked_form_on_the_template_is_as_exact_as_on_the_portable_math(route):
     """Mamba-3's chunked form on a bf16 layer's operands (`narrow_draw`) on the recurrence template, on each
     GPU's route (`on_route`), output and final state on par with it on the portable math (check 1), which
