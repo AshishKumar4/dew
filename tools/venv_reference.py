@@ -45,6 +45,11 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
                    "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
                    "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")},
+         "vllm-replay": {"test": "test_engine_replay", "worker": "vllm_replay_worker.py", "device": "cuda",
+                         "reference": ("vllm-project/vllm 0.30.0 (its CUDA 12.9 build) with "
+                                       "huggingface/transformers 5.16.1"),
+                         "license": "Apache-2.0", "distribution": ("vllm", "0.30.0+cu129"), "host": True,
+                         "outputs": True},
          "laya": {"test": "test_decision_laya", "worker": "laya_worker.py",
                   "reference": "NandhaKishorM/laya a4a8921afebfd852bba0000475cfb6ab737a124c",
                   "license": "Apache-2.0", "distribution": ("transformers", "5.16.1")},
@@ -80,6 +85,16 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
              "test": "test_flaxdiff_family_source", "arms": case, "worker": "flaxdiff_family_worker.py",
              "reference": "AshishKumar4/FlaxDiff 15c55b001304604147a2a8002a76cf5d4c32092f", "license": "MIT"}
             for case in importlib.import_module("flaxdiff_family_cases").CASES},
+         **{f"multimodal-{family}": {
+             "test": "test_multimodal_model", "arms": family, "worker": "multimodal_worker.py",
+             "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
+             "distribution": ("transformers", "5.16.1")}
+            for family in importlib.import_module("multimodal_families").DRAWN},
+         **{f"multimodal-{family}-text": {
+             "test": "test_multimodal_model", "arms": f"{family}/text", "worker": "multimodal_worker.py",
+             "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
+             "distribution": ("transformers", "5.16.1")}
+            for family in importlib.import_module("multimodal_families").TEXT_DRAWN},
          **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
                                        "worker": "codec_worker.py",
                                        "reference": "neuralmagic/compressed-tensors 0.17.1 with "
@@ -155,7 +170,10 @@ def recording(site: str, python: str, source: str | None, given=None) -> dict[st
         def evaluate(inputs):
             answer = worker.ask({f"case.{key}": value for key, value in inputs.items()})
             reference, truth = arms(answer, "case.")
-            return tuple({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth))
+            # The leaves the reference made that Dew replays (`record_case`), where the worker gives any.
+            replayed = {leaf.removeprefix("case.replayed."): value for leaf, value in answer.items()
+                        if leaf.startswith("case.replayed.")}
+            return (*({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth)), replayed)
 
         narrow = getattr(jnp, known.get("narrow", "float32"))
         dew = ((lambda inputs: run(narrow, inputs)) if known.get("host")

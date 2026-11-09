@@ -85,11 +85,19 @@ def test_every_package_dews_index_serves_resolves_undated(tmp_path, monkeypatch)
     assert all("--exclude-newer-package jax-cuda13-plugin=20" in call for call in calls), calls
 
 
-def test_a_gpu_extra_that_resolves_otherwise_for_aarch64_fails_the_lock(tmp_path, monkeypatch):
-    """Each GPU lock serves aarch64 too only where it pins the same there: one whose aarch64 resolution pins
-    otherwise fails the lock there (train 433's review: a stand-in writing every lock empty never could)."""
+def test_the_gpu_locks_resolve_universal_so_each_machines_pins_sit_under_its_markers(tmp_path, monkeypatch):
+    """Dew's CUDA plugins differ by machine (post67's for x86_64, post45's for aarch64 until its own are
+    built), which no lock resolved for one machine and checked against the other can hold. Each GPU lock
+    resolves for every machine at once, as the cpu lock does, and carries each machine's pins under its
+    markers, so a GH200 installs the same file; the lock is no longer resolved a second time for aarch64
+    to compare, however the machines' pins differ."""
     done, calls = locked(tmp_path, monkeypatch, SPLIT_MACHINE="1")
-    assert done.returncode == 1 and "--python-platform aarch64-manylinux_2_35" in calls[-1], calls[-1:]
+    assert done.returncode == 0, done.stderr
+    for name in ("cuda12", "cuda13"):
+        [call] = [call for call in calls if call.endswith(f"-o locks/{name}.txt")]
+        assert "--universal" in call.split() and "--python-platform" not in call, call
+        assert f"--extra {name} " in call, call
+    assert not any("aarch64.txt" in call for call in calls), calls
 
 
 # 3.12 is the locks' own Python, whose own lock fails first.

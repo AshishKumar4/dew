@@ -555,10 +555,13 @@ def dot_precisions(function, *arguments) -> list:
     sums (`dew.nn.precision.accumulated`) are tests/test_cpu_accumulation.py's."""
     with jax.default_matmul_precision(None):
         graph = jax.make_jaxpr(function)(*arguments)
-    return [(equation.params["precision"],
-             jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
-             tuple(variable.aval.shape for variable in equation.invars))
-            for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
+    # The types the program states, a float64 sum's traced under x64 (`dew.nn.precision.float64_sum`) among
+    # them, read as they are.
+    with jax.enable_x64(new_val=True):
+        return [(equation.params["precision"],
+                 jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
+                 tuple(variable.aval.shape for variable in equation.invars))
+                for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
 
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
@@ -1405,14 +1408,15 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
     `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
-    (a seeded NumPy or torch draw the generator made them by), every array stacked over the seeds on its
-    first axis, the truth in float64, and `<site>.redraw`, check 1's REDRAW it was recorded for. Inputs
-    drawn again are checked against the recording's `<site>.input_digest` (`input_digest`), so a
-    generator that changed since is named, not judged. A draw is `(index, inputs)`, the index an
-    integer `widened` keeps; the reference and the truth read the recorded outputs at it, and Dew's
-    function takes the same two arguments and ignores the index. The recording covers check 1's redraw,
-    (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than running
-    out of recorded seeds.
+    (a seeded NumPy or torch draw the generator made them by), and `<site>.replayed.<name>`, the leaves
+    the reference made that Dew replays (`record_case`), which a seed's inputs carry, every array stacked
+    over the seeds on its first axis, the truth in float64, and `<site>.redraw`, check 1's REDRAW it was
+    recorded for. Inputs drawn again are checked against the recording's `<site>.input_digest`
+    (`input_digest`), so a generator that changed since is named, not judged. A draw is `(index, inputs)`,
+    the index an integer `widened` keeps; the reference and the truth read the recorded outputs at it, and
+    Dew's function takes the same two arguments and ignores the index. The recording covers check 1's
+    redraw, (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than
+    running out of recorded seeds.
 
     A recording of the reference's evidence alone (`record_case(..., summary=True)`: `<site>.mse.<name>`,
     `<site>.worst.<name>`, `<site>.finite.<name>` and `<site>.sketch.<name>` over the seeds, the truth's
@@ -1443,7 +1447,7 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
         prefix = f"{site}.{kind}."
         return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
 
-    inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
+    inputs, reference, truth, replayed = tree("input"), tree("reference"), tree("truth"), tree("replayed")
     narrow = [name for name, value in truth.items()
               if jnp.issubdtype(value.dtype, jnp.floating) and value.dtype != np.float64]
     if narrow:
@@ -1467,12 +1471,14 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
 
     def draw(seed):
         if inputs_of is None:
-            return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
-        drawn = drawn_on_the_host(inputs_of, seed)
-        if input_digest(drawn) != digests[seed]:
-            raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
-                                 f"digest differs); the generator's draw changed since the recording")
-        return np.int32(seed), drawn
+            drawn = {name: value[seed] for name, value in inputs.items()}
+        else:
+            drawn = drawn_on_the_host(inputs_of, seed)
+            if input_digest(drawn) != digests[seed]:
+                raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones "
+                                     f"(their digest differs); the generator's draw changed since the "
+                                     f"recording")
+        return np.int32(seed), {**drawn, **{name: value[seed] for name, value in replayed.items()}}
 
     def lookup(values):
         looked = jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
@@ -1493,7 +1499,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets")
+    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "example_mse",
+             "example_worst")
     verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
@@ -1534,10 +1541,14 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
 
         def leaf(name):
             start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
+            examples = {field: evidence[field][name][row] for field in ("example_mse", "example_worst")
+                        if name in evidence[field]}
             return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
                                 evidence["zero_rows"][name][start:stop],
                                 evidence["zero_errors"][name][start:stop],
-                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]))
+                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]),
+                                **{field: None if np.isnan(value).all() else value
+                                   for field, value in examples.items()})
 
         return {name: leaf(name) for name in mse}
 

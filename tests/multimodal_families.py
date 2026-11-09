@@ -11,3 +11,35 @@ FAMILIES = {
 }
 """Each family's directory of references under tests/fixtures/hf, beside their float64 truths
 (tools/multimodal_reference.py float64), and the checkpoint they were written from."""
+
+OUTPUTS = ("logits", "loss", "pixel_gradient", "updated_logits")
+"""The leaves a family's numerics give: its valid logits, its summed next-token loss, its pixel gradient
+and its logits after one SGD step of every parameter (tools/multimodal_reference.py's `numerics`)."""
+DRAWN = frozenset({"llama4"})
+"""The families on check 1 over drawn images and audio, every leaf of theirs (`OUTPUTS`) resolved and
+recorded as their site (`multimodal-<family>`, tools/multimodal_worker.py); the others hold their leaves
+on their source draw until each resolves."""
+LEARNING_RATE = 1e-4
+"""The rate of the SGD step every family's references and Dew's runs take."""
+TEXT_DRAWN = frozenset({"qwen35"})
+"""The families whose step over drawn token rows alone is a site of its own (`multimodal-<family>-text`),
+its leaves `TEXT_OUTPUTS` every one resolved: their decoder's step, apart from the towers and processors
+(the source draw's tests hold those)."""
+TEXT_OUTPUTS = ("logits", "loss", "updated_logits")
+"""A text site's leaves: a family's numerics but the pixel gradient, which text alone has none of."""
+TEXT_LENGTHS = (32, 28, 24, 20)
+"""A text draw's rows' lengths in tokens, every row but the first right-padded: four rows, as the errors of
+a step over text are ruled by a few of its elements, which a larger draw holds in more of its draws; one
+shape for every draw, which a recording holds its leaves at."""
+TEXT_IDS = (4, 200)
+"""The ids a text draw's tokens are drawn from, its checkpoints' word tokens (`token4` on), short of their
+vision tokens (Qwen3.5's image token is 200)."""
+
+
+def text_rows(ids):
+    """A text draw's `input_ids` and `attention_mask`, `ids` `[rows, most]` each row its `TEXT_LENGTHS`
+    long, right-padded with the pad token 0."""
+    import numpy as np
+
+    mask = np.arange(max(TEXT_LENGTHS))[None, :] < np.asarray(TEXT_LENGTHS)[:, None]
+    return {"input_ids": np.where(mask, ids, 0).astype(np.int64), "attention_mask": mask.astype(np.int64)}

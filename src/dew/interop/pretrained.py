@@ -52,6 +52,7 @@ from dew.interop.generation_config import (
     pad_id,
     read_generation_config,
     return_sequences,
+    source_cache,
     source_decoding,
 )
 from dew.interop.layouts import CROSSING_UNWRITTEN, Unwritable
@@ -1131,7 +1132,7 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
     policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
                                                sampling)
     return loaded.formed(TextGeneration(
-        loaded.model,
+        source_cache(loaded.config, loaded.generation_config, loaded.model),
         loaded.variables,
         loaded.text_processor,
         policy,

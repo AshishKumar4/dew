@@ -16,11 +16,12 @@ from collections.abc import Callable, Hashable, Mapping
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn, struct
 from jax._src import config as jax_config
 from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import Mesh, NamedSharding, PartitionSpec, Sharding
 
 from dew.batch import VALIDITY_FIELD, Variables, coordinates, real_slots
 from dew.inference.tasks import cache_sized
@@ -46,6 +47,9 @@ from dew.nn.kv_cache import (
     grouped,
     is_paged,
     leaf_name,
+    on_device,
+    pages_read,
+    pages_written,
     row_axis,
     with_rounding_keys,
 )
@@ -594,8 +598,9 @@ Formats = Slots
 """A `Slots` whose leaves are `Format`s: the resident layout of each leaf."""
 
 
-def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
-    """Where each leaf of the resident state lives: `state` with a sharding at every leaf.
+def state_shardings(mesh: Mesh | None, state: Slots, *, offloaded: bool = False) -> Slots:
+    """Where each leaf of the resident state lives: `state` with a sharding at every leaf, an offloaded
+    pool's (`KVCache.offloaded`) in pinned host memory.
 
     Every leaf holds one row per slot on axis zero (`activation_batch`),
     except a paged cache's pool, `[kv_heads, pages, page_size, ...]`, whose
@@ -606,10 +611,21 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     vocabulary (`activation_vocab`), as a row's cross-attention keys and
     values keep theirs. `state` is abstract: only its shapes are read.
     """
+    paged = is_paged(state.decoder.cache)
+
+    def kept(path: tuple[jax.tree_util.KeyEntry, ...], sharding: Sharding) -> Sharding:
+        pooled = offloaded and leaf_name(path) in POOLED
+        return sharding.with_memory_kind("pinned_host") if pooled else sharding
+
     if mesh is None:
         device = default_placement()
-        return jax.tree.map(lambda _: device, state)
-    paged = is_paged(state.decoder.cache)
+        # An offloaded pool's on a mesh of the one device, whose sharding's memory kind a trace reads
+        # (`resident_formats`), as a single device's is not.
+        alone = NamedSharding(Mesh(np.asarray(list(device.device_set)), ("rows",)), PartitionSpec())
+        rows = jax.tree.map(lambda _: device, state)
+        return rows.replace(decoder=rows.decoder.replace(cache=jax.tree_util.tree_map_with_path(
+            lambda path, sharding: kept(path, alone) if offloaded and leaf_name(path) in POOLED else sharding,
+            rows.decoder.cache)))
 
     def placed(leaf: jax.ShapeDtypeStruct | jax.Array, *names: str | None) -> NamedSharding:
         axes = (*names, *(None,) * (leaf.ndim - len(names)))
@@ -631,7 +647,8 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
     rows = jax.tree.map(lambda leaf: placed(leaf, "activation_batch"), state)
     return rows.replace(decoder=rows.decoder.replace(
-        cache=jax.tree_util.tree_map_with_path(cached, state.decoder.cache),
+        cache=jax.tree_util.tree_map_with_path(
+            lambda path, leaf: kept(path, cached(path, leaf)), state.decoder.cache),
         logits=placed(state.decoder.logits, "activation_batch", "activation_vocab")))
 
 
@@ -678,9 +695,14 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
         return jax.tree.map(lambda leaf, sharding: None if leaf is None else Format(Layout.AUTO, sharding),
                             half, shardings, is_leaf=lambda leaf: leaf is None)
 
+    def abstract(half: Slots) -> Slots:
+        # Each leaf where it lies, an offloaded pool's in host memory, which the trace reads it as.
+        return jax.tree.map(lambda leaf, sharding: None if leaf is None else jax.ShapeDtypeStruct(
+            leaf.shape, leaf.dtype, sharding=sharding), half, shardings, is_leaf=lambda leaf: leaf is None)
+
     program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
-    arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
-                 grammar, progress)
+    arguments = (model, params, pad_id, placement, steps, abstract(resident), abstract(carried), None,
+                 transforms, stopping, grammar, progress)
     tune(lambda: program.lower(*arguments))
     compiled = program.compiled(*arguments)
     formats = joined(*compiled.output_formats[1][:2])
@@ -766,10 +788,11 @@ def _pages_axis(path: tuple[jax.tree_util.KeyEntry, ...]) -> int:
 
 def _gathered(tree: Variables, places: jax.Array, axis_of: Callable[[tuple], int | None]) -> Variables:
     """Each leaf of `tree` at `places` along its axis `axis_of` names, `[len(places), ...]`, the leaf's
-    every other axis after them, so the host keeps each place alike; None for a leaf it names none of."""
+    every other axis after them, so the host keeps each place alike, an offloaded pool's a page at a time
+    (`pages_read`); None for a leaf it names none of."""
     def read(path, leaf):
         axis = None if leaf is None else axis_of(path)
-        return None if axis is None else jnp.moveaxis(jnp.take(leaf, places, axis=axis), axis, 0)
+        return None if axis is None else pages_read(leaf, places, axis)
 
     return jax.tree_util.tree_map_with_path(read, tree, is_leaf=lambda x: x is None)
 
@@ -777,15 +800,14 @@ def _gathered(tree: Variables, places: jax.Array, axis_of: Callable[[tuple], int
 def _scattered(tree: Variables, places: jax.Array, held: Variables,
                axis_of: Callable[[tuple], int | None]) -> Variables:
     """`tree` with its `places`, `[groups, count]`, each group's own, set to `held`'s, each leaf
-    `[groups, count, ...]` as `_gathered` reads it along the axis `axis_of` names; a place past the leaf
-    is dropped."""
+    `[groups, count, ...]` as `_gathered` reads it along the axis `axis_of` names, an offloaded pool's a
+    page at a time (`pages_written`); a place past the leaf is dropped."""
     def written(path, leaf, values):
         if values is None:
             return leaf
         axis = axis_of(path)
         assert axis is not None
-        flat = jnp.moveaxis(values.reshape(-1, *values.shape[2:]), 0, axis)
-        return leaf.at[(*(slice(None),) * axis, places.reshape(-1))].set(flat.astype(leaf.dtype), mode="drop")
+        return pages_written(leaf, places.reshape(-1), values.reshape(-1, *values.shape[2:]), axis)
 
     return jax.tree_util.tree_map_with_path(written, tree, held, is_leaf=lambda x: x is None)
 
@@ -824,9 +846,14 @@ def _copied_pages(resident: Slots, carried: Slots, sources: jax.Array,
     def copied(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array) -> jax.Array:
         if leaf_name(path) not in POOLED:
             return leaf
-        axis = _pages_axis(path)
-        taken = jnp.take(leaf, jnp.clip(sources, 0, leaf.shape[axis] - 1), axis=axis)
-        return leaf.at[(*(slice(None),) * axis, targets)].set(taken, mode="drop")
+        # A layer's pool at a time where an offloaded bank holds every layer's (`on_device`).
+        axis = _pages_axis(path) - row_axis(path)
+
+        def copy(pool: jax.Array) -> jax.Array:
+            taken = jnp.take(pool, jnp.clip(sources, 0, pool.shape[axis] - 1), axis=axis)
+            return pool.at[(*(slice(None),) * axis, targets)].set(taken, mode="drop")
+
+        return on_device(copy, leaf, banked=bool(row_axis(path)))
 
     cache = jax.tree_util.tree_map_with_path(copied, state.decoder.cache)
     return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))

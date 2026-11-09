@@ -212,6 +212,28 @@ def test_dense_and_attention_equations_use_each_real_length():
     assert attention_flops(np.array([2**32], np.int64), 2, 4, 4, causal=True) == 16.0 * 2**64
 
 
+def test_a_modules_declared_count_is_counted_once_for_each_length_signature():
+    """A module's declared count is kept for the lengths it counted (`dew.nn.flops._declared`): a batch whose
+    rows repeat another's lengths reads the kept count, the module counted again for other lengths, and a
+    count is the module's own (row 4862's host costs)."""
+    calls = []
+
+    @dataclasses.dataclass(frozen=True)
+    class Declared:
+        scale: float
+
+        def model_flops(self, lengths) -> float:
+            calls.append(tuple(np.asarray(lengths).tolist()))
+            return self.scale * float(np.sum(lengths))
+
+    one, other = Declared(2.0), Declared(3.0)
+    assert counted_flops(one, np.array([4, 4])) == counted_flops(one, np.array([4, 4])) == 16.0
+    assert counted_flops(one, np.array([4, 5])) == 18.0
+    assert counted_flops(other, np.array([4, 4])) == 24.0
+    assert counted_flops(one, np.array([4, 4], np.int32)) == 16.0
+    assert calls == [(4, 4), (4, 5), (4, 4), (4, 4)]
+
+
 def test_windowed_and_chunked_attention_do_not_count_unread_pairs():
     lengths = np.array([8], np.int64)
     assert attention_flops(lengths, 2, 4, 4, causal=True, window=4) == 32 * (8 * 4 - 4 * 4 / 2)
@@ -475,6 +497,21 @@ def test_lm_counts_only_the_prediction_depths_the_loss_trains(mtp_weight):
     assert objective.training_flops(None, batch) == 3 * (trunk + depths)
 
 
+@pytest.mark.parametrize("exit_entropy", [None, 0.1])
+def test_lm_counts_the_head_over_every_pass_the_exit_objective_scores(exit_entropy):
+    """Ouro's exit objective (`LMObjective.exit_entropy`) scores each of a loop's three passes through the
+    head, so its forward and its training count the head three times; without it the last pass's
+    alone."""
+    model = decoder(loop=Loop(3, layers=(1, 3), exit_gate=True))
+    objective = LMObjective(model, seq_len=6, exit_entropy=exit_entropy)
+    batch = packed_batch()
+    passes = 1 if exit_entropy is None else 3
+    trunk = model.model_flops(objective.real_lengths(batch))
+    head = model.logits_flops(objective._prediction_lengths(batch))
+    assert objective.model_flops(None, batch) == trunk + passes * head
+    assert objective.training_flops(None, batch) == 3 * (trunk + passes * head)
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_prediction_depth_work_excludes_pad_holes_and_unscored_document_boundaries(packed):
     model = decoder(num_nextn_predict_layers=2)
@@ -694,13 +731,19 @@ GATED_NORM_SITES = ("embedding_layernorm", "norm", "input_layernorm", "post_atte
     {"embedding_norm": True, "embedding_norm_reads": "lookup", "embedding_features": 4},
     {"loop": Loop(3, reinject=True)},
     {"loop": Loop(3, layers=(1, 2)), "final_norm": False},
-], ids=["projected-lookup", "reinjecting-loop", "stepped-loop-unnormed-end"])
+    {"loop": Loop(3, exit_gate=True)},
+    {"loop": Loop(3, layers=(0, 2), exit_gate=True)},
+    {"loop": Loop(3, exit_gate=True), "final_norm": False},
+], ids=["projected-lookup", "reinjecting-loop", "stepped-loop-unnormed-end", "gated-loop", "gated-loop-coda",
+        "gated-loop-unnormed-end"])
 def test_gated_norms_count_each_run_at_its_width(fields):
     """A norm gated by a low-rank map of its own output (`NormSpec.gate_rank`, A.X-K2's) counts its gate's
     two maps each time a call runs it, at its width: the embedding's at the lookup's where it norms the
     lookup before `project_in`, the final one's after the stack and before or between a loop's passes
-    (seven runs of a reinjecting loop of three, two of a stepped one whose stack ends in no norm), and a
-    layer's before its sublayers: as many products as the forward traces beside the ungated decoder's."""
+    (seven runs of a reinjecting loop of three, two of a stepped one whose stack ends in no norm; under an
+    exit gate each pass's exit read through it, which serves the step's norm where no coda runs between
+    them, and none where the stack ends in no norm), and a layer's before its sublayers: as many products
+    as the forward traces beside the ungated decoder's."""
     lengths = np.array([4, 4], np.int64)
     operands = (jnp.ones((2, 4), jnp.int32),)
 

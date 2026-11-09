@@ -77,7 +77,8 @@ def test_a_decoder_is_as_exact_as_its_reference(name, dtype):
     pretrained = Pretrained.load(str(directory), dtype=dtype, attention_impl="reference")
     draw = fixture_ids(directory)
     if dtype == "bfloat16" and name in NARROW_ROUTED:
-        truth_model = Pretrained.load(str(directory), dtype="float64", attention_impl="reference")
+        with jax.enable_x64(new_val=True):
+            truth_model = Pretrained.load(str(directory), dtype="float64", attention_impl="reference")
         draw = clearing_selections(truth_model, draw, f"{name} {dtype}", tries=256, margin=NARROW_MARGIN)
     source = transformers_model(directory)
     narrow = source if dtype == "float32" else transformers_model(directory, dtype=dtype)

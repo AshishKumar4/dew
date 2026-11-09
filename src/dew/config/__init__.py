@@ -1764,13 +1764,15 @@ class RunConfig:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
         stages, `data_seed` and `data_plan_version`, the training read bounded to `trainer.examples` where
         the run counts them, or to `trainer.epochs` passes over its source examples where its read has no
-        record count, so its length is read off the loader this returns."""
+        record count, so its length is read off the loader this returns; its loading workers sized for
+        `trainer.steps` (`dew.data.Loading.resolved`)."""
         # At the version `resumed` resolves (itself where `prepare` or `readied` resolved it; a run built
         # alone, `build_run`, resolves it here), which it always states.
         planned = self.resumed(("data_plan_version",)).data_plan_version
         assert planned is not None
-        return fitted(dataset, validation, objective=objective, seed=self.data_seed,
-                      examples=self.trainer.examples, epochs=self.trainer.epochs, plan_version=planned)
+        trainer = self.trainer
+        return fitted(dataset, validation, objective=objective, seed=self.data_seed, plan_version=planned,
+                      examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -2083,26 +2085,23 @@ class RunConfig:
         return self.prepare().inspected(trainer.name or "inspected")
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
-        """The run's optimizer as it trains under `name`: each group it names that claims the modules its
-        objective draws fresh beside a loaded base matching those that hold a parameter
-        (`ParamGroup.fresh`, `trained_modules`). Where it names none, a resumed run trains in the groups
-        its record names, as its optimizer state holds them (none for a record written before runs took
-        them), and a new run that draws such modules in their default groups (`OptimConfig.fresh_groups`).
+        """The run's optimizer as it trains under `name`: a resumed run trains in the groups its record
+        names, as its optimizer state holds them (its own for a record written before runs took them); a
+        new run that draws modules fresh beside a loaded base in the groups that claim them, each matching
+        those that hold a parameter (`ParamGroup.fresh`, `trained_modules`): its own, or its named ones
+        with the fresh group beside them, or none named, the default groups (`OptimConfig.fresh_groups`).
         Every process agrees on the groups before any records them."""
         def resolved() -> JSON:
             named = self.optim.param_groups
-            if not named:
-                checkpoints = self.trainer.checkpoints(name)
-                saved = epath.Path(checkpoints.directory) / RUN_FILE
-                recorded = recorded_param_groups(saved) if checkpoints.resumed(
-                    self.trainer.resume) is not None and saved.exists() else None
-                if recorded is not None:
-                    return to_record(recorded, tuple[ParamGroup, ...])
-            groups = named or self.optim.fresh_groups()
-            modules, leaves = trained_modules(objective, objective.fresh_modules()) if any(
-                group.fresh for group in groups) else ((), ())
-            if not named and not modules and not leaves:
-                return to_record((), tuple[ParamGroup, ...])
+            checkpoints = self.trainer.checkpoints(name)
+            saved = epath.Path(checkpoints.directory) / RUN_FILE
+            recorded = recorded_param_groups(saved) if checkpoints.resumed(
+                self.trainer.resume) is not None and saved.exists() else None
+            if recorded is not None:
+                return to_record(recorded, tuple[ParamGroup, ...])
+            modules, leaves = trained_modules(objective, objective.fresh_modules())
+            # A group named fresh claims what the run draws, or is refused where it draws none (`with_fresh`).
+            groups = self.optim.fresh_groups() if modules or leaves else named
             claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
             return to_record(claimed.param_groups, tuple[ParamGroup, ...])
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
@@ -2227,33 +2226,50 @@ class DecoderRunConfig(RunConfig):
     """Checkpoint every pass of the loop, including the first, and recompute
     it in the backward pass; requires a loop and leaves decoding unchanged.
     False keeps a checkpoint's own choice."""
+    loop_implicit: bool = False
+    """Relax each later pass toward the block's input by a per-channel θ drawn
+    at zero (`Loop.implicit`), so the looped decoder starts as the one loaded
+    computes; False keeps a checkpoint's own choice."""
+    loop_exit_gate: bool = False
+    """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which an
+    objective's `exit_entropy` trains as Ouro does; False keeps a checkpoint's own choice."""
+    loop_exit_threshold: float | None = None
+    """Exit each token at the first pass whose cumulative exit probability reaches this
+    (`Loop.exit_threshold`); None keeps a checkpoint's own choice."""
 
     @property
     def loops(self) -> bool:
         """Whether the run asks anything of a loop (`looped`)."""
         return (self.loop_steps is not None or self.loop_layers is not None
-                or self.loop_backprop_steps is not None or self.loop_remat)
+                or self.loop_backprop_steps is not None or self.loop_remat or self.loop_implicit
+                or self.loop_exit_gate or self.loop_exit_threshold is not None)
 
     def looped(self, start: "Pretrained") -> "Pretrained":
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
         return looping(start, self.loop_steps, self.loop_layers, backprop_steps=self.loop_backprop_steps,
-                       remat=self.loop_remat or None, key=self.trainer.key)
+                       remat=self.loop_remat or None, implicit=self.loop_implicit or None,
+                       exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
+                       key=self.trainer.key)
 
 
 def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
             backprop_steps: int | None = None, remat: bool | None = None,
-            key: int | jax.Array = 0) -> "Pretrained":
+            implicit: bool | None = None, exit_gate: bool | None = None,
+            exit_threshold: float | None = None, key: int | jax.Array = 0) -> "Pretrained":
     """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
-    the loop's backward memory; None keeps a looped checkpoint's own value. A loop that gives its
-    layers parameters of their own draws them from `key` beside the loaded weights, fresh
-    (`Pretrained.with_model`)."""
+    the loop's backward memory, `implicit` its later passes' rule (`Loop.implicit`), and `exit_gate` and
+    `exit_threshold` its exits (`Loop.exit_gate`); None keeps a looped checkpoint's own value. A loop
+    that gives its layers parameters of their own (an implicit loop's θ, an exit gate) draws them from
+    `key` beside the loaded weights, fresh (`Pretrained.with_model`)."""
     from dew.nn.protocols import Looping
 
-    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
+    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat,
+                                      implicit=implicit, exit_gate=exit_gate,
+                                      exit_threshold=exit_threshold)
               if isinstance(start.model, Looping) else None)
     if looped is None:
         raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "

@@ -409,7 +409,8 @@ def test_a_text_sft_trainers_gradient_is_the_objectives(source):
     """The text SFT trainer's gradient is the objective's at the step's draws over drawn batches
     (`varied`), the float64 twin of the loaded fixture the truth (`assert_the_objectives_gradient`)."""
     obj, batch, _, run_key, variables = text_run(source)
-    wide = objective(Pretrained.load(FIXTURE, dtype="float64", attention_impl="xla", max_seq_len=32))
+    with jax.enable_x64(new_val=True):
+        wide = objective(Pretrained.load(FIXTURE, dtype="float64", attention_impl="xla", max_seq_len=32))
     assert_the_objectives_gradient(obj, wide, batch, run_key, variables, UPDATE_SEEDS["text"],
                                    batches=varied(batch, UPDATE_ROWS))
 
@@ -556,9 +557,10 @@ def test_an_image_sft_trainers_gradient_is_the_objectives(image_source):
     loaded multimodal fixture the truth (`assert_the_objectives_gradient`)."""
     _, inputs, obj, variables, _ = image_source
     batch, _, run_key = image_run(inputs)
-    wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64", attention_impl="xla",
-                           max_seq_len=32)
-    twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
+    with jax.enable_x64(new_val=True):
+        wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64",
+                               attention_impl="xla", max_seq_len=32)
+        twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
     assert_the_objectives_gradient(obj, twin, batch, run_key, variables, UPDATE_SEEDS["image"])
 
 

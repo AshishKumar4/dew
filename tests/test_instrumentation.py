@@ -25,7 +25,7 @@ from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
+from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops, step_flops
 from dew.training import Trainer
 from dew.training.interval import Interval
 
@@ -200,8 +200,10 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
 
 def a_fused_attention_counts_the_pairs_its_mask_computes(window):
     """A causal kernel computes about half the scores, a sliding window fewer: the forward's two
-    products and the backward's four count one multiply-add per pair it reaches, head and width.
-    On an H100 FlashAttention-3 counted the whole square of a causal call, twice its work."""
+    products and the backward's four count one multiply-add per pair it reaches, head and width, the
+    model's work, and the hardware's adds the backward's recomputed `Q K^T`, which the kernel kept off
+    memory (row 3948). On an H100 FlashAttention-3 counted the whole square of a causal call, twice its
+    work."""
     batch, length, heads, width = 1, 256, 2, 128
     shape = jax.ShapeDtypeStruct((batch, length, heads, width), jnp.bfloat16)
     spans = {} if window is None else {"local_window_size": (window, 0)}
@@ -213,10 +215,11 @@ def a_fused_attention_counts_the_pairs_its_mask_computes(window):
         return attend(q, k, v).astype(jnp.float32).sum()
 
     pairs = sum(min(row, length if window is None else window) + 1 for row in range(length))
-    forward = compiled_flops(jax.jit(attend).lower(shape, shape, shape).compile())
-    both = compiled_flops(jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(shape, shape, shape).compile())
-    assert forward == 2 * 2 * batch * heads * pairs * width
-    assert both == (2 + 4) * 2 * batch * heads * pairs * width
+    product = 2 * batch * heads * pairs * width
+    forward = step_flops(jax.jit(attend).lower(shape, shape, shape).compile())
+    both = step_flops(jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(shape, shape, shape).compile())
+    assert forward is not None and (forward.model, forward.hardware) == (2 * product, 2 * product)
+    assert both is not None and (both.model, both.hardware) == ((2 + 4) * product, (2 + 4 + 1) * product)
 
 
 def test_a_fused_attention_counts_its_value_product_at_the_values_width():

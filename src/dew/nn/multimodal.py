@@ -25,12 +25,13 @@ from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
 from dew.nn.progress import Progress
-from dew.nn.protocols import OutputTable, ProjectionGroup, ReadsTrain, held_groups
+from dew.nn.protocols import ExitPasses, OutputTable, ProjectionGroup, ReadsTrain, held_groups
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import ProjectorBase, TowerBase, TowerGeometry
 from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
+    from dew.nn.backbones.decoder_stack import Loop
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
     from dew.nn.hyper_connections import HyperConnections
@@ -464,7 +465,8 @@ class MultimodalTransformer(DecoderWrapper):
                       image_groups=None, block_groups=None, rotary_positions=None,
                       audio_indices=None, routed_experts=None, routed=None,
                       coordinates: Coordinates | None = None, whole_blocks: bool = False,
-                      progress: Progress | None = None):
+                      progress: Progress | None = None, attention_pairwise_mask=None,
+                      attention_key_positions=None, attention_key_runs=None, attention_key_valid=None):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads, and `image_indices` and
@@ -474,9 +476,12 @@ class MultimodalTransformer(DecoderWrapper):
         `routed_experts` and `routed` replay a routing record and go to the
         language model unchanged. Engines record a row for every placeholder
         position too, so the `[B, S, layers, top_k]` layout matches the text.
-        `coordinates`, `whole_blocks` and `progress` are the language model's
-        (`CausalTransformer.hidden_and_mtp_inputs`): the tokens as the decoder reads them, so the
-        cursor counts the places the layers do.
+        `coordinates`, `whole_blocks`, `progress` and the keys each token reads
+        (`attention_pairwise_mask`, `attention_key_positions`, `attention_key_runs`,
+        `attention_key_valid`) are the language model's (`CausalTransformer.hidden_and_mtp_inputs`):
+        the tokens as the decoder reads them, so the cursor counts the places the layers do. The
+        media replace their placeholders in place, so a token's keys are the same places with media
+        fused as without.
         """
         if decode:
             allocated = self.has_variable("cache", POSITION)
@@ -508,7 +513,9 @@ class MultimodalTransformer(DecoderWrapper):
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
             image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
             media_mask=fused.media, routed_experts=routed_experts, routed=routed, coordinates=coordinates,
-            conditioning=context, whole_blocks=whole_blocks, progress=progress)
+            conditioning=context, whole_blocks=whole_blocks, progress=progress,
+            attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
+            attention_key_runs=attention_key_runs, attention_key_valid=attention_key_valid)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
@@ -613,11 +620,26 @@ class MultimodalTransformer(DecoderWrapper):
         self.variable("cache", POSITION, jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
 
+    @property
+    def loop(self) -> Loop | None:
+        """The language model's loop (`CausalTransformer.loop`)."""
+        return self.language_model.loop
+
+    @nn.nowrap
+    def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses:
+        """The language model's (`CausalTransformer.exit_passes`), from its scope of `collections`."""
+        scoped = {name: tree["language_model"] for name, tree in collections.items()
+                  if "language_model" in tree}
+        return self.language_model.exit_passes(scoped)
+
     @nn.nowrap
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
-                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None:
+                    backprop_steps: int | None = None, remat: bool | None = None,
+                    implicit: bool | None = None, exit_gate: bool | None = None,
+                    exit_threshold: float | None = None) -> Self | None:
         language_model = self.language_model.with_passes(steps, layers, backprop_steps=backprop_steps,
-                                                         remat=remat)
+                                                         remat=remat, implicit=implicit, exit_gate=exit_gate,
+                                                         exit_threshold=exit_threshold)
         return None if language_model is None else self._over(language_model)
 
     @nn.nowrap

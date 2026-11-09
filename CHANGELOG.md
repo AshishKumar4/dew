@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `dew.telemetry.benchmark.exclusive_window(cores=None)` holds a job's measured region alone on its node's GPUs
+  where a node's session runs the job. It asks the session for a window (`$OUT/window`, a byte to
+  `$SESSION/wake`), waits for the grant, synchronizes the device and runs the block; on exit it synchronizes,
+  gives the window back and waits for the session to take back what it gave. A session that cannot give it
+  raises `WindowRefused`. Without `$SESSION` it does nothing. `tools/timing.py` runs each case's rounds, and its
+  profiles, inside one, so a timing or profile job shares its node with other jobs through its builds and holds
+  the GPUs alone only for what it measures.
 - Dreamer 4's tokenizer (`CausalTokenizer`) reads its tokens' places by two-axis rotary positions
   (`positions="rotary"`, the default), as the paper does, and RMS-normalizes its latents before the
   squeeze; tutorial 12's tokenizer, trained 8,000 updates, now reconstructs its balls (held-out squared
@@ -122,7 +129,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post66: a Mosaic GPU fragmented array's negation and copysign are float
+- Dew requires its JAX build 0.12.0.1.post67: each Mosaic GPU object's PTX assembles for its own target, so a
+  process that compiles kernels for two GPUs assembles each for its own capability (post67's x86_64 plugins;
+  aarch64 keeps post45's until its own are built, ledger row 5211); a compile-only GPU client keys its platform
+  by the loaded CUDA runtime, as a live client does, so a host's compile-ahead entries are the ones a live run
+  there reads; a TMEM load takes the registers each transfer moves (`plgpu.async_load_tmem(..., max_registers=)`,
+  32 by default), so an sm100 kernel whose grouped `tcgen05.ld` made ptxas spill loads in narrower transfers; a
+  dumped Mosaic GPU resource estimate names its kernel and the hash its custom call carries; and Pallas's Mosaic
+  GPU interpreter checks only the ending device's barriers, so a mesh's devices' kernels may end at different
+  times; post66: a Mosaic GPU fragmented array's negation and copysign are float
   instructions, so a WGMMA accumulator negated or sign-copied in a Pallas kernel lowers; post65: a host callback returns its results at its program's lowered
   precision, so a float64 callback compiled under `jax.enable_x64` and run on another thread keeps float64;
   post64: Pallas Mosaic GPU can keep each kernel it lowers under a key of all
@@ -152,8 +167,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
   its body on every Pallas backend and is checked within its body under `checkify`; and a step compiled ahead
   for an A100 on a host with no GPU lowers its Mosaic kernels for the A100, not an H100 (docs/installation.md
-  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post60
-  changed Python alone, and their native code is the same.
+  lists each fix). The `cuda12` and `cuda13` extras name post67's CUDA and PJRT plugins on x86_64 and keep
+  post45's on aarch64, and the `kernel-compile` extra's (x86_64 only) are post67's: post46 to post66 changed
+  Python alone, so the plugins' native code is post45's but for post67's assembly target. aarch64 therefore
+  remains affected by the assembly-target defect for any process that compiles for more than one GPU target.
+  The GPU locks (`locks/cuda12.txt`, `locks/cuda13.txt`) resolve for every machine at once, as `locks/cpu.txt`
+  does, each carrying every machine's pins under its markers, so a GH200 installs the same file; the lock
+  script no longer checks that aarch64 resolves the same pins.
 - FlashAttention's wrapper, `dew-flash-attn` 0.3.7, folds a mapped kernel call (`jax.vmap` over attention,
   as a batched model's step maps it) into the kernel's own batch, one launch a group of calls within its
   grid, where 0.3.6 refused to map an FFI call.

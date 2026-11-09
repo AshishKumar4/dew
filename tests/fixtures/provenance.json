@@ -115,10 +115,6 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
    "note": "--granitemoe-only; PowerMoE embedding/residual/attention/logit multipliers, packed input_linear/output_linear and nested router names."
   },
-  "laya/tiny/logits.npz": {
-   "tool": "tools/laya_reference.py",
-   "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "laya/real/logits.npz": {
    "tool": "tools/laya_reference.py",
    "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -1544,50 +1540,6 @@
    ],
    "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
   },
-  "hf/llama4-native-tiny/logits_f64.npy": {
-   "tool": "tools/multimodal_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.17.0",
-     "runs": "transformers"
-    }
-   ],
-   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
-  },
-  "hf/llama4-native-tiny/pixel_gradient_f64.npy": {
-   "tool": "tools/multimodal_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.17.0",
-     "runs": "transformers"
-    }
-   ],
-   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
-  },
-  "hf/llama4-native-tiny/training_f64.json": {
-   "tool": "tools/multimodal_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.17.0",
-     "runs": "transformers"
-    }
-   ],
-   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
-  },
-  "hf/llama4-native-tiny/updated_logits_f64.npy": {
-   "tool": "tools/multimodal_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.17.0",
-     "runs": "transformers"
-    }
-   ],
-   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
-  },
   "hf/qwen35-native-tiny/logits_f64.npy": {
    "tool": "tools/multimodal_reference.py",
    "sources": [
@@ -2088,37 +2040,6 @@
     }
    ],
    "note": "Expected processor tokens, explicitly compared in tests/test_multimodal_model.py:551."
-  },
-  "hf/llama4-native-tiny/logits.npy": {
-   "tool": "tools/multimodal_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
-  },
-  "hf/llama4-native-tiny/pixel_gradient.npy": {
-   "tool": "tools/multimodal_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ]
-  },
-  "hf/llama4-native-tiny/updated_logits.npy": {
-   "tool": "tools/multimodal_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/transformers",
-     "version": "5.16.1",
-     "runs": "transformers"
-    }
-   ],
-   "note": "Actual wrapper output after all-parameter SGD."
   },
   "hf/llama4-tiny-mm/projector_ref.npy": {
    "tool": "tools/hf_reference.py",
