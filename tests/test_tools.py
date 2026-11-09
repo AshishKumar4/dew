@@ -1435,7 +1435,8 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     that falls through to the loop's exit retries nothing. A notebook's display reaches its frontend,
     another process, so its frames redrawn on a clock are at that boundary, while a representation
     built round a loop publishes nothing; the kernel's accounting of the process, read from its /proc
-    files, is outside it too, so a high-water sampled on a clock is at that boundary."""
+    files, is outside it too, so a high-water sampled on a clock is at that boundary, where a loop that
+    only names such a file is not."""
     assert_reported(tmp_path, "src/sparx/waits.py", ("import concurrent.futures\n"
         "import subprocess\n"
         "import time\n"
@@ -1541,7 +1542,11 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "    return Path('/proc/self/smaps_rollup').read_text()\n"
         "def high_water(done):\n"
         "    while not done.wait(0.002):\n"
-        "        pages()\n"), "SLOP018", (5, 8, 12, 38, 44, 48, 50, 66, 86, 99))
+        "        pages()\n"
+        "def labelled(done):\n"
+        "    label = '/proc/self/status'\n"
+        "    while not done.wait(0.002):\n"
+        "        label.upper()\n"), "SLOP018", (5, 8, 12, 38, 44, 48, 50, 66, 86, 99, 109))
 
 
 def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):

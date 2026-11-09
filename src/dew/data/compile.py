@@ -25,7 +25,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
-import jax
 import numpy as np
 
 from dew._records import JSON, integer, json_value
@@ -820,6 +819,7 @@ def compile(
             resume=resume,
             plan_version=plan_version,
             steps=steps,
+            budget=tokens,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
@@ -1078,15 +1078,6 @@ def _output_batch(pipeline: Pipeline) -> int:
     return next(stage.size for stage in pipeline.stages if isinstance(stage, BatchStage))
 
 
-def _shares() -> int:
-    """The shares a run's processes make each batch's rows in (`DataPartition`), as automatic loading
-    sizes each process's workers for its own (`Loading.resolved`'s `shares`): one a process, the most a
-    mesh that splits its batch over every process cuts it into, where the mesh that reads it is not built
-    yet; processes that read one share alike (`DataPartition.readers`) each make that share whole, so
-    their Python a batch is counted short and they size fewer workers, never more than they pay for."""
-    return jax.process_count()
-
-
 def _validation_build(build: _Build, validation: Pipeline, read: Read) -> _Build:
     """The build a validation pass of `validation` reads by: training's loading as the chain states it,
     not as training resolved it, sized for its own pass (`_Build.tuned` over `pass_batches`): a reader opens
@@ -1095,7 +1086,7 @@ def _validation_build(build: _Build, validation: Pipeline, read: Read) -> _Build
     held = dataclasses.replace(build, lowering=_analyzed(validation, read, validation=True), training=False,
                                batch=_output_batch(validation), named=_own_key(validation))
     passed = held.pass_batches(validation) if held.loading.workers == "auto" else None
-    return held.tuned(validation, batches=passed, shares=_shares())
+    return held.tuned(validation, batches=passed)
 
 
 def _run_batches(staged: _Staged, *, steps: int | None, examples: int | None, epochs: int | None,
@@ -1166,7 +1157,7 @@ def _compiled(
         stores=tuple(store for source in sources for store in _token_stores(source)),
         version=build.version,
     )
-    tuned = build.tuned(train, batches=batches, shares=_shares())
+    tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
     build = tuned.pooled(train)
     train_host, device = _batch_steps(train)
@@ -1322,19 +1313,30 @@ def _compile_phases(
     resume: Literal["exact", "non-exact"],
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
+    budget: int | None = None,
 ) -> Loader:
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
 
-    def planned(index: int) -> int | None:
-        """The batches phase `index` reads of a run of `steps`, which automatic loading sizes its workers
-        for (`Loading.resolved`): its own steps on the step clock, else the run's."""
-        if steps is None or tokens:
-            return steps
-        start = source.ends[index - 1] if index else 0
+    def planned(index: int, phase: _Staged) -> int | None:
+        """The batches phase `index` reads, which automatic loading sizes its workers for
+        (`Loading.resolved`): of a run of `steps`, its own steps on the step clock, else the run's; of a
+        run of `budget` tokens, its own span of them on the token clock, else the run's, over the most a
+        batch of it holds (`_run_batches`)."""
+        start = (source.ends[index - 1] if index else 0) or 0
         until = source.ends[index]
-        return max(0, (steps if until is None else min(until, steps)) - (start or 0))
+
+        def span(length: int) -> int:
+            return max(0, (length if until is None else min(until, length)) - start)
+
+        if steps is not None:
+            return steps if tokens else span(steps)
+        if budget is None:
+            return None
+        return _run_batches(phase, steps=None, examples=None, epochs=None,
+                            tokens=span(budget) if tokens else budget)
+
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
     def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
@@ -1379,7 +1381,7 @@ def _compile_phases(
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
-        loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index))
+        loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index, phase))
         if built and loaded.device != built[0][0].device:
             # The run applies one set of device steps to every batch (`Loader.device`), so a phase
             # whose own differ would run the first phase's.
@@ -1408,8 +1410,8 @@ def _compile_phases(
         if tokens and index:
             consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
             if any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
-                loader = _compiled(staged_at(index, consumed), packed, host=host, resume=resume,
-                                   batches=planned(index))
+                phase = staged_at(index, consumed)
+                loader = _compiled(phase, packed, host=host, resume=resume, batches=planned(index, phase))
         return counted(loader)
 
     batches = tuple(phase.build.batch for phase, _ in staged)

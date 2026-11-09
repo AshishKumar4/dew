@@ -1387,7 +1387,21 @@ representations, such as `HTML`, are built in the process; a process group `dew.
 KERNEL_FILES = "/proc/"
 """The kernel's own accounting of a process, read from its files (the pages it holds,
 /proc/self/smaps_rollup): outside the process as a subprocess is, no work of the process orders or wakes
-it, so a region's high-water of it is sampled."""
+it, so a region's high-water of it is sampled. A function deals with it where it opens such a file by a
+path it spells (`KERNEL_READERS`), not where it names one."""
+
+KERNEL_READERS = frozenset({"builtins.open", "io.open", "os.open", "pathlib.Path"})
+"""What opens a file by its path: `open`, and a `Path` read after it is made."""
+
+
+def _kernel_read(node: ast.AST, table: Mapping[str, str]) -> bool:
+    """Whether `node` opens one of the kernel's files (`KERNEL_FILES`) by a path it spells, through
+    `KERNEL_READERS`: the builtin `open` unimported, or a name resolved through its imports."""
+    if not (isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant)
+            and str(node.args[0].value).startswith(KERNEL_FILES)):
+        return False
+    builtin = isinstance(node.func, ast.Name) and node.func.id not in table
+    return (f"builtins.{node.func.id}" if builtin else scopes.resolved(node.func, table)) in KERNEL_READERS
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
@@ -1718,7 +1732,7 @@ def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[in
             path = scopes.resolved(node, tables.get(id(node), {}))
             if path and f"{path}.".startswith(EXTERNAL):
                 return True
-        if isinstance(node, ast.Constant) and str(node.value).startswith(KERNEL_FILES):
+        if _kernel_read(node, tables.get(id(node), {})):
             return True
         if isinstance(node, ast.Call):
             for helper in calls.reached(scope, node):
