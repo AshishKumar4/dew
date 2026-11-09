@@ -6,6 +6,8 @@ kernel as the gather reads it; and a pool nobody hands out refuses to alias
 rows.
 """
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,6 +19,7 @@ from reference_error import assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels import generation
 from dew.nn.kv_cache import (
     KVCache,
     KVStore,
@@ -475,6 +478,107 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
     rows = "data" if "data" in axes else None
     arguments = (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, rows))
     tpu_lowering(step, arguments, mesh)
+
+
+def _kernels_run(step: Callable[[], object]) -> list[str]:
+    """The Pallas kernels `step()` runs, by their kernel function's name, run eagerly on this CPU
+    (`jax.disable_jit`: a conditional runs the branch its predicate takes, a loop each trip): each kernel's
+    launch records its name and stands in zeros for its outputs."""
+    from jax._src.pallas.pallas_call import pallas_call_p
+
+    ran: list[str] = []
+
+    def launched(*args, jaxpr, out_avals, **params):
+        del args, params
+        ran.append(jaxpr.debug_info.func_name)
+        return [jnp.zeros(aval.shape, aval.dtype) for aval in out_avals]
+
+    held = pallas_call_p.impl
+    pallas_call_p.def_impl(launched)
+    try:
+        with jax.disable_jit():
+            step()
+    finally:
+        pallas_call_p.def_impl(held)
+    return ran
+
+
+def _paged_decoder() -> CausalTransformer:
+    """A bf16 decoder of two layers whose cache is paged 16 slots a page, its heads 128 wide (the TPU paged
+    kernel's lanes)."""
+    return CausalTransformer(vocab_size=29, emb_features=32, num_layers=2, num_heads=4, num_kv_heads=2,
+                             head_dim=128, mlp_features=64, max_seq_len=64, dtype="bfloat16",
+                             kv_cache=KVCache(page_size=16))
+
+
+@pytest.mark.parametrize(("segments", "paged"), [(None, True), ([[1] * 4 + [2] * 3] * 2, False)],
+                         ids=["one-document-a-row", "packed"])
+def test_a_tpu_decode_step_runs_its_paged_kernel_where_each_row_holds_one_document(segments, paged):
+    """A decode step over a paged cache on a TPU (v6e, assumed on this CPU), each layer unwindowed: where
+    each row holds one document the step runs the TPU's paged kernel in each layer and no other, as a step
+    no row's own document narrows (`CausalSelfAttention._attended`); where a row was prefilled packed, its
+    query reads its last document alone from that document's first key, which the paged kernel does not
+    take, so the step runs it in no layer (the gathered rows through the layer's attention, as
+    test_a_packed_prefill_decodes_its_last_document_as_that_document_alone holds them on par). A cache that
+    numbers its documents whether or not a call names them used to take every step past the paged kernel."""
+    from dew.batch import coordinates
+
+    decoder = _paged_decoder()
+    params = decoder.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
+    _, made = decoder.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])
+    prompt = jax.random.randint(jax.random.key(1), (2, 7), 0, 29)
+    named = None if segments is None else coordinates(segments=jnp.asarray(segments))
+    _, held = decoder.apply({**params, "cache": made["cache"]}, prompt, decode=True, mutable=["cache"],
+                            coordinates=named)
+    with generation.assumed("v6e"):
+        ran = _kernels_run(lambda: decoder.apply({**params, "cache": held["cache"]}, jnp.asarray([[3], [5]]),
+                                                 decode=True, mutable=["cache"]))
+    assert ran == ["paged_flash_attention_kernel_inline_seq_dim"] * decoder.num_layers * paged
+
+
+def _branches_holding(jaxpr, name: str) -> list[tuple[bool, ...]]:
+    """For each conditional of `jaxpr` and the jaxprs it calls (a scan's body, a call's), whether each of
+    its branches launches the Pallas kernel `name`."""
+    from jax._src.core import jaxprs_in_params
+    from jax._src.pallas.pallas_call import pallas_call_p
+
+    def launches(jaxpr) -> bool:
+        return any((eqn.primitive is pallas_call_p and eqn.params["jaxpr"].debug_info.func_name == name)
+                   or any(launches(inner) for inner in jaxprs_in_params(eqn.params))
+                   for eqn in jaxpr.eqns)
+
+    found = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive is jax.lax.cond_p:
+            found.append(tuple(launches(branch.jaxpr) for branch in eqn.params["branches"]))
+        for inner in jaxprs_in_params(eqn.params):
+            found += _branches_holding(inner, name)
+    return found
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_tpu_decode_steps_paged_kernel_stays_one_branch_of_a_conditional_on_a_mesh_splitting_rows():
+    """The step's choice between the paged kernel and the gathered rows (`CausalSelfAttention._attended`)
+    stays a conditional, which runs one branch, under the layers' scanned stack and on a v6e mesh splitting
+    the rows (a select under a vectorizing map would run both): traced for that mesh, the paged kernel lies in
+    conditionals, in one branch of each."""
+    from sharded import placed, tpu_mesh
+
+    mesh = tpu_mesh(data=2)
+    decoder = _paged_decoder().clone(scan_layers=True)
+    tokens = jax.ShapeDtypeStruct((2, 1), jnp.int32)
+    params = jax.eval_shape(decoder.init, jax.random.key(0), tokens)
+    cache = jax.eval_shape(lambda params: decoder.apply(params, 2, method=CausalTransformer.init_cache,
+                                                        mutable=["cache"])[1]["cache"], params)
+
+    def step(params, cache, tokens):
+        return decoder.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
+
+    with generation.assumed("v6e"), jax.set_mesh(mesh):
+        traced = jax.make_jaxpr(step)(placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, "data"))
+    found = _branches_holding(traced.jaxpr, "paged_flash_attention_kernel_inline_seq_dim")
+    holding = [branches for branches in found if any(branches)]
+    assert holding and all(sum(branches) == 1 for branches in holding)
 
 
 PAGED_DERIVATIVE_SEEDS = 8
