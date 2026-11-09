@@ -38,6 +38,7 @@ def test_global(monkeypatch):
     lines=['events %d/%d'%(len(a),len(b))]
     def rel(a,b): return np.linalg.norm((np.asarray(a,np.float64)-b).ravel())/max(np.linalg.norm(np.asarray(b).ravel()),1e-300)
     for (ta,xa,ya,dya,dxa),(tb,xb,yb,dyb,dxb) in zip(a,b):
+        xa,ya,dya,dxa,xb,yb,dyb,dxb=jax.tree.map(np.asarray,(xa,ya,dya,dxa,xb,yb,dyb,dxb))
         name=ta[1]
         if name=='chunk_gated_delta_rule':ya,yb=ya[0],yb[0];dya,dyb=dya[0],dyb[0]
         target=(3,0)
