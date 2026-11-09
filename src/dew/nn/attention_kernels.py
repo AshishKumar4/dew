@@ -424,10 +424,11 @@ kernel with the call's mask, interpreted off a TPU."""
 _FITS = _Need('fits', lambda case: _dense_fits(case),
               lambda case: f"jax.nn's xla attention holds the call's scores whole, {_dense_peak(case)} bytes "
                            f"at once in a training step with its operands, past the "
-                           f"{generation.device_memory()} a device holds", row='5283')
+                           f"{generation.device_memory()} a device holds", row='5283', kind='measured')
 """A differentiated call on jax.nn's xla attention ('xla', and 'inference''s training) fits a device's
 memory (`_dense_fits`): one that does not takes the template, its temporaries growing with the tokens, not
-their square (row 5283)."""
+their square (row 5283). A call naming the kernel runs it, as a step compiled ahead for a larger device
+than this host's does."""
 
 XLA_SUPPORTS = (
     _Need('sinks', lambda case: not case.sinks, "jax.nn's attention has no sinks", row=INHERENT,
