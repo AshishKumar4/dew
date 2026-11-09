@@ -33,6 +33,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.batch import document_firsts
 from dew.mesh import LayoutRefused
 from dew.nn import rope
 from dew.nn.blocks import normal_kernel
@@ -41,11 +42,13 @@ from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.linear import forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 64
@@ -142,6 +145,18 @@ def _trapezoid(delta, real, resets):
     return weights, entering
 
 
+def _stepped(x, dt, B, C, lam, starts, valid):
+    """A call's working dtype (`at_least_fp32` of the operands'), its operands', whether each token
+    continues its document (`_within`), `dt` and `lam` in the working dtype, `dt` zero at a padded slot, and
+    its real tokens `[B, S]` (`valid`, every one where None)."""
+    batch, length = x.shape[:2]
+    work = at_least_fp32(jnp.result_type(x, B, C))
+    dt, lam = (jnp.asarray(t, work) for t in (dt, lam))
+    real = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
+    return (work, jnp.result_type(x, B, C), _within(starts, length, batch), jnp.where(real[..., None], dt, 0),
+            lam, real)
+
+
 def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, starts=None, valid=None,
                  chunk_size: int | None = None):
     """Mamba-3's recurrence over a sequence on the recurrence template's chunked op (`MAMBA3`), of `R` inputs
@@ -158,12 +173,7 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
     (`_rank_terms`). Returns `(output [B, S, R, H, P], Carried)` in `at_least_fp32` of the operands'
     dtype."""
     batch, length, rank, heads, _ = x.shape
-    work = at_least_fp32(jnp.result_type(x, B, C))
-    operand = jnp.result_type(x, B, C)
-    continues = _within(starts, length, batch)
-    dt, lam = (jnp.asarray(t, work) for t in (dt, lam))
-    real = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
-    dt = jnp.where(real[..., None], dt, 0)
+    work, operand, continues, dt, lam, real = _stepped(x, dt, B, C, lam, starts, valid)
     # A document's first token enters no state: its turn and decay act on nothing, so neither enters the
     # chunked op, whose pairs would cancel them to rounding where the recurrence's gradient is exactly zero.
     resets = jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool)
@@ -202,6 +212,69 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
         any_real = jnp.any(valid, axis=1)[:, None, None, None]
         last = tuple(jnp.where(any_real, t, b) for t, b in zip(taken, before, strict=True))
     return out, Carried(jnp.swapaxes(final, -1, -2), angles[:, -1], *(jnp.swapaxes(t, 1, 2) for t in last))
+
+
+def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, entered, starts, valid=None,
+                   chunk_size: int | None = None):
+    """`chunk_mamba3` whose documents each continue a carry of their own (a call over forks,
+    `dew.nn.linear.forked_scan`): `carried`'s leaves `[B, D', ...]` a carry a slot, `entered` `[B, D]` the
+    one-based slot each of `starts`' documents continues (zero, none; the row's first slot beginning one,
+    `dew.batch.document_firsts`). Each document's angles run on from its carry's, its first real token
+    writes the carry's token again at its `(1 - lambda) dt`, and the chunked op enters each document's state
+    (`Chunk.entered`); returns `(output, Carried)`, a carry a document `[B, D, ...]`, a document holding no
+    real token its entering carry."""
+    batch, length, rank, heads, _ = x.shape
+    work, operand, continues, dt, lam, real = _stepped(x, dt, B, C, lam, starts, valid)
+    resets = jnp.asarray(starts, bool)
+    documents = entered.shape[1]
+    firsts = document_firsts(resets, documents)
+    slots = jnp.arange(length, dtype=jnp.int32)
+    number = jnp.clip(jnp.sum(slots[None, :, None] >= firsts[:, None, :], axis=-1) - 1, 0, documents - 1)
+    rows = jnp.arange(batch)[:, None]
+    taken = jnp.asarray(entered, jnp.int32)
+    # A document entering no carry begins as `chunk_mamba3`'s do, its first token's turn and decay acting on
+    # nothing; one continuing a carry turns and decays it at its first token, as its own row's next token.
+    fresh = resets & (jnp.take_along_axis(taken, number, axis=1) == 0)
+    unturned = jnp.where(fresh[..., None], 0, dt)
+    # Each document's carry, its slot's (zero for none).
+    entering = Carried(*(jnp.where((taken > 0).reshape(*taken.shape, *(1,) * (leaf.ndim - 2)),
+                                   jax.vmap(lambda row, at: row[jnp.maximum(at - 1, 0)])(leaf, taken), 0)
+                         for leaf in carried))
+    turned = _angles(unturned, _per_head(jnp.asarray(theta), heads), continues)
+    angles = jnp.remainder(turned + jnp.take_along_axis(entering.angle, number[:, :, None, None], axis=1),
+                           2 * jnp.pi)
+    delta = (1 - lam) * dt
+    following, _ = _trapezoid(delta, real, resets)
+    # Each document's first and last real tokens, `length` and -1 where it holds none.
+    first = jnp.full((batch, documents), length, jnp.int32).at[rows, number].min(
+        jnp.where(real, slots, length))
+    last = jnp.full((batch, documents), -1, jnp.int32).at[rows, number].max(jnp.where(real, slots, -1))
+    holding = first < length
+    opening = jnp.take_along_axis(delta, jnp.minimum(first, length - 1)[..., None], axis=1)
+    weight = jnp.where(holding[..., None], opening, 0)
+    again = jnp.einsum('bdhrn,bdhrp->bdhnp', entering.key, entering.value)
+    memories = jnp.swapaxes(entering.state, -1, -2) + weight[..., None, None] * again
+    keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), angles[:, :, None]).astype(operand)
+                     for t in (B, C))
+    decay = jnp.zeros((batch, length, rank, heads), work).at[:, :, 0].set(unturned * jnp.asarray(A, work))
+    gate = jnp.broadcast_to((lam * dt + following)[:, :, None], decay.shape)
+    begins = jnp.zeros((batch, length, rank), bool).at[:, :, 0].set(resets)
+    own = jnp.broadcast_to(jnp.arange(1, documents + 1, dtype=jnp.int32), (batch, documents))
+    out, finals = chunk(MAMBA3, Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
+                                      log_decay=_ranked(decay), beta=_ranked(gate), state=memories,
+                                      starts=_ranked(begins), entered=own),
+                        **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
+    out = out.reshape(x.shape) + _rank_terms(queries.astype(work), keys.astype(work), jnp.asarray(x, work),
+                                             lam * dt, following)
+    # Each document's last real token's angles, keys and values; one holding none keeps its carry's.
+    at = jnp.maximum(last, 0)
+
+    kept = holding.reshape(*holding.shape, *(1,) * 3)
+    angle = jnp.where(holding[..., None, None], gather_positions(angles, at), entering.angle)
+    key = jnp.where(kept, jnp.swapaxes(gather_positions(keys.astype(work), at), 2, 3), entering.key)
+    value = jnp.where(kept, jnp.swapaxes(gather_positions(jnp.asarray(x, work), at), 2, 3), entering.value)
+    state = jnp.where(kept, jnp.swapaxes(finals, -1, -2), entering.state)
+    return out, Carried(state, angle, key, value)
 
 
 def step_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, valid=None, begins=None):
@@ -315,9 +388,10 @@ class Mamba3(nn.Module):
     documents (`starts`) run as if alone; a call under a mesh sequence axis above one is refused.
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """No `MIXING` field (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token of its document,
-    which no mask, bias, tree or entered document narrows here."""
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that continue another
+    (`dew.batch.Forks`), each from the carry its parent leaves (`entered_mamba3`, `forked_scan`); no mask or
+    bias, which a recurrence reading every earlier token of its document has no way to narrow."""
 
     emb_features: int
     num_heads: int
@@ -420,13 +494,17 @@ class Mamba3(nn.Module):
     def _cache(self, batch: int, dtype) -> tuple[bool, tuple[nn.Variable, ...]]:
         """Whether the cache was allocated before this call, and its four variables, `Carried`'s in order."""
         allocated = self.has_variable('cache', 'ssm_state')
-        heads = (batch, self.num_heads)
-        ranked = (*heads, self.mimo_rank)
-        shapes = ((*heads, self.head_dim, self.state_size), (*heads, self.angles), (*ranked, self.state_size),
-                  (*ranked, self.head_dim))
         names = ('ssm_state', 'angle_state', 'k_state', 'v_state')
         return allocated, tuple(self.variable('cache', name, jnp.zeros, shape, dtype)
-                                for name, shape in zip(names, shapes, strict=True))
+                                for name, shape in zip(names, self._shapes(batch), strict=True))
+
+    def _shapes(self, batch: int) -> tuple[tuple[int, ...], ...]:
+        """`Carried`'s four shapes for `batch` rows: the state, its angle, the last token's keys and
+        values."""
+        heads = (batch, self.num_heads)
+        ranked = (*heads, self.mimo_rank)
+        return ((*heads, self.head_dim, self.state_size), (*heads, self.angles), (*ranked, self.state_size),
+                (*ranked, self.head_dim))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL):
@@ -449,7 +527,17 @@ class Mamba3(nn.Module):
                 return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
             state, angle, key, value = (variable.value for variable in cache)
             carried = Carried(state, angle, key, value)
-        if carried is not None and length == 1:
+        if tokens.forks is not None:
+            # Each document from the carry its parent leaves, a root from the row's (`forked_scan`); a cached
+            # call's carry left as it was.
+            def forked_rule(values, *, valid, starts, state, entered):
+                return entered_mamba3(values, dt, A, B, C, lam, theta, state, entered, starts, valid=valid,
+                                      chunk_size=self.chunk_size)
+
+            start = Carried(*(jnp.zeros(shape, wide) for shape in self._shapes(batch)) if carried is None
+                            else (leaf.astype(wide) for leaf in carried))
+            out, carried, cache = forked_scan(values, forked_rule, tokens, start), None, ()
+        elif carried is not None and length == 1:
             out, carried = step_mamba3(values[:, 0], dt[:, 0], A[:, 0], B[:, 0], C[:, 0], lam[:, 0],
                                        theta[:, 0], carried, valid=None if valid is None else valid[:, 0],
                                        begins=None if tokens.starts is None else tokens.starts[:, 0])
@@ -457,7 +545,7 @@ class Mamba3(nn.Module):
         else:
             out, carried = chunk_mamba3(values, dt, A, B, C, lam, theta, carried, starts=tokens.starts,
                                         valid=valid, chunk_size=self.chunk_size)
-        if call.decode:
+        if call.decode and carried is not None:
             for variable, value in zip(cache, carried, strict=True):
                 variable.value = value.astype(variable.value.dtype)
         # The scan's output under both names a remat policy reads it by (`RESIDUALS`), as `held_scan` marks
@@ -486,6 +574,8 @@ class Mamba3Mixer(MixerBase):
     (`is_outproj_norm`), at its defaults (state-spaces/mamba3-siso-187m's)."""
 
     residuals = ('context', 'scan')
+    # Each document from the carry its parent leaves (`entered_mamba3`).
+    reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`chunk_mamba3`'s `starts`).
     packed_cache = True
     draws_init_std = True

@@ -50,6 +50,7 @@ from .linear import (
     decode_delta_rule,
     decode_kernel,
     fork_cache,
+    fork_start,
     forked_conv,
     forked_scan,
     fused_token,
@@ -246,8 +247,8 @@ class KimiDeltaAttention(nn.Module):
             history, held = fork_cache(self, 'recurrent_state') if decode else (None, None)
             convolved = forked_conv(projected, taps, tokens, history=history, parts=heads,
                                     dtype=projected.dtype if ported else wide)
-            out = forked_scan(convolved, forked_rule, tokens, (self.num_heads, self.head_dim, self.head_dim),
-                              held=held, state_dtype=wide)
+            out = forked_scan(convolved, forked_rule, tokens,
+                              fork_start(held, (B, self.num_heads, self.head_dim, self.head_dim), wide))
         elif shards > 1:
             if decode:
                 raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
