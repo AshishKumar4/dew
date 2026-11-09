@@ -180,30 +180,32 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         rows = DocumentRows.of(starts, operands.entered, firsts)
         query, key, value, g, beta = rows.laid(query, key, value, g, beta)
         state, starts, firsts, max_segments = rows.entering(state), None, None, None
-    epilogue = hooks.skip or hooks.output is not None
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
                                  work, dtype, max_segments=max_segments)
     else:
         # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
-        # over to the portable math there, reported as the call's route.
+        # over to the portable math there, reported as the call's route. A kernel's output unrounded, as the
+        # portable math's, where an epilogue reads it or the caller's dtype is not the operands' (Mamba-3's
+        # fp32 rank terms cancel against it, `chunk_mamba3`), so the output is rounded once.
+        wide = hooks.skip or hooks.output is not None or dtype != jnp.result_type(query, key, value)
+
         def product_kernel(product: str) -> str:
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                               scale=scale, wide=epilogue, bound=hooks.inverse_bound,
+                               scale=scale, wide=wide, bound=hooks.inverse_bound,
                                product=product,
                                delta=hooks.delta, decayed=hooks.decay != 'none')
 
         def run(kernel, query, key, value, g, beta, state, starts, firsts):
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
-                                     max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
+                                     max_segments=max_segments, scale=scale, delta=hooks.delta, wide=wide,
                                      bound=hooks.inverse_bound,
                                      rounded=chunk_rounding(hooks.delta, jnp.result_type(query, key, value)))
             if kernel == 'fla':
-                # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, wide=epilogue, firsts=firsts)
+                                scale=scale, wide=wide, firsts=firsts)
             size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
             return xla_mainloop(Tiles(size), query, key, value, g, beta, state, starts, scale=scale,
                                 delta=hooks.delta, dtype=work, bound=hooks.inverse_bound)
