@@ -295,8 +295,11 @@ def test_a_batch_that_does_not_fit_whole_is_split_before_anything_is_recomputed(
     state = trained(trainer)
     split = trainer.plan["split"]
     assert split > 1 and trainer.objective.model.remat is None
-    first, *_ = trainer.plan["probes"]
-    assert (first["split"], first["fits"]) == (1, False)
+    # The search starts where the footprint's bound picks (`derived_start`): whatever it compiled whole did
+    # not fit, and the split it trains at did.
+    probes = trainer.plan["probes"]
+    assert not any(probe["fits"] for probe in probes if probe["split"] == 1), probes
+    assert any(probe["fits"] for probe in probes if probe["split"] == split), probes
     assert (int(state.step), int(state.microstep), int(state.updates)) == (3, 3 * split, 3)
     for planned_leaf, whole_leaf in zip(jax.tree.leaves(state.variables), jax.tree.leaves(unsplit.variables),
                                         strict=True):
