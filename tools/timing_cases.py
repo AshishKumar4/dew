@@ -4,11 +4,11 @@
 `dense`: the dense cells of real model projections at a training step's tokens, each product a consumer
 launches: the forward (x @ W) and input gradient (dy @ W.T) in bf16, and the kernel gradient (x.T @ dy) into
 a training master's fp32 (`gemm_t`'s out_dtype, XLA's preferred_element_type). `implementation` is "xla"
-(XLA's dot, cuBLAS) or a grouped matmul's kernel by name ("mosaic_gpu", "triton"), chosen while the call
+(XLA's dot, cuBLAS) or a grouped matmul's kernel by name ("mosaic", "triton"), chosen while the call
 lowers, which is when a choice acts.
 
     {"builder": "tools/timing_cases.py:dense", "cells": [{"shape": "llama-3-8b qkv", "product": "forward"}],
-     "arms": [{"name": "xla", "implementation": "xla"}, {"name": "mosaic", "implementation": "mosaic_gpu"}]}
+     "arms": [{"name": "xla", "implementation": "xla"}, {"name": "mosaic", "implementation": "mosaic"}]}
 
 `fused`: a SwiGLU projection's two products with their biases and gating, through the program Dew compiles,
 the algebra pass's fusion on ("pass") or off ("nopass").
@@ -76,7 +76,7 @@ def fused(cell: dict, implementation: str) -> tuple:
     """A SwiGLU projection at `cell`'s shape (`cell["shape"]`, `DENSE`: each of its gate and up products),
     each product with its bias, silu(x @ W_gate + b_gate) * (x @ W_up + b_up), compiled as Dew compiles a
     program (`dew.nn.kernels.options.program`) under the GEMM template's launch (grouped_matmul
-    "mosaic_gpu"), the algebra pass on (`implementation` "pass": each product fused with its consumers where
+    "mosaic"), the algebra pass on (`implementation` "pass": each product fused with its consumers where
     the template takes them, `dew.algebra.fusion`) or off ("nopass"), and its one draw of inputs (seed 0).
     The pass acts as the program traces, so every call holds its switch."""
     from dew.algebra.program import passes
@@ -97,7 +97,7 @@ def fused(cell: dict, implementation: str) -> tuple:
     compiled = program(swiglu)
 
     def call(*arguments):
-        with passes(on=implementation == "pass"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        with passes(on=implementation == "pass"), generation.chosen(grouped_matmul="mosaic"):
             return compiled(*arguments)
 
     jax.block_until_ready(call(*inputs))

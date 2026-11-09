@@ -137,7 +137,7 @@ CONSUMERS = 2
 
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None,
-            ragged: bool = False) -> Tiles | None:
+            ragged: bool = False, units: tuple[int, int, int] = (1, 1, 1)) -> Tiles | None:
     """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its
     bundles in preference order, which share its facts but their loaders and registers) for a call whose
     output has `rows` rows (a group's,
@@ -146,7 +146,9 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     call's extents and the device's multiprocessors alone (no table, no ranking;
     docs/design/kernel-templates.md §7); `depths`, where given, the steps the launch's stage takes in place
     of the family's (a packed matrix's decode, `NVFP4_STEP`); `ragged`, rows a tile need not divide (a kernel
-    gradient's whose last row tile is partial, `tgmm`). `candidate(tile)` is the launch's legality apart
+    gradient's whose last row tile is partial, `tgmm`); `units`, what the rows, the columns and the step are
+    whole multiples of besides (a call's side vectors' copy units, `mosaic.Transport.vector_unit`).
+    `candidate(tile)` is the launch's legality apart
     from its
     resources (its granularity, its blocks dividing the call, its side operands' copies), and
     `launch_of(tile)` the launch whose ring and residency the planner sizes (`resources.plan`: its
@@ -195,21 +197,13 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     None where no tile holds."""
     # The facts the layouts share (their instruction family's); each layout's registers bound the shapes.
     family = layouts[0]
-    # Its widths in whole rows of the widest swizzle, as well as its column unit, where the call's width has
-    # one: the objective below prices reads, not a narrower staging swizzle's, and an A100's 160-wide tiles
-    # (64-byte swizzle) ran its forwards 1.13-1.24x their 128-wide time where the reads favoured them
-    # (M-FS-1, W3-a100); a narrower call (a swapped decode product's few rows) at its column unit.
-    widest = min(width, family.widest_product or width)
-    unit = family.column_unit(dtype)
-    swizzled = math.lcm(unit, swizzling.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
-    columns = ([block_n for block_n in range(widest - widest % swizzled, 0, -swizzled)
-                if width % block_n == 0]
-               or [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0])
-    steps = [step for step in depths or family.depths(dtype) if depth is None or depth % step == 0]
+    columns = _derived_columns(family, width, dtype, units[1])
+    steps = [step for step in depths or family.depths(dtype)
+             if (depth is None or depth % step == 0) and step % units[2] == 0]
     busy = 1 + family.loads_ahead + family.in_flight
 
     def tiled(consumers: int, programs: int) -> Tiles | None:
-        role = family.role_rows * consumers
+        role = math.lcm(family.role_rows * consumers, units[0])
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
                                    multiprocessors=multiprocessors, grouped=grouped)
@@ -255,6 +249,21 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         if tile is not None:
             return tile
     return None
+
+
+def _derived_columns(family: mosaic.Family, width: int, dtype, unit_of_call: int) -> list[int]:
+    """Dew: `derived`'s widths, widest first: whole rows of the widest swizzle, as well as its column unit,
+    where the call's width has one (the objective prices reads, not a narrower staging swizzle's, and an
+    A100's 160-wide tiles, 64-byte swizzle, ran its forwards 1.13-1.24x their 128-wide time where the reads
+    favoured them, M-FS-1, W3-a100); a narrower call (a swapped decode product's few rows) at its column
+    unit; each a whole number of the call's own unit (`unit_of_call`, its side vectors')."""
+    widest = min(width, family.widest_product or width)
+    unit = family.column_unit(dtype)
+    swizzled = math.lcm(unit, swizzling.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
+    columns = ([block_n for block_n in range(widest - widest % swizzled, 0, -swizzled)
+                if width % block_n == 0]
+               or [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0])
+    return [block_n for block_n in columns if block_n % unit_of_call == 0]
 
 
 def _held_tile(block_n: int, held_rows: int, *, role: int, steps: list[int], busy: int, shaped: Callable,
@@ -337,14 +346,15 @@ class GroupInfo:
     `first`); None where the group reads its own."""
 
     @classmethod
-    def create(cls, table, tile, tid):
+    def create(cls, table, tile, tid, unit: int = 8):
         """Dew: the group info of row tile `tid`, read from `tile_groups`' table (its group, its first row,
         its group's first and past-last row, and where `gmm` states one, its matrix of a stack) rather than
         walked over every group's length in each tile."""
         tile = jnp.int32(tile)
         group, block_start, group_start, group_end = (table[tid, column] for column in range(4))
-        # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes.
-        block_start = pl.multiple_of(block_start, TMA_ROWS)
+        # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes
+        # (`row_unit`).
+        block_start = pl.multiple_of(block_start, unit)
         actual_start = jnp.maximum(group_start, block_start)
         actual_end = jnp.minimum(group_end, block_start + tile)
         start_within_block = actual_start - block_start
@@ -362,12 +372,12 @@ class GroupInfo:
                    actual_end=start + size, start_within_block=jnp.int32(0), actual_size=size)
 
 
-def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
+def tile_groups(lengths: jax.Array, tile: int, tiles: int, unit: int = 8) -> jax.Array:
     """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch: of tiles `0` to
     `tiles`, the group (`lengths`' index), the tile's first row, and its group's first and past-last row,
     int32 `[tiles, 4]`; a tile no group reaches, zeros. A group's tiles start at its first row (rounded
-    down to the 8 rows a TMA descriptor tiles by, `TMA_ROWS`), whole tiles after it, as CUTLASS's grouped
-    GEMM tiles each group: a group of up to a tile's rows reads its matrix once, where tiles on the
+    down to the `unit` rows its family's copies start at, `row_unit`), whole tiles after it, as CUTLASS's
+    grouped GEMM tiles each group: a group of up to a tile's rows reads its matrix once, where tiles on the
     product's own row grid read it once a tile the group touches (two for most of Kimi Linear's
     128-row experts at 128-row tiles). The tiles number at most `cdiv(rows, tile)` plus the groups less
     one (a ceiling's sum exceeds the sum's ceiling by at most one a part). Upstream's
@@ -378,7 +388,7 @@ def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
     ends = _prefix_sums(lengths)
     starts = ends - lengths
     rows = jnp.int32(tile)
-    first_rows = starts // TMA_ROWS * TMA_ROWS
+    first_rows = starts // unit * unit
     counts = lax.div(ends - first_rows + rows - 1, rows) * (lengths > 0)
     firsts = _prefix_sums(counts) - counts
     tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
@@ -402,6 +412,13 @@ def _prefix_sums(values: jax.Array) -> jax.Array:
 
 TMA_ROWS = 8
 """The rows a TMA descriptor tiles by, to which `gmm` pads its rows and a group's first tile starts."""
+
+
+def row_unit(family: mosaic.Family, dtype) -> int:
+    """Dew: the rows a tile's first row is a multiple of (`tile_groups`): a TMA descriptor's 8 (`TMA_ROWS`),
+    or where a family's copies start at whole tiles of its layout (`mosaic.Transport.copies_tiled_rows`: a
+    TPU core's 8 sublanes of 32-bit words, 16 rows of bf16), the rows of `dtype` they hold."""
+    return 8 * 4 // jnp.dtype(dtype).itemsize if family.copies_tiled_rows else TMA_ROWS
 
 
 @dataclasses.dataclass(frozen=True)
@@ -430,11 +447,13 @@ class Allocations:
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
         streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
         held, walks = family.lifetimes(streams, steps)
+        # A core holding its values in scratch memory holds them beside (`mosaic.Issuer.value_scratch`).
+        values = family.value_scratch(self.blocks, self.outputs)
         if walks:
-            return resources.Scope(program=(*held, self.staged, persisted), walks=walks,
+            return resources.Scope(program=(*held, self.staged, persisted, values), walks=walks,
                                    after=tuple((buffer.shape, buffer.dtype) for buffer in staging),
                                    addresses=addresses)
-        return resources.Scope(program=(*held, self.staged, persisted, staging), addresses=addresses)
+        return resources.Scope(program=(*held, self.staged, persisted, staging, values), addresses=addresses)
 
 
 def _typed(dtype) -> jax.ShapeDtypeStruct:
@@ -474,12 +493,13 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
               # A block-scaled product's rows' and matrix's scales, a step's tiles of each (`gmm`'s
               # `mx_scales`), four scales a tile's row (`block_format`).
               **(_scale_tiles(block_m, block_n, block_k, dtype) if block_scaled else {}),
-              **{f'side_{i}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i]) for i in stepped}}
+              **{f'side_{i}': (axes.named(axes.held(prologue_axes[i]), extent), prologue_dtypes[i])
+                 for i in stepped}}
     sides = family.staging('side', [(axes.named(axes.held(side_axes), {'rows': part[0], 'columns': part[1]}),
                                      _typed(side))
                                     for side_axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
-    held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
-                                    for i in fixed])
+    held = family.staging('fixed', [(axes.named(axes.held(prologue_axes[i]), extent),
+                                     _typed(prologue_dtypes[i])) for i in fixed])
     shared = _shared_decode(tiles, interpret=interpret)
     decoded = ([] if not packed else [plgpu.SMEM((family.in_flight + 2, block_n, block_k), jnp.bfloat16)]
                if shared else [plgpu.SMEM((tiles.warpgroups, family.in_flight + 1, block_n, block_k),
@@ -534,10 +554,10 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
     blocks = {'ring_0': ((block_m, block_k) if k_major else (block_k, block_m), lhs_dtype),
               'ring_1': ((block_n, block_k) if k_major else (block_k, block_n), rhs_dtype),
               **(_scale_blocks(block_m, block_n) if step_scaled else {}),
-              **{f'ring_{2 + position}': (axes.named(prologue_axes[i], extent), prologue_dtypes[i])
-                 for position, i in enumerate(stepped)}}
-    held = family.staging('fixed', [(axes.named(prologue_axes[i], extent), _typed(prologue_dtypes[i]))
-                                    for i in fixed])
+              **{f'ring_{2 + position}': (axes.named(axes.held(prologue_axes[i]), extent),
+                                          prologue_dtypes[i]) for position, i in enumerate(stepped)}}
+    held = family.staging('fixed', [(axes.named(axes.held(prologue_axes[i]), extent),
+                                     _typed(prologue_dtypes[i])) for i in fixed])
     # Two consumers meet at their halves' boundaries (`_staged_halves`); one meets none, nor do two reading
     # their stages as loaded.
     meeting = (family.meeting(tiles.warpgroups),) if tiles.warpgroups > 1 and not unstaged else ()
@@ -547,12 +567,13 @@ def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dt
 
 def _stepped(family: mosaic.Family, axes_of: tuple, stepping: str) -> tuple[tuple, tuple, tuple]:
     """Dew: which side operands a launch streams with its steps (each with the `stepping` axis, but a vector a
-    family does not copy, `mosaic.Family.copies_vectors`), which its step reads from global memory (such a
-    vector), and which it loads once a tile (none with the `stepping` axis)."""
-    stepped = tuple(i for i, axes in enumerate(axes_of)
-                    if stepping in axes and (len(axes) > 1 or family.copies_vectors))
-    read = tuple(i for i, axes in enumerate(axes_of) if stepping in axes and i not in stepped)
-    fixed = tuple(i for i, axes in enumerate(axes_of) if stepping not in axes)
+    family does not copy, `mosaic.Family.copies_vectors`, its tile's axes those it holds, `axes.held`), which
+    its step reads from global memory (such a vector), and which it loads once a tile (none with the
+    `stepping` axis)."""
+    stepped = tuple(i for i, side_axes in enumerate(axes_of)
+                    if stepping in side_axes and (len(axes.held(side_axes)) > 1 or family.copies_vectors))
+    read = tuple(i for i, side_axes in enumerate(axes_of) if stepping in side_axes and i not in stepped)
+    fixed = tuple(i for i, side_axes in enumerate(axes_of) if stepping not in side_axes)
     return stepped, read, fixed
 
 
@@ -628,23 +649,16 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                 and not (transpose_lhs or exact_sums))
     _gmm_split_refused(tiles, k, n, step_scales, dense=dense, exact_sums=exact_sums,
                        hooked=prologue is not None or epilogue is not None or paired is not None, plain=plain)
-    # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
-    # the routed ones, the padding among them, are a last group, whose tiles store zeros. A group's tiles
-    # start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's
-    # first. Where a family's loads past an operand's rows read zeros (`Family.bounded_loads`: TMA's) the
-    # operands stay as they are; elsewhere every row-bearing operand is allocated to the schedule's extent
-    # (`row_extent`), zeros past its rows, which a group's stores never reach (a 128-row lhs of groups
-    # [120, 8] at 64-row tiles read rows 120 to 183 unpredicated on an A100, cp.async's loads), as the
-    # interpreter's are, whose slices past an array clamp rather than read zeros. On an H100 that copy was a
-    # kernel of its own each call, 0.035 to 0.33 ms beside a dense product of 0.34 to 2.4 (BREAKDOWN1-h100:
-    # 0.33 ms of Llama 3 8B gate_up's 2.69 ms input gradient). A dense call's tiles start at whole row
-    # tiles, so it reads to its last tile's end alone, no copy where its rows fill whole tiles: on an A100
-    # that copy was 0.094 ms of Llama 3 8B o's 1.52 ms forward (BC-A100-EXTENT-AB1, 6% of its time).
+    # The rows padded and extended as the schedule walks them (`_walked_rows`); a family whose copies start
+    # at whole tiles of its layout (`row_unit`) stores whole tiles of rows, its outputs at least a tile's.
+    walked_family = family_of(tiles, lhs.dtype)
+    unit, tiled = row_unit(walked_family, lhs.dtype), walked_family.copies_tiled_rows
     lhs, gather, scatter, m, extent = _walked_rows(
         lhs, gather, scatter, tiles, transpose_lhs=transpose_lhs, dense=dense,
-        bounded=family_of(tiles, lhs.dtype).bounded_loads and not interpret)
+        bounded=walked_family.bounded_loads and not interpret, unit=unit,
+        least=tiles.block_m * tiles.cluster if tiled else 0)
     row_tile = tiles.block_m * tiles.cluster
-    table = None if dense else _grouped_table(group_sizes, m, row_tile, first)
+    table = None if dense else _grouped_table(group_sizes, m, row_tile, first, unit)
     per = 1
     if step_scales is not None:
         column_scales, per = _column_scales(step_scales[1], n, block_n)
@@ -802,7 +816,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, decoded, *, streams):
             def issue(wg, tile, walk, *, active):
-                _, row_start, ni, start, *_ = tile
+                group, row_start, ni, start, *_ = tile
                 if tail is not None and not active:
                     return None  # past its program's range: another program walks the tile
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
@@ -812,7 +826,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 step = functools.partial(_gmm_step, family=family, prologue=prologue,
                                          prologue_axes=prologue_axes,
                                          fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
-                                         read_tiles={i: prologue_gmems[i] for i in read},
+                                         read_tiles=_reads(prologue_gmems, prologue_axes, read, group, g),
                                          mine_rows=pl.ds(wg * share, share), transpose_rhs=transpose_rhs,
                                          matrices=matrices, interpret=bool(interpret), first=start,
                                          transpose_lhs=transpose_lhs,
@@ -915,7 +929,7 @@ def _gmm_finished(accs: tuple, tile: tuple, wg, store, *, family: mosaic.Family,
     finished = functools.partial(
         _finished, family=family, wg=wg, epilogue=epilogue, o_gmems=o_gmems, store=store, sides=sides,
         origins={'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])},
-        group=jnp.minimum(group.group_id, g - 1),
+        group=_side_group(group, g),
         place=(part_row, first, stored, column, min(part[0], m), TMA_ROWS if dense else 1))
     if partials is None or partials[0] is None:
         finished(*accs)
@@ -973,7 +987,8 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
                    transpose_rhs: bool, axes_of: dict, interpreted: bool,
                    transpose_lhs: bool = False, splits: int = 1, traced: bool = False,
                    scale_gmems=None, scale_per: int = 1, mx_gmems=None, gather_gmem=None) -> tuple:
-    """Dew: `gmm`'s tile at the persistent walk's `index` (`mosaic.Family.persist`'s schedule): whether it
+    """Dew: `gmm`'s tile at the persistent walk's `index` (`mosaic.Family.persist`'s schedule; its first row
+    a multiple of its family's `row_unit`): whether it
     multiplies any row, its steps, its streams' views (`_gmm_views`) and its group, row block and column
     tile: its pair's but for this multiprocessor's row block; in a balanced tail, the first of the tile's
     steps its program walks and how many, its partials' gatherer and its program (`tail.Tail.segment`);
@@ -987,7 +1002,7 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
     spilling 32 bytes at the input gradient's 64 x 160 x 32 at five stages, NSDBG-5, NSDBG-DR1).
     `shape` is the padded rows, the steps and the groups."""
     m, steps, groups = shape
-    pair = tiles.cluster
+    pair, unit = tiles.cluster, row_unit(family_of(tiles, lhs_gmem.dtype), lhs_gmem.dtype)
     index = tail_of.ordered(tail, index, programs, interpreted)
     split = None
     if tail is not None:
@@ -1001,10 +1016,10 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
         count = jnp.minimum(share, steps - start)
     mi, ni = tail_of.planar_snake(snaked, grid, 1, tiles.grid_block_n)
     group = (GroupInfo.dense(tiles.block_m * pair, mi, m) if dense
-             else GroupInfo.create(table_gmem, tiles.block_m * pair, mi))
+             else GroupInfo.create(table_gmem, tiles.block_m * pair, mi, unit))
     # This multiprocessor's row tile of its pair, from its group's first: a multiple of the rows a TMA
     # descriptor tiles by, as Mosaic's layout inference reads a slice's start.
-    row_start = pl.multiple_of(group.block_start + mosaic.cluster_index(pair) * tiles.block_m, TMA_ROWS)
+    row_start = pl.multiple_of(group.block_start + mosaic.cluster_index(pair) * tiles.block_m, unit)
     views = _gmm_views(lhs_gmem, matrix_gmems, prologue_gmems, group, row_start, ni, tiles=tiles,
                        groups=groups, transpose_rhs=transpose_rhs, axes_of=axes_of, first=start,
                        transpose_lhs=transpose_lhs, scale_gmems=scale_gmems, scale_per=scale_per,
@@ -1113,13 +1128,14 @@ def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
     return {'gathered': ('rows',)}
 
 
-def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None) -> jax.Array:
+def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,
+                   unit: int = TMA_ROWS) -> jax.Array:
     """A grouped call's tile table (`tile_groups`) over its `m` padded rows at `row_tile`-row tiles: its
     groups', then the rows past the routed ones a last group, whose tiles store zeros."""
     g = group_sizes.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
-    table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
+    table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g, unit)
     if first is None:
         return table
     # Each tile's matrix, its group's of the stack from `first` (`GroupInfo.matrix`): the group itself stays
@@ -1128,22 +1144,34 @@ def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Arr
 
 
 def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
-                 bounded: bool) -> tuple:
+                 bounded: bool, unit: int = TMA_ROWS, least: int = 0) -> tuple:
     """Dew: `gmm`'s rows as its schedule walks them: `lhs`, or a gathered product's table (`gather`, a pad
-    reading row 0 of the tokens, which stay as they are), padded to whole TMA rows (`m` of them) and
-    extended to the schedule's extent where the family's loads past the rows are not zeros (`bounded`),
-    and a scattered product's table to the extent, its padded and extended rows stored nowhere
-    (`mosaic.Scattered`): `(lhs, gather, scatter, m, extent)`. A table is always extended: its threads
-    read a tile's entries by plain loads, which no TMA bounds (a gathered product's last tile read past an
-    unextended table on a GH200, CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
+    reading row 0 of the tokens, which stay as they are), padded to whole `unit`s of rows and to `least`
+    (`m` of them; `row_unit`: a TMA descriptor's 8; a tile's rows where its family stores whole tiles) and
+    extended to the schedule's extent where the family's loads past
+    the rows are not zeros (`bounded`), and a scattered product's table to the extent, its padded and
+    extended rows stored nowhere (`mosaic.Scattered`): `(lhs, gather, scatter, m, extent)`. The rows past
+    the routed ones, the padding among them, are a last group, whose tiles store zeros; a group's tiles
+    start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's first.
+    Where the loads read zeros past an operand's rows (TMA's) the operands stay as they are; elsewhere every
+    row-bearing operand is allocated to the extent, zeros past its rows, which a group's stores never reach
+    (a 128-row lhs of groups [120, 8] at 64-row tiles read rows 120 to 183 unpredicated on an A100,
+    cp.async's loads), as the interpreter's are, whose slices past an array clamp rather than read zeros. On
+    an H100 that copy was a kernel of its own each call, 0.035 to 0.33 ms beside a dense product of 0.34 to
+    2.4 (BREAKDOWN1-h100). A dense call's tiles start at whole row tiles, so it reads to its last tile's end
+    alone, no copy where its rows fill whole tiles: on an A100 that copy was 0.094 ms of Llama 3 8B o's
+    1.52 ms forward (BC-A100-EXTENT-AB1). A table is always extended: its threads read a tile's entries by
+    plain loads, which no TMA bounds (a gathered product's last tile read past an unextended table on a
+    GH200, CUDA_ERROR_ILLEGAL_ADDRESS, FS-4346-base-sm90)."""
     row_axis = 1 if transpose_lhs else 0
     walked, axis = (lhs, row_axis) if gather is None else (gather, 0)
-    walked = rows_padded(walked, axis, TMA_ROWS)
+    walked = rows_padded(walked, axis, unit)
+    walked = rows_extended(walked, axis, max(walked.shape[axis], least))
     m = walked.shape[axis]
     row_tile = tiles.block_m * tiles.cluster
     tabled = gather is not None or scatter is not None
     extent = (m if bounded and not tabled else -(-m // row_tile) * row_tile if dense
-              else row_extent(m, row_tile))
+              else row_extent(m, row_tile, unit))
     walked = rows_extended(walked, axis, extent)
     if scatter is not None:
         scatter = jnp.pad(scatter.astype(jnp.int32), (0, extent - scatter.shape[0]), constant_values=-1)
@@ -1218,12 +1246,19 @@ def _unrolled(prologue, exact_sums: bool) -> bool:
     return prologue is None and not exact_sums
 
 
-def _zeroed_atoms(dtype, block_n: int, consumers: int) -> tuple[int, int]:
-    """Dew: the columns of a swizzled row of the cotangent's stage and how many of them each consumer zeroes
-    (`_zeroed_share`): whole swizzled rows, as many each as the stage's divide among them, the last's share
-    short where they do not divide evenly."""
-    atom = swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES)
+def _zeroed_atoms(family: mosaic.Family, dtype, block_n: int, consumers: int) -> tuple[int, int]:
+    """Dew: the columns a consumer zeroes of the cotangent's stage at a time (`zeroing_columns`) and how many
+    such atoms each consumer zeroes (`_zeroed_share`): as many each as the stage's divide among them, the
+    last's share short where they do not divide evenly."""
+    atom = zeroing_columns(family, dtype)
     return atom, -(-(block_n // atom) // consumers)
+
+
+def zeroing_columns(family: mosaic.Family, dtype) -> int:
+    """Dew: the columns of a stage a consumer zeroes at a time (`_zero_neighbours_of`), so its registers hold
+    a few whatever the tile's width: a swizzled row, never narrower than its family's column unit (a TPU
+    core's slice of a VMEM block is whole lanes, 128 columns)."""
+    return max(family.column_unit(dtype), swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
 
 
 def _dtypes_of(arrays) -> tuple:
@@ -1338,10 +1373,26 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
         matrices['b_scales'] = (matrix_scales.at[matrix, pl.ds(column_tile * (tiles.block_n // 128),
                                                                 tiles.block_n // 128)],
                                 lambda j: (0, first + j, 0, 0))
+    # A side operand by group at the tile's group (`axes.at_group`), its groups' axis indexed away.
     return {'rows': lhs_view, **matrices,
-            **{f'side_{i}': (prologue_gmems[i].at[axes.placed(side_axes, {'rows': rows})],
-                             lambda j, side_axes=side_axes: axes.placed(side_axes, {'rows': 0}, first + j))
+            **{f'side_{i}': (prologue_gmems[i].at[axes.placed(side_axes, {'rows': rows} | axes.at_group(
+                                 side_axes, prologue_gmems[i].shape, _side_group(group, groups)))],
+                             lambda j, side_axes=side_axes: axes.placed(axes.held(side_axes), {'rows': 0},
+                                                                        first + j))
                for i, side_axes in axes_of.items()}}
+
+
+def _reads(prologue_gmems, prologue_axes: tuple, read: tuple, group, groups: int) -> dict:
+    """Dew: the prologue side vectors a step reads from global memory (`read`, by operand), one by group at
+    the tile's `group` of `groups` (`_side_group`, `axes.at_group`)."""
+    return {i: prologue_gmems[i].at[axes.placed(prologue_axes[i], axes.at_group(
+        prologue_axes[i], prologue_gmems[i].shape, _side_group(group, groups)))] for i in read}
+
+
+def _side_group(group, groups: int):
+    """Dew: the group a tile reads its side operands by group at (`axes.at_group`): its own, the unrouted
+    rows' the last's, as XLA's program reads them (`axes.at_rows`)."""
+    return jnp.minimum(group.group_id, groups - 1)
 
 
 def _meetings(family: mosaic.Family, tiles: Tiles, walks: int, programs: int, consumers: int,
@@ -1577,8 +1628,11 @@ def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
 
 def _transformed(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> jax.Array:
     """Dew: `mine`, this warpgroup's half of a stage, transformed by the prologue on its side tiles
-    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, in the stage's dtype."""
-    cut = [tiles_of[i].at[axes.placed(side_axes, {halved: half})][...] for i, side_axes in enumerate(axes_of)]
+    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, a side operand by group's
+    at each of its rows (`axes.by_rows`), in the stage's dtype."""
+    rows = mine.shape[0]
+    cut = [axes.by_rows(tiles_of[i].at[axes.placed(axes.held(side_axes), {halved: half})][...], side_axes,
+                        rows) for i, side_axes in enumerate(axes_of)]
     return prologue(mine[...], *cut).astype(mine.dtype)
 
 
@@ -1757,8 +1811,7 @@ def _rewritten_stage(family: mosaic.Family, starts_gmem, ends_gmem, block_k: int
     by its family's rewriting role (`mosaic.Family.persist`'s `prepared`), in the layouts it reads them in
     (`rewriting`)."""
     g_i, _, _, steps, start, *_ = tile
-    widths = [(stage, swizzling.swizzle_columns(stage.dtype, swizzling.SWIZZLE_BYTES))
-              for stage in (slots['ring_0'], slots['ring_1'])]
+    widths = [(stage, zeroing_columns(family, stage.dtype)) for stage in (slots['ring_0'], slots['ring_1'])]
     shares = [(stage.at[:, pl.ds(column, width)], None) for stage, width in widths
               for column in range(0, stage.shape[1], width)]
     _zero_neighbours_of(family.rewriting, shares, index + start, starts_gmem[g_i], ends_gmem[g_i], steps,
@@ -1802,7 +1855,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers = tiles.warpgroups
     depth_half = block_m // consumers
-    atom, atoms_each = _zeroed_atoms(rhs.dtype, block_n, consumers)
+    atom, atoms_each = _zeroed_atoms(family, rhs.dtype, block_n, consumers)
     part = (depth_half, block_n)
     grid = (-(-m // block_m), n // block_n)
     # A stream for each side operand with rows, but a vector a family does not copy, which its step reads
@@ -1843,8 +1896,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 group = (starts_gmem[g_i], ends_gmem[g_i], steps, block_k)
                 first = pl.multiple_of(block_starts_gmem[g_i], block_k) // block_k
                 if active:
-                    family.loaded([(side_gmems[i].at[tuple(depth for _ in prologue_axes[i])], ref,
-                                    barrier.at[wg])
+                    # A side operand by group at the tile's (`axes.at_group`).
+                    family.loaded([(side_gmems[i].at[axes.named(prologue_axes[i], {'depth': depth} | (
+                                        axes.at_group(prologue_axes[i], side_gmems[i].shape, g_i)))],
+                                    ref, barrier.at[wg])
                                    for i, ref, barrier in zip(fixed, fixed_refs, fixed_barriers,
                                                               strict=True)])
 
@@ -2046,7 +2101,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
         tiles_of = (dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
                     | read_refs)
         _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
-    atom = swizzling.swizzle_columns(cotangent_stage.dtype, swizzling.SWIZZLE_BYTES)
+    atom = zeroing_columns(family, cotangent_stage.dtype)
     atoms = cotangent_stage.shape[1] // atom
     # Its depth half's swizzled rows, each its own, and its share of the cotangent's, the last consumer's
     # past the stage's end held (`atoms_each` rounds the share up).
@@ -2250,9 +2305,9 @@ def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
     return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
 
 
-def row_extent(rows: int, row_tile: int) -> int:
-    """Dew: the rows `gmm`'s tile schedule reads of `rows` rows (a multiple of `TMA_ROWS`) at tiles of
-    `row_tile` rows: a tile starts at most `TMA_ROWS` before the rows end (`tile_groups`) and reads
+def row_extent(rows: int, row_tile: int, unit: int = TMA_ROWS) -> int:
+    """Dew: the rows `gmm`'s tile schedule reads of `rows` rows (a multiple of `unit`, `row_unit`) at tiles
+    of `row_tile` rows: a tile starts at most `unit` before the rows end (`tile_groups`) and reads
     `row_tile` rows on."""
-    return rows + row_tile - TMA_ROWS
+    return rows + row_tile - unit
 

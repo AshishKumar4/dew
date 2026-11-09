@@ -225,7 +225,7 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
     gradient = {**options, "out_dtype": jnp.float32}
     with generation.routes() as routes:
         got = jax.jit(lambda: gemm.gemm_t(tokens, cotangent, sizes, gather=(table, slots), **gradient))()
-    assert {route.kernel for route in routes} == {"mosaic_gpu"}, routes
+    assert {route.kernel for route in routes} == {"mosaic"}, routes
     expected = jax.jit(lambda: gemm.gemm_t(tokens[table], cotangent[slots], sizes, **gradient))()
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
@@ -281,13 +281,13 @@ def test_a_blackwells_gathered_block_scaled_product_gathers_its_scales_by_its_ta
     blocks = jnp.asarray([1, 0, 2, 1], jnp.int32)
     table = jnp.asarray(rng.integers(0, 300, 512), jnp.int32)
     gathered = dataclasses.replace(tokens, codes=tokens.codes[table], scales=tokens.scales[table])
-    named = generation.chosen(**{choice: "mosaic_gpu"})
+    named = generation.chosen(**{choice: "mosaic"})
     with generation.assumed("sm100"), named, generation.routes() as routes:
         got = jax.jit(lambda: product(tokens, matrices, blocks, out_dtype=jnp.float32, interpret_on_cpu=True,
                                       gather=table))()
         expected = jax.jit(lambda: product(gathered, matrices, blocks, out_dtype=jnp.float32,
                                            interpret_on_cpu=True))()
-    assert {route.kernel for route in routes if route.choice == choice} == {"mosaic_gpu"}, routes
+    assert {route.kernel for route in routes if route.choice == choice} == {"mosaic"}, routes
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 

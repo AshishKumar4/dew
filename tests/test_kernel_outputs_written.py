@@ -19,7 +19,7 @@ from kernel_outputs import launched_outputs, unwritten
 from dew.nn import norms
 from dew.nn.activations import gated_product, packed_gated_product
 from dew.nn.kernels import generation, grouped_matmul, norm_swiglu
-from dew.nn.kernels.templates.gemm import mosaic_tpu
+from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.norms import gated_rms_normalized, stream_rms_normalized
 
 
@@ -121,25 +121,23 @@ def test_the_silu_products_launches_write_every_output(packed):
 
 @pytest.mark.parametrize("product", ["gmm", "tgmm"])
 def test_the_tpus_gemm_launches_write_every_output(product):
-    """The TPU's grouped product and kernel gradient (`mosaic_tpu.gmm`, `tgmm`), interpreted, write every
-    output: groups ragged, one empty, rows past them (the product's padded rows a group of their own,
-    each row past the routed ones its zero accumulator's), and a grouped product of two outputs."""
+    """The template's grouped product and kernel gradient on a TPU core (`mosaic_gpu.gmm`, `tgmm` on the
+    MXU's bundle), interpreted, write every output: groups ragged, one empty, rows past them (each row past
+    the routed ones its zero accumulator's), and a grouped product of two outputs."""
     sizes = jnp.asarray([100, 0, 150], jnp.int32)
-    blocks = mosaic_tpu.Blocks(128, 128, 128)
+    tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family='mxu')
+    options = {"tiles": tiles, "multiprocessors": 1, "interpret": grouped_matmul.INTERPRETED}
     with generation.assumed("v5e"):
         if product == "gmm":
             lhs, rhs = drawn((300, 256), (3, 256, 256))
-            launch = functools.partial(mosaic_tpu.gmm, blocks=blocks, transpose_rhs=False,
-                                       out_dtype=jnp.float32, interpret=grouped_matmul.TPU_INTERPRETED)
+            launch = functools.partial(mosaic_gpu.gmm, transpose_rhs=False, out_dtype=jnp.float32, **options)
             assert_written(lambda lhs, rhs: launch(lhs, rhs, sizes), lhs, rhs)
             assert_written(lambda lhs, rhs: launch(lhs, rhs, sizes, epilogue=lambda acc: (acc, 2 * acc),
                                                    out_dtypes=(jnp.float32, jnp.bfloat16)), lhs, rhs)
         else:
             lhs, rhs = drawn((300, 256), (300, 256))
-            assert_written(lambda lhs, rhs: mosaic_tpu.tgmm(lhs, rhs, sizes, blocks=blocks,
-                                                            out_dtype=jnp.float32,
-                                                            interpret=grouped_matmul.TPU_INTERPRETED),
-                           lhs, rhs)
+            assert_written(lambda lhs, rhs: mosaic_gpu.tgmm(lhs, rhs, sizes, out_dtype=jnp.float32,
+                                                            **options), lhs, rhs)
 
 
 @pytest.mark.parametrize("product", ["gmm", "tgmm"])

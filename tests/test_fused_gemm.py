@@ -98,7 +98,7 @@ def test_a_regions_analysis_reports_what_fusing_it_would_raise():
     def region(x, w, sizes, bias):
         return fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True) + bias
 
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
         found = fused_gemm.analysis(region, x, w, sizes, bias)
         assert found.refused is not None and found.launch is None, found
         with pytest.raises(selection.KernelRefused):

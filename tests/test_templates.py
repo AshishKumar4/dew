@@ -44,7 +44,7 @@ def test_a_gemm_pullback_keeps_its_named_choice_and_restores_the_callers_scope()
 
         with generation.chosen(grouped_matmul="xla"):
             value, pullback = jax.vjp(projected, x, weight)
-        with generation.chosen(grouped_matmul="mosaic_gpu"):
+        with generation.chosen(grouped_matmul="mosaic"):
             dx, dw = pullback(jnp.ones_like(value))
             # The bound call's XLA scope must not leak into this new call. Mosaic cannot take fp64.
             with pytest.raises(KernelRefused):

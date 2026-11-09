@@ -50,7 +50,7 @@ GROUP_BLOCKS = (1, 0, 2, 1)
 """Each group's 128-row blocks: a one-block group, an empty one, two blocks, one."""
 
 
-@pytest.mark.parametrize("kernel", ["xla", "mosaic_gpu"])
+@pytest.mark.parametrize("kernel", ["xla", "mosaic"])
 def test_an_nvfp4_grouped_product_is_its_decoded_values_product(kernel):
     """Each group's rows times its matrix, both NVFP4, through `kernel` (the template on Blackwell's
     block-scaled tensor cores interpreted as a B200's, `mosaic_gpu.gmm`'s `mx_scales` at E2M1 operands,
@@ -66,7 +66,7 @@ def test_an_nvfp4_grouped_product_is_its_decoded_values_product(kernel):
         with generation.chosen(nvfp4_block=kernel):
             operands = (gemm.NvFp4Block.quantized(x), gemm.NvFp4Block.quantized(w))
             return gemm.nvfp4_block_product(*operands, blocks, out_dtype=jnp.float32,
-                                            interpret_on_cpu=kernel == "mosaic_gpu")
+                                            interpret_on_cpu=kernel == "mosaic")
 
     def decoded(x, w, wide=jnp.float32):
         x, w = mx_matrix.nvfp4_values(x), mx_matrix.nvfp4_values(w)
