@@ -99,6 +99,13 @@ def _token(expr, bound: dict):
             raise Inadmissible
         product = vector.reshape(-1, 1) * matrix
         return np.sum(np.broadcast_to(product, (KEYS, product.shape[-1])), axis=0)
+    if name == "applied":
+        # The state read along its values (`value_of`'s `_applied`): a scalar vector reads every value alike.
+        matrix, vector = (np.asarray(arg, dtype=object) for arg in args)
+        if vector.shape not in ((), (VALUES,)) or matrix.shape not in MATRICES:
+            raise Inadmissible
+        product = matrix * vector.reshape(1, -1)
+        return np.sum(np.broadcast_to(product, (KEYS, product.shape[-1])), axis=1)
     raise TypeError(f"no value of {name}")
 
 
@@ -148,12 +155,15 @@ def test_every_token_identity_holds_over_the_reals(index, rule):
     assert proven, f"token[{index}]: no instantiation makes both sides values"
 
 
-def _chunk_values(per_key: bool) -> dict:
+def _chunk_values(per_key: bool, values_read: bool = False) -> dict:
     """A symbolic chunk: its tokens, its entering state, and its decays (`scan._Decays`), each token's a
-    positive symbol (a key's own where `per_key`) and each span's the product of its tokens'."""
+    positive symbol (a key's own where `per_key`) and each span's the product of its tokens'; its reader and
+    free readout along the values and the keys where `values_read`."""
     keys = KEYS if per_key else 1
-    tokens = {name: _symbols(name, (TOKENS, KEYS)) for name in ("B", "C", "Q")}
-    tokens.update({name: _symbols(name, (TOKENS, VALUES)) for name in ("U", "R")})
+    read, out = (VALUES, KEYS) if values_read else (KEYS, VALUES)
+    tokens = {name: _symbols(name, (TOKENS, KEYS)) for name in ("B", "C")}
+    tokens.update(Q=_symbols("Q", (TOKENS, read)), R=_symbols("R", (TOKENS, out)),
+                  U=_symbols("U", (TOKENS, VALUES)))
     tokens["s"] = _symbols("s", (TOKENS,))
     step = _symbols("d", (TOKENS, keys), positive=True)
 
@@ -169,7 +179,8 @@ def _chunk_values(per_key: bool) -> dict:
     decays = {"entering": np.asarray([span(0, i) for i in range(TOKENS)], dtype=object),
               "to_last": np.asarray([span(i + 1, TOKENS - 1) for i in range(TOKENS)], dtype=object),
               "whole": span(0, TOKENS - 1), "between": between, "step": step}
-    return {"tokens": tokens, "decays": decays, "h": _symbols("h", (KEYS, VALUES))}
+    return {"tokens": tokens, "decays": decays, "h": _symbols("h", (KEYS, VALUES)),
+            "values_read": values_read}
 
 
 def _solved(lower: np.ndarray, given: np.ndarray) -> np.ndarray:
@@ -189,7 +200,8 @@ def _looped(chunk: dict, values: np.ndarray, *, corrected: bool) -> tuple:
         if corrected:
             h = h - tokens["s"][t] * np.outer(tokens["B"][t], tokens["C"][t] @ h)
         h = h + np.outer(tokens["B"][t], values[t])
-        outputs.append(tokens["Q"][t] @ h + tokens["R"][t])
+        read = h @ tokens["Q"][t] if chunk["values_read"] else tokens["Q"][t] @ h
+        outputs.append(read + tokens["R"][t])
     return np.asarray(outputs, dtype=object), h
 
 
@@ -219,6 +231,13 @@ def _chunk(expr, chunk: dict, bound: dict):
         paired = [[np.sum(left[i] * right[j] * decays["between"][i, j]) if j < i or (j == i and not strict)
                    else 0 for j in range(TOKENS)] for i in range(TOKENS)]
         return np.asarray(paired, dtype=object)
+    if name == "spread":
+        readers, values, keys = args
+        return np.asarray([sum((np.dot(readers[i], values[j]) * keys[j] * decays["between"][i, j]
+                                for j in range(i + 1)), np.zeros(KEYS, dtype=object))
+                           for i in range(TOKENS)], dtype=object)
+    if name == "applied":
+        return args[1] @ args[0].T
     if name == "rows":
         return args[1][:, None] * args[0]
     operations = {"times": np.multiply, "matmul": np.matmul, "plus": np.add, "minus": np.subtract}
@@ -240,19 +259,22 @@ VARIABLES = {"given": (TOKENS, VALUES), "other": (TOKENS, KEYS), "left": (TOKENS
 """Each chunk identity's variable's shape: a solve's given values and the left operand of a product with
 the entering state, a pair's parts; a solve's `lower` strictly lower."""
 
-CHUNK_IDENTITIES = [(corrects, per_key, index, rule)
+CHUNK_IDENTITIES = [(corrects, per_key, values_read, index, rule)
                     for corrects in (True, False) for per_key in (False, True)
-                    for index, rule in enumerate(_declared(linear_scan._identities(corrects, not per_key)))]
+                    for values_read in (False, True)
+                    for index, rule in enumerate(_declared(linear_scan._identities(corrects, not per_key,
+                                                                                   values_read)))]
 
 
-@pytest.mark.parametrize(("corrects", "per_key", "index", "rule"), CHUNK_IDENTITIES,
-                         ids=[f"{'wy' if corrects else 'plain'}-{'per_key' if per_key else 'scalar'}[{index}]"
-                              for corrects, per_key, index, _ in CHUNK_IDENTITIES])
-def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, index, rule):
+@pytest.mark.parametrize(("corrects", "per_key", "values_read", "index", "rule"), CHUNK_IDENTITIES,
+                         ids=[f"{'wy' if corrects else 'plain'}-{'per_key' if per_key else 'scalar'}"
+                              f"{'-values' if values_read else ''}[{index}]"
+                              for corrects, per_key, values_read, index, _ in CHUNK_IDENTITIES])
+def test_every_chunk_identity_holds_over_the_reals(corrects, per_key, values_read, index, rule):
     """The identity's two sides equal exactly over a symbolic chunk of three tokens, its decays a scalar's
-    or each key's, each under the identities the engine saturates for that decay
-    (`linear_scan._identities`): every entry of each side's value."""
-    chunk = _chunk_values(per_key)
+    or each key's, its readout along the state's keys or its values, each under the identities the engine
+    saturates for them (`linear_scan._identities`): every entry of each side's value."""
+    chunk = _chunk_values(per_key, values_read)
     bound = {name: _symbols(name, shape) for name, shape in VARIABLES.items()}
     bound["lower"] = np.tril(_symbols("lower", (TOKENS, TOKENS)), -1)
     left, right = (_chunk(side, chunk, bound) for side in (rule.lhs, rule.rhs))
