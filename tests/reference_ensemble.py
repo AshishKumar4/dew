@@ -15,11 +15,11 @@ from reference_error import (
     _ynn_decided,
     assert_as_exact_over_orders,
     assert_rows_as_exact_over_orders,
-    row_errors,
     widened,
 )
 
 from dew._accuracy import distance, within
+from dew.parity import row_errors
 
 STAGES = 4
 """The batches of ORDERS fresh orders an element is measured over before it fails
