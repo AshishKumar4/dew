@@ -377,35 +377,36 @@ def test_one_input_rewrites_to_one_program_in_any_process():
 @pytest.mark.parametrize("call", ["jit", "checkpoint", "custom_jvp", "custom_vjp", "custom_vmap"])
 def test_recognition_reads_a_program_inside_any_call_as_the_program(call):
     """A program run inside a call (`dew.nn.programs.CALLS`: a jit, a checkpoint, a custom derivative's
-    primal, a custom batching rule's program) is read by recognition's normal form (`canonical`) as the
-    program itself, its equations the same."""
+    primal, a custom batching rule's program), closed over a value the enclosing trace holds (a custom
+    rule's leading constant), is read by recognition's normal form (`canonical`) as the program itself:
+    canonicalized beside it, its result is the program's own value."""
     from jax.custom_batching import custom_vmap
 
     from dew.algebra.normal_form import canonical
 
-    def program(x):
-        return jnp.exp(x) * x + 1.0
+    def program(x, scale):
+        return jnp.exp(x) * scale + x * 3.0
 
-    def wrapped():
+    def wrapped(scale):
+        def inside(x):
+            return program(x, scale)
+
         if call == "jit":
-            return jax.jit(program)
+            return jax.jit(inside)
         if call == "checkpoint":
-            return jax.checkpoint(program)
+            return jax.checkpoint(inside)
         if call == "custom_jvp":
-            inner = jax.custom_jvp(program)
-            inner.defjvp(lambda primals, tangents: (inner(*primals), tangents[0]))
-            return inner
+            rule = jax.custom_jvp(inside)
+            rule.defjvp(lambda primals, tangents: (rule(*primals), tangents[0]))
+            return rule
         if call == "custom_vjp":
-            inner = jax.custom_vjp(program)
-            inner.defvjp(lambda x: (inner(x), x), lambda x, cotangent: (cotangent,))
-            return inner
-        inner = custom_vmap(program)
-        inner.def_vmap(lambda size, batched, x: (program(x), batched[0]))
-        return inner
+            rule = jax.custom_vjp(inside)
+            rule.defvjp(lambda x: (rule(x), x), lambda x, cotangent: (cotangent,))
+            return rule
+        rule = custom_vmap(inside)
+        rule.def_vmap(lambda size, batched, x: (inside(x), batched[0]))
+        return rule
 
-    x = jnp.ones(8)
-
-    def names(function):
-        return [equation.primitive.name for equation in canonical(jax.make_jaxpr(function)(x)).eqns]
-
-    assert names(wrapped()) == names(program)
+    both = canonical(jax.make_jaxpr(lambda x, scale: (wrapped(scale)(x), program(x, scale)))(
+        jnp.linspace(-1.0, 1.0, 8), jnp.float32(0.5)))
+    assert both.outvars[0] is both.outvars[1]

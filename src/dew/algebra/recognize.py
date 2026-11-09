@@ -267,9 +267,9 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
     return tuple(sorted(places))
 
 
-BARRIERS = frozenset({"custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
-"""The equations a region the compile point writes never holds: a program's own derivative rule, which the
-call written in its place would not keep. A gradient's stop is no barrier but no identity either
+BARRIERS = frozenset({"custom_jvp_call", "custom_vjp_call", "custom_vmap_call"})
+"""The equations a region the compile point writes never holds: a program's own derivative or batching rule,
+which the call written in its place would not keep. A gradient's stop is no barrier but no identity either
 (`VALUE_IDENTITIES`): it stays its own equation, so a region matches a declaration only where the declaration
 stops the same value, and a stop on a call's operand stays outside the call."""
 

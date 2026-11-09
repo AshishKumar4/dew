@@ -736,24 +736,25 @@ UNROUNDED = frozenset({
     "reshape", "squeeze", "expand_dims", "broadcast_in_dim", "transpose", "concatenate", "slice",
     "dynamic_slice", "dynamic_update_slice", "gather", "select_n", "copy", "copy_p", "rev", "pad",
     "optimization_barrier", "stop_gradient", "max", "min", "neg", "abs", "sign", "reduce_max", "reduce_min",
-    "argmax", "argmin", "sort", "jit", "pjit", "cond", "while", "scan", "remat", "checkpoint",
-    "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr", "shard_map", "closed_call",
+    "argmax", "argmin", "sort", "cond", "while", "scan", "shard_map",
 })
 """Equations that move, select or order values without rounding them, or run programs whose own
-equations the audits read (`reached`, through the gate's `equations`): a float32 boundary value they
-carry past the boundaries stays the witnessed value, and only an equation that rounds past them must
-be float64."""
+equations the audits read (`reached`, through the gate's `equations`), as every call does
+(`dew.nn.programs.CALLS`, read beside these): a float32 boundary value they carry past the boundaries stays
+the witnessed value, and only an equation that rounds past them must be float64."""
 
 
 def _rounds(eqn) -> bool:
-    """Whether an equation can round a floating value: not one of UNROUNDED, nor an identity barrier
-    (a primitive whose name says so), nor a conversion between equal dtypes or of a boolean, nor a
+    """Whether an equation can round a floating value: not one of UNROUNDED nor a call, nor an identity
+    barrier (a primitive whose name says so), nor a conversion between equal dtypes or of a boolean, nor a
     product with or quotient by the literal one, nor a sum with the literal zero."""
     import numpy as np
     from jax.extend import core
 
+    from dew.nn.programs import CALLS
+
     name = eqn.primitive.name
-    if name in UNROUNDED or name.endswith("barrier"):
+    if name in UNROUNDED or name in CALLS or name.endswith("barrier"):
         return False
     if name == "convert_element_type":
         source = eqn.invars[0].aval.dtype

@@ -22,6 +22,7 @@ from jax.extend import core as jcore
 
 from dew.algebra import terms
 from dew.algebra.forms import aval
+from dew.nn.derivatives import marked_call_p
 from dew.nn.programs import called, host_evaluated, jax_name, on_host
 
 
@@ -105,9 +106,9 @@ class _Forms(NamedTuple):
 
 
 def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | None = None) -> list:
-    """`jaxpr` run over `values` with every call's program (`dew.nn.programs.called`) run in place, each
-    equation in the form recognition compares (`_normal`): under a trace its equations each bind once, a value
-    of constants alone computed where it is made."""
+    """`jaxpr` run over `values` with every call's program (`dew.nn.programs.called`) but a marked span's run
+    in place, each equation in the form recognition compares (`_normal`): under a trace its equations each
+    bind once, a value of constants alone computed where it is made."""
     env: dict[jcore.Var, object] = dict(zip(jaxpr.constvars, consts, strict=True))
     env.update(zip(jaxpr.invars, values, strict=True))
     forms = forms or _Forms(_Made(), _Made(), _Made())
@@ -118,7 +119,9 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
 
     for equation in jaxpr.eqns:
         operands = [read(atom) for atom in equation.invars]
-        body = called(equation)
+        # A marked span stays as written: a boundary the algebra reads by its kind
+        # (`dew.nn.derivatives.marked`, a protected span's inside no rule touches), so no region crosses it.
+        body = None if equation.primitive is marked_call_p else called(equation)
         if body is not None:
             # What the call computes, the primal of a custom derivative's: its own derivative rule bars its
             # region (`BARRIERS`); a declaration's is the call's, kept where the call is written.

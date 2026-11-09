@@ -32,7 +32,7 @@ from dew.algebra.extract import Linear
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
-from dew.nn.programs import inlined
+from dew.nn.programs import CALLS, inlined
 
 
 @dataclasses.dataclass(frozen=True)
@@ -596,10 +596,10 @@ def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostMo
     return list(forms[0].value), price
 
 
-BODIES = frozenset({"jit", "pjit", "closed_call", "scan", "while", "cond", "remat2", "checkpoint",
-                    "custom_jvp_call", "custom_vjp_call", "custom_vjp_call_jaxpr"})
-"""The primitives whose bodies the pass rewrites in place, each a region of its own (§1.2): a nested program,
-a scan, a loop, a conditional, a checkpoint, and a custom derivative's primal call, its rules kept."""
+BODIES = (CALLS - {"marked_call"}) | {"scan", "while", "cond"}
+"""The primitives whose bodies the pass rewrites in place, each a region of its own (§1.2): every call
+(`dew.nn.programs.CALLS`: a nested program, a checkpoint, a custom derivative's or batching rule's primal
+call, its rules kept), a scan, a loop and a conditional. A marked span is read by its kind (`WITHIN`)."""
 
 
 def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
