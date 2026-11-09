@@ -851,7 +851,6 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
     source's `Pretrained.fresh`), so the run records a fresh group that claims the gate alone, ahead of
     the base that holds the checkpoint's weights (the train review of trains 707-732: an LM run trained
     its fresh parameters at the base rate)."""
-    from dew.config import RunConfig
     from dew.optim import param_labels, parameter_name
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
@@ -863,7 +862,7 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
     objective = config.prepare().train("gated")
     gate = ("early_exit_gate/bias", "early_exit_gate/kernel")
     assert objective.fresh_modules() == gate
-    groups = RunConfig.load(config.trainer.checkpoints("gated").directory).optim.param_groups
+    groups = config.grouped(objective, "gated").param_groups
     labels = param_labels(groups)(objective.held_variables()["params"])
     fresh = {parameter_name(path) for path, label in jax.tree_util.tree_leaves_with_path(labels)
              if label == groups[0].name}
