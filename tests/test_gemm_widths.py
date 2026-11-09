@@ -12,14 +12,28 @@ from generation_support import INTERPRETS
 
 from dew.nn.kernels import gemm, generation
 
+WIDTHS = [(96, 100), (200, 72)]
+"""Depths and widths no tile of any family divides."""
+
 
 @INTERPRETS
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90", "v5e"])
-@pytest.mark.parametrize(("depth", "width"), [(96, 100), (200, 72)], ids=["96x100", "200x72"])
+@pytest.mark.parametrize(("depth", "width"), WIDTHS, ids=["96x100", "200x72"])
 def test_a_product_of_unaligned_widths_runs_on_the_template(generation_name, depth, width):
+    """`unaligned_widths_run_on_the_template`, interpreted on the CPU as each family."""
+    with generation.assumed(generation_name):
+        unaligned_widths_run_on_the_template(depth, width, interpret=True)
+
+
+def unaligned_widths_run_on_the_template(depth: int, width: int, *, interpret: bool) -> None:
     """A grouped forward, its input gradient and its kernel gradient, and a dense forward, at a depth and a
     width no tile of the family divides, the template's launch named (`'mosaic'`): over integers from -1 to
-    1, every product and sum exact, bitwise numpy's, groups of rows no tile divides and one empty."""
+    1, every product and sum exact, bitwise numpy's, groups of rows no tile divides and one empty; on a GPU
+    itself too (tests/test_gpu_gemm.py's cell). Each runs padded to whole tiles of its family
+    (`grouped_matmul._Mosaic._aligned`): a TMA descriptor's tiled view takes no global dimension its
+    swizzle's tile does not divide (Mosaic GPU: "dimension 1 must have size smaller or a multiple of its
+    tiling 64, but got 100", the compile gate at a022d3abb83), so no bound of the descriptor's reads a
+    partial one in place."""
     sizes = [70, 0, 129, 57]
     starts = np.cumsum([0, *sizes])
     keys = jax.random.split(jax.random.key(4), 3)
@@ -30,7 +44,7 @@ def test_a_product_of_unaligned_widths_runs_on_the_template(generation_name, dep
     x, w, dy = ints(keys[0], (sum(sizes), depth)), ints(keys[1], (len(sizes), depth, width)), ints(
         keys[2], (sum(sizes), width))
     group_sizes = jnp.asarray(sizes, jnp.int32)
-    options = {"out_dtype": jnp.float32, "precision": "default", "interpret_on_cpu": True}
+    options = {"out_dtype": jnp.float32, "precision": "default", "interpret_on_cpu": interpret}
 
     def grouped(lhs, matrices):
         return np.concatenate([np.asarray(lhs[a:b], np.float32) @ np.asarray(matrices[g], np.float32)
@@ -46,7 +60,7 @@ def test_a_product_of_unaligned_widths_runs_on_the_template(generation_name, dep
         "dense forward": (lambda: gemm.gemm(x, w[0], None, **options),
                           np.asarray(x, np.float32) @ np.asarray(w[0], np.float32)),
     }
-    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
+    with generation.chosen(grouped_matmul="mosaic"):
         for name, (call, expected) in calls.items():
             with generation.routes() as routes:
                 got = np.asarray(jax.jit(call)(), np.float32)
