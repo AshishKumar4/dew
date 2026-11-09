@@ -336,6 +336,55 @@ def test_a_candidate_departing_from_the_sources_function_is_named_and_one_comput
     assert departed and departed[0].startswith("logits at draw 0")
 
 
+SCRIPTED = """
+import json
+import sys
+
+from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+
+
+class ScriptedConfig(LlamaConfig):
+    model_type = "scripted_llama"
+
+
+class ScriptedLlama(LlamaForCausalLM):
+    config_class = ScriptedConfig
+
+
+if __name__ == "__main__":
+    AutoConfig.register("scripted_llama", ScriptedConfig)
+    AutoModelForCausalLM.register(ScriptedConfig, ScriptedLlama)
+    from dew.interop.verify import verify_mapping
+
+    verified = verify_mapping(json.loads(sys.argv[1]))
+    with open(sys.argv[2], "w") as out:
+        json.dump({"verdict": type(verified).__name__, "family": getattr(verified, "family", None)}, out)
+"""
+"""A script that defines a type's classes itself and registers them with transformers' auto classes, then
+verifies the type (`test_a_type_a_script_defines_and_registers_verifies`)."""
+
+
+def test_a_type_a_script_defines_and_registers_verifies(tmp_path):
+    """A type whose config and causal LM a script defines in its own `__main__` and registers at runtime
+    verifies from parts: tier 2's float64 twin, built in a process of its own (`dew.interop.isolated`),
+    finds the script's classes there as `multiprocessing` finds them, the script's guarded block not run
+    again."""
+    import os
+    import subprocess
+    import sys
+
+    script = tmp_path / "scripted.py"
+    script.write_text(SCRIPTED)
+    config = {**tiny_config("llama").to_dict(), "model_type": "scripted_llama"}
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(path for path in sys.path if path),
+                   "XDG_CACHE_HOME": str(tmp_path / "cache")}
+    verdict = tmp_path / "verdict.json"
+    ran = subprocess.run([sys.executable, str(script), json.dumps(config), str(verdict)], env=environment,
+                         capture_output=True, text=True, check=False)
+    assert ran.returncode == 0, ran.stderr[-4000:]
+    assert json.loads(verdict.read_text()) == {"verdict": "VerifiedMapping", "family": "parts"}
+
+
 def test_a_probe_keeps_the_depth_of_code_not_transformers_own():
     """GLM-4.7-Flash's classes subclassed under a type of their own keep their stated depth in the probe
     (`verify.shallow`), whose cut reads each layer's kind: code other than transformers' own may compute
