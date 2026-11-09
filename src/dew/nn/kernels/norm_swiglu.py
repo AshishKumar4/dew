@@ -355,8 +355,7 @@ def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, 
         given = [read(atom) for atom in equation.invars]
         params = {key: retargeted(value) for key, value in equation.params.items()}
         with equation.ctx.manager:
-            functions, bound = equation.primitive.get_bind_params(params)
-            made = equation.primitive.bind(*functions, *given, **bound)
+            made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
         outputs = made if equation.primitive.multiple_results else [made]
         values.update(zip(equation.outvars, outputs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
