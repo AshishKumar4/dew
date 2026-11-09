@@ -101,9 +101,10 @@ STEP_SEEDS = 8
 """Check 1's declared seeds for a recomputed block's committed step against the plain block's (`seeds_for`,
 paired: both arms are one decoder's arithmetic, saved or recomputed), and for its forward."""
 
-SIZED_STEP_SEEDS = {("mla", False): 16, ("altup", True): 128}
-"""The steps that size past STEP_SEEDS (`seeds_for`, paired): the latent-attention block unscanned, and
-the scanned AltUp block, whose initialized draws (zero momentum) spread its step's error wider."""
+SIZED_STEP_SEEDS = {("mla", True): 512, ("altup", True): 128}
+"""The steps that size past STEP_SEEDS (`seeds_for`, paired): the scanned latent-attention block, whose
+query norm's 16 scales spread its gradient's ratio across draws, and the scanned AltUp block, whose
+initialized draws (zero momentum) spread its step's error wider."""
 
 
 def wide_step(model):
