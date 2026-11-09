@@ -163,6 +163,9 @@ followed = _loaded(HERE / "followed.py")
 progress = _loaded(HERE / "progress.py")
 digests = _loaded(HERE / "digests.py")
 grading = _loaded(HERE / "grading.py")
+# The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
+# run_tests.py's `node_of`), older commits' and newer alike.
+STALE, node_of = grading.STALE, grading.node_of
 code_of, unit, units = digests.code_of, digests.unit, digests.units
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
