@@ -706,48 +706,120 @@ def every_backward_config_on_a_gpu(config, case):
             run()
 
 
-SHARED_BYTES = (
-    # (launch, width, config, the bytes Triton asked for where it refused, or None where it compiled, GPU)
-    ("forward", 128, attention_triton.Tiles(128, 128, 8, 3), None, "sm80"),
-    ("forward", 128, attention_triton.Tiles(128, 128, 8, 3), 163840, "sm86"),
-    ("forward", 128, attention_triton.Tiles(32, 128, 4, 3), 147456, "sm86"),
-    ("forward", 128, attention_triton.Tiles(64, 128, 4, 3), 163840, "sm86"),
-    ("forward", 128, attention_triton.Tiles(128, 64, 4, 3), None, "sm86"),
-    ("forward", 256, attention_triton.Tiles(64, 32, 4, 3), 102400, "sm86"),
-    ("forward", 256, attention_triton.Tiles(128, 128, 4, 2), 229376, "sm86"),
-    ("backward", 256, attention_triton.Tiles(32, 32, 4, 2), None, "sm86"),
-    ("backward", 128, attention_triton.Tiles(128, 128, 4, 2), 167424, "sm80"),
-    ("backward", 64, attention_triton.Tiles(128, 128, 4, 2), 101888, "sm86"),
-)
-"""Configs Triton compiled or refused on an A100 (sm80) and an A10 (sm86), bf16, from
-bench_attention_smem.py's runs SMEM-a100 and SMEM-a10 (2026-10-21)."""
+STAGED_CALLS = {
+    # name: (GPU, dtype, width, score hooks)
+    "a100-bf16": ("sm80", jnp.bfloat16, 32, ()), "a100-bf16-128": ("sm80", jnp.bfloat16, 128, ()),
+    "a100-fp32": ("sm80", jnp.float32, 64, ()), "a100-fp16": ("sm80", jnp.float16, 64, ()),
+    "a100-softcap": ("sm80", jnp.bfloat16, 32, ("softcap",)),
+    "a100-temperature": ("sm80", jnp.bfloat16, 32, ("temperature",)),
+    "a100-key": ("sm80", jnp.bfloat16, 64, ("key",)), "a100-tile": ("sm80", jnp.bfloat16, 128, ("tile",)),
+    "h100-bf16": ("sm90", jnp.bfloat16, 64, ()), "h100-fp32": ("sm90", jnp.float32, 128, ()),
+    "h100-fp16": ("sm90", jnp.float16, 128, ()), "b200-bf16": ("sm100", jnp.bfloat16, 128, ()),
+    "b200-alibi": ("sm100", jnp.bfloat16, 64, ("alibi",)),
+    "b200-temperature": ("sm100", jnp.bfloat16, 64, ("temperature",)),
+    "b200-fp32": ("sm100", jnp.float32, 64, ()), "rtx5090-bf16": ("sm120", jnp.bfloat16, 64, ())}
+"""Calls of each GPU's staging forms (`_Staged`): mma.sync's and warpgroup MMA's, 16-bit and fp32, the
+chained products' warps along the queries and the values, and the score parameters' kinds."""
+
+STAGED_TILES = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 64, 4, 2),
+                attention_triton.Tiles(128, 64, 4, 2), attention_triton.Tiles(64, 128, 4, 3))
+"""Tiles either side of each staging rule's turns: mma.sync's and warpgroup MMA's (64 rows), the chained
+products' warps along the queries or the values, two stages and three."""
 
 
-@pytest.mark.parametrize("launch, width, tiles, requested, generation_name", SHARED_BYTES)
-def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_refuses(
-        launch, width, tiles, requested, generation_name):
-    """Each launch's shared-memory bound against what Triton did on a GPU: within the block's budget
-    where it compiled (an A100's 128 by 128 forward tile in three stages, jax's mha's fastest there),
-    and at or above the bytes it asked for, past the budget, where it refused."""
+def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, config: attention_triton.Tiles,
+                     *, step: bool) -> dict:
+    """Each Triton launch of a causal call of 512 queries over 4 heads at `config` (its forward, or with
+    `step` its training forward and backward), compiled by XLA's CUDA backend for a compile-only device of
+    `generation_name` on this CPU (tests/kernel_compile.py): the shared bytes it launched with, and its
+    model's count of them at the config it traced (`report.traced`), by kernel; none where either launch
+    refuses `config`."""
     import tokamax
+    from fla_gdn_support import KernelCase
+    from kernel_compile import KERNEL, UNIQUIFIED, _compiled
 
-    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import report
 
-    arrays = {"query": jax.ShapeDtypeStruct((1, 1024, 4, width), jnp.bfloat16),
-              "value": jax.ShapeDtypeStruct((1, 1024, 2, width), jnp.bfloat16)}
-    if launch == "forward":
-        op, config = attention_triton.TritonForward(), tiles
+    queries, heads = 512, 4
+    spans = template.spans(queries, queries, 1, causal=True)
+    score_mod, kinds, draw = score_hooks(hooks, queries, queries, width, rows=1, heads=heads)
+    params, initial = jax.eval_shape(lambda: draw(0))
+    shape = jax.ShapeDtypeStruct((1, queries, heads, width), dtype)
+
+    def hooked(params, initial):
+        return template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
+
+    if step:
+        def call(query, key, value, dout, params, initial):
+            out, *residuals = attention_triton.forward(query, key, value, spans, hooked(params, initial),
+                                                       residuals=True)
+            grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
+                                              residuals=tuple(residuals))
+            return out, grads.query, grads.key, grads.value
+        operands = (shape,) * 4 + (params, initial)
     else:
-        op = attention_triton.TritonBackward()
-        config = attention_triton.BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages,
-                                                tiles.warps, tiles.stages)
+        def call(query, key, value, params, initial):
+            return attention_triton.forward(query, key, value, spans, hooked(params, initial))
+        operands = (shape,) * 3 + (params, initial)
+    backward = attention_triton.BackwardTiles(config.block_q, config.block_k, config.warps, config.stages,
+                                              config.warps, config.stages)
+    score_kinds = tuple(kinds)
     target = generation.TARGETS[generation_name]
-    staged = op.staged_bytes(tokamax.BoundArguments(op, arrays), config, target)
-    budget = generation.shared_budget(target)
-    if requested is None:
-        assert staged <= budget
-    else:
-        assert staged >= requested > budget
+    arrays = {"query": shape, "value": shape, "query_ids": None,
+              "residuals": template.Kept.SPLIT if step else template.Kept.NONE}
+    # A config either launch refuses (its registers, its block) compiles nothing to compare.
+    launches = [(attention_triton.TritonForward(score_kinds=score_kinds), config)]
+    if step:
+        launches.append((attention_triton.TritonBackward(score_kinds=score_kinds), backward))
+    if not all(op.legal(tokamax.BoundArguments(op, arrays), tiles, target) for op, tiles in launches):
+        return {}
+    pins = {attention_triton.TritonForward: config, attention_triton.TritonBackward: backward}
+    record: dict = {}
+    with tuning.pinned(pins):
+        found = _compiled(KernelCase("staged", lambda: (call, operands)), generation_name, record)
+    assert found is not None, record
+    thunks, calls = found
+    staged = {}
+    for text in thunks:
+        for name, size in KERNEL.findall(text):
+            name = UNIQUIFIED.sub("", name)
+            if name not in calls:
+                continue
+            kernel, digest = report.kernel_of(name)
+            launch = report.traced(digest)
+            if kernel.startswith("attention_forward"):
+                op = attention_triton.TritonForward(score_kinds=score_kinds,
+                                                    scaled=kernel.endswith("_scaled"))
+                staging = op.staging(tokamax.BoundArguments(op, arrays), launch.config, target)
+            else:
+                op = attention_triton.TritonBackward(score_kinds=score_kinds)
+                counted = (attention_triton._dq_staging if kernel == "attention_dq"
+                           else attention_triton._dkv_staging)
+                staging = counted(tokamax.BoundArguments(op, arrays), launch.config, target, score_kinds)
+            staged[kernel] = (int(size), staging)
+    return staged
+
+
+@pytest.mark.parametrize("step", [False, True], ids=["forward", "step"])
+@pytest.mark.parametrize(("generation_name", "dtype", "width", "hooks"), STAGED_CALLS.values(),
+                         ids=STAGED_CALLS)
+def test_a_triton_launchs_shared_memory_is_what_triton_allocates(generation_name, dtype, width, hooks, step):
+    """Each Triton launch of a call, compiled by XLA's CUDA backend for a compile-only GPU on this CPU at
+    tiles either side of each staging rule's turns: the shared memory its model counts (`Staging`:
+    `TritonForward.staging`, `_dq_staging`, `_dkv_staging`) is the bytes Triton launched it with, where
+    Triton's rules determine them, and at or above them where it counts a tile whole that Triton's
+    allocator overlaps by liveness. An undercount once derived an A100's fp32 training forward Triton
+    refused (180224 bytes asked of 166912, where 131072 were counted)."""
+    compiled = 0
+    for config in STAGED_TILES:
+        staged = _staged_launches(generation_name, dtype, width, hooks, config, step=step)
+        compiled += bool(staged)
+        for kernel, (launched, staging) in staged.items():
+            if staging.whole:
+                assert staging.bytes >= launched, (kernel, config, staging, launched)
+            else:
+                assert staging.bytes == launched, (kernel, config, staging, launched)
+    assert compiled
 
 
 def _trained(spans: template.KeySpans):

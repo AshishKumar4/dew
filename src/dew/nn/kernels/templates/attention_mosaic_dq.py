@@ -21,6 +21,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     modelled,
     part_count,
     reducing,
+    staged_after,
+    stages_after_walks,
     stated,
     transposed_swizzles,
 )
@@ -36,23 +38,26 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
 
 
 def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
-                    stages: int) -> tuple[list, dict]:
-    """The dQ program's allocations as `Family.scoped` takes them, in `_dq_launch`'s order: its consumers'
-    query and output-cotangent stages, their dQ output stage (fp32, its share of the config's `columns`) and
-    their rows' stage, the two loads' barriers, each consumer's relay tile where its score cotangents reach
-    dQ's product through shared memory (`Family.relay_bytes`, `_relayed`), and its key and value streams in
-    `stages` slots (`Family.streams`)."""
+                    stages: int) -> tuple[list, dict, list]:
+    """The dQ program's allocations as `Family.scoped` takes them, in `_dq_launch`'s order, and those it
+    scopes after its walks: its consumers' query and output-cotangent stages, their dQ output stage (fp32,
+    its share of the config's `columns`; after the walks, in their slots, where the family scopes them apart,
+    `stages_after_walks`) and their rows' stage, the two loads' barriers, each consumer's relay tile where
+    its score cotangents reach dQ's product through shared memory (`Family.relay_bytes`, `_relayed`), and its
+    key and value streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
+    out = family.staged_memory((consumers, block_q, width // config.columns), jnp.float32)
+    after = [out] if stages_after_walks(family) else []
     scoped = [family.staged_memory((consumers, block_q, width), dtype),
               family.staged_memory((consumers, block_q, value_width), dtype),
-              family.staged_memory((consumers, block_q, width // config.columns), jnp.float32),
+              *([] if after else [out]),
               family.staged_memory((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers),
               *_relay_tiles(family, consumers, block_q, block_k, dtype)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
     # The logits' and dP's products read the keys and values transposed.
     return scoped, family.streams(blocks, stages, consumers,
-                                  swizzles=transposed_swizzles(config, "keys", "values"))
+                                  swizzles=transposed_swizzles(config, "keys", "values")), after
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
              rows, accumulators):
@@ -156,13 +161,16 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     rows_count = 4 + 2 * sum(summed)
     leaves, treedef = jax.tree.flatten((spans, score_params, drop))
 
-    def body(*refs, streams):
+    def body(*refs, streams, after=None):
         (q_ref, k_ref, v_ref, do_ref, peak_ref, prior_ref, anchor_ref, delta_ref, index_ref), refs = (
             refs[:9], refs[9:])
         (spans_of, score_refs, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, refs = refs[0], refs[1:]
         keyed_ref, refs = (refs[0], refs[1:]) if walk.accurate else (None, refs)
-        rows_ref, (q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded, *relay) = refs[0], refs[1:]
+        rows_ref, (q_smem, do_smem, *refs) = refs[0], refs[1:]
+        # Its output stage the program's where no scope after the walks holds it (`stages_after_walks`).
+        out_smem, refs = (None, refs) if after is not None else (refs[0], refs[1:])
+        row_smem, q_loaded, do_loaded, *relay = refs
         row, head, views, streams, pair_first, streamed = _query_program(
             program, streams, k_ref, v_ref, spans_of, heads=heads, kv_heads=kv_heads, queries=queries,
             consumers=consumers)
@@ -196,7 +204,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             written = [(dq, dq_ref.at[rows])]
             if keyed_ref is not None:
                 written.append((keyed[0], keyed_ref.at[rows]))
-            family.stored(*zip(*written, strict=True), smem=out_smem.at[index])
+            staged_after(after, out_smem, index,
+                         lambda stage: family.stored(*zip(*written, strict=True), smem=stage))
             # Each row in a row's layout whatever its own (a call without a hook's keyed mass is a constant).
             summed_grads = tuple(part for part, on in zip(grads, summed, strict=True) if on)
             summed_weighed = tuple(part for part, on in zip(weighed, summed, strict=True) if on)
@@ -211,10 +220,11 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
 
         family.scheduled(consumers, consumer, producer)
 
-    scoped, rings = _dq_allocations(family, program.tiles, width, value_width, query.dtype, program.stages)
+    scoped, rings, after = _dq_allocations(family, program.tiles, width, value_width, query.dtype,
+                                           program.stages)
 
     def entry(*refs):
-        family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
+        family.scoped(functools.partial(body, *refs), *scoped, streams=rings, after_walks=tuple(after))
 
     sums = jax.ShapeDtypeStruct((batch, queries, heads, share[1]), jnp.float32)
     stats_shape = jax.ShapeDtypeStruct((rows_count, batch, heads, queries), jnp.float32)

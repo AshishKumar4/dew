@@ -142,6 +142,24 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 `MosaicBackward.eligible`)."""
 
 
+def stages_after_walks(family: mosaic.Family) -> bool:
+    """Whether a launch stages its outputs (a forward's output or split sums, dQ's sums) after its walks, in
+    their slots (`Family.scoped`'s `after_walks`, `staged_after`): where its family scopes its walks apart
+    (`walks_scoped`, cp.async's pipelines), no walk reading them. An A100's forward at width 128 staged its
+    output beside its query's and its rings, 101,392 bytes at 128 x 32, one program a multiprocessor, where
+    FlashAttention 2 runs two (M-ET-48: 6.25% occupancy, 1.39-1.57x its time)."""
+    return family.walks_scoped
+
+
+def staged_after(after: Callable | None, stages, index, store: Callable) -> None:
+    """`store(stage)` of consumer `index`'s output stage: the program's `stages`', or one `after` scopes after
+    the walks (`stages_after_walks`)."""
+    if after is None:
+        store(stages.at[index])
+    else:
+        after(lambda scoped: store(scoped.at[index]))
+
+
 def query_swizzle(family: mosaic.Family) -> int | None:
     """The swizzle a forward stages its query block at, the left operand of its logits' product: the
     narrowest where its family loads operands into registers (`Family.operands_in_registers`), 8-row tiles
