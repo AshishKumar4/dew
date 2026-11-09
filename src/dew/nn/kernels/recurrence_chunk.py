@@ -373,20 +373,19 @@ itself; and keys wider than the port takes in their dtype. Packed documents take
 stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('wgmma', 'forward, a decay a key dimension'): (
-        'fla', "on an H100 80GB HBM3, 16-bit, the port's forward 1.406 ms against the template's 1.624 on "
-               "Kimi Linear's delta attention, the template's intra pairs 0.65 ms against the port's intra "
-               "rows' 0.65 and its keys' weighted launch 0.25 against the port's 0.17 "
-               "(window-h100-c70aaa8-b8109ee)"),
-}
+PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {}
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows Dew's port
 of fla's kernels (`fla_rule`; "the port" below) faster than the recurrence template, each its old route's
 kernel and that receipt; every time below sets the template against that port, not against upstream fla's
 own kernels or FlashQLA's (tools/benchmark_recurrence.py's `fla` and `flashqla` arms): the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
-shrinks as the template wins its cells, and no cell is picked or ranked at run time. A gated delta net's
-cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06 ms against
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. None is left: every
+cell is the template's. Warpgroup MMA's forward of Kimi delta attention, the last, is the template's, 1.154 ms
+against the port's 1.571 on a GH200 480GB and 1.647 against 2.412 on an H100 PCIe (M-JS-43b-gh200 and
+-h100pcie at e52d05f558f: exclusive, two rounds alternating the arms; the cell's receipt had the port's
+1.406 against the template's 1.624 on an H100 80GB HBM3 at c70aaa8, window-h100-c70aaa8-b8109ee). A gated
+delta net's cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06
+ms against
 the port's 8.81 (JS-kdacells-a100-a928ea2b4), and its training, 11.12 ms against 15.92
 (batch-window-a100-b2ad84c61). Warpgroup MMA's training of Kimi delta attention is the template's, its
 forward and gradient 3.926 ms a call against the port's 4.726 on an H100 80GB HBM3 and 3.916 against 4.694 on
