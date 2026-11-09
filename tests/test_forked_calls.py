@@ -524,7 +524,8 @@ def test_a_forked_recurrence_costs_its_tokens_and_a_chunk_a_document(layer, docu
     call's own operands and their cotangents laid onto it and back at most once more, with each document's
     memory, its cotangent, its final and that final's cotangent beside it, fp32, an operation an element: a
     decision window's rows at a documents bound of its own windows and at a loose one, nothing scaled by the
-    bound times the row (armada, 11-09: 1.04 and 1.28 times the grid's packed row, gated delta net and SSD)."""
+    bound times the row (armada, 11-09: 1.04 and 1.28 times the grid's packed row, gated delta net and
+    SSD)."""
     call, operands, chunk, memories = _recurrence_call(layer, FORKED_LENGTH, documents)
     temporaries, flops = _compiled_cost(call, *operands)
     packed = _recurrence_call(layer, FORKED_LENGTH + documents * chunk, 0)
