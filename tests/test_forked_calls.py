@@ -135,6 +135,13 @@ def test_forked_rows_lay_each_prefix_once_and_each_row_back_at_its_tokens():
     apart = ForkedRows.pack(ROWS, WIDTH, fields={"sampled": sampled})
     assert int(np.sum(np.asarray(apart.coordinates.segments) > 0)) == sum(map(len, ROWS))
     assert apart.coordinates.forks is None
+    # Each token's tree, the group its document's chain of ancestors roots in (`Forks.trees`): the four
+    # rows over the prompt one tree, the fifth another.
+    trees = np.asarray(forks.coordinates.forks.trees(forks.coordinates.segments)).reshape(-1)
+    owned = [{(int(slot) // WIDTH, int(trees[slot])) for slot in np.asarray(forks.index[number, :len(row)])}
+             for number, row in enumerate(ROWS)]
+    assert all(len(held) == 1 and next(iter(held))[1] > 0 for held in owned)
+    assert owned[0] == owned[1] == owned[2] == owned[3] != owned[4]
 
 
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
@@ -144,7 +151,8 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
     branches), or that draws
     dropout in a training step, says why a call over forks would not compute each row as its own
     (`ForkedCalls`): its objective lays its rows whole (`shares_prefixes`), and a call over forks is
-    refused, where the same decoder without the cause runs it."""
+    refused, where the same decoder without the cause runs it. A joint tree (`Forks.joint`), one row read
+    together, draws its dropout once and runs in training; its other causes refuse it all the same."""
     from dew.nn.engram import Engram
 
     forks = ForkedRows.pack(ROWS, WIDTH)
@@ -182,6 +190,17 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
     with pytest.raises(ValueError):
         dropping.apply(params, forks.tokens, coordinates=forks.coordinates, train=True,
                        rngs={"dropout": jax.random.key(1)})
+    # A joint tree is one row read together (`Forks.joint`, a decision row's siblings): it draws its dropout
+    # once, as that row does, so its training call runs; every other refusal holds.
+    assert forks.coordinates.forks is not None
+    joint = dataclasses.replace(forks.coordinates,
+                                forks=dataclasses.replace(forks.coordinates.forks, joint=True))
+    dropping.apply(params, forks.tokens, coordinates=joint, train=True,
+                   rngs={"dropout": jax.random.key(1)})
+    for model in refusing.values():
+        held = model.init(jax.random.key(0), jnp.ones((1, WIDTH), jnp.int32))
+        with pytest.raises(ValueError):
+            model.apply(held, forks.tokens, coordinates=joint)
 
 
 def test_a_mask_beside_forks_narrows_what_they_read():
