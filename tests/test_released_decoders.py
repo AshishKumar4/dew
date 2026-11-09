@@ -10,7 +10,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import pytest
 from interop_support import fixture_ids, token_draw, transformers_arms, transformers_model
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, seeds_for, widened
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
 from dew.interop import Pretrained
 
@@ -38,9 +38,9 @@ def test_minicpm5_computes_transformers_logits_through_the_llama_reader(tmp_path
     reference, truth = transformers_arms(transformers_model(tmp_path),
                                          lambda model, ids: model(ids, use_cache=False).logits)
     draw = token_draw(0x1D5, config["vocab_size"], (2, 9))
-    seeds = seeds_for(reference, draw, "MiniCPM5 logits", truth_fn=truth)
+    # The count `seeds_for` sized.
     assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw, "MiniCPM5 logits",
-                    seeds=seeds, truth_fn=truth)
+                    seeds=8, truth_fn=truth)
 
 
 def at_tiny_dims(release: str, tiny: str, dims: tuple[str, ...], directory: Path, **beside) -> Path:

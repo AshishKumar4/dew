@@ -1,11 +1,14 @@
 """The residual storage a pullback names before compiling, not a claim about XLA's scheduled peak."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.training.footprint import Workspace, device_bytes, gradient_peak, residual_bytes
+from dew.training.footprint import POINTER_BYTES, Workspace, device_bytes, gradient_peak, residual_bytes
 
 
 def test_resident_device_bytes_do_not_include_host_state():
@@ -133,7 +136,9 @@ def test_a_gradients_peak_holds_the_gradient_beside_the_cotangent_each_residual_
     held = (2 * 64 * 16 + 8 * 64) * 4
     for size in (0, 1 << 20):
         workspace = Workspace(size, size)
-        assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=workspace).bytes == held + size
+        # Beside them, the tuple of the two gradients, a pointer to each (`POINTER_BYTES`).
+        assert (gradient_peak(loss, params, (rows,), platform="gpu", workspace=workspace).bytes
+                == held + size + 2 * POINTER_BYTES)
 
 
 def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
@@ -221,7 +226,8 @@ def test_a_zero_gradient_is_held_from_the_programs_start_where_its_gradients_are
     held = gradient_peak(loss, params, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
     read = gradient_peak(loss, {"used": params["used"]}, (rows,), platform="gpu",
                          workspace=Workspace(0, 0)).bytes
-    assert held == read + 128 * 128 * 4, (held, read)
+    # And the tuple of its three gradients, a pointer to each, where the one returns its one gradient alone.
+    assert held == read + 128 * 128 * 4 + 3 * POINTER_BYTES, (held, read)
 
     # So where the weight gradients run after the backward (`sunk`, `late_weight_gradients`), its peak at a
     # cotangent of 64 MiB no weight gradient reads, which the zero is held through as well.
@@ -232,7 +238,7 @@ def test_a_zero_gradient_is_held_from_the_programs_start_where_its_gradients_are
                          deferred=True).bytes
     read = gradient_peak(widened, {"used": params["used"]}, (rows,), platform="gpu",
                          workspace=Workspace(0, 0), deferred=True).bytes
-    assert held == read + 128 * 128 * 4, (held, read)
+    assert held == read + 128 * 128 * 4 + 3 * POINTER_BYTES, (held, read)
 
 
 def test_a_loops_zero_carry_is_made_where_the_loop_needs_it():
@@ -544,7 +550,8 @@ def test_a_gemm_writes_in_its_bias_only_where_it_is_its_one_reader():
 
     matrix = 512 * 512 * 4
     # The bias and the sum beside it, and the reduction's scalar the program returns.
-    assert (peak(alone), peak(read_before)) == (matrix, 2 * matrix + 4)
+    # The second returns two results, a pointer to each in their tuple (`POINTER_BYTES`).
+    assert (peak(alone), peak(read_before)) == (matrix, 2 * matrix + 4 + 2 * POINTER_BYTES)
 
 
 def test_a_transposed_input_returned_flat_is_a_copy():
@@ -612,8 +619,9 @@ def test_an_input_a_product_reads_with_its_batch_inside_is_copied_once_for_every
         return jnp.einsum("mbk,bkn->bmn", rows, columns)
 
     assert peak(between, middle, columns) == 4 * 8 * 8 * 4
-    # Both outputs held to the end, and the one copy until the second product has read it.
-    assert peak(twice, inner, weights, weights) == 4096 + 2 * output
+    # Both outputs held to the end, their tuple's pointers, and the one copy until the second product has
+    # read it.
+    assert peak(twice, inner, weights, weights) == 4096 + 2 * output + 2 * POINTER_BYTES
 
 
 def test_a_gpu_product_holds_an_operand_xla_may_make_beside_its_own():
@@ -636,7 +644,7 @@ def test_a_gpu_product_holds_an_operand_xla_may_make_beside_its_own():
     # Both siblings ready before the first product, so made beside it, the second held from there to its
     # own product: the scores, both siblings and the first product's result at once.
     jaxpr = jax.make_jaxpr(program)(rows, columns, left, right).jaxpr
-    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 16384 + 16384 + 8192 + 2048
+    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 16384 + 16384 + 8192 + 2048 + 2 * POINTER_BYTES
 
     # Siblings read from an input's storage alike: the second held from the first product to its own.
     square = jax.ShapeDtypeStruct((64, 64), jnp.float32)
@@ -645,7 +653,7 @@ def test_a_gpu_product_holds_an_operand_xla_may_make_beside_its_own():
         return jnp.exp(rows).astype(jnp.bfloat16) @ left, (rows * 2.0) @ right
 
     jaxpr = jax.make_jaxpr(stored)(square, left, right).jaxpr
-    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 16384 + 8192 + 2048
+    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 16384 + 8192 + 2048 + 2 * POINTER_BYTES
 
     # A value read before its sibling's fusion makes it is made for that read, as before: the first
     # product holds its own operand beside the span of the second's sibling, made beside it, and its
@@ -657,7 +665,7 @@ def test_a_gpu_product_holds_an_operand_xla_may_make_beside_its_own():
         return jnp.sum(grown @ wide), (rows * 2.0) @ left, grown @ right
 
     jaxpr = jax.make_jaxpr(reread)(square, wide, right, right).jaxpr
-    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 2**20 + 2 * 16384
+    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 2**20 + 2 * 16384 + 3 * POINTER_BYTES
 
     # A value computed from another through a product is no sibling of it: no fusion makes both.
     weights = jax.ShapeDtypeStruct((64, 64), jnp.float32)
@@ -669,6 +677,68 @@ def test_a_gpu_product_holds_an_operand_xla_may_make_beside_its_own():
 
     jaxpr = jax.make_jaxpr(dependent)(rows, columns, weights, weights).jaxpr
     assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 3 * 16384
+
+
+@pytest.mark.parametrize(("rows", "tokens", "heads", "kv_heads", "width", "causal", "dtype"), [
+    (1, 1024, 8, 8, 64, True, jnp.float32), (64, 128, 8, 2, 128, False, jnp.float32),
+    (256, 64, 4, 4, 256, True, jnp.float32), (2, 2048, 4, 1, 64, False, jnp.bfloat16),
+    (16, 512, 16, 4, 128, True, jnp.bfloat16)],
+    ids=["causal", "grouped", "wide", "bf16", "bf16-grouped"])
+def test_a_cpu_attention_training_steps_derived_peak_bounds_its_compile(rows, tokens, heads, kv_heads, width,
+                                                                       causal, dtype):
+    """On a CPU the derived peak of jax.nn's xla attention's training step with its operands bounds what
+    XLA's compile of the real jitted forward and backward holds (its arguments, outputs and temporaries
+    but what an output aliases), the cotangent a constant or an argument: XLA's CPU fusions over YNNPACK's
+    kernels make broadcasts, transposes and copies apart where they will, so the derivation counts each
+    apart (row 5290: 1.07 to 1.46 times the derivation before)."""
+
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), dtype)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), dtype)
+    operands = (query, key, key)
+
+    def attended(query, key, value):
+        return jax.nn.dot_product_attention(query, key, value, is_causal=causal, implementation='xla')
+
+    def loss(params):
+        with jax.softmax_custom_jvp(new_val=True):
+            return attended(*params), ()
+
+    held = sum(math.prod(operand.shape) * jnp.dtype(dtype).itemsize for operand in operands)
+    derived = gradient_peak(loss, operands, (), platform="cpu", workspace=Workspace(0, 0)).bytes + held
+
+    def summed(query, key, value):
+        return jax.grad(lambda *operands: jnp.sum(attended(*operands).astype(jnp.float32)),
+                        argnums=(0, 1, 2))(query, key, value)
+
+    def pulled(query, key, value, cotangent):
+        return jax.vjp(attended, query, key, value)[1](cotangent)
+
+    def compiled(step, *shapes) -> int:
+        # Compiled for the CPU the derivation is of, whatever device the process runs first.
+        with jax.default_device(jax.devices("cpu")[0]):
+            analysis = jax.jit(step).lower(*shapes).compile().memory_analysis()
+        return (analysis.argument_size_in_bytes + analysis.output_size_in_bytes
+                + analysis.temp_size_in_bytes - analysis.alias_size_in_bytes)
+
+    cotangent = math.prod(query.shape) * jnp.dtype(dtype).itemsize
+    assert compiled(summed, *operands) <= derived
+    assert compiled(pulled, *operands, query) <= derived + cotangent
+
+
+def test_a_tpus_derived_peak_takes_none_of_a_cpus_terms():
+    """The arrays a CPU's YNNPACK fusions read apart (`laid_inputs`, `cpu_layouts`) are a CPU's alone: a
+    TPU's derived peak is the generic one a GPU's is where no product reads, and a CPU's holds the
+    broadcast its reduction reads beside it (the promotion's review: the terms were gated on any
+    platform but a GPU)."""
+    from dew.training.footprint import peak_bytes
+
+    def spread(rows):
+        totals = jnp.sum(rows, axis=1, keepdims=True)
+        return jnp.sum(rows * jnp.broadcast_to(totals, rows.shape))
+
+    jaxpr = jax.make_jaxpr(spread)(jax.ShapeDtypeStruct((64, 64), jnp.float32)).jaxpr
+    tpu, gpu, cpu = (peak_bytes(jaxpr, platform, Workspace(0, 0)) for platform in ("tpu", "gpu", "cpu"))
+    assert tpu == gpu < cpu
 
 
 def test_a_computed_value_read_in_two_orders_is_copied_for_the_second():
@@ -683,7 +753,7 @@ def test_a_computed_value_read_in_two_orders_is_copied_for_the_second():
         return product.reshape(-1), product.T.reshape(-1)
 
     program = jax.make_jaxpr(flattened)(rows, weights).jaxpr
-    assert peak_bytes(program, "gpu", Workspace(0, 0)) == 2 * 8 * 32 * 4
+    assert peak_bytes(program, "gpu", Workspace(0, 0)) == 2 * 8 * 32 * 4 + 2 * POINTER_BYTES
 
 
 def test_an_inner_product_of_vectors_takes_no_workspace():

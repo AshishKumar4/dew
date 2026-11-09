@@ -16,9 +16,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - One attention algebra: state, visibility, hooks. [1293]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293]
 - On an A100 a gathered grouped projection. [5213]
-- Theme r08 (not yet landed): training values padded to value tiles, the fast backward stepping Call.value_block. [5262]
-- Documents entering memories of their own. [5288]
-- On sm100 (tcgen05's chunks bundle) the recurrence template refuses a decay a key dimension's training. [5298]
+- Template and port walk the packed rows, each document from its own memory, and the portable walk's entered start. [5288]
+- XLA:GPU compiles a cuDNN fMHA backward with bias. [5322]
+- The template's rated scan (Mamba-2's SSD) gradient under the fast forms, decays near zero. [5335]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [2077, 485, 1424, 3423, 3425, 1506]
 - Derived resources: tiles, registers, residency and issued work. [2943, 3087, 2940, 566]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 2109]
@@ -30,6 +30,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Docs/design/architecture.md's departure block is deleted. [4655]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - A GEMM of a width or depth no swizzle tile divides. [5299]
+- Tests/test_local_attention.py::test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_axis and…. [5323]
+- Attention's contract is finite inputs. [5327]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Exact on every path, every edge and every derivative order. [2656, 3723]
 - Inference through the templates. [3424, 3602]
@@ -41,7 +43,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Models and interop
 
-- Every recurrence transition and state family. [1300, 1446, 1448, 1449, 1451, 1452, 1453, 1454, 1456, 1457, 1458, 1459, 1646]
+- Every recurrence transition and state family. [1300, 1448, 1449, 1450, 1451, 1452, 1453, 1454, 1455, 1456, 1457, 1458, 1459, 1460, 1646]
 - Saved runs carried across. [1622, 1641, 2791, 2792]
 - The remaining releases' media towers. [851, 879]
 - Formats read and written. [871, 2548, 2534, 2535]
@@ -56,6 +58,7 @@ This page is generated from the maintainers' findings ledger as each change land
 
 - Distributed and memory training modes. [156, 873, 1306]
 - XLA:CPU edges. [1591]
+- 3.12:tests/test_compile_ahead.py ran out its task's deadline. [5324]
 
 ## Data
 
@@ -67,6 +70,8 @@ This page is generated from the maintainers' findings ledger as each change land
 - Training and serving efficiency. [3330, 1880]
 - Dory: the release qualified and its tests' oracles. [596]
 - RL: lossless records, composed methods and real publication. [729]
+- Beam search over a paged cache. [5315]
+- Recurrent mixers run a serving step's mixed call. [5321]
 
 ## Algebra
 
@@ -75,10 +80,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - `precision.correctly_rounded_divide`'s tangent is `jnp.divide`'s. [5277]
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Reference comparisons held by derived bounds. [1719, 2094]
-- Bit-level synthesis in dew.algebra. [3733]
+- Bit-level synthesis in dew.algebra. [3733, 5343]
 - Tests/test_multimodal_model.py judges gemma3n-native-tiny's pixel gradient on its source draw. [5234]
 - Tests/test_multimodal_model.py judges gemma3n-native-tiny's logits after one SGD step on its source draw. [5235]
 - Tests/test_decision_laya.py's released English checkpoint. [5239]
+- algebra.md and the engine agree. [5337, 5338, 5339, 5340, 5342, 5341, 5346]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
 
 ## Decision

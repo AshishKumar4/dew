@@ -39,13 +39,19 @@ class StalePage(ValueError):
         return [str(self)]
 
 
+def sent(connection, payload):
+    """`payload` sent on `connection`, connected to the shared model process: the process refuses a guest as
+    it accepts its connection, writing why and closing it, so an admission refusal can already be queued
+    and the connection closed before the payload is sent; the refusal is read after all the same."""
+    with suppress(BrokenPipeError, ConnectionResetError):
+        connection.sendall(json.dumps(payload, allow_nan=False).encode() + b"\n")
+
+
 def request(payload):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(95)
         connection.connect(SOCKET)
-        # An admission refusal can already be queued before the payload is sent.
-        with suppress(BrokenPipeError, ConnectionResetError):
-            connection.sendall(json.dumps(payload, allow_nan=False).encode() + b"\n")
+        sent(connection, payload)
         with connection.makefile("rb") as stream:
             while True:
                 line = stream.readline(MAX_RESPONSE + 1)

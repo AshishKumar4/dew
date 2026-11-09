@@ -137,8 +137,10 @@ def dew_canvas(model, variables):
             return model.apply({**variables, "cache": cache}, canvas)
         return model.apply({**variables, "cache": prefill(model, variables, prompt)}, canvas)
 
-    # Eager: the cache's prefill reads its prompt on the host (`TokenEmbedding`'s padding).
-    return as_given(lambda *inputs: {"logits": canvas_of(*map(jnp.asarray, inputs))})
+    # Compiled as a sampler runs it, over its weights on the device as a loaded model holds them: eagerly,
+    # its every layer's every op dispatched alone, a draw cost seconds where its program costs milliseconds.
+    variables = jax.device_put(variables)
+    return jax.jit(lambda *inputs: {"logits": canvas_of(*inputs)})
 
 
 def assert_canvas_logits(model, variables, network, draw, label: str, seeds: int = CANVAS_SEEDS) -> None:

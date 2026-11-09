@@ -430,3 +430,67 @@ def test_a_flat_tables_groups_column_reaches_its_example():
     assert isinstance(example, Example) and example.groups == ()
     with pytest.raises(ValueError):
         table({"text": "t", "label": "billing", "groups": {"g": {"label": {"billing": "b", "tech": "t"}}}})
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "both_ways"])
+def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_beside_the_label_loss(causal):
+    """With `input_lm` w the loss is the label loss, unchanged to the bit, beside w times the rows' own
+    next-token cross entropy, reported as `input_ce`: bit for bit the loss a language model of the same
+    backbone, read causally, scores over the windows' rows as its documents (`LMObjective`, its head
+    tiled), every token after a row's first scored, none across the rows a window packs and none on the
+    padding; a backbone that attends both ways is read as its causal twin. A validation weighs it as
+    training does, its gradient reaches the backbone and leaves the decision head's as the label loss's,
+    and the run counts its pass and its head as work (row 4742)."""
+    from test_decision_packing import ROWS, windows
+
+    from dew.batch import coordinates, part
+    from dew.decision.head import DecisionHead
+    from dew.nn.flops import counted_flops
+    from dew.objectives.lm.objective import LMObjective
+
+    # Rows of one question each, several of which a window packs (tests/test_decision_packing.py's).
+    backbone = tiny_backbone().clone(max_seq_len=ROWS.max_len, causal=causal)
+    built = {"tokenizer": TOKENIZER, "specials": SPECIALS, "layout": ROWS, "head": DecisionHead(32, layers=1),
+             "shuffle_options": False}
+    plain = DecisionObjective(backbone, **built)
+    weighted = DecisionObjective(backbone, **built, input_lm=0.25)
+    batch = windows(plain, 2)
+    tokens, segments = np.asarray(batch["tokens"]), np.asarray(batch["segments"])
+    assert int(segments.max()) > 1, "no window packed two rows"
+    variables = plain.init(jax.random.key(0))
+    # Read as an evaluation reads it, so the language model scores its head's terms as this term does
+    # rather than taking a summed loss's gradient in its forward.
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=False)
+    labelled, _ = plain.loss(variables, batch, step)
+    stats, aux = weighted.loss(variables, batch, step)
+    assert isinstance(stats, Weighted) and stats.weights == (1.0, 0.25)
+    assert np.array_equal(np.asarray(stats.terms[0].total), np.asarray(labelled.total))
+    term = stats.terms[1]
+    label, _ = stats.terms[0].mean()
+    value, _ = weighted.reduce_loss(stats)
+    assert np.array_equal(np.asarray(value), np.asarray(label + 0.25 * term.mean()[0]))
+    assert np.array_equal(np.asarray(aux.metrics["input_ce"]), np.asarray(term.mean()[0]))
+    language = LMObjective(backbone.clone(causal=True), tokens.shape[1] - 1, head_tile="tiled")
+    text = {"text": jnp.asarray(tokens), "text_coordinates": coordinates(segments=segments)}
+    scored, _ = language.loss(part(variables, "backbone"), text, step)
+    assert np.array_equal(np.asarray(term.total), np.asarray(scored.total))
+    assert np.array_equal(np.asarray(term.mass), np.asarray(scored.mass))
+    rows = sum(len(np.unique(window[window > 0])) for window in segments)
+    assert int(np.asarray(term.mass)) == int(np.sum(segments > 0)) - rows
+    validated, _ = weighted._validation_scores(variables, batch, step)
+    assert np.array_equal(np.asarray(weighted.reduce_loss(validated)[0]), np.asarray(value))
+
+    def gradient(objective):
+        training = Step(jnp.asarray(0), jax.random.key(1), None)
+        return jax.grad(lambda params: objective.reduce_loss(objective.loss(
+            {**variables, "params": params}, batch, training)[0])[0])(variables["params"])
+
+    alone, both = gradient(plain), gradient(weighted)
+    assert all(np.array_equal(a, b) for a, b in zip(jax.tree.leaves(alone["head"]),
+                                                     jax.tree.leaves(both["head"]), strict=True))
+    assert not all(np.array_equal(a, b) for a, b in zip(jax.tree.leaves(alone["backbone"]),
+                                                         jax.tree.leaves(both["backbone"]), strict=True))
+    again = counted_flops(backbone, plain.real_lengths(batch))
+    head_work = backbone.logits_flops(np.maximum(plain.real_lengths(batch) - 1, 0))
+    assert weighted.model_flops(None, batch) == plain.model_flops(None, batch) + again + head_work
+    assert weighted.training_flops(None, batch) > plain.training_flops(None, batch)

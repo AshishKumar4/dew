@@ -130,6 +130,24 @@ def test_a_tokenizer_run_saved_before_rotary_positions_reads_as_it_learned_them(
     assert RunConfig.load(str(tmp_path)).model.build(frame=frame).positions == "learned"
 
 
+def test_a_dynamics_run_saved_before_rotary_positions_reads_as_it_learned_them(stages, tmp_path):
+    """A dynamics stage records its model's positions, "rotary" by default (Dreamer 4's, row 4802), and
+    reads back with them; one saved before the model took them, its record stating none, reads as it
+    trained, its frames and places learned vectors alone (`earlier_dynamics_positions`), so its saved
+    model computes as it was trained."""
+    record = json.loads((stages.root / "dynamics" / "run.json").read_text())
+    model = record["fields"]["model"]
+    assert {**model.get("defaults", {}), **model["fields"]}.get("positions") == "rotary"
+    # The widths a dynamics run derives from its tokenizer (`WorldModelRunConfig.build_run`).
+    widths = {"latents": 4, "bottleneck": 4, "action_size": 0}
+    assert RunConfig.load(str(stages.root / "dynamics")).model.build(**widths).positions == "rotary"
+    earlier = {**model, **{part: {name: value for name, value in model.get(part, {}).items()
+                                  if name != "positions"} for part in ("fields", "defaults")}}
+    fields = {**record["fields"], "model": earlier}
+    (tmp_path / "run.json").write_text(json.dumps({**record, "fields": fields}))
+    assert RunConfig.load(str(tmp_path)).model.build(**widths).positions == "learned"
+
+
 def test_a_dynamics_stage_names_the_step_it_read_of_its_tokenizer_and_reads_back_as_itself(stages):
     """A dynamics stage that names its tokenizer's run alone resolves, as it starts, the tokenizer's latest
     step, which its record then names; the run.json it writes reads back as the stage, as does each

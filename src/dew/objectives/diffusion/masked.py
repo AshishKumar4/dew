@@ -179,6 +179,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         """The tokens of each row, every one of them a slot the corruption may mask."""
         return self.inputs.sample.held(batch)[-1] if self.inputs is not None else None
 
+    traced = ("seq_len", "balance", "head_chunks", "process", "steps", "solver", "block", "eos_token_ids")
+    """Its window, balance, head chunks, process, its sampler's steps and solver, its blocks and end
+    tokens."""
+
     def loss(self, variables, batch, step: Step):
         nelbo, aux, _ = self._scored(variables, batch, step, train=step.training)
         return nelbo, aux

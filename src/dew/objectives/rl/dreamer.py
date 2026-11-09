@@ -563,11 +563,16 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
         self.entropy, self.free_nats, self.return_rate = entropy, free_nats, return_rate
         self.variables, self.imitates = variables, imitates
         self.slow_targets, self.smoothness = slow_targets, smoothness
-        self.ema = EMASpec(optax.constant_schedule(slow_decay), under("params", "value"))
+        self.ema = EMASpec(optax.constant_schedule(slow_decay), under("params", "value"),
+                           stated=("constant", slow_decay, "params/value"))
         self.bins = twohot_bins(model.bins)
 
     def held_variables(self) -> Variables | None:
         return self.variables
+
+    traced = ("horizon", "imagination", "lam", "entropy", "free_nats", "return_rate", "scales", "imitates",
+              "slow_targets", "smoothness")
+    """Its settings; its return bins are its model's, its slow targets' decay its EMA's."""
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         params_key, latent = jax.random.split(key)
