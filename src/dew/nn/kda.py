@@ -217,7 +217,7 @@ class KimiDeltaAttention(nn.Module):
             # The batch's documents' firsts, built once with it (`Coordinates.firsts`).
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
                                           starts=starts, max_segments=tokens.max_segments,
-                                          floor=self.lower_bound, write_bound=1.0, firsts=tokens.firsts)
+                                          write_bound=1.0, firsts=tokens.firsts)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
@@ -226,7 +226,7 @@ class KimiDeltaAttention(nn.Module):
         # fla's layer hands them over, the wide one for the math.
         rows, keys, values = (split(part) for part in jnp.split(projected, 3, axis=-1))
         # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
-        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound, write_bound=1.0)
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         shards = sequence_shards()
         given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
@@ -250,7 +250,7 @@ class KimiDeltaAttention(nn.Module):
                 kept_beta = jnp.where(valid[:, :, None], beta, 0.0)
                 return chunk_gated_delta_rule(query, key, value, kept_g, kept_beta, state, self.chunk_size,
                                               starts=starts, max_segments=tokens.max_segments,
-                                              floor=self.lower_bound, write_bound=1.0, entered=entered)
+                                              write_bound=1.0, entered=entered)
 
             out = entered_scan(projected, taps, None, entered_rule, tokens,
                                (self.num_heads, self.head_dim, self.head_dim), parts=heads,
@@ -261,8 +261,7 @@ class KimiDeltaAttention(nn.Module):
                                     f"training sequences; a decode step holds one state per row. Decode on a "
                                     f"mesh with sequence=1.")
             rule = functools.partial(chunk_gated_delta_rule, chunk_size=self.chunk_size,
-                                     max_segments=tokens.max_segments, floor=self.lower_bound,
-                                     write_bound=1.0)
+                                     max_segments=tokens.max_segments, write_bound=1.0)
             out = over_sequence(functools.partial(split_delta_rule, widths=(self.head_dim,) * 3, parts=heads,
                                                   dtype=projected.dtype if ported else wide, rule=rule),
                                 shards, (projected, g, beta, tokens.segments, tokens.starts, valid), (taps,))

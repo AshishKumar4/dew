@@ -85,10 +85,6 @@ SHAPES = {
 }
 """The real shapes. Dory 1.0 4B has none: its layers are attention and MLP (its config.json)."""
 
-KDA_FLOOR = -5.0
-"""Kimi Linear's declared lower bound of a token's log decay (`dew.nn.kda`'s `lower_bound`), its draws'
-decays above it (`operands`: at least -0.75 a token)."""
-
 ARMS = {'gdn': ('template', 'mosaic', 'hand', 'xla', 'fla', 'flashqla'),
         'kda': ('template', 'mosaic', 'hand', 'xla', 'fla'),
         'ssd': ('template', 'mosaic', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla')}
@@ -186,11 +182,9 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> l
             refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').failed(case))
             cotangents = (given['dy'], given['dfinal'])
         else:
-            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare,
-            # and Kimi delta attention's declared floor (`dew.nn.kda`'s `lower_bound`), which its draws keep.
+            # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                                     scale=shape.key_width ** -0.5, write_bound=1.0,
-                                     floor=KDA_FLOOR if shape.kind == 'kda' else None)
+                                     scale=shape.key_width ** -0.5, write_bound=1.0)
             inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
                       given['beta'].astype(bf16))
 
