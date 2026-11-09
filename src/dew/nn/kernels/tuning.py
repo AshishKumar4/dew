@@ -922,10 +922,12 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments):
 
 
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
-    """Every config of `ba`'s launch (at its key's shapes), each compiled on a
-    thread and timed alone: the device time CUPTI reads for the launch's own
+    """Every config of `ba`'s launch (at its key's shapes) the launch can take (`KernelOp.pinnable`), each
+    compiled on a thread and timed alone: the device time CUPTI reads for the launch's own
     kernels (`dew.telemetry.benchmark.device_time`), each run behind an
-    eviction, so every config starts with its operands out of cache."""
+    eviction, so every config starts with its operands out of cache. A config of the op's space the call
+    refuses is no candidate: measured, its launch raised `Unpinnable` and ended the run (row 5326, a
+    Triton forward's 128 x 128 tile holding 320 registers a thread)."""
     from dew.telemetry.benchmark import CuptiHeld, NoKernels, behind, device_time, eviction
 
     arrays, fill = materialized(op, ba)
@@ -949,8 +951,9 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
+    configs = [config for config in ba.autotuning_configs if op.pinnable(ba, op.completed(ba, config))]
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
-        futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
+        futures = {config: pool.submit(compiled, config) for config in configs}
     # CUPTI reads every run, the flush's own first. It takes one subscriber, so
     # where a profile capture holds it, from the first run or any later one,
     # the launch keeps its heuristic until a later compile.
@@ -971,7 +974,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
                     continue
                 read[config] = runs, lowering, compiling
     except CuptiHeld as error:
-        return Timings(dict.fromkeys(ba.autotuning_configs, error))
+        return Timings(dict.fromkeys(configs, error))
     return Timings({**timings, **_benchmarks(read)})
 
 
