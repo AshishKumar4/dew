@@ -239,9 +239,9 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
 def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
     """On this GPU the template's grouped product of bfloat16 rows and matrices into an fp32 output (its
     route named, `mosaic_gpu`), forward and both gradients, is as exact as XLA's ragged dot from float64 at a
-    `depth`-deep contraction: its sums promoted a step at a time (`templates.product.promoted`), where the
-    tensor cores' in-order fp32 accumulation was 1.661x XLA's error at depth 128 and 3.88x at 512 on an A100
-    (M-NS-1, NS4331-VALUE4-a100; row 4331)."""
+    `depth`-deep contraction: at the default precision its sums the tensor cores' own, as XLA's (cuBLAS's) are,
+    which held a dense kernel gradient within 0.98-1.00 of cuBLAS's error from float64 on an A100 and an H100
+    at depths of 128 to 2048 (M-EM-3; row 4331's 1.661x at depth 128 did not reproduce)."""
     group_sizes = jnp.asarray([70, 66], jnp.int32)
 
     def draw(seed):
@@ -912,9 +912,9 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
 def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
     """A Blackwell's projection of bf16 operands (grouped, or a dense layer's where no groups are given) into
     `out`, its forward and both gradients on the launches a B200 derives for them, interpreted: an fp32
-    output's depth steps summed a window at a time (`product.promoted`; tcgen05's own windows,
-    `Tcgen05Rings.persist`'s `summed`, row 5209), each as exact as XLA's product from float64, unrouted
-    rows and empty groups included."""
+    output asked at the highest precision summed a window at a time (`product.promoted`; tcgen05's own
+    windows, `Tcgen05Rings.persist`'s `summed`, row 5209), each as exact as XLA's product from float64,
+    unrouted rows and empty groups included."""
     group_sizes = None if sizes == "dense" else jnp.asarray(SIZES[sizes], jnp.int32)
     rows = 200 if sizes == "dense" else sum(SIZES[sizes]) + 9
     dtype = jnp.dtype(out)
@@ -936,8 +936,9 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
         return product
 
     def on_the_template(x, w, dy):
+        precision = "highest" if dtype == jnp.float32 else None
         return with_gradients(lambda x, w: gemm.gemm(x, w, group_sizes, compute=jnp.bfloat16, out_dtype=dtype,
-                                                     interpret_on_cpu=True))(x, w, dy)
+                                                     precision=precision, interpret_on_cpu=True))(x, w, dy)
 
     with generation.assumed("sm100"):
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.

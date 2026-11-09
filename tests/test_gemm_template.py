@@ -952,8 +952,8 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
     wave at most half full (`mosaic_gpu.balanced_tail`, its hand-off unmeasured, so the tail is taken at
     these few steps a tile): its tail's steps balanced over the programs, a program's range crossing a tile's
     boundary, each tile fixed up across them, on par with XLA's over the draws (check 1), truth float64's;
-    at rows a step does not divide, and at a tile of 256 x 128; into fp32 too, its programs' partials
-    exactly summed (`templates.product.promoted`) and added by IEEE adds."""
+    at rows a step does not divide, and at a tile of 256 x 128; into fp32 at the highest precision too, its
+    programs' partials exactly summed (`templates.product.promoted`) and added by IEEE adds."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
     spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -969,7 +969,8 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
 
     def dew(x, w, dy):
         del w
-        return gemm.gemm_t(x, dy, None, out_dtype=out_dtype, interpret_on_cpu=True)[0]
+        return gemm.gemm_t(x, dy, None, out_dtype=out_dtype, interpret_on_cpu=True,
+                           precision="highest" if exact else None)[0]
 
     def plain(x, w, dy, wide=jnp.float32, out=out_dtype):
         del w
