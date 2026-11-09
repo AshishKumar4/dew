@@ -30,26 +30,38 @@ class Isolated:
                                          pass_fds=(asked, replied), env=environment)
         os.close(asked)
         os.close(replied)
-        self._sent: BinaryIO = os.fdopen(self._asks, 'wb')
+        # Unbuffered, so a request is written whole as it is sent and closing holds nothing to flush into
+        # a pipe whose reader ended.
+        self._sent: BinaryIO = os.fdopen(self._asks, 'wb', buffering=0)
         self._read: BinaryIO = os.fdopen(self._replies, 'rb')
 
     def __enter__(self) -> 'Isolated':
         return self
 
-    def __exit__(self, *_) -> None:
-        # None ends the process's loop (`_serve`).
-        pickle.dump(None, self._sent)
-        self._sent.close()
-        self._process.wait()
-        self._read.close()
+    def __exit__(self, failed: type[BaseException] | None, *_) -> None:
+        try:
+            if failed is None:
+                # None ends the process's loop (`_serve`).
+                pickle.dump(None, self._sent)
+            else:
+                # An exchange broken off (an interrupt, a failed call): the process may be mid-reply, and
+                # its reply is not read.
+                self._process.kill()
+        finally:
+            self._sent.close()
+            self._read.close()
+            self._process.wait()
 
     def call(self, function: Callable, *arguments):
         """`function(*arguments)` in the process, its value: `function` a module-level function, which the
         process imports by its module and name, and `arguments` and the value pickled. Raises
         `IsolatedFailure` naming its error where it raised."""
         pickle.dump((function, arguments), self._sent)
-        self._sent.flush()
-        failed, value = pickle.load(self._read)
+        try:
+            failed, value = pickle.load(self._read)
+        except EOFError as ended:
+            raise IsolatedFailure(f"its process ended with code {self._process.wait()} before replying "
+                                  f"to {function.__qualname__}") from ended
         if failed:
             raise IsolatedFailure(value)
         return value
