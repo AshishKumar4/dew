@@ -66,6 +66,7 @@ outputs and every gradient against float64, not bitwise against XLA's
 differently rounded autodiff.
 """
 import dataclasses
+import enum
 import functools
 import math
 from collections.abc import Callable, Hashable
@@ -289,24 +290,21 @@ def elementwise(function) -> bool:
 def _alike(first, second, shape, other) -> bool:
     """Whether two traces of one function, at input `shape` and `other`, are one program but for those
     shapes: equation by equation the same primitives, literals and constants, and the same parameters, a
-    parameter that is the input's shape at each taken as one, nested programs alike; a rule a parameter
-    holds as a function (a custom derivative's) is the function's own, traced apart."""
+    parameter that is the input's shape at each taken as one, nested programs alike; a parameter that is
+    no value (a custom derivative's rule, a sharding) is its object's own, traced apart."""
     def same(a, b) -> bool:
-        programs_of = (jax.extend.core.ClosedJaxpr, jax.extend.core.Jaxpr)
-        if callable(a) and callable(b) and not isinstance(a, programs_of):
-            return True
         if isinstance(a, jax.extend.core.ClosedJaxpr) and isinstance(b, jax.extend.core.ClosedJaxpr):
             return programs(a, b)
         if isinstance(a, jax.extend.core.Jaxpr) and isinstance(b, jax.extend.core.Jaxpr):
             return equations(a, b)
-        if isinstance(a, tuple) and isinstance(b, tuple) and (a, b) == (shape, other):
-            return True
+        if isinstance(a, tuple) and isinstance(b, tuple):
+            return (a, b) == (shape, other) or (len(a) == len(b) and all(map(same, a, b)))
         if isinstance(a, jax.extend.core.Literal) and isinstance(b, jax.extend.core.Literal):
             return np.array_equal(a.val, b.val)
-        try:
-            return bool(a == b)
-        except (TypeError, ValueError):
-            return repr(a) == repr(b)
+        if isinstance(a, int | float | complex | str | np.ndarray | np.generic | np.dtype | enum.Enum | None):
+            return type(a) is type(b) and np.array_equal(a, b) if isinstance(a, np.ndarray) else a == b
+        # Any other parameter (a custom derivative's rule, a sharding) is the object's own, traced apart.
+        return type(a) is type(b)
 
     def equations(a, b) -> bool:
         return len(a.eqns) == len(b.eqns) and all(
