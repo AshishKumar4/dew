@@ -2169,7 +2169,7 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
     (jnp.bfloat16, HIGHEST, (jnp.float32,), True, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16,), False, None),
     (jnp.bfloat16, HIGHEST, (jnp.bfloat16, jnp.float32), True, None),
-    (jnp.float16, DEFAULT, (jnp.float32,), True, None),
+    (jnp.float16, DEFAULT, (jnp.float32,), False, None),
     (jnp.bfloat16, DEFAULT, (jnp.bfloat16,), False, None),
     (jnp.float32, DEFAULT, (jnp.float32,), False, None),
     (jnp.float32, HIGHEST, (jnp.float32,), True, "TF32"),
@@ -2185,8 +2185,9 @@ HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
 ])
 def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, precision, outputs, promoted,
                                                                    refused):
-    """A precision above the default, or 16-bit operands at any (row 4331), promotes each depth step's
-    partial where an output is fp32, and an FP8 product always (testing.md, FP8 products); the kernels refuse
+    """A precision above the default promotes each depth step's partial where an output is fp32, 16-bit
+    operands at the default precision summing on the tensor cores (M-EM-3), and an FP8 product always
+    (testing.md, FP8 products); the kernels refuse
     fp32 products above the default (they multiply in TF32), a dtype they do not multiply in, and a
     declared dot algorithm whose products are not the operands' whole ones (TF32's, bf16 parts of an fp32
     product, F64's: `precision.exact_products`), which a portable route computes."""
