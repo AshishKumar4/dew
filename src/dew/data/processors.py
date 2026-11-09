@@ -45,7 +45,7 @@ class LogMel:
     reflect-padded waveform under a periodic Hann window, HTK mel filters without a norm, the
     magnitude to `power`, floored at `floor` before the natural log. That is torchaudio's
     MelSpectrogram at its defaults and `power`, as MiMo-V2.6's audio tokenizer reads it at 24 kHz and
-    128 mels (MiMo-Audio-Tokenizer's `mel_spectrogram`, `MiMoAudioTokenizer.mel`)."""
+    128 mels (MiMo-Audio-Tokenizer's `mel_spectrogram`, `dew.interop.towers.mimo_audio.tokenizer_mel`)."""
 
     sampling_rate: int
     n_fft: int

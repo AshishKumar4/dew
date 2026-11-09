@@ -22,6 +22,7 @@ from ..rope import Scaling, rope_scaling_from_record
 if TYPE_CHECKING:
     # A layer's place in the depth mixture, which the plan carries and the block reads.
     from ..attention_residuals import ResidualSite
+    from ..hyper_connections import HyperConnections
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,6 +177,10 @@ class LayerSpec:
     runs for each."""
     dex: LayerDex | None = None
     """The layer's differential extension on its attention's chosen heads (`dew.nn.dex`), or None."""
+    streams: tuple[bool, bool] | None = None
+    """Whether the layer reads and writes the hyper-connection streams, as whether it enters them from
+    the residual and whether it leaves them collapsed (`HyperConnections.hc_layers`); None for a layer
+    outside them, or a model without them."""
 
 
 def scan_groups(specs: Sequence[Hashable], bank_layers: int | None = None, *,
@@ -231,3 +236,18 @@ def run_period(specs: Sequence[Hashable], first: int, count: int) -> int:
 
 
 __all__ = ["LayerKind", "LayerSpec", "ResolvedKind"]
+
+
+def layer_streams(hyper_connections: HyperConnections | None, index: int, num_layers: int,
+                  looped: bool) -> tuple[bool, bool] | None:
+    """Whether layer `index` of `num_layers` reads and writes the hyper-connection streams, as whether it
+    enters them and whether it leaves them (`LayerSpec.streams`): the stack's whole span enters them
+    before its first layer and leaves them after its last (`CausalTransformer._expand`, `_collapse`), a
+    range of layers at its own first layer, and at its last, but where the stack ends in the range
+    (`HyperConnections.ends_stack`, `looped` whether a loop runs it again)."""
+    if hyper_connections is None or not hyper_connections.streamed(index):
+        return None
+    if hyper_connections.hc_layers is None:
+        return False, False
+    first, end = hyper_connections.hc_layers
+    return index == first, index == end - 1 and not hyper_connections.ends_stack(num_layers, looped)

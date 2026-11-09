@@ -1,15 +1,16 @@
 """How a run saved by an earlier Dew reads now: each record shape an earlier release wrote, read as the run
-trained (`earlier_run`, the one place earlier record shapes are read)."""
+trained (`earlier_run`, the one place earlier record shapes are read), and the defaults an argument a class
+gained since keeps for runs that predate it (`_earlier_default`)."""
 
 import dataclasses
 from collections.abc import Mapping
 
 from dew import _records, registry
-from dew._records import earlier_fields
+from dew._records import JSON, earlier_fields
 from dew.checkpoints import Checkpoints
 from dew.data import records
 from dew.nn.precision import Numerics, numerics_of
-from dew.registry import from_record, objectives
+from dew.registry import from_record, models, objectives
 
 
 def _chains() -> tuple[str, ...]:
@@ -31,14 +32,16 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
     decision run's option text as its rows wrote it (`earlier_option_text`), and the fewest options its
-    rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); its data plan version
+    rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); a world model's
+    tokenizer's positions as it learned them (`earlier_tokenizer_positions`); its data plan version
     as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
     by today's names (`dew.data.records.earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    return records.earlier_chains(earlier_data_plan(earlier_option_text(earlier_none_of_the_above(
-        earlier_profile(earlier_newton_schulz(earlier_trainer(record)))))), _chains())
+    earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(record))))
+    earlier = earlier_option_text(earlier_tokenizer_positions(earlier))
+    return records.earlier_chains(earlier_data_plan(earlier), _chains())
 
 
 def earlier_data_plan(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -74,27 +77,44 @@ DECISION_OBJECTIVE = "dew.decision.objective:DecisionObjective"
 """The decision objective's import path, as a saved run's record names its objective
 (`ObjectiveConfig.name`)."""
 
+CAUSAL_TOKENIZER = "dew.objectives.world_model:CausalTokenizer"
+"""Dreamer 4's tokenizer's import path, as a saved run's record names its model (`ModelConfig.name`)."""
+
+
+def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.Aliases, path: str,
+                     argument: str, earlier: JSON) -> Mapping[str, object]:
+    """A saved run's record whose `field` (its objective, its model), a `path` class of `kinds`, states
+    `argument` neither in its fields nor in the defaults it recorded: saved before the class took it, it
+    trained as `earlier` computes, which its defaults read now; a run saved since records its own."""
+    named = registry.class_record(record)
+    if named is None:
+        return record
+    _, fields = named
+    held = fields.get(field)
+    if not isinstance(held, Mapping) or not isinstance(held.get("name"), str):
+        return record
+    stated, defaulted = held.get("fields", {}), held.get("defaults", {})
+    if (registry.import_path(kinds[held["name"]]) != path or not isinstance(stated, Mapping)
+            or not isinstance(defaulted, Mapping) or argument in {*stated, *defaulted}):
+        return record
+    return {**record, "fields": {**fields, field: {**held, "defaults": {**defaulted, argument: earlier}}}}
+
 
 def earlier_none_of_the_above(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved decision run's record whose objective states the fewest options its rows draw "none of the
     above" on (`none_of_the_above_options`) neither in its fields nor in the defaults it recorded: saved
     before the argument, its rows drew it on every choice, a yes or a no among them, so it reads 0, as
-    they drew; a run saved since records its own (row 2938: the default became 3). Carried to 1.0 (ledger
-    1552)."""
-    named = registry.class_record(record)
-    if named is None:
-        return record
-    _, fields = named
-    objective = fields.get("objective")
-    if not isinstance(objective, Mapping) or not isinstance(objective.get("name"), str):
-        return record
-    stated, defaulted = objective.get("fields", {}), objective.get("defaults", {})
-    if (registry.import_path(objectives[objective["name"]]) != DECISION_OBJECTIVE
-            or not isinstance(stated, Mapping)
-            or not isinstance(defaulted, Mapping) or "none_of_the_above_options" in {*stated, *defaulted}):
-        return record
-    earlier = {**objective, "defaults": {**defaulted, "none_of_the_above_options": 0}}
-    return {**record, "fields": {**fields, "objective": earlier}}
+    they drew (`_earlier_default`; row 2938: the default became 3). Carried to 1.0 (ledger 1552)."""
+    return _earlier_default(record, "objective", objectives, DECISION_OBJECTIVE, "none_of_the_above_options",
+                            0)
+
+
+def earlier_tokenizer_positions(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved world-model run's record whose tokenizer (`CausalTokenizer`) states its `positions`
+    nowhere: saved before rotary positions, its tokens knew their places by learned vectors alone, so it
+    reads "learned", as it trained (`_earlier_default`; row 4669: the default became "rotary"). Carried to
+    1.0 (ledger 1552)."""
+    return _earlier_default(record, "model", models, CAUSAL_TOKENIZER, "positions", "learned")
 
 
 def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:

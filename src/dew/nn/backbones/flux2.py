@@ -49,7 +49,7 @@ from .joint import (
 )
 
 if TYPE_CHECKING:
-    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.inputs import DenoisingCondition
 
 
 def flux2_positions(rows: int, columns: int, text: int) -> np.ndarray:

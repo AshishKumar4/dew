@@ -20,11 +20,12 @@ from flax import linen as nn
 
 from dew.batch import Variables, dicts, unboxed
 from dew.diffusion.presets import Preset
-from dew.diffusion.process import DenoisingCondition, Process
+from dew.diffusion.process import Process
 from dew.diffusion.schedules import NoiseScheduler, expand
 from dew.diffusion.transforms import PredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
+from dew.nn.inputs import DenoisingCondition
 from dew.nn.inspection import INSPECTED
 from dew.nn.kernels.options import Held
 from dew.nn.protocols import Lacks

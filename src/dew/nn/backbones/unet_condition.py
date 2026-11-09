@@ -31,8 +31,8 @@ from .joint import embedding, embedding_flops
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 if TYPE_CHECKING:
-    from dew.diffusion.process import DenoisingCondition
-    from dew.inputs.condition import ConditionWork
+    from dew.nn.flops import ConditionWork
+    from dew.nn.inputs import DenoisingCondition
 
 
 @dataclass(frozen=True)

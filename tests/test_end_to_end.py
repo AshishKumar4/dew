@@ -34,12 +34,12 @@ from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
 from dew.inference import TextToImage
 from dew.inputs import Condition, Field, InputSpec, unit_range
+from dew.interop.autoencoders.pretrained import REGISTRATIONS, load_kl_vae
+from dew.interop.autoencoders.vae import translate_vae_weights
 from dew.nn.autoencoders.api import AutoEncoder
 from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL
-from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
-from dew.nn.autoencoders.vae import translate_vae_weights
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
@@ -419,7 +419,7 @@ def _repae_task(tmp_path: Path, dtype) -> SimpleNamespace:
     inputs = InputSpec(Field("image", (SIDE, SIDE, 3)), {"textcontext": Condition(table)})
     task = DiffusionObjective(
         StandIn(), presets.Flow(density="uniform")(), inputs, guidance=None, solver=Euler(), steps=2,
-        autoencoder=StableDiffusionVAE(modelname=str(tmp_path / "sd" / "vae"), dtype=dtype),
+        autoencoder=load_kl_vae(str(tmp_path / "sd" / "vae"), dtype, revision="bf16", subfolder=None)[0],
         alignment=alignment, end_to_end=EndToEnd(discriminator_width=DISCRIMINATOR_WIDTH), ema_decay=None,
         unconditional_prob=DROPOUT, variables={REPRESENTATION: representation})
     assert task.autoencoder is not None
@@ -679,7 +679,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from dew.config import ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.inputs import TextCondition
-    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
     from dew.registry import ModelConfig
 
     for name in ("tiny_diffusers", "rae"):

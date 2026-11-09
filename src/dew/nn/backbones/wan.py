@@ -46,7 +46,7 @@ from ..mlp import GatedMLP
 from .joint import embedding, embedding_flops, layer_norm, modulate
 
 if TYPE_CHECKING:
-    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.inputs import DenoisingCondition
 
 
 def wan_rotation(frames: int, rows: int, columns: int, head_dim: int, *,

@@ -590,15 +590,17 @@ def rewalked_form(spec: Forward) -> Forward:
     return unfolded(spec) if spec.reaches else spec
 
 
-def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[jax.Array, O, O], O], *,
-                          in_place: bool = False) -> O:
+def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[jax.Array, O, O], O] | None,
+                          *, in_place: bool = False) -> O:
     """`walked`'s guards over whole launches, for a mainloop whose program walks its keys once (a producer
     streams them, so no program walks again): `launch(form, live)` runs the call in `form`, plain where
     `live` is None, else with its rows `live` shifting (`guarded`), and returns its outputs, each row's
     running maximum in the walk's units and whether its weighted values overflowed (`overflowed`), `[..., Q]`
     each; `kept(live, guarded, plain)` takes the guarded launch's outputs at the rows `live`, the plain
-    one's elsewhere, so every other row's bits are the plain walk's. The call walks again where `walked`'s
-    program would, decided over the whole call: in the natural form (`unfolded`) where some row's maximum
+    one's elsewhere, so every other row's bits are the plain walk's (None where `spec` takes no headroom,
+    so no row walks again shifting: a launch that shifts its rows in its one walk). The call walks again
+    where `walked`'s program would, decided over the whole call: in the natural form (`unfolded`) where
+    some row's maximum
     passes `FOLD_REACH` folded, guarded as the call's form is; under headroom, the rows whose weighted values
     overflowed. Ordinary inputs take the one plain launch, their cost unchanged but for these checks.
 
@@ -642,8 +644,10 @@ def walked_launches[O, F](spec: Forward, launch: Launch[O, F], kept: Callable[[j
         # (`taken`).
         if not form.headroom:
             return outputs
+        assert kept is not None, "a walk under headroom keeps its guarded rows (`kept`)"
+        keep = kept
         return once(taken & (jnp.max(over.astype(jnp.int32)) > 0),
-                    lambda plain: kept(over, launch(form, over)[0], plain), outputs)
+                    lambda plain: keep(over, launch(form, over)[0], plain), outputs)
 
     outputs, maxima, over = plain_launch(spec)
     if not spec.reaches:
@@ -801,7 +805,13 @@ def needed(total: jax.Array, reach: jax.Array, bound: float = 1.0) -> jax.Array:
     many binades as that product passes it by (log2 rounded up, so the bound holds whatever their
     rounding). A dropping call's draw multiplies each weight by at most `bound`, which counts in the log
     rather than in a product: `reach * bound` may itself pass fp32's largest."""
-    log = jnp.log2(total) + jnp.log2(reach)
+    return binades_past(jnp.log2(total) + jnp.log2(reach), bound)
+
+
+def binades_past(log: jax.Array, bound: float = 1.0) -> jax.Array:
+    """`needed`'s shift of a row whose weighted values are at most `2^log` before a dropping call's draw
+    multiplies a weight by at most `bound`: none below `2^HEADROOM`, else the binades past it (rounded up),
+    and none where `log` is no number (a row that sees no key)."""
     if bound != 1.0:
         log = log + math.log2(bound)
     binades = jnp.ceil(log) - HEADROOM
@@ -1189,11 +1199,61 @@ def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
 class Argmax(NamedTuple):
     """The keys' running maximum logit `peak` `[bq]` (the initial state's apart) and `key`, the first
     key that holds it `[bq]` int32: the backward's anchor key (`off_anchor`), a residual of the forward. Under
-    dropout, `multiplier` `[bq]` is that key's draw, which the anchor's own weight takes (`joined`)."""
+    dropout, `multiplier` `[bq]` is that key's draw, which the anchor's own weight takes (`joined`). Where
+    its values can carry its weighted values past fp32's largest (`Forward.headroom`), `shift` `[bq]`, the
+    power of two `2^-shift` the anchored walk takes every weight of the row at (`anchored_step`), from the
+    keys it sees before the walk (`row_shift`): its sums stay finite in the one walk, no row walks again,
+    and a row whose sums cannot pass it takes 0, its bits the unshifted walk's (row 1910)."""
 
     peak: jax.Array
     key: jax.Array
     multiplier: jax.Array | None = None
+    shift: jax.Array | None = None
+
+
+class Reach(NamedTuple):
+    """What a row's keys weigh at most, before its walk (`reach_step`): the largest of the keys' weighted
+    value magnitudes it sees, each key's weight at the row's maximum so far times its values' largest
+    magnitude, as its log2, `term` `[bq]` (-inf before a key), and how many keys it sees, `seen` `[bq]`
+    fp32."""
+
+    term: jax.Array
+    seen: jax.Array
+
+
+def reach_step(spec: Forward, state: Reach, peak: jax.Array, moved: jax.Array, logits: jax.Array,
+               magnitudes: jax.Array) -> Reach:
+    """`Reach` after a tile's logits (-inf where a row does not see a key), from the row's maximum `peak`
+    before it to `moved` after it (`argmax`'s), and its keys' value magnitudes as their log2, `magnitudes`
+    `[bk]`: each key's term its weight's binades at `moved` (`Forward.power`'s exponent, of the difference
+    the walk weighs, `weights`) plus its magnitude's, the earlier keys' taken from `peak` to `moved`; a key
+    the row does not see (padding, another document) adds nothing."""
+    seen = logits > -jnp.inf
+    binades = spec.naturalized(logits - expand(moved, logits)) * LOG2E
+    term = jnp.where(seen, binades + across(magnitudes, logits), -jnp.inf).max(axis=-1)
+    earlier = jnp.where(peak > -jnp.inf, state.term + spec.naturalized(peak - moved) * LOG2E, -jnp.inf)
+    return Reach(jnp.maximum(earlier, term), state.seen + seen.astype(jnp.float32).sum(axis=-1))
+
+
+def started_reach(spec: Forward, reach: Reach, peak: jax.Array, start: Partial) -> Reach:
+    """`reach` at its keys' maximum `peak` joined by the state a walk starts from (`resumed`: its sums, which
+    `anchored` takes to the walk's maximum): every term at that maximum, the larger of the start's and the
+    keys', the start's one more, its sums' largest magnitude at its factor (`carried`)."""
+    m = jnp.maximum(start.m, peak)
+    keys = jnp.where(peak > -jnp.inf, reach.term + spec.naturalized(peak - m) * LOG2E, -jnp.inf)
+    own = jnp.log2(jnp.max(jnp.abs(start.acc), axis=-1)) + spec.naturalized(start.m - m) * LOG2E
+    return Reach(jnp.maximum(keys, own), reach.seen + 1)
+
+
+def row_shift(reach: Reach, bound: float = 1.0) -> jax.Array:
+    """The shift a row's anchored walk takes (`Argmax.shift`), `binades_past` its weighted values' bound
+    (`Reach` at the row's maximum): each at most its largest term, so their sum at most that many terms as
+    it has keys, and `2^-shift` keeps it within `2^HEADROOM`; `bound`, a dropping call's draw's largest
+    multiplier. A row whose largest term is below `2^HEADROOM` over its keys' count takes none, so a weight
+    of its own is never shifted below fp32's range where its sums did not need it; nor does a row that
+    sees no key. At most 31 + 128 + log2(bound) - HEADROOM binades (2^31 keys at fp32's largest), within
+    `exact_power2`'s exponents."""
+    return binades_past(jnp.log2(jnp.maximum(reach.seen, 1.0)) + reach.term, bound)
 
 
 def no_argmax(rows: int, dropping: bool = False) -> Argmax:
@@ -1439,6 +1499,9 @@ def anchored(spec: Forward, start: Partial, arg: Argmax) -> Carry:
     yet."""
     m = jnp.maximum(start.m, arg.peak)
     factor = carried(spec, start.m, m)
+    if arg.shift is not None:
+        # The start's share at the row's shift, as every weight of its walk is (`anchored_step`).
+        factor = factor * exact_power2(-arg.shift)
     nothing = jnp.zeros_like(start.total)
     return Partial(expand(factor, start.acc) * start.acc, m, factor * start.total), arg, nothing, nothing
 
@@ -1448,13 +1511,19 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
     tile's weights at that maximum, so the sums take no factor and no old anchor's term ever joins them; the
     anchor's own weight from its own tile and the other keys' product and narrowed weights, each summed
     apart, as the gathering walk keeps them. No reduction finds a maximum or an anchor, and the sums the
-    mainloop holds take the product in place, unscaled (`Keys.accumulate`'s `scale` None)."""
+    mainloop holds take the product in place, unscaled (`Keys.accumulate`'s `scale` None). Every weight is
+    at the row's `2^-shift` where it has one (`Argmax.shift`), exactly, a power of two: its sums with them,
+    so none passes fp32's largest."""
     state, arg, own, others_total = carry
     if keys.coords.drop is None:
         # The derived forms' weights at the known maximum, which no tile moves.
         _, _, p, value, _ = _derived_softmax(spec, state, keys)
     else:
         p, value = weights(spec, keys.logits, state.m), keys.values.load()
+    if arg.shift is not None:
+        # A row's factor, one product an element (a shift is at most `HEADROOM`'s complement of the keys'
+        # count and fp32's largest binade, well within `exact_power2`'s exponents).
+        p = p * expand(exact_power2(-arg.shift), p)
     parts, others, own_tile, arg = _split_tile(keys, p, value.dtype, arg,
                                                drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos))
     if keys.accumulate is None:
@@ -1842,16 +1911,32 @@ def running_parts(x: jax.Array, exponent: jax.Array, dtype=jnp.float16
     (0 before any tile, else at most 0) and the parts; a product of them is taken back by
     `running_restored`. A part's entries far below the running largest lose their low bits to `dtype`'s
     subnormals, as an fp32 sum of them loses them to its rounding."""
+    new = jnp.maximum(exponent, tile_exponent(x))
+    return new, running_shift(exponent, new), parts_at(x, new, dtype)
+
+
+def tile_exponent(x: jax.Array) -> jax.Array:
+    """An fp32 tile's largest magnitude's exponent, rounded up (two one-axis reductions, `_scaled`), -inf
+    where it holds none: `running_parts`' tile's."""
     largest = jnp.max(jnp.max(jnp.abs(x), axis=-1))
     tile = jnp.ceil(jnp.log2(jnp.where(largest > 0, largest, 1.0)))
     # A GPU's approximate log2 flushes a subnormal largest to zero (`_scaled`, row 4464): such a tile, as an
     # empty one, moves no exponent.
-    tile = jnp.where((largest > 0) & finite(tile), tile, -jnp.inf)
-    new = jnp.maximum(exponent, tile)
-    shift = jnp.where(exponent == -jnp.inf, 0.0, exponent - jnp.where(new == -jnp.inf, 0.0, new))
-    scaled = scaled_by(x, jnp.where(new == -jnp.inf, 0.0, 14.0 - new))
+    return jnp.where((largest > 0) & finite(tile), tile, -jnp.inf)
+
+
+def running_shift(old: jax.Array, new: jax.Array) -> jax.Array:
+    """The power of two that takes an accumulator from the running scale of exponent `old` to `new`'s
+    (`running_parts`): 0 before any tile, else at most 0."""
+    return jnp.where(old == -jnp.inf, 0.0, old - jnp.where(new == -jnp.inf, 0.0, new))
+
+
+def parts_at(x: jax.Array, exponent: jax.Array, dtype=jnp.float16) -> tuple[jax.Array, jax.Array]:
+    """An fp32 tile `x` as two `dtype` parts at the running scale of `exponent`, its tile's own or larger
+    (`running_parts`): `x` times `2^(14 - exponent)` rounded, then its remainder rounded."""
+    scaled = scaled_by(x, jnp.where(exponent == -jnp.inf, 0.0, 14.0 - exponent))
     high = scaled.astype(dtype)
-    return new, shift, (high, (scaled - high.astype(jnp.float32)).astype(dtype))
+    return high, (scaled - high.astype(jnp.float32)).astype(dtype)
 
 
 def running_restored(value: jax.Array, exponent: jax.Array) -> jax.Array:

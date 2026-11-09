@@ -97,3 +97,8 @@ def interpreting() -> bool:
     no instruction the interpreter lacks there (mma.sync's sums, `mosaic_sm80.Mma.products`), whatever a
     caller states (row 5209's A100 backward: products called with no interpret flag issued mma.sync's)."""
     return _INTERPRETING.get()
+
+
+RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
+"""The programs a multiprocessor holds at once of the launch being traced (`kernel`'s `resident`): its roles
+raise their registers to that residency's share (`roles`)."""

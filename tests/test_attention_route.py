@@ -20,9 +20,8 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms, kept
 from flax import linen as nn
-from float64_terms import float64_terms
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, with_gradients
 from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
@@ -406,6 +405,23 @@ def test_a_call_named_onto_the_template_lowers_for_a_gpu(name, differentiated, f
     assert len([route for route in found if route.choice == "attention_mainloop"]) == 1 + differentiated
 
 
+def test_the_jax_nn_form_takes_values_of_the_querys_heads_beside_keys_of_fewer():
+    """The reference path's jax.nn form (`scale_logits`) over keys of one head and values of the query's two
+    (Z-Image's joint attention's) is, bit for bit, the same call over the keys repeated to the query's heads:
+    its query heads group over the keys' head only where the values share it (`_grouped_as_jax_nn`)."""
+    streams = jax.random.split(jax.random.key(4), 3)
+    query = jax.random.normal(streams[0], (2, 16, 2, 8), jnp.bfloat16)
+    key = jax.random.normal(streams[1], (2, 16, 1, 8), jnp.bfloat16)
+    value = jax.random.normal(streams[2], (2, 16, 2, 8), jnp.bfloat16)
+
+    def attend(key):
+        return scaled_dot_product_attention(query, key, value, implementation="reference", causal=True,
+                                            scale_logits=True)
+
+    repeated = jnp.repeat(key, 2, axis=2)
+    assert np.asarray(attend(key)).tobytes() == np.asarray(attend(repeated)).tobytes()
+
+
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
 @pytest.mark.parametrize(("heads", "kv_heads"), [(4, 4), (4, 2), (8, 1)], ids=["mha", "gqa", "mqa"])
 def test_the_reference_scaling_its_logits_after_the_product_is_jax_nns_xla_attention(heads, kv_heads, causal):
@@ -731,20 +747,15 @@ def an_fp16_call_on_an_h100_is_on_par(case):
 
 
 def _terms(case: dict):
-    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps (its
-    spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw `(query, key, value,
-    sinks, dout)`; the sinks' gradient, where the case has sinks, its float64 truth's own terms
-    (`float64_terms` of the reference path), as `attention_on_par` sizes it."""
+    """The float64 terms of `case`'s output and gradients, its sinks' among them (`attention_terms`), over
+    the keys it keeps (its spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw
+    `(query, key, value, sinks, dout)`."""
     keep = case_keep(case)[:, None]
 
     def terms(query, key, value, sinks, dout):
-        found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))[:4]
-        if sinks is None:
-            # The sinks' gradient, which a call without sinks holds as None.
-            return (*found, None)
-        with jax.enable_x64(new_val=True):
-            truth = float64_terms(pulled("reference", case), *widened((query, key, value, sinks, dout)))[1]
-        return (*found, truth[4])
+        found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))
+        # The sinks' gradient, which a call without sinks holds as None.
+        return (*found, None) if sinks is None else tuple(found)
 
     return terms
 
@@ -755,12 +766,15 @@ def a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     """A causal call of `length` tokens, two query heads over one key head (`WIDTH` wide), through the
     template on whichever mainloop the GPU runs it, on par with the reference path (check 1): D, the
     refinement and the denominator are sums the mainloops run in sequence over its key tiles where the
-    reference sums by tree, so a ratio that grew with the sequence would show here (math review P2.5)."""
+    reference sums by tree, so a ratio that grew with the sequence would show here (math review P2.5).
+    Every entry is sized by the terms attention's float64 gradients carry through their cancellation
+    (`_causal_terms`): the first query keeps one key, so its gradient is float64 zero, which a mainloop
+    forming D from its rounded output (an A100's) holds to that rounding."""
     case = {"causal": True}
     draw = drawing(length, length, dtype, sinks=False, heads=2, kv_heads=1, rows=1)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
                     f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS,
-                    truth_fn=_causal_truth(length))
+                    truth_fn=_causal_truth(length), terms=_causal_terms(length))
 
 
 TRUTH_ROWS = 1024
@@ -798,6 +812,25 @@ def _causal_truth(length: int):
         return whole(out), whole(d_query), d_key.sum(0), d_value.sum(0), None
 
     return truth
+
+
+def _causal_terms(length: int):
+    """The float64 terms of a causal call of `length` tokens (`attention_terms` over the keys each query
+    keeps), `TRUTH_ROWS` queries at a time as its truth is (`_causal_truth`): each block's output's and query
+    gradient's terms its own, the keys' and values' the root of the blocks' summed squares; a function of a
+    draw `(query, key, value, sinks, dout)`, the sinks' gradient none."""
+    def terms(query, key, value, sinks, dout):
+        del sinks
+        blocks = []
+        for first in range(0, length, TRUTH_ROWS):
+            rows = slice(first, first + TRUTH_ROWS)
+            keep = (np.arange(first, first + TRUTH_ROWS)[:, None] >= np.arange(length)[None, :])[None, None]
+            blocks.append(attention_terms(query[:, rows], key, value, dout[:, rows], keep))
+        out, d_query = (np.concatenate([block[leaf] for block in blocks], axis=1) for leaf in (0, 1))
+        d_key, d_value = (np.sqrt(sum(np.square(block[leaf]) for block in blocks)) for leaf in (2, 3))
+        return out, d_query, d_key, d_value, None
+
+    return terms
 
 
 def test_the_accurate_form_is_one_option_away():

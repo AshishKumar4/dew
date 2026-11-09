@@ -641,7 +641,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post66
+jax==0.12.0.1.post68
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -651,11 +651,11 @@ jax==0.12.0.1.post66
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda12-pjrt==0.12.0.1.post45 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+jax-cuda12-pjrt==0.12.0.1.post67 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda12-plugin
-jax-cuda12-plugin==0.12.0.1.post45 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+jax-cuda12-plugin==0.12.0.1.post67 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1
     # via
@@ -1193,6 +1193,8 @@ py-key-value-aio==0.4.6
     # via fastmcp-slim
 py-partiql-parser==0.6.3
     # via moto
+py-spy==0.4.2
+    # via dewml (pyproject.toml)
 pyahocorasick==2.3.1
     # via datatrove
 pyarrow==25.0.1

@@ -320,6 +320,45 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
             np.asarray(dequantize_mxfp4(stored[stem + "_blocks"], stored[stem + "_scales"])))
 
 
+def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_path):
+    """E8M0's 0x00 byte is the scale 2**-127, which a writer may give a group of nonzero codes as the
+    released encoder gives an all-zero group (`quantize_mxfp4`): a GPT-OSS whose first expert's groups
+    span bytes 0 to 17, one under byte 0 holding 0.5 and -0, and one of signed zeros under byte 200 far
+    past them, loads packed (`packed_experts`), the bank holding every value its dense load decodes to the
+    bit, signed zeros included, and exports the values its dense load exports."""
+    from safetensors.numpy import load_file, save_file
+
+    from dew.nn.kernels.gemm import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    source = _mxfp4_gpt_oss(tmp_path)
+    stored = dict(load_file(str(source / "model.safetensors")))
+    stem = next(name.removesuffix("_blocks") for name in sorted(stored) if name.endswith("down_proj_blocks"))
+    blocks, scales = stored[stem + "_blocks"].copy(), stored[stem + "_scales"].copy()
+    scales[0] = np.random.default_rng(0x8E0).integers(0, 18, scales[0].shape).astype(np.uint8)
+    scales[0, 0, 0], scales[0, 0, 1] = 0, 17
+    blocks[0, 0, 0, :2] = 0x81
+    blocks[0, 1, 2], scales[0, 1, 2] = 0x88, 200
+    stored[stem + "_blocks"], stored[stem + "_scales"] = blocks, scales
+    save_file(stored, str(source / "model.safetensors"))
+
+    packed, dense = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=flag)
+                     for flag in (True, False))
+    banks = {".".join(path): bank for path, bank in flatten_dict(
+        dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
+    path = next(name for name in banks if name.endswith("down_proj") and ".layers_0." in f".{name}.")
+    bank = banks[path]
+    values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
+    held = np.asarray(flat_tree(dense.variables["params"])[path], np.float32)
+    np.testing.assert_array_equal(values.view(np.uint32), held.view(np.uint32))
+    # An export writes the values back, which the released encoder may state at another scale than the
+    # source's bytes (`test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded`): values, bitwise.
+    exported, written = packed.export(), dense.export()
+    np.testing.assert_array_equal(
+        np.asarray(dequantize_mxfp4(exported[stem + "_blocks"], exported[stem + "_scales"])).view(np.uint32),
+        np.asarray(dequantize_mxfp4(written[stem + "_blocks"], written[stem + "_scales"])).view(np.uint32))
+
+
 @pytest.mark.mesh(devices=2)
 def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(tmp_path):
     """An MXFP4 GPT-OSS loaded packed onto a mesh whose expert axis takes two devices (`packed_experts`

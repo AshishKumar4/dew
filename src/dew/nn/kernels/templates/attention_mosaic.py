@@ -200,7 +200,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def register_budget(self, config: Config) -> int:
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
-        file (`mosaic.roles`)."""
+        file (`handoffs.Schedule`)."""
         # A consumer's budget is its family's, whatever the operands' dtype (`mosaic.Family.registers`).
         return bundle_of(config, jnp.bfloat16).registers(config.consumers)
 
@@ -633,10 +633,10 @@ class MosaicForward(_Mainloop[Tiles]):
             # 64: 48 bytes on two consumers, 24 on one): the Pallas-Triton mainloop's.
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
-        if self.parts > 1 and (family.feeds_itself or not family.pieces_of_views):
+        if self.parts > 1 and (family.feeds_itself or not family.copies_in_pieces):
             # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
-            # neither a consumer's own ring nor cp.async's pipeline, whose pieces are a table's runs
-            # (`mosaic.Transport.pieces_of_views`), does.
+            # neither a consumer's own ring nor cp.async's pipeline (`mosaic.Transport.copies_in_pieces`)
+            # does.
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
@@ -785,14 +785,9 @@ def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tupl
 
 def _pages_hold(page: int, tile: int, family: mosaic.Family) -> bool:
     """Whether a paged call's key tiles of `tile` keys lie in its pages of `page`: whole tiles a page, each
-    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, its rows gathered
-    through the table where `family` gathers rows (`attention_mosaic_forward.paged_reads`), any page, else
-    each page its own copy into a slot's whole swizzled rows (`mosaic.Pieces`, `mosaic.TILE_ROWS`) where it
-    loads a step's block in pieces (`mosaic.Transport.copies_in_pieces`)."""
-    if page % tile == 0:
-        return True
-    return tile % page == 0 and (family.gathers_rows
-                                 or (page % mosaic.TILE_ROWS == 0 and family.copies_in_pieces))
+    read where it lies (`attention_mosaic_forward._paged_views`), or whole pages a tile, any page, its rows
+    gathered through the table where `family` gathers rows (`attention_mosaic_forward.paged_reads`)."""
+    return page % tile == 0 or (tile % page == 0 and family.gathers_rows)
 
 
 def streams(query, target: generation.GpuTarget) -> bool:
@@ -1049,6 +1044,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         share = config.consumers
         carried = [(block_k, width // share, jnp.float32), (block_k, value_width // share, jnp.float32)]
         products = [(block_q, block_k // share, jnp.float32)] * 2 + [(block_q, block_k // share, jnp.int8)]
+        if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+            # fp16's operands as two parts at the running scale (`attention_mosaic_coop._sixteen_step`): an
+            # operand's scaled tile and both its parts beside the products.
+            products += [(block_q, block_k // share, jnp.float32), *[(block_q, block_k // share, dtype)] * 2]
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
         # A score hook's slopes held beside both products to its pullback (as the fused launch's below).
         slope_tiles = [(block_q, block_k // share, jnp.float32)] * slopes
@@ -1201,10 +1200,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         dtype = ba.arguments["query"].dtype
         # The one launch stages its weights and score cotangents for its products (`mosaic.staged`): fp16's
-        # as two parts at the walk's running scale (`attention_mosaic_fused._sixteen_step`), queries first
-        # each consumer its own keys alone (row 3886: its two launches 4.1 times the bf16 step on an H100).
-        sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16) and not (
-            config.queries_first and not config.shared_keys)
+        # as two parts at the walk's running scale (`attention_mosaic_fused._sixteen_step`), queries first,
+        # each consumer its own keys or its share of a block they share (`attention_mosaic_coop`'s, every
+        # share's scale joined): row 3886, its two launches 4.1 times the bf16 step on an H100.
+        sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16) and not config.queries_first
         if (config.fused and (self.accurate or hooked or sixteen)) or not super().legal(ba, config, target):
             return False
         family = bundle_of(config, dtype)
@@ -1390,8 +1389,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k)),
                              True))
+        # The fused launch's warpgroups reserve fp16's running scale's reduction scratch too, as it launches
+        # (`reducing`'s `scaled`: `_fused_launch`'s and `_coop_launch`'s).
+        scaled = config.fused and staged_parts(dtype) > 1
         return max(resources.shared_bytes(layout, launch_scope(layout, allocations, reducing(
-            layout, tiles.consumers, self.score_reduces), reduces=reduces))
+            layout, tiles.consumers, self.score_reduces, scaled=scaled), reduces=reduces))
             for layout, tiles, allocations, reduces in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int | None:

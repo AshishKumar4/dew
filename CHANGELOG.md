@@ -16,6 +16,17 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dreamer 4's tokenizer (`CausalTokenizer`) reads its tokens' places by two-axis rotary positions
+  (`positions="rotary"`, the default), as the paper does, and RMS-normalizes its latents before the
+  squeeze; tutorial 12's tokenizer, trained 8,000 updates, now reconstructs its balls (held-out squared
+  error 0.0067 against the mean frame's 0.14; at the 2,000 updates the tutorial as recorded trains,
+  0.12). A run saved before reads `positions="learned"`, as it
+  trained.
+- Phases (`dew.data.phases`, `dew.data.schedule`) may each read batches of their own: a phase's end on the
+  step clock is the records of the phases before it and its own steps in its own rows, each batch steps a
+  program of its own, and under accumulation a phase of another batch than the one before it begins where
+  an update does, refused where it would begin inside one. They were refused unless every phase
+  batched alike.
 - Every release Dew writes is planned once and written once (`dew.interop.releases.ReleasePlan`): `dew
   export`, `Pretrained.save`, `Decide.save_pretrained` and `SavedModel.save_pretrained` each write a plan of
   a model part, a decision head's files, the task's assets and one release record, and `export` returns the
@@ -120,7 +131,19 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post66: a Mosaic GPU fragmented array's negation and copysign are float
+- Dew requires its JAX build 0.12.0.1.post68: the Pallas lowering cache keys no setting a lowering never reads,
+  and a process may declare packages of its own sealed by their tree's digest (`JAX_PALLAS_LOWERING_CACHE_SOURCES`),
+  which Dew declares itself, so its kernels holding Dew's own code (an `inline_mgpu` body, a marked call) are
+  kept and read back across processes. Its CUDA plugins are post67's, whose fixes follow.
+- Dew's JAX build 0.12.0.1.post67: each Mosaic GPU object's PTX assembles for its own target, so a
+  process that compiles kernels for two GPUs assembles each for its own capability (post67's x86_64 plugins;
+  aarch64 keeps post45's until its own are built, ledger row 5211); a compile-only GPU client keys its platform
+  by the loaded CUDA runtime, as a live client does, so a host's compile-ahead entries are the ones a live run
+  there reads; a TMEM load takes the registers each transfer moves (`plgpu.async_load_tmem(..., max_registers=)`,
+  32 by default), so an sm100 kernel whose grouped `tcgen05.ld` made ptxas spill loads in narrower transfers; a
+  dumped Mosaic GPU resource estimate names its kernel and the hash its custom call carries; and Pallas's Mosaic
+  GPU interpreter checks only the ending device's barriers, so a mesh's devices' kernels may end at different
+  times; post66: a Mosaic GPU fragmented array's negation and copysign are float
   instructions, so a WGMMA accumulator negated or sign-copied in a Pallas kernel lowers; post65: a host callback returns its results at its program's lowered
   precision, so a float64 callback compiled under `jax.enable_x64` and run on another thread keeps float64;
   post64: Pallas Mosaic GPU keeps each kernel it lowers under a key of all
@@ -151,8 +174,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   refused its kernels; and a Pallas kernel's body may call a call primitive, a span Dew marks, which lowers as
   its body on every Pallas backend and is checked within its body under `checkify`; and a step compiled ahead
   for an A100 on a host with no GPU lowers its Mosaic kernels for the A100, not an H100 (docs/installation.md
-  lists each fix). The `cuda12` and `cuda13` extras keep the post45 CUDA and PJRT plugins: post46 to post60
-  changed Python alone, and their native code is the same.
+  lists each fix). The `cuda12` and `cuda13` extras name post67's CUDA and PJRT plugins on x86_64 and keep
+  post45's on aarch64, and the `kernel-compile` extra's (x86_64 only) are post67's: post46 to post66 changed
+  Python alone, so the plugins' native code is post45's but for post67's assembly target. aarch64 therefore
+  remains affected by the assembly-target defect for any process that compiles for more than one GPU target.
+  The GPU locks (`locks/cuda12.txt`, `locks/cuda13.txt`) resolve for every machine at once, as `locks/cpu.txt`
+  does, each carrying every machine's pins under its markers, so a GH200 installs the same file; the lock
+  script no longer checks that aarch64 resolves the same pins.
 - FlashAttention's wrapper, `dew-flash-attn` 0.3.7, folds a mapped kernel call (`jax.vmap` over attention,
   as a batched model's step maps it) into the kernel's own batch, one launch a group of calls within its
   grid, where 0.3.6 refused to map an FFI call.

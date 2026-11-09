@@ -243,19 +243,20 @@ class Counted(LMObjective):
         return super().loss(variables, batch, step)
 
 
-def lm(split=None, accumulation=1, objective=LMObjective, **fields):
-    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                              max_seq_len=SEQ, **fields)
-    return one_device(Trainer(objective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+def lm(split=None, accumulation=1, objective=LMObjective, *, seq=SEQ, width=16, layers=1, **fields):
+    model = CausalTransformer(vocab_size=64, emb_features=width, num_layers=layers, num_heads=2,
+                              mlp_features=2 * width, max_seq_len=seq, **fields)
+    return one_device(Trainer(objective(model, seq_len=seq), optax.sgd(1e-2), key=jax.random.key(0),
                               split=split, accumulation=accumulation))
 
 
-def trained(trainer, steps=3):
-    """The state after `steps` steps of BATCH."""
+def trained(trainer, steps=3, batch=None):
+    """The state after `steps` steps of `batch`, BATCH where None."""
+    batch = BATCH if batch is None else batch
     state, _, _ = trainer.place()
-    step = trainer.compile(state, BATCH)
+    step = trainer.compile(state, batch)
     for _ in range(steps):
-        state, *_ = step(state, BATCH)
+        state, *_ = step(state, batch)
     return state
 
 
@@ -605,7 +606,11 @@ def test_a_waiting_window_reports_in_a_run_that_cannot_create_a_process(tmp_path
     """A window that waits (`ProfileWindow.wait`) converts its capture's reports in the run's own process as
     it stops: a fit in a program its sandbox forbids to create processes (the live site's guest policy, a
     seccomp filter on fork and clone, `site/live/container/guest_limits.py`) finishes with its window's
-    reports written, where an exporter's process of its own could not start."""
+    reports written, where an exporter's process of its own could not start. The guest holds a uid of its
+    own, as each of the site's kernels does (`site/live/container/gateway_manager.py`), here a user
+    namespace's, so the policy's 256 threads are its own, beside another process of the test's uid holding
+    300 threads, as a host's neighbouring runs do (row 4869: sharing their uid, its threads failed to start,
+    pthread_create's EAGAIN, and the run aborted)."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import os
     import subprocess
@@ -616,8 +621,13 @@ def test_a_waiting_window_reports_in_a_run_that_cannot_create_a_process(tmp_path
 
     root = Path(dew.__file__).resolve().parents[2]
     script = f"""
-import importlib.util, sys
+import importlib.util, os, sys
 sys.path.insert(0, {str(root / "tests")!r})
+# A uid of its own, mapped to the test's, so the threads the policy counts are this guest's alone.
+uid = os.getuid()
+os.unshare(os.CLONE_NEWUSER)
+with open("/proc/self/uid_map", "w") as handle:
+    handle.write(f"{{uid}} {{uid}} 1\\n")
 import jax, jax.numpy as jnp, numpy as np, optax
 from affine_run import Replaying
 from dew.data.dataset import Loader
@@ -641,8 +651,18 @@ trainer.fit(Loader(lambda partition: rows, None, None, {ROWS}), steps=3)
 """
     source = str(root / "src")
     path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
-    subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
-                   env={**os.environ, "PYTHONPATH": path})
+    # A neighbour of the test's uid holding 300 threads, past the policy's 256 for a uid.
+    neighbour = subprocess.Popen([sys.executable, "-c", "import threading, time, sys\n"
+                                  "for _ in range(300): threading.Thread(target=time.sleep, args=(600,), "
+                                  "daemon=True).start()\nprint(flush=True)\ntime.sleep(600)"],
+                                 stdout=subprocess.PIPE, text=True)
+    try:
+        neighbour.stdout.readline()
+        subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
+                       env={**os.environ, "PYTHONPATH": path})
+    finally:
+        neighbour.kill()
+        neighbour.wait()
     (capture,) = (tmp_path / "trace").glob("capture-*")
     record = json.loads((capture / "manifest.json").read_text())
     assert record["capture_status"] == record["export_status"] == "completed"
@@ -964,14 +984,19 @@ def asked(trainer) -> list[tuple[int, str | None, bool]]:
     return [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]]
 
 
-def assert_searched(probes, chosen, below, *, half=None):
+def assert_searched(probes, chosen, below, *, half=None, derived=False):
     """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
     compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
     `below`, the largest split under the plan, asked and missed at each rung it may fit at, a plan at
     the half rung missed at no recomputation before, and no optional frontier is asked. Which splits
     between are asked, and in what order, follows the memory each compile measured, which differs
-    between devices (`Forecast`)."""
-    assert probes[0][:2] == (1, None) and not probes[0][2]
+    between devices (`Forecast`). A `derived` search starts at the split its derivation forecasts
+    (row 3341) and asks none it rules out, so it asks neither the batch whole first nor `below`
+    necessarily, and none past the plan's split."""
+    if derived:
+        assert probes[0][1] is None and all(split <= chosen[0] for split, _, _ in probes)
+    else:
+        assert probes[0][:2] == (1, None) and not probes[0][2]
     assert len({probe[:2] for probe in probes}) == len(probes)
     assert (*chosen, True) in probes
     assert all(remat in (None, half) for _, remat, _ in probes)
@@ -979,7 +1004,8 @@ def assert_searched(probes, chosen, below, *, half=None):
         if half is not None and remat is None and not fits:
             assert probes[index + 1] == (split, half, probes[index + 1][2])
     rungs = [None] if half is None else [None, half] if chosen[1] is None else [half]
-    assert all((below, remat, False) in probes for remat in rungs)
+    assert derived or all((below, remat, False) in probes for remat in rungs)
+    assert not derived or not any(fits for split, _, fits in probes if split < chosen[0])
     if half is not None and chosen[1] == half:
         # A plan at the half rung missed at no recomputation first.
         assert probes.index((chosen[0], None, False)) < probes.index((*chosen, True))
@@ -989,24 +1015,39 @@ DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear
                                linear_key_head_dim=8, linear_value_head_dim=8)}
 """A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
 
+HALVED = {"seq": 256, "width": 64, "layers": 2, **DELTA}
+"""A decoder of two gated delta net layers over 256 tokens, the delta rule's memory a share of the step
+that its half rung saves: at four microbatches of 32 rows the rung needs 3.4 to 3.7 MB less than no
+recomputation on an A100 and an H100, where the one-layer, sixteen-token decoder's needs 512 bytes more
+(row 3341's GPU cell)."""
+HALVED_BATCH = {"text": jnp.asarray((np.arange(ROWS * 257).reshape(ROWS, 257) * 7) % 64, jnp.int32)}
+
 
 def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The
-    delta rule runs its port (`port_support.row_names_port`), whatever the generation's row names: the half
-    rung recomputes the memory the port names (`checkpoint_name`), and the portable route, an A10's, names
-    none."""
+    decoder's delta rule holds a share of the step the half rung saves (`HALVED`), which the cell checks
+    first. The delta rule runs its port (`port_support.row_names_port`), whatever the generation's row
+    names: the half rung recomputes the memory the port names (`checkpoint_name`), and the portable route,
+    an A10's, names none."""
     half = "all_but_delta_memory"
     with row_names_port("gated_delta_rule", "fla"):
-        free(monkeypatch, needs(monkeypatch, lm(split=4, remat=half, **DELTA)))
-        trainer = lm(**DELTA)
+        def measured(**fields) -> int:
+            trainer = lm(split=4, **HALVED, **fields)
+            return needs(monkeypatch, trainer, lambda: trained(trainer, steps=0, batch=HALVED_BATCH))
+
+        room = measured(remat=half)
+        assert room < measured(), "the half rung saves memory at four microbatches"
+        free(monkeypatch, room)
+        trainer = lm(**HALVED)
         state, _, _ = trainer.place()
-        trials = Trials(state, BATCH)
-        trainer.compile(state, BATCH, trials)
+        trials = Trials(state, HALVED_BATCH)
+        trainer.compile(state, HALVED_BATCH, trials)
         assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), 2, half=half)
+    # The derivation forecasts the split it asks first (row 3341), so the search starts there.
+    assert_searched(asked(trainer), (4, half), 2, half=half, derived=True)
 
 
 def test_a_plan_at_no_recomputation_stops_before_any_optional_frontier(monkeypatch):
