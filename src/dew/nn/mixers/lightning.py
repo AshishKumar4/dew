@@ -38,6 +38,7 @@ from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Chunk, chunk
+from dew.nn.linear import forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -75,9 +76,10 @@ class LightningAttention(nn.Module):
     place among `layers` (`MixerCall.depth`). The decode state is `recurrent_state` `[B, H, D, D]` in
     at least fp32, which the first decode call only allocates."""
 
-    reads: ClassVar[frozenset[str]] = frozenset()
-    """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
-    of its document, with no mask or bias to narrow it."""
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that continue another
+    (`dew.batch.Forks`), each from the memory its parent leaves (`dew.nn.linear.forked_scan`); none of the
+    others: a recurrence reads every earlier token of its document, with no mask or bias to narrow it."""
 
     emb_features: int
     num_heads: int
@@ -159,6 +161,21 @@ class LightningAttention(nn.Module):
             if not allocated:
                 # The allocation-only call: init_cache's dummy token leaves no memory behind.
                 return self.out_proj(jnp.zeros((batch, length, self.features), qkv.dtype))
+        if tokens.forks is not None:
+            # Each document from the memory its parent leaves, a root from the row's; a cached call's memory
+            # left as it was.
+            def forked_rule(heads, *, valid, starts, state, entered):
+                queries, keys, values = heads
+                return chunk(LIGHTNING, Chunk(queries, keys, jnp.where(valid[:, :, None, None], values, 0),
+                                              log_decay=jnp.where(valid[:, :, None], log_decay, 0.0),
+                                              state=state, starts=starts, entered=entered),
+                             chunk_size=self.chunk_size, max_segments=tokens.max_segments)
+
+            out = forked_scan((query, key, value), forked_rule, tokens,
+                              (self.num_heads, self.head_dim, self.head_dim),
+                              held=None if held is None else held.value, state_dtype=wide)
+            out = self.norm(out.reshape(batch, length, self.features))
+            return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
         if held is not None and length == 1:
             out, _, final = recurrence.step_reference(LIGHTNING, recurrence.Step(
                 state=held.value, query=query[:, 0], key=key[:, 0], value=value[:, 0],
@@ -187,6 +204,8 @@ class LightningAttentionMixer(MixerBase):
 
     residuals = ('context', 'scan')
     reads_depth = True
+    # Each document from the memory its parent leaves (`dew.nn.linear.forked_scan`).
+    reads_forks = True
 
     num_hidden_layers: int = 2
     layer_idx: int | None = None
