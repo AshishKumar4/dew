@@ -138,7 +138,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post70: a serialized executable's output types unpickle with JAX's own
+- Dew requires its JAX build 0.12.0.1.post71: an interpreted Mosaic GPU kernel's shared memory admits its own
+  devices alone, so a second kernel interpreted at once (a program's next execution under asynchronous dispatch,
+  or one from another thread) waits for the live one's clean-up instead of joining its memory and failing.
+- Dew's JAX build 0.12.0.1.post70: a serialized executable's output types unpickle with JAX's own
   `AutoLayout`, so a loaded executable's outputs trace as a fresh run's do (a nested `jit` fed them traced twice,
   and a step compiled ahead recompiled on the GPU).
 - Dew's JAX build 0.12.0.1.post69: a `cond` whose lowering drops a platform's branch still passes
