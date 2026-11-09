@@ -8,13 +8,13 @@ from reference_error import recording
 from arm_arithmetic import summed_as_run
 
 
-def test_probe(*, users=False):
+def test_probe(*, users=False, seeds=(10,700)):
     fixture, draw, dew, _ = T.pipeline_arms('qwen35/text')
     stored = recording(fixture)
     lines = []
     narrow = jax.jit(lambda inputs: dew(jnp.float32, inputs)['updated_logits'])
     wide = jax.jit(lambda inputs: dew(jnp.float64, inputs)['updated_logits'])
-    for seed in (10, 700):
+    for seed in seeds:
         inputs = draw(seed)
         with summed_as_run() if users else contextlib.nullcontext():
             a = np.asarray(narrow(inputs), np.float64)
