@@ -5,7 +5,7 @@ whose barriers count the arrivals of the roles that fill and give back each."""
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from jax import lax
@@ -105,11 +105,11 @@ class Schedule:
         """Each hand-off's allocations (`stated`), in turn."""
         return tuple(shape.scratch(target) for shape in self.stated())
 
-    def opened(self, refs: Sequence) -> Mapping[str, Any]:
-        """Each hand-off opened by name over its scoped `refs` (`scratch`'s, in turn): each its shape's own
-        opened type (a tensor-core `Signal`, a `Tensor` of accumulators)."""
-        return {handoff.name: shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
-                for handoff, shape, ref in zip(self.handoffs, self.stated(), refs, strict=True)}
+    def opened(self, refs: Sequence) -> tuple:
+        """Each hand-off opened over its scoped `refs` (`scratch`'s), in turn, as `scratch` allocates them:
+        each its shape's own opened type (a tensor-core `Signal`, a `Tensor` of accumulators)."""
+        return tuple(shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
+                     for shape, ref in zip(self.stated(), refs, strict=True))
 
     def run[R](self, **bodies: Callable[..., R]) -> R | None:
         """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
@@ -153,5 +153,7 @@ class Schedule:
             @plgpu.warp_map
             def _(warp):
                 for index, role in enumerate(lowered):
-                    pl.when(warp == index)(bodies[role.name])
+                    @pl.when(warp == index)
+                    def _(body=bodies[role.name]):
+                        body()
         return None

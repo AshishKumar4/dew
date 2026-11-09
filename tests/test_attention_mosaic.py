@@ -1778,6 +1778,34 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
             lowering_platforms=("cuda",))
 
 
+@lowers("sm90")
+@pytest.mark.parametrize("width", [64, 128])
+@pytest.mark.parametrize("natural", [False, True], ids=["folded", "natural"])
+@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
+def test_the_training_forward_under_every_score_hook_lowers_for_an_h100(hooks, natural, width):
+    """The training forward that supplies each hooked backward's residuals lowers for an H100 at the GPU
+    cells' head widths, in either form: a row-indexed hook's unit column of its query places found no layout
+    beside the walk's split on mma.sync (row 5279)."""
+    case = CASES["causal-documents-window"]
+    queries, keys = core_geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    q = jax.ShapeDtypeStruct((ROWS, queries, 4, width), jnp.bfloat16)
+    kv = jax.ShapeDtypeStruct((ROWS, keys, 2, width), jnp.bfloat16)
+    score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, width)
+    params, initial = draw_hooks(0)
+
+    def trained(q, k, v, params, initial):
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)),
+                                initial)
+        return attention_mosaic.forward(q, k, v, spans, hooked, natural=natural,
+                                        residuals=template.Kept.SPLIT)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(trained).trace(q, kv, kv, params, initial).lower(lowering_platforms=("cuda",))
+
+
 @ON_HOPPER
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)

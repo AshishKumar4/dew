@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative
+from dew.nn.programs import holes
 
 type Tree = Mapping[str, object]
 
@@ -152,14 +153,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     traced = _Traced()
     # What every layer reads crosses the rule as its arrays; its other leaves (a static field of the
     # attention metadata) are the rule's own.
-    held, structure = jax.tree.flatten(tuple(shared))
-    arrays = [position for position, leaf in enumerate(held) if isinstance(leaf, jax.Array | np.ndarray)]
-
-    def shared_of(given):
-        leaves = list(held)
-        for position, leaf in zip(arrays, given, strict=True):
-            leaves[position] = leaf
-        return jax.tree.unflatten(structure, leaves)
+    arrays, shared_of = holes(tuple(shared), lambda leaf: isinstance(leaf, jax.Array | np.ndarray))
 
     def forward_layer(x, slices, shared):
         weights_i, per_layer_i = slices
@@ -248,4 +242,4 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     updating = contracted("test_a_run_updating_in_its_backward_moves_as_its_step_would")(
         declared_derivative(Surrogate(), run, run_forward, run_backward))
     return updating(weights, masters, dict(moments), norms, x, per_layer,
-                    tuple(held[position] for position in arrays))
+                    tuple(arrays))

@@ -201,7 +201,7 @@ the identity where a walk's tiles are traced (`evaluated_inline`)."""
 
 
 def _platform_default(equation: jcore.JaxprEqn,
-                      producers: Mapping[jcore.Var, jcore.JaxprEqn]) -> jcore.ClosedJaxpr | None:
+                      producers: Mapping[jcore.Var, jcore.JaxprEqn]) -> jcore.Jaxpr | None:
     """The branch a choice by the platform a program lowers for (`lax.platform_dependent`: a `cond` on a
     `platform_index`, `producers` mapping each value to its equation) takes on a platform it names no branch
     for, its default; None for any other equation, or a choice without one. Read so in Dew's own programs
