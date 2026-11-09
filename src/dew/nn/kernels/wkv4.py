@@ -26,13 +26,13 @@ EMPTY = -1e38
 
 class SpanCarry(NamedTuple):
     """A span of tokens' carry: its numerator and denominator scaled by `e^{-top}`, `top` their running
-    maximum (fla's alpha, beta and eps), `count` its tokens (each decaying what precedes it once) and
+    maximum (fla's alpha, beta and eps), `tokens` its tokens (each decaying what precedes it once) and
     `fresh` whether it begins a document (what precedes it is dropped)."""
 
     numerator: jax.Array
     denominator: jax.Array
     top: jax.Array
-    count: jax.Array
+    tokens: jax.Array
     fresh: jax.Array
 
 
@@ -42,21 +42,30 @@ def _joined(decay):
     later one begins no document."""
 
     def join(before: SpanCarry, after: SpanCarry) -> SpanCarry:
-        aged = before.top + after.count * decay
+        aged = before.top + after.tokens * decay
         top = jnp.maximum(aged, after.top)
         kept, added = jnp.exp(aged - top), jnp.exp(after.top - top)
         joined = SpanCarry(kept * before.numerator + added * after.numerator,
-                      kept * before.denominator + added * after.denominator, top,
-                      before.count + after.count, before.fresh | after.fresh)
-        dropped = after._replace(count=joined.count, fresh=joined.fresh)
+                           kept * before.denominator + added * after.denominator, top,
+                           before.tokens + after.tokens, before.fresh | after.fresh)
+        dropped = after._replace(tokens=joined.tokens, fresh=joined.fresh)
         return jax.tree.map(lambda one, other: jnp.where(after.fresh, other, one), joined, dropped)
     return join
 
 
-def _empty(batch: int, channels: int, work) -> jax.Array:
-    """An empty past's carry `[B, 3, C]`: no numerator or denominator, the running maximum `EMPTY`."""
-    return jnp.stack([jnp.zeros((batch, channels), work), jnp.zeros((batch, channels), work),
-                      jnp.full((batch, channels), EMPTY, work)], axis=1)
+def _operands(time_decay, time_first, key, value, state):
+    """`wkv4`'s operands in its working dtype (`at_least_fp32` of the inputs'): the decay `-exp(time_decay)`,
+    the bonus, the keys and values, and the carry entering, an empty past's (no numerator or denominator,
+    the running maximum `EMPTY`) where `state` is None; and the inputs' dtype."""
+    dtype = jnp.result_type(key, value)
+    work = at_least_fp32(dtype)
+    key, value = jnp.asarray(key, work), jnp.asarray(value, work)
+    batch, _, channels = key.shape
+    if state is None:
+        state = jnp.stack([jnp.zeros((batch, channels), work), jnp.zeros((batch, channels), work),
+                           jnp.full((batch, channels), EMPTY, work)], axis=1)
+    return (-jnp.exp(jnp.asarray(time_decay, work)), jnp.asarray(time_first, work), key, value,
+            jnp.asarray(state, work), dtype)
 
 
 def wkv4(time_decay, time_first, key, value, state=None, starts=None):
@@ -65,17 +74,12 @@ def wkv4(time_decay, time_first, key, value, state=None, starts=None):
     beta and eps; an empty past where None); `starts` `[B, S]` each packed document's first token, which
     enters an empty past. Returns `(out [B, S, C] in the inputs' dtype, state [B, 3, C] in at least fp32)`,
     as fla's `fused_recurrent_rwkv4` (its state's last token)."""
-    dtype = jnp.result_type(key, value)
-    work = at_least_fp32(dtype)
-    decay = -jnp.exp(jnp.asarray(time_decay, work))
-    bonus = jnp.asarray(time_first, work)
-    key, value = jnp.asarray(key, work), jnp.asarray(value, work)
+    decay, bonus, key, value, state, dtype = _operands(time_decay, time_first, key, value, state)
     batch, length, channels = key.shape
-    state = _empty(batch, channels, work) if state is None else state
     fresh = (jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool))[..., None]
     fresh = jnp.broadcast_to(fresh, key.shape)
-    entering = SpanCarry(*(jnp.asarray(state, work)[:, i][:, None] for i in range(3)),
-                    jnp.zeros((batch, 1, channels), work), jnp.zeros((batch, 1, channels), bool))
+    entering = SpanCarry(state[:, 0, None], state[:, 1, None], state[:, 2, None],
+                         jnp.zeros((batch, 1, channels), key.dtype), jnp.zeros((batch, 1, channels), bool))
     tokens = SpanCarry(value, jnp.ones_like(key), key, jnp.ones_like(key), fresh)
     spans = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest], axis=1), entering, tokens)
     carried = jax.lax.associative_scan(_joined(decay), spans, axis=1)
@@ -95,13 +99,8 @@ def wkv4(time_decay, time_first, key, value, state=None, starts=None):
 def recurrent_wkv4(time_decay, time_first, key, value, state=None, starts=None):
     """`wkv4`'s recurrence a token at a time as fla's kernel steps it (fused_recurrent.py:94-114), in at
     least fp32 (float64 where the inputs are); operands and results as `wkv4`'s."""
-    dtype = jnp.result_type(key, value)
-    work = at_least_fp32(dtype)
-    decay = -jnp.exp(jnp.asarray(time_decay, work))
-    bonus = jnp.asarray(time_first, work)
-    key, value = jnp.asarray(key, work), jnp.asarray(value, work)
-    batch, length, channels = key.shape
-    state = _empty(batch, channels, work) if state is None else state
+    decay, bonus, key, value, state, dtype = _operands(time_decay, time_first, key, value, state)
+    batch, length, _ = key.shape
     starts = jnp.zeros((batch, length), bool) if starts is None else jnp.asarray(starts, bool)
 
     def one_token(carry, step):
@@ -118,7 +117,7 @@ def recurrent_wkv4(time_decay, time_first, key, value, state=None, starts=None):
         kept, added = jnp.exp(aged - eps), jnp.exp(k - eps)
         return (kept * alpha + added * v, kept * beta + added, eps), out
 
-    entering = tuple(jnp.asarray(state, work)[:, i] for i in range(3))
+    entering = (state[:, 0], state[:, 1], state[:, 2])
     steps = tuple(jnp.moveaxis(x, 1, 0) for x in (key, value, starts))
     final, out = jax.lax.scan(one_token, entering, steps)
     return jnp.moveaxis(out, 0, 1).astype(dtype), jnp.stack(final, axis=1)

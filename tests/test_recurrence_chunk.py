@@ -136,6 +136,17 @@ def marked(documents, length: int) -> np.ndarray:
     return starts
 
 
+def assert_packed_on_par(dew: Callable, reference: Callable, draw: Callable, label: str, *, packed: bool,
+                        documents, length: int, seeds: int, **options) -> None:
+    """Check 1 of a sequence rule `dew` against `reference` (its form a token at a time, each taking packed
+    documents' `starts`), output and every operand's gradient (`with_gradients`) from float64 at `seeds`
+    draws, over one sequence or, `packed`, the rows' `documents` (`marked`)."""
+    starts = marked(documents, length) if packed else None
+    assert_as_exact(jax.jit(with_gradients(functools.partial(dew, starts=starts))),
+                    jax.jit(with_gradients(functools.partial(reference, starts=starts))), draw,
+                    f'{label} packed={packed}', seeds=seeds, **options)
+
+
 def hosted(x, dtype=jnp.float32) -> jax.Array:
     """A float64 NumPy draw rounded once to fp32, then to `dtype`, as JAX takes it. A recorded site's draws
     (`fla_sites`) are NumPy's, their arithmetic float64's, the same bits on any host and jaxlib: JAX's

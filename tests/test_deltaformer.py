@@ -2,13 +2,10 @@
 solve and a softmax attention: its output and gradients on par with fla's reference a token at a time from
 float64, one sequence and packed documents (check 1)."""
 
-import functools
 
-import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import hosted, marked, sigmoid
+from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid
 
 from dew.nn.kernels.deltaformer import deltaformer, recurrent_deltaformer
 
@@ -34,7 +31,5 @@ def test_the_solve_is_as_exact_as_the_recurrence_a_token_at_a_time(packed):
     """The solve's output and every operand's gradient on par with fla's reference a token at a time from
     float64, one sequence and packed documents (check 1): each token's value corrected by its earlier tokens'
     corrected values, each softmax and the solve within its document."""
-    starts = marked(DOCUMENTS, LENGTH) if packed else None
-    dew = jax.jit(with_gradients(functools.partial(deltaformer, starts=starts)))
-    reference = jax.jit(with_gradients(functools.partial(recurrent_deltaformer, starts=starts)))
-    assert_as_exact(dew, reference, draw, f'deltaformer packed={packed}', seeds=SEEDS[packed])
+    assert_packed_on_par(deltaformer, recurrent_deltaformer, draw, 'deltaformer', packed=packed,
+                         documents=DOCUMENTS, length=LENGTH, seeds=SEEDS[packed])

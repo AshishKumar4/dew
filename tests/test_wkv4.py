@@ -2,13 +2,11 @@
 carries: its output, final carry and gradients on par with fla's recurrence a token at a time from float64,
 one sequence and packed documents (check 1)."""
 
-import functools
 
 import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import hosted, marked
+from test_recurrence_chunk import assert_packed_on_par, hosted
 
 from dew.nn.kernels.wkv4 import recurrent_wkv4, wkv4
 
@@ -38,11 +36,8 @@ def test_the_scan_is_as_exact_as_the_recurrence_a_token_at_a_time(packed):
     """The scan's output, final carry and every operand's gradient on par with fla's recurrence a token at a
     time from float64, one sequence and packed documents (check 1): each span's carry rescaled to the larger
     running maximum as it joins, a document's first token reading an empty past."""
-    starts = marked(DOCUMENTS, LENGTH) if packed else None
-    dew = jax.jit(with_gradients(functools.partial(wkv4, starts=starts)))
-    reference = jax.jit(with_gradients(functools.partial(recurrent_wkv4, starts=starts)))
     # Packed, the first row's carry entering is dropped at its token 0, so its gradient is exactly zero in
     # both arms: held to the reference's residue there, zero, no float64 terms traced (the token loop's terms
     # took 11.5 GB and were killed, jsf-wkv4t1); one sequence holds no zero row, so none are traced either.
-    assert_as_exact(dew, reference, draw, f'wkv4 packed={packed}', seeds=SEEDS[packed],
-                    terms=False if packed else None)
+    assert_packed_on_par(wkv4, recurrent_wkv4, draw, 'wkv4', packed=packed, documents=DOCUMENTS,
+                         length=LENGTH, seeds=SEEDS[packed], terms=False if packed else None)
