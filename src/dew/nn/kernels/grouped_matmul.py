@@ -1372,8 +1372,12 @@ class MosaicTgmm(_Mosaic):
 
     def _depth_unit(self, ba, family: mosaic.Family, dtype) -> int:
         # A tile's rows take whole roles of the depth, but where its last row tile may be partial
-        # (`_ragged`: 8 rows, a TMA descriptor's).
-        return mosaic_gpu.TMA_ROWS if self._ragged(ba, family) else family.role_rows
+        # (`_ragged`): there whole swizzled rows of the output's, which a TMA store's tiled view takes no
+        # fewer of ("dimension 1 must have size smaller or a multiple of its tiling 64, but got 200", a
+        # 200-deep kernel gradient on sm90 and sm120, the compile gate at c717a2439b4).
+        if self._ragged(ba, family):
+            return math.lcm(mosaic_gpu.TMA_ROWS, swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES))
+        return family.role_rows
 
     def _padded_extents(self, ba) -> dict[str, int]:
         if self.K_MAJOR:  # a step-scaled call's operands lie as its scales do: not padded
