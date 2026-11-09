@@ -2439,7 +2439,6 @@ class CausalTransformer(LinearProducts):
         return self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
 
     @nn.nowrap
-    @nn.nowrap
     def layer_mixers(self) -> tuple[tuple[MixerBase, MixerContext], ...]:
         """Each layer's mixer and the context it is built with, in order (`decoder_refusals`)."""
         types, default = self.per_layer_types, self.layer_mixer
