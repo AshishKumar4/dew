@@ -107,13 +107,14 @@ def test_a_cpu_pairwise_dense_product_holds_every_order(edge):
 def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
     """`pairwise.pairwise_ragged_dot_general` (a CPU's float32 grouped product summed blocked and pairwise,
     row 4863's GEMM remainder): its rows grouped and their depth contracted, and each group's rows contracted
-    into the group's matrix, each contraction 96 long, as the dense form's, so both take blocks and a partial
-    last one, one group empty:
+    into the group's matrix (96 deep, and 36 rows, few enough that no partial sum of its products near
+    float32's largest passes it where its total does not), so both take blocks and a partial last one, one
+    group empty:
     every order runs in the float operands, the group sizes not differentiable, finite wherever float64 is a
     normal float32 and wherever the plain grouped product (by a mask, its float64 run the truth) is."""
     from dew.nn import pairwise
 
-    sizes = jnp.asarray([70, 0, 66] if form == "rows" else [50, 0, 46], jnp.int32)
+    sizes = jnp.asarray([70, 0, 66] if form == "rows" else [20, 0, 16], jnp.int32)
     rows = int(sizes.sum())
     groups = jax.nn.one_hot(jnp.repeat(jnp.arange(3), sizes, total_repeat_length=rows), 3)
     if form == "rows":
@@ -132,7 +133,7 @@ def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
     primals = normal_draw(4866, *shapes, scale=EDGES[edge])
     direction = normal_draw(4867, *shapes, scale=EDGES[edge])
     (cotangent,) = normal_draw(4868, out)
-    assert pairwise.contraction_block(96) < 96
+    assert pairwise.contraction_block(96) < 96 and pairwise.contraction_block(36) < 36
     assert_contract(lambda lhs, rhs: pairwise.pairwise_ragged_dot_general(lhs, rhs, sizes, numbers),
                     primals, direction, cotangent, f"a CPU pairwise grouped product {form} {edge}",
                     truth_fn=plain, plain_fn=plain)

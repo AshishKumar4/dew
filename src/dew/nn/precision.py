@@ -496,22 +496,25 @@ def _sums_in_float64(*operands) -> bool:
     return _wide_cpu_products(*operands) and jax.config.jax_default_matmul_precision != FP32_SUMS
 
 
-def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
+def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike, counts: int = 0) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
     CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`), with no platform of its own to choose.
     Its products run at HIGHEST precision, whatever fp32 algorithm the caller bound, which would
-    narrow float64 operands back to float32."""
+    narrow float64 operands back to float32. Its last `counts` operands (a ragged dot's group sizes) multiply
+    nothing and pass through as they are."""
     with jax.enable_x64(new_val=True):
-        wide = product(*_widened(operands), precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
+        wide = product(*_widened(operands, counts), precision=jax.lax.Precision.HIGHEST,
+                       preferred_element_type=None)
         return wide.astype(dtype)
 
 
-def _widened(operands) -> list[jax.Array]:
+def _widened(operands, counts: int = 0) -> list[jax.Array]:
     """`operands` as the float64 operands of their float32 product: each converted to the dtype they
     multiply in (`products_dtype`), as the product converts them, then widened exactly."""
-    dtype = products_dtype(*operands)
-    return [operand.astype(dtype).astype(jnp.float64) for operand in operands]
+    multiplied = operands[:len(operands) - counts]
+    dtype = products_dtype(*multiplied)
+    return [operand.astype(dtype).astype(jnp.float64) for operand in multiplied] + list(operands[len(multiplied):])
 
 
 def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
@@ -572,18 +575,14 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if _ragged(product):
-        # A ragged dot's group sizes count its rows and multiply nothing: its product is of the two others,
-        # the sizes held fixed in it (a closed-over value of its trace, which `_paired` reads).
-        *multiplied, sizes = operands
-
-        def bound(lhs, rhs, **options):
-            return product(lhs, rhs, sizes, **options)
-
+        # A ragged dot's group sizes count its rows and multiply nothing (`counts`): its product is of the two
+        # others, the sizes passed through as they are.
+        *multiplied, _ = operands
         if _sums_in_float64(*multiplied):
-            return _summed_wide(bound, preferred_element_type, *multiplied)
+            return _summed_wide(product, preferred_element_type, *operands, counts=1)
         if (all(isinstance(operand, jax.Array | np.ndarray) for operand in multiplied)
                 and products_dtype(*multiplied) == jnp.dtype(jnp.float32)):
-            return _summed_pairwise(bound, preferred_element_type, *multiplied)
+            return _summed_pairwise(product, preferred_element_type, *operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if not _sums_in_float64(*operands):
         if ((key := _contraction(product, preferred_element_type)) is not None
@@ -765,10 +764,10 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
     return [read(atom) for atom in jaxpr.outvars]
 
 
-def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Array:
+def _summed_wide(product: Callable, preferred_element_type, *operands, counts: int = 0) -> jax.Array:
     """`accumulated`'s product under Dew's wide CPU arithmetic: its float64 sum where it takes the
     platform's choice (`platform_dependent`), the plain product where its result is wider than float32 or
-    its library states its derivative."""
+    its library states its derivative; its last `counts` operands multiply nothing (`float64_sum`)."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
@@ -780,14 +779,14 @@ def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Ar
         return narrow(*operands)
 
     def summed(*operands):
-        return float64_sum(product, *operands, dtype=dtype)
+        return float64_sum(product, *operands, dtype=dtype, counts=counts)
 
     def pulled(saved, operands, cotangent, live):
         """The cotangents of the operands at `live`, each the float64 sum of its products rounded
         once: JAX transposes a product after its trace, outside the scope that widened it, so the
         pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
-            wide = _widened(operands)
+            wide = _widened(operands, counts)
             wide_cotangent = cotangent.astype(jnp.float64)
 
             def transposed(index):
