@@ -1537,25 +1537,46 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
     return scaled_step(state, scale, split, raised=raised, branched=keys.accumulate is None)
 
 
-def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Partial:
-    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`) from `start`, its sums compensated
-    where its form takes them so (`compensated`, `settled`)."""
-    return settled(jax.lax.fori_loop(lo, hi, lambda index, state: plain_step(spec, state, keys_at(index)),
-                                     compensated(spec, start)))
+def tiles_walked[C](lo, hi, step: Callable[[jax.Array, C], C], carry: C, most: int | None = None) -> C:
+    """`step(index, carry)` over a program's tiles `lo` to `hi`, from `carry`: `jax.lax.fori_loop`'s, a
+    kernel's loop of traced bounds (a Pallas mainloop's, which Triton pipelines); given `most`, the tiles the
+    call holds (static), a loop counted from 0 while under `most` and under `hi` past `lo`, so its program
+    states at most `most` trips beside the spans' bounds (`dew.telemetry.instrumentation._counted_trips`): a
+    program XLA runs whole (the plain-JAX mainloop's), whose loop of traced bounds alone stated no trip count,
+    and a CPU training step at 3,072 tokens on that mainloop no FLOPs (`Trainer.step_flops` None)."""
+    if most is None:
+        return jax.lax.fori_loop(lo, hi, step, carry)
+
+    def stepped(state: tuple[jax.Array, C]) -> tuple[jax.Array, C]:
+        trip, carried = state
+        return trip + 1, step(lo + trip, carried)
+
+    return jax.lax.while_loop(lambda state: (state[0] < most) & (lo + state[0] < hi), stepped,
+                              (jnp.int32(0), carry))[1]
+
+
+def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial, *,
+               most: int | None = None) -> Partial:
+    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, of at most `most`, `tiles_walked`)
+    from `start`, its sums compensated where its form takes them so (`compensated`, `settled`)."""
+    return settled(tiles_walked(lo, hi, lambda index, state: plain_step(spec, state, keys_at(index)),
+                                compensated(spec, start), most))
 
 
 def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
-                  rows: Callable[[jax.Array], jax.Array], start: Partial, dropping: bool = False) -> Carry:
+                  rows: Callable[[jax.Array], jax.Array], start: Partial, dropping: bool = False, *,
+                  most: int | None = None) -> Carry:
     """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
     sums, from none (`training_step`)."""
     nothing = jnp.zeros(start.total.shape, jnp.float32)
-    state, arg, own, others_total = jax.lax.fori_loop(
+    state, arg, own, others_total = tiles_walked(
         lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
-        (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing))
+        (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing), most)
     return settled(state), arg, own, others_total
 
 
-def anchored_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Carry:
+def anchored_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial, *,
+                  most: int | None = None) -> Carry:
     """A training forward's walk (`training_walk`'s carry) at each row's maximum and anchor found before it:
     a walk of `argmax` over the logits alone, then `anchored_step`s from `anchored`'s carry, as the Mosaic
     training launch walks a peak walk's anchors; a quantized call's (`Forward.rounds`), whose weights round
@@ -1565,9 +1586,10 @@ def anchored_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], s
         keys = keys_at(index)
         return argmax(arg, keys.logits, keys.coords.k_pos)
 
-    arg = jax.lax.fori_loop(lo, hi, peaked, no_argmax(start.total.shape[0]))
-    state, arg, own, others_total = jax.lax.fori_loop(
-        lo, hi, lambda index, carry: anchored_step(spec, carry, keys_at(index)), anchored(spec, start, arg))
+    arg = tiles_walked(lo, hi, peaked, no_argmax(start.total.shape[0]), most)
+    state, arg, own, others_total = tiles_walked(
+        lo, hi, lambda index, carry: anchored_step(spec, carry, keys_at(index)), anchored(spec, start, arg),
+        most)
     return settled(state), arg, own, others_total
 
 

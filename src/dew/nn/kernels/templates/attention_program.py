@@ -19,18 +19,19 @@ from dew.nn.kernels.templates.attention_backward_algebra import derived_backward
 
 def walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.Keys],
          rows: Callable[[jax.Array], jax.Array], resumed: tuple[jax.Array, jax.Array, jax.Array] | None,
-         block_q: int, width: int, *, training: bool, dropping: bool = False):
+         block_q: int, width: int, *, training: bool, dropping: bool = False, most: int | None = None):
     """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, in `spec`'s form) from the initial
     state `resumed` `(m0, total0, acc0)` or none (`algebra.started`, at its rows' scale where the walk is
     scaled): the plain walk (`algebra.plain_walk`), or with `training` the training walk carrying the anchor
     key and split sums (`algebra.training_walk`, `rows(keys)` each key's value row), at each row's maximum
-    found first where its weights round there (`algebra.anchored_walk`, `Forward.rounds`)."""
+    found first where its weights round there (`algebra.anchored_walk`, `Forward.rounds`); its tiles at most
+    `most` (`algebra.tiles_walked`)."""
     start = algebra.started(spec, resumed, block_q, width)
     if training and spec.rounds is not None:
-        return algebra.anchored_walk(spec, lo, hi, keys_at, start)
+        return algebra.anchored_walk(spec, lo, hi, keys_at, start, most=most)
     if training:
-        return algebra.training_walk(spec, lo, hi, keys_at, rows, start, dropping=dropping)
-    return algebra.plain_walk(spec, lo, hi, keys_at, start)
+        return algebra.training_walk(spec, lo, hi, keys_at, rows, start, dropping=dropping, most=most)
+    return algebra.plain_walk(spec, lo, hi, keys_at, start, most=most)
 
 
 def finished(spec: algebra.Forward, walked, rows: Callable[[jax.Array], jax.Array],
@@ -50,12 +51,13 @@ def finished(spec: algebra.Forward, walked, rows: Callable[[jax.Array], jax.Arra
 
 def off_anchor_pass(lo, hi, formed: Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array]],
                     before: gradient.OffAnchor, maximum: jax.Array, chosen: jax.Array, shift: jax.Array,
-                    how: algebra.Recompute, dot: Callable[[jax.Array, jax.Array], jax.Array]
-                    ) -> gradient.OffAnchor:
+                    how: algebra.Recompute, dot: Callable[[jax.Array, jax.Array], jax.Array], *,
+                    most: int | None = None) -> gradient.OffAnchor:
     """A dQ program's first pass over its key tiles `lo` to `hi` without the forward's split sums
     (`gradient.off_anchor`): each tile's weights against the forward's `maximum`, the anchor keys `chosen`'s
     own apart, its products with the tile's values summed from `before` (`gradient.off_anchor_start`);
-    `formed(index)` a tile's key positions `[1, bk]`, logits as the forward formed them and values."""
+    `formed(index)` a tile's key positions `[1, bk]`, logits as the forward formed them and values; its tiles
+    at most `most` (`algebra.tiles_walked`)."""
     def step(index, state):
         k_pos, logits, values = formed(index)
         at_anchor = k_pos == chosen[:, None]
@@ -64,7 +66,7 @@ def off_anchor_pass(lo, hi, formed: Callable[[jax.Array], tuple[jax.Array, jax.A
         return gradient.off_anchor(state, exponentials, rest, own, dot(rest, values), shift, small,
                                    dot(small, values))
 
-    return jax.lax.fori_loop(lo, hi, step, before)
+    return algebra.tiles_walked(lo, hi, step, before, most)
 
 
 def accurate_sums(dot: Callable) -> Callable:
@@ -83,8 +85,8 @@ def accurate_sums(dot: Callable) -> Callable:
 def dq_sums(formed: Callable, q: jax.Array, do: jax.Array, m: jax.Array, anchor: jax.Array, delta: jax.Array,
             total: jax.Array, lo, hi, chosen: jax.Array, keep: Callable | None, *, hooked: bool,
             score_kinds: tuple[Kind, ...], summed: tuple[bool, ...], prescale: float, grad_scale: float,
-            how: algebra.Recompute, accurate: bool, dot: Callable[[jax.Array, jax.Array], jax.Array]
-            ) -> gradient.DqSums:
+            how: algebra.Recompute, accurate: bool, dot: Callable[[jax.Array, jax.Array], jax.Array],
+            most: int | None = None) -> gradient.DqSums:
     """A dQ program's sums by the backward's derived forms (`derived_backward`, in the forward's units `how`
     and the form `accurate` names): dQ the walk's over its key tiles `lo` to `hi` (`formed(index)` a tile's
     key positions `[1, bk]`, mask, keys, values, logits as the forward formed them and their hook's slopes),
@@ -93,7 +95,7 @@ def dq_sums(formed: Callable, q: jax.Array, do: jax.Array, m: jax.Array, anchor:
     `attention.prescale`: exactly undone), under dropout's multipliers `keep(k_pos)` where it drops; the row
     sums D's refinement and the hook's parameters read (`gradient.dq_rows`) from each tile's weights and
     cotangents. The accurate form's dQ products issued through `dot` (`accurate_sums`), its keyed sums its own
-    (`gradient.dq_issued`)."""
+    (`gradient.dq_issued`). Its tiles at most `most` (`algebra.tiles_walked`)."""
     # dV's operands bf16's order where dO is bf16 (`derived_backward`'s `normalized_values`).
     forms = derived_backward(grad_scale, "keys", hooked, keep is not None, how, accurate, anchored=True,
                              normalized_values=do.dtype == jnp.bfloat16)
@@ -131,18 +133,18 @@ def dq_sums(formed: Callable, q: jax.Array, do: jax.Array, m: jax.Array, anchor:
 
     shapes = {name: (value.shape, value.dtype) for name, value in tiles_at(lo)[0].items()}
     empty = gradient.no_dq_sums(q.shape[0], q.shape[1], len(score_kinds))
-    state, sums = jax.lax.fori_loop(lo, hi, step, (forms.init(shapes), empty))
+    state, sums = algebra.tiles_walked(lo, hi, step, (forms.init(shapes), empty), most)
     return sums._replace(dq=forms.finish(state, shapes=shapes)[0])
 
 
 def fused_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, dq: jax.Array,
                add_dq: Callable, *, hooked: bool, grad_scale: float, how: algebra.Recompute,
-               dot: Callable[[jax.Array, jax.Array], jax.Array]):
+               dot: Callable[[jax.Array, jax.Array], jax.Array], most: int | None = None):
     """A one-pass backward program's sums (the fast form's one launch, FlashAttention's): `dkv_sums`' walk of
     one key block over its query tiles `lo` to `hi`, each tile's own dQ (the derived forms' first output,
     walked keys first) added into the carried `dq` by `add_dq(index, dq, tile)` as it is formed, so dQ,
-    dK and dV come from one recomputation of each tile's weights and cotangents. dK, dV `[bk, ...]` and
-    `dq`."""
+    dK and dV come from one recomputation of each tile's weights and cotangents, its tiles at most `most`
+    (`algebra.tiles_walked`). dK, dV `[bk, ...]` and `dq`."""
     forms = derived_backward(grad_scale, "rows", hooked, dropped=False, how=how, accurate=False,
                              anchored=True, normalized_values=v_tile.dtype == jnp.bfloat16)
 
@@ -156,22 +158,23 @@ def fused_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, d
         return sums, add_dq(index, dq, tile)
 
     shapes = {name: (value.shape, value.dtype) for name, value in tiles_of(lo).items()}
-    sums, dq = jax.lax.fori_loop(lo, hi, step, (forms.init(shapes), dq))
+    sums, dq = algebra.tiles_walked(lo, hi, step, (forms.init(shapes), dq), most)
     dk, dv = forms.finish(sums, shapes=shapes)[1:3]
     return dk, dv, dq
 
 
 def dkv_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, pulled: Callable, hooks, *,
              hooked: bool, dropped: bool, grad_scale: float, how: algebra.Recompute, accurate: bool,
-             score_kinds: tuple[Kind, ...], dot: Callable[[jax.Array, jax.Array], jax.Array]):
+             score_kinds: tuple[Kind, ...], dot: Callable[[jax.Array, jax.Array], jax.Array],
+             most: int | None = None):
     """A dK/dV program's sums by the backward's derived forms (`derived_backward`, walked over the query tiles
     `lo` to `hi`, in the forward's units `how`), its keys `k_tile` and values `v_tile` its own:
     `formed(index)`
     a query tile's operands as the forms read them (`q`, `dout`, its mask, its logits as the forward formed
     them, its rows' maximum, denominator, anchor and D, its hook's slopes and dropout's multipliers) and its
     slopes and mask; each tile's score cotangents pulled through the hook (`gradient.pulled`) into `hooks` by
-    `pulled(index, hooks, pieces)`; each product issued through the mainloop's `dot`. dK and dV `[bk, ...]`
-    and the hooks' sums."""
+    `pulled(index, hooks, pieces)`; each product issued through the mainloop's `dot`; its tiles at most `most`
+    (`algebra.tiles_walked`). dK and dV `[bk, ...]` and the hooks' sums."""
     forms = derived_backward(grad_scale, "rows", hooked, dropped, how, accurate, anchored=True,
                              normalized_values=v_tile.dtype == jnp.bfloat16)
 
@@ -188,6 +191,6 @@ def dkv_sums(formed: Callable, k_tile: jax.Array, v_tile: jax.Array, lo, hi, pul
         return sums, pulled(index, held, gradient.pulled(cotangents, slopes, seen, score_kinds)[1])
 
     shapes = {name: (value.shape, value.dtype) for name, value in tiles_of(lo)[0].items()}
-    sums, hooks = jax.lax.fori_loop(lo, hi, step, (forms.init(shapes), hooks))
+    sums, hooks = algebra.tiles_walked(lo, hi, step, (forms.init(shapes), hooks), most)
     dk, dv = forms.finish(sums, shapes=shapes)[1:3]
     return dk, dv, hooks
