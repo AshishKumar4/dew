@@ -900,6 +900,23 @@ class Declared(NamedTuple):
         library, name = _records.strings(entry, f"model_index {component}")
         return cls(library, name)
 
+    @classmethod
+    def read(cls, index: Mapping[str, JSON], component: str, config: Mapping[str, JSON]) -> Declared:
+        """`component` as the pipeline's `index` declares it, or, where the index omits it (Dew reads a
+        pipeline's denoiser, autoencoder and text encoders by their files, `pipeline_assembly`), as its own
+        `config` was written: Diffusers' configs state their class (`_class_name`), transformers' their
+        type (`model_type`); its class is then none the index names, so no Flax one."""
+        entry = index.get(component)
+        if entry is not None:
+            return cls.of(entry, component)
+        if "_class_name" in config:
+            return cls("diffusers", "")
+        if "model_type" in config:
+            return cls("transformers", "")
+        raise ValueError(f"the pipeline's {component} is declared neither by its model_index.json nor by "
+                         "its own config (a Diffusers class or a transformers type), so no library names its "
+                         "files")
+
     @property
     def stem(self) -> str:
         """The stem its weight files are named by, as its library writes them: Diffusers'
@@ -982,7 +999,7 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
         carried = LazyTensors({name: specifications[original] for name, original in names.items()},
                               lambda name, names=names: source.retained_tensors[names[name]])
         tensors = layout_tensors(layouts.get(component, {}), values, retained=carried)
-        declared = Declared.of(index[component], component)
+        declared = Declared.read(index, component, component_configs.get(component, {}))
         save_sharded(tensors, destination / component, max_shard_size, stem=declared.stem)
         if declared.name.startswith("Flax"):
             # Diffusers' Flax classes read one whole msgpack, so it is built whole.
