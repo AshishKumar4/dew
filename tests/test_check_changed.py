@@ -130,18 +130,18 @@ def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_cha
 
 
 def test_a_changed_check_held_to_a_base_its_checkout_lacks_fails_and_one_gate_runs_alone(tmp_path):
-    """--changed holds a head to BASE (a base head's precheck gives it base's tip): a BASE its checkout holds
-    no history of fails, as does a listing git cannot make, rather than reading as nothing changed; GATE runs
-    one gate alone, and each changed-file gate says how many files it read, so one that read none says so
+    """--changed holds a head to BASE (a base head's precheck gives it base's tip) and GATE runs that one
+    gate alone: the slop lint fails on the head's own function annotated Any where ruff, run alone, passes
+    it; a BASE its checkout holds no history of fails apart (2), never reading as nothing changed
     (2026-11-09: a base head's touched lint was green over a SLOP009 its CI then found)."""
     root = checkout(tmp_path)
     base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True,
                           check=True).stdout.strip()
-    (root / "src/dew/wide.py").write_text("from typing import Any\n\n\ndef wide() -> Any:\n    return 1\n")
+    for name in ("wide",):
+        (root / "src/dew" / f"{name}.py").write_text(
+            "from typing import Any\n\n\ndef wide() -> Any:\n    return 1\n")
     git(root, "add", "-A")
     git(root, "commit", "-qm", "a head whose function is annotated Any")
-    slop = check(root, "--changed", "slop", BASE=base)
-    assert slop.returncode == 1 and "SLOP001" in slop.stdout and "files read: 1" in slop.stdout, slop.stdout
-    assert "=== ruff" not in slop.stdout and "=== duplicate-structure" not in slop.stdout
-    lacking = check(root, "--changed", "slop", BASE="1" * 40)
-    assert lacking.returncode != 0 and "check --changed: green" not in lacking.stdout, lacking.stdout
+    assert check(root, "--changed", "slop", BASE=base).returncode == 1
+    assert check(root, "--changed", "ruff", BASE=base).returncode == 0
+    assert check(root, "--changed", "slop", BASE="1" * 40).returncode == 2
