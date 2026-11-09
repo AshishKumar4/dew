@@ -1035,6 +1035,36 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
         assert op.registers(ba, derived) <= op.register_budget(derived)
 
 
+@pytest.mark.parametrize(("target", "width", "hooks"), [
+    ("sm90", 64, ("softcap",)), ("sm90", 128, ("softcap",)), ("sm90", 128, ("alibi",)), ("sm100", 128, ()),
+    ("sm100", 64, ("softcap",)), ("sm80", 128, ("softcap",)), ("sm120", 128, ())])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+def test_a_scaled_forward_derives_wherever_its_common_one_does(target, width, hooks, dtype):
+    """A rare call's scaled op (`MosaicForward.scaled`) derives its own config, legal on the target, for
+    every call whose common op derives one: its small weights' parts and their products priced in its
+    register model (an H100's fp32 call under a softcap and a B200's fp32 call at width 128 derived none,
+    their scaled walk's terms priced beside tiles they are not live with) and narrower blocks of its value
+    columns where a family stages them swizzled (`_column_blocks_of`), so no call leaves the mainloop."""
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    score_mod, kinds, draw = score_hooks(hooks, queries, queries, width, rows=1, heads=4)
+    params, initial = draw(0)
+    hooked = template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
+    arrays = [jnp.zeros((1, queries, heads, width), dtype) for heads in (4, 2, 2)]
+    with generation.assumed(target):
+        op, args = attention_mosaic._forward_call(*arrays, spans, hooked, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        scaled = dataclasses.replace(op, scaled=True)
+        devices = generation.gpu_target()
+        for kept in (template.Kept.NONE, template.Kept.SPLIT):
+            if op.derived(op.bind(*args, residuals=kept, interpret=False), devices) is None:
+                continue
+            ba = scaled.bind(*args, residuals=kept, interpret=False)
+            config = scaled.derived(ba, devices)
+            assert config is not None
+            assert scaled.legal(ba, config, devices)
+
+
 @pytest.mark.parametrize("named", [{"relaunch_k": 64}, {"relaunch_columns": 64}], ids=["key-tile", "columns"])
 def test_a_pinned_rewalk_runs_whichever_of_its_tiles_the_pin_names(named):
     """A pin naming any of its natural rewalk's tiles (its key tile, its value columns) runs that rewalk, the
