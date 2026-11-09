@@ -378,8 +378,11 @@ class GpuTarget:
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
     memory: int | None = None
-    """The named device's memory in bytes, its datasheet's, which a call's footprint is held to where the
-    device is assumed and absent (`device_memory`; an attached device states its allocator's own limit)."""
+    """The memory in bytes of the least of the parts the target covers (`dense_peaks`' parts, their
+    datasheets'), which a call's footprint is held to where the device is assumed and absent
+    (`device_memory`) and a build states none (`built_target`): a program compiled for an A100 may run on
+    one of 40 GB, so a plan for the 80 GB part's memory kept an attention whose peak only that part holds
+    and failed to load on the other. An attached device states its allocator's own limit."""
     l2_bytes: int | None = None
     """The L2 cache's bytes, which a launch whose operands are re-read across its programs (a split
     contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
@@ -573,7 +576,8 @@ TARGETS = {target.generation: target for target in (
     # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
-              memory_bandwidth=2039e9, memory=80 * 10 ** 9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # The A100 40 GB's, the least an A100 holds.
+              memory_bandwidth=2039e9, memory=40 * 10 ** 9, triton_gemm_fusions=False, step_seconds=5.96e-6,
               # The Ampere Tuning Guide's "Increased L2 Capacity": A100's 40 MB.
               l2_bytes=40 * 2 ** 20,
               # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
@@ -591,7 +595,8 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), multiprocessors=58,
-              clock_hz=2040e6, memory_bandwidth=300e9, memory=24 * 10 ** 9, triton_gemm_fusions=False),
+              # The RTX 4080's 16 GB, the least of the parts it covers (the L4's 24).
+              clock_hz=2040e6, memory_bandwidth=300e9, memory=16 * 10 ** 9, triton_gemm_fusions=False),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
@@ -730,17 +735,20 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     return GpuTarget(identifier, identifier)
 
 
-def built_target(generation: str, multiprocessors: int | None = None) -> GpuTarget:
+def built_target(generation: str, multiprocessors: int | None = None, memory: int | None = None) -> GpuTarget:
     """The GPU a program compiled ahead is built for: the CUDA `generation`'s target (`gpu_target`) with the
     `multiprocessors` its build states, where it states them (an H100 PCIe's 114 against the canonical H100's
-    132), else the generation's own. What a build's XLA target (`dew.training.ahead.target_config`), its
-    launches (`assumed`) and the target its loader holds it to (`dew.training.ahead.BuildTarget`) all read."""
+    132), else the generation's own, and the `memory` a device holds where it states it (an A100 of 40 GB's
+    bytes, a call's footprint held to them by `device_memory`), else the least of the target's parts
+    (`GpuTarget.memory`). What a build's XLA target (`dew.training.ahead.target_config`), its launches
+    (`assumed`) and the target its loader holds it to (`dew.training.ahead.BuildTarget`) all read."""
     target = gpu_target(generation)
-    if multiprocessors is None:
-        return target
-    if multiprocessors <= 0:
+    if multiprocessors is not None and multiprocessors <= 0:
         raise ValueError(f"a GPU states a positive count of multiprocessors, not {multiprocessors}")
-    return dataclasses.replace(target, multiprocessors=multiprocessors)
+    if memory is not None and memory <= 0:
+        raise ValueError(f"a GPU states a positive count of bytes, not {memory}")
+    return dataclasses.replace(target, multiprocessors=multiprocessors or target.multiprocessors,
+                               memory=memory or target.memory)
 
 
 def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:

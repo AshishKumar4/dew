@@ -1064,7 +1064,7 @@ def test_an_a100s_fp32_call_takes_xla_only_where_its_receipt_measured_and_its_sc
     """An A100's fp32 causal call, 128 wide over 8 key heads, whose declared cell names jax.nn's xla
     attention (`attention_kernels.DECLARED`, timed at 1 x 1024 tokens): the call its receipt measured takes
     xla; a longer one is a cell none declares (`FP32_MEASURED`), and one whose xla attention would not fit the
-    A100's 80 GB (512 rows of 64 heads, 412 GB of training scores by Dew's footprint model,
+    A100's 40 GB (512 rows of 64 heads, 412 GB of training scores by Dew's footprint model,
     `_dense_fits`) refuses it, each taking the template, whose temporaries grow with the tokens (row 5283)."""
     from dew.nn import attention_kernels
     from dew.nn.attention import attention_case
@@ -1082,7 +1082,7 @@ def test_an_a100s_fp32_call_takes_xla_only_where_its_receipt_measured_and_its_sc
 def test_an_a100s_dense_bias_trains_on_xla_only_where_its_scores_fit(rows, heads, ran):
     """An A100's bf16 call of 1024 tokens under a bias that varies by query, 128 wide over 8 key heads: it
     infers on the template and trains on jax.nn's xla attention ('inference') where that fits the A100's
-    80 GB; one of 512 rows of 64 heads, whose xla attention holds over a terabyte of fp32 scores a training
+    40 GB; one of 512 rows of 64 heads, whose xla attention holds over a terabyte of fp32 scores a training
     step, takes the template whole (`attention_kernels._FITS`, row 5283)."""
     from dew.nn import attention_kernels
     from dew.nn.attention import attention_case
