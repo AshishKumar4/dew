@@ -7,7 +7,7 @@ One plain fold-form step of a query row over key tile j (attention_algebra.py on
 confirmed by the attention lane, 11-06):
 
 1. the products `s = q kᵀ`, bf16 operands on the tensor cores in fp32 (the native-dot contract,
-   `recurrence_witness.dot`), a masked entry -inf;
+   `interval_certificates.dot`), a masked entry -inf;
 2. the maximum `m_j = max(m_{j-1}, max(s) f)`, f = fp32(scale log2(e)) the walk's units, rounded once;
 3. the factor `alpha = ex2(m_{j-1} - m_j)`, its subtraction fp32, zero from a first tile's -inf;
 4. the weights `p = ex2(s f - m_j)`, the multiply and the subtraction one FMA or two roundings;
@@ -18,7 +18,7 @@ confirmed by the attention lane, 11-06):
 7. the output `acc / l` (div.rn, or rcp.approx and a multiply: within two steps of the fp32 grid), cast to
    the output dtype, zero where `l` is.
 
-`ex2` lies within the lane's reach of its correctly rounded value (`recurrence_witness.exp2`), measured
+`ex2` lies within the lane's reach of its correctly rounded value (`interval_certificates.exp2`), measured
 over the step's own operands (`attention_lane`). Each state is held from the stored state before it, so no
 enclosure grows across the walk; a bias below one step's enclosure is not visible (design-20's stated limit).
 A query row's tiles past its last kept key are walked with nothing kept, which leaves its state bit for bit;
@@ -28,9 +28,9 @@ import functools
 
 import attention_oracle
 import numpy as np
+from interval_certificates import Iv, Lane, add, cast, dot, exp2, exp2_reach, fp32, hull, mul, point, within
 from native_certificates import PTX_EX2
 from op_certificates import BFLOAT16, FLOAT32, nearest, stepped
-from recurrence_witness import Iv, Lane, add, cast, dot, exp2, exp2_reach, fp32, hull, mul, point, within
 
 from dew.nn.kernels.templates import attention as template, attention_mosaic
 from dew.nn.kernels.templates.attention import LOG2E
