@@ -9,7 +9,7 @@ from arm_arithmetic import summed_as_run
 
 
 def test_shadow():
-    stored={};mode=['capture']
+    stored={};mode=['capture'];selection=['all']
     def transform(value,key):
         leaves,tree=jax.tree.flatten(value)
         found=[]
@@ -18,7 +18,7 @@ def test_shadow():
                 tag=key+':'+str(i)
                 if mode[0]=='capture':
                     jax.debug.callback(lambda a,t=tag:stored.__setitem__(t,np.asarray(a)),x)
-                elif tag in stored:
+                elif tag in stored and (selection[0]=='all' or tag==selection[0]):
                     x=x+jax.lax.stop_gradient(jnp.asarray(stored[tag],x.dtype)-x)
             found.append(x)
         return jax.tree.unflatten(tree,found)
@@ -51,4 +51,29 @@ def test_shadow():
     rows.sort(reverse=True)
     lines=['rounded boundaries %d'%count]
     for err,path,residual,predicted in rows[:6]:lines.append('%s original %.5g residual %.5g shadow-shift %.5g'%(path,err,residual,predicted))
+    controls=[
+        'language_model/layers_0/input_layernorm.seam:out:1',
+        'language_model/layers_0/self_attn/in_proj_qkv.__call__:out:0',
+        'language_model/layers_0/self_attn/norm.__call__:in:0',
+        'language_model/layers_0/self_attn.__call__:out:0',
+    ]
+    target=lambda g:np.asarray(g['language_model']['layers_0']['self_attn']['in_proj_qkv']['kernel'])
+    actual=target(g32)-target(g64);norm=np.linalg.norm(actual.ravel())
+    for key in controls:
+        assert key in stored,key
+        selection[0]=key
+        with jax.enable_x64(True):hybrid=jax.block_until_ready(run(jnp.float64,True))
+        delta=target(hybrid)-target(g64)
+        cosine=np.vdot(actual,delta)/max(norm*np.linalg.norm(delta.ravel()),1e-300)
+        lines.append('only %s reproduced %.5g residual %.5g cosine %.5g'%(key,np.linalg.norm(delta.ravel())/norm,np.linalg.norm((actual-delta).ravel())/norm,cosine))
+    import torch
+    torch.set_num_threads(1)
+    key='language_model/layers_0/self_attn/in_proj_qkv.__call__'
+    x=stored[key+':in:0'];out=stored[key+':out:0']
+    w=np.asarray(loaded.variables['params']['language_model']['layers_0']['self_attn']['in_proj_qkv']['kernel'])
+    truth=x.astype(np.float64)@w.astype(np.float64)
+    torch_out=np.stack([(torch.from_numpy(row.copy())@torch.from_numpy(w.copy())).numpy() for row in x])
+    for label,value in [('dew',out),('torch',torch_out)]:
+        error=value-truth
+        lines.append('qkv same-input %s rms %.6g target rms %.6g'%(label,np.sqrt(np.mean(error**2)),np.sqrt(np.mean(error[3,0]**2))))
     raise AssertionError('PROBE\n'+'\n'.join(lines))
