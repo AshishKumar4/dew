@@ -266,7 +266,8 @@ ACCURATE_SEEDS = 8
 """The accurate-policy site's declared check-1 seeds, sized by `seeds_for` paired on a GPU."""
 
 
-def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
+def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu(
+        fixture: str = "qwen3-tiny"):
     """A float32 decoder under a run's ACCURATE precision policy (`generation.run_precision`, ledger
     2500) multiplies every product that states no precision in IEEE float32, forward and backward: on a
     GPU its logits and its cross entropy's gradient of every parameter, one program computing both, are as
@@ -274,7 +275,8 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     there, as JAX documents) cleared first (row 5275: no GPU check held a whole model's gradients). The
     policy sets the products' precision; the decoder's float32 dtype keeps their operands float32. Each
     gradient is read in the release's layout (`WeightLayout.export`). Check 1 over drawn ids of the
-    fixture's shape."""
+    fixture's shape: Qwen3's and Llama's (`fixture`), whose gradients XLA's GEMM fusion miscompiled
+    (row 5275)."""
     import torch
     from interop_support import token_draw
     from transformers import AutoModelForCausalLM
@@ -283,7 +285,7 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     from dew.nn.precision import ACCURATE
     from tools.torch_precision import float64, float64_twin
 
-    directory = FIXTURES / "qwen3-tiny"
+    directory = FIXTURES / fixture
     ids = np.load(directory / "input_ids.npy")
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
     reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()

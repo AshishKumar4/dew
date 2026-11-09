@@ -50,9 +50,12 @@ def test_the_models_run_their_gpu_kernels(rng, without_deterministic_ops):
         Cell("a padded prefill is on par with the full pass",
              lambda: causal.a_padded_prefill_is_on_par_with_the_full_pass(
                  rng, without_deterministic_ops)),
-        Cell("a float32 decoder's logits and gradients under the accurate policy are as exact as "
-             "transformers",
-             decoders.a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu),
+        *(Cell(f"a float32 {fixture}'s logits and gradients under the accurate policy are as exact as "
+               "transformers",
+               functools.partial(
+                   decoders.a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu,
+                   fixture))
+          for fixture in ("qwen3-tiny", "llama-tiny")),
         Cell("ModernBERT's states in bf16 on its GPU kernels",
              lambda: modernbert.modernbert_states_in_bf16_on_the_gpu_kernels(without_deterministic_ops)),
         Cell("a packed window decides each row as the row alone: the joint arm",
