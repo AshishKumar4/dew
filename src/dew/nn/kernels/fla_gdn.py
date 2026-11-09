@@ -33,6 +33,7 @@ from dew.nn import derivatives
 from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
+    SPAN,
     Sequences,
     Tiles,
     _aligned,
@@ -306,10 +307,10 @@ def recompute_w_u(k, v, beta, a, g, *, g_lo, chunk: int = 64, spans: Sequences |
     return spanned(_RECOMPUTE_W_U, k, v, beta, a, g, g_lo, chunk=chunk, spans=spans, interpret=interpret)
 
 
-def _stored(ref, row, memory) -> None:
-    """A row's memory, its 64-key slices in order, into `ref`'s row `row` `[K, V]`."""
+def _stored(ref, index, memory) -> None:
+    """A memory, its 64-key slices in order, into `ref`'s `index`-th `[K, V]`."""
     for i, block in enumerate(memory):
-        ref[row, pl.ds(i * 64, 64), :] = block.astype(ref.dtype)
+        ref[index, pl.ds(i * 64, 64), :] = block.astype(ref.dtype)
 
 def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, gl_ref, h_ref, corrected_ref, ht_ref, *,
               chunk: int, aligned: bool, length: int, exact: bool, per_key: bool = False):
@@ -324,12 +325,12 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, gl_ref, h_ref, corre
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
-    start, count, base, entered, _, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
+    start, count, base, entered, _, memory, takes, gives = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
 
     @pl.when(count > 0)
     def _():
-        state = [jnp.where(first, h0_ref[row, pl.ds(i * 64, 64), :].astype(jnp.float32), 0.0)
+        state = [jnp.where(takes, h0_ref[memory, pl.ds(i * 64, 64), :].astype(jnp.float32), 0.0)
                  for i in range(slices)]
 
         def step(n, state):
@@ -367,7 +368,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, gl_ref, h_ref, corre
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
 
-        pl.when(last_in_row)(lambda: _stored(ht_ref, row, state))
+        pl.when(gives)(lambda: _stored(ht_ref, memory, state))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -393,15 +394,17 @@ class ChunkFwdH(_Launch):
             return sh % value_heads
 
         per_key = g.ndim == 4
-        rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
+        # The call's memories: a row's each, or each of its documents' (`Sequences`).
+        memories = h0.shape[0]
+        rows = pl.BlockSpec((memories, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
-        held = slots(spans, batch, length, chunk)
+        held = slots(spans, batch, length, chunk, memories)
         h, corrected, final = launches.pallas_call(
             functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, 5), lambda i_v, sh: (sh // value_heads, 0)),
+            in_specs=[pl.BlockSpec((None, SPAN), lambda i_v, sh: (sh // value_heads, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0)),
                       pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
@@ -411,7 +414,7 @@ class ChunkFwdH(_Launch):
                        rows],
             out_shape=[jax.ShapeDtypeStruct((held, value_heads, width, columns), k.dtype),
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), u.dtype),
-                       jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)],
+                       jax.ShapeDtypeStruct((memories, value_heads, width, columns), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_fwd_h",
         )(spans.spans, *_flat(k, u, w, g), h0, *_flat(g_lo))
@@ -449,13 +452,13 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, g
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
-    start, count, base, _, left, row, first, last_in_row = _span(span_ref, length, chunk, aligned)
+    start, count, base, _, left, memory, takes, gives = _span(span_ref, length, chunk, aligned)
     slices = k_ref.shape[-1] // 64
     chunks = -(-count // chunk)
 
     @pl.when(count > 0)
     def _():
-        grad = [jnp.where(last_in_row, dht_ref[row, pl.ds(i * 64, 64), :].astype(jnp.float32), 0.0)
+        grad = [jnp.where(gives, dht_ref[memory, pl.ds(i * 64, 64), :].astype(jnp.float32), 0.0)
                 for i in range(slices)]
 
         def step(r, grad):
@@ -516,7 +519,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, g
 
         grad = jax.lax.fori_loop(0, chunks, step, grad)
 
-        pl.when(first)(lambda: _stored(dh0_ref, row, grad))
+        pl.when(takes)(lambda: _stored(dh0_ref, memory, grad))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -551,14 +554,16 @@ class ChunkBwdDhu(_Launch):
         bv, warps, stages = config.bv, config.warps, config.stages
         spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
             q, do, chunk_spans, sequence_spans, chunk)
-        held = slots(spans, batch, length, chunk)
+        # The call's memories: a row's each, or each of its documents' (`Sequences`).
+        memories = dht.shape[0]
+        held = slots(spans, batch, length, chunk, memories)
 
         def head(i_v, sh):
             return sh % value_heads
 
         keys = pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0))
         values = pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v))
-        rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
+        rows = pl.BlockSpec((memories, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
         per_key = g.ndim == 4
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
@@ -567,14 +572,14 @@ class ChunkBwdDhu(_Launch):
                               exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, 5), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
+            in_specs=[pl.BlockSpec((None, SPAN), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
                       gated, rows, values, values, gated],
             out_specs=[pl.BlockSpec((held, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v)),
                        rows,
                        values],
             out_shape=[jax.ShapeDtypeStruct((held, value_heads, width, columns), q.dtype),
-                       jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32),
+                       jax.ShapeDtypeStruct((memories, value_heads, width, columns), jnp.float32),
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), dv.dtype)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_bwd_dhu",
@@ -1140,8 +1145,12 @@ def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chun
     cumulated in base 2 within each chunk (`recurrence.cumulated`, compensated: its `(hi, lo)` halves,
     separated into the prefix's whole part and fraction, `algebra.separated`, whose differences every
     decay takes exactly), named 'delta_decay' for a block's remat policy, then the port's `cumulated`
-    forward on it (this module's `cumulated_fwd`, or `fla_kda`'s)."""
-    spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
+    forward on it (this module's `cumulated_fwd`, or `fla_kda`'s). Where `h0` holds more memories than
+    the rows, each of a row's documents takes and gives back its own (`Sequences`, `cu_seqlens` a row's
+    documents' each)."""
+    rows = q.shape[0]
+    documents = None if h0.shape[0] == rows else h0.shape[0] // rows
+    spans = sequences(rows, q.shape[1], cu_seqlens, chunk=chunk, documents=documents)
     g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans, compensated=True,
                                              interpret=interpret),
                         'delta_decay')

@@ -86,6 +86,7 @@ from dew.batch import prefix_sum, valid_order
 from dew.newton_schulz import orthogonalized_leaf
 from dew.nn import linear
 from dew.nn.dense import Dense
+from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
@@ -527,7 +528,7 @@ class InContextMemory(LinearProducts):
             out, state = recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(
                 steps.query, steps.key, value, log_decay=log_decay, beta=beta, state=held,
                 starts=begins & ~continued), max_segments=max_segments)
-        share = _within(log_decay, begins)
+        share = within_documents(log_decay, begins)
         if kept is not None:
             share = share + jnp.where(continued[..., None], kept[:, None], 0.0)
         wide = at_least_fp32(self.dtype)
@@ -571,7 +572,7 @@ class InContextMemory(LinearProducts):
         less the share of W_0's, and a row with no real token keeps its own."""
         real = steps.real
         begins, continued = _documents(steps)
-        share = (_within(jnp.where(real[..., None], log_kept, 0.0), begins)
+        share = (within_documents(jnp.where(real[..., None], log_kept, 0.0), begins)
                  + jnp.where(continued[..., None], kept[:, None], 0.0))
         rows = tuple(_weights_from(head.initial, held[:, index], jnp.exp(kept[:, index]), real)
                      for index, head in enumerate(heads))
@@ -859,16 +860,6 @@ def _rows(initial: dict, real: jax.Array) -> dict:
     """A head's W_0 for every row `[B, ...]`, placed as the rows of `real` `[B, S]` are."""
     return jax.tree.map(lambda leaf: rows_like(jnp.broadcast_to(leaf, (real.shape[0], *leaf.shape)), real),
                         initial)
-
-
-def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
-    """Each token's sum of `values` `[B, S, ...]` over its document up to it, `begins` `[B, S]` marking
-    each document's first token: a sum that restarts at each, scanned as one associative scan."""
-    def combined(first: tuple, second: tuple) -> tuple:
-        (opened, summed), (opens, adds) = first, second
-        return opened | opens, jnp.where(_lead(opens, adds), adds, summed + adds)
-
-    return jax.lax.associative_scan(combined, (begins, values), axis=1)[1]
 
 
 def _at(keys: dict[tuple, jax.Array] | None, head: int, axis: int) -> dict[tuple, jax.Array] | None:

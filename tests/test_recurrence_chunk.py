@@ -26,6 +26,7 @@ from reference_error import (
 
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.templates import bundles
 from dew.nn.precision import l2norm
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
@@ -82,12 +83,20 @@ def formed(forms: str, fn):
 
 
 
-ROUTES = (None, 'sm80') if jax.default_backend() != 'gpu' else (None,)
-"""The routes an interpreted check runs (`on_route`), each a GPU's own bundle at its own facts: the
-interpreter's (`generation.interpreted_target`, wgmma's at the widest tiles that hold) and an A100's
-(mma.sync's at its derived tiles), whose arithmetic the interpreter runs as the A100 does (launch by launch
-to 1e-4, M-JS-29d): wgmma's alone interpreted, an A100's wrong Kimi delta attention gradients went unseen off
-a GPU (row 5194). On a GPU, the device's own alone."""
+ISSUING = tuple(next(name for name in generation.TARGETS
+                    if (found := generation.architecture(name)) and found.issuers[:1] == (issuer,))
+                for issuer in bundles.COMPOSITIONS if issuer != 'tpu')
+"""A GPU generation leading each issuer the bundle registry composes (`bundles.COMPOSITIONS`): tcgen05's,
+wgmma's and mma.sync's (sm100, sm90, sm80)."""
+
+ROUTES = ((None, *(name for name in ISSUING if name != generation.INTERPRETED_GENERATION))
+          if jax.default_backend() != 'gpu' else (None,))
+"""The routes an interpreted check runs (`on_route`), each a GPU's own bundle at its own facts, one an
+issuer of the registry (`ISSUING`): the interpreter's (`generation.interpreted_target`, wgmma's at the
+widest tiles that hold) and every other's, an A100's mma.sync at its derived tiles, whose arithmetic the
+interpreter runs as the A100 does (launch by launch to 1e-4, M-JS-29d), and a B200's tcgen05: wgmma's
+alone interpreted, an A100's wrong Kimi delta attention gradients went unseen off a GPU (row 5194). On a
+GPU, the device's own alone."""
 
 
 def on_route(route: str | None):
@@ -288,7 +297,7 @@ def entered_draw(hooks, seed: int):
 
 
 
-def _documents(operands):
+def entering_documents(operands):
     """`operands` with `draw`'s packed documents, each entering its `ENTERED` slot."""
     starts = jnp.zeros(operands.value.shape[:2], bool)
     for row, begins in enumerate(DOCUMENTS):
@@ -317,18 +326,14 @@ def document_by_document(hooks, operands):
     return jnp.stack(outs), jnp.stack(finals)
 
 
-@pytest.mark.check1_shards(seeds=80, per_task=16)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
-def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
-    """80 draws, 16 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
-    inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b), and 40 took up to 115 s.
-    Packed documents each entering a memory of its own (`Chunk.entered`, a request's shared prefix's
-    final memory for each of its questions): the portable math's output, each document's final memory and
-    every operand's gradient, the slots' memories' included (a slot entered twice summing both documents'),
-    against each document a sequence of its own from its slot's memory, the recurrence a token at a time
-    from float64."""
+def assert_entering_on_par(kernel: str, hooks) -> None:
+    """Packed documents each entering a memory of its own (`Chunk.entered`, a request's shared prefix's final
+    memory for each of its questions) on `kernel`: its output, each document's final memory and every
+    operand's gradient, the slots' memories' included (a slot entered twice summing both documents'),
+    against each document a sequence of its own from its slot's memory, the recurrence a token at a time from
+    float64 (check 1)."""
     def ours(operands):
-        out, final = chunk_on('xla', hooks, _documents(operands), chunk_size=CHUNK)
+        out, final = chunk_on(kernel, hooks, entering_documents(operands), chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
     def theirs(operands):
@@ -337,7 +342,26 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
 
     assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)),
                     functools.partial(entered_draw, hooks),
-                    f'{hooks} documents entering their own memories', seeds=80)
+                    f'{kernel} {hooks} documents entering their own memories', seeds=80)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=16)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
+def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
+    """80 draws, 16 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
+    inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b), and 40 took up to 115 s.
+    The portable math's on the packed rows, each document laid from a chunk's edge and its memory taken up
+    there (`xla_mainloop`'s `_Aligned`, `_walk`; `assert_entering_on_par`)."""
+    assert_entering_on_par('xla', hooks)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=8)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], FORMED[0]], ids=str)
+def test_the_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
+    """80 draws, 8 a task: one map task of both kernels' 16 draws held 11.5 GiB (jsf-r08own1). The port's,
+    the packed rows each document's sequence from its own memory (row 5288), over the delta rule's forms it
+    takes (`assert_entering_on_par`)."""
+    assert_entering_on_par('fla', hooks)
 
 
 def edge_draw(hooks, seed: int):
