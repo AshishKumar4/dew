@@ -209,6 +209,28 @@ def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_resumed_run_trains_in_the_groups_it_names_refused_a_changed_partition(tmp_path):
+    """A run resumed naming its groups trains in its own: a group's rate it changes is the rate it resumes
+    at, not its record's; groups whose names or patterns differ from its record's, which partition the
+    optimizer state it resumes, are refused (the train review of row 5246: a resume kept the record's 30x
+    and reported nothing)."""
+    from run_kinds import trained
+
+    run = dataclasses.replace(context_run(tmp_path), validation=None)
+    claiming = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, BASE)))
+    trained(claiming, tmp_path, "named", trainer=SAVING)
+    slower = dataclasses.replace(FRESH, learning_rate_multiplier=MULTIPLIER / 4)
+    resumed, _ = trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(
+        slower, BASE))), tmp_path, "named", trainer={**SAVING, "steps": 2})
+    assert int(resumed.step) == 2
+    assert groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER / 4
+    renamed = ParamGroup("rest", ("*",), spared=True)
+    with pytest.raises(ValueError):
+        trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, renamed))),
+                tmp_path, "named", trainer={**SAVING, "steps": 3})
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_run_naming_groups_none_of_them_fresh_steps_its_fresh_modules_at_the_fresh_rate(tmp_path):
     """A run that names its groups but none that claims the modules it draws fresh, as a decision context
     arm did with a base group of every parameter, steps its cross-attention block and its head at the

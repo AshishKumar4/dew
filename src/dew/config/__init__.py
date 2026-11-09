@@ -283,6 +283,12 @@ def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
     return from_record(tuple[ParamGroup, ...], groups)
 
 
+def partitioned(groups: Sequence[ParamGroup]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """What of `groups` partitions a run's parameters, and so its optimizer state: each group's name and
+    patterns, in order (a parameter belongs to the first group it matches)."""
+    return tuple((group.name, group.patterns) for group in groups)
+
+
 def trained_modules(objective: Objective[Loss, Effects],
                     modules: Sequence[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree is
@@ -2131,24 +2137,31 @@ class RunConfig:
         return self.prepare().inspected(trainer.name or "inspected")
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
-        """The run's optimizer as it trains under `name`: a resumed run trains in the groups its record
-        names, as its optimizer state holds them (its own for a record written before runs took them); a
-        new run that draws modules fresh beside a loaded base in the groups that claim them, each matching
-        those that hold a parameter (`ParamGroup.fresh`, `trained_modules`): its own, or its named ones
-        with the fresh group beside them, or none named, the default groups (`OptimConfig.fresh_groups`).
-        Every process agrees on the groups before any records them."""
+        """The run's optimizer as it trains under `name`: the groups that claim what it draws fresh beside a
+        loaded base, each matching those that hold a parameter (`ParamGroup.fresh`, `trained_modules`): its
+        own, or its named ones with the fresh group beside them, or none named, the default groups
+        (`OptimConfig.fresh_groups`). A resumed run that names no groups trains in those its record names,
+        as its optimizer state holds them (none for a record written before runs took them); one that
+        names some trains in its own, their rates and bounds as it states them, refused where their names
+        or patterns are not the record's, which partition the optimizer state it resumes. Every process
+        agrees on the groups before any records them."""
         def resolved() -> JSON:
             named = self.optim.param_groups
             checkpoints = self.trainer.checkpoints(name)
             saved = epath.Path(checkpoints.directory) / RUN_FILE
             recorded = recorded_param_groups(saved) if checkpoints.resumed(
                 self.trainer.resume) is not None and saved.exists() else None
-            if recorded is not None:
+            if recorded is not None and not named:
                 return to_record(recorded, tuple[ParamGroup, ...])
             modules, leaves = trained_modules(objective, objective.fresh_modules())
             # A group named fresh claims what the run draws, or is refused where it draws none (`with_fresh`).
             groups = self.optim.fresh_groups() if modules or leaves else named
             claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
+            if recorded is not None and partitioned(claimed.param_groups) != partitioned(recorded):
+                raise ValueError(f"run {name!r} resumes an optimizer state partitioned by the groups "
+                                 f"{partitioned(recorded)} (names and patterns), and names "
+                                 f"{partitioned(claimed.param_groups)}: change only a group's rate, decay, "
+                                 "schedule or bounds on a resume, or start a new run")
             return to_record(claimed.param_groups, tuple[ParamGroup, ...])
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
         return self.optim if groups == self.optim.param_groups else dataclasses.replace(
