@@ -18,6 +18,7 @@ from jax.core import Tracer
 from dew._coordination import agreed
 from dew.batch import (
     COORDINATES_FIELD,
+    LAID_FIELDS,
     POSITIONS_FIELD,
     SEGMENTS_FIELD,
     TOKEN_LAYOUT_FIELDS,
@@ -861,10 +862,6 @@ def _response_document(value: jax.Array, valid: jax.Array, width: int) -> jax.Ar
 def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
     """Text: no media feature, no image or block group (-1)."""
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
-
-
-LAID_FIELDS = {"valid": VALIDITY_FIELD, "positions": POSITIONS_FIELD, "segments": SEGMENTS_FIELD}
-"""Each `Coordinates` field a request's flat layout gives, by the flat field that gives it."""
 
 
 def _continued_layout(value: Coordinates, valid: jax.Array, width: int,
