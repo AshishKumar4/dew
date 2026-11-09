@@ -239,9 +239,9 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
 def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
     """On this GPU the template's grouped product of bfloat16 rows and matrices into an fp32 output (its
     route named, `mosaic_gpu`), forward and both gradients, is as exact as XLA's ragged dot from float64 at a
-    `depth`-deep contraction: at the default precision its sums the tensor cores' own, as XLA's (cuBLAS's) are,
-    which held a dense kernel gradient within 0.98-1.00 of cuBLAS's error from float64 on an A100 and an H100
-    at depths of 128 to 2048 (M-EM-3; row 4331's 1.661x at depth 128 did not reproduce)."""
+    `depth`-deep contraction: at the default precision its sums the tensor cores' own, as XLA's (cuBLAS's)
+    are, which held a dense kernel gradient within 0.98-1.00 of cuBLAS's error from float64 on an A100 and an
+    H100 at depths of 128 to 2048 (M-EM-3; row 4331's 1.661x at depth 128 did not reproduce)."""
     group_sizes = jnp.asarray([70, 66], jnp.int32)
 
     def draw(seed):
