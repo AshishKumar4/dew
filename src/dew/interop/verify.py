@@ -52,7 +52,15 @@ from flax import traverse_util as flax_traverse
 
 from dew import _records
 from dew._cache import package_digest
-from dew.interop import decoder_config, decoder_parts, hf_decoders as decoders, isolated, parts, sources
+from dew.interop import (
+    codecs,
+    decoder_config,
+    decoder_parts,
+    hf_decoders as decoders,
+    isolated,
+    parts,
+    sources,
+)
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.isolated import Isolated
 from dew.nn.blocks import padded_row
@@ -118,7 +126,7 @@ _FREQUENCY_FACTORS = frozenset({'long_factor', 'short_factor'})
 # checkpoint's own code, and the probe runs in fp32 whatever the checkpoint
 # stores. The quantization record is the codec's, and the probe's weights are
 # plain floats.
-_PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoder_parts.CODEC_FIELDS
+_PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | codecs.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # Tier 2 verifies a mapping, that Dew's decoder computes the source's function (docs/design/testing.md,

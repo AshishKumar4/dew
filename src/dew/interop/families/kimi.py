@@ -62,11 +62,11 @@ from types import MappingProxyType
 import numpy as np
 
 from dew import _records
+from dew.interop.codecs import CODEC_FIELDS
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
-    CODEC_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
     IGNORED_FIELDS,
     KDA_LEAVES,

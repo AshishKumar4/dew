@@ -1843,14 +1843,24 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
                 "safetensors repo it was converted from (the model card's base_model)")
 
 
+QUANTIZATION_CONFIG = "quantization_config"
+"""The config field a source's quantization is declared in (`quantization_record`)."""
+EXPERT_DTYPE = "expert_dtype"
+"""The config field DeepSeek-V4 names its routed experts' storage in, in its quantization_config or beside
+it (`source_quantization`)."""
+CODEC_FIELDS = frozenset({QUANTIZATION_CONFIG, EXPERT_DTYPE})
+"""The root config fields this codec reads (`source_quantization`), rather than any family: it decodes the
+weights they name and refuses a format it cannot, before a family translator sees the config."""
+
+
 def quantization_record(config: Mapping[str, object]) -> Mapping[str, object] | None:
     """A config's `quantization_config`, or its text_config's where it declares it there alone (KimiK3Config
     lifts `text_config.quantization_config` onto itself, configuration_kimi_k3.py:282-283); None for
     neither, and ValueError for one that is no object."""
-    quantization = config.get("quantization_config")
+    quantization = config.get(QUANTIZATION_CONFIG)
     text = config.get("text_config")
     if quantization is None and isinstance(text, Mapping):
-        quantization = text.get("quantization_config")
+        quantization = text.get(QUANTIZATION_CONFIG)
     if quantization is not None and not isinstance(quantization, Mapping):
         raise ValueError(f"quantization_config must be an object, got {quantization!r}")
     return quantization
@@ -1872,14 +1882,14 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     if quantization is None:
         return None
     method = quantization.get("quant_method")
-    if method == "fp8" and ("expert_dtype" in quantization or "expert_dtype" in config):
+    if method == "fp8" and (EXPERT_DTYPE in quantization or EXPERT_DTYPE in config):
         # `fp8_format`'s blocks under ue8m0 scales, the only kind an E8M0
         # `.scale` holds. expert_dtype 'fp4' ships routed experts as E2M1
         # pairs (inference/model.py `Linear` under float4_e2m1fn_x2), 'fp8' or
         # null as FP8 blocks like every other Linear (the Base releases).
         block, ue8m0 = fp8_format(quantization)
         side = _square(block, "DeepSeek-V4's")
-        experts = quantization.get("expert_dtype", config.get("expert_dtype"))
+        experts = quantization.get(EXPERT_DTYPE, config.get(EXPERT_DTYPE))
         if not ue8m0:
             raise ValueError(
                 f"quantization_config declares expert_dtype, DeepSeek-V4's `.scale` storage, with scale_fmt "

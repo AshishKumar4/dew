@@ -15,7 +15,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict, get_type_hints
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +25,7 @@ from flax.traverse_util import flatten_dict
 from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import unboxed
+from dew.interop.codecs import CODEC_FIELDS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.layouts import (
     Condition,
@@ -52,6 +53,7 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.sharding import drawn_axes
 from dew.registry import from_record, to_record
@@ -132,10 +134,10 @@ def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new')
 GEMMA3_MODEL_TYPE = 'gemma3_text'
 QWEN35 = 'qwen3_5_text'
 
-# The gated delta net's own geometry, the config's names and the mixer kind's.
-LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
-                  'linear_key_head_dim', 'linear_value_head_dim',
-                  'linear_conv_kernel_dim')
+LINEAR_FIELDS = tuple(field.name for field in dataclasses.fields(GatedDeltaNetMixer)
+                      if get_type_hints(GatedDeltaNetMixer)[field.name] is int)
+"""The gated delta net's own geometry, the config's names and the mixer kind's: the mixer's integer
+fields, in its order."""
 
 # These fields have no effect on an eval-time forward pass: metadata, token
 # ids, or runtime knobs of the reference implementation (Gemma 3 ships
@@ -146,11 +148,6 @@ IGNORED_FIELDS = set(_records.HF_METADATA) | {
     'use_cache', 'use_sliding_window', 'unk_token_id',
 }
 
-# Read by the codec rather than by any family: `codecs.source_quantization`
-# decodes the weights these name and refuses a format it cannot, before a
-# family translator sees the config. DeepSeek-V4 names its routed experts'
-# storage as `expert_dtype` beside its quantization_config.
-CODEC_FIELDS = frozenset({'quantization_config', 'expert_dtype'})
 
 # A wrapper's text_config serialized by transformers 4.56.2 carries every
 # PreTrainedConfig attribute (moonshotai/Kimi-K2.5 and moonshotai/Kimi-K3).
