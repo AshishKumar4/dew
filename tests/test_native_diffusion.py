@@ -123,9 +123,9 @@ def test_multilevel_unet_geometry_and_input_gradient(tmp_path, case):
 
 
 def test_an_autoencoder_the_pipeline_index_omits_exports_by_diffusers_names(saved_pipelines, tmp_path):
-    """A pipeline whose model_index.json declares no vae still loads its `vae/` (Dew reads its denoiser and
-    autoencoder by their files), and exports it under Diffusers' file names, as its own config states it
-    (`_class_name`)."""
+    """A pipeline whose model_index.json declares no vae, its vae's config naming no class (an older
+    AutoencoderKL's), still loads its `vae/` (Dew reads its denoiser and autoencoder by their files), and
+    exports it under Diffusers' file names: its config is no transformers one (none states a `model_type`)."""
     import json
     import shutil
 
@@ -136,6 +136,9 @@ def test_an_autoencoder_the_pipeline_index_omits_exports_by_diffusers_names(save
     index = json.loads((source / "model_index.json").read_text())
     del index["vae"]
     (source / "model_index.json").write_text(json.dumps(index))
+    vae = json.loads((source / "vae" / "config.json").read_text())
+    del vae["_class_name"]
+    (source / "vae" / "config.json").write_text(json.dumps(vae))
     loaded = Pretrained.load(source, dtype="float32", attention_impl="xla")
     destination = tmp_path / "export"
     loaded.save(destination)

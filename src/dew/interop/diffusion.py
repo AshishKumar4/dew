@@ -904,18 +904,13 @@ class Declared(NamedTuple):
     def read(cls, index: Mapping[str, JSON], component: str, config: Mapping[str, JSON]) -> Declared:
         """`component` as the pipeline's `index` declares it, or, where the index omits it (Dew reads a
         pipeline's denoiser, autoencoder and text encoders by their files, `pipeline_assembly`), as its own
-        `config` was written: Diffusers' configs state their class (`_class_name`), transformers' their
-        type (`model_type`); its class is then none the index names, so no Flax one."""
+        `config` was written: transformers' configs always state their type (`model_type`, which
+        `PretrainedConfig.to_dict` writes), Diffusers' none (an older AutoencoderKL's or UNet's not even its
+        class); its class is then none the index names, so no Flax one."""
         entry = index.get(component)
         if entry is not None:
             return cls.of(entry, component)
-        if "_class_name" in config:
-            return cls("diffusers", "")
-        if "model_type" in config:
-            return cls("transformers", "")
-        raise ValueError(f"the pipeline's {component} is declared neither by its model_index.json nor by "
-                         "its own config (a Diffusers class or a transformers type), so no library names its "
-                         "files")
+        return cls("transformers" if "model_type" in config else "diffusers", "")
 
     @property
     def stem(self) -> str:
