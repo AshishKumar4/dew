@@ -850,7 +850,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            **_prefetched(tiles, grid, k // block_k, transpose_rhs, interpret,
                                          dense=dense, parts=(tail, scales, mx_scales, gather)))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
-                  *_workspace(tail, (multiprocessors, 2, consumers, *part)))
+                  *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
 
 
 def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, interpret, *, dense: bool,
@@ -1070,14 +1070,13 @@ def _outputs(o_gmems: tuple, scatter_gmem, interpret: bool) -> tuple:
     return o_gmems
 
 
-def _workspace(tail, shape: tuple) -> tuple:
+def _workspace(tail, shape: tuple, interpret) -> tuple:
     """Dew: a balanced tail's partials (`tail.Tail`): each program's, a consumer's share of a tile each, of
     the tile its range starts inside and of the one it walks the first step of (`Family.fixed_up`'s
     `firsts`), a ref the kernel writes in place, the last of its operands; none without a tail. Its slots
     are written only where programs share a tile, so it is no declared output, which would leave the rest
-    unwritten (NSNAN-2), and it starts uninitialized (`lax.empty`: XLA's AllocateBuffer on a GPU, no
-    memset), as no slot is read before its program writes it."""
-    return () if tail is None else (jax.new_ref(lax.empty(shape, jnp.float32)),)
+    unwritten (NSNAN-2), and it starts uninitialized (`mosaic.workspace`)."""
+    return () if tail is None else (mosaic.workspace(shape, jnp.float32, interpret=interpret),)
 
 
 def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
@@ -1855,7 +1854,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *(table for table in tables if table is not None), *(step_scales or ()),
                   *prologue_operands,
-                  *_workspace(tail, (multiprocessors, 2, consumers, *part)))
+                  *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
 
 
 def ragged_rows(m: int, *, prologue, k_major: bool) -> bool:
