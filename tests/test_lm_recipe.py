@@ -874,7 +874,9 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
     labels = param_labels(groups)(objective.held_variables()["params"])
     fresh = {parameter_name(path) for path, label in jax.tree_util.tree_leaves_with_path(labels)
              if label == groups[0].name}
-    assert groups[0].learning_rate_multiplier > 1 and fresh == set(gate)
+    # The fresh group at the fresh rate on the run's schedule (`fresh_groups`), the gate alone in it.
+    assert groups[0].learning_rate_multiplier == config.optim.fresh_groups()[0].learning_rate_multiplier
+    assert fresh == set(gate) and len(groups) == 2
 
 
 def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):
