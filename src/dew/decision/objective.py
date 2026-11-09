@@ -42,6 +42,7 @@ from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
 from dew.nn import categorical
+from dew.nn.backbones.looping import exit_objective
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
@@ -53,6 +54,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CrossAttending,
     Lacks,
+    Looped,
     ProjectionGroup,
     TokenModel,
 )
@@ -161,6 +163,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     in context) is refused under it: each pass would read the last pass's
     context, which no `with_passes(k)` model reads.
 
+    `exit_entropy` β trains a looped backbone's exit gate as Ouro does (arXiv 2510.25741,
+    `dew.nn.backbones.looping.exit_objective`), as `LMObjective`'s does: each question's label loss at
+    each pass, its option logits read off that pass's states by the same head, weighted by the
+    probability the question exits there, less β times that distribution's entropy. A question exits
+    where the token its head reads its answer from does (`Head.answered`: its answer cue, or its row's
+    last token for a head that reads the whole row); its hazards are the gate's there. The expectation
+    and the entropy are reported as `exit_ce` and `exit_entropy`, the consistency term is the last
+    pass's. It and `pass_weights` each weigh the passes, so a run states one. None, for a backbone
+    without a gate, scores the last pass alone.
+
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
     divided by `temperatures` (none by default: a `Decide`'s calibration fits
@@ -206,8 +218,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def _exits(self, model: DecisionModel) -> DecisionModel:
         """`model` as the loss runs it: its backbone's every pass exiting where the loss weighs its passes
-        (`pass_weights`), else as it is."""
-        if self.pass_weights is None or self.pass_weights.of_model(model.backbone) is None:
+        (`pass_weights`, `exit_entropy`), else as it is."""
+        if self.exit_entropy is None and (self.pass_weights is None
+                                          or self.pass_weights.of_model(model.backbone) is None):
             return model
         return replace(model, backbone=exiting(model.backbone))
 
@@ -332,7 +345,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None,
                  none_of_the_above_options: int = 3, input_lm: float = 0.0,
-                 pass_weights: PassWeighting | None = None):
+                 pass_weights: PassWeighting | None = None, exit_entropy: float | None = None):
         held: Variables | None = None
         widths: tuple[int | None, int] | None = None
         self.image_processor = None
@@ -431,6 +444,17 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                else context_window or max(self.layout.max_len, held_context))
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
         self.pass_weights = self._passes_weighed(PassWeights.of(pass_weights))
+        if exit_entropy is not None:
+            backbone = self.model.backbone
+            loop = backbone.loop if isinstance(backbone, Looped) else None
+            if loop is None or not loop.exit_gate or not 0 <= exit_entropy < float("inf"):
+                raise ValueError(f"exit_entropy weighs the entropy of a looped backbone's exit distribution: "
+                                 f"a backbone whose loop has an exit gate, and a finite nonnegative weight, "
+                                 f"got {exit_entropy}")
+            if self.pass_weights is not None:
+                raise ValueError("pass_weights and exit_entropy each weigh a looped backbone's passes; "
+                                 "state one")
+        self.exit_entropy = exit_entropy
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The backbone, then the head, both trained."""
@@ -533,10 +557,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention, fork_depth=self._fork_depth,
                           joint_forks=self._joint_forks)
-        passes, sown = self._pass_logits(
+        passes, gates, sown = self._pass_logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             progress=self.progress(step), opened=step.sown())
-        loss, aux = self._charged(passes, inputs, batch)
+        loss, aux = self._charged(passes, inputs, batch, gates)
         term = self.input_terms(variables, inputs, batch, step) if self.input_lm else None
         loss = self._with_input_term(loss, term)
         if term is not None:
@@ -627,12 +651,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         return self.row_mean(losses, batch, weights=scored)
 
     def _pass_logits(self, variables: Variables, inputs: DecisionInputs, **read
-                     ) -> tuple[tuple[jax.Array, ...], Variables]:
-        """The option logits of each pass the loss weighs (`pass_weights`), in order, its last the model's
-        own, else the model's alone (`DecisionModel.observed_logits`), and what the pass sowed."""
-        if self._weights is None:
+                     ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], Variables]:
+        """The option logits of each pass the loss weighs (`pass_weights`, `exit_entropy`), in order, its
+        last the model's own, else the model's alone (`DecisionModel.observed_logits`); every pass's
+        exit-gate logits where they are read (`DecisionModel.pass_logits`); and what the pass sowed."""
+        if self._weights is None and self.exit_entropy is None:
             logits, sown = self.model.observed_logits(variables, inputs, **read)
-            return (logits,), sown
+            return (logits,), (), sown
         exits = replace(self.model, backbone=exiting(self.model.backbone))
         return exits.pass_logits(variables, inputs, **read)
 
@@ -667,43 +692,62 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         """Each pass's weight in the loss (`PassWeights.of_model`), None where it scores the last alone."""
         return None if self.pass_weights is None else self.pass_weights.of_model(self.model.backbone)
 
-    def _charged(self, passes: tuple[jax.Array, ...], inputs: DecisionInputs, batch: Batch
-                 ) -> tuple[Ratio | Weighted, Aux]:
+    def _charge(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
+        """Each question's label loss `[B, Q]` over its option `logits`, and the logits as they score it: a
+        padding question, which has no options, over a finite, even distribution, so no NaN reaches its
+        gradient."""
+        options = inputs.options
+        empty = ~jnp.any(options, axis=-1, keepdims=True)
+        logits, options = jnp.where(empty, 0.0, logits), options | empty
+        # The gold distribution smoothed in the loss's precision, so a float64 run's sums are float64.
+        target = categorical.smoothed(jnp.asarray(batch["targets"]).astype(at_least_fp32(logits.dtype)),
+                                      options, self.label_smoothing)
+        return self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE), logits
+
+    def _charged(self, passes: tuple[jax.Array, ...], inputs: DecisionInputs, batch: Batch,
+                 gates: tuple[jax.Array, ...] = ()) -> tuple[Ratio | Weighted, Aux]:
         """The loss and its accuracy report over the questions' option logits at each pass the loss weighs
         (`passes`, the last the model's own, at `pass_weights`): where it adds a consistency term, the
         label loss and the groups' divergence, each its own `Ratio`, `consistency` weighing the divergence
         (`Weighted`). Each pass's charge and divergence are weighed before their means, whose masses every
-        pass shares; the accuracy is the last pass's."""
+        pass shares; the accuracy is the last pass's. Where it trains a loop's exit gate (`exit_entropy`),
+        Ouro's exit objective over every pass's charge and `gates`, each pass's gate logits, is the label
+        loss."""
         # The questions' mask in the logits' precision, so a float64 run's masses sum in float64.
-        options = inputs.options
         scored = jnp.asarray(batch["scored"]).astype(at_least_fp32(passes[-1].dtype))
-        # A padding question has no options; it is scored nothing over a
-        # finite, even distribution, so no NaN reaches its gradient.
-        empty = ~jnp.any(options, axis=-1, keepdims=True)
-        passes, options = tuple(jnp.where(empty, 0.0, logits) for logits in passes), options | empty
-        # The gold distribution smoothed in the loss's precision, as its mask is.
-        target = categorical.smoothed(jnp.asarray(batch["targets"]).astype(scored.dtype), options,
-                                      self.label_smoothing)
-        charge = self._weighed([self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
-                                for logits in passes])
+        charged = [self._charge(logits, inputs, batch) for logits in passes]
+        charges, passes = [charge for charge, _ in charged], tuple(logits for _, logits in charged)
         logits = passes[-1]
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
+        metrics = {"accuracy": accuracy}
+        if self.exit_entropy is None or len(passes) == 1:
+            charge = self._weighed(charges)
+        else:
+            # Each question's hazards where its head reads its answer (`Head.answered`), in the row's tokens.
+            at = self.model.head.answered(inputs)[..., None]
+            hazards = [jnp.take_along_axis(gate, at, axis=1) for gate in gates]
+            charge, expected, entropy = exit_objective(charges, hazards, self.exit_entropy, charges[-1].dtype)
+            counted = self.row_mean(scored, batch).total
+            metrics["exit_ce"] = Ratio(self.row_mean(expected * scored, batch).total, counted).mean()[0]
+            metrics["exit_entropy"] = Ratio(self.row_mean(entropy * scored, batch).total, counted).mean()[0]
         loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
         if not self.consistency:
-            return loss, Aux(metrics={"accuracy": accuracy})
+            return loss, Aux(metrics=metrics)
         # Each question's group in its window, and each option slot's canonical option: the group's
         # members' answers over the canonical options (`categorical.group_divergence`).
+        options = inputs.options | ~jnp.any(inputs.options, axis=-1, keepdims=True)
         groups, canonical = jnp.asarray(batch["groups"]), jnp.asarray(batch["canonical"])
         divided = [categorical.group_divergence(logits, groups, canonical, options) for logits in passes]
         divergence, members = self._weighed([divergence for divergence, _ in divided]), divided[-1][1]
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
         return (Weighted((loss, term), (1.0, self.consistency)),
-                Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
+                Aux(metrics={**metrics, "consistency": term.mean()[0]}))
 
     def _weighed(self, terms: list[jax.Array]) -> jax.Array:
-        """The passes' terms at their weights (`passes.weighed`), the one term of a loss of the last pass."""
-        return terms[0] if len(terms) == 1 else weighed(self._weights or (), terms)
+        """The passes' terms at their weights (`passes.weighed`), the last pass's where the loss weighs none
+        (one pass, or `exit_entropy`, whose exit objective weighs the label loss's passes itself)."""
+        return terms[-1] if len(terms) == 1 or self._weights is None else weighed(self._weights, terms)
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
@@ -721,9 +765,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention, fork_depth=self._fork_depth,
                           joint_forks=self._joint_forks)
-        passes, _ = self._pass_logits(params, inputs)
+        passes, gates, _ = self._pass_logits(params, inputs)
         term = self.input_terms(params, inputs, batch, step) if self.input_lm else None
-        loss = self._with_input_term(self._charged(passes, inputs, batch)[0], term)
+        loss = self._with_input_term(self._charged(passes, inputs, batch, gates)[0], term)
         decisions = self._decisions(passes[-1], inputs, batch)
         if len(passes) == 1:
             return loss, decisions

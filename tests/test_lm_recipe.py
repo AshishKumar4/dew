@@ -863,6 +863,14 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
     gate = ("early_exit_gate/bias", "early_exit_gate/kernel")
     assert objective.fresh_modules() == gate
     groups = config.grouped(objective, "gated").param_groups
+    from dew.nn.backbones.looping import EXIT_ENTROPY
+
+    # The gate trains under the exit objective at its default weight, the run stating none.
+    assert objective.exit_entropy == EXIT_ENTROPY
+    untrained = dataclasses.replace(config, objective=dataclasses.replace(
+        config.objective, fields={**config.objective.fields, "exit_entropy": None}))
+    with pytest.raises(ValueError):
+        untrained.exit_settings()
     labels = param_labels(groups)(objective.held_variables()["params"])
     fresh = {parameter_name(path) for path, label in jax.tree_util.tree_leaves_with_path(labels)
              if label == groups[0].name}

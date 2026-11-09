@@ -303,7 +303,7 @@ class DecisionRunConfig(DecoderRunConfig):
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
             derived.update(self._fresh_head(start, blocked, budgets))
-        objective = self.objective.build(backbone=start, **derived)
+        objective = self.objective.build(backbone=start, **derived, **self.exit_settings())
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained,
                                       "capacities": self._capacities(objective, release, assumed)}
