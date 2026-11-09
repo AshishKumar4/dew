@@ -315,7 +315,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     assert rows["3.12:tests/test_pass.py"]["timings"].keys() == {"3.12:tests/test_pass.py"}
     assert rows["3.12:tests/test_pass.py"]["tests"].keys() == {"tests/test_pass.py::test_ok",
                                                                "tests/test_pass.py::test_skip"}
-    assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
+    assert ci.grading.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
         "tests/test_split.py::TestB::test_b"
     # A process that dies after its report is written leaves every row it ran red, green cases included.
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"

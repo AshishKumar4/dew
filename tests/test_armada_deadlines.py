@@ -43,8 +43,8 @@ def test_a_task_past_its_deadline_is_interrupted_its_hung_file_red_and_the_rest_
     assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: (row["exitCode"], row["kind"]) for name, row in rows.items()} == {
-        "3.12:tests/test_quick.py": (1, ci.STALE), "3.12:tests/test_hangs.py": (1, "deadline"),
-        "3.12:tests/test_zlast.py": (1, ci.STALE)}
+        "3.12:tests/test_quick.py": (1, ci.grading.STALE), "3.12:tests/test_hangs.py": (1, "deadline"),
+        "3.12:tests/test_zlast.py": (1, ci.grading.STALE)}
     assert "spent in tests/test_hangs.py" in rows["3.12:tests/test_zlast.py"]["output"]
 
 
@@ -142,7 +142,7 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     first, stuck, never = (rows[f"3.12:tests/test_{name}.py"] for name in ("first", "stuck", "never"))
     slept = first["tests"]["tests/test_first.py::test_first"]
-    assert (first["exitCode"], stuck["kind"], never["kind"]) == (0, "deadline", ci.STALE)
+    assert (first["exitCode"], stuck["kind"], never["kind"]) == (0, "deadline", ci.grading.STALE)
     assert slept >= 0.5 and first["seconds"] == slept
     # The file the deadline stopped holds the wall time the finished file's own did not.
     assert stuck["seconds"] + slept >= deadline
@@ -167,7 +167,7 @@ def test_a_pytest_that_never_began_runs_again_and_one_a_signal_ended_is_red_with
     written(tmp_path, {"test_any.py": "def test_ok():\n    pass\n"})
     ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "rows.json", 30.0, cache="off")
     [unstarted] = json.loads((tmp_path / "rows.json").read_text())["rows"]
-    assert (unstarted["exitCode"], unstarted["kind"]) == (1, ci.STALE)
+    assert (unstarted["exitCode"], unstarted["kind"]) == (1, ci.grading.STALE)
     python.write_text(kept)
     written(tmp_path, {"test_any.py": "import os\nimport signal\n\n\ndef test_dies():\n"
                                       "    os.kill(os.getpid(), signal.SIGKILL)\n"})

@@ -162,6 +162,7 @@ watched = _loaded(HERE / "watched.py")
 followed = _loaded(HERE / "followed.py")
 progress = _loaded(HERE / "progress.py")
 digests = _loaded(HERE / "digests.py")
+grading = _loaded(HERE / "grading.py")
 code_of, unit, units = digests.code_of, digests.unit, digests.units
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
@@ -1255,41 +1256,13 @@ def release(python: str, tests: list[str], requirement: str, out: Path) -> int:
     return 1 if red else 0
 
 
-def node_of(case: ET.Element) -> str:
-    """A JUnit case's pytest node id, as tests/test_durations.json keys it."""
-    parts = (case.get("classname") or "").split(".")
-    module = next((index for index, part in enumerate(parts) if part.startswith("test_")), len(parts) - 1)
-    return "/".join(parts[:module + 1]) + ".py::" + "::".join([*parts[module + 1:], case.get("name") or ""])
-
-
-def file_of(case: ET.Element) -> str:
-    """The test file a JUnit case is from: its class path, or a collection error's own name."""
-    parts = (case.get("classname") or case.get("name") or "").split(".")
-    module = next((index for index, part in enumerate(parts) if part.startswith("test_")), len(parts) - 1)
-    return "/".join(parts[:module + 1]) + ".py"
-
-
-def red_as(kind: str, nodes: list[str]) -> dict:
-    """What turned a red row red, for grading it again (`land.sh`, `suspect.sh`): `kind` "nodes", its
-    `failed` tests alone, by node id; "collect", its file's collection; "deadline", its task's; or
-    "whole", its file otherwise (a test that did not collect, a missing import, pytest's own exit); or
-    `STALE`, a kept row its task did not run (`stale_row`)."""
-    return {"kind": kind, "failed": nodes}
-
-
-STALE = "stale"
-"""The kind of a row its plan kept on a green record its task did not find and did not run (`stale_row`): no
-verdict of its tests, so not passed (armada reads its exit 1 so), which the queue runs again as a row of its
-own before it grades any red (land.sh), never a red of its tests and never a flaky row of its owner's."""
-
-
 def stale_row(python: str, name: str, group: str, why: str) -> dict:
-    """Kept row `name` (in `group`'s group) said stale, not run (`STALE`), with `why`: a row armada reads as
-    not passed, so its run is graded, and the queue runs it again."""
+    """Kept row `name` (in `group`'s group) said stale, not run (`grading.STALE`), with `why`: a row armada
+    reads as not passed, so its run is graded, and the queue runs it again."""
     return {"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
             "output": f"stale, not run: the plan kept it on a record this task did not find, {why}",
             "tests": {}, "ynn_switched": [], "cells": {}, "timings": {row(python, name, ""): 0.0},
-            **red_as(STALE, [])}
+            **grading.red_as(grading.STALE, [])}
 
 
 def stale_cost(name: str, group: str, reading: Reading) -> float:
@@ -1323,7 +1296,7 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     # A collection runs no test, so it moved no site onto YNNPACK's fusions: counted, not unknown.
     rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
              "output": errors.get(name, ""), "ynn_switched": [], "cells": {},
-             **(red_as(COLLECT, []) if name in errors else {})}
+             **(grading.red_as(COLLECT, []) if name in errors else {})}
             for name in tests]
     out.write_text(json.dumps({"rows": rows}))
     return 0
@@ -1349,7 +1322,7 @@ def flow_cells(cases) -> dict[str, dict]:
     tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an
     empty object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
     unqualified, and a reused row keeps its counts (ledger 2643)."""
-    return {node_of(case): json.loads(item.get("value") or "null") for case in cases
+    return {grading.node_of(case): json.loads(item.get("value") or "null") for case in cases
             for item in case.iter("property") if item.get("name") == "cells"}
 
 
@@ -1358,7 +1331,7 @@ def ynn_switched(cases) -> list[dict]:
     `ynn_switched`, tests/conftest.py), green cases included: each its test node, label and XLA:CPU's
     refusal, as every row a task runs carries them for the train report to count, an empty list where
     nothing moved, so a row without the field is one recorded before it, uncounted."""
-    return [{"node": node_of(case), **site} for case in cases
+    return [{"node": grading.node_of(case), **site} for case in cases
             for item in case.iter("property") if item.get("name") == "ynn_switched"
             for site in json.loads(item.get("value") or "[]")]
 
@@ -1503,24 +1476,6 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
-def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselected: bool,
-             name: str, reached: str | None = None) -> list[str]:
-    """Why pytest's exit `code` reddens file `name`'s row, whose own cases are `own` among the process's
-    `cases`, and every one of whose tests the selection set aside where `deselected`. pytest exits 1 for
-    failed tests and 5 for none collected; any other exit (a crash, a signal, an internal error) leaves even
-    a written report untrustworthy, so every row it holds is red, as does an exit 1 no failed case explains
-    (a late hook's os._exit): its tests ran in a process that failed. A file whose every test the selection
-    set aside has no report however pytest exits, another file's failure among the task's included."""
-    failed = any(case.find(kind) is not None for case in cases for kind in ("failure", "error"))
-    if code == 1 and cases and not failed:
-        return ["the process ended 1 after its tests passed"]
-    if code not in (0, 1, 5) or (not own and not deselected and code == 1):
-        ended = f"pytest was killed by signal {-code}" if code < 0 else f"pytest exited {code}"
-        return [ended + ("" if own else f" with no report of {name}")
-                + (f", the last file a test of began in {reached}" if reached and not own else "")]
-    return []
-
-
 def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     """The files beside a task's verdict `out` that its pytest writes, none left from an earlier run: the
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
@@ -1598,55 +1553,6 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     return done.returncode, "".join(lines), expired, dump, None if left else closed, wrote
 
 
-def graded(name: str, own: list[ET.Element], cases: list[ET.Element], counted: Mapping[str, int],
-           reported: bool, returncode: int, expired: float | None, running: str | None, started: bool = True,
-           reached: str | None = None) -> tuple[list[str], list[tuple[ET.Element, str, ET.Element]], dict]:
-    """Test file `name`'s grade in its task (`tested`): what makes its row red, its failed cases, and what
-    turned it red (`red_as`). `own` its cases of the task's JUnit `cases`, `counted` its collection,
-    `reported` whether pytest wrote its report, `returncode` pytest's exit; `expired` the task's deadline
-    where it ran out of time, `running` the file its time was spent in (its executed log's last visit).
-    `started` whether pytest began (executed.py wrote its pid as pytest loaded it): a task whose pytest never
-    began failed in its runner (its environment, its launch, an install before pytest), with no verdict of any
-    test, so its row is said stale and run again (`STALE`), never a red of its tests; one that began and ended
-    with no report is a red of its file whole, the file it `reached` last and its exit, a signal's named,
-    kept for whoever it routes to (Main, 2026-11-09: a write the runner could not make filed 43 GPU tier
-    parts' files as reds)."""
-    failed = [(case, kind, node) for case in own for kind in ("failure", "error")
-              if (node := case.find(kind)) is not None]
-    red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
-           for case, kind, node in failed]
-    skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
-               f"{node.get('message')}" for case in own for node in case.iter("skipped")
-               if "could not import" in f"{node.get('message')} {node.text}"]
-    deselected = bool(counted) and counted["collected"] == counted["deselected"]
-    spent = expired is not None and (name == running or running is None)
-    unreached = expired is not None and not spent and not own and not deselected
-    unstarted = expired is None and not started and not reported and returncode != 0
-    exited = [] if (expired is not None and not spent) or unstarted else \
-        exit_red(returncode, cases, own, deselected, name, reached)
-    unaccounted = ([] if exited or unreached or unstarted or (reported and (own or deselected))
-                   else [f"no evidence {name} ran: " + ("pytest wrote no report" if not reported
-                                                        else "pytest reported none of its tests, and its "
-                                                             "collection shows them not all deselected")])
-    red += skipped + exited + unaccounted
-    if spent:
-        red.append(f"{INTERRUPTED} of {expired:.0f} s and was interrupted")
-    if unreached:
-        red.append(f"not graded: its task's {expired:.0f} s were spent in {running}, before pytest reported "
-                   "any test of it; it runs again")
-    if unstarted:
-        red.append(f"not graded: pytest never began (its runner exited {returncode} before pytest loaded its "
-                   "plugins: the environment, the launch or an install before it); it runs again")
-    # A failed case with no class path is a file that did not collect, no test of it.
-    nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
-    whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
-                                                                  for case, _, _ in failed)
-    cause = ({} if not red else red_as(STALE, []) if unreached or unstarted
-             else red_as("deadline", []) if spent
-             else red_as("whole", []) if whole else red_as("nodes", nodes))
-    return red, failed, cause
-
-
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
@@ -1665,9 +1571,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if kept:
         # A row its plan kept that this task did not find (its record replaced since) runs here only where
         # what it costs run cold fits what is left of the task's deadline, in turn (`stale_cost`); any other
-        # is said stale, not run (`STALE`), which the queue runs again as a row of its own, neither a red of
-        # its tests nor flaky (Main, 2026-11-07; row 4468: 163 of a kept task's 165 rows ran out its deadline
-        # one after another).
+        # is said stale, not run (`grading.STALE`), which the queue runs again as a row of its own, neither a
+        # red of its tests nor flaky (Main, 2026-11-07; row 4468: 163 of a kept task's 165 rows ran out its
+        # deadline one after another).
         left, fitting, reading = deadline - (time.monotonic() - began), [], Reading()
         for name in tests:
             cost = stale_cost(name, group, reading)
@@ -1712,16 +1618,18 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     shares = task_seconds(tests, cases, log, time.monotonic() - began, expired)
     # Where the task ran out of time, the file whose test started last is the one it was spent in (executed.py
     # logs each visit): its row is the deadline's red; a file pytest reported is graded by its own cases, the
-    # exit the interrupt's, not its; and one with none is not graded but run again (`STALE`), never a red of
-    # its tests (Main, 2026-11-09: train 745 filed six files packed beside a hung one as reds "at 0.0 s").
+    # exit the interrupt's, not its; and one with none is not graded but run again (`grading.STALE`), never
+    # a red of its tests (Main, 2026-11-09: train 745 filed six files packed beside a hung one as reds
+    # "at 0.0 s").
     # A task stalled before any test started (its collection) has no such file: each of its rows is the
     # deadline's.
     stood = followed.visited(followed.log_events(log)) if expired or not report.is_file() else []
     running = stood[-1] if stood else None
     for name in tests:
-        own = [case for case in cases if file_of(case) == name]
-        red, failed, cause = graded(name, own, cases, counts.get(name, {}), report.is_file(), returncode,
-                                    deadline if expired else None, running, pid.is_file(), running)
+        own = [case for case in cases if grading.file_of(case) == name]
+        red, failed, cause = grading.graded(name, own, cases, counts.get(name, {}), report.is_file(),
+                                            returncode, deadline if expired else None, running, pid.is_file(),
+                                            running)
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
@@ -1740,7 +1648,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      **({"signal": -returncode} if red and returncode < 0 and not expired else {}),
                      "tests": {**{node: seconds for node, seconds in done_before.items()
                                   if node.split("::", 1)[0] == name},
-                               **{node_of(case): float(case.get("time") or 0) for case in own}},
+                               **{grading.node_of(case): float(case.get("time") or 0) for case in own}},
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
@@ -1763,13 +1671,14 @@ def task_seconds(tests: list[str], cases: list[ET.Element], log: Path, wall: flo
     own times (`apportioned`); where the task ran out of time (`expired`), the file running at its deadline
     (its executed `log`'s last visit) at least what it needs, and one that never started none
     (`deadline_shares`)."""
-    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if grading.file_of(case) == name)
                    for name in tests}
     if not expired:
         return apportioned(own_seconds, wall, len(tests))
     # The file whose test started last is the one running at the deadline (executed.py logs each visit).
     stood = followed.visited(followed.log_events(log))
-    return deadline_shares(own_seconds, {file_of(case) for case in cases}, wall, stood[-1] if stood else None)
+    return deadline_shares(own_seconds, {grading.file_of(case) for case in cases}, wall,
+                           stood[-1] if stood else None)
 
 
 def resumed(tests: list[str]) -> dict[str, float]:
@@ -2240,8 +2149,6 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
 
 ARTIFACTS = "/armada/task/artifacts"
 """Where an armada task's files are kept for `armada map --artifacts`."""
-INTERRUPTED = "the task ran past its deadline"
-"""How a row says its task was interrupted: tests after the point it reached did not run."""
 COVERAGE_DEADLINE = 5400.0
 """A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
 its files' coverage partial, which `coverage_report.report` refuses."""

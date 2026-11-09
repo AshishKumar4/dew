@@ -338,7 +338,7 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
 def test_a_kept_task_runs_a_stale_row_only_within_its_deadline_and_says_the_rest_stale_not_run(
         ci, tmp_path, monkeypatch, cache_worker):
     """A kept task whose kept groups' green runs it cannot read runs each only where its recorded seconds fit
-    what is left of its deadline: every other is said stale, not run (ci.py's `STALE`), its own outcome the
+    what is left of its deadline: every other is said stale, not run (grading.py's `STALE`), its own outcome the
     queue runs again, never a deadline red, and none runs past the deadline (row 4468: a kept task's 163 of
     165 stale rows ran out its 1680 s one after another, each a deadline red); groups that fit run and
     pass."""
@@ -359,7 +359,8 @@ def test_a_kept_task_runs_a_stale_row_only_within_its_deadline_and_says_the_rest
         return [(row["name"], row["exitCode"], row.get("kind"))
                 for row in json.loads(verdict.read_text())["rows"]]
 
-    assert kept_task(250.0, 60) == [(f"3.12:tests/test_c.py#{index}/3", 1, ci.STALE) for index in (1, 2, 3)]
+    assert kept_task(250.0, 60) == [(f"3.12:tests/test_c.py#{index}/3", 1, ci.grading.STALE)
+                                    for index in (1, 2, 3)]
     assert not any((tmp_path / f"runs-{name}").exists() for name in names)
     assert any("tests/test_c.py/1-of-3" in path for path in seen)
     assert kept_task(0.5, 600) == [(f"3.12:tests/test_c.py#{index}/3", 0, None) for index in (1, 2, 3)]
