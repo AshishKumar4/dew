@@ -43,6 +43,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     mosaic_sm100,
     resources,
+    swizzling,
 )
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
 from dew.nn.kernels.templates.mosaic_sm100 import ISSUING, RINGS, STORED, TCGEN05, TMEM, Accumulator
@@ -425,15 +426,15 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
             mma=functools.partial(_products, block, scratch, q_ref))
 
     # The hand-offs' allocations (`schedule`), each where the program's shared and tensor memory have long
-    # placed it; the rescales and the final rows staged plainly (`mosaic.plain`), stated rather than left to
-    # layout inference, which tiled a raw buffer read at row offsets in the KDA backward.
+    # placed it; the rescales and the final rows staged plainly (`swizzling.plain`), stated rather than left
+    # to layout inference, which tiled a raw buffer read at row offsets in the KDA backward.
     scores, p_full, o_done, scaled, corrected, finished = roles.scratch(target)
     scratch = (mosaic_sm100.operand((rows, width), dtype, width), RINGS.load_barriers(1),
                tuple(rings["keys"].values()), tuple(rings["values"].values()), scores,
                *(mosaic_sm100.operand_columns(rows, block_k, dtype) for _ in range(2)), p_full,
                mosaic_sm100.accumulator_columns(rows, value_width), o_done,
-               mosaic.plain((2, rows), jnp.float32), scaled, corrected,
-               mosaic.plain((2, rows), jnp.float32), finished,
+               swizzling.plain((2, rows), jnp.float32), scaled, corrected,
+               swizzling.plain((2, rows), jnp.float32), finished,
                mosaic_sm100.operand((rows, value_width), dtype, value_width), mosaic_sm100.vector(rows))
     rows_type = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
     out, maxima = TCGEN05.kernel(

@@ -246,17 +246,37 @@ def uncached() -> Iterator[None]:
             compilation_cache.reset_cache()
 
 
+def plugin_builds() -> str:
+    """The build of each CUDA PJRT plugin installed, in order of the builds' names (an order any other reader
+    of the installed wheels can take): `-<build>-<version>` each. The GPU compile, XLA's, Triton's and Mosaic
+    GPU's, runs in the plugin, and Dew builds its plugins again under one jax and jaxlib, a version each
+    (row 3560)."""
+    return "".join(f"-{build}-{importlib.metadata.version(f'jax-{build}-pjrt')}"
+                   for build in sorted(cuda_builds()))
+
+
 def autotune_dir(path: str) -> str:
     """Where the GPU picks of the executables cached under `path` go, for this
-    jaxlib and the build of each CUDA PJRT plugin installed beside it: XLA's
-    per fusion, and Dew's kernels' beside them (`kernel_picks_path`). The GPU
-    compile each pick's speed depends on, XLA's, Triton's and Mosaic GPU's,
-    runs in the plugin, and Dew builds its plugins again under one jaxlib, a
-    version each (row 3560). The builds go in order of their names, an order
-    any other reader of the installed wheels can take without this list."""
-    plugins = "".join(f"-{build}-{importlib.metadata.version(f'jax-{build}-pjrt')}"
-                      for build in sorted(cuda_builds()))
-    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}{plugins}")
+    jaxlib and the build of each CUDA PJRT plugin installed beside it (`plugin_builds`): XLA's
+    per fusion, and Dew's kernels' beside them (`kernel_picks_path`), each pick's speed the plugin's
+    compile's."""
+    return os.path.join(path, 'autotune', f"jaxlib-{importlib.metadata.version('jaxlib')}{plugin_builds()}")
+
+
+def _keyed_by_plugin_builds() -> None:
+    """JAX's persistent cache key with each CUDA PJRT plugin's build in it (`plugin_builds`, through the key's
+    custom hook, any hook set before kept in front): JAX keys an executable by jax's and jaxlib's versions
+    and the backend's platform version (CUDA's), not the plugin that compiled it, so a plugin rebuilt under
+    one jax served the executables its earlier build's XLA compiled, a miscompile it fixed included
+    (IG-P0-CANDIDATE: an A100's candidate plugin read its control's executables, row 5275)."""
+    from jax._src import cache_key
+
+    before = cache_key.custom_hook
+    builds = plugin_builds()
+    cache_key.custom_hook = lambda: before() + builds
+
+
+_keyed_by_plugin_builds()
 
 
 def kernel_picks_path(device_kind: str) -> str:

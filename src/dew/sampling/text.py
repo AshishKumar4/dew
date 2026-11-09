@@ -36,6 +36,7 @@ from dew._hashing import array_fingerprint
 from dew._records import finite
 from dew.batch import (
     VALIDITY_FIELD,
+    Coordinates,
     Variables,
     coordinates as laid_out,
     flat_field,
@@ -545,16 +546,16 @@ def _refuse_generation(model: nn.Module) -> None:
         raise ValueError(refusal)
 
 
-def _step_places(state: DecoderState, width: int, tree: TreeBlock | None, capacity: int | None
-                 ) -> tuple[dict[str, jax.Array], jax.Array | None]:
-    """A decode step's attention visibility and its tokens' places: a tree's tokens each read the row's prefix
-    and their own ancestors, at their depths' places (`TreeBlock`); a chain's each its predecessors, at the
-    places the rows reach. A windowed layer windows the runs over the keys' places (`call_visibility`): the
-    prefix's slots' as the chain's cache reads them, a node's its depth past the root's."""
+def _step_layout(state: DecoderState, width: int,
+                 tree: TreeBlock | None) -> Callable[[jax.Array], Coordinates]:
+    """A decode step's tokens' layout from their validity: a tree's tokens each a document continuing its
+    parent's, reading the row's prefix and their own ancestors at their depths' places
+    (`TreeBlock.coordinates`), a windowed layer its cached keys at the places the forks give them; a
+    chain's each its predecessors, at the places the rows reach."""
     if tree is not None:
-        return ({"attention_key_runs": tree.runs(), "attention_key_positions": tree.key_positions(capacity)},
-                tree.positions())
-    return {}, None if state.positions is None else state.positions[:, None] + jnp.arange(width)[None, :]
+        return tree.coordinates
+    places = None if state.positions is None else state.positions[:, None] + jnp.arange(width)[None, :]
+    return lambda valid: laid_out(valid.shape, valid=valid, positions=places)
 
 
 def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None,
@@ -594,16 +595,16 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True,
             tree: TreeBlock | None = None) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
-        visibility, places = _step_places(state, width, tree, capacity)
+        layout = _step_layout(state, width, tree)
 
         def append(valid):
             # The step's tokens laid out once (`Coordinates`): the real ones, at their places.
-            laid = laid_out(tokens.shape, valid=valid, positions=places)
+            laid = layout(valid)
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
                 decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
                 method="states_and_logits" if exposed else None, capture_intermediates=False, **at,
-                **adapter_field(state.adapters), **visibility)
+                **adapter_field(state.adapters))
 
         history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         if original is not None and history is not None and lengths is not None:

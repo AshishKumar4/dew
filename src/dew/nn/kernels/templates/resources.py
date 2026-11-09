@@ -54,8 +54,9 @@ THREADS = 128
 
 COPIED_REGISTERS = 32
 """The registers a thread holds for one copy of an output's rows out through registers (no TMA store before
-Hopper: `templates.mosaic.copied`), which bounds its rows (`copied_rows`): a whole 128 x 128 fp32 tile's 128
-beside the next tile's accumulator spilled on sm86 and sm89 at some shapes and held at others (DECIDE3)."""
+Hopper: `templates.swizzling.copied`), which bounds its rows (`copied_rows`): a whole 128 x 128 fp32
+tile's 128 beside the next tile's accumulator spilled on sm86 and sm89 at some shapes and held at others
+(DECIDE3)."""
 
 
 def copied_rows(columns: int, dtype) -> int:
@@ -153,7 +154,11 @@ def program_shared(block: int, programs: int) -> int:
 
 def held_area(family: "Family", consumers: int) -> int:
     """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
-    (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns)."""
+    (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns); a
+    family's own where its values live in a core's scratch memory (`Issuer.held_area`: a TPU's VMEM)."""
+    area = family.held_area(consumers)
+    if area is not None:
+        return area
     return (family.registers(consumers) - family.held_registers) * THREADS * consumers
 
 
@@ -364,12 +369,13 @@ recurrence's derived ring)."""
 @dataclasses.dataclass(frozen=True)
 class Launch:
     """One launch a derivation plans (`plan`): its program's allocations at a ring depth (`scope`), its
-    consumer roles, the registers a consumer thread of it holds (`live_registers`, `tile_registers`), and
-    the fewest and most stages it streams at (`floor`: two keep one stage loading beside the one consumed;
-    `most`: deeper rings cover no latency a GPU's loads have)."""
+    consumer roles, the registers a consumer thread of it holds (`live_registers`, `tile_registers`; None on
+    a core that budgets none, `Family.budgets_registers`), and the fewest and most stages it streams at
+    (`floor`: two keep one stage loading beside the one consumed; `most`: deeper rings cover no latency a
+    GPU's loads have)."""
     scope: Callable[[int], Scope]
     consumers: int
-    registers: int
+    registers: int | None
     floor: int = 2
     most: int = MOST_STAGES
     tile: object = None
@@ -487,7 +493,7 @@ class Asked:
     may close over a trace's values): each launch's tile (`Launch.tile`) and registers, the family it asked
     on, the residency it fixed (None: the most that hold) and the plans, None where a launch held at none."""
     tiles: tuple
-    registers: tuple[int, ...]
+    registers: tuple[int | None, ...]
     family: "Family"
     programs: int | None
     plans: tuple[LaunchPlan, ...] | None
@@ -564,7 +570,8 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
     block = generation.shared_budget(target)
     plans = []
     for launch in launches:
-        if family.budgets_registers and launch.registers > family.registers(launch.consumers):
+        if (family.budgets_registers and launch.registers is not None
+                and launch.registers > family.registers(launch.consumers)):
             return None
         most = family.programs(launch.consumers, launch.registers)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()

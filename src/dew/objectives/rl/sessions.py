@@ -36,10 +36,9 @@ them. A `TRUNCATED` session follows the `truncation` policy:
 
 from __future__ import annotations
 
-import itertools
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
 from typing import Protocol, SupportsFloat
@@ -50,8 +49,8 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew._records import finite, json_value, record as section
-from dew.batch import Variables
-from dew.data.tokens import first_fit
+from dew.batch import Coordinates, Forks, Variables, coordinates
+from dew.data.forked_rows import ForkedRows
 from dew.inference.rollouts import Draw, Routing, routing_rows
 from dew.nn.inputs import local_rows
 from dew.rl import group_advantage, rloo_advantage
@@ -73,9 +72,14 @@ TOKEN_REWARDS_KEY = "token_rewards"
 the session's trained reward (`pack`'s `truncation`) on its last call's; 0 elsewhere. verl's
 token_level_rewards, which a critic's GAE reads."""
 SEGMENT_IDS_KEY = "text_segment_ids"
-"""Which chain of its row each token belongs to, from 1; 0 is padding."""
+"""Which document of its row each token belongs to, from 1; 0 is padding: a chain's, or with shared prompts
+(`pack`'s `share`) a prompt its group's chains share and each chain's rest continuing it
+(`FORK_PARENTS_KEY`)."""
 POSITIONS_KEY = "text_positions"
 """Each token's position inside its chain, from 0."""
+FORK_PARENTS_KEY = "fork_parents"
+"""`[rows, documents]`: the document each of a row's documents continues, 0 for none (`dew.batch.Forks`);
+present where `pack` shares its chains' prompts."""
 VERSIONS_KEY = "versions"
 """On a sampled id, the policy version its call was submitted under; -1 elsewhere."""
 SESSION_INDEX_KEY = "session_index"
@@ -648,31 +652,48 @@ def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Ch
     ]
 
 
-def _place(lengths: Sequence[int], width: int) -> list[list[int]]:
-    """Place chains first-fit in decreasing length, a stable order: per row, its chain numbers.
+def _chain_rows(built: Sequence[_Chain]) -> tuple[list[list[int]], dict[str, list[np.ndarray]]]:
+    """Each chain's ids, and the per-token fields a shared prompt agrees on (`ForkedRows.pack`'s `fields`):
+    its sampled ids' chain, so no two chains share a sampled id, and its routing records where any call
+    recorded one, so a prompt shares only where its chains' engines routed it alike."""
+    # A sampled id is its chain's own: two chains of one session may sample alike after one prompt.
+    sampled = [np.where(np.asarray(chain.calls) >= 0, number, -1).astype(np.int64)
+               for number, chain in enumerate(built)]
+    carried: dict[str, list[np.ndarray]] = {"sampled": sampled}
+    records = [chain.routing for chain in built if chain.routing is not None]
+    if records:
+        layout = _layout(records)
+        for name in layout:
+            carried[name] = []
+        carried[ROUTED_KEY] = []
+        for chain in built:
+            length = len(chain.tokens)
+            covered = 0 if chain.routing is None else routing_rows(chain.routing)
+            held = {} if chain.routing is None else dict(_routing_keys(chain.routing))
+            for name, (dims, dtype) in layout.items():
+                laid = np.zeros((length, *dims), dtype)
+                if name in held:
+                    laid[:covered] = held[name]
+                carried[name].append(laid)
+            carried[ROUTED_KEY].append(np.arange(length) < covered)
+    return [list(chain.tokens) for chain in built], carried
 
-    With a window open per chain, `first_fit` never closes one, so it is plain first-fit.
-    """
-    order = sorted(range(len(lengths)), key=lambda number: -lengths[number])
-    grouped, starts = first_fit(np.asarray(lengths, np.int64)[order], width, max(len(order), 1))
-    return [[order[index] for index in grouped[start:stop]] for start, stop in itertools.pairwise(starts)]
 
-
-def chain_lengths(sessions: Sequence[Session], width: int, *, truncation: str) -> list[int]:
-    """The length of every chain `pack` builds from `sessions` under `truncation`."""
-    return [len(chain.tokens) for chain in _built(sessions, width, truncation)]
-
-
-def rows_needed(lengths: Sequence[int], width: int) -> int:
-    """How many `width`-id rows `pack` fills with chains of `lengths`."""
-    return len(_place(lengths, width))
+def packed_rows(sessions: Sequence[Session], width: int, *, truncation: str, share: bool = False) -> int:
+    """How many `width`-id rows `pack` fills with `sessions`' chains under `truncation`, their group's
+    prompts shared where `share` (`pack`)."""
+    built = _built(sessions, width, truncation)
+    if not built:
+        return 0
+    rows, carried = _chain_rows(built)
+    return ForkedRows.needed(rows, width, share=share, fields=carried)
 
 
 def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
          estimator: str = "group", truncation: str = "mask", credit: str = "session",
          support_capacity: int | None = None, overlong: tuple[int, int] | None = None,
          shaping: Mapping[int, Sequence[float]] | None = None,
-         whitening: tuple[float, float] | None = None) -> dict[str, np.ndarray]:
+         whitening: tuple[float, float] | None = None, share: bool = False) -> dict[str, np.ndarray]:
     """Strictly merge each trained session's calls, then pack the chains into `[rows, width]`.
 
     A call joins the chain of the call before it only when its prompt ids
@@ -695,8 +716,15 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     `sum(weights * terms) / sum(weights)` is the mean over sessions of each
     session's token mean. Chains are placed first-fit in decreasing length,
     a stable order. `rows` pads the batch to a fixed count and raises
-    `ValueError` when the chains need more (`rows_needed` over
-    `chain_lengths` counts them).
+    `ValueError` when the chains need more (`packed_rows` counts them).
+
+    `share` lays the prompt a group's chains begin with once (`ForkedRows`):
+    each chain's rest is a document continuing it (`FORK_PARENTS_KEY`), at
+    the positions its chain gives it, so the policy scores every sampled id
+    as its chain alone does, and the chains' columns stand on the ids they
+    sampled as ever. A shared prompt id carries the columns of the first
+    chain laid over it, none of which a loss reads there, its response mask
+    0; it is shared only where its chains' routing records agree.
 
     `truncation` decides what a `TRUNCATED` session trains on: `mask` (the
     default) drops it, `score` trains it on its verifier reward, and `zero`
@@ -720,15 +748,24 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     values = advantages(sessions, estimator, truncation=truncation, credit=credit, overlong=overlong,
                         shaping=shaping, whitening=whitening)
     built = _built(sessions, width, truncation)
-    placed = _place([len(chain.tokens) for chain in built], width)
-    count = len(placed) if rows is None else rows
-    if len(placed) > count:
-        raise ValueError(f"the chains need {len(placed)} rows of {width} ids, more than the {rows} asked for")
-    count = max(count, 1)
-    shape = (count, width)
-    ids = np.zeros(shape, np.int32)
-    segments = np.zeros(shape, np.int32)
-    positions = np.zeros(shape, np.int32)
+    trainable = np.zeros(len(sessions), np.int64)
+    for chain in built:
+        trainable[chain.session] += sum(1 for call in chain.calls if call >= 0)
+    if built:
+        chained, carried = _chain_rows(built)
+        needed = ForkedRows.needed(chained, width, share=share, fields=carried)
+        if rows is not None and needed > rows:
+            raise ValueError(f"the chains need {needed} rows of {width} ids, more than the {rows} asked for")
+        laid = ForkedRows.pack(chained, width, windows=max(needed if rows is None else rows, 1), share=share,
+                               fields=carried)
+        shape = (int(laid.tokens.shape[0]), int(laid.tokens.shape[1]))
+    else:
+        laid, shape = None, (max(rows or 1, 1), width)
+    ids = np.zeros(shape, np.int32) if laid is None else np.asarray(laid.tokens, np.int32)
+    segments = (np.zeros(shape, np.int32) if laid is None
+                else np.asarray(laid.coordinates.segments, np.int32))
+    positions = (np.zeros(shape, np.int32) if laid is None
+                 else np.asarray(laid.coordinates.positions, np.int32))
     mask = np.zeros(shape, np.float32)
     behavior = np.zeros(shape, np.float32)
     versions = np.full(shape, -1, np.int32)
@@ -736,48 +773,62 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     call_index = np.full(shape, -1, np.int32)
     advantage = np.zeros(shape, np.float32)
     token_rewards = np.zeros(shape, np.float32)
-    trainable = np.zeros(len(sessions), np.int64)
-    for chain in built:
-        trainable[chain.session] += sum(1 for call in chain.calls if call >= 0)
     weights = np.zeros(shape, np.float32)
-    for row, segment, start, chain in _spans(built, placed):
-        span = slice(start, start + len(chain.tokens))
+    slots = [] if laid is None else _chain_slots(laid, built, width)
+    # The chains in reverse, so a shared prompt id keeps the first chain's columns.
+    for number in reversed(range(len(built))):
+        chain, (row, columns) = built[number], slots[number]
         sampled = np.asarray(chain.calls) >= 0
-        ids[row, span] = chain.tokens
-        segments[row, span] = segment
-        positions[row, span] = np.arange(len(chain.tokens))
-        mask[row, span] = sampled
-        behavior[row, span] = chain.behavior
-        versions[row, span] = chain.versions
-        session_index[row, span] = chain.session
-        call_index[row, span] = chain.calls
-        advantage[row, span] = values[chain.session][_owners(chain)]
-        weights[row, span] = sampled / max(int(trainable[chain.session]), 1)
+        mask[row, columns] = sampled
+        behavior[row, columns] = chain.behavior
+        versions[row, columns] = chain.versions
+        session_index[row, columns] = chain.session
+        call_index[row, columns] = chain.calls
+        advantage[row, columns] = values[chain.session][_owners(chain)]
+        weights[row, columns] = sampled / max(int(trainable[chain.session]), 1)
         session = sessions[chain.session]
         for call, first, count in chain.members:
             if count:
                 paid = session.calls[call].reward
                 trained = trained_reward(session, truncation) if call == len(session.calls) - 1 else None
-                token_rewards[row, start + first + count - 1] = ((0.0 if paid is None else paid)
-                                                                 + (0.0 if trained is None else trained))
-    return {
+                token_rewards[row, columns[first + count - 1]] = ((0.0 if paid is None else paid)
+                                                                  + (0.0 if trained is None else trained))
+    packed = {
         IDS_KEY: ids, SEGMENT_IDS_KEY: segments, POSITIONS_KEY: positions,
         RESPONSE_MASK_KEY: mask, BEHAVIOR_LOG_PROBS_KEY: behavior, VERSIONS_KEY: versions,
         SESSION_INDEX_KEY: session_index, CALL_INDEX_KEY: call_index,
         ADVANTAGES_KEY: advantage, TOKEN_REWARDS_KEY: token_rewards, SESSION_WEIGHTS_KEY: weights,
-        **_engine_records(built, placed, shape, support_capacity),
+        **_engine_records(laid, built, slots, shape, support_capacity),
     }
+    if laid is not None and laid.coordinates.forks is not None:
+        packed[FORK_PARENTS_KEY] = np.asarray(laid.coordinates.forks.parents, np.int32)
+    return packed
 
 
-def _spans(built: Sequence[_Chain], placed: Sequence[Sequence[int]]):
-    """Each placed chain as `(row, segment, start, chain)`: its packed row, its 1-based segment in
-    the row, the column its first id takes, and the chain, in packing order."""
-    for row, numbers in enumerate(placed):
-        start = 0
-        for segment, number in enumerate(numbers, start=1):
-            chain = built[number]
-            yield row, segment, start, chain
-            start += len(chain.tokens)
+def _chain_slots(laid: ForkedRows, built: Sequence[_Chain], width: int) -> list[tuple[int, np.ndarray]]:
+    """Each chain's row and the columns its ids stand at there (`ForkedRows.index`), its prompt's in its
+    group's shared document."""
+    index = np.asarray(laid.index)
+    placed = []
+    for number, chain in enumerate(built):
+        flat = index[number, :len(chain.tokens)]
+        placed.append((int(flat[0] // width), flat % width))
+    return placed
+
+
+def packed_coordinates(batch: Mapping[str, object], stop: int | None = None) -> Coordinates:
+    """A packed batch's layout as the model reads it (`Coordinates`), its slots before `stop`: its
+    documents and positions, and the documents its shared prompts' chains continue where `pack` shared
+    them (`FORK_PARENTS_KEY`)."""
+    segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)[:, :stop]
+    if FORK_PARENTS_KEY not in batch:
+        return coordinates(segments.shape, segments=segments,
+                           positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :stop])
+    parents = jnp.asarray(batch[FORK_PARENTS_KEY], jnp.int32)
+    laid = coordinates(segments.shape, segments=segments,
+                       positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :stop],
+                       max_segments=parents.shape[1])
+    return replace(laid, forks=Forks(parents, depth=1))
 
 
 def routing_of[Leaf](batch: Mapping[str, Leaf]) -> Leaf | dict[str, Leaf] | None:
@@ -833,7 +884,7 @@ def _empty_support(rows: int, capacity: int) -> dict[str, np.ndarray]:
             SUPPORT_COLUMNS_KEY: np.full((rows, capacity), -1, np.int32)}
 
 
-def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
+def _engine_records(laid: ForkedRows | None, built: Sequence[_Chain], slots: Sequence[tuple[int, np.ndarray]],
                     shape: tuple[int, int], support_capacity: int | None) -> dict[str, np.ndarray]:
     """The packed routing and support arrays, present only when a call recorded them.
 
@@ -847,19 +898,18 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
     `support_capacity`, so the arrays shard with the rows they describe.
     """
     records = [chain.routing for chain in built if chain.routing is not None]
-    out = {} if not records else _empty_routing(shape, _layout(records))
+    # The routing records laid out with the ids they cover (`_chain_rows`, `ForkedRows.fields`).
+    out = {} if not records or laid is None else {
+        name: np.asarray(value) for name, value in laid.fields.items() if name != "sampled"}
     kept: list[list[tuple[int, ...]]] = [[] for _ in range(shape[0])]
     owners: list[list[int]] = [[] for _ in range(shape[0])]
-    for row, _, start, chain in _spans(built, placed):
-        if out and chain.routing is not None:
-            covered = slice(start, start + routing_rows(chain.routing))
-            for name, held in _routing_keys(chain.routing):
-                out[name][row, covered] = held
-            out[ROUTED_KEY][row, covered] = True
-        for position, ids in enumerate(chain.supports):
-            if ids is not None:
-                kept[row].append(ids)
-                owners[row].append(start + position)
+    # Supports in each row's column order, as a row's ids stand.
+    standing = sorted((row, int(columns[position]), ids)
+                      for (row, columns), chain in zip(slots, built, strict=True)
+                      for position, ids in enumerate(chain.supports) if ids is not None)
+    for row, column, ids in standing:
+        kept[row].append(ids)
+        owners[row].append(column)
     if any(kept):
         totals = [sum(len(group) for group in groups) for groups in kept]
         if support_capacity is None:

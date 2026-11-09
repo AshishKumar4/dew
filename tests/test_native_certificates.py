@@ -84,20 +84,20 @@ def launches(*pairs) -> list[tuple[str, str]]:
     return list(pairs)
 
 
-PLAIN = launches(*((kernel, name) for kernel in ("mosaic_gpu", "triton") for name in ("sm80", "sm90")))
+PLAIN = launches(*((kernel, name) for kernel in ("mosaic", "triton") for name in ("sm80", "sm90")))
 """The template's native launches of 16-bit products on the lanes' GPUs, each forced (`generation.chosen`),
 refusing rather than falling back to another route."""
 TRITON = launches(("triton", "sm80"), ("triton", "sm90"))
 """The launches of fp32 operands, Triton's alone (Mosaic GPU's take 16-bit ones), and of a forward's exact
 sums (Mosaic GPU's forward takes none)."""
-EXACT = launches(("mosaic_gpu", "sm90"), ("triton", "sm80"), ("triton", "sm90"))
+EXACT = launches(("mosaic", "sm90"), ("triton", "sm80"), ("triton", "sm90"))
 """The launches of a kernel gradient's exact sums: Triton's, and Mosaic GPU's on Hopper alone (Ampere's
 bundle counts no running sum in its registers, `mosaic.Family.counts_hooks`, so it refuses them)."""
 CUTLASS = launches(("cutlass", "sm90"))
 """The vendored CUTLASS grouped GEMM's launch (`grouped_matmul.CutlassGmm`, the dew-cutlass wheel's): bf16
 operands on Hopper, its one tile, no exact sums or steps of its own, so its products' cell alone (row 2084
 (a)); a GPU whose installed wheel holds no sm90 kernels refuses it."""
-GRADIENTS = {"mosaic_gpu": grouped_matmul.MosaicTgmm, "triton": grouped_matmul.Tgmm}
+GRADIENTS = {"mosaic": grouped_matmul.MosaicTgmm, "triton": grouped_matmul.Tgmm}
 """Each kernel's kernel-gradient launch."""
 STEPS = {grouped_matmul.MosaicTgmm: ("block_k", True), grouped_matmul.Tgmm: ("block_m", False),
          grouped_matmul.Gmm: ("block_k", False)}
@@ -489,7 +489,7 @@ def the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_par
     grid shows it, a partial sum over half the depth rounded to bf16 before the rest is added, at more than
     `NARROW_SHARE` of the elements of Gaussian draws, wherever that rounding outweighs the sum's own."""
     # The Mosaic template itself, refusing rather than falling back to another route.
-    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
         x, w, _ = draw(0, signed=True)
         products = forward_products(x, w, SIZES)
         rows = groups(SIZES) == 3
@@ -515,8 +515,8 @@ def the_native_certificate_refuses_a_lost_block_a_misrouted_row_and_a_narrow_par
 
 
 SUBNORMAL_CELLS = [
-    (jnp.float16, "triton", "sm80"), (jnp.float16, "triton", "sm90"), (jnp.float16, "mosaic_gpu", "sm90"),
-    (jnp.bfloat16, "mosaic_gpu", "sm80"), (jnp.bfloat16, "mosaic_gpu", "sm90"),
+    (jnp.float16, "triton", "sm80"), (jnp.float16, "triton", "sm90"), (jnp.float16, "mosaic", "sm90"),
+    (jnp.bfloat16, "mosaic", "sm80"), (jnp.bfloat16, "mosaic", "sm90"),
     (jnp.bfloat16, "triton", "sm80"), (jnp.bfloat16, "triton", "sm90")]
 """The template's launches of 16-bit products by dtype on the lanes' GPUs (Mosaic GPU's mma.sync bundle takes
 no fp16)."""

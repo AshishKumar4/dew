@@ -169,10 +169,8 @@ class DecisionRunConfig(DecoderRunConfig):
     layout's own."""
     shared_state: int | None = None
     """The most questions a row asks over one copy of their request's state, each read as its own row reads
-    it (`QuestionLayout.shared_state`). None keeps a row a question, each with its state."""
-    siblings: bool | None = None
-    """Whether a question of a row over one state also reads the questions before it in the row
-    (`QuestionLayout.siblings`). None keeps the layout's own, each reading the state and itself."""
+    it (`QuestionLayout.shared_state`), 1 a row a question. None keeps the layout's own: as many as a row
+    holds, where the backbone and head read each question as its own row."""
     unit: Unit | None = None
     """How a question row's `segments` encode their text, piece by piece or whole
     (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""

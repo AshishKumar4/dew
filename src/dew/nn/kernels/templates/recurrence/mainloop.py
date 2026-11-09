@@ -57,7 +57,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import bundles, mosaic, product, resources
+from dew.nn.kernels.templates import bundles, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work, estimate
 from dew.nn.kernels.templates.operands import Issuer, Parts
 
@@ -1408,12 +1408,12 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     # columns (Mosaic GPU's layout inference refused 24 at a 16-column tiling and 80 at a 64-column one,
     # jsf-kdaintra5 and 9), a multiple of 32 words at 32 columns or more, so no stride it takes moves a
     # fragment store's rows off one another's banks.
-    padded = (mosaic.plain((3, algebra.SUB + chunk, keys), jnp.float32),)
-    scanned = mosaic.plain((2, 2 * chunk, keys), jnp.float32)
+    padded = (swizzling.plain((3, algebra.SUB + chunk, keys), jnp.float32),)
+    scanned = swizzling.plain((2, 2 * chunk, keys), jnp.float32)
     # A merged walk's sums in shared memory, each read and written whole, so in swizzled 8-row tiles: plain,
     # rows a multiple of 32 words apart put a fragment's 8 rows in the same banks (41.3M bank conflicts in a
     # GH200's Kimi Linear intra launch at ceb64ccc5d, M-JS-17); a lone output's in registers (`_intra_held`).
-    sums = ((mosaic.staged((len(products), chunk, chunk), jnp.float32, 128),) if len(products) > 1
+    sums = ((swizzling.staged((len(products), chunk, chunk), jnp.float32, 128),) if len(products) > 1
             else ())
     return (_pairing(call, keys), scanned, *sums, *padded), landing
 
@@ -2231,7 +2231,7 @@ def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
     swizzle = resources.widest_swizzle(call.given.stored, call.width)
     if not family.operands_in_registers:
         swizzle = min(swizzle, family.right_swizzle(call.memories.stored, bv))
-    while swizzle > mosaic.NARROWEST_SWIZZLE_BYTES and (
+    while swizzle > swizzling.NARROWEST_SWIZZLE_BYTES and (
             _output_held(call, bv, swizzle).registers(family, _addressed(staging, landing))
             > family.registers(1)):
         swizzle //= 2

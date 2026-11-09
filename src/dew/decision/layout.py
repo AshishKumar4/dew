@@ -32,7 +32,7 @@ from typing_extensions import get_protocol_members
 
 from dew import _records
 from dew._records import JSON
-from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD, Coordinates, coordinates
+from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD, Coordinates, Forks, coordinates
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
@@ -217,6 +217,10 @@ class Encoded:
     streams: tuple[int, ...] | None = None
     """Each token's stream, its index in the layout's (`stream_names`), which its reads say what each
     token attends to (`Reads`, `Layout.attention`); None for a row read in order."""
+    forked: tuple[int, ...] | None = None
+    """Each token's document in a row of questions over one state (`dew.decision.shared_state`): 1 the
+    shared part, each question's own part a document after it continuing it (`dew.batch.Forks`); None
+    for a row of one document."""
 
     @property
     def trimmed(self) -> bool:
@@ -714,29 +718,20 @@ class QuestionLayout(Layout):
     option (`option_0`) writes nothing the row reads. An option with no description is its key."""
 
     shared_state: int | None = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
-    """The most questions a row asks over one copy of their request's state (None: a row a question). Each
-    reads what its own row writes before it, written once, and itself, at its own row's positions, so it
-    decides as its own row does (`dew.decision.shared_state`); questions that outgrow a row take several,
-    each repeating the state, and one whose own row cuts the state is a row of its own."""
-    siblings: bool = dataclasses.field(default=False, repr=False, metadata={_records.ADDED: True})
-    """Whether a question of a row of several (`shared_state`) also reads the questions before it in its
-    row, whole; off, each reads the shared part and itself alone."""
+    """The most questions a row asks over one copy of their request's state (as many as it holds where
+    None, one at 1), each continuing it as its own row does (`dew.decision.shared_state`)."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.shared_state is not None:
             _least("shared_state", self.shared_state, 1)
-            if self.parallel or self.blocks or self.reads is not None or self.spans_in_context:
-                raise ValueError("a row of questions over one state sets what its tokens read, as parallel "
-                                 "options, blocks, reads and a question in context do; a row takes one")
-            kinds = [type(segment) for segment in self.written]
-            asked = [at for at, kind in enumerate(kinds) if kind in (Instructions, OptionLines, AnswerCue)]
-            if max((at for at, kind in enumerate(kinds) if kind is State), default=-1) > min(asked) or (
-                    kinds.index(Instructions) != min(asked)):
+            from dew.decision.shared_state import forkable
+
+            if self.shared_state > 1 and not forkable(self):
                 raise ValueError("a row of questions over one state writes its state before its question, "
-                                 "and the question's instructions before its options and cue")
-        elif self.siblings:
-            raise ValueError("siblings are the questions a row over one state asks; give shared_state=")
+                                 "the question's instructions before its options and cue, and sets nothing "
+                                 "else its tokens read, as parallel options, blocks, reads and a question in "
+                                 "context do")
         if self.head_max_len is not None:
             _least("head_max_len", self.head_max_len, 1)
         if self.option_tokens is not None:
@@ -806,8 +801,17 @@ class QuestionLayout(Layout):
         return tuple(encoder.encode(text, add_special_tokens=False))
 
     def row_questions(self, questions: int) -> int:
-        """One, a row a question; or with `shared_state`, as many of them as one row asks."""
-        return 1 if self.shared_state is None else min(questions, self.shared_state)
+        """As many of them as one row asks over one state (`shares`, `shared_state`), else one."""
+        if not self.shares:
+            return 1
+        return questions if self.shared_state is None else min(questions, self.shared_state)
+
+    @property
+    def shares(self) -> bool:
+        """Whether a request's questions share one copy of its state in their rows (`shared_state`)."""
+        from dew.decision.shared_state import forkable
+
+        return self.shared_state != 1 and forkable(self)
 
     @property
     def spans_in_context(self) -> bool:
@@ -817,16 +821,8 @@ class QuestionLayout(Layout):
 
     @property
     def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
-        """Its rows' reads over their streams (`streamed_attention`); with `shared_state`, the shared part
-        reads itself causally, and each question itself causally, it whole and with `siblings` the earlier."""
-        if self.shared_state is None:
-            return streamed_attention(self.reads, self.written)
-        count = self.shared_state
-        questions = tuple((HOWS["causal"], HOWS["whole"],
-                           *(HOWS["whole"] if self.siblings and other < own else 0
-                             for other in range(1, count + 1)))
-                          for own in range(1, count + 1))
-        return ((HOWS["causal"], *[0] * (count + 1)), *questions), count + 1
+        """Its rows' reads over their streams (`streamed_attention`)."""
+        return streamed_attention(self.reads, self.written)
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
@@ -841,11 +837,11 @@ class QuestionLayout(Layout):
                              tokens=tokens, conversation=_conversation(state),
                              request=questions if request is None else request)
                for name, question in questions.items()]
-        if self.shared_state is None:
+        if not self.shares:
             return own
         from dew.decision.shared_state import over_one_state
 
-        return over_one_state(own, self.max_len, self.shared_state)
+        return over_one_state(own, self.max_len, self.shared_state or len(own))
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
                state: Sequence[int], *, conversation: bool = False,
@@ -2330,6 +2326,12 @@ class DecisionInputs:
     streams: jnp.ndarray | None = None
     """`[B, L]` each token's stream in its row (`Encoded.streams`), -1 on the padding, or None for rows
     read in order."""
+    documents: jnp.ndarray | None = None
+    """`[B, L]` each token's document in its window where its rows ask questions over one state
+    (`Encoded.forked`): each row's shared part a document and each question's own part one continuing it,
+    numbered from 1 in the window's order, 0 on the padding; None for rows of one document each."""
+    parents: jnp.ndarray | None = None
+    """`[B, D]` the document each of `documents`' continues, 0 for a shared part (`dew.batch.Forks`)."""
     reads: tuple[tuple[int, ...], ...] | None = struct.field(pytree_node=False, default=None)
     """What each stream's tokens read, as the layout lowers its `Reads` (`Reads.lowered`), where the rows
     stand in `streams`."""
@@ -2352,9 +2354,16 @@ class DecisionInputs:
         """The tokens' `Coordinates`: each row a document, real tokens first, at
         most `max_segments` a window. The padding after them runs as one more
         sequence, which a sequence kernel adds to the documents itself
-        (`dew.nn.attention.flash_attention`)."""
-        return coordinates(segments=self.segments, positions=self.positions,
-                           max_segments=self.max_segments, right_padded=True)
+        (`dew.nn.attention.flash_attention`). Rows asking questions over one
+        state lay out their `documents` instead, each question's continuing its
+        row's shared part (`Coordinates.forks`)."""
+        if self.documents is None:
+            return coordinates(segments=self.segments, positions=self.positions,
+                               max_segments=self.max_segments, right_padded=True)
+        assert self.parents is not None, "a window's documents come with the documents they continue"
+        laid = coordinates(segments=self.documents, positions=self.positions,
+                           max_segments=self.parents.shape[1], right_padded=True)
+        return dataclasses.replace(laid, forks=Forks(self.parents, depth=1))
 
     @property
     def question_segments(self) -> jnp.ndarray:
@@ -2403,10 +2412,21 @@ class DecisionInputs:
             raise ValueError("one batch reads its rows one way, in their layout's streams or in order")
         if streamed:
             fields["streams"] = [row.streams or () for row in rows]
+        forked = rows[0].forked is not None
+        if any((row.forked is not None) != forked for row in rows):
+            raise ValueError("one batch lays its rows out one way, over one state or a question a row")
+        if forked:
+            fields["forked"] = [row.forked or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
                                         fields=fields or None)
         valid = padded.get(VALIDITY_FIELD, np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
+        documents = parents = None
+        if forked:
+            # A window a row: its shared part document 1, each question's own part continuing it.
+            documents = jnp.asarray(np.where(valid, padded["forked"], 0), jnp.int32)
+            parents = jnp.asarray(np.broadcast_to(np.arange(count + 1) > 0, (len(rows), count + 1)),
+                                  jnp.int32)
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
         labelled = labelled_rows(rows)
         laid = [question_fields(row, count, width, labelled) for row in rows]
@@ -2442,6 +2462,7 @@ class DecisionInputs:
                    blocks=jnp.asarray(np.where(valid, padded["blocks"], -1), jnp.int32) if blocked else None,
                    streams=(jnp.asarray(np.where(valid, padded["streams"], -1), jnp.int32) if streamed
                             else None),
+                   documents=documents, parents=parents,
                    reads=None if attention is None else attention[0],
                    fragments=1 if attention is None else attention[1],
                    spans_in_context=in_context)

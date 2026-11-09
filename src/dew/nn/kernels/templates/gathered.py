@@ -20,7 +20,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
 from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref, vector as mgpu_vector
 
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import mosaic, swizzling
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,7 +51,7 @@ class Ring(mosaic.Ring):
         [depth] = rows.rest
         source = tokens.at[:, pl.ds(depth * width, width)]
         bytes_ = swizzled(self.block, tokens.dtype)
-        swizzle = mosaic.swizzle_transforms(tokens.dtype, bytes_)
+        swizzle = swizzling.swizzle_transforms(tokens.dtype, bytes_)
         copies = functools.partial(gathered_copies, swizzle=bytes_)
         refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType())
         plgpu.inline_mgpu(arg_types=refs)(lambda ctx, *refs: copies(*refs))(
@@ -74,15 +74,15 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, released_by_pr
     `mosaic.ring`'s)."""
     consumed = (plgpu.Barrier(num_barriers=stages, orders_tensor_core=True) if released_by_products
                 else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
-    return {'smem': mosaic.staged((stages, *block), dtype, swizzled(block, dtype)),
+    return {'smem': swizzling.staged((stages, *block), dtype, swizzled(block, dtype)),
             'full': plgpu.SMEM((stages,), jnp.uint64), 'consumed': consumed}
 
 
 def swizzled(block: tuple, dtype) -> int:
     """The swizzle a gathered ring's slots of `block` stage at: the widest whose row its columns hold
-    whole (`mosaic.swizzle_for`), as layout inference stages an ungathered one: 128 bytes but a narrow
+    whole (`swizzling.swizzle_for`), as layout inference stages an ungathered one: 128 bytes but a narrow
     block's (a 32-column bf16 cotangent of mma.sync's kernel gradient, 64)."""
-    return mosaic.swizzle_for(dtype, block[1])
+    return swizzling.swizzle_for(dtype, block[1])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,7 +101,7 @@ class Committed(Ring):
         height, width = self.block
         [depth] = rows.rest
         bytes_ = swizzled(self.block, tokens.dtype)
-        swizzle = mosaic.swizzle_transforms(tokens.dtype, bytes_)
+        swizzle = swizzling.swizzle_transforms(tokens.dtype, bytes_)
         refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(swizzle), plgpu.RefType(),
                 plgpu.Layout.WG_SPLAT(()))
         copies = functools.partial(tma_rows, swizzle=bytes_)

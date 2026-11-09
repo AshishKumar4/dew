@@ -854,10 +854,19 @@ def sass_findings(elf: bytes) -> tuple[str, ...] | None:
 
 
 _INSTRUCTION = re.compile(r"/\*([0-9a-f]{4,})\*/\s+(.*?)\s*;")
-_DEAD_MMA = re.compile(r"\bHGMMA\.\S+\s+RZ\b")
-"""A warpgroup MMA writing no register: what ptxas leaves of a kernel's MMAs whose results it found dead, the
-products never read (row 4346: ptxas 12.9 folds an integer op on an accumulator through its value before
-the MMA, so a negated product read stores -0.0)."""
+WARPGROUP_MMAS = frozenset({"HGMMA", "QGMMA", "IGMMA"})
+"""Hopper's warpgroup MMA opcodes, by their operands: 16-bit floats, 8-bit floats (fp8) and integers."""
+
+
+def _dead_mma(instruction: str) -> bool:
+    """Whether a SASS instruction is a warpgroup MMA writing no register (its destination RZ): what ptxas
+    leaves of a kernel's MMAs whose results it found dead, the products never read (row 4346: ptxas 12.9 folds
+    an integer op on an accumulator through its value before the MMA, so a negated product read stores
+    -0.0). Read from the instruction's opcode and first operand, a predicate guard aside."""
+    words = instruction.split()
+    if words and words[0].startswith("@"):
+        words = words[1:]
+    return len(words) > 1 and words[0].split(".")[0] in WARPGROUP_MMAS and words[1].rstrip(",") == "RZ"
 _LABEL = re.compile(r"^\s*(\.L_\w+):")
 _WATERFALL = re.compile(r"\bBRA\.U\.ANY\s+`?\(?(\.L_\w+)\)?`?")
 
@@ -866,7 +875,7 @@ def sass_findings_of(listing: str) -> tuple[str, ...]:
     """What nvdisasm's `listing` of a kernel breaks of the kernel challenge's SASS rules (row 4071, its
     harness/ptxas checks; notes/ptxas-re.md §2): an elect waterfall (a backward BRA.U.ANY) holding an R2UR, a
     copy issued lane by lane because ptxas could not prove its operand uniform; and a warpgroup MMA writing
-    no register (`_DEAD_MMA`), a product ptxas dropped as never read (row 4346)."""
+    no register (`_dead_mma`), a product ptxas dropped as never read (row 4346)."""
     instructions, labels, pending = [], {}, []
     for line in listing.splitlines():
         if label := _LABEL.match(line):
@@ -880,7 +889,7 @@ def sass_findings_of(listing: str) -> tuple[str, ...]:
         head = labels.get(branch.group(1)) if (branch := _WATERFALL.search(text)) else None
         if head is not None and head <= at:
             serialized += any("R2UR" in held for held in instructions[head:at + 1])
-    dead = sum(1 for text in instructions if _DEAD_MMA.search(text))
+    dead = sum(1 for text in instructions if _dead_mma(text))
     found = []
     if serialized:
         found.append(f"{serialized} elect waterfall holding an R2UR, a copy issued lane by lane")

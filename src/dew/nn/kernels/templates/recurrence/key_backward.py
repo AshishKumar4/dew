@@ -16,7 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates import mosaic, product, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -458,19 +458,20 @@ def _key_pairs_staged(call: Call, keys: int) -> tuple:
     # The squares' and gated rows' sub-chunk products contract `algebra.SUB` rows, which tcgen05 issues in
     # whole swizzles: their swizzle fits that depth, where inference's 128 bytes refused the launch on an
     # sm100 ('K must be a multiple of 64, got: 16', jsf-gate100g).
-    transforms = mosaic.swizzle_transforms(parted.stored, mosaic.swizzle_for(parted.stored, algebra.SUB))
+    transforms = swizzling.swizzle_transforms(parted.stored,
+                                              swizzling.swizzle_for(parted.stored, algebra.SUB))
 
     def sub_parts(columns):
         return tuple(plgpu.SMEM((chunk, columns), parted.stored, transforms=transforms)
                      for _ in range(parted.parts))
 
     # A key block's keys and separated prefix below a sub-chunk's rows and a tile above them
-    # (`algebra.key_diagonal_pairs_back`'s shifted reads), stated plain as the forward's are (`mosaic.plain`):
-    # unstated, layout inference tiled them, and the reads at row offsets no tiling divides took other rows on
-    # every GPU, Kimi delta attention's gradients 1e4 times their size, its interpreted run right (row 5194,
-    # M-JS-28 to M-JS-35).
-    padded = (mosaic.plain((3, algebra.SUB + chunk, keys), jnp.float32),
-              mosaic.plain((chunk + algebra.SUB, keys), jnp.float32))
+    # (`algebra.key_diagonal_pairs_back`'s shifted reads), stated plain as the forward's are
+    # (`swizzling.plain`): unstated, layout inference tiled them, and the reads at row offsets no tiling
+    # divides took other rows on every GPU, Kimi delta attention's gradients 1e4 times their size, its
+    # interpreted run right (row 5194, M-JS-28 to M-JS-35).
+    padded = (swizzling.plain((3, algebra.SUB + chunk, keys), jnp.float32),
+              swizzling.plain((chunk + algebra.SUB, keys), jnp.float32))
     staging = ([staging_tiles(parted, (chunk, keys))[0] for _ in range(2)],
                [sub_parts(chunk) for _ in range(2)],
                [sub_parts(keys) for _ in range(2)],

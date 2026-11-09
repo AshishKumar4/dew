@@ -99,18 +99,37 @@ tile's 8 and its two statistics' 1 each; a GEMM's 128 x 128 fp32 tile 128). One 
 waited each read behind the last one's combine, 0.49 us a slice (a 16-row decode's 49, M-DD-12)."""
 
 
-def merge_slices(summed, held: int) -> tuple[int | None, int]:
-    """The place among a partial's leaves of its widest 2-D leaf and the column slices `Family.fixed_up`
-    merges it in: as few as bring its registers a thread (`held`) within `MERGED_REGISTERS`, each a whole
-    number of the layout's 8-column atoms dividing its columns; none (and one slice) where it already fits or
-    has no 2-D leaf."""
+def merge_spans(summed, held: int) -> tuple[int | None, list[tuple[int, int | None]]]:
+    """The place among a partial's leaves of its widest 2-D leaf and the column spans `(start, width)`
+    `Family.fixed_up` merges it in: as few as bring its registers a thread (`held`) within
+    `MERGED_REGISTERS`, each a whole number of the layout's 8-column atoms dividing its columns; none and one
+    whole span `(0, None)` where it already fits or has no 2-D leaf."""
     leaves = jax.tree.leaves(summed)
     tiles = [place for place, leaf in enumerate(leaves) if leaf.ndim == 2]
     if held <= MERGED_REGISTERS or not tiles:
-        return None, 1
+        return None, [(0, None)]
     widest = max(tiles, key=lambda place: leaves[place].size)
     columns = leaves[widest].shape[1]
     slices = -(-held // MERGED_REGISTERS)
     while slices < columns // 8 and (columns % slices or (columns // slices) % 8):
         slices += 1
-    return (widest, slices) if columns % slices == 0 and (columns // slices) % 8 == 0 else (None, 1)
+    if columns % slices or (columns // slices) % 8:
+        return None, [(0, None)]
+    width = columns // slices
+    return widest, [(start, width) for start in range(0, columns, width)]
+
+
+def sliced(value, widest: int | None, start: int, width: int):
+    """`value`'s leaves with its `widest`-th (`merge_spans`) cut to `width` columns from `start`."""
+    leaves, tree = jax.tree.flatten(value)
+    return jax.tree.unflatten(tree, [leaf[:, start:start + width] if place == widest else leaf
+                                     for place, leaf in enumerate(leaves)])
+
+
+def joined(parts: list, widest: int | None):
+    """The merged slices `parts` (`sliced`'s) as one value: their `widest`-th leaves side by side, every other
+    leaf the last slice's (a column-separable merge leaves them alike)."""
+    flat = [jax.tree.flatten(part)[0] for part in parts]
+    return jax.tree.unflatten(jax.tree.structure(parts[0]), [
+        jnp.concatenate([each[place] for each in flat], axis=1) if place == widest else flat[-1][place]
+        for place in range(len(flat[0]))])

@@ -26,7 +26,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew._devices import deterministic_ops_requested
 from dew.nn import derivatives
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan
+from dew.nn.kernels.templates import base, mosaic, report, resources, scan as block_scan, swizzling
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop
 
 RESET_WIDTH = 32
@@ -115,9 +115,9 @@ def forward_allocations(family: mosaic.Family, chunk: int, block: int, states: i
         blocks["resets"] = ((chunk, RESET_WIDTH), jnp.int8)
     once = {"parameters": ((states + PARAMETER_ROWS, block), jnp.float32),
             "entering": ((states, block), jnp.float32)}
-    # Each tile read a row at a time, at a traced row: staged plain (`mosaic.UNSWIZZLED`).
-    streams = {"walked": family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED)),
-               "once": family.streams(once, 1, 1, swizzles=dict.fromkeys(once, mosaic.UNSWIZZLED))}
+    # Each tile read a row at a time, at a traced row: staged plain (`swizzling.UNSWIZZLED`).
+    streams = {"walked": family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, swizzling.UNSWIZZLED)),
+               "once": family.streams(once, 1, 1, swizzles=dict.fromkeys(once, swizzling.UNSWIZZLED))}
     return streams, (plgpu.SMEM((chunk, block), x_dtype), plgpu.SMEM((block,), jnp.float32))
 
 

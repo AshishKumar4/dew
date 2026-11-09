@@ -46,7 +46,7 @@ AXES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "gemm": {
         "generation": ("sm90", "sm80", "v5e"),
-        "kernel": ("mosaic_gpu", "triton", "cutlass", "mosaic_tpu"),
+        "kernel": ("mosaic", "triton", "cutlass"),
         "form": ("dense", "grouped"),
         "matrix": ("n-major", "k-major"),
         "hook": ("plain", "bias", "row-scale", "paired"),

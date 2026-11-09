@@ -33,7 +33,7 @@ SEEDS = 8
 CHOICES = frozenset({"blockwise_fp8"})
 """The `generation.CHOICES` entries the cells run: each cell asserts that the routes it records run
 `blockwise_fp8` `mosaic_gpu` and every choice outside `CHOICES` at XLA."""
-KERNELS = {"blockwise_fp8": frozenset({"mosaic_gpu"})}
+KERNELS = {"blockwise_fp8": frozenset({"mosaic"})}
 """The kernels under test of each choice the cells run: the template's step-scaled walk."""
 
 
@@ -62,11 +62,11 @@ def supported(case: dict[str, str]) -> bool:
                                                  for array in _operands(case, 0))
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
     with (generation.assumed(case["generation"]), jax.sharding.use_abstract_mesh(mesh),
-          generation.chosen(blockwise_fp8="mosaic_gpu"), generation.routes() as routes):
+          generation.chosen(blockwise_fp8="mosaic"), generation.routes() as routes):
         jax.eval_shape(lambda *operands: gemm.blockwise_fp8_product(
             *operands[:2], _sizes(int(case["groups"])), *operands[2:], out_dtype=case["out_dtype"]),
             rows, matrices, row_scales, column_scales)
-    return [route.kernel for route in routes if route.choice == "blockwise_fp8"] == ["mosaic_gpu"]
+    return [route.kernel for route in routes if route.choice == "blockwise_fp8"] == ["mosaic"]
 
 
 CASES = (
@@ -120,13 +120,13 @@ def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
     combination = dict(zip(AXES["blockwise_fp8"], case, strict=True))
     groups, out_dtype = int(combination["groups"]), combination["out_dtype"]
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic_gpu")),
+        assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic")),
                         jax.jit(_product(groups, out_dtype, "xla")),
                         lambda seed: _operands(combination, seed), "-".join(case), seeds=SEEDS,
                         truth_fn=truth(_sizes(groups)))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
-    assert ("blockwise_fp8", "mosaic_gpu") in recorded and not unnamed, (sorted(recorded), unnamed)
+    assert ("blockwise_fp8", "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)
 
 
 def grouped(group_blocks, lhs, matrices):

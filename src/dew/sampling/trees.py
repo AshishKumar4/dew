@@ -2,9 +2,9 @@
 
 A drafter proposes a tree of candidate tokens after the row's next token, the root: several children a node,
 each a guess at the token after its parent. The target verifies every node in one pass over its cache
-(`TreeBlock`): the root and the nodes laid at the row's next cache slots in tree order, each node reading the
-row's prefix and its own ancestors alone (`TreeBlock.runs`), at the place its depth gives it
-(`TreeBlock.positions`), so each node's logits are the target's distribution after the path to it.
+(`TreeBlock`): the root and the nodes laid at the row's next cache slots in tree order, each a document
+continuing its parent's (`dew.batch.Forks`), so each node reads the row's prefix and its own ancestors alone,
+at the place its depth gives it, and its logits are the target's distribution after the path to it.
 """
 
 import dataclasses
@@ -14,6 +14,8 @@ from typing import NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from dew.batch import Coordinates, Forks, coordinates
 
 
 @dataclasses.dataclass(frozen=True)
@@ -63,12 +65,6 @@ class TreeShape:
             found[parent + 1].append(node)
         return tuple(tuple(each) for each in found)
 
-    @property
-    def fed_parents(self) -> tuple[int, ...]:
-        """Each fed token's parent among the fed tokens, the root's -1 (the row's last cached token), as a
-        cached call states its tree (`dew.nn.inputs.AttentionMetadata.tree`)."""
-        return (-1, *(parent + 1 for parent in self.parents))
-
     def ancestry(self, node: int) -> tuple[int, ...]:
         """Node `node`'s path from the root's child down to itself."""
         path = []
@@ -81,48 +77,26 @@ class TreeShape:
 class TreeBlock(NamedTuple):
     """A verify block of a tree (`TreeShape`) as the target reads it: the root and the draft nodes fed in tree
     order from each row's next cache slot `cursor` `[rows]` (its real tokens), the root at coordinate `base`
-    `[rows]`."""
+    `[rows]`. Each fed token is a document of its own continuing its parent's (`dew.batch.Forks`), the root's
+    continuing the row's cache, so each reads the row's prefix and its own ancestors alone, at the place its
+    depth gives it (`coordinates`)."""
 
     shape: TreeShape
     cursor: jax.Array
     base: jax.Array
 
-    def positions(self) -> jax.Array:
-        """Each fed token's place `[rows, 1 + N]`: the root's `base`, a node's its depth past it."""
-        depths = np.concatenate([[0], self.shape.depths])
-        return self.base[:, None] + jnp.asarray(depths)[None, :]
-
-    def key_positions(self, capacity: int | None) -> jax.Array:
-        """Each of a row's `capacity` cache slots' place `[rows, capacity]`
-        (`AttentionMetadata.key_positions`): the prefix's slots counted back from the root's place, a
-        node's slot its depth past the root's. A tree is verified over a bounded cache."""
-        assert capacity is not None, "a tree verifies over a cache of bounded capacity"
-        rows = self.cursor.shape[0]
-        slots = jnp.arange(capacity)[None, :]
-        places = self.base[:, None] - self.cursor[:, None] + slots
-        nodes = self.cursor[:, None] + 1 + jnp.arange(self.shape.nodes)[None, :]
-        depths = self.base[:, None] + jnp.asarray(self.shape.depths)[None, :]
-        return places.at[jnp.arange(rows)[:, None], nodes].set(depths, mode="drop").astype(jnp.int32)
-
-    def runs(self) -> jax.Array:
-        """Each fed token's key runs `[rows, 1 + N, R, 2]` (`AttentionMetadata.key_runs`), over the cache's
-        slots: the row's prefix and the root, `[0, cursor + 1)`, then a node's ancestors and itself a slot
-        each, `R` the deepest node's depth plus one, empty runs `[0, 0)` past a shallower one's."""
-        shape = self.shape
-        count = 1 + int(shape.depths.max())
-        # Each fed token's ancestors' offsets past the root's slot, -1 past its path.
-        offsets = np.full((shape.nodes + 1, count - 1), -1, np.int32)
-        for node in range(shape.nodes):
-            path = shape.ancestry(node)
-            offsets[1 + node, :len(path)] = 1 + np.asarray(path)
-        cursor = self.cursor[:, None, None]
-        held = jnp.asarray(offsets)[None]
-        starts = jnp.where(held >= 0, cursor + held, 0)
-        ends = jnp.where(held >= 0, cursor + held + 1, 0)
-        rows = self.cursor.shape[0]
-        prefix = jnp.stack([jnp.zeros_like(self.cursor), self.cursor + 1], -1)[:, None, None]
-        prefix = jnp.broadcast_to(prefix, (rows, shape.nodes + 1, 1, 2))
-        return jnp.concatenate([prefix, jnp.stack([starts, ends], -1)], axis=2).astype(jnp.int32)
+    def coordinates(self, valid: jax.Array) -> Coordinates:
+        """The fed tokens' layout `[rows, 1 + N]` for the cached call (`valid` its real tokens): a document a
+        token, numbered in tree order from 1, each continuing its parent's, the root's the row's cache,
+        each at the root's `base` plus its depth (`Forks.positions`)."""
+        rows, fed = valid.shape
+        segments = jnp.broadcast_to(jnp.arange(1, fed + 1, dtype=jnp.int32), (rows, fed))
+        parents = np.asarray([0, *(parent + 2 for parent in self.shape.parents)], np.int32)
+        forks = Forks(jnp.broadcast_to(jnp.asarray(parents), (rows, fed)),
+                      depth=Forks.depth_of(parents[None]))
+        laid = coordinates(segments=segments, valid=valid,
+                           positions=forks.positions(segments, self.base, valid), max_segments=fed)
+        return dataclasses.replace(laid, forks=forks)
 
 
 class TreeDraft(NamedTuple):

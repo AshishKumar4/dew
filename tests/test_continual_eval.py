@@ -70,14 +70,15 @@ def test_label_scores_refuse_a_prompt_with_no_token_to_score_a_label_from():
     the scores refuse it, where a score read from position -1, the row's last, left the first token of
     every label unscored and a one-token label scored 0 (row 3941)."""
     with pytest.raises(ValueError):
-        label_scores(lambda rows: jnp.zeros(rows.shape, jnp.float32), [[]], [[1], [2, 3]])
+        label_scores(lambda tokens, _: jnp.zeros(tokens.shape, jnp.float32), [[]], [[1], [2, 3]])
 
 
 @pytest.mark.parametrize("adapted", [False, True], ids=["plain", "in-context"])
 def test_label_scores_are_the_labels_summed_log_likelihood(adapted):
     """Each label's score after each prompt is the sum of its tokens' log-likelihoods as the objective
-    scores the row (check 1 against the float64 log-softmax of the model's logits): the plain model's, and
-    a model whose continuum level steps in context, which chooses through its steps."""
+    scores the row alone (check 1): the plain model's, each prompt computed once for its labels over
+    forks (`ForkedRows`), and a model whose continuum level steps in context, which chooses through its
+    steps, its rows each laid out alone (`shares_prefixes`)."""
     model = CausalTransformer(vocab_size=VOCAB, emb_features=8, num_layers=1, num_heads=2, head_dim=4,
                               mlp_features=16, max_seq_len=32, attention_impl="xla",
                               continuum=ContinuumLevel(hidden=4) if adapted else None)
@@ -93,7 +94,10 @@ def test_label_scores_are_the_labels_summed_log_likelihood(adapted):
                              shapes),)
 
     def scored(variables):
-        return label_scores(lambda rows: objective.token_scores(variables, rows).losses, prompts, labels)
+        assert objective.shares_prefixes() == (not adapted)
+        return label_scores(
+            lambda tokens, laid: objective.token_scores(variables, tokens, coordinates=laid).losses, prompts,
+            labels, share=objective.shares_prefixes())
 
     def literal(variables):
         # Each pair's row alone at its own length, its label's losses summed by hand.

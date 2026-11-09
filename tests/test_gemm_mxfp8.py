@@ -39,7 +39,7 @@ GROUP_BLOCKS = (1, 0, 2, 1)
 """Each group's 128-row blocks: a one-block group, an empty one, two blocks, one."""
 
 
-@pytest.mark.parametrize("kernel", ["xla", "mosaic_gpu"])
+@pytest.mark.parametrize("kernel", ["xla", "mosaic"])
 def test_an_mxfp8_grouped_product_is_its_decoded_values_product(kernel):
     """Each group's rows times its matrix, both MXFP8, through `kernel` (the template on Blackwell's
     block-scaled tensor cores interpreted as a B200's, `mosaic_gpu.gmm`'s `mx_scales`, or the decoded operands
@@ -55,7 +55,7 @@ def test_an_mxfp8_grouped_product_is_its_decoded_values_product(kernel):
     def dew(x, w):
         with generation.chosen(mxfp8=kernel):
             return gemm.mxfp8_product(gemm.MxFp8.quantized(x), gemm.MxFp8.quantized(w), blocks,
-                                      out_dtype=jnp.float32, interpret_on_cpu=kernel == "mosaic_gpu")
+                                      out_dtype=jnp.float32, interpret_on_cpu=kernel == "mosaic")
 
     def decoded(x, w, wide=jnp.float32):
         x, w = gemm.MxFp8.quantized(x).decoded(), gemm.MxFp8.quantized(w).decoded()

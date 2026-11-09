@@ -76,11 +76,11 @@ def test_an_nvfp4_product_through_the_template_is_exact(generation_name):
         return gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32, interpret_on_cpu=True)
 
     with generation.assumed(generation_name):
-        with generation.chosen(grouped_matmul="mosaic_gpu"), generation.routes() as routes:
+        with generation.chosen(grouped_matmul="mosaic"), generation.routes() as routes:
             got = jax.jit(product)(rows)
         _, pull = jax.vjp(product, rows)
         (gradient,) = pull(cotangent)
-    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic_gpu"}
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
     # The rows' gradient is exact in fp32 (small integers times powers of two) and rounds once to bfloat16.
     expected = jnp.asarray(np.asarray(cotangent, np.float64) @ values.T, jnp.float32).astype(jnp.bfloat16)

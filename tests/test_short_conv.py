@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES
+from forks_support import LAYOUTS, assert_forks_as_own_rows
 from reference_error import (
     FACTOR,
     as_given,
@@ -399,3 +400,17 @@ def test_a_document_that_enters_a_history_convolves_as_if_it_followed_it(taps):
         expected[width - kept:] = np.asarray(x[0, begin + length - kept:begin + length])
         np.testing.assert_array_equal(tails[0, number], expected, err_msg=str(number))
         begin += length
+
+
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_documents_that_continue_another_convolve_after_their_chain_as_their_own_rows_do(layout):
+    """LFM2's gated short convolution over forks (`dew.batch.Forks`) gives each document's tokens, and the
+    gradients through them, what its own row of its ancestors and itself gives (check 1;
+    `forks_support`): each convolves after its chain's last tokens (`forked_conv`), through a parent shorter
+    than the conv reads behind."""
+    from dew.nn.mixers.short_conv import GatedShortConv
+
+    mixer = GatedShortConv(emb_features=8, kernel=3)
+    variables = jax.jit(mixer.init)(jax.random.key(0), jnp.ones((1, 4, 8), jnp.float32))
+    assert_forks_as_own_rows(mixer, variables, 8, layout, "short conv")
+
