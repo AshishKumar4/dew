@@ -633,16 +633,17 @@ def _bound_walk(name: str, params, inputs: list, rule, used=None) -> list:
     return [*carry, *ys]
 
 
-def _scan_reads(params, operands: int, used) -> tuple:
+def _scan_reads(params, operands: int, used, compiling: bool = False) -> tuple:
     """Which of a scan body's outputs its `used` outputs read (`_evaluated`'s `used`, every one where None):
     a used carry or output, and every carry a read output reads back in through the next step, until none
-    is added."""
+    is added, over the spans its steps run (`_evaluated`'s: each run of static steps whole where
+    `compiling`, which reads every input of a run any of it reads, else each equation)."""
     from jax.extend.core import Var
 
     body = params["jaxpr"].jaxpr
     constants, carries = scan_groups(params, operands)
     reading = tuple([True] * len(body.outvars) if used is None else used)
-    spans = tuple((index, index + 1) for index in range(len(body.eqns)))
+    spans = _layout(body)[2] if compiling else tuple((index, index + 1) for index in range(len(body.eqns)))
     while True:
         read = {body.outvars[index] for index, kept in enumerate(reading)
                 if kept and isinstance(body.outvars[index], Var)}
@@ -673,7 +674,7 @@ def _scanned(params, inputs, given, compiling: bool = False, rule=None, used=Non
     """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time, each step's
     rule its own (`Rule.at`), its `used` outputs alone (`_scan_reads`)."""
     body = params["jaxpr"]
-    reading = _scan_reads(params, len(inputs), used)
+    reading = _scan_reads(params, len(inputs), used, compiling)
 
     def step(index, pairs):
         outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
