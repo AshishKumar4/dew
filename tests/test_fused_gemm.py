@@ -103,3 +103,29 @@ def test_a_regions_analysis_reports_what_fusing_it_would_raise():
         assert found.refused is not None and found.launch is None, found
         with pytest.raises(selection.KernelRefused):
             jax.jit(functools.partial(fused_gemm.fused, region))(x, w, sizes, bias)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("generation_name", ["sm90"])
+def test_a_fused_prologue_never_reads_the_depths_padding(generation_name):
+    """A region whose product reads a per-row scale divided by its rows (`fusible_gemm(s / x, w)`, the
+    division fused into the template's prologue) at a depth of 100, which the launch pads to whole tiles with
+    zeros: the prologue's result is zero past the call's depth (`mosaic_gpu.depth_masked`), so the region is
+    the program's, not NaN (a scale over the padding's zeros, infinities times the matrix's zero rows, where
+    the depth was padded before the prologue ran)."""
+    sizes = jnp.asarray([40, 24], jnp.int32)
+    keys = jax.random.split(jax.random.key(96), 2)
+    magnitude = jax.random.randint(keys[0], (64, 100), 1, 4)
+    x = jnp.where(jax.random.bernoulli(keys[1], shape=(64, 100)), magnitude, -magnitude).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (2, 100, 128), -3, 4).astype(jnp.bfloat16)
+    s = jnp.full((64, 1), 6.0, jnp.bfloat16)
+
+    def region(x, w, s):
+        return fused_gemm.fusible_gemm(s / x, w, sizes, interpret_on_cpu=True)
+
+    def program(x, w, s):
+        return jax.lax.ragged_dot(s / x, w, sizes, preferred_element_type=jnp.float32)
+
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
+        got = jax.jit(functools.partial(fused_gemm.fused, region))(x, w, s)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(program(x, w, s)))
