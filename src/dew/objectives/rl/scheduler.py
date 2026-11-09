@@ -877,7 +877,8 @@ class RolloutScheduler:
         home = entry.packs or entry
         width, rows = self.acquisition.width, self.acquisition.rows(len(home.tasks), self.groups)
         # Read once: each admission plans the rows from the groups' plans, never their chains again.
-        plan = planned(group.done, width, truncation=self.truncation, share=self.share)
+        plan = planned(group.done, width, truncation=self.truncation, share=self.share,
+                       first=sum(len(held.lengths) for held in home.plans))
         alone = planned_rows([plan], width)
         if alone > rows:
             raise ValueError(
