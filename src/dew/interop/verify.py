@@ -90,11 +90,14 @@ BATCH, LENGTH = 2, 12
 _DRAWN = (8, 16)
 """Each of check 1's draws of the logits' token grid (`logits_parity`), as a test's `model_draw` draws:
 past LENGTH, so a window the probe tells conventions apart by is applied on every draw."""
-_GRADIENT_DRAWN = (128, 4)
+_GRADIENT_DRAWN = (2048, 4)
 """Each of check 1's draws of the gradients' token grid (`gradient_parity`): many short sequences, so a
 gradient summed over the draw is filled, and a recurrence's backward, which carries one rounding event
 along a sequence into every parameter, sums over enough independent sequences for its error to size
-(Falcon-H1's mamba sizes at 128 x 4, not at 64 x 8 nor 8 x 16)."""
+(Falcon-H1's mamba sizes at 128 x 4, not at 64 x 8 nor 8 x 16). Its draws' error is heavy-tailed even
+so, a few draws' Mamba-2 backward putting Dew 2 to 8 times its source on a layer's projections where it
+is half the source's on the rest: the draws' log ratios spread 0.52 at 128 x 4 tokens, 0.44 at 512 x 4
+and 0.30 at 2048 x 4, under the 0.4 check 1's tail test sees at (FS-4863-FALCON-DRAWN512, -2048)."""
 
 _HEAD_DIM = 16
 _VOCAB = 256
