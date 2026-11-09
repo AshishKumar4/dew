@@ -312,7 +312,7 @@ def _alike(first, second, shape, other) -> bool:
             and all(same(x.params[key], y.params[key]) for key in x.params)
             and all(same(u, v) for u, v in zip(x.invars, y.invars, strict=True)
                     if isinstance(u, jax.extend.core.Literal) or isinstance(v, jax.extend.core.Literal))
-            for x, y in zip(a.eqns, b.eqns))
+            for x, y in zip(a.eqns, b.eqns, strict=True))
 
     def programs(a, b) -> bool:
         return (len(a.consts) == len(b.consts)
