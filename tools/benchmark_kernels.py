@@ -5,8 +5,10 @@ mark, so a row is one process.
 
 - `projection`: `dew.nn.moe.expert_projection` forward and forward plus
   backward, at lm-moe's shape (8192 rows, 8 experts, bf16 compute, Dirichlet
-  routing), against a float64 oracle of the rounded operands; with
-  `--against`, the implementation against another in role-swapped pairs
+  routing), against a float64 oracle of the rounded operands, its grouped
+  matmul the selector's own (`--kernel auto`) or one of its kernels by name
+  (`generation.chosen(grouped_matmul=...)`: 'mosaic', 'triton', 'cutlass',
+  'xla'); with `--against`, that kernel against another in role-swapped pairs
   (`dew.telemetry.benchmark.compared`), each call at the next of a pool of
   routings, with its own A/A, which is the comparison to read across arms.
 - `adam`: one AdamW update over the lm-dense parameter tree, fp32, bf16 or
@@ -18,9 +20,8 @@ mark, so a row is one process.
 The docs/performance.md section "Kernel choices per generation" was measured
 with these commands, for example:
 
-    PYTHONPATH=src python tools/benchmark_kernels.py projection --implementation pallas
-    PYTHONPATH=src python tools/benchmark_kernels.py projection --implementation mosaic_gpu \\
-        --against cutlass
+    PYTHONPATH=src python tools/benchmark_kernels.py projection --kernel triton
+    PYTHONPATH=src python tools/benchmark_kernels.py projection --kernel mosaic --against cutlass
     PYTHONPATH=src python tools/benchmark_kernels.py adam --state-dtype bfloat16
     PYTHONPATH=src python tools/benchmark_kernels.py step --path lm-moe --batch 4 \\
         --implementation auto --state-dtype bfloat16
@@ -38,6 +39,7 @@ import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
+from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
 from dew.optim import OptimConfig
@@ -69,28 +71,56 @@ def routed(rng: np.random.Generator, rows: int, experts: int) -> np.ndarray:
     return sizes
 
 
-def projections(implementation: str) -> tuple:
-    """`implementation`'s expert projection compiled as the forward alone and as the forward plus backward
-    of the product's sum against a cotangent, each called as `(x, kernel, group_sizes, ...)`."""
+KERNELS = tuple(kernel.name for kernel in grouped_matmul.GROUPED.kernels)
+"""The grouped matmul's kernels a projection names (`--kernel`, `--against`), besides the selector's own
+('auto')."""
+
+
+def kernel_name(name: str) -> str:
+    """`name`, an argument naming a grouped matmul's kernel or 'auto', refused where it names neither."""
+    if name != "auto" and name not in KERNELS:
+        raise argparse.ArgumentTypeError(f"{name!r} is no grouped matmul kernel: auto, {', '.join(KERNELS)}")
+    return name
+
+
+def projections(kernel_named: str) -> tuple:
+    """The expert projection (its 'auto' implementation, the kernels where they take the call) through the
+    grouped matmul's kernel `kernel_named` (`generation.chosen`; the selector's own for 'auto'), compiled as
+    the forward alone and as the forward plus backward of the product's sum against a cotangent, each called
+    as `(x, kernel, group_sizes, ...)`: compiled under the choice, as a choice reads at trace time."""
+    def chosen():
+        # A choice a call at a time: a choice is a context manager, entered once.
+        if kernel_named == "auto":
+            return generation.chosen()
+        return generation.chosen(grouped_matmul=kernel_named)
+
     # Arrays are arguments, not closures: `program` keeps each function it compiled.
     def project(x, kernel, group_sizes):
-        return jnp.asarray(expert_projection(x, kernel, group_sizes, jnp.bfloat16, implementation, None))
+        return jnp.asarray(expert_projection(x, kernel, group_sizes, jnp.bfloat16, "auto", None))
 
     def loss(x, kernel, group_sizes, cotangent):
         return jnp.sum(project(x, kernel, group_sizes).astype(jnp.float32) * cotangent.astype(jnp.float32))
 
-    return program(project), program(jax.value_and_grad(loss, argnums=(0, 1)))
+    forward, both = program(project), program(jax.value_and_grad(loss, argnums=(0, 1)))
+
+    def under_choice(function):
+        def called(*arguments):
+            with chosen():
+                return function(*arguments)
+        return called
+
+    return under_choice(forward), under_choice(both)
 
 
 def paired(args: argparse.Namespace, x, kernel, cotangent) -> dict[str, object]:
-    """`args.implementation` against `args.against` in `args.pairs` role-swapped pairs (`compared`) for the
+    """`args.kernel` against `args.against` in `args.pairs` role-swapped pairs (`compared`) for the
     forward and the forward plus backward, every call at the next of `ROUTINGS` routings: the median ratio of
     the first's seconds to the second's, its interval, and the second's against itself (its A/A). Its cache
     state: each arm compiled and warmed before its pairs, and no flush between calls, so a call reads
     whatever of its operands the call before it left in L2."""
     pool = [jnp.asarray(routed(np.random.default_rng(seed), args.rows, args.experts))
             for seed in range(ROUTINGS)]
-    arms = [projections(implementation) for implementation in (args.implementation, args.against)]
+    arms = [projections(name) for name in (args.kernel, args.against)]
     result: dict[str, object] = {"against": args.against, "routings": ROUTINGS,
                                  "cache": {"compile": "warm", "l2": "unflushed"}}
     for index, (name, extra) in enumerate((("forward", ()), ("forward_backward", (cotangent,)))):
@@ -112,7 +142,7 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     kernel = jnp.asarray(rng.normal(size=(experts, width, features)) / np.sqrt(width), jnp.float32)
     cotangent = jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16)
     group_sizes = jnp.asarray(sizes)
-    forward, both = projections(args.implementation)
+    forward, both = projections(args.kernel)
     output = np.asarray(forward(x, kernel, group_sizes), np.float64)
     _, (dx, dk) = both(x, kernel, group_sizes, cotangent)
     oracle, dx_oracle, dk_oracle = grouped_oracle.products(x, kernel.astype(jnp.bfloat16), cotangent, sizes)
@@ -120,7 +150,7 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     def relative(value, reference):
         return float(np.abs(np.asarray(value, np.float64) - reference).max() / np.abs(reference).max())
 
-    result = {"implementation": args.implementation, "shape": [rows, width, features, experts],
+    result = {"kernel": args.kernel, "shape": [rows, width, features, experts],
               "groups": sizes.tolist(), "forward": timed(forward, (x, kernel, group_sizes), args.repeats),
               "forward_backward": timed(both, (x, kernel, group_sizes, cotangent), args.repeats),
               "forward_error": relative(output, oracle), "input_gradient_error": relative(dx, dx_oracle),
@@ -215,15 +245,16 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     modes = parser.add_subparsers(dest="mode", required=True)
     project = modes.add_parser("projection")
-    project.add_argument("--implementation", default="auto")
+    project.add_argument("--kernel", type=kernel_name, default="auto",
+                         help="the grouped matmul's kernel by name, or the selector's own (auto)")
     project.add_argument("--shape", choices=("up", "down"), default="up")
     project.add_argument("--rows", type=int, default=8192, help="routed tokens, each top-k choice a row")
     project.add_argument("--experts", type=int, default=8)
     project.add_argument("--width", type=int, default=768, help="the model width an up projection reads")
     project.add_argument("--features", type=int, default=2048, help="the expert width it writes")
     project.add_argument("--repeats", type=int, default=50)
-    project.add_argument("--against", default=None,
-                         help="an implementation to compare against in role-swapped pairs")
+    project.add_argument("--against", type=kernel_name, default=None,
+                         help="a grouped matmul kernel to compare against in role-swapped pairs")
     project.add_argument("--pairs", type=int, default=400, help="the paired comparison's pairs")
     update = modes.add_parser("adam")
     update.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32")
