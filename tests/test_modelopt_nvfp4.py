@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import stored_codec
 
 from dew.interop import codecs
 from dew.interop.safetensors_io import read_weights
@@ -25,10 +26,7 @@ def checkpoint():
 
 def test_modelopt_weights_match_its_own_reader_of_the_same_files(checkpoint):
     directory, reference = checkpoint
-    stored = read_weights(directory)
-    codec = codecs.source_quantization(json.loads((directory / "config.json").read_text()))
-    assert codec is not None
-    assert len(codec.names(stored)) == 7
+    stored, codec = stored_codec(directory)
     for name in codec.names(stored):
         expected = reference[name.removesuffix(".weight") + "/weight"]
         np.testing.assert_array_equal(codec.decode(stored, name).view(np.uint32), expected.view(np.uint32))
@@ -45,8 +43,11 @@ def test_modelopt_input_arithmetic_matches_its_own_fake_quantizer_in_every_bit(c
                                     format="modelopt")
         actual = jax.jit(lambda x, spec=spec: nvfp4_input_qdq(x, spec))(jnp.asarray(reference[key], dtype))
         suffix = "/qdq" if dtype == jnp.float32 else "/qdq_bf16"
-        np.testing.assert_array_equal(np.asarray(actual, np.float32).view(np.uint32),
-                                      reference[stem + suffix].view(np.uint32), err_msg=stem)
+        # Every bit, a zero's sign aside: ModelOpt's compiled kernel gives -0 or +0 for a zero code by how it
+        # is compiled (adding +0 maps -0 to +0 and leaves every other value as it is).
+        np.testing.assert_array_equal((np.asarray(actual, np.float32) + np.float32(0)).view(np.uint32),
+                                      (reference[stem + suffix] + np.float32(0)).view(np.uint32),
+                                      err_msg=stem)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])

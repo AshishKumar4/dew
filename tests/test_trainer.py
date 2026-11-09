@@ -791,9 +791,9 @@ def test_native_frozen_variables_train_save_and_resume_as_plain_ones(tmp_path):
 
 def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
     """A step is Orbax PyTree items, its model and the rest of its state: Orbax's own manager reads the
-    state's fields by name, the PRNG key as a key, and an EMA leaf the metadata
-    lists as byte planes decodes to the run's average bit for bit, as the
-    checkpoint guide says."""
+    state's fields by name, the PRNG key as its key data, which the implementation the step records
+    (`custom["keys"]`) wraps back into the run's key, and an EMA leaf the metadata lists as byte
+    planes decodes to the run's average bit for bit, as the checkpoint guide says."""
     import orbax.checkpoint as ocp
 
     trainer, _, _ = held_lm_trainer(checkpoints=Checkpoints(str(tmp_path)))
@@ -811,10 +811,13 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
     read = manager.restore(manager.latest_step(), args=ocp.args.Composite(**{
         name: ocp.args.PyTreeRestore() for name in items}))
     tree = {name: value for item in items for name, value in dict(read[item]).items()}
-    deltas = manager.metadata(manager.latest_step()).custom_metadata["deltas"]["ema"]
+    custom = manager.metadata(manager.latest_step()).custom_metadata
+    deltas = custom["deltas"]["ema"]
     assert int(tree["step"]) == int(state.step) == 2
-    assert jnp.issubdtype(tree["key"].dtype, jax.dtypes.prng_key)
-    np.testing.assert_array_equal(jax.random.key_data(tree["key"]), jax.random.key_data(state.key))
+    (impl,) = custom["keys"].values()
+    key = jax.random.wrap_key_data(tree["key"], impl=impl)
+    assert key.dtype == state.key.dtype
+    np.testing.assert_array_equal(jax.random.key_data(key), jax.random.key_data(state.key))
     for got, want in zip(jax.tree.leaves(tree["variables"]), jax.tree.leaves(state.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     weights = {jax.tree_util.keystr(path): np.asarray(leaf)

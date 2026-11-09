@@ -28,6 +28,7 @@ from dew._records import JSON, integer, json_value, record
 from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name, written
 from dew.data.dataset import Ranges, Records
+from dew.data.handoff import _threads
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
@@ -37,7 +38,6 @@ from dew.data.lowering import (
     _Locality,
     _outputs,
     _packed,
-    _threads,
     _TokenSplit,
 )
 from dew.data.mixing import CorpusCounts
