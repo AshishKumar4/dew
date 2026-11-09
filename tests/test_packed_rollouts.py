@@ -8,6 +8,7 @@ positions alone and compared with that structure.
 
 import numpy as np
 import pytest
+from reference_error import assert_fp32_reduction_bound
 
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
@@ -31,6 +32,7 @@ from dew.objectives.rl.sessions import (
     sampled_values,
     session_metrics,
 )
+from dew.rl.advantage import GROUP_EPS
 
 
 def _ids(rng, count):
@@ -130,7 +132,8 @@ def test_strict_merge_follows_append_only_history_and_splits_on_any_rewrite(seed
     # Session weights give each trainable rollout unit mass.
     for index in range(len(rollouts)):
         mine = batch[SESSION_INDEX_KEY] == index
-        assert batch[SESSION_WEIGHTS_KEY][mine].sum() == pytest.approx(1.0)
+        weights = batch[SESSION_WEIGHTS_KEY][mine]
+        assert_fp32_reduction_bound(weights.sum(), 1.0, np.sum(np.abs(weights)), weights.size)
         # Per session, every call takes the session's advantage, as every id of its chains.
         [value] = set(advantages(rollouts)[index].tolist())
         assert (batch[ADVANTAGES_KEY][mine] == np.float32(value)).all()
@@ -161,14 +164,18 @@ def test_the_truncation_policy_decides_whether_a_truncation_trains_and_on_what_r
                 Session("t", "g", 1, 0, (call,), Status.AGENT_ERROR, 0.0),
                 Session("t", "g", 2, 0, (call,), Status.TRUNCATED, 5.0),
                 Session("t", "g", 3, 0, (call,), Status.INFRA_ERROR, None)]
-    np.testing.assert_allclose(np.concatenate(advantages(sessions, "mean", truncation=truncation)), expected,
-                               rtol=1e-6)
+    # Each trained reward less its group's float32 mean: a mean of n rewards and one difference, each
+    # rounding within float32's reduction bound of every reward's magnitude.
+    rewards = [1.0, 0.0, 5.0]
+    assert_fp32_reduction_bound(np.concatenate(advantages(sessions, "mean", truncation=truncation)), expected,
+                                2 * sum(map(abs, rewards)), len(rewards) + 1)
     batch = pack(sessions, 3, estimator="mean", truncation=truncation)
     trained = {0, 1} if truncation == "mask" else {0, 1, 2}
     assert set(np.unique(batch[SESSION_INDEX_KEY][batch[RESPONSE_MASK_KEY] > 0])) == trained
     assert packed_rows(sessions, 3, truncation=truncation) == batch[IDS_KEY].shape[0]
     metrics = session_metrics(sessions, batch, truncation=truncation)
-    assert metrics["reward/mean"] == pytest.approx({"mask": .5, "score": 2.0, "zero": 1 / 3}[truncation])
+    # The trained rewards' float64 mean, as their sum over their count: exactly these quotients.
+    assert metrics["reward/mean"] == {"mask": 1 / 2, "score": 6 / 3, "zero": 1 / 3}[truncation]
     assert ("masked/truncated" in metrics) == (truncation == "mask")
 
 
@@ -192,18 +199,19 @@ def test_session_metrics_report_merge_masking_reward_latency_and_lag():
     ]
     batch = pack(rollouts, 8)
     metrics = session_metrics(rollouts, batch, latencies=[1.0, 2.0, 3.0, 40.0], version=6)
-    assert metrics["merge/calls_per_chain"] == pytest.approx(4 / 3)
+    # Counts' quotients, which Python's float division rounds as the literal's does.
+    assert metrics["merge/calls_per_chain"] == 4 / 3
     # A group's prompt laid once is no chain of its own.
     shared = session_metrics(rollouts, pack(rollouts, 8, share=True), latencies=[1.0, 2.0, 3.0, 40.0],
                              version=6)
-    assert shared["merge/calls_per_chain"] == pytest.approx(4 / 3)
+    assert shared["merge/calls_per_chain"] == 4 / 3
     assert metrics["status/completed"] == metrics["status/truncated"] == .25
-    assert metrics["masked/truncated"] == pytest.approx(1 / 9)
-    assert metrics["masked/infra_error"] == pytest.approx(3 / 9)
+    assert metrics["masked/truncated"] == 1 / 9
+    assert metrics["masked/infra_error"] == 3 / 9
     assert metrics["reward/mean"] == .5
     assert metrics["reward/component/tests"] == .5
     assert metrics["latency/max"] == 40.0 and metrics["latency/p50"] == 2.5
-    assert metrics["lag/max"] == 2 and metrics["lag/mean"] == pytest.approx((2 + 1 + 1 + 2 + 1) / 5)
+    assert metrics["lag/max"] == 2 and metrics["lag/mean"] == (2 + 1 + 1 + 2 + 1) / 5
 
 
 def test_group_advantages_match_hand_computed_values_across_uneven_groups():
@@ -216,12 +224,19 @@ def test_group_advantages_match_hand_computed_values_across_uneven_groups():
                 Session("a", "g", 3, 0, (call,), Status.INFRA_ERROR, None),
                 Session("b", "g", 0, 0, (call,), Status.COMPLETED, 0.0),
                 Session("b", "g", 1, 0, (call,), Status.COMPLETED, 1.0)]
-    expected = [0.57735, -1.15470, 0.57735, 0.0, -0.70711, 0.70711]
-    np.testing.assert_allclose(np.concatenate(advantages(rollouts)), expected, atol=1e-4)
+    # Group a trains on 1, 0, 1: mean 2/3, deviation sqrt(1/3); group b on 0, 1: mean 1/2, deviation
+    # sqrt(1/2); each over its deviation plus GROUP_EPS. Each value rounds in float32 through its group's
+    # mean and variance (n terms each), a root, the epsilon's sum, a difference and a quotient: within
+    # float32's bound over 2n + 4 roundings of its magnitude.
+    a, b = np.sqrt(1 / 3) + GROUP_EPS, np.sqrt(1 / 2) + GROUP_EPS
+    expected = np.asarray([(1 / 3) / a, (-2 / 3) / a, (1 / 3) / a, 0.0, (-1 / 2) / b, (1 / 2) / b])
+    terms = np.asarray([10, 10, 10, 1, 8, 8])
+    found = np.concatenate(advantages(rollouts))
+    assert_fp32_reduction_bound(found, expected, np.abs(expected), terms)
     batch = pack(rollouts, 3)
-    for index, value in enumerate(expected):
+    for index, value in enumerate(found):
         mine = batch[SESSION_INDEX_KEY] == index
-        np.testing.assert_allclose(batch[ADVANTAGES_KEY][mine], value, atol=1e-4)
+        assert (batch[ADVANTAGES_KEY][mine] == value).all()
 
 
 def test_groups_planned_apart_count_the_rows_their_batch_packs_in():

@@ -481,10 +481,6 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_packed_rollouts.py": {
-   "comparisons": 9,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_parallelism.py": {
    "comparisons": 6,
    "lane": "Training"
