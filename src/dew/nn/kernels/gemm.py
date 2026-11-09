@@ -267,8 +267,8 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
             # No launch reads the rows where they lie (an fp32 call's, which only Mosaic GPU's gathering
             # producer would): the rows gathered first, the grouped launches taking the product, never XLA's
             # ragged dot over every group's matrix (row 5213's, as `_gemm`'s).
-            return kernel(*gathered(lhs, rhs, tables), group_sizes, prologue_arrays, (None, None),
-                          interpret=interpret)
+            rows, columns = gathered(lhs, rhs, tables)
+            return kernel(rows, columns, group_sizes, prologue_arrays, (None, None), interpret=interpret)
         return portable(lhs, rhs, group_sizes, prologue_arrays, tables)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, tables):
@@ -286,7 +286,14 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # made the GPU's product an fp32 one (an sm120's 4096-token gate_up weight gradient 5.91 ms against
         # 2.72 for the bf16 product).
         # A sum over rows an Explicit axis splits lands whole (`ragged_placement`), the depth and width placed
-        # as the rows' and the cotangent's columns are.
+        # as the rows' and the cotangent's columns are. A dense call's is XLA's own dot over the rows, as the
+        # forward's (`grouped_matmul.xla_dot`): its ragged dot of one group took an A100's gate_up weight
+        # gradient 470 ms against the template's 11.4 (W121-a100), where DENSE1 timed XLA's dot.
+        if dense:
+            return jax.lax.dot_general(
+                lhs, rhs.astype(lhs.dtype), (((0,), (0,)), ((), ())), precision=precision,
+                preferred_element_type=wide,
+                out_sharding=grouped_matmul.ragged_placement(((lhs, 1), (rhs, 1))))[None].astype(out_dtype)
         return jax.lax.ragged_dot_general(
             lhs, rhs.astype(lhs.dtype), group_sizes, _CONTRACTED_ROWS,
             precision=precision, preferred_element_type=wide,
