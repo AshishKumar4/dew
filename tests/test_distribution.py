@@ -120,9 +120,15 @@ def test_a_pool_caches_by_default_only_where_its_processes_share_the_directory(t
                   str(tmp_path / "home"), str(out), "shared" if shared else "apart", devices=1, timeout=150)
     assert done.returncode == 0, done.stdout + done.stderr
     directories = [json.loads(path.read_text()) for path in sorted(out.iterdir())]
+    if not shared:
+        assert directories == [None] * 2
+        return
+    # One directory both read, under the user's cache: this Python's, and its CUDA plugins' builds where it
+    # has any (`dew._cache`'s default).
     minor = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    expected = str(tmp_path / "home" / "dew" / "xla" / minor) if shared else None
-    assert directories == [expected] * 2
+    held = Path(directories[0])
+    assert directories == [str(held)] * 2
+    assert held.parent == tmp_path / "home" / "dew" / "xla" and held.name.startswith(minor)
 
 
 def test_hybrid_sharding_groups_hosts_into_replicas_and_trains_like_fsdp(tmp_path, reference):
