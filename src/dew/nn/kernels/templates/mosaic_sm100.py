@@ -366,9 +366,11 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
     issues_in_consumers = False
 
-    counts_hooks = False  # its model is an epilogue chunk's accumulator alone (`chunk_columns`)
-
     takes_pairs = False
+
+    # Eight stages spilled 16 bytes at every cap to 224 where two to six held at 64-80 registers, a
+    # 128 x 64 x 64 kernel gradient's, split or not (the GEMM compile gate's caps, EM-s8).
+    most_stages = 6
 
     takes_register_left = False
 
@@ -402,6 +404,15 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
     def chunk_columns(self, columns: int) -> int:
         return min(columns, CHUNK_COLUMNS)
+
+    def column_registers(self, columns: int, dtype) -> int:
+        # An epilogue chunk's columns of a vector in the epilogue's layout (`STORED`, `TCGEN05_COL_LAYOUT`:
+        # warpgroup MMA's column layout, two of each eight columns a thread), so a quarter of the chunk's.
+        return -(-self.chunk_columns(columns) * jnp.dtype(dtype).itemsize // 16)
+
+    def row_registers(self, rows: int, dtype) -> int:
+        # Each warp's 32 rows over its eight row lanes (`TCGEN05_ROW_LAYOUT`), a thread four of them.
+        return -(-rows * jnp.dtype(dtype).itemsize // 128)
 
     def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
         # Each chunk's columns read from each accumulator's tensor memory (`read`) as its consumer asks for

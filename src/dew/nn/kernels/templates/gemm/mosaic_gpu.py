@@ -983,7 +983,8 @@ def _finished(*accs, family: mosaic.Family, wg, epilogue, o_gmems: tuple, store,
     for start, chunk in family.chunks(accs):
         columns = {'columns': slice(start, start + chunk[0].shape[-1])}
         values = chunk if epilogue is None else epilogue(*chunk, *(
-            axes.by_rows(smem.at[wg].at[axes.placed(axes.held(side_axes), columns)][...], side_axes, rows)
+            axes.by_rows(family.side_tile(smem.at[wg].at[axes.placed(axes.held(side_axes), columns)],
+                                          axes.held(side_axes)), side_axes, rows)
             for _, side_axes, smem, _ in sides))
         values = values if isinstance(values, tuple) else (values,)
         for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
