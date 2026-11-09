@@ -1,0 +1,25 @@
+{
+ "sha": "95ce9f8567c9b9d2852cf4388265f7057579dc38",
+ "items": [
+  {
+   "item": "tests/test_algebra_fusion.py",
+   "green": true,
+   "why": "3 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra_fusion.py": "passed"
+   },
+   "tail": ".................................                                        [100%]\n=============================== warnings summary ===============================\ntests/test_algebra_fusion.py: 418 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 468 programs fetched (5.8 MB read), 1 bundles uploaded (5.9 MB)\n33 passed, 65 deselected, 418 warnings in 57.97s\nrun_tests: {\"tests\": 33, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 33, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_algebra.py",
+   "green": true,
+   "why": "30 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra.py": "passed"
+   },
+   "tail": "..............................                                           [100%]\n=============================== warnings summary ===============================\ntests/test_algebra.py: 25 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\ntests/test_algebra.py::test_each_rewrites_right_side_holds_check_2\n  /home/ci/work/dew/dew/tests/op_certificates.py:195: RuntimeWarning: overflow encountered in nextafter\n    return np.nextafter(x, np.full(x.shape, direction, dtype)).astype(np.float64)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 6623 programs fetched (27.2 MB read), 0 bundles uploaded (0.0 MB)\n30 passed, 26 warnings in 33.15s\nrun_tests: {\"tests\": 30, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 30, \"cases\": {}}\n"
+  }
+ ]
+}

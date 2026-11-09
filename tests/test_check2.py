@@ -309,14 +309,22 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
 
 
 def test_an_integer_division_is_held_at_every_64_bit_magnitude():
-    """An integer division truncates toward zero and wraps to its width: int64's least value, -2^63, over 3
-    is -3074457345618258602, and uint64's values past 2^63 divide as themselves, each held as XLA computes
-    it (row 1966's head review)."""
+    """An integer division truncates toward zero and wraps to its width, and its remainder takes the
+    dividend's sign: int64's least value, -2^63, over 3 is -3074457345618258602, over -1 itself, uint64's
+    values past 2^63 divide as themselves, and a division by zero is every bit set and its remainder the
+    dividend, each held as XLA computes it (row 1966's head review); so a program guarding its division
+    (`where(n > 0, total // n, 0)`, which computes both sides) holds check 2."""
     with jax.enable_x64(new_val=True):
-        signed = (np.int64([-(2 ** 63), -(2 ** 63), 7, -7, 2 ** 63 - 1]), np.int64([3, -3, -2, 2, -1]))
-        unsigned = (np.uint64([2 ** 64 - 1, 2 ** 63 + 5]), np.uint64([3, 2]))
-        for operands in (signed, unsigned):
+        least = -(2 ** 63)
+        signed = (np.int64([least, least, least, 7, -7, 2 ** 63 - 1, 5, -5, least]),
+                  np.int64([3, -3, -1, -2, 2, -1, 0, 0, 0]))
+        unsigned = (np.uint64([2 ** 64 - 1, 2 ** 63 + 5, 9]), np.uint64([3, 2, 0]))
+        narrow = (np.int32([-(2 ** 31), 5, -5, 0]), np.int32([-1, 0, 0, 0]))
+        for operands in (signed, unsigned, narrow):
             assert ct.certified(jax.lax.div, *operands)[1] == [], operands
+            assert ct.certified(jax.lax.rem, *operands)[1] == [], operands
+    totals, counts = np.int32([12, 7, -9, 0]), np.int32([4, 0, 2, 0])
+    assert ct.certified(lambda total, n: jnp.where(n > 0, total // n, 0), totals, counts)[1] == []
 
 
 def _first_equation(fn, operands, name):

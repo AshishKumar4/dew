@@ -418,17 +418,29 @@ def _arithmetic(build):
 
 def _truncated(result, dividend, divisor):
     """An integer division's quotient as `lax.div` gives it, truncated toward zero, wrapped to the result's
-    width."""
+    width; by zero every bit set (-1 signed), as XLA defines it (its elemental emitter's integer division:
+    `x / 0 == -1`, `INT_MIN / -1 == INT_MIN`, the latter the wrap)."""
     dtype = np.asarray(result).dtype
     dividends, divisors = (np.asarray(value).ravel().tolist()
                            for value in np.broadcast_arrays(dividend, divisor))
     # Python's integers hold every magnitude (int64's -2**63, uint64's past 2**63) exactly; the quotient wraps
     # to the result's width once.
     bits = 8 * dtype.itemsize
-    quotients = [((abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1)) % (1 << bits) if b else 0
+    quotients = [((abs(a) // abs(b)) * (-1 if (a < 0) != (b < 0) else 1) if b else -1) % (1 << bits)
                  for a, b in zip(dividends, divisors, strict=True)]
     return np.asarray(quotients, np.uint64 if bits == 64 else np.int64).astype(dtype).reshape(
         np.shape(result))
+
+
+def _remainder(dividend, divisor):
+    """A remainder as `lax.rem` gives it, the dividend's sign; an integer one by zero the dividend and by -1
+    zero, as XLA defines them (its elemental emitter's: `x % 0 == x`, `INT_MIN % -1 == 0`)."""
+    if not np.issubdtype(np.result_type(dividend, divisor), np.integer):
+        return np.fmod(dividend, divisor)
+    dividend, divisor = np.broadcast_arrays(dividend, divisor)
+    defined = (divisor != 0) & (divisor != -1)
+    remainders = np.fmod(dividend, np.where(defined, divisor, 1))
+    return np.where(divisor == 0, dividend, np.where(defined, remainders, 0))
 
 
 def _rounding(name: str, integral):
@@ -967,7 +979,7 @@ CONTRACTS = {
     "div": _rounding("div", _truncated),
     # A remainder (C's, the dividend's sign) is exact in IEEE arithmetic and in integers, and a sign is a
     # sign operation, each kept zero's sign: bit for bit.
-    "rem": _moved(lambda params, a, b: np.fmod(a, b)),
+    "rem": _moved(lambda params, a, b: _remainder(a, b)),
     "sign": _moved(lambda params, a: np.where(a == 0, a, np.sign(a))),
     "sqrt": _rounding("sqrt", None),
     "neg": _moved(lambda params, a: -a),
