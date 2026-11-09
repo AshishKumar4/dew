@@ -221,13 +221,9 @@ def connected(path, payload):
 
 
 def sent(client, payload):
-    """`payload` sent on a guest's connected `client`, and its lines, as the site's client sends it
-    (model_client.request): the service refuses a guest as it accepts its connection, writing why and closing
-    it, so the send may find it closed, and the refusal is read all the same."""
-    import json
-
-    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-        client.sendall(json.dumps(payload).encode() + b"\n")
+    """`payload` sent on a guest's connected `client` by the site's own client (`model_client.sent`), and its
+    lines."""
+    load("model_client", "site/live/container").sent(client, payload)
     return client, client.makefile()
 
 
