@@ -387,6 +387,9 @@ class Launch:
     producer: int | None = None
     """The registers its producer role is lowered to where its issue loop holds more than the family's
     least (`Family.roles`; None: `producer_floor`), as its schedule runs it."""
+    entry: int = 0
+    """The registers a thread of its program launches with at least (`entry_registers`), whatever its roles'
+    raises: ptxas assembles its products within the program's launch share (`Issuer.entry_floor`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -584,6 +587,9 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
                 and launch.registers > family.registers(launch.consumers, producer=launch.producer)):
             return None
         most = family.programs(launch.consumers, launch.registers, launch.producer)
+        while most and family.budgets_registers and entry_registers(
+                family.warpgroups(launch.consumers), most) < launch.entry:
+            most -= 1
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
         order = hidden(family, launch.consumers)
         found = None
