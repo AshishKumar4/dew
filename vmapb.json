@@ -1,0 +1,35 @@
+{
+ "sha": "b96ddf179358e11527d307cfcbd0e79b7cb6c20e",
+ "items": [
+  {
+   "item": "tests/test_algebra_fusion.py",
+   "green": true,
+   "why": "4 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra_fusion.py": "passed"
+   },
+   "tail": ".........................                                                [100%]\n=============================== warnings summary ===============================\ntests/test_algebra_fusion.py: 426 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 470 programs fetched (7.5 MB read), 1 bundles uploaded (5.9 MB)\n25 passed, 74 deselected, 426 warnings in 35.26s\nrun_tests: {\"tests\": 25, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 25, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_algebra.py",
+   "green": true,
+   "why": "30 passed in a green run of exactly these inputs, reused from the test cache",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra.py": "passed"
+   },
+   "tail": "1 files ran green on these inputs on AuthenticAMD-25-17, AuthenticAMD-26-17; their rows are reused\nrun_tests: {\"tests\": 30, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 30, \"cases\": {}, \"reused\": true}\n"
+  },
+  {
+   "item": "tests/test_algebra_program.py",
+   "green": true,
+   "why": "80 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra_program.py": "passed"
+   },
+   "tail": "........................................................................ [ 90%]\n........                                                                 [100%]\n=============================== warnings summary ===============================\ntests/test_algebra_program.py: 106 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 5372 programs fetched (29.6 MB read), 0 bundles uploaded (0.0 MB)\n80 passed, 106 warnings in 34.62s\nrun_tests: {\"tests\": 80, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 80, \"cases\": {}}\n"
+  }
+ ]
+}
