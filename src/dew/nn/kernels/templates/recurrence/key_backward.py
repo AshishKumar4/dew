@@ -359,14 +359,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
         pairs, squares, gated_rows, referenced = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        keyed = h // call.group * width
-        views = {**stream_views(lambda i: (0, 0), scores=square.views(ds_ref, row, chunk, h * chunk, chunk),
-                                system=square.views(da_ref, row, chunk, h * chunk, chunk)),
-                 **stream_views(lambda i: (0, i),
-                                queries=given.views(q_ref, row, chunk, keyed, width),
-                                keys=given.views(k_ref, row, chunk, keyed, width),
-                                gates=gates.views(hi_ref, row, chunk, h * width, width),
-                                lows=gates.views(lo_ref, row, chunk, h * width, width))}
+        views = own_pairs.pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref)
 
         def step(index, slots, d_betas, accumulators):
             # Every slot acquired in the step's own trace: the rolled sub-chunks read them.
@@ -409,11 +402,9 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
                 reference, Issuer(call, {"pairs": list(pairs)}).summed, staged, chunk=chunk,
                 emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad))
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
-            for ref, grad in ((dq_ref, d_query), (dk_ref, d_keyed * betas[:, None] + d_key),
-                              (dg_ref, query * d_query + key * (d_keyed * betas[:, None] - d_key))):
-                square.store(ref, grad, row, chunk, h * width + index * keys, keys, family=family,
-                             smem=landing["block"])
-            d_betas = d_betas + jnp.sum(d_keyed * key, axis=1)
+            d_betas = d_betas + own_pairs.pairs_back_stored(
+                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
+                (query, key, betas), (d_query, d_keyed, d_key))
 
             @pl.when(index == steps - 1)
             def _():
