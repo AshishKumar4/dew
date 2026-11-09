@@ -611,16 +611,15 @@ def _derived_and_refused(launch, ba, target) -> tuple:
     return config, list(refused.values())
 
 
-def _emitted_forms(family, shape: str | None = None) -> set[str]:
+def _emitted_forms(family) -> set[str]:
     """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `EXACT_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`):
     none without a bundle, the exactly summed ones where its register model counts a running sum
     (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the
     paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
     take FP8 (`Family.takes_fp8`); where its consumers do not issue their products, none whose step prepares
     them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
-    first, an exactly summed step takes its product apart);
-    at a projection `shape`, each whose output's width steps by the family's column unit and whose
-    contraction steps by its narrowest depth (`Family.column_unit`, `Family.depths`)."""
+    first, an exactly summed step takes its product apart); at every projection, its widths padded to whole
+    tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
     if family is None:
         return set()
     paired = family.takes_pairs and (family.counts_hooks or not family.feeds_itself)
@@ -631,21 +630,7 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
         # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`).
         forms = {form for form in forms
                  if form.startswith("dense") or ("kernel gradient" not in form and form not in EXACT_FORMS)}
-    if shape is None:
-        return forms
-    _, depth, width, _ = GEMM_SHAPES[shape]
-
-    def takes(form: str) -> bool:
-        # Each form at its operands' units: an FP8 product's column unit and narrowest step are FP8's (128
-        # elements a 128-byte swizzle), the others' bf16's.
-        dtype = jnp.float8_e4m3fn if form in FP8_FORMS else jnp.bfloat16
-        unit, step = family.column_unit(dtype), min(family.depths(dtype))
-        # An input gradient's output is the depth wide, contracting the width; every other form's output
-        # is the width wide, a kernel gradient's contracting the rows (padded to its steps).
-        columns, contracted = (depth, width) if "input gradient" in form else (width, depth)
-        return columns % unit == 0 and ("kernel gradient" in form or contracted % step == 0)
-
-    return {form for form in forms if takes(form)}
+    return forms
 
 
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
@@ -661,7 +646,7 @@ def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     for group in bundles.groups(generation_name, jnp.bfloat16, stated=True):
         own = _emitted_forms(group[0]) - taken
         taken |= own
-        forms |= own & _emitted_forms(group[0], shape)
+        forms |= own
     assert {case.name.split(" Tiles(")[0].removesuffix(" refused") for case in cases} == forms
 
 
