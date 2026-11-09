@@ -32,10 +32,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import eq
+from jax._src import core as jax_core
 from jax.extend import core as jcore
 
 from dew import _cache
 from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program, rules, terms
+from dew.algebra.forms import aval
 from dew.nn.kernels import generation
 from dew.nn.programs import bodies, jax_name
 from dew.nn.sharding import sequence_shards
@@ -58,7 +60,7 @@ class Candidate(NamedTuple):
     operands: tuple[jcore.Var, ...]
     outputs: tuple[jcore.Var, ...]
     call: Callable
-    declared: Callable
+    declared: functools.partial
     taken: Callable[[], bool]
 
 
@@ -191,7 +193,7 @@ def _region_key(jaxpr: jcore.Jaxpr, index: fusion.Index, places: tuple[int, ...]
 def _digest(value) -> Hashable:
     """A constant by its type and bits; a traced one (a value an enclosing trace closes over), which holds no
     bits until it runs, by its type alone, as an input is."""
-    if isinstance(value, jax.core.Tracer):
+    if isinstance(value, jax_core.Tracer):
         return value.aval
     value = np.asarray(value)
     return str(value.dtype), value.shape, hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
@@ -378,7 +380,7 @@ def _window(index: fusion.Index, places: Sequence[int], inputs: Sequence[jcore.V
     closing over them computes them."""
     held = [var for var in index.consts if _reads(index, places, var)]
     window = jcore.Jaxpr([], [*held, *inputs], list(outputs), [index.jaxpr.eqns[place] for place in places])
-    return jcore.jaxpr_as_fun(jcore.ClosedJaxpr(window, [])), [index.consts[var] for var in held]
+    return jcore.jaxpr_as_fun(jcore.Jaxpr(window, [])), [index.consts[var] for var in held]
 
 
 def _reads(index: fusion.Index, places: Sequence[int], var: jcore.Var) -> bool:
@@ -502,7 +504,7 @@ def _scalars(index: fusion.Index, places: Sequence[int], primitives: frozenset[s
 
 
 def _shape(var: jcore.Var) -> jax.ShapeDtypeStruct:
-    return jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype)
+    return jax.ShapeDtypeStruct(aval(var).shape, aval(var).dtype)
 
 
 def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
@@ -519,17 +521,18 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
     anchor = index.jaxpr.eqns[place].outvars[0]
     rows = [(0, row) for row in _summed_rows(index, anchor)]
     outputs = sorted(((distance, var) for var, distance in _forward(index, anchor).items()
-                      if var is not anchor and var.aval.ndim >= 1), key=lambda pair: -pair[0])
+                      if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0])
     for (_, row), (_, output) in itertools.product(rows, outputs):
-        if row.aval.shape != output.aval.shape or not jnp.issubdtype(output.aval.dtype, jnp.floating):
+        made = aval(output)
+        if aval(row).shape != made.shape or not jnp.issubdtype(made.dtype, jnp.floating):
             continue
         found = _extras(index, row, output)
         if found is None or len(found) > 2:
             continue
-        width = row.aval.shape[-1]
+        width = aval(row).shape[-1]
         for extras in itertools.product(*(_chain(index, var) for var in found)):
-            weights = [var for var in extras if var.aval.shape == (width,)]
-            gates = [var for var in extras if var.aval.shape == row.aval.shape]
+            weights = [var for var in extras if aval(var).shape == (width,)]
+            gates = [var for var in extras if aval(var).shape == aval(row).shape]
             if len(weights) > 1 or len(gates) > 1 or len(weights) + len(gates) != len(extras):
                 continue
             epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or (), frozenset({"add"}))
@@ -537,12 +540,13 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
                                         gates[0] if gates else None, epsilons)
 
 
-def _norm_candidates(index: fusion.Index, row, output, weight, gate, epsilons) -> Iterator[Candidate]:
+def _norm_candidates(index: fusion.Index, row: jcore.Var, output: jcore.Var, weight: jcore.Var | None,
+                     gate: jcore.Var | None, epsilons: Sequence[float]) -> Iterator[Candidate]:
     """`_norms`' candidates over one row and result (the module's account)."""
     from dew.nn.kernels import norm_swiglu
     from dew.nn.norms import gated_rms_normalized, stream_rms_normalized
 
-    dtype = output.aval.dtype
+    dtype = aval(output).dtype
     if gate is not None:
         for epsilon, activation in itertools.product(epsilons, ("silu", "sigmoid")):
             def gated(x, g, *weight_, epsilon=epsilon, activation=activation, implementation='auto'):
@@ -556,13 +560,13 @@ def _norm_candidates(index: fusion.Index, row, output, weight, gate, epsilons) -
                                 dtype, activation) == "pallas")
         return
     added = index.producer.get(row)
-    streams = [None]
-    if (added is not None and jax_name(index.jaxpr.eqns[added].primitive) == "add"
-            and all(isinstance(atom, jcore.Var) and atom.aval.shape == row.aval.shape
-                    for atom in index.jaxpr.eqns[added].invars)):
-        streams.insert(0, tuple(index.jaxpr.eqns[added].invars))
+    streams: list[tuple[jcore.Var, ...] | None] = [None]
+    if added is not None and jax_name(index.jaxpr.eqns[added].primitive) == "add":
+        summands = tuple(atom for atom in index.jaxpr.eqns[added].invars if isinstance(atom, jcore.Var))
+        if len(summands) == 2 and all(aval(atom).shape == aval(row).shape for atom in summands):
+            streams.insert(0, summands)
     # (offset, after_cast, weight_first): the weight folded into the inverse first (Flax's) takes no cast.
-    choices = [(False, False, False)] if weight is None else [
+    choices: list[tuple[bool, ...]] = [(False, False, False)] if weight is None else [
         choice for choice in itertools.product((False, True), repeat=3) if not (choice[1] and choice[2])]
     for stream, epsilon, (offset, after_cast, first) in itertools.product(streams, epsilons, choices):
         def normed(x, *rest, stream=stream, epsilon=epsilon, offset=offset, after_cast=after_cast,
@@ -594,19 +598,19 @@ def _swiglus(index: fusion.Index, place: int) -> Iterator[Candidate]:
 
     anchor = index.jaxpr.eqns[place].outvars[0]
     gates = sorted(((distance, var) for var, distance in _backward(index, anchor, 3).items()
-                    if var is not anchor and var.aval.ndim >= 1), key=lambda pair: -pair[0])
+                    if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0])
     outputs = sorted(((distance, var) for var, distance in _forward(index, anchor, 4).items()
-                      if var is not anchor and var.aval.ndim >= 1), key=lambda pair: -pair[0])
+                      if var is not anchor and aval(var).ndim >= 1), key=lambda pair: -pair[0])
     for (_, gate), (_, output) in itertools.product(gates, outputs):
-        if gate.aval.shape != output.aval.shape:
+        if aval(gate).shape != aval(output).shape:
             continue
         extras = _extras(index, gate, output)
         if extras is None or len(extras) != 1:
             continue
-        ups = [var for var in _chain(index, extras[0]) if var.aval.shape == gate.aval.shape]
+        ups = [var for var in _chain(index, extras[0]) if aval(var).shape == aval(gate).shape]
         if not ups:
             continue
-        up, dtype = ups[-1], output.aval.dtype
+        up, dtype = ups[-1], aval(output).dtype
         packed = _packed(index, gate, up)
         if packed is not None:
             def halves(gate_up, implementation='auto', dtype=dtype):
@@ -630,7 +634,7 @@ def _packed(index: fusion.Index, gate: jcore.Var, up: jcore.Var) -> jcore.Var | 
     sources = []
     for var in (gate, up):
         made = [value for value, _ in _backward(index, var, 3).items()
-                if value.aval.shape == (*gate.aval.shape[:-1], 2, gate.aval.shape[-1])]
+                if aval(value).shape == (*aval(gate).shape[:-1], 2, aval(gate).shape[-1])]
         sources.append(made)
     shared = [var for var in sources[0] if var in sources[1]]
     return shared[0] if shared else None
@@ -657,7 +661,7 @@ def _summed_rows(index: fusion.Index, anchor: jcore.Var) -> list[jcore.Var]:
         summed = index.jaxpr.eqns[made].invars[0]
         if isinstance(summed, jcore.Var):
             rows.update(dict.fromkeys(source for source in _sources(index, summed, REACH)
-                                      if source.aval.shape == summed.aval.shape))
+                                      if aval(source).shape == aval(summed).shape))
     return list(rows)
 
 
@@ -699,23 +703,23 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
     reached = _forward(index, anchor)
     query, key = index.jaxpr.eqns[logits].invars
     values = next((atom for atom in index.jaxpr.eqns[weighed].invars if atom not in reached), None)
-    if not all(isinstance(atom, jcore.Var) for atom in (query, key, values)):
+    if not (isinstance(query, jcore.Var) and isinstance(key, jcore.Var) and isinstance(values, jcore.Var)):
         return
     sources = [_sources(index, query, 2), _sources(index, key, 2), _sources(index, values, 2)]
     made = index.jaxpr.eqns[weighed].outvars[0]
     farthest_first = sorted(((distance, var) for var, distance in _forward(index, made, 3).items()),
                             key=lambda pair: -pair[0])
     for q, k, v in itertools.product(*sources):
-        if q.aval.ndim != 4 or k.aval.ndim != 4 or v.aval.ndim != 4:
+        if aval(q).ndim != 4 or aval(k).ndim != 4 or aval(v).ndim != 4:
             continue
         for _, output in farthest_first:
-            if output.aval.shape != (*q.aval.shape[:-1], v.aval.shape[-1]):
+            if aval(output).shape != (*aval(q).shape[:-1], aval(v).shape[-1]):
                 continue
             extras = _extras(index, (q, k, v), output)
             if extras is None or len(extras) > 1:
                 continue
-            logits_shape = (q.aval.shape[0], q.aval.shape[2], q.aval.shape[1], k.aval.shape[1])
-            biases = [var for var in _addends(index, logits, anchor) if var.aval.shape == logits_shape]
+            logits_shape = (aval(q).shape[0], aval(q).shape[2], aval(q).shape[1], aval(k).shape[1])
+            biases = [var for var in _addends(index, logits, anchor) if aval(var).shape == logits_shape]
             for extra in ([extras[0]] if extras else [None, *biases]):
                 given = () if extra is None else (extra,)
                 region = _between(index, (q, k, v, *given), (output,)) or ()
@@ -743,7 +747,8 @@ def _addends(index: fusion.Index, logits: int, anchor: jcore.Var) -> list[jcore.
             if isinstance(atom, jcore.Var) and atom not in downstream:
                 # The addend as the call takes it, `[B, H, Q, K]`: it or a value it is laid out from (a
                 # grouped layout's reshape, a cast).
-                found.update(dict.fromkeys(var for var in _sources(index, atom, REACH) if var.aval.ndim == 4))
+                found.update(dict.fromkeys(var for var in _sources(index, atom, REACH)
+                                           if aval(var).ndim == 4))
     return list(found)
 
 
@@ -759,19 +764,20 @@ def _nearest_product(index: fusion.Index, reached: dict[jcore.Var, int], *, upst
     return min(places)[1] if places else None
 
 
-def _attention_candidates(q, k, v, output, extra, softcaps, fills, windows) -> Iterator[Candidate]:
+def _attention_candidates(q: jcore.Var, k: jcore.Var, v: jcore.Var, output: jcore.Var,
+                          extra: jcore.Var | None, softcaps, fills, windows) -> Iterator[Candidate]:
     """`_attentions`' candidates over one query, keys, values and result (the module's account)."""
-    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 
-    dtype = output.aval.dtype
-    boolean = extra is not None and extra.aval.dtype == jnp.bool_
+    dtype = aval(output).dtype
+    boolean = extra is not None and aval(extra).dtype == jnp.bool_
     choices = itertools.product((False, True), softcaps, (True, False), (True, False), fills, windows)
     for causal, softcap, wide, after, fill, window in choices:
         if window is not None and not causal:
             continue
 
         def attend(query, key, value, *given, causal=causal, softcap=softcap, wide=wide, after=after,
-                   fill=fill, window=window, implementation='auto'):
+                   fill=fill, window=window, implementation: AttentionImpl = 'auto'):
             extra_ = given[0] if given else None
             return scaled_dot_product_attention(
                 query, key, value, implementation=implementation, causal=causal, softcap=softcap,
