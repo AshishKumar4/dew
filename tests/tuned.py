@@ -5,7 +5,6 @@ kernel's float64 gate holds at, and the launches the tuner times (dew.nn.kernels
 import dataclasses
 
 import jax
-import tokamax
 
 from dew.nn.kernels import generation, tuning
 
@@ -40,10 +39,10 @@ def each_config(kernel, function, *args) -> list:
                    for config in op.keyed(ba).autotuning_configs}, key=dataclasses.astuple)
 
 
-def launches(function, *args) -> list:
-    """The tuner's launches `function(*args)` makes, as the tuner reads them from a program."""
-    with tuning.launches():
-        return tokamax.autotuning.get_bound_args(jax.jit(function), *args)
+def recorded(function, *args) -> list:
+    """The launches `function(*args)` makes as it traces, in that order, each keyed as the tuner reads,
+    measures and stores it (`tuning.seen`)."""
+    return [ba for _, ba in _traced(function, *args)]
 
 
 def timed(ba) -> tuple:

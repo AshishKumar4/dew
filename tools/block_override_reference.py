@@ -5,7 +5,7 @@ release's pinned serve.patch supplies install_noncausal/blocks; no attention
 mask is transcribed here. The generator writes a native checkpoint, paired
 fp32/float64 logits and source.json with exact package/source provenance.
 `--seeds` comes from the accuracy gate's recording plan; the draws recorded are its staged units
-(`check1_wire.staged_units`), the seeds and their redraw.
+(`dew.parity_stages.staged_units`), the seeds and their redraw.
 """
 
 import argparse
@@ -174,7 +174,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(args.output)
     sys.path.insert(0, str(ROOT / "tests"))
-    from check1_wire import REDRAW, staged_units
+    from dew.parity_stages import REDRAW, staged_units
 
     arrays = {"blocks.redraw": np.asarray(REDRAW), "precision": np.asarray("ieee")}
     draws, references, truths = [], [], []
@@ -209,8 +209,9 @@ def calibrate(directory: Path, sites: tuple[str, ...] = ("blocks",)):
     """Declare the recorded site's seeds with the gate's reference-vs-reference sizing, retaining
     enough recorded draws for its redraw policy. No candidate implementation is measured."""
     sys.path.insert(0, str(ROOT / "tests"))
-    from check1_wire import staged_units
     from reference_error import indexed_recording, recording, seeds_for
+
+    from dew.parity_stages import staged_units
 
     path = directory / "reference.npz"
     arrays = recording(path)

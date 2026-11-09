@@ -45,7 +45,7 @@ from reference_error import as_given, assert_as_exact, ieee_fixture
 from safetensors.numpy import load_file
 from tool_support import run_from
 
-from dew.nn.vision import (
+from dew.interop.towers import (
     gemma4,
     llama4,
     mimo,
@@ -57,6 +57,9 @@ from dew.nn.vision import (
     tower_layout,
     tower_variables,
 )
+from dew.nn.vision.gemma4 import Gemma4ClippableLinear
+from dew.nn.vision.mimo import MiMoProjector
+from dew.nn.vision.siglip import GemmaProjector, SiglipVision
 from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -86,6 +89,22 @@ def assert_tower_with_live_positions(tower, variables, fixture, positions: str) 
         lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key == positions else leaf, variables)
     assert np.max(np.abs(
         np.asarray(tower.apply(unpositioned, fixture["pixels"])) - fixture["tower_ref"])) > 1e-2
+
+
+@dataclasses.dataclass(frozen=True)
+class DerivedSiglip(SiglipVision):
+    """A user's tower derived from SigLIP's, named by its import path."""
+
+
+class DerivedGemmaProjector(GemmaProjector):
+    """A user's projector derived from Gemma 3's, named by its import path."""
+
+
+def test_a_class_derived_from_a_familys_reads_where_its_family_stores_its_tensors():
+    """A tower or projector a user derives from a family's, named by its import path, reads where the family's
+    tensors sit, as the class it derives from declares them (row 4856)."""
+    assert tower_layout(f"{__name__}:DerivedSiglip") is tower_layout("siglip")
+    assert projector_layout(f"{__name__}:DerivedGemmaProjector") is projector_layout("gemma")
 
 
 @pytest.mark.parametrize("name, family, translate, positions", [
@@ -397,7 +416,7 @@ def test_mimo_merger_is_as_exact_as_the_reference(native):
     projector = projectors.from_record(record)
     if native:
         vision = config["vision_config"]
-        projector = mimo.MiMoProjector(
+        projector = MiMoProjector(
             hidden_size=vision["hidden_size"], spatial_merge_size=vision["spatial_merge_size"],
             width=vision["hidden_size"] * vision["spatial_merge_size"] ** 2,
             out_width=config["text_config"]["hidden_size"])
@@ -465,7 +484,7 @@ def test_gemma4_clipping_matches_reference_forward_and_backward():
     Reference output [0.2, 0.06], input gradient [0, -0.1, 0], and the second
     weight row gradient [-1, 0.4, 1] distinguish both clipping locations.
     """
-    linear = gemma4.Gemma4ClippableLinear(features=2, use_bias=False, use_clipped_linears=True)
+    linear = Gemma4ClippableLinear(features=2, use_bias=False, use_clipped_linears=True)
     kernel = jnp.array([[0.1, 0.1], [0.2, -0.1], [0.3, 0.2]], jnp.float32)
     constants = {"input_min": jnp.float32(-1), "input_max": jnp.float32(1),
                  "output_min": jnp.float32(-0.2), "output_max": jnp.float32(0.2)}

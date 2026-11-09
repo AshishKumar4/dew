@@ -209,7 +209,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         def producer():
             family.stream(streams, views, *streamed)
 
-        family.roles(consumers, consumer, producer)
+        family.scheduled(consumers, consumer, producer)
 
     scoped, rings = _dq_allocations(family, program.tiles, width, value_width, query.dtype, program.stages)
 

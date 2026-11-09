@@ -279,7 +279,7 @@ width its backward takes, a causal or windowed call square or over another seque
 aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias, softcap or sinks,
 no deterministic ops, and a wheel holding code for the target."""
 
-CUDNN_SUPPORTS = (
+CUDNN_FORWARD_SUPPORTS = (
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "cuDNN takes bf16 and fp16 from sm80",
                 row=INHERENT),
@@ -310,20 +310,26 @@ CUDNN_SUPPORTS = (
                 "cuDNN takes key starts only as their mask, a dense bias, where the decode kernel reads "
                 "each row's span of the cache alone (`decode_attention.attend`)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
-    _Need('deterministic', lambda case: not deterministic_ops_requested(),
-                "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
-                "(openxla/xla#46500)", row=INHERENT),
     _Need('dropout', lambda case: not case.dropout,
           "the call drops attention weights, which cuDNN's fused path here does not take",
           row='roadmap: attention dropout in cuDNN'),
     _ARITHMETIC,
 )
-"""cuDNN's fused attention's requirements (`cudnn_attention`): a GPU of sm80 or later (cuDNN refuses
-bf16 and fp16 below it: "SDPA FP16/BF16 requires SM80"), one of its two dtypes, heads it tiles, no
-softcap or sinks, a window only behind the query, no documents but another sequence's aligned ones
-(which it takes as their mask, `_attention_kernel`), no block groups or key starts, and no deterministic
-ops. Every
-fused kernel runs at the query's head width, values included (`widen_value_heads`)."""
+"""cuDNN's fused attention's forward requirements (`cudnn_attention`): a GPU of sm80 or later (cuDNN
+refuses bf16 and fp16 below it: "SDPA FP16/BF16 requires SM80"), one of its two dtypes, heads it tiles, no
+softcap or sinks, a window only behind the query, no documents but another sequence's aligned ones (which
+it takes as their mask, `_attention_kernel`), and no block groups or key starts: a decode step's, which
+takes no gradient (`DECODE`). Every fused kernel runs at the query's head width, values included
+(`widen_value_heads`)."""
+
+CUDNN_SUPPORTS = (
+    *CUDNN_FORWARD_SUPPORTS,
+    _Need('deterministic', lambda case: not deterministic_ops_requested(),
+                "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
+                "(openxla/xla#46500)", row=INHERENT),
+)
+"""cuDNN's fused attention's requirements where a call may take its gradient (`ATTENTION`): its forward's
+(`CUDNN_FORWARD_SUPPORTS`) and no deterministic ops, under which its backward crashes."""
 
 TRITON_SUPPORTS = (
     _FAST,
@@ -639,7 +645,8 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 DECODE = Op[AttentionCase]('decode', (
     Kernel[AttentionCase]('decode', decode_attention.SUPPORTS),
-    Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS)),
+    # A decode step takes no gradient, so its cuDNN forward runs under deterministic ops too.
+    Kernel[AttentionCase]('cudnn', (*CUDNN_FORWARD_SUPPORTS, decode_attention.PRODUCTS)),
     Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),

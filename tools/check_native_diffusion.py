@@ -216,7 +216,7 @@ def diffusers_reads(task, source, export, model, variables, noise, given):
     from diffusion_support import assert_export_recomputes
     from safetensors.numpy import load_file
 
-    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.inputs import DenoisingCondition
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
@@ -642,9 +642,9 @@ def model_site(directory):
     from native_unet_reference import POOLED, TIME_IDS
     from reference_error import with_gradients
 
-    from dew.diffusion.process import DenoisingCondition
     from dew.interop.diffusion import component_tensors, translate_unet_weights, unet_fields
     from dew.nn.backbones.unet_condition import UNet2DCondition
+    from dew.nn.inputs import DenoisingCondition
     from tools.diffusers_consumer import flax_unet
 
     directory = Path(directory)

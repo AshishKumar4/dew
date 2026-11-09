@@ -896,12 +896,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         commits. By default every real input, each row's `real_lengths` summed; an objective that
         scores fewer, a language model its shifted targets, counts those. The FLOP count reads the
         inputs (`real_lengths`)."""
-        from dew.data.dataset import rows_of
+        from dew.data.dataset import rows_of, take_row_fields
 
-        rows = rows_of(batch)
-        return np.asarray([np.sum(self.real_lengths(jax.tree.map(
-            lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
-            else leaf, batch))) for index in range(rows)], np.int64)
+        return np.asarray([np.sum(self.real_lengths(take_row_fields(batch, np.array([index]))))
+                           for index in range(rows_of(batch))], np.int64)
 
     def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None:
         """The statistics `loss` returns for `batch`, without its `Aux`, by the loss's own path (its

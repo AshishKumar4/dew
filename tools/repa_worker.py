@@ -20,7 +20,7 @@ import types
 import numpy as np
 import torch
 from reference_source import definitions
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 REPA = "https://raw.githubusercontent.com/sihyun-yu/REPA/67f714503e3892f993844aab088ffc5791c92613/"
 IREPA = "https://raw.githubusercontent.com/End2End-Diffusion/iREPA/99ad4ac234efe8de52ce157120f72856e836d09f/ldm/"
@@ -39,18 +39,16 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
                         {"torch": torch, "Normalize": Normalize, "VisionEncoder": object, "Dict": dict,
                          "Optional": object, **TIMM})["DINOv2Encoder"]
     zscore = definitions(IREPA + "utils.py", ("spatial_zscore",), {"torch": torch})["spatial_zscore"]
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        pixels = cases[f"{name}.pixels"]
-        for kind, dtype in (("reference", torch.float32), ("truth", torch.float64)):
-            raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
-            dinov2 = repa(raw, "dinov2")
-            if not torch.equal(irepa.preprocess(types.SimpleNamespace(resolution=256), raw), dinov2):
-                raise ValueError("REPA's and iREPA's DINOv2 preprocessing differ")
-            features = dinov2.permute(0, 2, 3, 1).reshape(len(pixels), -1, 3)
-            out[f"{name}.{kind}.dinov2"] = features.numpy()
-            out[f"{name}.{kind}.zscore"] = zscore(features, alpha=GAMMA).numpy()
-    return out
+    def arm(pixels, dtype):
+        raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
+        dinov2 = repa(raw, "dinov2")
+        if not torch.equal(irepa.preprocess(types.SimpleNamespace(resolution=256), raw), dinov2):
+            raise ValueError("REPA's and iREPA's DINOv2 preprocessing differ")
+        features = dinov2.permute(0, 2, 3, 1).reshape(len(pixels), -1, 3)
+        return {"dinov2": features.numpy(), "zscore": zscore(features, alpha=GAMMA).numpy()}
+
+    return drawn(cases, lambda inputs: (arm(inputs["pixels"], torch.float32),
+                                        arm(inputs["pixels"], torch.float64)))
 
 
 if __name__ == "__main__":

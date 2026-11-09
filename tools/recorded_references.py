@@ -17,6 +17,7 @@ summary writes. A reference whose recorder keeps each row's distance from its tr
 too large to keep over the seeds, is summarized from those by `record_distances`.
 """
 
+import dataclasses
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -28,21 +29,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from check1_wire import staged_units
 from fetched_fixtures import save
-from reference_error import (
-    FEWEST_SEEDS,
-    REDRAW,
-    SIZING_FROM,
-    as_given,
-    input_digest,
-    leaf_summaries,
-    rows_summary,
-    seeds_for,
-    seeds_resolving,
-    widened,
-)
+from reference_error import FEWEST_SEEDS, REDRAW, as_given, input_digest, seeds_for, widened
 from truth_sketch import truth_sketch
+
+from dew.parity import SIZING_FROM, example_mse, example_worst, leaf_summaries, rows_summary, seeds_resolving
+from dew.parity_stages import staged_units
 
 __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
            "record_reference", "record_shard", "save", "with_pilots"]
@@ -89,7 +81,8 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
 
 
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
-                summary: bool = False, dew=None, start: int = FEWEST_SEEDS) -> dict[str, np.ndarray]:
+                summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
+                examples: bool = False) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. With no proxy, the recorded reference alone
@@ -97,7 +90,10 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
     draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can call
     again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
-    hands `draw` to `indexed_recording` as `inputs_of`. With `summary`, the recording keeps no outputs
+    hands `draw` to `indexed_recording` as `inputs_of`. Where `evaluate` gives a third dict, the leaves the
+    reference made that Dew replays (an engine's sampled ids, its kept support, its routes), the recording
+    keeps them whole as `<label>.replayed.<leaf>`, and Dew's run and the test's take them beside the draw's
+    inputs: the comparison is of the replay. With `summary`, the recording keeps no outputs
     at all: per seed and leaf, the reference's evidence check 1 reads (`leaf_summary`: its mean squared
     error from its truth, its worst sized row, its errors on the truth's rows of zero, finiteness) and
     its truth's sketch
@@ -107,7 +103,8 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     verdict pairs it (`seeds_for`'s `dew_fn`), for a site whose errors are heavy-tailed across draws
     alike in both arms (a lognormal training sigma), where the reference compared with itself on other
     draws never resolves. A site whose GPU paired sizing needs more seeds than the recording CPU's
-    declares that count through `start`: the recording confirms it here and keeps its whole redraw."""
+    declares that count through `start`: the recording confirms it here and keeps its whole redraw. A site
+    whose leaves stack independent examples (`examples`) is sized as its verdict judges it."""
     if proxy is None and truth_proxy is not None:
         raise ValueError("a planning truth requires its proxy")
     # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
@@ -116,15 +113,21 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
                          truth_fn=None if truth_proxy is None else jax.jit(truth_proxy)))
     print(f"{label}: starting with {planned} seeds", flush=True)
     # Each seed drawn once, as the sizing reads it: a paired sizing reads its pilots from SIZING_FROM, which a
-    # run of every seed below it would draw too.
-    records = {}
+    # run of every seed below it would draw too. A pilot is read as it is drawn and never again (`_drawn`
+    # reads each draw through before the next), so only the one being read is held.
+    records, pilot, replayed = {}, {}, set()
 
     def record(seed):
-        if seed not in records:
+        held = pilot if seed >= SIZING_FROM else records
+        if seed not in held:
+            pilot.clear()
             inputs = draw(seed)
-            reference, truth = evaluate(inputs)
-            records[seed] = (inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth))
-        return records[seed]
+            reference, truth, *made = evaluate(inputs)
+            made = jax.tree.map(np.asarray, made[0] if made else {})
+            replayed.update(made)
+            held[seed] = ({**inputs, **made}, jax.tree.map(np.asarray, reference),
+                          jax.tree.map(np.asarray, truth))
+        return held[seed]
 
     def ensure(count):
         for seed in range(count):
@@ -135,17 +138,19 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
 
     ensure(staged_units(planned))
     # The recorded reference is read by index from the host's records, as given.
-    confirmed = seeds_for(as_given(lambda index, inputs: records[int(index)][1]), recorded_draw, label,
+    confirmed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
                           start=start,
-                          truth_fn=as_given(lambda index, inputs: records[int(index)][2]),
-                          dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)))
+                          truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                          dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
+                          examples=examples)
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
     # than the recorded reference confirms leaves draws the recording does not keep.
     kept = staged_units(confirmed)
     ensure(kept)
     kept_records = [records[seed] for seed in range(kept)]
     if summary:
-        result = _finished(label, _evidence(label, range(kept), map(_summarized, kept_records)), confirmed)
+        summarized = (_summarized(record, examples) for record in kept_records)
+        result = _finished(label, _evidence(label, range(kept), summarized), confirmed)
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
         return result
     result = {}
@@ -153,9 +158,14 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
         if kind == "input" and not store_inputs:
             continue
         for name in kept_records[0][index]:
-            result[f"{label}.{kind}.{name}"] = np.stack([entry[index][name] for entry in kept_records])
+            stored = "replayed" if kind == "input" and name in replayed else kind
+            result[f"{label}.{stored}.{name}"] = np.stack([entry[index][name] for entry in kept_records])
+    for name in replayed if not store_inputs else ():
+        result[f"{label}.replayed.{name}"] = np.stack([entry[0][name] for entry in kept_records])
     if not store_inputs:
-        result[f"{label}.input_digest"] = np.asarray([input_digest(entry[0]) for entry in kept_records])
+        result[f"{label}.input_digest"] = np.asarray([
+            input_digest({name: value for name, value in entry[0].items() if name not in replayed})
+            for entry in kept_records])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
@@ -359,12 +369,17 @@ def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) 
     return joined
 
 
-def _summarized(record):
+def _summarized(record, examples: bool = False):
     """A record of (inputs, reference, truth) as `_evidence` reads it: each leaf's `leaf_summary`, the
-    record's leaves read at once (`leaf_summaries`)."""
+    record's leaves read at once (`leaf_summaries`), and at a site whose leaves stack independent
+    `examples`, each example's evidence (`example_mse`, `example_worst`)."""
     inputs, reference, truth = record
     names = list(reference)
     summaries = leaf_summaries([reference[name] for name in names], [truth[name] for name in names])
+    if examples:
+        summaries = [dataclasses.replace(summary, example_mse=example_mse(reference[name], truth[name]),
+                                         example_worst=example_worst(reference[name], truth[name]))
+                     for name, summary in zip(names, summaries, strict=True)]
     return inputs, dict(zip(names, summaries, strict=True)), truth
 
 
@@ -393,6 +408,12 @@ def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
             f"{label}.sketch.{name}": np.stack(sketches[name]),
             f"{label}.shape.{name}": shapes[name],
             f"{label}.dtype.{name}": np.asarray(summaries[0].dtype)})
+        if summaries[0].example_mse is not None:
+            # An example of no sized row leaves its leaf's worst rows unread (NaN), as `example_worst` does.
+            unread = np.full(len(summaries[0].example_mse), np.nan)
+            evidence[f"{label}.example_mse.{name}"] = np.stack([leaf.example_mse for leaf in summaries])
+            evidence[f"{label}.example_worst.{name}"] = np.stack(
+                [unread if leaf.example_worst is None else leaf.example_worst for leaf in summaries])
     return evidence
 
 
@@ -412,7 +433,8 @@ def _kept(label: str, evidence: Mapping[str, np.ndarray], kept: int) -> dict[str
     for name in names:
         offsets = np.cumsum([0, *evidence[f"{label}.zero_counts.{name}"][:kept]])
         result.update({f"{label}.{field}.{name}": evidence[f"{label}.{field}.{name}"][:kept]
-                       for field in ("mse", "worst", "finite", "sketch")})
+                       for field in ("mse", "worst", "finite", "sketch", "example_mse", "example_worst")
+                       if f"{label}.{field}.{name}" in evidence})
         result.update({f"{label}.zero_rows.{name}": evidence[f"{label}.zero_rows.{name}"][:offsets[-1]],
                        f"{label}.zero_errors.{name}": evidence[f"{label}.zero_errors.{name}"][:offsets[-1]],
                        f"{label}.zero_offsets.{name}": offsets,

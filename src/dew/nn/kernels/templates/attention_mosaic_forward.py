@@ -1744,12 +1744,12 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     target = generation.gpu_target()
     slots = None
     if merges and splits > 1:
-        # Its slices' states their merge reads, a workspace started uninitialized (`lax.empty`: XLA's
-        # AllocateBuffer on a GPU, no memset), as no slot is read before its slice writes it (`_Read.slots`).
+        # Its slices' states their merge reads, a workspace (`mosaic.workspace`): no slot is read before its
+        # slice writes it (`_Read.slots`).
         batch, padded, heads = query.shape[:3]
         width = (column_width or value.shape[-1]) * column_blocks
-        slots = (jax.new_ref(lax.empty((batch, splits, padded, heads, width), jnp.float32)),
-                 jax.new_ref(lax.empty((2, batch, heads, splits, padded), jnp.float32)))
+        slots = (mosaic.workspace((batch, splits, padded, heads, width), jnp.float32, interpret=interpret),
+                 mosaic.workspace((2, batch, heads, splits, padded), jnp.float32, interpret=interpret))
     return _launched(query, key, value,
                      _Read(spans, hooked, guard, anchors, None if table is None else table[0],
                            None if walks is None else walks.blocks, sources, block, into, slots,
@@ -1915,9 +1915,9 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
 
         # A family that keeps its products' accumulators in the program's scratch, a role's own share
         # (`Issuer.product_scratch`: tcgen05's chunks'), takes each consumer built at its static role.
-        family.roles(consumers, (functools.partial(mosaic.per_role, roles=consumers,
-                                                    run=lambda role, index: consumer(index))
-                                 if scopes_products(family) else consumer), producer)
+        family.scheduled(consumers, (functools.partial(mosaic.per_role, roles=consumers,
+                                                       run=lambda role, index: consumer(index))
+                                     if scopes_products(family) else consumer), producer)
 
     products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, products),

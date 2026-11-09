@@ -1742,7 +1742,7 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
         family.stream(entered, entered_views, 0, 1)
         family.stream(chunks, views, start, start + count)
 
-    family.roles(walkers, consumer, producer)
+    family.scheduled(walkers, consumer, producer)
 
 
 def _roles_staged(staging: tuple, landing: dict, consumers: int) -> tuple[tuple, dict]:
