@@ -187,6 +187,9 @@ class DPOObjective(TokenScorer):
             laid[VALID_ROWS] = jnp.repeat(jnp.asarray(batch[VALID_ROWS]).reshape(rows), 2)
         return {**batch, **laid}
 
+    traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "beta")
+    """Its window, balance, head policy and its beta; its reference is the step's EMA, an argument."""
+
     def loss(self, variables, batch, step):
         """Compute the preference term over each pair's completion tokens.
 

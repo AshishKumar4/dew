@@ -29,6 +29,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dew requires its JAX build 0.12.0.1.post73, its CUDA and PJRT plugins post73's on every machine: XLA:GPU's
+  GEMM fusion moves a bitcast across an operand only where the operand keeps its layout (upstream a22dec8093);
+  `MOSAIC_GPU_DUMP_TO` dumps the kinds named beside it alone; `MOSAIC_GPU_CAPTURE_LAUNCHES` writes each Mosaic
+  GPU launch as a spec a simulator runs bit-exactly; Pallas's Mosaic GPU interpreter has a functional mode; and
+  the persistent compilation cache keys an executable by the PJRT plugin build that compiled it.
 - `dew.telemetry.benchmark.exclusive_window(cores=None)` holds a job's measured region alone on its node's GPUs
   where a node's session runs the job. It asks the session for a window (`$OUT/window`, a byte to
   `$SESSION/wake`), waits for the grant, synchronizes the device and runs the block; on exit it synchronizes,

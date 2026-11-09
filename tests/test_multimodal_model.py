@@ -37,7 +37,7 @@ from reference_error import GateFailure, widened
 from reference_runs import assert_arms_as_recorded
 from safetensors.numpy import load_file
 
-from dew.batch import coordinates
+from dew.batch import VALIDITY_FIELD, coordinates
 from dew.data.dataset import Loader
 from dew.interop.pretrained import Pretrained
 from dew.nn.inputs import ModelInputs
@@ -323,8 +323,14 @@ def _one_layer_negated(gradient):
     return negated
 
 
-def _wrong_inputs(family: str, inputs: ModelInputs) -> ModelInputs:
-    """One plausible integration bug per family that the parity assertion must catch."""
+def _wrong_inputs(family: str, inputs: ModelInputs, text: bool = False) -> ModelInputs:
+    """One plausible integration bug per family that the parity assertion must catch; over token rows alone
+    (`text`), whose fields no family's media slip reads, the rows' validity read inverted, which moves
+    every valid token's keys and positions."""
+    if text:
+        validity = inputs.token_fields[VALIDITY_FIELD]
+        inverted = (1 - validity).astype(validity.dtype)
+        return dataclasses.replace(inputs, token_fields={**inputs.token_fields, VALIDITY_FIELD: inverted})
     if family == "gemma4":
         # The 2D position tables read (x, y); swapping them is the natural slip.
         positions = inputs.conditioning["image_position_ids"]
@@ -654,14 +660,15 @@ def drawing_text(family: str):
     return draw
 
 
-def computing(family: str, *, slipped: bool = False, text: bool = False):
+def computing(family: str, *, slipped: str | None = None, text: bool = False):
     """`dew(dtype, inputs)` of `family` over a draw's encoding (`drawing`), at `dtype` (the model rebuilt in
     float64 for a float64 run, `ModelConfig.with_dtype`): its logits at every valid position, the summed
     next-token loss, its pixel gradient in the reference's image order (`_real_pixels`, over the encoding's
     image counts, which every draw shares) and the logits after one SGD step on every parameter
     (multimodal_families.OUTPUTS), or over a `text` draw's token rows alone (`drawing_text`) all but the
-    pixel gradient (TEXT_OUTPUTS). A `slipped` run takes the family's characteristic slip (`_wrong_inputs`)
-    into its logits and one layer's gradient with its sign flipped (`_one_layer_negated`) into its step."""
+    pixel gradient (TEXT_OUTPUTS). A run `slipped` "inputs" takes the family's characteristic slip
+    (`_wrong_inputs`) into its logits and loss, one `slipped` "gradient" one layer's gradient with its sign
+    flipped (`_one_layer_negated`) into its step."""
     loaded, sample, _ = _family(family)
     if text:
         # Every text draw lays its rows alike (`text_rows`): any ids give the tree.
@@ -681,9 +688,9 @@ def computing(family: str, *, slipped: bool = False, text: bool = False):
         def forward(variables, given):
             return model.apply(variables, given.tokens, **given.kwargs())
 
-        value, gradient, pixels = _stepped(model, variables, encoded)
-        trained = _trained(variables, _one_layer_negated(gradient) if slipped else gradient)
-        given = _wrong_inputs(family, encoded) if slipped else encoded
+        given = _wrong_inputs(family, encoded, text) if slipped == "inputs" else encoded
+        value, gradient, pixels = _stepped(model, variables, given)
+        trained = _trained(variables, _one_layer_negated(gradient) if slipped == "gradient" else gradient)
         found = {"logits": jnp.where(valid, forward(variables, given), 0), "loss": value,
                  "updated_logits": jnp.where(valid, forward(trained, encoded), 0)}
         return found if text else {**found, "pixel_gradient": _real_pixels(sample, pixels)}
@@ -712,17 +719,18 @@ def test_a_drawn_site_is_on_par_with_its_reference(arms):
     taking the same step: a family's valid logits, its summed next-token loss, its pixel gradient and its
     logits after one SGD step of every parameter over drawn images and audio, or all but the pixel gradient
     over drawn token rows alone; its characteristic slip, and one layer's gradient with its sign flipped,
-    fail the same check."""
+    each alone, fail the same check."""
     family, _, kind = arms.partition("/")
     site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
     recording, draw, dew, leaves = pipeline_arms(arms)
     assert_arms_as_recorded((recording, draw, dew, leaves), site, SEEDS[arms], arms)
-    slip = computing(family, slipped=True, text=kind == "text")
-    with pytest.raises(GateFailure):
-        # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
-        assert_arms_as_recorded(
-            (recording, draw, lambda dtype, inputs: (dew if dtype == jnp.float64 else slip)(dtype, inputs),
-             leaves), site, SEEDS[arms], f"{arms} slipped")
+    for slipped in ("inputs", "gradient"):
+        slip = computing(family, slipped=slipped, text=kind == "text")
+        with pytest.raises(GateFailure):
+            # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
+            assert_arms_as_recorded(
+                (recording, draw, lambda dtype, inputs, slip=slip: (dew if dtype == jnp.float64 else slip)(
+                    dtype, inputs), leaves), site, SEEDS[arms], f"{arms} slipped {slipped}")
 
 
 def _float32_values_in_float64(loaded, inputs) -> int:

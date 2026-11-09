@@ -33,6 +33,8 @@ import numpy as np
 from arm_arithmetic import unrewritten
 from float64_terms import SUMS, _static, _target, evaluated_on, walked
 
+from dew.nn.precision import compensated_add
+
 EXACT = frozenset({
     "neg", "abs", "max", "min", "select_n", "reshape", "broadcast_in_dim", "transpose", "squeeze",
     "expand_dims", "slice", "dynamic_slice", "dynamic_update_slice", "concatenate", "pad", "gather",
@@ -57,10 +59,11 @@ ONCE = frozenset({"add", "add_any", "sub", "mul", "div", "sqrt", "square", "redu
 """IEEE 754's correctly rounded operations: one rounding, at most u times the result."""
 
 ULPS = {"exp": 1.42, "log": 2.05, "log1p": 3.64, "expm1": 1.21, "logistic": 2.49, "tanh": 4.9,
-        "erf": 6.71, "rsqrt": 2.8}
+        "erf": 6.71, "rsqrt": 2.8, "sin": 1.07, "cos": 1.07}
 """Each elementary function's error bound, in units of u times its true result: the largest of XLA
 CPU's float32 implementations over every normal float32 input whose result is a normal float32, read
-exhaustively against float64 references (2^32 inputs each, 11-02), rounded up at the second decimal.
+exhaustively against float64 references (2^32 inputs each, 11-02; sin and cos 11-08, 1.0606 each, a
+rotary position's), rounded up at the second decimal.
 XLA CPU flushes subnormal inputs to zero, so the bound holds where no elementary function reads one."""
 
 SCATTERS = {"scatter": jax.lax.scatter, "scatter-add": jax.lax.scatter_add,
@@ -124,6 +127,9 @@ class TapRule:
             unit = _unit(name, params, dtype)
             tap = _mixed(self.key ^ (_GOLDEN * jnp.asarray(index + 1, jnp.uint64)))
             draw = _signs(tap, jnp.shape(value))
+            # An infinite result (a masked logit's -inf carried on) is exact: nothing rounds it, and its
+            # weight, a multiple of its magnitude, is no rounding's.
+            weight = jnp.where(jnp.isfinite(value), weight, 0.0)
             tapped.append(value + self.scale * unit * weight * draw)
         return tapped
 
@@ -235,6 +241,33 @@ def _weight(equation, name, params, operands, value):
         return ULPS[name] * magnitude
     if name == "integer_pow":
         return max(abs(int(params["y"])) - 1, 1) * magnitude
+    if name == "reduce" and params["computation"] is compensated_add:
+        # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
+        # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
+        # the pair's halves by it, as the high half's rounding moves the low half by as much.
+        terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
+        u = _unit(name, params, equation.outvars[0].aval.dtype)
+        gamma = (terms - 1) * u / (1 - (terms - 1) * u)
+        pair = operands[:len(operands) // 2]
+        total = jnp.abs(sum(jnp.sum(operand, params["dimensions"]) for operand in pair))
+        spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
+        return total + gamma * gamma / u * spread
+    if (name == "reduce" and isinstance(started := equation.invars[len(equation.invars) // 2],
+                                        jax.extend.core.Literal) and started.val == -np.inf):
+        # A running logsumexp (`dew.objectives.lm.chunked`'s, its maximum started at -inf), in float64
+        # under Dew's wide CPU arithmetic (`dew.nn.precision.widened_reduction`) and float32 elsewhere:
+        # each combine rescales a running sum by exp(a - larger), the difference rounding at most u
+        # times the row's range, which moves the exponential by as much relative, beside the
+        # exponential's ulps and two roundings of the result's magnitude.
+        terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
+        # A masked column (-inf, `chunked._without`) holds no mass and rescales nothing: the range is the
+        # finite logits', none where the row holds no finite one.
+        logits = operands[0]
+        finite = jnp.isfinite(logits)
+        highest = jnp.max(jnp.where(finite, logits, -jnp.inf), params["dimensions"])
+        lowest = jnp.min(jnp.where(finite, logits, jnp.inf), params["dimensions"])
+        spread = jnp.where(jnp.any(finite, params["dimensions"]), highest - lowest, 0.0)
+        return max(terms - 1, 1) * (2 + ULPS["exp"] + spread) * magnitude
     if name == "one_minus_square":
         # The square rounds by its magnitude, which the difference carries, and the difference by its own.
         return jnp.square(operands[0]) + magnitude
@@ -249,6 +282,11 @@ def _bound(equation, params, operands) -> list:
     """`equation`'s primitive applied to `operands`, widened past its program's dtypes, with `params`: a
     scatter's combining computation, traced for its program's dtype, built again for theirs (`SCATTERS`)."""
     name = equation.primitive.name
+    if name == "reduce":
+        # Its combining computation, traced for its program's dtypes, is called again on theirs.
+        count = len(operands) // 2
+        return list(jax.lax.reduce(tuple(operands[:count]), tuple(operands[count:]), params["computation"],
+                                   params["dimensions"]))
     if name in SCATTERS:
         operand, indices, updates = operands
         return [SCATTERS[name](operand, indices, updates, params["dimension_numbers"],
