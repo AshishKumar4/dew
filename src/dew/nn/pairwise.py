@@ -22,6 +22,7 @@ import functools
 import math
 import os
 import platform
+from collections.abc import Callable
 from pathlib import Path
 
 import jax
@@ -302,32 +303,44 @@ def pairwise_ragged_dot_general(lhs: jax.Array, rhs: jax.Array, group_sizes: jax
     form = ragged_form(lhs, rhs, ragged_dot_dimension_numbers)
     if form is None:
         raise ValueError(f"no pairwise ragged product takes {ragged_dot_dimension_numbers}")
-    if form != 'groups':
-        transposed = form == 'rows transposed'
-
-        def summed(rows, matrices, sizes):
-            matrices = jnp.swapaxes(matrices, 1, 2) if transposed else matrices
-            return _rows_blocked(rows, matrices, sizes, precision)
-
-        def pulled(saved, operands, cotangent, live):
-            rows, matrices, sizes = operands
-            laid = jnp.swapaxes(matrices, 1, 2) if transposed else matrices
-            gradients = {0: lambda: _rows_blocked(cotangent, jnp.swapaxes(laid, 1, 2), sizes, precision),
-                         1: lambda: (lambda grads: jnp.swapaxes(grads, 1, 2) if transposed else grads)(
-                             _groups_blocked(rows, cotangent, sizes, precision))}
-            return tuple(gradients[index]() for index in live)
-    else:
-        def summed(rows, cotangent, sizes):
-            return _groups_blocked(rows, cotangent, sizes, precision)
-
-        def pulled(saved, operands, cotangent, live):
-            rows, rows_cotangent, sizes = operands
-            gradients = {0: lambda: _rows_blocked(rows_cotangent, jnp.swapaxes(cotangent, 1, 2), sizes,
-                                                  precision),
-                         1: lambda: _rows_blocked(rows, cotangent, sizes, precision)}
-            return tuple(gradients[index]() for index in live)
-
+    summed, pulled = (_ragged_groups(precision) if form == 'groups'
+                      else _ragged_rows(form == 'rows transposed', precision))
     product = contracted("test_a_cpu_pairwise_grouped_product_holds_every_order")(
         linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
                        kind=Protected()))
     return product(lhs, rhs, group_sizes)
+
+
+def _ragged_rows(transposed: bool, precision) -> tuple[Callable, Callable]:
+    """`pairwise_ragged_dot_general`'s product and pullback where rows are grouped and their depth contracted,
+    each group's matrix `[depth, width]`, or `[width, depth]` where `transposed`."""
+    def summed(rows, matrices, sizes):
+        matrices = jnp.swapaxes(matrices, 1, 2) if transposed else matrices
+        return _rows_blocked(rows, matrices, sizes, precision)
+
+    def pulled(saved, operands, cotangent, live):
+        del saved
+        rows, matrices, sizes = operands
+        laid = jnp.swapaxes(matrices, 1, 2) if transposed else matrices
+        gradients = {0: lambda: _rows_blocked(cotangent, jnp.swapaxes(laid, 1, 2), sizes, precision),
+                     1: lambda: (lambda grads: jnp.swapaxes(grads, 1, 2) if transposed else grads)(
+                         _groups_blocked(rows, cotangent, sizes, precision))}
+        return tuple(gradients[index]() for index in live)
+
+    return summed, pulled
+
+
+def _ragged_groups(precision) -> tuple[Callable, Callable]:
+    """`pairwise_ragged_dot_general`'s product and pullback where each group's rows are contracted."""
+    def summed(rows, cotangent, sizes):
+        return _groups_blocked(rows, cotangent, sizes, precision)
+
+    def pulled(saved, operands, cotangent, live):
+        del saved
+        rows, rows_cotangent, sizes = operands
+        gradients = {0: lambda: _rows_blocked(rows_cotangent, jnp.swapaxes(cotangent, 1, 2), sizes,
+                                              precision),
+                     1: lambda: _rows_blocked(rows, cotangent, sizes, precision)}
+        return tuple(gradients[index]() for index in live)
+
+    return summed, pulled
