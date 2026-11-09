@@ -9,6 +9,7 @@ Only the container is handled here. No leaf is renamed, transposed or cast.
 The names on disk are the module names in the tree.
 """
 
+import functools
 import json
 import math
 import os
@@ -16,6 +17,7 @@ import re
 import secrets
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 
 import jax
 import ml_dtypes
@@ -35,32 +37,28 @@ MAX_SHARD_SIZE = "5GB"
 """The shard size an export writes at most, as huggingface_hub's splitter
 reads it; a tensor larger than that takes a shard of its own."""
 
-# Use the format tag, not a NumPy conversion through safetensors: its NumPy
-# FP8 conversion looks for np.float8_e4m3fn, which NumPy does not expose.
-# These dtypes describe the mapped bytes; none widens or dequantizes them.
-_STORED_DTYPES = {
-    "BOOL": np.dtype(np.bool_),
-    "U8": np.dtype(np.uint8),
-    "I8": np.dtype(np.int8),
-    "U16": np.dtype("<u2"),
-    "I16": np.dtype("<i2"),
-    "U32": np.dtype("<u4"),
-    "I32": np.dtype("<i4"),
-    "U64": np.dtype("<u8"),
-    "I64": np.dtype("<i8"),
-    "F16": np.dtype("<f2"),
-    "F32": np.dtype("<f4"),
-    "F64": np.dtype("<f8"),
-    "C64": np.dtype("<c8"),
-    "BF16": np.dtype(ml_dtypes.bfloat16),
-    "F8_E4M3": np.dtype(ml_dtypes.float8_e4m3fn),
-    "F8_E5M2": np.dtype(ml_dtypes.float8_e5m2),
-    "F8_E4M3FNUZ": np.dtype(ml_dtypes.float8_e4m3fnuz),
-    "F8_E5M2FNUZ": np.dtype(ml_dtypes.float8_e5m2fnuz),
-    # The block-scale exponents of MX formats and DeepSeek-V4's `.scale`
-    # tensors: one unsigned power-of-two exponent per byte.
-    "F8_E8M0": np.dtype(ml_dtypes.float8_e8m0fnu),
-}
+@functools.cache
+def stored_dtypes() -> Mapping[str, np.dtype]:
+    """Each safetensors dtype tag's dtype, as safetensors itself codes them: the tag it writes for each
+    dtype NumPy and ml_dtypes name (`TensorSpec.dtype`), little-endian as the format stores every
+    element. A dtype safetensors has no tag for is none of them. The tag, not a NumPy conversion through
+    safetensors, is read: safetensors' NumPy FP8 conversion looks for np.float8_e4m3fn, which NumPy does
+    not expose. These dtypes describe the mapped bytes; none widens or dequantizes them, and F4, two
+    elements to a byte, reads as its byte view (`PACKED_F4`)."""
+    package, _ = _safetensors()
+    named = [np.dtype(code) for code in np.typecodes["All"]]
+    named += [np.dtype(kind) for kind in (getattr(ml_dtypes, name) for name in ml_dtypes.__all__)
+              if isinstance(kind, type) and issubclass(kind, np.generic)]
+    tags = {}
+    for dtype in named:
+        try:
+            spec = package.TensorSpec(dtype=dtype.name, shape=[1], data_ptr=0, data_len=dtype.itemsize)
+        except package.SafetensorError:
+            continue
+        # NumPy's own dtypes spelled little-endian, as the format stores them; ml_dtypes' have one order.
+        tags[spec.dtype] = dtype.newbyteorder("<") if dtype.isbuiltin else dtype
+    return MappingProxyType(tags)
+
 
 PACKED_F4 = "F4"
 """safetensors' 4-bit float (e2m1), two elements per byte.
@@ -322,10 +320,10 @@ def stored_spec(name: str, shape: Sequence[int], tag: str, filename: str) -> jax
                 f"tensor {name!r} in {filename} is F4 with shape {tuple(shape)}; two "
                 "elements share a byte, so its last axis is even")
         return jax.ShapeDtypeStruct((*shape[:-1], shape[-1] // 2), np.dtype(np.uint8))
-    try:
-        return jax.ShapeDtypeStruct(tuple(shape), _STORED_DTYPES[tag])
-    except KeyError as error:
-        raise ValueError(f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}") from error
+    dtypes = stored_dtypes()
+    if tag not in dtypes:
+        raise ValueError(f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}")
+    return jax.ShapeDtypeStruct(tuple(shape), dtypes[tag])
 
 
 def header_specs(path) -> dict[str, jax.ShapeDtypeStruct]:
