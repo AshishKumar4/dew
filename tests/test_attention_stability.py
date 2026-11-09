@@ -29,6 +29,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
@@ -71,8 +72,9 @@ class Family:
     (`decode_only`), a shape the template's interpreted mainloops would take too long over, which its
     template twin covers in fewer programs; and whether its queries' products with the keys pass fp32's
     largest before the scale (`query_first`), where jax's attention, which scales its products, overflows,
-    so its reference takes the query scaled first, as Dew's reference path and flax's do (`_reference`).
-    Its declared seeds are `SEEDS`'."""
+    so its reference takes the query scaled first, as Dew's reference path and flax's do (`_reference`);
+    and, where its values are a dtype's extremes, its draw in any dtype at that dtype's own (`drawn_in`,
+    `retyped`). Its declared seeds are `SEEDS`'."""
 
     draw: Callable[[int], tuple]
     keep: np.ndarray
@@ -84,6 +86,14 @@ class Family:
     splits: int = 1
     decode_only: bool = False
     query_first: bool = False
+    drawn_in: Callable[[str], Callable[[int], tuple]] | None = None
+
+    def retyped(self, dtype: str) -> "Family":
+        """The family run in `dtype`: its draw rounded to it, or where its values are a dtype's extremes
+        (`drawn_in`), drawn at `dtype`'s own, so the family means the same in each (fp32's largest is past
+        fp16's, whose cast would make the family's large values infinite)."""
+        draw = self.draw if self.drawn_in is None else self.drawn_in(dtype)
+        return dataclasses.replace(self, draw=draw, dtype=dtype)
 
 
 @functools.partial(jax.jit, static_argnums=1)
@@ -323,32 +333,50 @@ def _band_seen(*, later: bool) -> tuple[np.ndarray, dict]:
     return seen, {"segment_ids": CrossDocuments(np.ones((64, 1), np.int32), np.tile(ids, (64, 1)))}
 
 
-def _masked_outlier(seed: int, rows: int = 64):
+def _extremes(dtype: str) -> tuple[float, float]:
+    """The factor fp32's near-largest values (2.5e38 to 3.3e38) take and the binades its near-least normal
+    ones (2^-125 to 2^-120) shift by to be near `dtype`'s own: none where `dtype` holds them (fp32, bf16),
+    else its largest over fp32's and its least normal's exponent over fp32's (fp16's, 65504 and 2^-14)."""
+    held = ml_dtypes.finfo(dtype)
+    largest = 1.0 if float(held.max) >= 3.3e38 else float(held.max) / float(np.finfo(np.float32).max)
+    least = float(held.smallest_normal)
+    return largest, 0.0 if least <= 2.0 ** -125 else float(np.log2(least)) + 126.0
+
+
+def _small_and_large(seed: int, rows: int, dtype: str) -> np.ndarray:
+    """Values `[rows, 8, 1, 16]` near `dtype`'s extremes (`_extremes`): the first four keys' a drawn 2^-125
+    to 2^-120 in their first column and a draw in [-1, 1) times 2^-120 past it, the last four's first
+    column near the largest, 2.5e38 to 3.3e38, each at `dtype`'s own."""
+    largest, shift = _extremes(dtype)
+    value = np.zeros((rows, 8, 1, 16), np.float32)
+    value[:, :4, 0, 0] = 2.0 ** (_uniform(seed, -125.0, -120.0, (rows, 4)) + np.float32(shift))
+    value[:, :4, 0, 1:] = _uniform(seed + 1, -1.0, 1.0, (rows, 4, 15)) * np.float32(2.0 ** (shift - 120))
+    value[:, 4:, 0, 0] = _uniform(seed + 2, 2.5e38, 3.3e38, (rows, 4)) * np.float32(largest)
+    return value
+
+
+def _masked_outlier(seed: int, rows: int = 64, *, dtype: str = "float32"):
     """One query a row over eight keys of equal logits, the first four seen and the last four past its
     length: the seen keys' values a drawn 2^-125 to 2^-120 in their first column and a draw in [-1, 1) times
-    2^-120 past it, the unseen ones' first column near fp32's largest. A key the row does not see weighs
-    nothing, so no value it holds scales the row's sums or flushes the small ones it reads. The cotangent
-    reads none of the first column: a backward forms every key's `dO · vᵀ`, an unseen one's too, which a
-    cotangent on that column carries past fp32's largest (the reference's fp32 and FlashAttention's alike)."""
-    value = np.zeros((rows, 8, 1, 16), np.float32)
-    value[:, :4, 0, 0] = 2.0 ** _uniform(seed, -125.0, -120.0, (rows, 4))
-    value[:, :4, 0, 1:] = _uniform(seed + 1, -1.0, 1.0, (rows, 4, 15)) * np.float32(2.0 ** -120)
-    value[:, 4:, 0, 0] = _uniform(seed + 2, 2.5e38, 3.3e38, (rows, 4))
+    2^-120 past it, the unseen ones' first column near fp32's largest, each at `dtype`'s own extremes
+    (`_small_and_large`). A key the row does not see weighs nothing, so no value it holds scales the row's
+    sums or flushes the small ones it reads. The cotangent reads none of the first column: a backward forms
+    every key's `dO · vᵀ`, an unseen one's too, which a cotangent on that column carries past fp32's largest
+    (the reference's fp32 and FlashAttention's alike)."""
+    value = _small_and_large(seed, rows, dtype)
     (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
     dout[..., 0] = 0.0
     return (np.zeros((rows, 1, 1, 16), np.float32), np.zeros((rows, 8, 1, 16), np.float32), value, None,
             dout)
 
 
-def _separated_rows(seed: int, rows: int = 64):
+def _separated_rows(seed: int, rows: int = 64, *, dtype: str = "float32"):
     """Two queries a row of one query tile over eight keys of equal logits, each its own document: the first
     sees the first four, whose values hold a drawn 2^-125 to 2^-120 in their first column and a draw in
     [-1, 1) times 2^-120 past it; the second sees the last four, whose values near fp32's largest pass it
-    in their sum. Each row's sums are its own: the second's size moves nothing of the first's."""
-    value = np.zeros((rows, 8, 1, 16), np.float32)
-    value[:, :4, 0, 0] = 2.0 ** _uniform(seed, -125.0, -120.0, (rows, 4))
-    value[:, :4, 0, 1:] = _uniform(seed + 1, -1.0, 1.0, (rows, 4, 15)) * np.float32(2.0 ** -120)
-    value[:, 4:, 0, 0] = _uniform(seed + 2, 2.5e38, 3.3e38, (rows, 4))
+    in their sum; each at `dtype`'s own extremes (`_small_and_large`). Each row's sums are its own: the
+    second's size moves nothing of the first's."""
+    value = _small_and_large(seed, rows, dtype)
     (dout,) = _normal(seed + 3, (rows, 2, 1, 16))
     # The cotangent times 2^-8, so its products with the large values stay finite in the reference's dP.
     return (np.zeros((rows, 2, 1, 16), np.float32), np.zeros((rows, 8, 1, 16), np.float32), value, None,
@@ -713,10 +741,13 @@ def _families() -> dict[str, Family]:
         # padding), and rows of one query tile of either size, each its own.
         **{f"small values beside unseen ones near fp32's largest, {dtype}": Family(
             _masked_outlier, np.broadcast_to(np.arange(8) < 4, (64, 1, 1, 8)).copy(),
-            {"lengths": np.full(64, 4)}, dtype=dtype) for dtype in ("float32", "bfloat16")},
+            {"lengths": np.full(64, 4)}, dtype=dtype,
+            drawn_in=lambda dtype: functools.partial(_masked_outlier, dtype=dtype))
+           for dtype in ("float32", "bfloat16")},
         **{f"a row of small values beside one that overflows in its tile, {dtype}": Family(
             _separated_rows, SEPARATED_SEEN, {"segment_ids": SEPARATED}, folded=False, overflows=True,
-            dtype=dtype) for dtype in ("float32", "bfloat16")},
+            dtype=dtype, drawn_in=lambda dtype: functools.partial(_separated_rows, dtype=dtype))
+           for dtype in ("float32", "bfloat16")},
     }
     return {**families, **_structured_families()}
 
