@@ -21,7 +21,17 @@ import numpy as np
 import optax
 import pytest
 from float64_terms import float32_values, float64_forward
-from multimodal_families import DRAWN, FAMILIES, LEARNING_RATE, OUTPUTS
+from multimodal_families import (
+    DRAWN,
+    FAMILIES,
+    LEARNING_RATE,
+    OUTPUTS,
+    TEXT_DRAWN,
+    TEXT_IDS,
+    TEXT_LENGTHS,
+    TEXT_OUTPUTS,
+    text_rows,
+)
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import GateFailure, widened
 from reference_runs import assert_arms_as_recorded
@@ -512,17 +522,19 @@ def test_source_forward_matches_reference(source_draw):
 
 def _stepped(model, variables, inputs):
     """`model`'s summed next-token loss over `inputs` from `variables`, and its gradient in every parameter
-    and in the pixels."""
+    and in the pixels (an empty one for text alone, which reads none)."""
     objective = LMObjective(model, inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(4), ema=None)
+    seeing = "pixel_values" in inputs.conditioning
 
     def loss(params, pixels):
-        data = dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
+        data = (dataclasses.replace(inputs, conditioning={**inputs.conditioning, "pixel_values": pixels})
+                if seeing else inputs)
         statistics, _ = objective.loss({**variables, "params": params}, {"text": data}, step)
         return objective.reduce_loss(statistics)[0]
 
     value, (gradient, pixels) = jax.value_and_grad(loss, argnums=(0, 1))(
-        variables["params"], inputs.conditioning["pixel_values"])
+        variables["params"], inputs.conditioning["pixel_values"] if seeing else jnp.zeros(0))
     return value, gradient, pixels
 
 
@@ -599,9 +611,9 @@ def test_source_trained_export_and_frozen_buffers_match_reference(family_source,
                 np.testing.assert_array_equal(actual, original)
 
 
-SEEDS = {"llama4": 512}
-"""Each drawn family's declared seeds (multimodal_families.DRAWN), sized by `seeds_for` paired as its
-recording confirmed them."""
+SEEDS = {"llama4": 512, "qwen35/text": 512}
+"""Each drawn site's declared seeds (multimodal_families.DRAWN, TEXT_DRAWN), sized by `seeds_for` paired as
+its recording confirmed them."""
 
 
 def drawing(family: str):
@@ -628,14 +640,33 @@ def drawing(family: str):
     return draw
 
 
-def computing(family: str, *, slipped: bool = False):
+def drawing_text(family: str):
+    """`draw(seed)` of `family`'s text site: four rows of drawn token ids alone, `ids`, laid as
+    `multimodal_families.text_rows` lays them for both models; and Dew's inputs of them, each leaf
+    `dew.<index>` in its tree's order."""
+    loaded, _, _ = _family(family)
+
+    def draw(seed: int) -> dict[str, np.ndarray]:
+        shape = (len(TEXT_LENGTHS), max(TEXT_LENGTHS))
+        ids = np.random.default_rng([495, seed]).integers(*TEXT_IDS, shape)
+        leaves = jax.tree.leaves(loaded.processor.from_hf(text_rows(ids)))
+        return {"ids": ids, **{f"dew.{index}": np.asarray(leaf) for index, leaf in enumerate(leaves)}}
+    return draw
+
+
+def computing(family: str, *, slipped: bool = False, text: bool = False):
     """`dew(dtype, inputs)` of `family` over a draw's encoding (`drawing`), at `dtype` (the model rebuilt in
     float64 for a float64 run, `ModelConfig.with_dtype`): its logits at every valid position, the summed
     next-token loss, its pixel gradient in the reference's image order (`_real_pixels`, over the encoding's
     image counts, which every draw shares) and the logits after one SGD step on every parameter
-    (multimodal_families.OUTPUTS). A `slipped` run takes the family's characteristic slip (`_wrong_inputs`)
+    (multimodal_families.OUTPUTS), or over a `text` draw's token rows alone (`drawing_text`) all but the
+    pixel gradient (TEXT_OUTPUTS). A `slipped` run takes the family's characteristic slip (`_wrong_inputs`)
     into its logits and one layer's gradient with its sign flipped (`_one_layer_negated`) into its step."""
     loaded, sample, _ = _family(family)
+    if text:
+        # Every text draw lays its rows alike (`text_rows`): any ids give the tree.
+        laid = np.full((len(TEXT_LENGTHS), max(TEXT_LENGTHS)), TEXT_IDS[0])
+        sample = loaded.processor.from_hf(text_rows(laid))
     tree = jax.tree.structure(sample)
 
     def dew(dtype, inputs) -> dict:
@@ -653,34 +684,45 @@ def computing(family: str, *, slipped: bool = False):
         value, gradient, pixels = _stepped(model, variables, encoded)
         trained = _trained(variables, _one_layer_negated(gradient) if slipped else gradient)
         given = _wrong_inputs(family, encoded) if slipped else encoded
-        return {"logits": jnp.where(valid, forward(variables, given), 0), "loss": value,
-                "pixel_gradient": _real_pixels(sample, pixels),
-                "updated_logits": jnp.where(valid, forward(trained, encoded), 0)}
+        found = {"logits": jnp.where(valid, forward(variables, given), 0), "loss": value,
+                 "updated_logits": jnp.where(valid, forward(trained, encoded), 0)}
+        return found if text else {**found, "pixel_gradient": _real_pixels(sample, pixels)}
     return dew
 
 
-def pipeline_arms(family: str):
-    """tools/venv_reference.py's `multimodal-<family>` site: its recording, draw, Dew run and leaves."""
-    return (FIXTURE.parent / FAMILIES[family][0] / "recording.npz", drawing(family), computing(family),
-            OUTPUTS)
+def pipeline_arms(arms: str):
+    """tools/venv_reference.py's `multimodal-<family>` site (`arms` its family) or `multimodal-<family>-text`
+    site (`<family>/text`): its recording, draw, Dew run and leaves."""
+    family, _, kind = arms.partition("/")
+    directory = FIXTURE.parent / FAMILIES[family][0]
+    if kind == "text":
+        return (directory / "recording-text.npz", drawing_text(family), computing(family, text=True),
+                TEXT_OUTPUTS)
+    return directory / "recording.npz", drawing(family), computing(family), OUTPUTS
 
 
-@pytest.mark.parametrize("family", sorted(DRAWN))
-def test_a_drawn_familys_logits_loss_pixel_gradient_and_step_are_on_par_with_its_reference(family):
-    """A drawn family's valid logits, its summed next-token loss, its pixel gradient and its logits after
-    one SGD step of every parameter, on par with the reference's over drawn images and audio (check 1),
-    the truth the reference's float64 twin taking the same step; its characteristic slip, and one layer's
-    gradient with its sign flipped, fail the same check."""
-    arms = pipeline_arms(family)
-    site = f"multimodal-{family}"
-    assert_arms_as_recorded(arms, site, SEEDS[family], family)
-    recording, draw, dew, _ = arms
-    slip = computing(family, slipped=True)
+DRAWN_SITES = [*sorted(DRAWN), *(f"{family}/text" for family in sorted(TEXT_DRAWN))]
+"""Every drawn site's arms (`pipeline_arms`): each drawn family's over images and audio, and each family's
+over token rows alone."""
+
+
+@pytest.mark.parametrize("arms", DRAWN_SITES)
+def test_a_drawn_site_is_on_par_with_its_reference(arms):
+    """A drawn site's leaves, on par with the reference's (check 1), the truth the reference's float64 twin
+    taking the same step: a family's valid logits, its summed next-token loss, its pixel gradient and its
+    logits after one SGD step of every parameter over drawn images and audio, or all but the pixel gradient
+    over drawn token rows alone; its characteristic slip, and one layer's gradient with its sign flipped,
+    fail the same check."""
+    family, _, kind = arms.partition("/")
+    site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
+    recording, draw, dew, leaves = pipeline_arms(arms)
+    assert_arms_as_recorded((recording, draw, dew, leaves), site, SEEDS[arms], arms)
+    slip = computing(family, slipped=True, text=kind == "text")
     with pytest.raises(GateFailure):
         # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
         assert_arms_as_recorded(
             (recording, draw, lambda dtype, inputs: (dew if dtype == jnp.float64 else slip)(dtype, inputs),
-             OUTPUTS), site, SEEDS[family], f"{family} slipped")
+             leaves), site, SEEDS[arms], f"{arms} slipped")
 
 
 def _float32_values_in_float64(loaded, inputs) -> int:

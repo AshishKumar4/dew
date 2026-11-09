@@ -402,7 +402,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
                 d_pairs, [lambda c: query, lambda c: key * betas[:, None]], lambda c: key, 1, gated,
                 reference, Issuer(call, {"pairs": list(pairs)}).summed, chunk=CHUNK,
                 emit=lambda kind, p, c, grad: found.__setitem__((kind, p), grad),
-                **({} if call.factored else {"shifted": shifted, "lower": lower, "d_loads": d_loads}))
+                shifted=shifted, lower=lower, d_loads=d_loads)
             d_query, d_keyed, d_key = found["rows", 0], found["rows", 1], found["keys", 0]
             for ref, grad in ((dq_ref, d_query), (dk_ref, d_keyed * betas[:, None] + d_key),
                               (dg_ref, query * d_query + key * (d_keyed * betas[:, None] - d_key))):
@@ -438,13 +438,12 @@ def _key_pairs_staged(call: Call, keys: int) -> tuple:
     of a chunk's square in `_parted`'s form, and the sub-chunks' references' plain tile; a key block's
     landing."""
     parted = _parted(call)
-    # Where the call's pairs do not factor (`Call.factored`), a key block's keys and separated prefix below a
-    # sub-chunk's rows and a tile above them (`algebra.key_diagonal_pairs_back`'s shifted reads), stated
-    # plain as the forward's are (`mosaic.plain`): unstated, layout inference tiled them, and the reads at
-    # row offsets no tiling divides took other rows on every GPU, Kimi delta attention's gradients 1e4 times
-    # their size where its pairs do not factor, its interpreted run right (row 5194).
-    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),
-                                       mosaic.plain((CHUNK + algebra.SUB, keys), jnp.float32))
+    # A key block's keys and separated prefix below a sub-chunk's rows and a tile above them
+    # (`algebra.key_diagonal_pairs_back`'s shifted reads), stated plain as the forward's are (`mosaic.plain`):
+    # unstated, layout inference tiled them, and the reads at row offsets no tiling divides took other rows on
+    # every GPU, Kimi delta attention's gradients 1e4 times their size, its interpreted run right (row 5194).
+    padded = (mosaic.plain((3, algebra.SUB + CHUNK, keys), jnp.float32),
+              mosaic.plain((CHUNK + algebra.SUB, keys), jnp.float32))
     staging = ([staging_tiles(parted, (CHUNK, keys))[0] for _ in range(2)],
                [staging_tiles(parted, (CHUNK, CHUNK))[0] for _ in range(2)],
                plgpu.SMEM((2, CHUNK // algebra.SUB, keys), jnp.float32), *padded)
