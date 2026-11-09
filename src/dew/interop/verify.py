@@ -408,8 +408,12 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
         rotary = 'qk_rope_head_dim' in hf_config and stated == hf_config['qk_rope_head_dim']
         fields[key('head_dim')] = _HEAD_DIM // 2 if rotary else _HEAD_DIM
     # A window, a chunk and a ramp's original context shrink below the probe's length, so the probe runs
-    # past each.
-    for positional in ('sliding_window', 'attention_chunk_size'):
+    # past each. A state space layer's scan chunk is one too: its chunks are the scan's own exact
+    # arithmetic, which the probe crosses between chunks only below its length, and a stated one past it
+    # (Falcon-H1-3B's 128) pads each of the gradients' four-token rows to the whole chunk, where
+    # transformers' torch scan holds a [rows, chunk, chunk, heads, head width] product: its float32
+    # gradient of 128 rows took 9.8 GiB.
+    for positional in ('sliding_window', 'attention_chunk_size', 'mamba_chunk_size', 'chunk_size'):
         if isinstance(hf_config.get(positional), int):
             fields[positional] = _WINDOW
     small_head_dim = _HEAD_DIM if key('head_dim') in hf_config else small_hidden // small_heads
