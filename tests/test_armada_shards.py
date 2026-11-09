@@ -275,6 +275,61 @@ def test_a_mark_the_plan_cannot_read_from_its_tests_decorator_is_refused(ci, tmp
         "pytest", "-p", "executed", "tests/test_site.py::TestSite::test_work"]
 
 
+PARAMETERS = """import os
+from pathlib import Path
+
+import pytest
+
+
+@pytest.mark.parametrize("form", [
+    pytest.param("one", id="one", marks=pytest.mark.check1_shards(seeds=2, per_task=8)),
+    pytest.param("two", id="two-rated", marks=[pytest.mark.check1_shards(seeds=4, per_task=8)]),
+    "plain"])
+def test_form(form):
+    with Path(f"runs-{form}").open("a") as runs:
+        runs.write(os.environ.get("DEW_CHECK1_DRAWS", "whole") + " ")
+"""
+"""A test of three parameters, two marked as check-1 sites of their own seeds (one in a list of marks), one
+unmarked."""
+
+
+def test_a_marked_parameter_is_a_site_of_its_own_whose_tasks_run_it_alone(ci, tmp_path, monkeypatch):
+    """A parameter marked check1_shards in its test's one literal parametrize list, `pytest.param(...,
+    id="<id>", marks=...)`, is a site of its own, `test[id]`: its own map tasks and judge, which run its node
+    alone, while the file's own row runs its unmarked parameters and none of its marked ones (Main's ruling,
+    2026-11-09: test_recurrence's hook combinations each a check-1 site of its own seeds); a marked parameter
+    with no literal id, or of a test parametrized twice, is refused, naming its line."""
+    out = site_checkout(tmp_path, PARAMETERS)
+    assert ci.sites("tests/test_site.py") == {
+        "test_form[one]": ci.Mark(units=staged_units(2), per_task=8, line=8, timed=2),
+        "test_form[two-rated]": ci.Mark(units=staged_units(4), per_task=8, line=9, timed=4)}
+    entries = planned(ci, 30.0)
+    judges = {entry["split"]: entry for entry in entries.values() if "after" in entry}
+    assert sorted(judges) == ["test_form[one]", "test_form[two-rated]"]
+    whole = next(entry for entry in entries.values() if entry["split"] == "" and "3.12:tests/test_site.py"
+                 in entry["rows"])
+    assert entry_task(ci, monkeypatch, whole, out) == 0
+    first = entries[judges["test_form[one]"]["after"][0]]
+    assert first["split"] == "test_form[one].draws-0-2"
+    assert entry_task(ci, monkeypatch, first, out, artifacts=tmp_path / ".verdict/first") == 0
+    ran = {form: (tmp_path / f"runs-{form}").read_text().split() for form in ("one", "two", "plain")
+           if (tmp_path / f"runs-{form}").exists()}
+    assert ran == {"plain": ["whole"], "one": ["0:2"]}
+    mark = "marks=pytest.mark.check1_shards(seeds=2, per_task=8)"
+    for parameters in (f'pytest.param("one", {mark})', f'pytest.param("one", id="o.ne", {mark})'):
+        written(tmp_path, {"test_site.py": "import pytest\n"
+                                           f"@pytest.mark.parametrize('form', [{parameters}])\n"
+                                           "def test_form(form):\n    pass\n"})
+        with pytest.raises(SystemExit):
+            ci.plan(30.0, {})
+    written(tmp_path, {"test_site.py": "import pytest\n@pytest.mark.parametrize('side', [1, 2])\n"
+                                       "@pytest.mark.parametrize('form', [pytest.param('one', id='one', "
+                                       "marks=pytest.mark.check1_shards(seeds=2, per_task=8))])\n"
+                                       "def test_form(form, side):\n    pass\n"})
+    with pytest.raises(SystemExit):
+        ci.plan(30.0, {})
+
+
 def test_sites_past_one_judges_jobs_inputs_together_are_planned_and_one_past_it_alone_is_refused(
         ci, tmp_path, monkeypatch):
     """armada cuts the judges of one environment and size into as many judges' jobs as keep each within
