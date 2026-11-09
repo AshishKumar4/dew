@@ -957,6 +957,17 @@ def plain(shape: tuple, dtype):
     return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
 
 
+def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
+    """A ref a launch writes in place and reads back, no declared output (a balanced tail's partials, a split
+    decode's slices' states), started uninitialized: on a GPU XLA's AllocateBuffer (`lax.empty`, no memset,
+    as no slot is read before a program writes it); interpreted, NaN, as the interpreter starts an output
+    (`uninitialized_memory='nan'`), so a slot read before any program writes it reaches the outputs as NaN
+    (`tests/kernel_outputs.py`'s sentinel), which a CPU's zeroed allocation would hide."""
+    if interpret:
+        return jax.new_ref(jnp.full(shape, jnp.nan, dtype))
+    return jax.new_ref(lax.empty(shape, dtype))
+
+
 def laid(condition, like: jax.Array) -> jax.Array:
     """The scalar `condition` laid over `like`, a vector predicate of its shape: Mosaic GPU's warpgroup
     semantics select under no scalar predicate (`jnp.where` passes a scalar condition as it is; the fused

@@ -131,7 +131,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post68: the Pallas lowering cache keys no setting a lowering never reads,
+- Dew requires its JAX build 0.12.0.1.post70: a serialized executable's output types unpickle with JAX's own
+  `AutoLayout`, so a loaded executable's outputs trace as a fresh run's do (a nested `jit` fed them traced twice,
+  and a step compiled ahead recompiled on the GPU).
+- Dew's JAX build 0.12.0.1.post69: a `cond` whose lowering drops a platform's branch still passes
+  that branch's ordered-effect tokens, and the Pallas lowering cache encodes each interned abstract value and dtype
+  once per key. Its CUDA plugins are post67's on every machine: aarch64's are built (ledger row 5211), so a GH200
+  that compiles for more than one GPU target assembles each object for its own capability too, and the `cuda12`
+  and `cuda13` extras name one plugin for x86_64 and aarch64 alike.
+- Dew's JAX build 0.12.0.1.post68: the Pallas lowering cache keys no setting a lowering never reads,
   and a process may declare packages of its own sealed by their tree's digest (`JAX_PALLAS_LOWERING_CACHE_SOURCES`),
   which Dew declares itself, so its kernels holding Dew's own code (an `inline_mgpu` body, a marked call) are
   kept and read back across processes. Its CUDA plugins are post67's, whose fixes follow.

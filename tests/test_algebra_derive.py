@@ -11,12 +11,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from check1_statistics import GateFailure
 from reference_error import assert_as_exact
 
 from dew import algebra
 from dew.algebra import SATURATION, derive, forms as algebra_forms
 from dew.nn import precision
+from dew.parity import GateFailure
 
 QUERIES, KEYS, WIDTH, TILE = 16, 96, 32, 32
 

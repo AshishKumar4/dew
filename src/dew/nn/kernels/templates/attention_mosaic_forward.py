@@ -1744,12 +1744,12 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     target = generation.gpu_target()
     slots = None
     if merges and splits > 1:
-        # Its slices' states their merge reads, a workspace started uninitialized (`lax.empty`: XLA's
-        # AllocateBuffer on a GPU, no memset), as no slot is read before its slice writes it (`_Read.slots`).
+        # Its slices' states their merge reads, a workspace (`mosaic.workspace`): no slot is read before its
+        # slice writes it (`_Read.slots`).
         batch, padded, heads = query.shape[:3]
         width = (column_width or value.shape[-1]) * column_blocks
-        slots = (jax.new_ref(lax.empty((batch, splits, padded, heads, width), jnp.float32)),
-                 jax.new_ref(lax.empty((2, batch, heads, splits, padded), jnp.float32)))
+        slots = (mosaic.workspace((batch, splits, padded, heads, width), jnp.float32, interpret=interpret),
+                 mosaic.workspace((2, batch, heads, splits, padded), jnp.float32, interpret=interpret))
     return _launched(query, key, value,
                      _Read(spans, hooked, guard, anchors, None if table is None else table[0],
                            None if walks is None else walks.blocks, sources, block, into, slots,
