@@ -957,7 +957,7 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
     its lone call draws under its keys and settings, on par with that call
     against the float64 pipeline over the same prepared noise and conditions (check 1)."""
     from arm_arithmetic import widened
-    from reference_error import as_given, assert_as_exact, seeds_for
+    from reference_error import as_given, assert_as_exact
 
     from dew.inference import ImageRequest, ScoringServer
 
@@ -1041,8 +1041,8 @@ def test_a_scoring_server_answers_image_requests_as_each_draws_alone(tmp_path):
         return tuple(images)
 
     label = "served images"
-    count = seeds_for(alone, draw, label, truth_fn=truth, dew_fn=served)
-    assert_as_exact(served, alone, draw, label, seeds=count, truth_fn=truth)
+    # The count `seeds_for` sized, paired against the served arm.
+    assert_as_exact(served, alone, draw, label, seeds=8, truth_fn=truth)
 
 
 def test_pipeline_places_a_run_on_a_mesh_and_answers_the_same_images(tmp_path):

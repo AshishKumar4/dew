@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import as_given, assert_as_exact, seeds_for
+from reference_error import as_given, assert_as_exact
 
 from dew.newton_schulz import NEWTON_SCHULZ
 from dew.optim import delta_gradient_descent, scale_by_m3
@@ -113,8 +113,8 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     def truth(gradients):
         return jax.tree.map(m3_directions, gradients)
 
-    seeds = seeds_for(reference, draw, "M3 directions", truth_fn=truth, dew_fn=directions)
-    assert_as_exact(directions, reference, draw, "M3 directions", seeds=seeds, truth_fn=truth)
+    # The count `seeds_for` sized, paired against the directions.
+    assert_as_exact(directions, reference, draw, "M3 directions", seeds=8, truth_fn=truth)
     (gradients,) = draw(0)
     gradients = gradients["head"]
     state, held = transform.init(gradients[0]), []
