@@ -18,6 +18,7 @@ import jax
 import jax.extend.core as jcore
 import jax.numpy as jnp
 from jax._src import mesh as mesh_lib
+from jax.extend.backend import backends
 from jax.interpreters import ad
 
 CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
@@ -242,16 +243,17 @@ def _extended(value) -> bool:
 
 @contextlib.contextmanager
 def on_host() -> Iterator[None]:
-    """Compile-time evaluation on this host's CPU, no mesh in context, abstract or concrete: a step traced
-    under its devices' mesh (`jax.set_mesh`, a compile-only TPU topology's, a multi-process one's) would
-    place an eager primitive's operands on devices that run nothing here. `jax.set_mesh(None)` does the
-    same swaps but refuses to run under a trace, which a program's rewrite may be."""
+    """Compile-time evaluation on this host, no mesh in context, abstract or concrete: a step
+    traced under its devices' mesh (`jax.set_mesh`, a compile-only TPU topology's, a multi-process one's)
+    would place an eager primitive's operands on devices that run nothing here. `jax.set_mesh(None)` does
+    the same swaps but refuses to run under a trace, which a program's rewrite may be."""
     abstract = mesh_lib.abstract_mesh_context_manager.swap_local(mesh_lib.empty_abstract_mesh)
     concrete = mesh_lib.device_context.swap_local(mesh_lib.empty_concrete_mesh)
     try:
-        # This process's own CPU: the pool's first device may be another process's, which this one
-        # cannot read back.
-        with jax.ensure_compile_time_eval(), jax.default_device(jax.local_devices(backend="cpu")[0]):
+        # This process's own device: its CPU, or, where it runs no CPU backend (`JAX_PLATFORMS=cuda`), its
+        # first. Its own: the pool's first device may be another process's, which this one cannot read back.
+        host = jax.local_devices(backend="cpu" if "cpu" in backends() else None)[0]
+        with jax.ensure_compile_time_eval(), jax.default_device(host):
             yield
     finally:
         mesh_lib.device_context.set_local(concrete)
