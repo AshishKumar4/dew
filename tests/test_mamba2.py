@@ -43,6 +43,7 @@ from ssd_support import (
     mamba2_model_variables,
     mamba2_site,
     padded_layout,
+    transformers_tangent,
 )
 
 from dew.batch import coordinates
@@ -74,14 +75,19 @@ def _recorded(reference, site):
                                      truth_fn=jax.jit(lambda inputs: twin(site, inputs)))
 
 
-def assert_recorded_as_exact(reference, site, run=None, label: str | None = None):
+def assert_recorded_as_exact(reference, site, run=None, label: str | None = None, transcribed=None):
     """Dew's `run(inputs)` (the site's own computation by default, Dew's float64 twin's in the inputs' dtype:
-    `ssd_support.mamba2_site`) on par with transformers' recorded at the site (check 1)."""
+    `ssd_support.mamba2_site`) on par with transformers' recorded at the site (check 1); weighed where it
+    stays undecided, at the recording's declared `<site>.conditioning` seeds, its rounding scale read from
+    `transcribed(inputs)`, transformers' computation transcribed in JAX, where the site declares one."""
     seeds, draw, recorded, truth = _recorded(reference, site)
     _, twin = mamba2_site(site)
     run = (lambda inputs: twin(site, inputs)) if run is None else run
+    weighed = {} if transcribed is None else {
+        "conditioning": int(reference[f"{site}.conditioning"]),
+        "conditioning_program": lambda index, inputs: transcribed(inputs)}
     assert_as_exact(jax.jit(lambda index, inputs: run(inputs)), recorded, draw,
-                    label or f"transformers {site}", seeds=seeds, truth_fn=truth)
+                    label or f"transformers {site}", seeds=seeds, truth_fn=truth, **weighed)
 
 
 def assert_recorded_moves(reference, site, changed, label: str):
@@ -224,8 +230,12 @@ def test_the_layer_decodes_as_it_prefills(seeded_reference):
 def test_the_layer_takes_forward_mode(seeded_reference):
     """`jax.jvp` through the layer, as MeanFlow and consistency training trace a model: its tangent along a
     drawn direction against transformers' (`torch.func.jvp`, 'tangent'). The D skip's custom VJP refused
-    forward mode on every target (row 1933), so a hybrid with Mamba-2 layers trained on neither."""
-    assert_recorded_as_exact(seeded_reference, "tangent", label="the layer's tangent")
+    forward mode on every target (row 1933), so a hybrid with Mamba-2 layers trained on neither. Its SSD
+    scan's output cancels on some tokens, so every arm's rounding is amplified unevenly and the unweighted
+    pool stays heavy-tailed at any count: undecided there, the site is judged weighed, its scale read from
+    transformers' computation transcribed in JAX (`transformers_tangent`; row 5287)."""
+    assert_recorded_as_exact(seeded_reference, "tangent", label="the layer's tangent",
+                             transcribed=transformers_tangent)
 
 
 def test_padded_rows_preserve_the_state_and_the_history(seeded_reference):

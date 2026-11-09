@@ -33,7 +33,16 @@ from fetched_fixtures import save
 from reference_error import FEWEST_SEEDS, REDRAW, as_given, input_digest, seeds_for, widened
 from truth_sketch import truth_sketch
 
-from dew.parity import SIZING_FROM, example_mse, example_worst, leaf_summaries, rows_summary, seeds_resolving
+from dew.parity import (
+    MOST_SEEDS,
+    SIZING_FROM,
+    Inconclusive,
+    example_mse,
+    example_worst,
+    leaf_summaries,
+    rows_summary,
+    seeds_resolving,
+)
 from dew.parity_stages import staged_units
 
 __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "record_logits",
@@ -82,7 +91,7 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
 
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
-                examples: bool = False) -> dict[str, np.ndarray]:
+                examples: bool = False, conditioning_program=None) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. With no proxy, the recorded reference alone
@@ -104,7 +113,14 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     alike in both arms (a lognormal training sigma), where the reference compared with itself on other
     draws never resolves. A site whose GPU paired sizing needs more seeds than the recording CPU's
     declares that count through `start`: the recording confirms it here and keeps its whole redraw. A site
-    whose leaves stack independent examples (`examples`) is sized as its verdict judges it."""
+    whose leaves stack independent examples (`examples`) is sized as its verdict judges it. A site that
+    declares the weighed check (`assert_as_exact`'s `conditioning`) names `conditioning_program`, the
+    reference's computation transcribed in JAX that its rounding scale is read from: the weighed check's
+    seeds are sized on the recorded reference as that check judges them (`seeds_for(...,
+    conditioning=True)`, paired where the unweighted check's are), recorded as far as its stages draw (from
+    the first seed, as the unweighted check's do), and declared as `<label>.conditioning`; its outputs are
+    kept whole, which the weighing reads. Its unweighted sizing that never resolves declares the cap,
+    MOST_SEEDS (docs/design/testing.md)."""
     if proxy is None and truth_proxy is not None:
         raise ValueError("a planning truth requires its proxy")
     # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
@@ -138,14 +154,28 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
 
     ensure(staged_units(planned))
     # The recorded reference is read by index from the host's records, as given.
-    confirmed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
-                          start=start,
-                          truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                          dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
-                          examples=examples)
+    try:
+        confirmed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
+                              start=start,
+                              truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                              dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
+                              examples=examples)
+    except Inconclusive:
+        # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
+        if conditioning_program is None:
+            raise
+        confirmed = MOST_SEEDS
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
     # than the recorded reference confirms leaves draws the recording does not keep.
     kept = staged_units(confirmed)
+    weighed = 0
+    if conditioning_program is not None:
+        weighed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
+                            start=start, truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                            dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
+                            conditioning=True, conditioning_program=jax.jit(conditioning_program))
+        # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
+        kept = max(kept, staged_units(weighed))
     ensure(kept)
     kept_records = [records[seed] for seed in range(kept)]
     if summary:
@@ -167,6 +197,8 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
             input_digest({name: value for name, value in entry[0].items() if name not in replayed})
             for entry in kept_records])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+    if conditioning_program is not None:
+        result[f"{label}.conditioning"] = np.int32(weighed)
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
 
