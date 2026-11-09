@@ -629,11 +629,16 @@ class EMASpec:
     decay: optax.Schedule
     select: PathFilter = everything
     progressed: bool = False
+    stated: Hashable = None
+    """A value of its decay and selection where one states them (`constant`'s), which a trace of the
+    step that keeps the EMA is kept by (`Objective.traced_by`); None for a schedule or a selection given
+    as a function alone."""
 
     @classmethod
     def constant(cls, decay: float | None) -> EMASpec | None:
         """Follow what moves at a constant `decay`, never the frozen collection; None keeps no EMA."""
-        return None if decay is None else cls(optax.constant_schedule(decay), lambda path: path[0] != FROZEN)
+        return None if decay is None else cls(optax.constant_schedule(decay), lambda path: path[0] != FROZEN,
+                                              stated=("constant", decay, "moving"))
 
 
 class SavedTask(Protocol):
@@ -963,11 +968,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         states its own (`stated_trace`): a subclass that inherits one, whose loss may read more, has none."""
         return None
 
-    def traced_by(self, *settings: Hashable) -> Hashable:
+    def traced_by(self, *settings: Hashable) -> Hashable | None:
         """A trace key (`trace_key`) of the objective's `settings` beside what every objective's trace
         reads: the modules its programs execute as they stand (`program_key`: after a rung's substitute,
-        at its head's policy) and its held tree's shapes (`held_shapes`), whose arrays pass as arguments."""
-        return (tuple(self.program_key()), held_shapes(self.held_variables()), *settings)
+        at its head's policy), its held tree's shapes (`held_shapes`), whose arrays pass as arguments, and
+        the EMA its step keeps (`EMASpec.stated`); None where its EMA states no value."""
+        ema = getattr(self, "ema", None)
+        if ema is not None and ema.stated is None:
+            return None
+        return (tuple(self.program_key()), held_shapes(self.held_variables()),
+                None if ema is None else (ema.stated, ema.progressed), *settings)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.

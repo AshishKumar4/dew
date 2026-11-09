@@ -11,11 +11,13 @@ import contextlib
 import dataclasses
 import functools
 import threading
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from typing import TYPE_CHECKING
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.batch import CLOSES_WINDOW, Batch
@@ -24,6 +26,7 @@ from dew.distributed.placement import Placement, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import owned_program, trace_context
+from dew.nn.kernels.templates import report
 from dew.nn.sharding import Schedule
 from dew.state import TrainState, apart, together
 from dew.training import staging
@@ -75,16 +78,53 @@ _CANDIDATES: collections.OrderedDict[Hashable, Candidate] = collections.OrderedD
 _KEEPING = threading.Lock()
 
 
+class _Unkeyed:
+    """A part of a step's settings that states no value (a function, an object compared by identity)."""
+
+
+UNKEYED = _Unkeyed()
+
+
+def frozen_value(value) -> Hashable:
+    """`value` as a value a step's trace can be kept by: a mapping as its sorted items, a sequence as a
+    tuple, a dataclass as its type and fields, recursively, a number, string or other hashable value as
+    itself (a Flax module by its fields); `UNKEYED` where any part is a function, or an object of no value
+    (one hashed by its identity)."""
+    if isinstance(value, Mapping):
+        items = tuple(sorted((key, frozen_value(item)) for key, item in value.items()))
+        return UNKEYED if any(item is UNKEYED for _, item in items) else items
+    if isinstance(value, list | tuple):
+        parts = tuple(map(frozen_value, value))
+        return UNKEYED if any(part is UNKEYED for part in parts) else (type(value), parts)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type | nn.Module):
+        fields = tuple((field.name, frozen_value(getattr(value, field.name)))
+                       for field in dataclasses.fields(value))
+        return UNKEYED if any(item is UNKEYED for _, item in fields) else (type(value), fields)
+    if ((callable(value) and not isinstance(value, nn.Module))
+            or type(value).__hash__ in (None, object.__hash__)):
+        return UNKEYED
+    return value
+
+
 def _shaped(tree) -> Hashable:
-    """`tree`'s structure and each leaf's abstract value and placement (an array's, a shape's), or the leaf
-    itself where it is neither."""
+    """`tree`'s structure and each leaf's abstract value and placement (an array's, a NumPy array's, a
+    shape's, a scalar's beside its type, which tells True from 1), or the leaf itself where it is none."""
     def leaf(value) -> Hashable:
-        if isinstance(value, jax.Array | jax.ShapeDtypeStruct):
+        if isinstance(value, jax.Array | jax.ShapeDtypeStruct | np.ndarray | np.generic | bool | int | float
+                      | complex):
             aval = jax.typeof(value)
-            return aval.shape, aval.dtype, aval.weak_type, getattr(value, "sharding", None)
+            return type(value), aval.shape, aval.dtype, aval.weak_type, getattr(value, "sharding", None)
         return value
     leaves, structure = jax.tree.flatten(tree)
     return structure, tuple(map(leaf, leaves))
+
+
+def _shapes(tree):
+    """`tree` with each array leaf as its shape, dtype and placement, as a kept step holds a batch it
+    traced over and none of its values."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                          sharding=getattr(leaf, "sharding", None))
+                        if hasattr(leaf, "dtype") else leaf, tree)
 
 
 def _footprinted(footprint: Footprint | None) -> Hashable:
@@ -106,24 +146,44 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     lowered it, 9 s), its pipeline's schedule the one its microbatches make; a trainer whose step no value
     states traces its own."""
     stated = stepping.trainer._step_key()
+    # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
+    # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
         stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, launches,
         lowering, mesh, platforms, capacity, _footprinted(footprint), derived, stepping.rows, stepping.split,
-        stepping.prefetch, stepping.examples is not None, trace_context())
+        stepping.prefetch, stepping.examples, report.refused(), trace_context())
     if key is not None:
         with _KEEPING:
             if (kept := _CANDIDATES.get(key)) is not None:
                 _CANDIDATES.move_to_end(key)
-                return kept
+                sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
+                return dataclasses.replace(kept, sampled=sampled)
     candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow, launches,
                            lowering, mesh=mesh, platforms=platforms, capacity=capacity, footprint=footprint,
                            derived=derived)
     if key is not None:
+        # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
+        # builds the reader's own).
         with _KEEPING:
-            _CANDIDATES[key] = candidate
+            _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None)
             while len(_CANDIDATES) > KEPT_CANDIDATES:
                 _CANDIDATES.popitem(last=False)
     return candidate
+
+
+def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Candidate, batch: Batch,
+                              placement, replicated, split: int, platforms: tuple[str, ...] | None
+                              ) -> Callable[[], jax.stages.Lowered] | None:
+    """The sampled step a kept candidate's reader lowers (`Candidate.sampled`), its own trainer's: as
+    `_candidate` builds it, over the candidate's shapes and the batch's."""
+    if stepping.trainer.inspection is None:
+        return None
+    watched = step_program(stepping, candidate.shapes, candidate.copies, candidate.shardings, placement,
+                           replicated, split, sampled=True)
+    part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
+    given = placed_shapes(batch, placement)
+    return functools.partial(lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
+                             *apart(candidate.prepared), given, part)
 
 
 def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,

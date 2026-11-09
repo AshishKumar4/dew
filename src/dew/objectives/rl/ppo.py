@@ -170,7 +170,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         self.inputs = self.actor.inputs
         reference = self.actor.ema
         self.ema = None if reference is None else EMASpec(reference.decay,
-            lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
+            lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])),
+            stated=None if reference.stated is None else ("policy", reference.stated))
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """The policy's runs a pipeline over `stages` stacks, under `policy`, and the critic's, under

@@ -52,3 +52,31 @@ def test_a_head_at_another_policy_and_a_subclass_trace_by_keys_of_their_own():
             return super().loss(variables, batch, step)
 
     assert stated_trace(Counted(tiny(), 8)) is None
+
+
+def test_an_ema_of_another_decay_traces_apart_and_one_given_as_a_function_keeps_no_key():
+    """The EMA a step keeps is the step's: a decay of its own traces apart (`EMASpec.stated`), and an EMA
+    whose decay is a schedule given as a function states no value, so its objective keeps no key."""
+    import dataclasses
+
+    import optax
+
+    slow, fast = LMObjective(tiny(), 8, ema_decay=0.99), LMObjective(tiny(), 8, ema_decay=0.9)
+    assert stated_trace(slow) != stated_trace(fast) != stated_trace(LMObjective(tiny(), 8))
+    scheduled = LMObjective(tiny(), 8, ema_decay=0.99)
+    decay = optax.linear_schedule(0.9, 0.99, 10)
+    scheduled.ema = dataclasses.replace(scheduled.ema, decay=decay, stated=None)
+    assert stated_trace(scheduled) is None
+
+
+def test_a_settings_value_holds_its_mappings_in_order_and_none_for_a_function():
+    """A step's settings are kept by value (`frozen_value`): an optimizer config's option mapping in any
+    order alike, its options apart from another's, and a setting that is a function, none."""
+    from dew.optim import OptimConfig
+    from dew.training._candidates import UNKEYED, frozen_value
+
+    one = OptimConfig(optimizer_opts={"b1": 0.8, "b2": 0.9})
+    assert frozen_value(one) == frozen_value(OptimConfig(optimizer_opts={"b2": 0.9, "b1": 0.8}))
+    assert frozen_value(one) != frozen_value(OptimConfig(optimizer_opts={"b1": 0.8, "b2": 0.95}))
+    assert hash(frozen_value(one)) is not None
+    assert frozen_value((one, lambda batch: batch)) is UNKEYED
