@@ -11,10 +11,9 @@ import contextlib
 import dataclasses
 import functools
 import threading
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable
 from typing import TYPE_CHECKING
 
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -76,34 +75,6 @@ holds its lowered module."""
 
 _CANDIDATES: collections.OrderedDict[Hashable, Candidate] = collections.OrderedDict()
 _KEEPING = threading.Lock()
-
-
-class _Unkeyed:
-    """A part of a step's settings that states no value (a function, an object compared by identity)."""
-
-
-UNKEYED = _Unkeyed()
-
-
-def frozen_value(value) -> Hashable:
-    """`value` as a value a step's trace can be kept by: a mapping as its sorted items, a sequence as a
-    tuple, a dataclass as its type and fields, recursively, a number, string or other hashable value as
-    itself (a Flax module by its fields); `UNKEYED` where any part is a function, or an object of no value
-    (one hashed by its identity)."""
-    if isinstance(value, Mapping):
-        items = tuple(sorted((key, frozen_value(item)) for key, item in value.items()))
-        return UNKEYED if any(item is UNKEYED for _, item in items) else items
-    if isinstance(value, list | tuple):
-        parts = tuple(map(frozen_value, value))
-        return UNKEYED if any(part is UNKEYED for part in parts) else (type(value), parts)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type | nn.Module):
-        fields = tuple((field.name, frozen_value(getattr(value, field.name)))
-                       for field in dataclasses.fields(value))
-        return UNKEYED if any(item is UNKEYED for _, item in fields) else (type(value), fields)
-    if ((callable(value) and not isinstance(value, nn.Module))
-            or type(value).__hash__ in (None, object.__hash__)):
-        return UNKEYED
-    return value
 
 
 def _shaped(tree) -> Hashable:

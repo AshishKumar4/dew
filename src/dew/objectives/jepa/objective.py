@@ -24,7 +24,7 @@ that collapse shows in the training curves, before a probe run.
 from __future__ import annotations
 
 import functools
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 import jax
@@ -247,9 +247,8 @@ class JepaObjective(ReleasesModel, Objective[Ratio]):
             raise ValueError("the JEPA target branch needs the trainer's EMA variables")
         return part(step.ema, CONTEXT_ENCODER)
 
-    def trace_key(self) -> Hashable | None:
-        """Its encoder, predictor, masks and what it reads (`Objective.traced_by`)."""
-        return self.traced_by(self.encoder, self.predictor, self.mask, self.sample, self.is_video)
+    traced = ("encoder", "predictor", "mask", "sample", "is_video")
+    """Its encoder, predictor, masks and what it reads."""
 
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.sample.key])

@@ -26,7 +26,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-from collections.abc import Hashable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
@@ -570,12 +570,9 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
     def held_variables(self) -> Variables | None:
         return self.variables
 
-    def trace_key(self) -> Hashable | None:
-        """Its world model, its settings and the shapes of the tree it starts from: its loss and its draw
-        read nothing else (its return bins are its model's, its slow targets' decay a state's EMA)."""
-        return self.traced_by(self.horizon, self.imagination, self.lam, self.entropy, self.free_nats,
-                              self.return_rate, tuple(sorted(self.scales.items())), self.imitates,
-                              self.slow_targets, self.smoothness)
+    traced = ("horizon", "imagination", "lam", "entropy", "free_nats", "return_rate", "scales", "imitates",
+              "slow_targets", "smoothness")
+    """Its settings; its return bins are its model's, its slow targets' decay its EMA's."""
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         params_key, latent = jax.random.split(key)

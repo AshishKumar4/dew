@@ -75,7 +75,7 @@ def test_a_settings_value_holds_its_mappings_in_order_and_none_for_a_function():
     """A step's settings are kept by value (`frozen_value`): an optimizer config's option mapping in any
     order alike, its options apart from another's, and a setting that is a function, none."""
     from dew.optim import OptimConfig
-    from dew.training._candidates import UNKEYED, frozen_value
+    from dew.objectives.base import UNKEYED, frozen_value
 
     one = OptimConfig(optimizer_opts={"b1": 0.8, "b2": 0.9})
     assert frozen_value(one) == frozen_value(OptimConfig(optimizer_opts={"b2": 0.9, "b1": 0.8}))

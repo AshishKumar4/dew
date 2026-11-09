@@ -499,8 +499,7 @@ class Trainer(Generic[Loss, Effects]):
         trace, an optimizer given built, a custom step, a device step or a setting compared by identity
         (`frozen_value`), a loss scale given built, links, or a run that measures its kernels' configs as
         it lowers."""
-        from dew.objectives.base import stated_trace
-        from dew.training._candidates import UNKEYED, frozen_value
+        from dew.objectives.base import UNKEYED, frozen_value, stated_trace
 
         objective = stated_trace(self.objective)
         if (objective is None or self._config is None or self.step is not None or self._scaled is None

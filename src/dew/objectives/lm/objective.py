@@ -30,7 +30,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import math
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 
@@ -1531,12 +1531,10 @@ class LMObjective(TokenScorer):
         scored = self._scored_loss(variables, batch, step, train=step.training)
         return scored.statistics, scored.units * self.row_weights(batch, scored.units.shape[0])[:, None]
 
-    def trace_key(self) -> Hashable | None:
-        """Its window, balance, head policy and every setting its loss reads (`Objective.traced_by`); its
-        indexer phase is its indexer's."""
-        return self.traced_by(self.seq_len, self.balance, self.head_chunks, self.head_tile, self.head_fused,
-                              self.pad_id, self.token_accuracy, self.prefix, self.exit_entropy,
-                              self.mtp_weight, self.z_loss, self.loss_role, self.indexer, self.adaptation)
+    traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "pad_id", "token_accuracy",
+              "prefix", "exit_entropy", "mtp_weight", "z_loss", "loss_role", "indexer", "adaptation")
+    """Its window, balance, head policy and every setting its loss reads; its indexer phase is its
+    indexer's."""
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | RoutedStatistics, Aux[Variables]]:
         if self._warmup:

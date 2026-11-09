@@ -22,9 +22,10 @@ import weakref
 import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import (
     TYPE_CHECKING,
+    Any,
     ClassVar,
     Generic,
     Literal,
@@ -779,6 +780,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     any the data would give, or declares none."""
 
     ema: EMASpec | None = None
+    traced: ClassVar[tuple[str, ...] | None] = None
+    """The attributes beside its modules, held tree and EMA that its loss, draw and optimizer read, by
+    name, which its trace is kept by (`trace_key`); None where no value states them. A class states its
+    own: a subclass, whose loss may read more, inherits none (`stated_trace`)."""
     saved_task: ClassVar[type[SavedTask] | None] = None
     settings: ClassVar[type[DataclassInstance] | None] = None
     """The dataclass of what a saved run records beside its objective and model
@@ -962,22 +967,24 @@ class Objective(ABC, Generic[Loss, Effects]):
     def trace_key(self) -> Hashable | None:
         """A value of everything this objective's loss and its draw read beside their arguments, equal for
         two objectives whose losses trace alike, so a trace of one serves the other's equal fit, a refit or
-        a resume in the same process building it anew (`traced_update_flops`; row 3873); None, the
-        default, where no value states them (a closure, a constant a trace bakes in), and none is shared.
-        A key reads the objective as it is now, its modules and head as a fit's rung set them. A class
-        states its own (`stated_trace`): a subclass that inherits one, whose loss may read more, has none."""
-        return None
+        a resume in the same process building it anew (`traced_update_flops`; row 3873): its `traced`
+        settings' values beside its modules, held tree and EMA (`traced_by`). None where its class states
+        none, or a value none of them (a closure, a constant a trace bakes in). A key reads the objective
+        as it is now, its modules and head as a fit's rung set them."""
+        names = vars(type(self)).get("traced")
+        return None if names is None else self.traced_by(*(getattr(self, name) for name in names))
 
-    def traced_by(self, *settings: Hashable) -> Hashable | None:
-        """A trace key (`trace_key`) of the objective's `settings` beside what every objective's trace
-        reads: the modules its programs execute as they stand (`program_key`: after a rung's substitute,
-        at its head's policy), its held tree's shapes (`held_shapes`), whose arrays pass as arguments, and
-        the EMA its step keeps (`EMASpec.stated`); None where its EMA states no value."""
-        ema = getattr(self, "ema", None)
-        if ema is not None and ema.stated is None:
+    def traced_by(self, *settings: object) -> Hashable | None:
+        """A trace key (`trace_key`) of the objective's `settings` (`frozen_value`) beside what every
+        objective's trace reads: the modules its programs execute as they stand (`program_key`: after a
+        rung's substitute, at its head's policy), its held tree's shapes (`held_shapes`), whose arrays pass
+        as arguments, and the EMA its step keeps (`EMASpec.stated`); None where its EMA or a setting
+        states no value."""
+        stated = frozen_value(settings)
+        if stated is UNKEYED or (self.ema is not None and self.ema.stated is None):
             return None
         return (tuple(self.program_key()), held_shapes(self.held_variables()),
-                None if ema is None else (ema.stated, ema.progressed), *settings)
+                None if self.ema is None else (self.ema.stated, self.ema.progressed), stated)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
@@ -1816,10 +1823,42 @@ def held_shapes(tree) -> Hashable:
     return jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes))
 
 
-def stated_trace(objective: Objective) -> Hashable | None:
-    """`objective.trace_key()` where its own class states one, else None: a subclass reads what its own
-    loss adds (a counter, a term), which a key it inherited does not state."""
-    return objective.trace_key() if "trace_key" in vars(type(objective)) else None
+def stated_trace(objective: Objective[Any, Any]) -> Hashable | None:
+    """`objective.trace_key()` where its own class states its settings (`Objective.traced`) or its key,
+    else None: a subclass reads what its own loss adds (a counter, a term), which a key it inherited does
+    not state."""
+    own = vars(type(objective))
+    return objective.trace_key() if "trace_key" in own or "traced" in own else None
+
+
+class _Unkeyed:
+    """A part of a trace's settings that states no value (a function, an object compared by identity)."""
+
+
+UNKEYED = _Unkeyed()
+
+
+def frozen_value(value: object) -> Hashable:
+    """`value` as a value a trace can be kept by: a mapping as its sorted entries, a sequence as a tuple, a
+    dataclass as its type and fields, recursively, a number, string or other hashable value as itself (a
+    Flax module by its fields); `UNKEYED` where any part is a function, or an object of no value (one
+    hashed by its identity, or not at all)."""
+    from flax import linen as nn
+
+    if isinstance(value, Mapping):
+        entries = tuple(sorted((name, frozen_value(field)) for name, field in value.items()))
+        return UNKEYED if any(field is UNKEYED for _, field in entries) else entries
+    if isinstance(value, list | tuple):
+        parts = tuple(map(frozen_value, value))
+        return UNKEYED if any(part is UNKEYED for part in parts) else (type(value), parts)
+    if is_dataclass(value) and not isinstance(value, type | nn.Module):
+        stated = tuple((declared.name, frozen_value(getattr(value, declared.name)))
+                       for declared in fields(value))
+        return UNKEYED if any(part is UNKEYED for _, part in stated) else (type(value), stated)
+    if ((callable(value) and not isinstance(value, nn.Module))
+            or type(value).__hash__ in (None, object.__hash__)):
+        return UNKEYED
+    return value
 
 
 _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (

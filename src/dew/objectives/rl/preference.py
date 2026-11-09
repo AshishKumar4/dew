@@ -11,8 +11,6 @@ never separates a pair; the loss reads them in TRL's stacked order.
 
 from __future__ import annotations
 
-from collections.abc import Hashable
-
 import jax
 import jax.numpy as jnp
 
@@ -102,11 +100,8 @@ class DPOObjective(TokenScorer):
         # pairs into the halves and compare across them.
         return (ids[:, 0], ids[:, 1], mask[:, 0, 1:], mask[:, 1, 1:])
 
-    def trace_key(self) -> Hashable | None:
-        """Its window, balance, head policy and its beta (`Objective.traced_by`); its reference is the
-        step's EMA, an argument."""
-        return self.traced_by(self.seq_len, self.balance, self.head_chunks, self.head_tile, self.head_fused,
-                              self.beta)
+    traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "beta")
+    """Its window, balance, head policy and its beta; its reference is the step's EMA, an argument."""
 
     def loss(self, variables, batch, step):
         """Compute the preference term over each pair's completion tokens.
