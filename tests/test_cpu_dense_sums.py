@@ -71,10 +71,10 @@ def test_a_rows_product_is_its_own_whatever_rows_share_its_call():
     np.testing.assert_array_equal(np.asarray(pairwise._summed(a[:, :100], b, None)), whole[:, :100])
 
 
-def test_a_layers_projection_alone_sums_as_a_vectorized_dot():
-    """A layer's projection (`gemm.dot_general`, a Dense's product past the template) takes the CPU's
-    vectorized-dot sum; a product the algebra derives or a mixer forms (`float32_dot_general` itself:
-    attention's `dP` and `D`, whose sums cancel bit for bit on a one-key row) keeps XLA's, as before."""
+def test_a_layers_projection_and_every_accumulated_contraction_sum_as_a_vectorized_dot():
+    """A layer's projection (`gemm.dot_general`, a Dense's product past the template) and every float32
+    contraction `accumulated` sums (`float32_dot_general`, a product the algebra derives, a mixer's
+    `float32_einsum`) take the CPU's vectorized-dot sum: one order for sums that cancel each other."""
     numbers = (((1,), (0,)), ((), ()))
     operands = (jnp.ones((4, 96), jnp.float32), jnp.ones((96, 8), jnp.float32))
 
@@ -87,12 +87,38 @@ def test_a_layers_projection_alone_sums_as_a_vectorized_dot():
                     if isinstance(inner, jax.extend.core.Jaxpr):
                         yield from walked(inner)
 
-        traced = jax.make_jaxpr(lambda a, b: product(a, b, numbers))(*operands)
+        traced = jax.make_jaxpr(product)(*operands)
         return "platform_index" in set(walked(traced.jaxpr))
 
     with jax.default_matmul_precision(precision.FP32_SUMS):
-        assert chooses(gemm.dot_general(precision.float32_dot_general))
-        assert not chooses(precision.float32_dot_general)
+        assert chooses(lambda a, b: gemm.dot_general(precision.float32_dot_general)(a, b, numbers))
+        assert chooses(lambda a, b: precision.float32_dot_general(a, b, numbers))
+        assert chooses(lambda a, b: precision.float32_einsum("rd,dc->rc", a, b))
+
+
+def test_a_mixers_einsum_on_a_cpu_is_the_pairwise_product():
+    """A mixer's contraction in fixed float32 sums (`float32_einsum` under `FP32_SUMS`, a Mamba layer's chunk
+    einsum `bcdn,bcn->bcd`) on a CPU is `pairwise_dot_general`'s product over the einsum's axes, bitwise, its
+    value and both operands' gradients: one sum for a model's mixers and its projections, where XLA's one
+    FMA chain left Jamba's and Falcon-H1's logits and gradients apart from their sources'."""
+    rng = np.random.default_rng(0)
+    states = jnp.asarray(rng.standard_normal((2, 3, 96, 64)), jnp.float32)
+    readout = jnp.asarray(rng.standard_normal((2, 3, 64)), jnp.float32)
+    cotangent = jnp.asarray(rng.standard_normal((2, 3, 96)), jnp.float32)
+
+    def ours(states, readout):
+        with jax.default_matmul_precision(precision.FP32_SUMS):
+            return precision.float32_einsum("bcdn,bcn->bcd", states, readout)
+
+    def theirs(states, readout):
+        return pairwise.pairwise_dot_general(states, readout, (((3,), (2,)), ((0, 1), (0, 1))))
+
+    def pulled(function):
+        value, pull = jax.vjp(jax.jit(function), states, readout)
+        return (value, *pull(cotangent))
+
+    for mine, expected in zip(pulled(ours), pulled(theirs), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(expected))
 
 
 @pytest.mark.parametrize("depth", [64, 128, 1024])
