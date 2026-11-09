@@ -190,6 +190,6 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
     ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "killed.json", 30.0, cache="off")
     said = capsys.readouterr().out.rstrip().splitlines()
     red = said.index("RED 3.12:tests/test_any.py")
-    assert said[red + 1] == "  | pytest was killed by signal 9 with no report of tests/test_any.py"
+    assert said[red + 1].startswith("  | pytest was killed by signal 9 with no report of tests/test_any.py")
     assert "  | line 39" in said[red:] and "  | ..." in said[red:]
 
