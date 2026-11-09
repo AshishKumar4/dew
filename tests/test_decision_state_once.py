@@ -33,6 +33,7 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel, stream_runs
 from dew.decision.rows import Encoding, Fit
+from dew.decision.shared_state import fork_depth
 from dew.decision.task import laid_out
 from dew.nn.attention_masks import visibility_mask
 
@@ -56,10 +57,10 @@ STATE_ONCE_SEEDS = 16
 rows' of two streams (`STREAM_SEEDS`), a question of two options' rows were left unresolved over 40."""
 
 
-def own_and_shared(layout=SHARED, state: str = STATES[2]):
+def own_and_shared(layout=SHARED, state: str = STATES[2], questions=QUESTIONS):
     """The request's rows of a question each (`OWN`) and over one state (`layout`)."""
-    return (OWN.rows(TOKENIZER, SPECIALS, state, QUESTIONS),
-            layout.rows(TOKENIZER, SPECIALS, state, QUESTIONS))
+    return (OWN.rows(TOKENIZER, SPECIALS, state, questions),
+            layout.rows(TOKENIZER, SPECIALS, state, questions))
 
 
 def test_a_row_over_one_state_holds_it_once_and_each_question_as_its_own_row_lays_it():
@@ -115,6 +116,59 @@ def test_each_question_reads_the_shared_part_and_itself():
         read = (documents == 1) & ((index <= query) if document == 1 else True)
         read |= (documents == document) & (index <= query)
         assert list(seen[query, :len(documents)]) == list(read), query
+
+
+def test_a_question_with_siblings_reads_the_questions_before_it_in_its_row_whole():
+    """With siblings (`QuestionLayout.siblings`, a layout a run saved before rows forked states), each
+    question reads the shared part whole, the questions before it in its row whole and itself up to each
+    token, as the layout's streamed reads read it before (each own stream causal, the shared stream whole
+    and with siblings the earlier questions' whole), each token at its own row's position; a row whose
+    window packs it lays the same forks (`PackedRows`), and a record of the layout reads back as it is.
+    The questions' documents chain, so the forks run as deep as a row's questions (`fork_depth`)."""
+    from dew import registry
+
+    chained = dataclasses.replace(SHARED, siblings=True)
+    assert registry.from_record(StateFirstLayout, registry.to_record(chained, StateFirstLayout)) == chained
+    _, [plain] = own_and_shared()
+    _, [row] = own_and_shared(chained)
+    assert (row.tokens, row.positions, row.forked) == (plain.tokens, plain.positions, plain.forked)
+    inputs = DecisionInputs.collate([row], SPECIALS.pad)
+    laid = inputs.coordinates()
+    assert laid.forks is not None and laid.segments is not None and laid.forks.depth >= len(row.questions)
+    # One row read together, its dropout drawn once, one question of it or several (`Forks.joint`).
+    _, [alone] = own_and_shared(chained, questions=dict(list(QUESTIONS.items())[:1]))
+    assert laid.forks.joint and DecisionInputs.collate([alone], SPECIALS.pad).coordinates().forks.joint
+    runs = laid.forks.runs(laid.segments)
+    length = inputs.tokens.shape[1]
+    seen = np.asarray(visibility_mask(length, length, causal=False, sliding_window=None, key_runs=runs))[0, 0]
+    documents = np.asarray(row.forked)
+    index = np.arange(len(documents))
+    for query, document in enumerate(documents):
+        read = (documents == 1) & ((index <= query) if document == 1 else True)
+        read |= (documents > 1) & (documents < document)
+        read |= (documents == document) & (index <= query)
+        assert list(seen[query, :len(documents)]) == list(read), query
+    with pytest.raises(ValueError):
+        dataclasses.replace(OWN, shared_state=None, siblings=True)
+
+
+def test_sibling_questions_packed_a_window_read_each_their_own_requests_context():
+    """Requests' rows with siblings, two a window, each lay one tree of documents, its shared part and its
+    questions chained after it (`Forks.trees`), numbered as the window numbers its rows: what a token's
+    cross-attention reads its context by (`CrossContext.queries`), so each question reads its own
+    request's context and no other's, as the rows' streams did before rows forked."""
+    from test_decision_context import windows_of
+
+    from dew.batch import Forks
+
+    # Windows long enough to pack two requests' rows, each holding a request's three questions.
+    chained = in_streams(dataclasses.replace(SHARED, siblings=True, max_len=1024), segments=2)
+    windows = windows_of(chained, examples(), count=4)
+    assert any(len(set(np.asarray(batch["segments"]).ravel()) - {0}) > 1 for batch in windows)
+    for batch in windows:
+        forks = Forks(np.asarray(batch["parents"]), depth=fork_depth(chained.layout))
+        trees = forks.trees(np.asarray(batch["documents"]), xp=np)
+        np.testing.assert_array_equal(trees, np.asarray(batch["segments"]))
 
 
 def test_a_layout_of_its_own_reads_that_writes_a_stream_twice_reads_by_its_streams():

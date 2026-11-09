@@ -151,7 +151,8 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
     branches), or that draws
     dropout in a training step, says why a call over forks would not compute each row as its own
     (`ForkedCalls`): its objective lays its rows whole (`shares_prefixes`), and a call over forks is
-    refused, where the same decoder without the cause runs it."""
+    refused, where the same decoder without the cause runs it. A joint tree (`Forks.joint`), one row read
+    together, draws its dropout once and runs in training; its other causes refuse it all the same."""
     from dew.nn.engram import Engram
 
     forks = ForkedRows.pack(ROWS, WIDTH)
@@ -189,6 +190,17 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
     with pytest.raises(ValueError):
         dropping.apply(params, forks.tokens, coordinates=forks.coordinates, train=True,
                        rngs={"dropout": jax.random.key(1)})
+    # A joint tree is one row read together (`Forks.joint`, a decision row's siblings): it draws its dropout
+    # once, as that row does, so its training call runs; every other refusal holds.
+    assert forks.coordinates.forks is not None
+    joint = dataclasses.replace(forks.coordinates,
+                                forks=dataclasses.replace(forks.coordinates.forks, joint=True))
+    dropping.apply(params, forks.tokens, coordinates=joint, train=True,
+                   rngs={"dropout": jax.random.key(1)})
+    for model in refusing.values():
+        held = model.init(jax.random.key(0), jnp.ones((1, WIDTH), jnp.int32))
+        with pytest.raises(ValueError):
+            model.apply(held, forks.tokens, coordinates=joint)
 
 
 def test_a_mask_beside_forks_narrows_what_they_read():
