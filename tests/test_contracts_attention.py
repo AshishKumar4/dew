@@ -10,7 +10,7 @@ import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 
 from dew.nn import attention, kv_cache
-from dew.nn.kernels.templates import attention as template
+from dew.nn.kernels.templates import attention as template, attention_quantized
 
 
 def plain_attention(query, key, value):
@@ -73,6 +73,27 @@ def test_a_fused_attention_kernel_holds_its_reverse_orders(implementation, edge)
 
     assert_contract(fused, primals, direction, cotangent, f"{implementation} attention {edge}",
                     truth_fn=plain_attention, plain_fn=plain_attention, without=REVERSE_ONLY)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_quantized_attention_holds_its_reverse_orders(edge):
+    """A quantized model's attention on the template (`attention_quantized.attend`, row 4858), a reverse-only
+    custom derivative: its primal and its straight-through reverse derivative run, finite wherever float64
+    is a normal float32 and the plain attention formula is, at queries, keys and values whose products near
+    float32's ends, over a causal call. Its other orders do not run (`REVERSE_ONLY`)."""
+    primals, direction, cotangent = attention_draw(4858, (1, 128, 2, 64), edge)
+    spans = template.spans(128, 128, 1, causal=True)
+
+    def plain(query, key, value):
+        causal = jnp.tril(jnp.ones((128, 128), bool))
+        logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) * query.shape[-1] ** -0.5
+        return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), axis=-1),
+                          value)
+
+    assert_contract(lambda query, key, value: attention_quantized.attend(query, key, value, spans,
+                                                                         template.Hooks()),
+                    primals, direction, cotangent, f"quantized attention {edge}", truth_fn=plain,
+                    plain_fn=plain, without=REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)

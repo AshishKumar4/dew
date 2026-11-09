@@ -202,7 +202,11 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     where the call takes that (`takes_output_residuals`), the Mosaic and the Pallas-Triton one alike,
     whichever mainloop runs the backward (the residuals are every mainloop's, `output_split`)."""
     form = {"scale": config.scale, "natural": config.natural}
-    if not residuals:
+    if hooks.rounds is not None:
+        # A quantized call's weights round at each row's maximum, which the anchored training walk alone
+        # knows (`Hooks.rounds`).
+        kept = Kept.SPLIT
+    elif not residuals:
         kept = Kept.NONE
     elif takes_output_residuals(hooks, query.dtype, accurate=config.accurate):
         kept = Kept.OUTPUT
@@ -213,8 +217,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
         attention_triton.unfitted, query, key, value, spans, hooks, residuals=kept, **form))
     if mainloop == 'mosaic':
-        if not residuals and attention_decode.serves(query, key, hooks, natural=config.natural,
-                                                     target=generation.gpu_target()):
+        if kept is Kept.NONE and attention_decode.serves(query, key, hooks, natural=config.natural,
+                                                         target=generation.gpu_target()):
             # A memory-bound inference call (a decode step's, a verify block's) as the decode's work list.
             return attention_decode.attend(query, key, value, spans, hooks, scale=config.scale)
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
@@ -223,6 +227,15 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                         **form)
     return attention_portable.xla_mainloop(PLAIN, query, key, value, spans, hooks, residuals=residuals,
                                            **form)
+
+
+def rounded(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks) -> jax.Array:
+    """A quantized call's forward (`Hooks.rounds`) at a logit scale of 1 on its mainloop (`_forward`): the
+    anchored training walk's output, its residuals let go; its backward is its quantization's own
+    (`attention_quantized`)."""
+    wide = generation.numerics().forms == 'accurate'
+    config = _Config(1.0, NATURAL or wide, ACCURATE or wide, None)
+    return _forward(query, key, value, spans, hooks, config, residuals=True)[0]
 
 
 def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:

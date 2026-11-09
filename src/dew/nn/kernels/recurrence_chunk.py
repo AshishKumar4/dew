@@ -373,20 +373,19 @@ itself; and keys wider than the port takes in their dtype. Packed documents take
 stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('wgmma', 'forward, a decay a key dimension'): (
-        'fla', "on an H100 80GB HBM3, 16-bit, the port's forward 1.406 ms against the template's 1.624 on "
-               "Kimi Linear's delta attention, the template's intra pairs 0.65 ms against the port's intra "
-               "rows' 0.65 and its keys' weighted launch 0.25 against the port's 0.17 "
-               "(window-h100-c70aaa8-b8109ee)"),
-}
+PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {}
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows Dew's port
 of fla's kernels (`fla_rule`; "the port" below) faster than the recurrence template, each its old route's
 kernel and that receipt; every time below sets the template against that port, not against upstream fla's
 own kernels or FlashQLA's (tools/benchmark_recurrence.py's `fla` and `flashqla` arms): the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
-shrinks as the template wins its cells, and no cell is picked or ranked at run time. A gated delta net's
-cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06 ms against
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. None is left: every
+cell is the template's. Warpgroup MMA's forward of Kimi delta attention, the last, is the template's, 1.154 ms
+against the port's 1.571 on a GH200 480GB and 1.647 against 2.412 on an H100 PCIe (M-JS-43b-gh200 and
+-h100pcie at e52d05f558f: exclusive, two rounds alternating the arms; the cell's receipt had the port's
+1.406 against the template's 1.624 on an H100 80GB HBM3 at c70aaa8, window-h100-c70aaa8-b8109ee). A gated
+delta net's cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06
+ms against
 the port's 8.81 (JS-kdacells-a100-a928ea2b4), and its training, 11.12 ms against 15.92
 (batch-window-a100-b2ad84c61). Warpgroup MMA's training of Kimi delta attention is the template's, its
 forward and gradient 3.926 ms a call against the port's 4.726 on an H100 80GB HBM3 and 3.916 against 4.694 on
@@ -492,6 +491,37 @@ class Tiles:
     chunk: int
 
 
+def _grouped(query, key, value, dtype):
+    """A derived walk's output dtype (the operands' where `dtype` is None), its working dtype (at least
+    fp32), and `query` and `key` repeated over the value heads each key head serves."""
+    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
+    work = at_least_fp32(jnp.result_type(query, key, value))
+    group = value.shape[2] // key.shape[2]
+    if group > 1:
+        query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    return dtype, work, query, key
+
+
+def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
+    """A derived walk's operands (`_walk`): each of `named`'s `[B, S, H, ...]` in `work`, padded with tokens
+    that leave the memory as it was and laid out `[B, H, chunks, C, ...]`; where `starts` `[B, S]` is
+    given, each head's tokens' resets (`RESET`) where their row's document starts, a padded token starting
+    none."""
+    rows, length, heads = next(iter(named.values())).shape[:3]
+    chunks = -(-length // chunk_size)
+    padded = chunks * chunk_size - length
+
+    def laid(x):
+        x = jnp.pad(x, [(0, 0), (0, padded)] + [(0, 0)] * (x.ndim - 2))
+        x = jnp.moveaxis(x, 2, 1)
+        return x.reshape(rows, heads, chunks, chunk_size, *x.shape[3:])
+
+    operands = {name: laid(x.astype(work)) for name, x in named.items()}
+    if starts is not None:
+        operands[RESET] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
+    return operands
+
+
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, *, scale: float,
                  delta: bool, dtype=None, bound: float | None = None):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
@@ -509,11 +539,7 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     declaration's range facts (`scan.Scan.ranges`)."""
     from dew.algebra import SATURATION, scan
 
-    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
-    work = at_least_fp32(jnp.result_type(query, key, value))
-    group = value.shape[2] // key.shape[2]
-    if group > 1:
-        query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
     width = key.shape[-1]
     per_key = g.ndim == 4
@@ -538,21 +564,8 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
                                        state=((width, columns), work), reset=reset, ranges=ranges),
                              saturation=SATURATION)
-    chunk_size = config.chunk
-    chunks = -(-length // chunk_size)
-    padded = chunks * chunk_size - length
-
-    def laid(x):
-        # [B, S, H, ...] padded and laid out as [B, H, chunks, C, ...].
-        x = jnp.pad(x, [(0, 0), (0, padded)] + [(0, 0)] * (x.ndim - 2))
-        x = jnp.moveaxis(x, 2, 1)
-        return x.reshape(rows, heads, chunks, chunk_size, *x.shape[3:])
-
-    operands = {name: laid(x.astype(work))
-                for name, x in zip(axes, (query, key, value, g, beta), strict=True)}
-    if starts is not None:
-        # Each head's tokens reset where their row's document starts; a padded token starts none.
-        operands[RESET] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
+    given = dict(zip(axes, (query, key, value, g, beta), strict=True))
+    operands = _chunked(given, starts, config.chunk, work)
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
@@ -581,11 +594,7 @@ def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *
     math walks them (`_walk`), their derivative the token update replayed a chunk at a time."""
     from dew.algebra import SATURATION, scan
 
-    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
-    work = at_least_fp32(jnp.result_type(query, key, value))
-    group = value.shape[2] // key.shape[2]
-    if group > 1:
-        query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+    dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
     width = key.shape[-1]
     scale = width ** -0.5 if scale is None else scale
@@ -606,19 +615,8 @@ def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *
     declaration = scan.Scan(update, readout, declared, walked="time", state=((columns, width), work),
                             reset=reset, ranges={"g": (-math.inf, 0.0)})
     forms = scan.derive_scan(declaration, saturation=SATURATION)
-    chunks = -(-length // chunk_size)
-    padded = chunks * chunk_size - length
-
-    def laid(x):
-        # [B, S, H, ...] padded with tokens that leave the memory as it was, laid out [B, H, chunks, C, ...].
-        x = jnp.pad(x, [(0, 0), (0, padded)] + [(0, 0)] * (x.ndim - 2))
-        x = jnp.moveaxis(x, 2, 1)
-        return x.reshape(rows, heads, chunks, chunk_size, *x.shape[3:])
-
-    given = (query, key, value, gv, beta)
-    operands = {name: laid(x.astype(work)) for name, x in zip(axes, given, strict=True)}
-    if starts is not None:
-        operands[RESET] = laid(jnp.broadcast_to(starts[:, :, None], (rows, length, heads)))
+    given = dict(zip(axes, (query, key, value, gv, beta), strict=True))
+    operands = _chunked(given, starts, chunk_size, work)
     varying = (query, key, value, gv, beta, starts)
     entering = varying_like(rows_like(jnp.zeros((rows, heads, columns, width), work), value) if state is None
                             else jnp.swapaxes(state.astype(work), -1, -2), *varying)

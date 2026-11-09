@@ -23,8 +23,11 @@ def walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.K
     """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, in `spec`'s form) from the initial
     state `resumed` `(m0, total0, acc0)` or none: the plain walk (`algebra.plain_walk`), or with `training`
     the training walk carrying the anchor key and split sums (`algebra.training_walk`, `rows(keys)` each key's
-    value row); on the guarded path its `live` rows shifting (`algebra.started`)."""
+    value row), at each row's maximum found first where its weights round there (`algebra.anchored_walk`,
+    `Forward.rounds`); on the guarded path its `live` rows shifting (`algebra.started`)."""
     start = algebra.started(spec, resumed, block_q, width, live)
+    if training and spec.rounds is not None:
+        return algebra.anchored_walk(spec, lo, hi, keys_at, start)
     if training:
         return algebra.training_walk(spec, lo, hi, keys_at, rows, start, dropping=dropping)
     return algebra.plain_walk(spec, lo, hi, keys_at, start)
