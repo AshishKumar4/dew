@@ -182,11 +182,14 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
     that tail (Main, 2026-11-09: a map task "exited 1 after 437 s", its row's "pytest exited -9" kept in its
     output alone)."""
     interpreter(tmp_path, "3.12")
+    # Its pytest says more than the task repeats before it is killed: why its row is red is said all the same.
     written(tmp_path, {"test_any.py": "import os\nimport signal\n\n\ndef test_dies():\n"
+                                      "    print('\\n'.join(f'line {at}' for at in range(40)), flush=True)\n"
                                       "    os.kill(os.getpid(), signal.SIGKILL)\n"})
     capsys.readouterr()
     ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "killed.json", 30.0, cache="off")
     said = capsys.readouterr().out.rstrip().splitlines()
-    assert said[-2:] == ["RED 3.12:tests/test_any.py",
-                         "  | pytest was killed by signal 9 with no report of tests/test_any.py"]
+    red = said.index("RED 3.12:tests/test_any.py")
+    assert said[red + 1] == "  | pytest was killed by signal 9 with no report of tests/test_any.py"
+    assert "  | line 39" in said[red:] and "  | ..." in said[red:]
 
