@@ -1,6 +1,6 @@
 """The derived forms' stability (bible §6; docs/design/testing.md, a template's stability suite): every
-derived form behind the switch (`dew.algebra.forms.derived`) under the stability families that broke
-derived forms before, generated over the template suites' own families and the edges each pass found:
+derived form under the stability families that broke derived forms before, generated over the template
+suites' own families and the edges each pass found:
 
 - attention's: the template suite's every family (fp32 and bf16 as drawn, and in fp16, the dtype the derived
   forward walks), on the plain-JAX mainloop, forward and backward, its output and gradients finite wherever
@@ -9,10 +9,10 @@ derived forms before, generated over the template suites' own families and the e
   hook empties beside a value product past fp32's largest, a query no span reaches beside one, keys past a
   whole tile, a hook infinite or NaN at the keys it masks, values at fp32's and fp16's largest and least, each
   in every dtype the derived forms walk, finite wherever the reference is;
-- the recurrence's: the template suite's every site and regime (`test_recurrence_stability`), its output and
-  final memory finite wherever float64's are and on par with the token-by-token recurrence's (check 1), and
-  the decays' edges both ways (none, every token vanishing, a live decay then a vanishing one, the reverse),
-  each through its value, its gradient and its gradient's tangent (every order the derived forms hold).
+- the recurrence's: the decays' edges both ways (none, every token vanishing, a live decay then a vanishing
+  one, the reverse), each through its value, its gradient and its gradient's tangent (every order the derived
+  forms hold); the template suite's every site and regime is the portable route's own suite's
+  (`test_recurrence_stability`, the plain-JAX mainloop's).
 
 A drawn input's check 1 is each derived form's own suite's (tests/test_attention_derived.py,
 tests/test_algebra_derive.py, tests/test_algebra_scan.py); the families here are adversarial, where the fast
@@ -31,17 +31,21 @@ import test_recurrence_stability as recurrence_suite
 from reference_error import widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 
-from dew.algebra import forms as algebra_forms
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_portable
 
 
 @contextlib.contextmanager
-def derived():
-    """Within the block, the run's fast forms with the template's walks the derived ones."""
-    fast = dataclasses.replace(generation.numerics(), forms="fast")
-    with generation.run_precision(fast), algebra_forms.derived():
+def derived(forms: str = "fast"):
+    """Within the block, the run's `forms` (the fast ones, or the accurate ones: natural logits, the anchor's
+    split, the keyed sums) with the template's walks the derived ones."""
+    numerics = dataclasses.replace(generation.numerics(), forms=forms)
+    with generation.run_precision(numerics):
         yield
+
+
+FORMS = ["fast", "accurate"]
+"""The forms each derived walk is held under."""
 
 
 ATTENTION_FAMILIES = [(name, dtype) for name in attention_suite.TEMPLATE_FAMILIES
@@ -49,17 +53,19 @@ ATTENTION_FAMILIES = [(name, dtype) for name in attention_suite.TEMPLATE_FAMILIE
 """Each template family as drawn (None) and in fp16, the dtype the derived forward walks."""
 
 
+@pytest.mark.parametrize("forms", FORMS)
 @pytest.mark.parametrize(("name", "dtype"), ATTENTION_FAMILIES,
                          ids=[f"{name}-{dtype or 'as drawn'}" for name, dtype in ATTENTION_FAMILIES])
-def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name, dtype):
-    """The plain-JAX mainloop's derived forms, forward and backward, finite wherever the float64 truth
-    rounded to their dtype is (`assert_finite`) over the family's draws, a row that sees nothing zero."""
+def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name, dtype, forms):
+    """The plain-JAX mainloop's derived forms under each of its `forms`, forward and backward, finite
+    wherever the float64 truth rounded to their dtype is (`assert_finite`) over the family's draws (an
+    anchor's, one key's and a masked query's among them), a row that sees nothing zero."""
     family = attention_suite.FAMILIES[name]
     family = family if dtype is None else dataclasses.replace(family, dtype=dtype)
     draw = attention_suite._cast(family, family.draw)
     truth = with_gradients(attention_suite._reference(family, anchored=True))
-    label = f"portable derived {family.dtype} {name}"
-    with derived():
+    label = f"portable derived {forms} {family.dtype} {name}"
+    with derived(forms):
         differentiated = jax.jit(with_gradients(attention_suite._mainloops(family, {})["portable"]))
         attention_suite.assert_finite(differentiated, truth, draw, label, seeds=attention_suite.SEEDS[name])
         attention_suite._held_empty(family, differentiated(*draw(0)), label)
@@ -119,10 +125,11 @@ def _edges(dtype) -> dict:
 EDGES = [(name, dtype) for dtype in ("float16", "bfloat16", "float32") for name in _edges(jnp.float32)]
 
 
+@pytest.mark.parametrize("forms", FORMS)
 @pytest.mark.parametrize(("name", "dtype"), EDGES, ids=[f"{name}-{dtype}" for name, dtype in EDGES])
-def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(name, dtype):
-    """The plain-JAX mainloop's derived forms at the edge `name` in `dtype`: its output and gradients finite
-    wherever the reference's are."""
+def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(name, dtype, forms):
+    """The plain-JAX mainloop's derived forms under each of its `forms` at the edge `name` in `dtype`: its
+    output and gradients finite wherever the reference's are."""
     query, key, value, dout, spans, hooks = _edges(jnp.dtype(dtype))[name]
     tiles = {"block_q": 8, "block_k": 8, "pad": 8}
 
@@ -131,32 +138,15 @@ def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(nam
 
     out, pull = jax.vjp(reference, query, key, value)
     theirs = (out, *pull(dout))
-    with derived():
-        made = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles)
-        mine = (attention_portable.attend(query, key, value, spans, hooks, **tiles), made.query, made.key,
+    with derived(forms):
+        made = attention_portable.backward(attention_portable.Tiles(**tiles), query, key, value, spans, hooks,
+                                           dout)
+        mine = (attention_portable.xla_mainloop(attention_portable.Tiles(**tiles), query, key, value, spans,
+                                                hooks), made.query, made.key,
                 made.value)
     for leaf, ours, exact in zip(("output", "dq", "dk", "dv"), mine, theirs, strict=True):
         finite = np.isfinite(np.asarray(exact, np.float32))
         assert np.isfinite(np.asarray(ours, np.float32))[finite].all(), f"{name} {dtype} {leaf}"
-
-
-RECURRENCE_CASES = [pytest.param(name, regime, id=f"{name}-{regime}")
-                    for name in recurrence_suite.SITES for regime in recurrence_suite.REGIMES]
-
-
-@pytest.mark.parametrize(("name", "regime"), RECURRENCE_CASES)
-def test_the_derived_chunk_stays_finite_and_exact_on_every_regime(name, regime):
-    """The portable math's derived chunk forms (`recurrence_chunk.derived_rule`) under the template suite's
-    regime: output and final memory finite wherever float64's are, and on par with the token-by-token
-    recurrence's (check 1)."""
-    hooks = recurrence_suite.SITES[name]
-    seeds = recurrence_suite.SEEDS[name, regime]
-    with derived():
-        recurrence_suite.assert_finite_and_on_par(
-            functools.partial(chunk_on, "xla", hooks, chunk_size=recurrence_suite.CHUNK),
-            functools.partial(token_by_token, hooks),
-            functools.partial(recurrence_suite.stressed, hooks, regime),
-            f"the derived chunk, {name} under {regime}", seeds=seeds, finite_seeds=seeds)
 
 
 DECAY_EDGES = {"no decay": [0.0] * 4, "every token vanishing": [-(2.0 ** 127)] * 4,
@@ -197,8 +187,8 @@ def test_the_derived_chunk_holds_every_order_at_the_decays_edges(edge, name):
     with jax.enable_x64(new_val=True):
         exact = orders(functools.partial(token_by_token, hooks), *widened((operands, target)))
     with derived():
-        mine = orders(functools.partial(chunk_on, "xla", hooks, chunk_size=recurrence_suite.CHUNK), operands,
-                      target)
+        mine = orders(functools.partial(chunk_on, "xla", hooks, chunk_size=recurrence_suite.CHUNK),
+                      operands, target)
     for leaf, ours, theirs in zip(("value", "gradient", "tangent"), mine, exact, strict=True):
         # Finite where float64's is within the call's float32: a value past its range overflows as it must.
         with np.errstate(over="ignore"):

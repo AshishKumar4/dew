@@ -1,13 +1,12 @@
 """Rectified flow schedules: the linear path and its resolution shift."""
 
 import math
-from functools import partial
 from typing import Literal, get_args
 
 import jax
 import jax.numpy as jnp
 
-from dew.nn.derivatives import contracted
+from dew.nn.derivatives import Protected, contracted, declared_tangent
 
 from .common import ContinuousNoiseScheduler, times
 
@@ -31,19 +30,20 @@ def static_shift(shift, t):
     return shift * t / (1 + (shift - 1) * t)
 
 
-@contracted("test_a_time_shift_holds_every_order")
-@partial(jax.custom_jvp, nondiff_argnums=(0,))
-def time_shift(shift: float, t: jax.Array) -> jax.Array:
-    """shift / (shift + 1 / t - 1), Diffusers' `FlowMatchEulerDiscreteScheduler.time_shift` operation for
-    operation. Its derivative is taken in the regular form shift / (shift t + 1 - t)^2: the reciprocal's
-    would multiply zero by infinity at t = 0, where the map and its derivative are finite."""
+def _time_shift_value(shift: float, t: jax.Array) -> jax.Array:
     return shift / (shift + (1 / t - 1))
 
 
-@time_shift.defjvp
 def _time_shift_jvp(shift, primals, tangents):
     (t,), (dt,) = primals, tangents
     return time_shift(shift, t), shift / (shift * t + (1 - t)) ** 2 * dt
+
+
+time_shift = contracted("test_a_time_shift_holds_every_order")(
+    declared_tangent(Protected(), _time_shift_value, _time_shift_jvp, nondiff_argnums=(0,)))
+"""shift / (shift + 1 / t - 1), Diffusers' `FlowMatchEulerDiscreteScheduler.time_shift` operation for
+operation. Its derivative is taken in the regular form shift / (shift t + 1 - t)^2: the reciprocal's would
+multiply zero by infinity at t = 0, where the map and its derivative are finite."""
 
 
 class RectifiedFlow:

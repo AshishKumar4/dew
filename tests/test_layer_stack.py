@@ -622,11 +622,14 @@ def test_a_banked_moe_decode_reads_each_layers_experts_in_place_and_decodes_as_t
 
     draw = drawn_ids(0x1342, 8)
 
-    @as_given
+    # The plain loop's float64 twin over its variables widened once, which the gate compiles for every
+    # draw.
+    with jax.enable_x64(new_val=True):
+        wide, wide_variables = (tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64),
+                                float64_held(variables))
+
     def truth(ids):
-        with jax.enable_x64(new_val=True):
-            wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
-            return np.asarray(decoded(wide, widened(variables), ids)[0])
+        return decoded(wide, wide_variables, ids)[0]
 
     def steps(model, store):
         return lambda ids: decoded(model, store, ids)[0]
@@ -690,13 +693,12 @@ def test_a_banked_decode_keeps_its_cache_banked_and_reads_its_layers_as_the_per_
     for name, value in exact.items():
         np.testing.assert_array_equal(held[name], value, err_msg=name)
 
-    @as_given
-    def truth(ids):
-        with jax.enable_x64(new_val=True):
-            wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
-            cache = wide.init(jax.random.key(0), first, decode=True)["cache"]
-            return {name: np.asarray(value) for name, value in
-                    floating(decoded(wide, widened(variables), cache))(ids).items()}
+    # The plain loop's float64 twin, its variables and cache widened once, its decode one program the gate
+    # compiles for every draw.
+    with jax.enable_x64(new_val=True):
+        wide = tiny(num_layers=4, max_seq_len=16, mixture=routed, dtype=jnp.float64)
+        truth = floating(decoded(wide, float64_held(variables),
+                                 float64_held(wide.init(jax.random.key(0), first, decode=True)["cache"])))
 
     assert_as_exact(floating(bank), floating(layers), drawn_ids(0x4550, 10), "banked decode",
                     seeds=BANKED_DECODE_SEEDS, truth_fn=truth)
@@ -1013,21 +1015,19 @@ def test_scanned_dropout_uses_the_supplied_rng():
 
 def test_a_scanned_glm5_next_computes_its_unrolled_forward():
     """GLM-5-Next's first three layers (Kimi Delta Attention, a dense MLP,
-    hyper-connections) scan as one run under `scan_layers`. The scanned
-    forward is the unrolled one's, call after call. On XLA:CPU it was off by
-    8.7, 10.1 or NaN depending on the process, exact without jit and on a
-    GPU: the compiled program is identical across processes, so the bad
-    values came from its run (the chunked rule's workaround)."""
+    hyper-connections) scan as one run under `scan_layers`: the scanned
+    forward is the unrolled one's. XLA:CPU's XNNPACK matrix packer (at XLA's
+    pinned 0a66ebb5) over-reads a zero matrix aliased as an all-zero-stride
+    scalar view (ynnpack/subgraph/dot.cc:613-636, fixed in XNNPACK 0e7357e2):
+    with the chunk loop's zero state fused there, the scan was off by 8.7,
+    10.1 or NaN in about 60% of compilations (row 1701). Dew's zero state now
+    reaches the loop materialized: 96 compilations ran right (jsf-1701)."""
     loaded = Pretrained.load(FIXTURES / "glm5-next-tiny", dtype="float32", param_dtype="float32")
     tokens = (jnp.arange(24, dtype=jnp.int32).reshape(2, 12) * 7) % 31 + 1
     unrolled = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, tokens), np.float64)
     scanned = dataclasses.replace(loaded.model, scan_layers=True)
-    # Each compilation drew the fault afresh, about 60% of the time, so the
-    # scan compiles eight times over: a regression shows in 99% of runs.
-    for _ in range(8):
-        jax.clear_caches()
-        got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
-        assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
+    got = np.asarray(jax.jit(scanned.apply)(loaded.variables, tokens), np.float64)
+    assert np.abs(got - unrolled).max() <= 1e-4 * np.abs(unrolled).max()
 
 
 def fetched_layer_states():

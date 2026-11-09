@@ -43,6 +43,10 @@ struct GroupedK {
 
 // Each runs the call on `stream` and returns nullptr, or names why it cannot (an unsupported dtype or
 // alignment, scratch exhausted, a CUTLASS status).
+const char* sm80_grouped(const Grouped& call, cudaStream_t stream, const Allocate& allocate, int device,
+                         int multiprocessors);
+const char* sm80_grouped_k(const GroupedK& call, cudaStream_t stream, const Allocate& allocate, int device,
+                           int multiprocessors);
 const char* sm90_grouped(const Grouped& call, cudaStream_t stream, const Allocate& allocate, int device,
                          int multiprocessors);
 const char* sm90_grouped_k(const GroupedK& call, cudaStream_t stream, const Allocate& allocate, int device,

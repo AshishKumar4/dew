@@ -15,8 +15,8 @@ import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import runs
-from reference_error import with_gradients
-from test_recurrence_chunk import chunk_on, cotangents, formed
+from reference_error import assert_as_exact, with_gradients
+from test_recurrence_chunk import ROUTES, chunk_on, cotangents, formed, on_route, routed, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -34,8 +34,8 @@ from test_recurrence_mosaic import (
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
-from dew.nn.kernels.templates import bundles
-from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates import bundles, mosaic_sm90, mosaic_sm100
+from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
 
@@ -76,13 +76,10 @@ def interpreted_gradient(case: str, dtype: str, remat: str) -> Callable:
     site of its own (its `check1_shards` mark). Whole, these cases took 122 to 225 seconds (train 270's CI on
     66a222273, ledger 2127), 483 to 653 (train 479's on e82eab19a) and 474 (the recomputed one, train 521's
     on e65403fc9); a map task of 80 seeds of the three 256-seed cases took 525 s, one of 15 of the two
-    128-seed cases 159 s (other-shards at 77a98366c), so each case is a site apart."""
+    128-seed cases 159 s (other-shards at 77a98366c), so each case is a site apart, on each route
+    (`routed`)."""
     INTERPRETED_GRADIENT.add((case, dtype, remat))
-
-    def check():
-        the_mosaic_gradient_is_as_exact_as_its_reference(case, DTYPES[dtype], remat)
-
-    return lambda test: functools.update_wrapper(check, test)
+    return routed(lambda: the_mosaic_gradient_is_as_exact_as_its_reference(case, DTYPES[dtype], remat))
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=20)
@@ -187,6 +184,71 @@ def the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
                                     under=under)
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.parametrize('case', ['one sequence', 'packed documents'])
+def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
+    """The template's training step at a B200's derived tiles on its bundle (tcgen05's 64-row products into
+    tensor memory read back in the WGMMA layout, `mosaic_sm100.CHUNKS`, interpreted: Mosaic GPU's interpreter
+    models tensor memory and tcgen05's products) on par from float64 with the same tiles on wgmma's bundle
+    (check 1, the truth the recurrence a token at a time in float64): its output, final memory and every
+    operand's gradient in bf16 (row 4747). Wgmma's arm is held to recorded fla-core
+    (`the_mosaic_gradient_is_as_exact_as_its_reference`)."""
+    hooks, dtype = case_hooks(case), jnp.bfloat16
+    (sample, _) = drawn(dtype, 0, **geometry(case))
+    tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm100'))
+    assert tiles is not None
+
+    def on(family):
+        def rule(given):
+            return template.mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta,
+                                        given.state, tiles=tiles, family=family, delta=hooks.delta,
+                                        scale=given.key.shape[-1] ** -0.5, bound=hooks.inverse_bound,
+                                        rounded=True)
+        return jax.jit(with_gradients(rule))
+
+    assert_as_exact(on(mosaic_sm100.CHUNKS), on(mosaic_sm90.WGMMA), functools.partial(drawn, dtype,
+                    **geometry(case)), f'tcgen05 chunks training, {case}', seeds=8,
+                    truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=4)
+@pytest.mark.parametrize('family', ['wgmma', 'mma.sync'])
+@pytest.mark.parametrize('case', ['one sequence', 'a decay a key dimension'])
+def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
+    """The template's forward and fast backward (`chunk_forward.kept_forward`,
+    `mainloop_backward.kept_backward`) at 128 tokens a chunk (`Tiles.chunk`), interpreted on wgmma's and
+    mma.sync's bundles, on par from float64
+    with the same launches at 64 (check 1, the truth the recurrence a token at a time in float64): the output,
+    final memory and every operand's gradient in bf16 (row 4770). No rule derives 128 at the scoreboard's
+    geometries, whose launches at 128 pass a GPU's resources (`template.chunk_of`'s step down,
+    jsf-chunkchoice), so the launches are called as the rule calls them."""
+    hooks, dtype = case_hooks(case), jnp.bfloat16
+    bundle = bundles.of({'wgmma': 'sm90', 'mma.sync': 'sm80'}[family], jnp.bfloat16)
+    (sample, _) = drawn(dtype, 0, **geometry(case))
+    tiles = template.MOSAIC.derived(template_call(sample, hooks), generation.gpu_target('sm90'))
+    assert tiles is not None
+
+    def at(chunk):
+        common = {'tiles': dataclasses.replace(tiles, chunk=chunk), 'family': bundle, 'interpret': True,
+                  'delta': hooks.delta, 'rounded': True}
+
+        def trained(given, cotangent):
+            operands = (given.query, given.key, given.value, given.log_decay, given.beta, given.state)
+            out, final, (inverse, kept) = chunk_forward.kept_forward(*operands, **common)
+            grads, _ = mainloop_backward.kept_backward(*operands, *cotangent, inverse=inverse, kept=kept,
+                                                       **common)
+            # Its gradients of the operands, the skip's last beside them none.
+            names = ('query', 'key', 'value', 'log_decay', 'beta', 'state')
+            return (out, final), dataclasses.replace(given, **{
+                name: grad.astype(operand.dtype)
+                for name, grad, operand in zip(names, grads[:len(names)], operands, strict=True)})
+        return jax.jit(trained)
+
+    assert_as_exact(at(128), at(64), functools.partial(drawn, dtype, **geometry(case)),
+                    f'128-token chunks training on {family}, {case}', seeds=8,
+                    truth_fn=jax.jit(with_gradients(functools.partial(token_by_token, hooks))))
+
+
 def test_a_recomputed_decay_a_key_dimension_trains_as_its_kept_forward():
     """Kimi delta attention's gradient through the template (interpreted off a GPU) under the remat rung that
     recomputes the forward's memories (`recomputing(('delta_memory',))`), its recompute reading the inverse
@@ -228,7 +290,7 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     skips it. Its interpreted forward's 256 recorded draws took 108 s whole with the shared cache warm
     (jsf-slow-37e5) and 135 to 148 s in main's CI (ea1d57903, 614382ac3): a site, two map tasks."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
-    tiles = mainloop.Tiles(32, 1, walkers=2)
+    tiles = mainloop.Tiles(32, 1, walkers=2, chunk=64)
 
     def walked(given: Chunk):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
@@ -317,3 +379,24 @@ def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template's gradient runs a call over `given`'s operands under `hooks` on the device its
     launches run for (`Mosaic.trains`: the fast backward takes it, its launches held at the call's tiles)."""
     return template.MOSAIC.trains(template_call(given, hooks), template.Mosaic.launched())
+
+
+@pytest.mark.parametrize("route", ROUTES)
+def test_a_decay_a_key_dimensions_first_token_takes_no_gradient_where_its_sequence_starts_from_none(route):
+    """Packed documents under a decay a key dimension: each document after its row's first starts from no
+    memory, so its first token's decay scales nothing and its gradient is exactly zero in float64, as fla's
+    port takes it (`fla_kda.first_decay_grad`). The template's from its chunk's end, every term of the chunk,
+    held 1.5e-7 there against fla's 3.3e-9 on an A100 (row 5194); taken from the memory it scales, zero."""
+    case = 'a decay a key dimension, packed'
+    hooks = case_hooks(case)
+    with on_route(route):
+        # The route's geometry: its rows a GPU's, its documents' starts the draw's.
+        given, cotangent = drawn(jnp.bfloat16, 0, **geometry(case))
+        rule = restarted(functools.partial(chunk_on, 'mosaic_gpu', hooks), case)
+        grads = jax.device_get(with_gradients(rule)(given, cotangent))
+        (operands,) = draw(jnp.float32, 0, **geometry(case))
+    starts = np.asarray(operands.starts)
+    later = starts.copy()
+    later[:, 0] = False
+    dg = np.asarray(grads[1].log_decay)
+    assert later.any() and np.all(dg[later] == 0.0)

@@ -15,7 +15,8 @@ from reference_error import assert_as_exact
 
 from dew.nn import precision
 from dew.nn.blocks import table_rows
-from dew.nn.kernels import gemm
+from dew.nn.dense import Dense
+from dew.nn.kernels import gemm, generation
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -85,6 +86,72 @@ def test_a_bf16_dot_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_cpu_pairwise_dense_product_holds_every_order(edge):
+    """`pairwise.pairwise_dot_general` (a CPU's float32 dense product summed blocked and pairwise, its
+    reverse pass blocked over each cotangent's own contraction, row 4863), 96 deep so it takes blocks and a
+    partial last one: every order runs, finite wherever float64 is a normal float32 and wherever XLA's plain
+    product is, at values whose products near float32's ends."""
+    from dew.nn import pairwise
+
+    primals = normal_draw(4863, (4, 96), (96, 5), scale=EDGES[edge])
+    direction = normal_draw(4864, (4, 96), (96, 5), scale=EDGES[edge])
+    (cotangent,) = normal_draw(4865, (4, 5))
+    assert pairwise.contraction_block(96) < 96
+    assert_contract(lambda lhs, rhs: pairwise.pairwise_dot_general(lhs, rhs, (((1,), (0,)), ((), ()))),
+                    primals, direction, cotangent, f"a CPU pairwise dense product {edge}",
+                    truth_fn=jnp.matmul, plain_fn=jnp.matmul)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("form", ["rows", "groups"])
+def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
+    """`pairwise.pairwise_ragged_dot_general` (a CPU's float32 grouped product summed blocked and pairwise,
+    row 4863's GEMM remainder): its rows grouped and their depth contracted, and each group's rows contracted
+    into the group's matrix (96 deep, and 36 rows, few enough that no partial sum of its products near
+    float32's largest passes it where its total does not), so both take blocks and a partial last one, one
+    group empty:
+    every order runs in the float operands, the group sizes not differentiable, finite wherever float64 is a
+    normal float32 and wherever the plain grouped product is (by a mask, its float64 run the truth; each
+    group's rows contracted by the dense form, whose tree the grouped form's is)."""
+    from dew.nn import pairwise
+
+    sizes = jnp.asarray([70, 0, 66] if form == "rows" else [20, 0, 16], jnp.int32)
+    rows = int(sizes.sum())
+    groups = jax.nn.one_hot(jnp.repeat(jnp.arange(3), sizes, total_repeat_length=rows), 3)
+    if form == "rows":
+        numbers = jax.lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
+        shapes, out = ((136, 96), (3, 96, 5)), (136, 5)
+
+        def plain(rows, matrices):
+            return jnp.einsum("rg,rk,gkn->rn", groups.astype(rows.dtype), rows, matrices)
+    else:
+        numbers = jax.lax.RaggedDotDimensionNumbers((((0,), (0,)), ((), ())), (0,), ())
+        shapes, out = ((rows, 4), (rows, 5)), (3, 4, 5)
+
+        def masked(rows, cotangent):
+            return jnp.einsum("rg,rk,rn->gkn", groups.astype(rows.dtype), rows, cotangent)
+
+        def plain(rows, cotangent):
+            # Each group's rows summed as the dense form sums a contraction (`pairwise_dot_general`), whose
+            # partial sums near float32's largest pass it where they pass it (the same tree, bitwise:
+            # tests/test_cpu_dense_sums.py), where XLA's chain sums them in another order; float64 the
+            # masked product's.
+            if rows.dtype == jnp.float64:
+                return masked(rows, cotangent)
+            starts, numbers = np.cumsum([0, *np.asarray(sizes)]), (((1,), (0,)), ((), ()))
+            return jnp.stack([pairwise.pairwise_dot_general(rows[a:b].T, cotangent[a:b], numbers)
+                              for a, b in itertools.pairwise(starts)])
+
+    primals = normal_draw(4866, *shapes, scale=EDGES[edge])
+    direction = normal_draw(4867, *shapes, scale=EDGES[edge])
+    (cotangent,) = normal_draw(4868, out)
+    assert pairwise.contraction_block(96) < 96 and pairwise.contraction_block(36) < 36
+    assert_contract(lambda lhs, rhs: pairwise.pairwise_ragged_dot_general(lhs, rhs, sizes, numbers),
+                    primals, direction, cotangent, f"a CPU pairwise grouped product {form} {edge}",
+                    truth_fn=plain if form == "rows" else masked, plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch, edge):
     """`precision.accumulated` in a process running wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, its own
     custom derivative of the float64-summed product): every order runs, finite wherever float64 is a
@@ -118,6 +185,151 @@ def test_a_grouped_gemm_holds_every_order(edge):
 
     assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", truth_fn=plain,
                     plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_adapted_product_holds_every_reverse_order(edge):
+    """`gemm.low_rank` (LoRA's adapted product as one product over the depth its rank extends, its custom VJP
+    declared through `derivatives.declared_derivative`): every reverse order, under a nested jit and a scan,
+    in the rows, the kernel and both factors, finite wherever float64 is a normal float32 and wherever the
+    plain adapted product (`x·W + s·(x·A)·B`, its float64 run the truth) is, at values whose products near
+    float32's ends. It takes no forward order yet: a custom VJP has none (row 1304; the appended pair walked
+    in place brings one)."""
+    shapes = ((8, 16), (16, 12), (16, 4), (4, 12))
+    primals = normal_draw(1304, *shapes, scale=EDGES[edge])
+    direction = normal_draw(1305, *shapes, scale=EDGES[edge])
+    (cotangent,) = normal_draw(1306, (8, 12))
+
+    def adapted(rows, kernel, a, b):
+        return gemm.low_rank(rows, kernel, a, b, 0.5, out_dtype=rows.dtype)
+
+    def plain(rows, kernel, a, b):
+        return rows @ kernel + 0.5 * ((rows @ a) @ b)
+
+    assert_contract(adapted, primals, direction, cotangent, f"an adapted product {edge}", truth_fn=plain,
+                    plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_once_rounded_biased_layer_holds_every_order(edge):
+    """A bfloat16 Dense whose bias is stored at fp32 (its product summed in fp32, the bias added and the sum
+    rounded once: `dense._widened`'s declared tangent): every order, in the inputs, the kernel and the bias,
+    finite wherever float64 is a normal float32 and wherever the plain formula (JAX's derivatives of the
+    fp32 product plus the bias, rounded once) is, at values whose products near float32's ends."""
+    layer = Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.float32)
+    primals = normal_draw(634, (8, 16), (16, 16), (16,), scale=EDGES[edge])
+    direction = normal_draw(635, (8, 16), (16, 16), (16,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(636, (8, 16))
+
+    def dense(x, kernel, bias):
+        return layer.apply({"params": {"kernel": kernel, "bias": bias}}, x.astype(jnp.bfloat16))
+
+    def plain(x, kernel, bias):
+        product = jax.lax.dot(x.astype(jnp.bfloat16), kernel.astype(jnp.bfloat16),
+                              preferred_element_type=jnp.float32)
+        return (product + bias).astype(jnp.bfloat16)
+
+    assert_contract(dense, primals, direction, cotangent, f"a once-rounded biased layer {edge}",
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_mxfp8_projection_holds_every_reverse_order(edge):
+    """`gemm.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared as a
+    surrogate): every reverse order, under a nested jit and a scan, in the rows and the matrices, finite
+    wherever float64 is a normal float32 and wherever the recipe's own fp32 sums are (tests/mx_matrix.py's
+    `recipe_truth`, its float64 run the truth: a value quantized can round up past float32's largest where
+    the unquantized one does not), at values whose products near float32's ends (row 2513). It takes no
+    forward order: a custom VJP has none."""
+    import mx_matrix
+
+    group_blocks = jnp.asarray([1, 0, 1], jnp.int32)
+    primals = normal_draw(2519, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    direction = normal_draw(2520, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    (cotangent,) = normal_draw(2521, (256, 128))
+
+    def recipe(rows, matrices):
+        return gemm.mxfp8_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
+
+    assert_contract(recipe, primals, direction, cotangent, f"an mxfp8 projection {edge}",
+                    truth_fn=mx_matrix.recipe_truth(group_blocks),
+                    plain_fn=mx_matrix.recipe_truth(group_blocks, jnp.float32), without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_nvfp4_projection_holds_every_reverse_order(edge):
+    """`gemm.nvfp4_projection` (the NVFP4 recipe, its custom VJP the recipe's own NVFP4 products, declared as
+    a surrogate): every reverse order, under a nested jit and a scan, in the rows and the matrices, finite
+    wherever float64 is a normal float32 and wherever the recipe's own fp32 sums are (`mx_matrix.recipe_truth`
+    of `gemm.NvFp4Block`, its float64 run the truth), at values whose products near float32's ends (row
+    2513). It takes no forward order: a custom VJP has none."""
+    import mx_matrix
+
+    group_blocks = jnp.asarray([1, 0, 1], jnp.int32)
+    primals = normal_draw(2522, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    direction = normal_draw(2523, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    (cotangent,) = normal_draw(2524, (256, 128))
+
+    def recipe(rows, matrices):
+        return gemm.nvfp4_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
+
+    truth = functools.partial(mx_matrix.recipe_truth, group_blocks, quantized=mx_matrix.nvfp4_values)
+    assert_contract(recipe, primals, direction, cotangent, f"an nvfp4 projection {edge}", truth_fn=truth(),
+                    plain_fn=truth(jnp.float32), without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
+    """`gemm.blockwise_fp8_projection` (DeepSeek-V3's blockwise FP8 recipe, its custom VJP the recipe's own
+    FP8 products, declared through `derivatives.declared_derivative` as a surrogate): every reverse order,
+    under a nested jit and a scan, in the rows and the matrices, finite wherever float64 is a normal float32
+    and wherever the plain grouped product (its float64 run the truth) is, at values whose products near
+    float32's ends (row 2513). It takes no forward order: a custom VJP has none."""
+    group_blocks = jnp.asarray([1, 0, 1], jnp.int32)
+    sizes = 128 * group_blocks
+    primals = normal_draw(2513, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    direction = normal_draw(2514, (256, 128), (3, 128, 128), scale=EDGES[edge])
+    (cotangent,) = normal_draw(2515, (256, 128))
+
+    def recipe(rows, matrices):
+        return gemm.blockwise_fp8_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
+
+    def plain(rows, matrices):
+        return jax.lax.ragged_dot(rows, matrices, sizes)
+
+    assert_contract(recipe, primals, direction, cotangent, f"a blockwise fp8 projection {edge}",
+                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
+    """`gemm.nvfp4_product` on its selector's `kernel` (`xla` here, the decoded matrix's product; `packed`,
+    the template's mainloop decoding each stage in place through `generation.linear_tangent` as `gemm` is,
+    on an H100 and an A100 in the GPU flow, tests/test_gpu_gemm.py: Mosaic GPU's interpreter runs its kernel
+    through ordered callbacks, which no rematerialization differentiates): every order runs in the rows,
+    finite wherever float64 is a normal float32 and wherever the plain product (the rows times the decoded
+    values times the deferred factor, its float64 run the truth) is, at values whose products near float32's
+    ends (row 3621). The frozen words and scales take no cotangent."""
+    codes = np.random.default_rng(3621).integers(0, 16, size=(256, 64))
+    e2m1 = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    magnitudes = np.where(codes >= 8, -1.0, 1.0) * e2m1[codes & 7]
+    exponents = np.random.default_rng(3622).integers(-2, 3, size=(16, 64))
+    block = jnp.asarray(np.exp2(exponents), jnp.float8_e4m3fn)
+    matrix = gemm.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
+    values = matrix.decoded().astype(jnp.float32) * matrix.factor
+    primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
+    direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
+    (cotangent,) = normal_draw(3625, (64, 64))
+
+    def product(rows):
+        with generation.chosen(nvfp4=kernel):
+            return gemm.nvfp4_product(rows, matrix, out_dtype=rows.dtype)
+
+    def plain(rows):
+        return rows @ values.astype(rows.dtype)
+
+    assert_contract(product, primals, direction, cotangent, f"an NVFP4 product's {kernel} kernel {edge}",
+                    truth_fn=plain, plain_fn=plain)
 
 
 GROUPS = jnp.asarray([3, 0, 5], jnp.int32)

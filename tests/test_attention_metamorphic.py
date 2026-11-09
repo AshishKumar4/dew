@@ -4,10 +4,12 @@ against the reference path over the untransformed one, its float64 truth the ref
 property holds of whatever form the route runs. Hypothesis draws each transformation (the suite's derandomized
 profile, docs/design/testing.md): a full call's keys and values permuted together, a causal call against its
 own first queries, query heads permuted with the key heads they read, and a decode step's keys cut into each
-slice count its work list takes (every count a case, Hypothesis drawing the rows' lengths; a paged cache's
-pages permuted with its table are `test_attention_decode_template`'s paged cells). The plain-JAX mainloop runs
+slice count its work list takes (every count a case, each draw's rows of lengths of their own, both ends
+among them; a paged cache's pages permuted with its table are `test_attention_decode_template`'s paged
+cells). The plain-JAX mainloop runs
 the dense properties on this CPU; the decode one runs the Mosaic mainloop interpreted, as an H100 runs it."""
 
+import functools
 
 import hypothesis
 import jax
@@ -15,11 +17,12 @@ import jax.numpy as jnp
 import pytest
 from generation_support import INTERPRETS
 from hypothesis import strategies as st
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_algebra as algebra,
     attention_decode,
     attention_mosaic,
     attention_portable,
@@ -35,11 +38,6 @@ DENSE = hypothesis.settings(max_examples=30, deadline=None)
 """Each dense property's draws: the plain-JAX mainloop's check 1 a draw, about 0.5 s on armada's CPU (six
 draws' tests took 3.1 s in CI), about 15 s a property."""
 
-INTERPRETED = hypothesis.settings(max_examples=8, deadline=None)
-"""Each interpreted case's draws: the Mosaic mainloop interpreted, about 2.7 s a draw (three draws' test took
-7.95 s in CI), about 22 s a slice count."""
-
-
 def _dense_draw(seed: int, queries: int = QUERIES):
     streams = jax.random.split(jax.random.key(seed), 3)
     query = jax.random.normal(streams[0], (ROWS, queries, HEADS, WIDTH), jnp.bfloat16)
@@ -50,8 +48,8 @@ def _dense_draw(seed: int, queries: int = QUERIES):
 
 def _portable(query, key, value, spans):
     # The plain-JAX mainloop at 32-query and 32-key tiles, padded as the route pads a call.
-    return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
-                                     pad=attention_triton.BLOCK)
+    return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK), query,
+                                           key, value, spans)
 
 
 @DENSE
@@ -121,11 +119,31 @@ def _decode_spans(lengths):
     return template.spans(1, DECODE_KEYS, DECODE_ROWS, lengths=jnp.asarray(lengths, jnp.int32))
 
 
+def _slices_merged(query, key, value, spans, *, slices: int = 8, subtracted: bool = False):
+    """A folded decode step (`natural=False`) cut into `slices` slices a row at the decode plan's config
+    (the fold's raw products where `subtracted`, as `attention_decode.attend` walks them), merged after the
+    launch (`algebra.merged_slices`), interpreted."""
+    with generation.assumed("sm90"):
+        rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
+        config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
+                                       target=generation.gpu_target()).config
+        with tuning.pinned({attention_mosaic.MosaicForward: config}):
+            out, maximum, total = attention_mosaic.forward(
+                rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
+                residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=slices,
+                subtracted=subtracted)[:3]
+            spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
+            # One slice's output its rows' whole (`attention_decode.attend`'s), nothing to merge.
+            merged = out if slices == 1 else algebra.merged_slices(spec, out, maximum, total)
+        return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
+
+
 @INTERPRETS
 def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
     """A decode step cut into 8 slices a row, its first row's query 2^16 times a drawn one (past the fold's
     reach, so the masked rewalk walks it) and 70 keys long, two key tiles: its six slices of no key store
-    their empty walks' start in the rewalk for the merge to read (row 3778). On par with the step walked
+    their empty walks' start in the rewalk for the merge to read (row 3778), the slices merged after the
+    launch, each in the units of its finished rows (`algebra.finished_form`). On par with the step walked
     whole (check 1)."""
     spans = _decode_spans((70, DECODE_KEYS))
 
@@ -133,50 +151,95 @@ def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
         query, key, value = _decode_draw(seed)
         return query.at[0].multiply(2.0 ** 16), key, value
 
-    def sliced(query, key, value):
-        with generation.assumed("sm90"):
-            rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
-            config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
-                                           target=generation.gpu_target()).config
-            with tuning.pinned({attention_mosaic.MosaicForward: config}):
-                out, maximum, total = attention_mosaic.forward(
-                    rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
-                    residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=8)[:3]
-            spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-            merged = attention_decode.merged(spec, out, maximum, total)
-            return attention_decode.unpacked(merged, DECODE_HEADS).astype(query.dtype)
-
-    assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)), far,
+    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans)),
+                    jax.jit(lambda q, k, v: template.reference(q, k, v, spans)), far,
                     "a far short row's slices through its masked rewalk", seeds=SEEDS)
 
 
 @INTERPRETS
-@INTERPRETED
-@pytest.mark.parametrize("slices", [1, 2, 4, 8])
-@hypothesis.given(lengths=st.tuples(st.integers(1, DECODE_KEYS), st.integers(1, DECODE_KEYS)))
-def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices, lengths):
-    """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
-    decode plan's config, a program a slice), the slices merged (`attention_decode.merged`), rows of their own
-    lengths: on par with the step walked whole."""
+def test_a_decode_steps_slices_rewalk_rows_whose_sums_pass_fp32s_largest_interpreted():
+    """A decode step cut into 8 slices a row, its values near bf16's largest under equal logits, so its
+    rows' weighted values pass fp32's largest and its guarded rewalk walks their slices again, merged after
+    the launch: on par with jax's own attention, which normalizes its weights before their product
+    (check 1)."""
+    lengths = (300, DECODE_KEYS)
     spans = _decode_spans(lengths)
 
-    def sliced(query, key, value):
-        with generation.assumed("sm90"):
-            rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
-            config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
-                                           target=generation.gpu_target()).config
-            with tuning.pinned({attention_mosaic.MosaicForward: config}):
-                out, maximum, total = attention_mosaic.forward(
-                    rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
-                    residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True,
-                    splits=slices)[:3]
-            if slices == 1:
-                # One slice's launch gives its rows without a slices axis.
-                out, maximum, total = out[:, None], maximum[:, :, None], total[:, :, None]
-            spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-            merged = attention_decode.merged(spec, out, maximum, total)
-            return attention_decode.unpacked(merged, DECODE_HEADS).astype(query.dtype)
+    def large(seed: int):
+        query, key, _ = _decode_draw(seed)
+        value = jax.random.uniform(jax.random.key(seed + 1), (DECODE_ROWS, DECODE_KEYS, DECODE_KV, 64),
+                                   jnp.float32, 2.9e38, 3.3e38).astype(jnp.bfloat16)
+        return jnp.zeros_like(query), key, value
 
-    assert_as_exact(jax.jit(sliced), jax.jit(lambda q, k, v: template.reference(q, k, v, spans)),
-                    _decode_draw, f"decode step cut into {slices} slices", seeds=SEEDS)
+    def reference(query, key, value):
+        return jax.nn.dot_product_attention(query, key, value, implementation="xla",
+                                            key_value_seq_lengths=jnp.asarray(lengths, jnp.int32))
+
+    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans)),
+                    as_given(jax.jit(reference)), large,
+                    "a decode step's slices past fp32's largest", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_interpreted():
+    """A decode step cut into 8 slices a row, each slice's 64 keys one whose logit is 30 and whose values near
+    bf16's largest: no slice's sums pass fp32's largest, but their outputs, each near 3e38, sum past it, so
+    their merge weighs each output by its share of the masses before its product (row 4526,
+    `algebra.finished_merged`): on par with jax's own attention, which normalizes its weights before their
+    product (check 1)."""
+    lengths = (DECODE_KEYS, DECODE_KEYS)
+    spans = _decode_spans(lengths)
+    dominant = jnp.arange(DECODE_KEYS) % 64 == 0
+
+    def outputs_near_the_largest(seed: int):
+        query, key, value = _decode_draw(seed)
+        query = jnp.zeros_like(query).at[..., 0].set(1.0)
+        key = jnp.where(dominant[None, :, None, None] & (jnp.arange(64) == 0), 240.0, key).astype(key.dtype)
+        large = jax.random.uniform(jax.random.key(seed + 1), value.shape, jnp.float32, 2.9e38, 3.3e38)
+        value = jnp.where(dominant[None, :, None, None], large, value).astype(value.dtype)
+        return query, key, value
+
+    def reference(query, key, value):
+        return jax.nn.dot_product_attention(query, key, value, implementation="xla",
+                                            key_value_seq_lengths=jnp.asarray(lengths, jnp.int32))
+
+    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans)),
+                    as_given(jax.jit(reference)), outputs_near_the_largest,
+                    "slices whose outputs sum past fp32's largest", seeds=SEEDS)
+
+
+@functools.partial(jax.jit, static_argnames="slices")
+def _sliced_step(query, key, value, lengths, *, slices: int):
+    """A decode step of rows `lengths` long, its keys cut into `slices` slices a row at the decode plan's
+    config and merged after the launch (`_slices_merged`), the fold's raw products (`subtracted`) as
+    `attention_decode.attend` walks them; lengths an operand, so every drawn length compiles one program."""
+    return _slices_merged(query, key, value, _decode_spans(lengths), slices=slices, subtracted=True)
+
+
+@jax.jit
+def _whole_step(query, key, value, lengths):
+    return template.reference(query, key, value, _decode_spans(lengths))
+
+
+def _lengths_draw(seed: int):
+    """`_decode_draw`'s step and its rows' lengths: one row of a single key beside one of every key, then the
+    other way round, then lengths drawn from 1 to every key, so a slice of no key, a short row's first and a
+    full row's last are each among a case's draws."""
+    if seed < 2:
+        lengths = jnp.asarray((1, DECODE_KEYS) if seed == 0 else (DECODE_KEYS, 1), jnp.int32)
+    else:
+        lengths = jax.random.randint(jax.random.key(seed + 1000), (DECODE_ROWS,), 1, DECODE_KEYS + 1)
+    return (*_decode_draw(seed), lengths)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("slices", [1, 2, 4, 8])
+def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices):
+    """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
+    decode plan's config, a program a slice), the slices merged after the launch, rows of their own lengths,
+    each draw's (`_lengths_draw`): on par with the step walked whole. The lengths an operand, one program
+    judges every draw (row 4640: Hypothesis's eight lengths a case, each over eight draws, took the
+    eight-slice case 124 s)."""
+    assert_as_exact(functools.partial(_sliced_step, slices=slices), _whole_step, _lengths_draw,
+                    f"decode step cut into {slices} slices", seeds=SEEDS)
 

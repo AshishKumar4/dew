@@ -1,10 +1,10 @@
 """The attention backward's tile algebra, what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK
 and dQ) on natural logits: a tile's logits recomputed under the score hook and their derivatives
-(`tile_logits`, `scored`, `pulled`), its weights and score cotangents (`grad_scores`), each query's dQ sums
-about its anchor key (`DqSums`, `dq_step`, `dq_finish`), the anchors themselves (`off_anchor`, `centre_step`)
-and the dropout's (`dropped_products`). The forward's algebra and the products' operand parts every launch
-shares are `attention_algebra`'s; the declared backward and its derived forms
-`attention_backward_algebra`'s."""
+(`tile_logits`, `scored`, `pulled`), its weights and score cotangents
+(`attention_backward_algebra.softmax_cotangents`), each query's dQ sums about its anchor key (`DqSums`,
+`dq_issued`, `dq_finish`), the anchors themselves (`off_anchor`, `centre_step`) and the dropout's
+(`dropped_products`). The forward's algebra and the products' operand parts every launch shares are
+`attention_algebra`'s; the declared backward and its derived forms `attention_backward_algebra`'s."""
 
 import math
 from collections.abc import Callable, Mapping
@@ -22,7 +22,6 @@ from dew.nn.kernels.templates.attention_algebra import (
     WEIGHT_SHIFT,
     Parts,
     Recompute,
-    cotangent_product,
     expand,
     exponent,
     finite,
@@ -31,7 +30,6 @@ from dew.nn.kernels.templates.attention_algebra import (
     normalized_rows,
     power2,
     split_output,
-    summed_products,
     weights_parts,
 )
 from dew.nn.precision import Running, added_to, compensated_sum, compensates_loops, running_sum, running_total
@@ -125,7 +123,7 @@ class OffAnchor(NamedTuple):
 def off_anchor_start(peak0: jax.Array, total0: jax.Array, maximum: jax.Array, width: int,
                      shift: jax.Array) -> tuple[OffAnchor, jax.Array]:
     """The first pass from the softmax's initial state (its maximum and denominator) weighed at the
-    forward's `maximum`, its sums at each row's `2^-shift` (the forward's, `room`), and that state's
+    forward's `maximum`, its sums at each row's `2^-shift` (the forward's scale, `Scale`), and that state's
     denominator there, unshifted; its share of D enters as that weight over the total times its values'
     mean's product with the cotangent (`off_anchor_delta`), never `acc0 · dO`, which overflows where the
     state's sums are near fp32's largest."""
@@ -142,10 +140,11 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
                        dtype, shift: jax.Array, how: Recompute = PLAIN
                        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """A tile's weights `exp(s - m)` at the forward's maximum, fp32, at the forward's weights' shift,
-    `2^-min(shift, WEIGHT_SHIFT)` (`room`); them narrowed to the values' `dtype` as the forward rounds
+    `2^-min(shift, WEIGHT_SHIFT)`; them narrowed to the values' `dtype` as the forward rounds
     them, zero at the anchor key (`at_anchor`), the left operand of `B`'s product; the anchor key's
     narrowed weight, fp32; and the weights that shift would push below fp32's least normal, unshifted
-    and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's (`room`)."""
+    and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's small weights'
+    (`at_scale`)."""
     exponentials = below(logits, maximum, how)
     weight = expand(jnp.minimum(shift, WEIGHT_SHIFT), exponentials)
     small = jnp.where(exponentials < power2(jnp.float32(1.0), weight - 126.0), exponentials, 0.0)
@@ -159,7 +158,7 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
 def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: jax.Array,
                others: jax.Array, shift: jax.Array, small: jax.Array, small_others: jax.Array) -> OffAnchor:
     """The first pass after a tile (`off_anchor_weights`), `others` the tile's `rest · V`, its sums taken
-    from the weights' shift to each row's `shift`, as the forward's (`beyond_weights`), and the small
+    from the weights' shift to each row's `shift`, as the forward's (`carry_factor`), and the small
     weights and their product `small_others` taken there after the product: they feed D alone, whose
     small terms are below an ulp of it."""
     beyond = jnp.minimum(shift, WEIGHT_SHIFT) - shift
@@ -174,6 +173,12 @@ def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: 
                      state.own + taken(own))
 
 
+def summed_rows(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Each row's `a · b` over the last axis, as a kernel's body sums it: D's and the anchor's products with
+    dO where the body's issuer forms dP (`off_anchor_delta`'s `rows`)."""
+    return jnp.sum(a * b, axis=-1)
+
+
 def nearer_centre(anchor: jax.Array, about_anchor: jax.Array, about_zero: jax.Array, key_index: jax.Array
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """D's centre, the nearer to D of the anchor key's `dP` (`anchor`) and zero, each sum's difference from
@@ -185,54 +190,58 @@ def nearer_centre(anchor: jax.Array, about_anchor: jax.Array, about_zero: jax.Ar
 
 
 def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array, state_total: jax.Array,
-                     mean0: jax.Array, key_index: jax.Array,
-                     shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                     mean0: jax.Array, key_index: jax.Array, shift: jax.Array, *,
+                     rows: Callable[[jax.Array, jax.Array], jax.Array]
+                     ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each query's anchor c (`v_c · dO`, or 0), `D - c`, and the anchor key's index (-1 where c is 0),
     from the first pass. D two ways: about 0, `sum_j p_j v_j · dO`, as the output's own product with dO
     rounds it, which suits a query whose weights spread over many keys; and about `c = v_c · dO`,
     `sum_{j != c} p_j (v_j - v_c) · dO`, where c enters as exactly 0, which suits one whose weight sits on
     c. Each query takes the one nearer its D, the one whose terms cancel less. The pass's sums are at each
-    row's `2^-shift` (`room`), and each is taken over the total before its product with dO, as the
+    row's `2^-shift` (`Scale`), and each is taken over the total before its product with dO, as the
     reference's output is, so none overflows where the sums are near fp32's largest; the initial state's
-    share is its weight over the total times its values' mean's product with dO (`mean0`)."""
+    share is its weight over the total times its values' mean's product with dO (`mean0`). Each row's
+    product with dO is `rows`', the issuer's own that forms dP (`summed_rows` in a kernel's body,
+    `interpreted_rows` off a GPU), so c and the anchor key's dP sum alike and cancel exactly."""
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
-    anchor = jnp.sum(anchor_value * cotangent, axis=-1)
+    anchor = rows(anchor_value, cotangent)
     over = inverse(state.total)
     state_weight = power2(state_total, -shift) * over
     others = state.others * expand(over, state.others)
     own = expand(state.own * over, anchor_value)
     others_total = expand(state.others_total * over, anchor_value)
-    about_zero = jnp.sum((others + own * anchor_value) * cotangent, axis=-1) + state_weight * mean0
-    about_anchor = (jnp.sum((others - others_total * anchor_value) * cotangent, axis=-1)
-                    + state_weight * (mean0 - anchor))
+    about_zero = rows(others + own * anchor_value, cotangent) + state_weight * mean0
+    about_anchor = rows(others - others_total * anchor_value, cotangent) + state_weight * (mean0 - anchor)
     return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
                 state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
-                key_index: jax.Array, shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                key_index: jax.Array, shift: jax.Array, *,
+                rows: Callable[[jax.Array, jax.Array], jax.Array]) -> tuple[jax.Array, jax.Array, jax.Array]:
     """`off_anchor_delta` from a training forward's split sums (`training_step`), the backward's first
     pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
     sum, the anchor's own weight, the denominator `total` and the initial state's own `state_total`, all
     at the forward's maximum. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
     `(B - others_total v_c) · dO - state_total c`, its terms kept apart so a state or keys that weigh
     little beside the anchor are not lost from a total; each query takes the one nearer its D. The split
-    sums are at each row's `2^-shift` (`room`), and `total` is taken there; a row at the shift `NORMALIZED`
-    holds normalized sums (`split_residuals`, `normalized_rows`), its total 1. Each sum is taken over the
-    total before its product with dO, as the reference's output is, so none overflows where the sums are
-    near fp32's largest (a state's)."""
+    sums are at each row's `2^-shift` (`Scale`), and `total` is taken there; a row at the shift
+    `NORMALIZED` holds normalized sums (an output residual's, `normalized_rows`), its total 1. Each sum is
+    taken over the total before its product with dO, as the reference's output is, so none overflows where
+    the sums are near fp32's largest (a state's). Each row's product with dO is `rows`'
+    (`off_anchor_delta`'s)."""
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
     state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
-    anchor = jnp.sum(anchor_value * cotangent, axis=-1)
+    anchor = rows(anchor_value, cotangent)
     others = others * expand(over, others)
     own, others_total = own * over, others_total * over
-    about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
-    about_anchor = (jnp.sum((others - expand(others_total, anchor_value) * anchor_value) * cotangent, axis=-1)
+    about_zero = rows(split_output(others, own, anchor_value), cotangent)
+    about_anchor = (rows(others - expand(others_total, anchor_value) * anchor_value, cotangent)
                     - state_weight * anchor)
     return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
@@ -246,15 +255,14 @@ def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift:
 
 
 class DqSums(NamedTuple):
-    """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and
-    QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
-    (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums, the hook
-    parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's, scaled and pulled
-    through the hook over the prior denominator, held as its coefficients' magnitude
-    `keyed_mass · 2^keyed_shift` (`[bq]` each, the mantissa at most the keys' count, the exponent the
-    largest coefficient's) times a mean
-    of the keys under coefficients of magnitudes summing to at most one, `keyed` `[bq, D]`: each finite
-    wherever the keys are, whatever the scale and the hook's slopes, fp32."""
+    """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and QUERY
+    hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator (the
+    forward's, or the first pass's; `attention_backward_algebra.softmax_cotangents`); and the unnormalized
+    weights' row sums, the hook parameters' pullbacks of them (`weighed`) and their product with the keys as
+    dQ's, scaled and pulled through the hook over the prior denominator, held as its coefficients' magnitude
+    `keyed_mass · 2^keyed_shift` (`[bq]` each, the mantissa at most the keys' count, the exponent the largest
+    coefficient's) times a mean of the keys under coefficients of magnitudes summing to at most one, `keyed`
+    `[bq, D]`: each finite wherever the keys are, whatever the scale and the hook's slopes, fp32."""
 
     dq: jax.Array
     residual: jax.Array
@@ -309,7 +317,7 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
 
 def dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
              kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
-    """A dQ tile's row sums (`dq_step`): the HEAD and QUERY parameters' pullbacks of the cotangents and of
+    """A dQ tile's row sums (`dq_issued`): the HEAD and QUERY parameters' pullbacks of the cotangents and of
     the weights, the cotangents' and the weights' sums; and the weights pulled through the score hook."""
     _, pieces = pulled(cotangents, slopes, seen, kinds)
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
@@ -325,7 +333,7 @@ def dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
 
 def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
              scale: float, kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
-    """`dq_step`'s row sums after a tile and dQ's score cotangents pulled and scaled, whose parts
+    """`dq_issued`'s row sums after a tile and dQ's score cotangents pulled and scaled, whose parts
     (`cotangent_parts`, `formed_parts`) a mainloop adds to dQ, into its accumulator in place where it can: the
     whole of the fast form's step, and the accurate form's with `keyed_terms` where it takes no score
     hook."""
@@ -341,7 +349,7 @@ def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: fl
     every weight at its maximum: the weights over it sum to at most one, so their product with the keys is a
     mean of them, finite wherever they are, and the scale is the mass's, its mantissa and exponent apart
     (`dq_finish`). One product, no exponent a row; a score hook's coefficients rescale a row's sums each
-    tile instead (`dq_step`)."""
+    tile instead (`dq_issued`)."""
     scale_mantissa, scale_exponent = _static_split(scale)
     keyed = weights_parts(weights * expand(inverse(prior), weights), dtype, rows)
     return (sums._replace(keyed_mass=jnp.full_like(sums.keyed_mass, scale_mantissa),
@@ -356,8 +364,8 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
     pullbacks and, in the accurate form, the keyed mass and exponent); dQ's parts (`cotangent_parts`), whose
     products with the keys join dQ; and in the accurate form the keyed parts (`weights_parts`), whose products
     join the keyed sums behind the row factor `(factor, parts)` the sums take first (None: none); None in the
-    fast form. `dq_step` takes these products as the Triton and plain-JAX mainloops do; a mainloop that issues
-    them in place takes the same parts. dQ's come as its scaled cotangents, whose parts a mainloop forms
+    fast form. Every mainloop issues these products (`attention_program.dq_sums`, the Mosaic dQ launch), in
+    place or by its own dot. dQ's come as its scaled cotangents, whose parts a mainloop forms
     (`cotangent_parts`) or forms a part at a time (`formed_parts`)."""
     if not accurate or slopes is None:
         terms, parts = dq_terms(sums, weights, cotangents, slopes, seen, scale=scale, kinds=kinds,
@@ -389,29 +397,6 @@ def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, s
             (before * over, weights_parts(coefficients * expand(over, coefficients), dtype, rows)))
 
 
-def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
-            prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
-            dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool) -> DqSums:
-    """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
-    (`pulled`) and scaled, times the keys (`cotangent_product`, in the form `accurate` names); the HEAD and
-    QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row) and of the weights,
-    which take those gradients to the refined D (`dq_finish`); the weights' sums unnormalized; and in the
-    accurate form the weights' product with the keys over the prior denominator, which takes dQ there too.
-    The fast form leaves dQ at the first pass's D (the forward's anchored one, `split_delta`, or the dQ
-    launch's own, `off_anchor_delta`), FlashAttention's arithmetic, its `keyed` sums untouched: a
-    parameter's gradient sums its cotangents over every key and query, a position's or a scale's times
-    each, so the first pass's D error enters it multiplied (ALiBi's slope 2.3 to 6.7 times the reference's
-    error at its first D), where dQ's per query is FlashAttention's."""
-    terms, parts, keyed = dq_issued(sums, weights, cotangents, slopes, seen, key.dtype, prior, scale=scale,
-                                    kinds=kinds, summed=summed, accurate=accurate)
-    terms = terms._replace(dq=sums.dq + cotangent_product(parts, key, dot, accurate=accurate))
-    if keyed is None:
-        return terms
-    factor, keyed_parts = keyed
-    scaled = sums.keyed if factor is None else expand(factor, sums.keyed) * sums.keyed
-    return terms._replace(keyed=scaled + summed_products(keyed_parts, key, dot))
-
-
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
               shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array, *,
               accurate: bool):
@@ -423,7 +408,7 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     (`weighed`). In the accurate form dQ takes it too, less the refinement times its weights' product with
     the keys (`keyed`): a query's dQ cancels across its keys exactly as its cotangents sum to 0, so the D it
     takes must be the one whose cotangents do, not the first pass's; the fast form leaves dQ at the first
-    pass's (`dq_step`). Returns dQ, the refined `D - c`, the denominator, the keys' share of the weights,
+    pass's (`dq_issued`). Returns dQ, the refined `D - c`, the denominator, the keys' share of the weights,
     and the hook gradients."""
     total = state_total + sums.mass
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
@@ -477,33 +462,6 @@ def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.A
     if multiplier is None:
         return products
     return jax.lax.optimization_barrier(products * multiplier)
-
-
-def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array | None, at_anchor: jax.Array | None, inverse_total: jax.Array,
-                multiplier: jax.Array | None = None, weights: jax.Array | None = None) -> jax.Array:
-    """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
-    `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
-    denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every intermediate
-    lies where the reference's does (a weight below fp32's range keeps its share beside a large product, and
-    none overflows that the reference keeps); zero where unseen (`where_seen`). The anchor key's own
-    `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding, so a query that
-    sees one key has no cotangent, as the reference's: FlashAttention's order, `(dP - D) / T` with no anchor
-    test, fails check 1 there in both dQ and dK (a query of one key, the stability suite's ordinary "one
-    key" and causal windows' first queries: rows whose float64 gradient is exactly 0). That is the accurate
-    form's. The fast form's (`weights` given, the normalized weights its launch forms anyway) is
-    FlashAttention's order about the anchor, `weights ((dP - c) - (D - c))`, its anchor test the accurate
-    form's alone (`at_anchor` None)."""
-    products = dropped_products(products, multiplier)
-    relative = products - expand(anchor, products)
-    if at_anchor is not None:
-        relative = jnp.where(at_anchor, 0.0, relative)
-    if weights is not None:
-        # The weights a launch forms anyway times `(dP - c) - (D - c)`: one product fewer an entry (the fast
-        # backward's dK/dV launch: FMUL 112 to 96 at Qwen3-8B's widths, ptxas 12.9 sm90a).
-        return where_seen(seen, weights * (relative - expand(delta, relative)), 0.0)
-    centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
-    return where_seen(seen, exponentials * centred, 0.0)
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],

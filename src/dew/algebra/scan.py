@@ -18,13 +18,16 @@ exponents' inclusive prefix (per key), `Gamma[i, j, k] = exp(G_ik - G_jk)` for `
     h_out = gamma_last h_in + sum_j (B_j * exp(G_last - G_j)) w_j^T,
 
 Mamba-2's state-space dual where no token corrects (`w = U`), derived from the token update rather than
-written. The prefix is taken compensated (each partial a float and its rounding error, `two_sum`), and every
-difference of two partials from both parts: a plain prefix loses about 1e-6 of a deep decay (ledger 2098). A
-chunk's adjoint (`backward`) is its forms' derivative, each exponent's from the decays whose sums hold it,
-summed without one term added and taken away again (`_decays_backward`). A token a reset marks (`Scan.reset`,
-a packed document's first) takes the exponent `RESET_DECAY` in place of its own, so every decay spanning it is
-zero and every other its own: the forms, their merge and their adjoint unchanged, the exponent its reset
-replaced given no gradient.
+written. The prefix is taken compensated (each partial a float and its rounding error, `compensated_add`),
+and every difference of two partials from both parts: a plain prefix loses about 1e-6 of a deep decay
+(ledger 2098). A chunk's adjoint (`backward`) is its token update's, replayed per chunk (`replay`, the
+owner's ruling of 2026-11-07): the chunk walked token by token by the affine map's parts from the state
+entering it and differentiated, each token's state cotangent erased before its decay's is formed, where the
+forms' derivative cancelled independently rounded inverse, decay and readout paths (row 1966: an aligned
+key's decay gradient 2.04 times the token scan's error, its exact zero lost, NaNs near float32's largest).
+A token a reset marks (`Scan.reset`, a packed document's first) takes the exponent `RESET_DECAY` in place of
+its own, so every decay spanning it is zero and every other its own: the forms, their merge and their
+adjoint unchanged, the exponent its reset replaced given no gradient.
 Every other update or readout is refused, named.
 """
 
@@ -46,8 +49,8 @@ from jax.extend import core as jcore
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
-from dew.nn.derivatives import contracted
-from dew.nn.precision import at_least_fp32, float32_einsum, float32_matmul, two_sum, vanishing
+from dew.nn.derivatives import Protected, contracted
+from dew.nn.precision import at_least_fp32, compensated_add, float32_einsum, float32_matmul, vanishing
 
 Axes = tuple[str, ...]
 
@@ -107,17 +110,26 @@ def _traced(declaration: Scan, function: Callable, names: tuple[str, ...], chunk
 def derive_scan(declaration: Scan, *, saturation: program.Saturation,
                 splits_held: int = derive.FORMS_HELD) -> Derived:
     """`declaration`'s chunk forms (the module's account), split into what every chunk computes at once and
-    what its carry computes in sequence (`carry.split`, under `saturation`'s limits, the latest
-    `splits_held` contexts' and shapes' splits kept: the bound `derive.FORMS_HELD` sets a declaration's
-    forms, given apart only so a test reaches eviction without 65 derivations, never a knob to tune):
-    `init(shapes)` a zero state and no decay, `prepare(chunk)` a chunk's values that read no state
-    (`Prepared`), `step(state, prepared)` the state after the chunk, `mapped(prepared, state)` the chunk's
-    outputs from the state entering it, `merge(a, b)` two consecutive walks' states joined (the later walk's
-    from zero), `finish(state, operands)` the final state; `backward` a chunk's adjoint, a cotangent for
-    each operand but the reset's. Refused (`Refused`) where the update or the readout is not of the
-    module's form. `init(shapes)` given a chunk's operands (or their shapes and dtypes) starts a walk that
-    merges (`Walk`), its transfer carried where its tokens correct the state; given none, one that steps
-    alone."""
+    what its carry computes in sequence (`carry.split`, under `saturation`'s limits, the latest `splits_held`
+    contexts' and shapes' splits kept: the bound `derive.FORMS_HELD` sets a declaration's forms, given apart
+    only so a test reaches eviction without 65 derivations, never a knob to tune): `init(shapes)` a zero state
+    and no decay, `prepare(chunk)` a chunk's values that read no state (`Prepared`), `step(state, prepared)`
+    the state after the chunk, `mapped(prepared, state)` the chunk's outputs from the state entering it,
+    `merge(a, b)` two consecutive walks' states joined (the later walk's from zero), `finish(state, operands)`
+    the final state; `replay(chunk, h)` the chunk walked token by token from the state `h` entering it, its
+    outputs and the state leaving it (`_replayed`), and `backward(chunk, state, d_state, d_outputs)` its
+    derivative, the chunk's adjoint: the cotangent of the state entering it and of each operand but the
+    reset's. Refused (`Refused`) where the update or the readout is not of the module's form. `init(shapes)`
+    given a chunk's operands (or their shapes and dtypes) starts a walk that merges (`Walk`), its transfer
+    carried where its tokens correct the state; given none, one that steps alone. `prepare`, `step`, `mapped`
+    and `merge` each take a mainloop's issuer, `issue(role, lhs, rhs)` (`lhs @ rhs`), which makes every matrix
+    product of the forms, each by its role: `scores`, `gram`, `inverse_merge`, `apply` and `carry` prepared;
+    `correct` and `carry` stepped (`carry.CARRY_ROLES`); `readout_memory` and `readout_local` mapped
+    (`carry.EMIT_ROLES`); `transfer_compose` (a chunk's prepared transition on the transfer, and two transfers
+    joined), `transfer_apply` and `transfer_decay` (`rhs * lhs`, a decay's column scale, the one role no
+    product) forming and joining a walk's transfer. The same forms without one take Dew's products, the
+    portable route's; a chunk's transition, which a walk that carries its transfer composes (`prepare(chunk,
+    transition=True)`), is always Dew's, formed chunk-parallel."""
     names = tuple(name for name in declaration.operands if name != declaration.reset)
     shape, dtype = declaration.state
     if len(shape) != 2:
@@ -134,17 +146,7 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     def parts(chunk: Mapping):
         affine = affine_of(chunk)
-        # An operand with no walked axis (a rate, a skip) is every token's.
-        axes = [declaration.operands[name].index(declaration.walked)
-                if declaration.walked in declaration.operands[name] else None for name in names]
-        exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
-            *[chunk[name] for name in names])
-        # The exponents summed in float32 at least: a narrower prefix loses a decay's digits to its partials'
-        # magnitude, and float16's overflows past six resets (65504).
-        exponent = exponent.astype(at_least_fp32(exponent.dtype))
-        if declaration.reset is not None:
-            exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
-        return affine, (exponent, *values)
+        return affine, _token_parts(declaration, names, affine, chunk)
 
     # A walk's decay and state carried in its chunks' accumulation (`parts`' float32 at least; a float64
     # state's, float64), the state rounded to its declared dtype once, at the finish: a 16-bit state carried
@@ -160,21 +162,22 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
 
     splits: collections.OrderedDict = collections.OrderedDict()  # the least recently prepared first
 
-    def prepare(chunk):
+    def prepare(chunk, issue=None, transition: bool = False):
         affine, (exponent, *values) = parts(chunk)
         decays = _decays(exponent, affine.base2)
         natural = _walked(exponent, affine.base2)
         tokens = dict(zip(TOKENS, values, strict=True))
-        extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1])
+        extents = linear_scan.Extents(tokens["B"].shape[0], shape[0], shape[1], exponent.shape[-1],
+                                      affine.values_read)
         corrected = affine.correction is not None
         form = _form(extents, corrected)
         # The form's largest values that read no state, prepared with the chunk's decays and tokens: the
         # operands of its function, whose state the carry reads (`carry.split`).
-        held = _prepared(form, tokens, decays)
+        held = _prepared(form, tokens, decays, issue or _issued)
         given = (*decays, *(tokens[name] for name in TOKENS), *held.values())
         # A split is priced and traced where it is derived (`derive.context`): one derived under another
         # target, precision, numerics or mesh is none of this one's.
-        key = (derive.context(), affine.base2, corrected,
+        key = (derive.context(), affine.base2, corrected, affine.values_read,
                *((value.shape, str(value.dtype)) for value in given))
         split = splits.get(key)
         if split is None:
@@ -183,58 +186,122 @@ def derive_scan(declaration: Scan, *, saturation: program.Saturation,
             if len(splits) > splits_held:
                 splits.popitem(last=False)
         splits.move_to_end(key)
-        return Prepared((natural, split.prepare(*given)), split, corrected)
+        prepared = Prepared((natural, split.prepare(*given, issue=issue or _issued)), split, corrected)
+        if not (corrected and transition):
+            return prepared
+        return dataclasses.replace(prepared, transition=_transition(prepared, jnp.zeros(shape, carried)))
 
-    def step(state, prepared):
-        decay, h = state[:2]
-        natural, values = prepared.values
-        (leaving,) = prepared.split.carry(values, h)
-        decay = _held(decay + natural.astype(decay.dtype))
-        if not isinstance(state, Walk):
-            return decay, leaving
-        if prepared.corrected and state.transfer is None:
-            raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
-        transfer = None if state.transfer is None else _transferred(prepared, state.transfer, h)
-        return Walk(decay, leaving, transfer)
-
-    def mapped(prepared, state):
-        (outputs,) = prepared.split.emit(prepared.values[1], state[1])
+    def mapped(prepared, state, issue=None):
+        # Dew's products where no mainloop issues them (`_issued`): a readout's the portable math's.
+        (outputs,) = prepared.split.emit(prepared.values[1], state[1], issue or _issued)
         return outputs
 
-    def merge(a, b, operands):
+    def merge(a, b, operands, issue=None):
         del operands
-        return _merged(a, b, carried)
+        return _merged(a, b, None if issue else carried, issue or _issued)
 
     def finish(state, operands):
         del operands
         return state[1].astype(dtype)
 
+    def replay(chunk, h):
+        return _replayed(declaration, names, affine_of(chunk), chunk, h)
+
     def backward(chunk, state, d_state, d_outputs):
-        # The chunk's forms' adjoint: the reverse scan's step, each chunk's transition transposed, as the
-        # forward forms' derivative (their prefix, substitution and Dew products differentiated).
         # The reset's booleans held, no operand of the derivative.
-        def forward(h, operands):
-            entering, prepared = (state[0], h), prepare({**chunk, **operands})
-            return mapped(prepared, entering), step(entering, prepared)[1]
+        _, pullback = jax.vjp(lambda h, operands: replay({**chunk, **operands}, h), state[1],
+                              {name: chunk[name] for name in names})
+        return pullback((d_outputs, d_state))
 
-        _, pullback = jax.vjp(forward, state[1], {name: chunk[name] for name in names})
-        d_h, d_chunk = pullback((d_outputs, d_state))
-        return d_h, d_chunk
-
-    return Derived(init, step, merge, finish, mapped,
-                   {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare)
+    return Derived(init, _stepped, merge, finish, mapped,
+                   {"rounding": "compensated prefix", "walked": declaration.walked}, backward, prepare,
+                   replay=replay)
 
 
-@functools.partial(jax.tree_util.register_dataclass, data_fields=["values"],
+def _stepped(state, prepared: Prepared, issue=None):
+    """A walk's state after a prepared chunk (`derive_scan`'s `step`): its decay summed, its state the
+    chunk's carry from it, and where the walk carries its transfer, the chunk's transition composed on it."""
+    decay, h = state[:2]
+    natural, values = prepared.values
+    (leaving,) = prepared.split.carry(values, h, issue)
+    decay = _held(decay + natural.astype(decay.dtype))
+    if not isinstance(state, Walk):
+        return decay, leaving
+    if prepared.corrected and state.transfer is None:
+        raise Refused("a walk started for tokens that do not correct the state steps a chunk whose do")
+    if state.transfer is not None and prepared.transition is None:
+        raise Refused("a walk that carries its transfer steps a chunk prepared without its transition "
+                      "(`prepare(chunk, transition=True)`)")
+    transfer = (None if state.transfer is None
+                else (issue or _issued)("transfer_compose", prepared.transition, state.transfer))
+    return Walk(decay, leaving, transfer)
+
+
+def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
+    """A chunk's tokens' exponents and the affine map's parts at each (`_token`), the exponents in float32
+    at least: a narrower prefix loses a decay's digits to its partials' magnitude, and float16's overflows
+    past six resets (65504); a reset token's decay `RESET_DECAY`."""
+    # An operand with no walked axis (a rate, a skip) is every token's.
+    axes = [declaration.operands[name].index(declaration.walked)
+            if declaration.walked in declaration.operands[name] else None for name in names]
+    exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
+        *[chunk[name] for name in names])
+    exponent = exponent.astype(at_least_fp32(exponent.dtype))
+    if declaration.reset is not None:
+        exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
+    return exponent, *values
+
+
+def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h) -> tuple:
+    """`chunk` walked token by token from the state `h` entering it by the affine map's parts at each token
+    (`_token_parts`): `(outputs, h)`, each token's output and the state leaving the chunk, in the state's
+    carried dtype. A scalar decay follows the transition, so its cotangent reads the corrected state; a
+    per-key decay's correction and update read one decayed state, `D h`, so a state's cotangent meets the
+    decay once, summed before it does. The scalar reader contracts each outer product before it is formed,
+    so its gradient's tangent avoids a state's overflowing unscaled contraction. A token whose exponent
+    vanishes (a reset's, `RESET_DECAY`) enters a zero state, selected, so no NaN of the state before it
+    reaches the one after (row 1966's overflow orders)."""
+    exponent, B, U, s, C, Q, R = _token_parts(declaration, names, affine, chunk)
+    floor = vanishing(exponent.dtype, affine.base2)
+
+    def token(h, parts):
+        z, b, u, strength, c, q, r = parts
+        h = jnp.where((z <= floor)[:, None], 0.0, h)
+        decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
+        if not affine.per_key:
+            correction = jnp.sum(c[:, None] * h, axis=0)
+            transitioned = (h - b[:, None] * (strength * correction)[None, :]) * decay[:, None]
+            h = transitioned + b[:, None] * u[None, :]
+            if affine.values_read:
+                output = jnp.sum(transitioned * q[None, :], axis=1) + b * jnp.sum(u * q) + r
+            else:
+                output = jnp.sum(q[:, None] * transitioned, axis=0) + jnp.sum(q * b) * u + r
+        else:
+            decayed = h * decay[:, None]
+            correction = jnp.sum(c[:, None] * decayed, axis=0)
+            h = decayed + b[:, None] * (u - strength * correction)[None, :]
+            read = jnp.sum(h * q[None, :], axis=1) if affine.values_read else jnp.sum(q[:, None] * h, axis=0)
+            output = read + r
+        return h, output
+
+    carried = at_least_fp32(h.dtype)
+    h, outputs = lax.scan(token, h.astype(carried), (exponent, B, U, s, C, Q, R))
+    return outputs, h
+
+
+@functools.partial(jax.tree_util.register_dataclass, data_fields=["values", "transition"],
                    meta_fields=["split", "corrected"])
 @dataclasses.dataclass(frozen=True)
 class Prepared:
     """A chunk's values that read no state (`carry.Split.prepare`), batched as a walk computes them for every
-    chunk at once, the split that reads them and whether its tokens correct the state (static)."""
+    chunk at once, the split that reads them and whether its tokens correct the state (static); where they
+    do, the chunk's transition (`transition`, keys by keys: its carry's linear part, `_transition`), which a
+    walk that merges composes into its transfer."""
 
     values: tuple
     split: carry.Split
     corrected: bool
+    transition: jax.Array | None = None
 
 
 class Walk(NamedTuple):
@@ -248,31 +315,35 @@ class Walk(NamedTuple):
     transfer: jax.Array | None
 
 
-def _merged(a, b, carried) -> Walk:
+def _merged(a, b, carried, issue: Callable) -> Walk:
     """Two consecutive walks' states joined (`derive_scan`'s `merge`), the later's from zero applying its
     transfer to the state before it: its decay per key (its exponent sum in natural units) where no token
-    corrects the state, else the transfer it carried; each in `carried`, the walks' accumulation dtype."""
+    corrects the state, else the transfer it carried; each in `carried`, the walks' accumulation dtype (as
+    `issue` makes them where `carried` is None: a mainloop's issuer, its products float32 and its operands
+    its own, each touched by it alone)."""
     if not (isinstance(a, Walk) and isinstance(b, Walk)):
         raise Refused("a merge of walks init did not start from their operands' shapes")
     if b.transfer is None:
         h = jnp.exp(b.decay)[:, None] * a.h + b.h
         transfer = None if a.transfer is None else jnp.exp(b.decay)[:, None] * a.transfer
     else:
-        h = float32_matmul(b.transfer, a.h) + b.h
-        transfer = (b.transfer * jnp.exp(a.decay)[None, :] if a.transfer is None
-                    else float32_matmul(b.transfer, a.transfer))
+        h = issue("transfer_apply", b.transfer, a.h) + b.h
+        transfer = (issue("transfer_decay", jnp.exp(a.decay), b.transfer) if a.transfer is None
+                    else issue("transfer_compose", b.transfer, a.transfer))
+    if carried is None:
+        return Walk(_held(a.decay + b.decay), h, transfer)
     return Walk(_held(a.decay + b.decay), h.astype(carried),
                 None if transfer is None else transfer.astype(carried))
 
 
-def _transferred(prepared: Prepared, transfer: jax.Array, h: jax.Array) -> jax.Array:
-    """The chunk's transfer applied to a walk's (`transfer`, keys by keys): its carry's linear part in the
-    state (`jax.linearize` at the state `h` entering it, the carry affine in it), over the transfer's
-    columns a state's width at a time."""
+def _transition(prepared: Prepared, h: jax.Array) -> jax.Array:
+    """The chunk's transition (keys by keys): its carry's linear part in the state (`jax.linearize` at a
+    state `h`, the carry affine in it) over the identity's columns a state's width at a time, Dew's products,
+    prepared for every chunk at once."""
     keys, width = h.shape
     _, linear = jax.linearize(lambda state: prepared.split.carry(prepared.values[1], state)[0], h)
     blocks = -(-keys // width)
-    padded = jnp.pad(transfer.astype(h.dtype), ((0, 0), (0, blocks * width - keys)))
+    padded = jnp.pad(jnp.eye(keys, dtype=h.dtype), ((0, 0), (0, blocks * width - keys)))
     columns = jax.vmap(linear, in_axes=1, out_axes=1)(padded.reshape(keys, blocks, width))
     return columns.reshape(keys, blocks * width)[:, :keys]
 
@@ -318,8 +389,9 @@ def _split(declaration: Scan, names: Sequence[str], chunk: Mapping, affine, form
     ranges.update({DECAYS + len(TOKENS) + place: bound for place, node in enumerate(held)
                    if bound is not None and linear_scan.inverse(node)})
     avals = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in given]
-    return carry.split(functools.partial(_chunk, form, held), state, avals, (1,), saturation=saturation,
-                       ranges=ranges, state_range=_magnitude(declaration.ranges.get("state")))
+    return carry.split(functools.partial(_chunk, form, held, affine.values_read), state, avals, (1,),
+                       saturation=saturation, ranges=ranges,
+                       state_range=_magnitude(declaration.ranges.get("state")))
 
 
 def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
@@ -366,29 +438,45 @@ def _ranges(declaration: Scan, names: Sequence[str], chunk: Mapping, affine,
     return {**dict.fromkeys(range(DECAYS), 1.0), **bounded}
 
 
-def _chunk(form: linear_scan.Form, held: tuple, h, entering, to_last, whole, between, *values):
+def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, h, entering, to_last, whole, between,
+           *values):
     """A chunk's outputs and the state it leaves, from the state `h` entering it, its decays (`_Decays`'
     fields, each at most 1), its tokens' values (`_token`'s, `TOKENS`) and the form's prepared values
-    (`held`'s nodes, `_prepared`): the extracted form evaluated (`_evaluated`), which `carry.split`
-    splits."""
+    (`held`'s nodes, `_prepared`): the extracted form evaluated (`_evaluated`), its readout along the state's
+    values where `values_read`, which `carry.split` splits."""
     decays = _Decays(entering=entering, to_last=to_last, whole=whole, between=between)
     tokens = dict(zip(TOKENS, values[:len(TOKENS)], strict=True))
     known = {terms.key(node): value for node, value in zip(held, values[len(TOKENS):], strict=True)}
-    return (_evaluated(form.outputs, tokens, decays, h, known),
-            _evaluated(form.state, tokens, decays, h, known))
+    # The language's own products (`_plain`), which the split's forms name and issue themselves
+    # (`carry.split`'s roles): a declared product's tangent in this trace reads the state opaquely.
+    return (_evaluated(form.outputs, tokens, decays, h, known, _plain, values_read=values_read),
+            _evaluated(form.state, tokens, decays, h, known, _plain, values_read=values_read))
 
 
-def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays) -> dict:
+def _plain(name: str, left, right):
+    """A chunk's products as the language's plain ones, `dot_general`s, as the trace `carry.split` derives
+    from takes them (`_chunk`): the split's forms issue every product themselves (its roles), so this trace
+    states only which. `float32_matmul` here traced a float64 run's product inside a protected span the
+    language cannot read, and the split refused the state it read (Kimi Linear's float64 truth)."""
+    del name
+    return jnp.matmul(left, right)
+
+
+def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable) -> dict:
     """The form's largest values that read no state but its tokens and decays (a solve's inverse, a gram,
-    a token decayed), by node, evaluated."""
+    a token decayed), by node, evaluated, each product `issue`'s (`_evaluated`)."""
     known: dict = {}
     nodes = linear_scan.prepared((form.outputs, form.state))
-    return {node: _evaluated(node, tokens, decays, None, known) for node in nodes}
+    return {node: _evaluated(node, tokens, decays, None, known, issue) for node in nodes}
 
 
-def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
+def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict, issue: Callable | None = None, *,
+               values_read: bool = False):
     """A node of the chunk's language (`linear_scan.Chunk`) at the chunk's tokens, decays and entering state
-    `h`, each node once (`known`, by node)."""
+    `h`, each node once (`known`, by node), each matrix product `issue(role, lhs, rhs)`'s (`_issued`, Dew's,
+    where none is given): a pair's scores (`scores`) or a strict gram (`gram`), the inverse's doubling
+    (`inverse_merge`), an application (`apply`) and a write's `Kᵀ V` (`carry`)."""
+    issue = issue or _issued
     from egglog import get_callable_args
 
     Chunk = linear_scan.Chunk
@@ -397,7 +485,7 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
         return known[named]
 
     def of(child):
-        return _evaluated(child, tokens, decays, h, known)
+        return _evaluated(child, tokens, decays, h, known, issue, values_read=values_read)
 
     if (args := get_callable_args(node, Chunk.token)) is not None:
         value = tokens[terms.text(args[0])]
@@ -406,9 +494,9 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
     elif (args := get_callable_args(node, Chunk.decay)) is not None:
         value = getattr(decays, terms.text(args[0]))
     elif (args := get_callable_args(node, Chunk.loop)) is not None:
-        value = _looped(tokens, decays, h, of(args[0]), corrected=True)
+        value = _looped(tokens, decays, h, of(args[0]), corrected=True, values_read=values_read)
     elif (args := get_callable_args(node, Chunk.plain)) is not None:
-        value = _looped(tokens, decays, h, of(args[0]), corrected=False)
+        value = _looped(tokens, decays, h, of(args[0]), corrected=False, values_read=values_read)
     elif (args := get_callable_args(node, Chunk.pair)) is not None:
         value = (of(args[0]), of(args[1]))
     elif (args := get_callable_args(node, Chunk.outputs)) is not None:
@@ -416,18 +504,23 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
     elif (args := get_callable_args(node, Chunk.state)) is not None:
         value = of(args[0])[1]
     elif (args := get_callable_args(node, Chunk.gram)) is not None:
-        strict = terms.integer(args[2])
-        between = decays.between
-        if strict:
-            below = jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None]
-            between = jnp.where(below, between, 0.0)
-        value = _paired(of(args[0]), of(args[1]), between)
+        strict = bool(terms.integer(args[2]))
+        value = _paired(of(args[0]), of(args[1]), decays.between, issue, "gram" if strict else "scores",
+                        strict=strict)
+    elif (args := get_callable_args(node, Chunk.spread)) is not None:
+        value = _spread(of(args[0]), of(args[1]), of(args[2]), decays.between, issue)
+    elif (args := get_callable_args(node, Chunk.applied)) is not None:
+        value = issue("apply", of(args[1]), of(args[0]).T)
     elif (args := get_callable_args(node, Chunk.rows)) is not None:
         value = of(args[1])[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.times)) is not None:
         value = of(args[0]) * of(args[1])
     elif (args := get_callable_args(node, Chunk.matmul)) is not None:
-        value = float32_matmul(of(args[0]), of(args[1]))
+        # The chunk's scores (a pairing of its tokens through their decays, not the solve's) applied to its
+        # tokens' values is its local readout, `readout_local` (`carry.EMIT_ROLES`), as the hand form's.
+        pairing = get_callable_args(args[0], Chunk.gram)
+        local = pairing is not None and not terms.integer(pairing[2])
+        value = issue("readout_local" if local else "apply", of(args[0]), of(args[1]))
     elif (args := get_callable_args(node, Chunk.plus)) is not None:
         value = of(args[0]) + of(args[1])
     elif (args := get_callable_args(node, Chunk.minus)) is not None:
@@ -435,9 +528,10 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
     elif (args := get_callable_args(node, Chunk.decayed)) is not None:
         value = decays.whole[:, None] * of(args[0])
     elif (args := get_callable_args(node, Chunk.written)) is not None:
-        value = float32_einsum("tk,tv->kv", of(args[0]) * decays.to_last, of(args[1]))
+        value = issue("carry", (of(args[0]) * decays.to_last).T, of(args[1]))
     elif (args := get_callable_args(node, Chunk.doubled)) is not None:
-        value = _lowered(of(args[0]))
+        # Differentiated by its own rule where Dew's products make it (`_lowered`); a mainloop's are forward.
+        value = _lowered(of(args[0])) if issue is _issued else _doubled(of(args[0]), issue)
     elif (args := get_callable_args(node, Chunk.substituted)) is not None:
         value = _substituted(of(args[0]), of(args[1]))
     else:
@@ -446,13 +540,13 @@ def _evaluated(node, tokens: Mapping, decays: _Decays, h, known: dict):
     return value
 
 
-def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool):
+def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, values_read: bool = False):
     """The token loop over the chunk, each token's step in turn (its decay `exp(z_t)` the pair of it and the
     token before, `between[t, t - 1]`, the first's `entering[0]`): its outputs and the state it leaves. Each
     token's output is placed at its row by a constant one-hot column and the rows summed, the carry's own
     language (`carry.split` reads products and sums, not a concatenation)."""
     B, s, C, Q, R = (tokens[name] for name in ("B", "s", "C", "Q", "R"))
-    placed = jnp.eye(B.shape[0], dtype=jnp.float32)
+    placed = jnp.eye(B.shape[0], dtype=B.dtype)
     outputs = 0.0
     for t in range(B.shape[0]):
         decay = decays.entering[0] if t == 0 else decays.between[t, t - 1]
@@ -460,7 +554,8 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool):
         if corrected:
             h = h - s[t] * B[t][:, None] * float32_matmul(C[t][None, :], h)
         h = h + B[t][:, None] * values[t][None, :]
-        outputs = outputs + placed[:, t][:, None] * (float32_matmul(Q[t][None, :], h)[0] + R[t])[None, :]
+        read = float32_matmul(h, Q[t][:, None])[:, 0] if values_read else float32_matmul(Q[t][None, :], h)[0]
+        outputs = outputs + placed[:, t][:, None] * (read + R[t])[None, :]
     return outputs, h
 
 
@@ -479,6 +574,7 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     (`linear_scan.Parts`) at the token's values, each in float32 at least."""
     shape = aval(parts.update.jaxpr.invars[0]).shape
     zero = jnp.zeros(shape, aval(parts.update.jaxpr.invars[0]).dtype)
+    carried = at_least_fp32(zero.dtype)  # the parts' constants': a float64 run's are float64
     envs: dict = {}
 
     def read(index: int):
@@ -490,7 +586,7 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
         return env[atom].astype(at_least_fp32(env[atom].dtype))
 
     def along(term, extent: int):
-        value = linear_scan.value_of(term, read, shape[0])
+        value = linear_scan.value_of(term, read, shape[0], carried)
         return jnp.broadcast_to(jnp.reshape(value, (-1,)) if jnp.ndim(value) == 2 else value, (extent,))
 
     keys, values = shape
@@ -498,26 +594,95 @@ def _token(parts: linear_scan.Parts, token: tuple) -> tuple:
     corrects = parts.correction is not None
     # A correction `B (X^T D h)` is the transition's `-s B C^T D h`: `C = -X`, of unit strength.
     C = -along(parts.correction, keys) if corrects else jnp.zeros_like(B)
-    s = jnp.float32(1.0 if corrects else 0.0)
+    s = jnp.asarray(1.0 if corrects else 0.0, carried)
     exponent = along(parts.exponent, keys if parts.per_key else 1)
-    return exponent, B, U, s, C, along(parts.reader, keys), along(parts.free, values)
+    reader, out = (values, keys) if parts.values_read else (keys, values)
+    return exponent, B, U, s, C, along(parts.reader, reader), along(parts.free, out)
 
 
-def _paired(left, right, between):
+def _paired(left, right, between, issue: Callable | None = None, role: str = "scores", *,
+            strict: bool = False):
     """Each pair's decayed contraction over keys, `sum_k left_ik right_jk between_ijk` `[C, C]`: a decay a
     key dimension's over the pairs' every key; a scalar decay's (`between` `[C, C, 1]`) the keys'
     product decayed after it, `(left right^T) between`, which spans no `[C, C, K]` tensor (Qwen3.5-27B's
-    derived forward took 66 ms on an H100 spanning it, derived-cells-h100-6d105a908). A pair no decay joins
-    (`between` zero, a token's future) is zero, selected, not multiplied: its product, or its cotangent, may
-    be infinite near float32's largest (a future corrected write's), whose product by a zero decay is NaN in
-    every query's gradient the pair reads (the chunked op's reverse mode, near the largest) and in the
-    decays'."""
-    active = jnp.any(between != 0, axis=-1)
+    derived forward took 66 ms on an H100 spanning it, derived-cells-h100-6d105a908). A per-key decay's
+    pairs factor around each sub-chunk's reference (`_factored`): a product of the rows decayed to it by the
+    keys decayed from it, the diagonal sub-chunks' alone elementwise. A pair no decay joins (`between` zero,
+    a token's future) is zero, selected, not multiplied: its product, or its cotangent, may be infinite near
+    float32's largest (a future corrected write's), whose product by a zero decay is NaN in every query's
+    gradient the pair reads (the chunked op's reverse mode, near the largest) and in the decays'. A `strict`
+    pairing's diagonal (a gram's own token) is no pair."""
+    joined = between
+    if strict:
+        joined = jnp.where(jnp.tril(jnp.ones(between.shape[:2], bool), -1)[:, :, None], between, 0.0)
+    active = jnp.any(joined != 0, axis=-1)
+    issue = issue or _issued
     if between.shape[-1] == 1:
         # The product selected before its decay multiplies it: an inactive pair's may overflow, whose zero
         # decay's derivative would read it.
-        return jnp.where(active, float32_matmul(left, right.T), 0.0) * between[..., 0]
-    return jnp.where(active, float32_einsum("ik,ijk->ij", left, right[None] * between), 0.0)
+        return jnp.where(active, issue(role, left, right.T), 0.0) * joined[..., 0]
+    # The factors read the reference's own decay (1, on the diagonal a strict pairing excludes).
+    return jnp.where(active, _factored(left, right, between, joined, issue, role), 0.0)
+
+
+def _factored(left, right, between, joined, issue: Callable, role: str):
+    """A per-key decay's pairs `sum_k left_ik right_jk between_ijk` over sub-chunks of `SUB` rows
+    (`recurrence_algebra.SUB`, fla's BC): a pair of an earlier sub-chunk's key `j` and a later one's row `i`
+    is the product of the row decayed to the reference `p` before its sub-chunk and the key decayed from it,
+    `(left_i between_ip) (right_j between_pj)`, each factor at most 1 (every exponent at most zero, each span
+    across a vanished token zero, `_decays_value`), a matrix product `issue` makes; a sub-chunk's own pairs
+    elementwise over its keys (at most SUB^2 K a sub-chunk, not C^2 K), by the pairing's own decays
+    (`joined`: `between` less a strict pairing's diagonal)."""
+    from dew.nn.kernels import recurrence_algebra
+
+    count = left.shape[0]
+    sub = recurrence_algebra.SUB
+    starts = range(0, count, sub)
+    rows = []
+    for first in starts:
+        own = slice(first, min(first + sub, count))
+        blocks = []
+        for start in starts:
+            keys = slice(start, min(start + sub, count))
+            if start > first:
+                blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start),
+                                        at_least_fp32(jnp.result_type(left, right, joined))))
+            elif start == first:
+                blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * joined[own, keys]))
+            else:
+                reference = first - 1
+                blocks.append(issue(role, left[own] * between[own, reference],
+                                    (right[keys] * between[reference, keys]).T))
+        rows.append(jnp.concatenate(blocks, axis=1))
+    return jnp.concatenate(rows, axis=0)
+
+
+def _spread(readers, values, keys, between, issue: Callable):
+    """Each token's earlier writes read along the state's values and decayed to it along its keys, `sum_{j <=
+    i} (readers_i . values_j) keys_jk between_ijk` `[C, K]` (`linear_scan.Chunk.spread`): the reads a
+    product `issue` makes (`scores`), a pair no decay joins (a token's future) selected out. A scalar decay's
+    pairs decay the reads, then a product applies them; a decay a key dimension's factor around each
+    sub-chunk's reference as `_factored`'s (`recurrence_algebra.SUB`): an earlier sub-chunk's keys decayed to
+    the reference `p` before the row's sub-chunk and applied, the row's decay from it after, each factor at
+    most 1; a sub-chunk's own pairs elementwise over its keys."""
+    from dew.nn.kernels import recurrence_algebra
+
+    active = jnp.any(between != 0, axis=-1)
+    reads = jnp.where(active, issue("scores", readers, values.T), 0.0)
+    if between.shape[-1] == 1:
+        return issue("apply", reads * between[..., 0], keys)
+    count = keys.shape[0]
+    sub = recurrence_algebra.SUB
+    rows = []
+    for first in range(0, count, sub):
+        own = slice(first, min(first + sub, count))
+        row = float32_einsum("ij,jk,ijk->ik", reads[own, own], keys[own], between[own, own])
+        if first:
+            reference = first - 1
+            earlier = issue("apply", reads[own, :first], keys[:first] * between[reference, :first])
+            row = row + between[own, reference] * earlier
+        rows.append(row)
+    return jnp.concatenate(rows, axis=0)
 
 
 def _lowered(overlaps):
@@ -531,17 +696,38 @@ def _lowered(overlaps):
     return _lowered_rule()(overlaps)
 
 
-def _doubled(overlaps):
+def _doubled(overlaps, issue: Callable | None = None):
+    """`_lowered`'s doubling, its products `issue`'s under the role `inverse_merge` (Dew's where none is
+    given)."""
     # The template's algebra imports the compile point, which imports this package: read at a call.
     from dew.nn.kernels import recurrence_algebra
 
-    return _below(recurrence_algebra.doubled(-overlaps, _issued))
+    if issue is None:
+        return _below(recurrence_algebra.doubled(-overlaps, _issued))
+    return _below(recurrence_algebra.doubled(-overlaps, lambda name, left, right: issue(
+        "inverse_" + name, left, right)))
 
 
 def _issued(name: str, left, right):
-    """The doubling's products (`recurrence_algebra.doubled`'s issuer) as Dew's (`float32_matmul`)."""
-    del name
+    """A derived scan's products as Dew's (`float32_matmul`), the doubling's among them
+    (`recurrence_algebra.doubled`'s issuer); `transfer_decay` a transfer's columns scaled, `right * left`;
+    a readout (`carry.EMIT_ROLES`) the portable math's (`recurrence_algebra.remembered` by its issuer), its
+    gradient in what it reads summed from the chunk's last token (row 4466: from the first, the entering
+    memory's gradient 1.9 times the portable math's distance from float64)."""
+    if name == "transfer_decay":
+        return right * left[None, :]
+    if name in carry.EMIT_ROLES:
+        from dew.nn.kernels import recurrence_algebra
+
+        return recurrence_algebra.remembered(left, right, recurrence_algebra.portable, name)
     return float32_matmul(left, right)
+
+
+def _inverse_cotangent(lower, d_lower):
+    """The overlaps' cotangent of `(I + overlaps)^-1 - I` (`lower`) from its own: with `X = I + lower`,
+    `-X^T d_lower X^T` below the diagonal."""
+    back = _applied(lower.T, d_lower)
+    return _below(-_applied(lower, back.T).T)
 
 
 def _applied(lower, given):
@@ -567,20 +753,20 @@ def _lowered_rule() -> Callable:
 
     def backward(lower, operands, d_lower):
         del operands
-        back = _applied(lower.T, d_lower)
-        return (_below(-_applied(lower, back.T).T),)
+        return (_inverse_cotangent(lower, d_lower),)
 
     return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
-        generation.linear_tangent(forward, backward, _doubled))
+        generation.linear_tangent(forward, backward, _doubled, kind=Protected()))
 
 
 def _compensated(values, *, reverse: bool = False, restarts=None) -> tuple[jax.Array, jax.Array]:
     """`values`' inclusive prefix sums along their first axis (suffix sums where `reverse`), each a float and
     its rounding error (a compensated scan), each restarting where `restarts` holds (a segmented scan: an
-    element of it the first of its segment's)."""
+    element of it the first of its segment's). Each pair joined renormalized (`compensated_add`), the hand
+    math's sum: a pair left unrenormalized held a residual that a product XLA:CPU fused into its sum (a
+    rated decay's `rate * beta`, an FMA) had left wrong, 1.5e-5 off a 16-token prefix (row 1966)."""
     def combine(left, right):
-        total, error = two_sum(left[0], right[0])
-        summed = total, error + left[1] + right[1]
+        summed = compensated_add(left[:2], right[:2])
         if restarts is None:
             return summed
         # Where the right part restarts, the left's sums are not its segment's.
@@ -676,7 +862,8 @@ def _decays_rule(base2: bool) -> Callable:
         return _decays_backward(base2, decays, cotangents)
 
     return contracted("test_the_derived_delta_rule_chunks_hold_their_orders")(
-        generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2)))
+        generation.linear_tangent(forward, backward, functools.partial(_decays_value, base2=base2),
+                                  kind=Protected()))
 
 
 def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
@@ -689,6 +876,12 @@ def _decays_backward(base2: bool, decays: _Decays, cotangents: _Decays):
     entering = cotangents.entering * decays.entering
     to_last = cotangents.to_last * decays.to_last
     between = cotangents.between * decays.between
+    if between.shape[-1] > 1:
+        # A decay a key's pairs' terms `[C, C, K]` formed once, ahead of their scans: fused into the first,
+        # XLA:CPU formed them again in its every step, Kimi delta attention's derived forward and backward
+        # 14.7 s against 1.24 at 2 x 1024 tokens, 4 heads of 128 (row 1966's probe at ea6a839c5ba, a CPU
+        # host); a decay a head's, its pairs a key's alone, ran 147 ms fused against 161 so.
+        between = lax.optimization_barrier(between)
     from_on = _scanned(entering, reverse=True)
     before = _earlier(_scanned(to_last))
     # Rectangle sums: each row's terms left of a column, then the rows from a column's own row down.

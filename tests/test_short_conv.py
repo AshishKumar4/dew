@@ -24,13 +24,16 @@ from reference_error import (
     with_gradients,
     within,
 )
+from test_recurrence_chunk import ROUTES, on_route
 
 from dew.nn.kernels import generation, short_conv
 from dew.nn.linear import causal_conv1d, xla_conv1d
 
 pytestmark = pytest.mark.kernel
 
-DELTA = ((32, 16), (32, 16), (32, None))
+DELTA = ((128, 128), (128, 128), (128, None))
+"""A delta rule's pieces at a warpgroup's widths (`templates.recurrence.conv.fits`): queries and keys of one
+128-wide head each, l2-normalised, and values."""
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
@@ -38,6 +41,14 @@ REFUSED_SEEDS = 8
 """The declared draws of a conv the kernels do not take against XLA's conv (check 1), sized by `seeds_for`
 paired with the kernels' arm on armada: the most any of its 16-bit geometries took."""
 """A delta rule's queries, keys and values on two 16-wide heads: the keys and queries normalised."""
+
+
+def training_draw(length: int, parts, dtype, seed: int):
+    """A training shape's draw of two rows by seed: the projection, the taps and the pieces' cotangents
+    (`operands`, `cotangents`). Two rows: a row's tokens are the distances' terms, and the 0.8b's eight held
+    28 GiB of an H100 at the float64 truth."""
+    x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
+    return x, weights, cotangents(x, parts, dtype, seed=[1725, seed])
 
 
 def operands(batch, length, parts, *, taps=4, dtype=jnp.bfloat16, bias=False, valid=False, seed=0):
@@ -101,7 +112,7 @@ def test_the_kernels_take_forward_mode_however_a_caller_stages_them(staged):
     (`short_conv.conv`'s `generation.linear_tangent`), on par with XLA's from float64 (check 1). Its
     selector once routed by whether it saw a JVP tracer, which a remat hides, and there the kernels' custom
     VJP raised (row 2395)."""
-    parts = ((64, 32), (64, None))
+    parts = ((128, 128), (128, None))
 
     def draw(seed):
         x, weights, shift, _ = operands(1, 40, parts, dtype=jnp.float32, bias=True, seed=seed)
@@ -154,18 +165,26 @@ def row_truth(x, weights, parts, grads, segments):
     ((2, 37), DELTA, 4, False, False, False),
     ((2, 37), DELTA, 4, False, True, False),
     ((2, 37), DELTA, 4, False, False, True),
-    ((1, 700), ((64, None),), 4, True, False, False),
-    ((1, 700), ((64, None),), 4, True, False, True),
-    ((2, 19), ((32, 32), (32, 32), (64, None)), 3, True, True, False),
-    ((2, 19), ((32, 32), (32, 32), (64, None)), 3, True, True, True),
-    ((2, 9), ((48, None),), 2, True, False, False),
+    ((1, 700), ((128, None),), 4, True, False, False),
+    ((1, 700), ((128, None),), 4, True, False, True),
+    ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, False),
+    ((2, 19), ((128, 128), (128, 128), (256, None)), 3, True, True, True),
+    ((2, 9), ((128, None),), 2, True, False, False),
 ])
-def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
+@pytest.mark.parametrize("route", ROUTES)
+def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed, route):
     """Each piece and the gradients of the projection, the taps and the bias, as XLA computes them, at
     lengths that leave runs and a tile partly past the end, and over packed documents that start inside a
     window: bf16 pieces and the projection's bf16 gradient rounded where XLA rounds them, and every fp32 leaf
     (a call's of fp32 pieces, and the taps' and bias's gradients, fp32 sums over every token whatever the
-    pieces' dtype) on par with XLA's from float64 over seeded draws (check 1)."""
+    pieces' dtype) on par with XLA's from float64 over seeded draws (check 1), on each route's bundle
+    (`on_route`)."""
+    with on_route(route):
+        computes_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed)
+
+
+def computes_causal_conv1d(dtype, out, shape, parts, taps, bias, valid, packed):
+    """`test_the_kernels_compute_causal_conv1d`'s checks on the route in force."""
     segments = documents(*shape) if packed else None
     _, _, _, kept = operands(*shape, parts, taps=taps, dtype=dtype, bias=bias, valid=valid)
 
@@ -280,9 +299,7 @@ def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed)
     (_, length), parts = CONV_SHAPES[model]
     segments = documents(2, length) if packed else None
 
-    def draw(seed):
-        x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
-        return x, weights, cotangents(x, parts, dtype, seed=[1725, seed])
+    draw = functools.partial(training_draw, length, parts, dtype)
 
     def conv(fn):
         def pieces_and_gradients(x, weights, grads):
@@ -291,6 +308,7 @@ def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed)
             return out, found[:2]
         return pieces_and_gradients
 
+    @as_given
     def exact(x, weights, grads):
         # A row at a time on the host (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past
         # a packed job's 8.9 GiB share where main's GPU tier ran them (row 1724,
@@ -332,3 +350,52 @@ def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
     rows, whole = PartitionSpec(axis), PartitionSpec()
     assert_runs_per_shard(gradients, draw, [rows, whole, whole, rows, rows, rows, rows, rows], mesh,
                           f"conv split over {axis}", seeds=SHARDED_SEEDS, truth_fn=exact)
+
+
+@pytest.mark.parametrize("taps", [1, 2, 4])
+def test_a_document_that_enters_a_history_convolves_as_if_it_followed_it(taps):
+    """`entered_conv1d` of packed documents, each entering one of the histories `held` holds or none, gives
+    each document's tokens what `xla_conv1d` gives them where the history stands right before the document
+    in a row of its own (check 1); a document entering none, what it gives a document alone; padding none.
+    The histories are the documents' own last tokens as `document_tails` reads them, zeros in front of a
+    document shorter than the conv reads behind."""
+    from dew.nn.linear import document_tails, entered_conv1d
+
+    channels, width = 6, taps - 1
+    lengths = [(5, 0), (3, 1), (1, 1), (2, 0), (4, 4)]
+    tokens = sum(length for length, _ in lengths)
+    documents = np.concatenate([*(np.full(length, number, np.int32)
+                                  for number, (length, _) in enumerate(lengths, start=1)),
+                                np.zeros(2, np.int32)])
+    valid = documents > 0
+    entered = jnp.asarray([[slot for _, slot in lengths]], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal((1, tokens + 2, channels)), jnp.float32),
+                jnp.asarray(rng.standard_normal((channels, taps)), jnp.float32),
+                jnp.asarray(rng.standard_normal((1, len(lengths), width, channels)), jnp.float32))
+
+    def entering(x, kernel, held):
+        return entered_conv1d(x, kernel, valid[None], documents[None], held, entered)
+
+    def apart(x, kernel, held):
+        pieces, begin = [], 0
+        for length, slot in lengths:
+            behind = held[:, slot - 1] if slot else jnp.zeros((1, width, channels), x.dtype)
+            pieces.append(xla_conv1d(jnp.concatenate([behind, x[:, begin:begin + length]], axis=1),
+                                     kernel)[:, width:])
+            begin += length
+        return jnp.concatenate([*pieces, jnp.zeros((1, 2, channels), x.dtype)], axis=1)
+
+    assert_as_exact(jax.jit(entering), jax.jit(apart), draw, f"documents entering histories, {taps} taps",
+                    seeds=FP32_SEEDS)
+    x, _, _ = draw(0)
+    tails = np.asarray(document_tails(x, valid[None], documents[None], width, len(lengths)))
+    begin = 0
+    for number, (length, _) in enumerate(lengths):
+        expected = np.zeros((width, channels), np.float32)
+        kept = min(length, width)
+        expected[width - kept:] = np.asarray(x[0, begin + length - kept:begin + length])
+        np.testing.assert_array_equal(tails[0, number], expected, err_msg=str(number))
+        begin += length

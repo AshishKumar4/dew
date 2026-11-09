@@ -30,11 +30,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
-from ssd_support import ssd_orbit, stepwise_scan
+from ssd_support import segment_sum, ssd_orbit, stepwise_scan
 
 from dew.algebra.scan import RESET_DECAY
 from dew.nn.kernels.recurrence_chunk import ssd_operands
-from dew.nn.kernels.ssd import ssd_chunk_scan
+from dew.nn.kernels.ssd import _chunk_scan
 
 pytestmark = pytest.mark.kernel
 
@@ -72,19 +72,6 @@ def mixer_operands(shape, seed: int = 0):
             jax.random.normal(keys[4], (batch, steps, groups, state_size), jnp.float32),
             jax.random.normal(keys[5], (heads,), jnp.float32),
             jax.random.normal(keys[6], (batch, heads, head_dim, state_size), jnp.float32))
-
-
-def segment_sum(x):
-    """`segment_sum` (modeling_mamba2.py:73-90): over the last axis of `x`,
-    `out[..., i, j] = sum_{j < k <= i} x[..., k]` on and below the diagonal,
-    `-inf` above, as the reference's masked cumulative sum rather than a
-    difference of cumulative sums, so exp of it is the same numbers."""
-    size = x.shape[-1]
-    strict = jnp.tril(jnp.ones((size, size), jnp.bool_), -1)
-    expanded = jnp.where(strict, jnp.broadcast_to(x[..., :, None], (*x.shape, size)), 0.0)
-    summed = jnp.cumsum(expanded, axis=-2)
-    inclusive = jnp.tril(jnp.ones((size, size), jnp.bool_))
-    return jnp.where(inclusive, summed, -jnp.inf)
 
 
 def _chunk_writes(x_c, B_c, a_c):
@@ -162,7 +149,7 @@ def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
     XLA's, and XLA's independently checked float64 truth. The kernel and the scan, two Dew paths,
     compile without YNNPACK fusions on the CPU lane (`without_ynn`)."""
     mine = without_ynn(lambda operands, seeded: evaluated(
-        lambda *o: ssd_chunk_scan(*o, chunk_size, platform), operands, seeded))
+        lambda *o: _chunk_scan(*o, chunk_size, platform), operands, seeded))
     xla = without_ynn(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
@@ -313,7 +300,7 @@ def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, 
     operands, seeded = case_draw(reference, kind, case)(0)
     chunk_size = case[0] if kind == "fixture" else case[1]
     run = jax.jit(lambda inputs, cotangents: evaluated(
-        lambda *args: ssd_chunk_scan(*args, chunk_size, "tpu"), inputs, cotangents))
+        lambda *args: _chunk_scan(*args, chunk_size, "tpu"), inputs, cotangents))
     actual = jax.tree.map(np.asarray, run(operands, seeded))
     expected = {"output": operands[0], "final": operands[-1],
                 **dict(zip(("x", "B", "C", "A dt", "state"), operands, strict=True))}
@@ -337,3 +324,13 @@ def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, 
                                           without_state["output"][row, prefix:])
             np.testing.assert_array_equal(actual["final"][row], without_state["final"][row])
             np.testing.assert_array_equal(final_only["state"][row], np.zeros_like(final_only["state"][row]))
+
+
+@pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")
+def test_the_recurrence_matrix_holds_on_this_tpu():
+    """The recurrence's check-1 matrix (tests/kernel_matrix.py) on a TPU: the rated scan's TPU kernel's
+    training step on par with the portable math's, each cell on its own TPU (a v6e or a v5e)."""
+    import recurrence_matrix
+    from gpu_flow import cells_of, run_cells
+
+    run_cells(cells_of(recurrence_matrix.a_recurrences_training_step_on_a_tpu_is_on_par))

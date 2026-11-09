@@ -377,19 +377,11 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
     target's float64 run gives the first token times the second's given it, at the sampling's temperature,
     over every pair of a 13-token vocabulary (the sampling gate). The draft is the model's own prediction
     depth, untrained, so it proposes off the target's law and the acceptance has to undo it."""
-    from reference_error import widened
     from sampling_gate import assert_draws_as_declared
 
     model = predictor()
-    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
-    params = jax.jit(model.init)(jax.random.key(0), prompt)
+    prompt, params, chances = pair_law(model)
     vocab = model.vocab_size
-    with jax.enable_x64(new_val=True):
-        wide, wide_params = model.clone(dtype=jnp.float64), widened(params)
-        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1] / LAW_TEMPERATURE)
-        pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
-        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
-        chances = np.asarray(first[:, None] * second).reshape(-1)
 
     rows = jnp.broadcast_to(prompt, (LAW_ROWS, 3))
 
@@ -400,3 +392,20 @@ def test_a_blocks_tokens_are_drawn_as_the_target_draws_them():
         return np.bincount(tokens[:, 0] * vocab + tokens[:, 1], minlength=vocab * vocab)
 
     assert_draws_as_declared(counts, chances, "a speculative block's first two tokens", seeds=LAW_SEEDS)
+
+
+def pair_law(model):
+    """A prompt of three tokens, `model`'s parameters drawn over it, and the chance of each pair of the
+    two tokens after it (`[V * V]`, the first's id times V plus the second's) at `LAW_TEMPERATURE`, from
+    the model's float64 run: the law a speculative strategy's first two draws are held to."""
+    from reference_error import widened
+
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    params = jax.jit(model.init)(jax.random.key(0), prompt)
+    vocab = model.vocab_size
+    with jax.enable_x64(new_val=True):
+        wide, wide_params = model.clone(dtype=jnp.float64), widened(params)
+        first = jax.nn.softmax(wide.apply(wide_params, prompt)[0, -1] / LAW_TEMPERATURE)
+        pairs = jnp.concatenate([jnp.broadcast_to(prompt, (vocab, 3)), jnp.arange(vocab)[:, None]], axis=1)
+        second = jax.nn.softmax(wide.apply(wide_params, pairs)[:, -1] / LAW_TEMPERATURE, axis=-1)
+        return prompt, params, np.asarray(first[:, None] * second).reshape(-1)

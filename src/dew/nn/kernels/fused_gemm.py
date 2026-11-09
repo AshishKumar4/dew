@@ -34,20 +34,25 @@ kernels take, the reference a fused route is checked against, and 'fused' raises
 take it rather than run XLA (`selection.KernelRefused`).
 """
 
+import contextvars
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
+from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
-from dew import algebra
+from dew import _cache, algebra
+from dew.algebra import cost as algebra_cost
 from dew.nn import programs
-from dew.nn.kernels import gemm
-from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
+from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
+from dew.nn.kernels.templates import cost
 
 FUSION_ROW = 'ledger 1295'
 """The fusion analysis's limits."""
@@ -60,42 +65,199 @@ AXES = ('rows', 'columns')
 def fusible_gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
                  transpose_rhs: bool = False, interpret_on_cpu: bool = False) -> jax.Array:
     """`gemm.gemm`'s fp32 product of each group's rows of `lhs` and its matrix of `rhs`, its consumers
-    fused into the epilogue under `fuser.fuse` (the module's docstring)."""
+    fused into the epilogue under `fuser.fuse` (the module's docstring): `product` declared fp32."""
+    return product(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
+                   interpret_on_cpu=interpret_on_cpu)
+
+
+def product(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *,
+            transpose_rhs: bool = False, precision: PrecisionLike = None, out_dtype=None,
+            interpret_on_cpu: bool = False) -> jax.Array:
+    """The fusible product of each group's rows of `lhs` and its matrix of `rhs` (one matrix where
+    `group_sizes` is None, a dense dot), declared as the dot it stands for declares itself: its `precision`
+    (`gemm.gemm`'s) and its result dtype (`out_dtype`, `lhs`'s where None; a `preferred_element_type`'s).
+    Its products sum in fp32 at least and round once to `out_dtype`, the dot's own rounding, so its
+    consumers, fused into the template's epilogue under `fuser.fuse`, read the product exactly as the
+    program they came from does: the accumulator tile rounded to `out_dtype`, their first operation."""
+    declared = (precision, jnp.dtype(lhs.dtype if out_dtype is None else out_dtype))
+    if not all(jnp.issubdtype(operand.dtype, jnp.inexact) for operand in (lhs, rhs)):
+        # An integer product (a quantized dot's) is XLA's own, nothing fused: the template sums floating
+        # products alone, so a region of one has no stage to analyse or price (`analysis`).
+        if group_sizes is None:
+            return jax.lax.dot_general(lhs, rhs, (((1,), (1 if transpose_rhs else 0,)), ((), ())),
+                                       precision=precision, preferred_element_type=declared[1])
+        matrices = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
+        return jax.lax.ragged_dot(lhs, matrices, group_sizes, precision=precision,
+                                  preferred_element_type=declared[1])
+    if (made := _FUSIBLES.get()) is not None:
+        made.append(declared)
     fusible = fuser.fusible(output_fusion_prefix=True)(
-        functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None))
+        functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None, declared))
     return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
 
 
-def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions):
+def fused(region, *inputs):
+    """`region(*inputs)`, a program's neighbourhood of one product written with `product` in place of its
+    dot, its producer and consumers fused into the template's prologue and epilogue where the kernels take
+    them tile by tile (`fuser.fuse`): the one entry a call site or a pass fuses a region through, so each
+    stage is its selector's decision and report (`EPILOGUE`, `PROLOGUE`). A region whose products are all
+    XLA's own (integer ones) has nothing to fuse and runs as written."""
+    made: list = []
+    token = _FUSIBLES.set(made)
+    try:
+        jax.eval_shape(region, *inputs)
+    finally:
+        _FUSIBLES.reset(token)
+    return fuser.fuse(region)(*inputs) if made else region(*inputs)
+
+
+_FUSIBLES: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gemm_fusibles', default=None)
+"""The fusible products a region makes while `fused` traces it."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Analysis:
+    """What `fused` makes of a region (`analysis`): each stage's route as its selector reported it
+    (`generation.Route`: the kernel it takes, its refusal's reason where the kernels cannot take it
+    tile by tile), and the product's launch's; and the region's seconds both ways on the target
+    (`priced`): fused, its consumers in the launch's epilogue, and unfused, the product's launch then
+    XLA's fusion of its consumers. None where the region has no consumer, or the target states no rate."""
+
+    epilogue: generation.Route | None
+    prologue: generation.Route | None
+    launch: generation.Route | None
+    fused_seconds: float | None = None
+    unfused_seconds: float | None = None
+    refused: str | None = None
+    """Why a kernel the call names (`generation.chosen`) refuses the region, as `fused` would raise
+    (`selection.KernelRefused`); None where nothing named refuses."""
+
+
+def analysis(region, *inputs) -> Analysis:
+    """`fused(region, *inputs)` traced for its shapes alone, nothing run: what its selectors decide, and
+    its two prices (`priced`), so a pass fuses where the fused one is the less and no stage refused."""
+    priced_calls: list = []
+    token = _PRICED.set(priced_calls)
+    try:
+        # Its routes are its own, no caller's report's: what a pass only weighs is no decision a call took.
+        with _cache.KERNEL_ROUTES(()), generation.routes() as found:
+            jax.eval_shape(functools.partial(fused, region), *inputs)
+    except KernelRefused as refusal:
+        return Analysis(None, None, None, refused=str(refusal))
+    finally:
+        _PRICED.reset(token)
+
+    def last(choice):
+        return next((route for route in reversed(found) if route.choice == choice), None)
+    seconds = priced(priced_calls[-1], generation.gpu_target()) if priced_calls else (None, None)
+    return Analysis(last(EPILOGUE.choice), last(PROLOGUE.choice), last('grouped_matmul'), *seconds)
+
+
+@dataclasses.dataclass(frozen=True)
+class Region:
+    """A traced region's product and consumers as `priced` reads them: the product's extents (rows, depth,
+    width), its operands' and its result's dtypes, the consumers' elementwise work on the whole product
+    (`_chain`), and the bytes of the arrays they capture and of their outputs."""
+
+    rows: int
+    depth: int
+    width: int
+    operands: jnp.dtype
+    result: jnp.dtype
+    chain: cost.Work
+    captured_bytes: float
+    output_bytes: float
+
+
+_PRICED: contextvars.ContextVar[list | None] = contextvars.ContextVar('fused_gemm_priced', default=None)
+"""The regions `_product` traces while `analysis` collects them."""
+
+
+def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, float | None]:
+    """`region`'s seconds on `target`, fused and unfused, from one model (`templates.cost`): the launch's
+    units overlapped at the whole device's rates (its products in their tensor mode, its operands, captured
+    arrays and outputs in device memory), plus its fixed launch (`GpuTarget.launch_seconds`), with its
+    consumers' work in it; and the plain launch writing the product at its result dtype, then XLA's fusion
+    of the consumers reading it (`algebra.cost.fused`). None where the target states no tensor rate."""
+    rates = cost.rates(target, device=True)
+    if rates[0] is None:
+        return None, None
+    product = algebra_cost.product_work(region.rows, region.depth, region.width, dtype=region.operands)
+    operands = (region.rows + region.width) * region.depth * jnp.dtype(region.operands).itemsize
+    written = region.rows * region.width * jnp.dtype(region.result).itemsize
+    launch = target.launch_seconds or 0.0
+
+    def launched(work: cost.Work) -> float:
+        return max(cost.units(work, rates)[0]) + launch
+
+    fused_seconds = launched(product + region.chain + cost.Work(
+        device_bytes=operands + region.captured_bytes + region.output_bytes))
+    chain = region.chain + cost.Work(device_bytes=written + region.captured_bytes + region.output_bytes,
+                                     kernels=1.0)
+    unfused_seconds = (launched(product + cost.Work(device_bytes=operands + written))
+                       + algebra_cost.fused(target)(chain))
+    return fused_seconds, unfused_seconds
+
+
+TRANSCENDENTAL = frozenset({'exp', 'exp2', 'log', 'log1p', 'tanh', 'logistic', 'erf', 'sin', 'cos', 'pow',
+                            'rsqrt', 'sqrt'})
+"""The consumers' operations the special-function units take (`_chain`)."""
+
+
+def _chain(consumer, values, acc) -> cost.Work:
+    """The consumers' elementwise work on the whole product: each equation of their program an operation an
+    element of its result, a transcendental's on the special-function units, a conversion's apart."""
+    closed = jax.make_jaxpr(consumer)(values, acc)
+    work = cost.Work()
+    for eqn in closed.jaxpr.eqns:
+        elements = float(sum(math.prod(shape) for var in eqn.outvars
+                             if (shape := getattr(var.aval, 'shape', None)) is not None))
+        name = eqn.primitive.name
+        work = work + (cost.Work(exponentials=elements) if name in TRANSCENDENTAL
+                       else cost.Work(conversions=elements) if name == 'convert_element_type'
+                       else cost.Work(operations=elements))
+    return work
+
+
+def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, declared: tuple, *fusions):
     """The fusible product: its operands from their fusions, its consumers (`fusions`' last) as the
-    template's epilogue where the kernels take them tile by tile, after its product in XLA otherwise."""
+    template's epilogue where the kernels take them tile by tile, after its product in XLA otherwise,
+    reading it as `declared` (its precision and result dtype, `product`)."""
+    precision, out_dtype = declared
     *operand_fusions, out_fusion = fusions
     lhs_fusion, *rest_fusions = operand_fusions
     lhs, prologue = _prologue(lhs_fusion)
     rhs, *rest = (fusion() for fusion in rest_fusions)
     group_sizes = None if dense else rest[0]
     if out_fusion is None:
-        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
-                             interpret_on_cpu=interpret_on_cpu, **prologue)
+        return gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                         precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
-    acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
+    acc = jax.ShapeDtypeStruct((lhs.shape[0], width), out_dtype)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
+    if (collected := _PRICED.get()) is not None:
+        depth = lhs.shape[-1]
+        outs = jax.tree.leaves(jax.eval_shape(consumer, values, acc))
+        collected.append(Region(
+            lhs.shape[0], depth, width, jnp.dtype(lhs.dtype), jnp.dtype(out_dtype),
+            _chain(consumer, values, acc), float(sum(leaf.size * leaf.dtype.itemsize for leaf in leaves)),
+            float(sum(math.prod(out.shape) * out.dtype.itemsize for out in outs))))
     axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
-        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
-                               interpret_on_cpu=interpret_on_cpu, **prologue)
+        summed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=out_dtype,
+                           precision=precision, interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
-    epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
+    epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
     consumed = gemm.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
-                             epilogue_operands=tuple(zip(leaves, axes, strict=True)),
-                             out_dtype=dtypes[0], out_dtypes=dtypes if several else None,
-                             interpret_on_cpu=interpret_on_cpu, **prologue)
+                         epilogue_operands=tuple(zip(leaves, axes, strict=True)),
+                         out_dtype=dtypes[0], out_dtypes=dtypes if several else None, precision=precision,
+                         interpret_on_cpu=interpret_on_cpu, **prologue)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
 
 
@@ -401,7 +563,7 @@ def _axes(consumer, values, acc) -> tuple | Refusal:
                     'value_off_axes', f"a captured {leaf.shape} array follows no launch axis tile by tile")
             named.append(AXES[axis])
         axes.append(tuple(named))
-    if _reads_position(tiled, value_specs, values, probe):
+    if _reads_position(tiled, value_specs, values, probe, acc.dtype):
         return Refusal('reads_position', "the consumer reads its tile's position")
     return tuple(axes)
 
@@ -462,25 +624,27 @@ def _is_spec(node) -> bool:
     return isinstance(node, pl.BlockSpec)
 
 
-def _reads_position(tiled, value_specs, values, probe) -> bool:
+def _reads_position(tiled, value_specs, values, probe, dtype) -> bool:
     """Whether the tiled consumer's outputs depend on the program ids it is given (an iota, a position
-    mask): the template's kernels place ragged tiles where no grid index says."""
+    mask): the template's kernels place ragged tiles where no grid index says. Its product tile is of
+    `dtype`, the product's declared one (`product`)."""
     tiles = jax.tree.map(lambda leaf, leaf_spec: jax.ShapeDtypeStruct(leaf_spec.block_shape, leaf.dtype),
                          values, value_specs, is_leaf=_is_spec)
-    tile = jax.ShapeDtypeStruct(probe, jnp.float32)
+    tile = jax.ShapeDtypeStruct(probe, dtype)
     closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
         (jnp.int32(0), jnp.int32(0)), tiles, tile)
     needed = gemm._needed(closed.jaxpr, closed.jaxpr.outvars)
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
 
-def _tiled(consumer, treedef, value_types: tuple, out_treedef, whole: tuple, acc, *tiles):
-    """The consumer on one accumulator tile of `acc.shape` and the captured arrays' tiles beside it: its
-    block spec pulled at that block of the `whole` product it was traced at, so the same function serves
-    every kernel tile and XLA's whole array."""
+def _tiled(consumer, treedef, value_types: tuple, out_treedef, whole: jax.ShapeDtypeStruct, acc, *tiles):
+    """The consumer on one fp32 accumulator tile of `acc.shape`, rounded first to the product's declared
+    dtype (`whole`'s, the product it was traced at), and the captured arrays' tiles beside it: its block
+    spec pulled at that block of `whole`, so the same function serves every kernel tile and XLA's whole
+    array."""
     values = jax.tree.unflatten(treedef, [jax.ShapeDtypeStruct(t.shape, t.dtype) for t in value_types])
-    whole_acc = jax.ShapeDtypeStruct(whole, jnp.float32)
-    tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, whole_acc, acc.shape),
-                                        grid_len=2)(values, whole_acc)
-    outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)), acc)
+    tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, whole, acc.shape),
+                                        grid_len=2)(values, whole)
+    outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)),
+                 acc.astype(whole.dtype))
     return tuple(jax.tree.leaves(outs)) if out_treedef.num_leaves > 1 else jax.tree.leaves(outs)[0]

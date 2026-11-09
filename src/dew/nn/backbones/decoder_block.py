@@ -57,7 +57,7 @@ from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
 from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
-from ..precision import float32_dot_general, scaled
+from ..precision import float32_dot_general, projection_role, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
 from ..sharding import RESIDUAL, constrain, declared
 
@@ -163,9 +163,19 @@ class SeamNorm(Protocol):
     """A pre-norm that owns a block's residual seam (`dew.nn.norms.RMSNorm`):
     it adds a sublayer's branch to the stream it reads and hands that stream
     back beside the norm, `(x + branch, normed)`, so one fused pass takes the
-    add, the norm and, in reverse, the stream's own cotangent."""
+    add, the norm and, in reverse, the stream's own cotangent; called alone, it
+    reads its input's axes (`axes`) as the seam does."""
 
     def seam(self, x, branch=None, *, axes=None) -> tuple[jax.Array, jax.Array]: ...
+
+    def __call__(self, x, *, axes=None) -> jax.Array: ...
+
+
+def residual_normed(norm: Callable[..., jax.Array], x: jax.Array) -> jax.Array:
+    """`norm` of the residual-shaped `x`: a seam norm's input placed as the stream is (`RESIDUAL`), which its
+    fused kernel reads to run on each shard of an automatic mesh, where an unplaced call is XLA's (row 822);
+    another norm as it is."""
+    return norm(x, axes=RESIDUAL) if isinstance(norm, SeamNorm) else norm(x)
 
 
 @runtime_checkable
@@ -1005,7 +1015,7 @@ class DecoderBlock(nn.Module):
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
             mixer_routes, None if per_layer_input is None else per_layer_input.depth)
         if self.wiring.output_norms:
-            mixed = self.attention_output_norm(mixed)
+            mixed = residual_normed(self.attention_output_norm, mixed)
         attention_branch = self._branch(mixed, train, "attention")
         joined = self._joined(state)
         if not (self.wiring.parallel_residual or joined):
@@ -1026,15 +1036,16 @@ class DecoderBlock(nn.Module):
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
                 if self.wiring.normed_residual:
                     state = state._replace(x=mlp_input)
-            hidden = self.mlp(mlp_input,
-                              **self._feedforward_inputs(attention_metadata, mlp_input.shape),
-                              **({} if self.parallel is not None else routes),
-                              **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
-                                 else {}))
-            if self.parallel is not None:
-                hidden = self.moe(read, hidden, **routes)
+            with projection_role("mlp"):  # The feed-forward's projections, as a recipe takes them by role.
+                hidden = self.mlp(mlp_input,
+                                  **self._feedforward_inputs(attention_metadata, mlp_input.shape),
+                                  **({} if self.parallel is not None else routes),
+                                  **({"train": train} if isinstance(self.mlp, ReadsTrain)
+                                     and self.mlp.reads_train else {}))
+                if self.parallel is not None:
+                    hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
-                hidden = self.mlp_output_norm(hidden)
+                hidden = residual_normed(self.mlp_output_norm, hidden)
             mlp_branch = self._branch(hidden, train, "mlp")
             if self.wiring.parallel_residual:
                 # GPT-NeoX adds the two branches first, then the residual;
@@ -1056,7 +1067,13 @@ class DecoderBlock(nn.Module):
                 raise ValueError(f"this layer's mixer ({type(self.self_attn).__name__}) has no attention of "
                                  "its own for its cross-attention block to read a context through")
             layer = {"layer": LayerReads(self._attention_input, self.self_attn, progress)}
-        cross = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
+        joined = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
+
+        def cross(*arguments, **options):
+            # Its attention's projections are a mixer's, its feed-forward's a feed-forward's.
+            with projection_role("mixer"):
+                return joined(*arguments, **options)
+
         if isinstance(state, _Plain):
             return state._replace(x=constrain(cross(state.x, context), RESIDUAL))
         if isinstance(state, _Streams):
@@ -1289,17 +1306,18 @@ class DecoderBlock(nn.Module):
         if unread:
             raise ValueError(f"{type(self.self_attn).__name__} does not read the call's {', '.join(unread)}, "
                              "and would run it as if unset; give this layer a mixer that reads them")
-        return self.self_attn(
-            x,
-            call,
-            **routes,
-            **(
-                {"train": train}
-                if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
-                else {}
-            ),
-            **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
-        )
+        with projection_role("mixer"):  # The mixer's projections, as a recipe takes them by role.
+            return self.self_attn(
+                x,
+                call,
+                **routes,
+                **(
+                    {"train": train}
+                    if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
+                    else {}
+                ),
+                **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
+            )
 
     def _feedforward_inputs(self, attention_metadata, shape: tuple[int, ...]) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
@@ -1345,7 +1363,7 @@ class DecoderBlock(nn.Module):
         back and normed."""
         gated = gated_product(self.gate_activation)(self.per_layer_input_gate(x), per_layer_input)
         projected = self.per_layer_projection(gated)
-        return self.post_per_layer_input_norm(projected)
+        return residual_normed(self.post_per_layer_input_norm, projected)
 
 
 class MTPBlock(nn.Module):
@@ -1453,7 +1471,7 @@ class MTPBlock(nn.Module):
         streams = predicted
         if self.hyper_connections is not None:
             predicted = self.hc_head(predicted)
-        normalized = self.final_norm(predicted)
+        normalized = residual_normed(self.final_norm, predicted)
         return normalized, normalized if self.hyper_connections is None else streams
 
 

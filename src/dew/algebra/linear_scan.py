@@ -121,6 +121,10 @@ class Token(Expr):
     """`vector^T matrix`, the keys contracted: a vector along the values."""
 
     @classmethod
+    def applied(cls, matrix: Token, vector: Token) -> Token: ...
+    """`matrix vector`, the values contracted: a vector along the keys."""
+
+    @classmethod
     def exp(cls, value: Token) -> Token: ...
 
     @classmethod
@@ -145,6 +149,10 @@ class Affine(Expr):
     @classmethod
     def readout(cls, reader: Token, free: Token) -> Affine: ...
     """`reader^T h + free`."""
+
+    @classmethod
+    def applied(cls, reader: Token, free: Token) -> Affine: ...
+    """`h reader + free`: the state read along its values."""
 
 
 @function(cost=2**40)
@@ -175,6 +183,10 @@ def _token_rules():
         birewrite(Token.read(Token.scalar(x).times(c), m)).to(Token.scalar(x).times(Token.read(c, m))),
         birewrite(Token.read(c, Token.column(a).times(m))).to(Token.read(c.times(a), m)),
         birewrite(Token.read(c, Token.row(a).times(m))).to(a.times(Token.read(c, m))),
+        birewrite(Token.applied(Token.scalar(x).times(m), c)).to(Token.scalar(x).times(Token.applied(m, c))),
+        birewrite(Token.applied(m, Token.scalar(x).times(c))).to(Token.scalar(x).times(Token.applied(m, c))),
+        birewrite(Token.applied(Token.row(a).times(m), c)).to(Token.applied(m, c.times(a))),
+        birewrite(Token.applied(Token.column(a).times(m), c)).to(a.times(Token.applied(m, c))),
     ]
     for wrap in (Token.scalar, Token.column, Token.row):
         found += [birewrite(wrap(a.times(b))).to(wrap(a).times(wrap(b))),
@@ -187,7 +199,7 @@ def _token_rules():
     found += [rule(eq(t).to(made(a)), free(a)).then(free(t))
               for made in (Token.scalar, Token.column, Token.row, Token.exp, Token.exp2)]
     found += [rule(eq(t).to(made), free(a), free(b)).then(free(t))
-              for made in (a.times(b), a.plus(b), Token.read(a, b))]
+              for made in (a.times(b), a.plus(b), Token.read(a, b), Token.applied(a, b))]
     for base2, power in ((0, Token.exp), (1, Token.exp2)):
         for per_key, wrap in ((0, Token.scalar), (1, Token.column)):
             decayed = wrap(power(z)).times(h)
@@ -202,7 +214,11 @@ def _token_rules():
     found += [rule(eq(t).to(Token.read(a, h)), free(a)).then(
                   union(form_of(t)).with_(Affine.readout(a, Token.zero()))),
               rule(eq(t).to(Token.read(a, h).plus(b)), free(a), free(b)).then(
-                  union(form_of(t)).with_(Affine.readout(a, b)))]
+                  union(form_of(t)).with_(Affine.readout(a, b))),
+              rule(eq(t).to(Token.applied(h, a)), free(a)).then(
+                  union(form_of(t)).with_(Affine.applied(a, Token.zero()))),
+              rule(eq(t).to(Token.applied(h, a).plus(b)), free(a), free(b)).then(
+                  union(form_of(t)).with_(Affine.applied(a, b)))]
     return ruleset(*found, name="token_affine")
 
 
@@ -211,8 +227,9 @@ class Parts:
     """A token's update and readout as the affine map the rules reach (`parts`): the decay `exp(exponent)`
     (`exp2` where `base2`), a scalar's or each key's (`per_key`), on the state; the input `left right^T`;
     the corrections' sum `left (correction^T (D h))^T`, None where none corrects; the readout
-    `reader^T h + free`. Each a term free of the state over the traced programs' values `atoms` (each its
-    program and its atom, at `Token.value`'s place)."""
+    `reader^T h + free`, or where `values_read` `h reader + free` (the state read along its values, Oja's
+    rule on its transposed state). Each a term free of the state over the traced programs' values `atoms`
+    (each its program and its atom, at `Token.value`'s place)."""
 
     update: Program
     readout: Program
@@ -225,6 +242,7 @@ class Parts:
     correction: Token | None
     reader: Token
     free: Token
+    values_read: bool = False
 
 
 def parts(update: Program, readout: Program) -> Parts:
@@ -243,13 +261,15 @@ def parts(update: Program, readout: Program) -> Parts:
         raise Refused("the update is not a decayed state, exp(z) a scalar's or each key's, plus a rank-one "
                       "input and corrections of the decayed state along the input's vector")
     readout_args = get_callable_args(read, Affine.readout)
-    if readout_args is None:
-        raise Refused("the readout is not the state contracted with a vector over its keys plus a part free "
-                      "of it")
+    values_read = readout_args is None
+    found = get_callable_args(read, Affine.applied) if values_read else readout_args
+    if found is None:
+        raise Refused("the readout is not the state contracted with a vector over its keys or its values "
+                      "plus a part free of it")
     base2, per_key, exponent, left, right, *correction = args
     return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
                  bool(terms.integer(per_key)), exponent, left, right,
-                 correction[0] if correction else None, *readout_args)
+                 correction[0] if correction else None, *found, values_read=values_read)
 
 
 _KEEPING = frozenset({"copy", "copy_p"})
@@ -319,12 +339,15 @@ def _algebra(equation: jcore.JaxprEqn, operands: list[Token]) -> Token | None:
         return _laid(operands[0], shapes[0], after, equation.params.get("broadcast_dimensions"))
     if name == "dot_general":
         (contracted, batch) = equation.params["dimension_numbers"]
-        if tuple(map(tuple, batch)) != ((), ()) or tuple(map(tuple, contracted)) != ((0,), (0,)):
+        contracted, ranks = tuple(map(tuple, contracted)), [len(shape) for shape in shapes]
+        if tuple(map(tuple, batch)) != ((), ()):
             return None
-        if [len(shape) for shape in shapes] == [1, 2]:
+        if contracted == ((0,), (0,)) and ranks == [1, 2]:
             return Token.read(operands[0], operands[1])
-        if [len(shape) for shape in shapes] == [2, 1]:
+        if contracted == ((0,), (0,)) and ranks == [2, 1]:
             return Token.read(operands[1], operands[0])
+        if contracted == ((1,), (0,)) and ranks == [2, 1]:
+            return Token.applied(operands[0], operands[1])
     return None
 
 
@@ -366,20 +389,30 @@ def _read(vector, matrix, keys: int) -> jax.Array:
     return jnp.sum(jnp.broadcast_to(product, (keys, jnp.shape(product)[-1])), axis=0)
 
 
-def value_of(term: Token, read: Callable[[int], jax.Array], keys: int) -> jax.Array:
-    """A free term's value over a state of `keys` keys, its leaves `read(index)` (`Token.value`'s)."""
+def _applied(matrix, vector, keys: int) -> jax.Array:
+    """`matrix vector` over the state's `keys`, the values contracted, each operand broadcast along them."""
+    product = matrix * jnp.reshape(vector, (1, -1))
+    return jnp.sum(jnp.broadcast_to(product, (keys, jnp.shape(product)[-1])), axis=1)
+
+
+def value_of(term: Token, read: Callable[[int], jax.Array], keys: int, dtype) -> jax.Array:
+    """A free term's value over a state of `keys` keys, its leaves `read(index)` (`Token.value`'s), its
+    constants in the computation's `dtype`."""
     if (args := get_callable_args(term, Token.value)) is not None:
         return read(terms.integer(args[0]))
     if (args := get_callable_args(term, Token.literal)) is not None:
-        return jnp.asarray(terms.real(args[0]), jnp.float32)
+        return jnp.asarray(terms.real(args[0]), dtype)
     if get_callable_args(term, Token.zero) is not None:
-        return jnp.zeros((), jnp.float32)
+        return jnp.zeros((), dtype)
     if (args := get_callable_args(term, Token.read)) is not None:
         vector, matrix = args
-        return _read(value_of(vector, read, keys), value_of(matrix, read, keys), keys)
+        return _read(value_of(vector, read, keys, dtype), value_of(matrix, read, keys, dtype), keys)
+    if (args := get_callable_args(term, Token.applied)) is not None:
+        matrix, vector = args
+        return _applied(value_of(matrix, read, keys, dtype), value_of(vector, read, keys, dtype), keys)
     for constructor, applied in _APPLIED:
         if (args := get_callable_args(term, constructor)) is not None:
-            return applied(*(value_of(arg, read, keys) for arg in args))
+            return applied(*(value_of(arg, read, keys, dtype) for arg in args))
     raise Refused("a part of the token's affine map that reads the state")
 
 
@@ -441,6 +474,15 @@ class Chunk(Expr):
     def minus(self, other: Chunk) -> Chunk: ...
 
     @classmethod
+    def spread(cls, readers: Chunk, values: Chunk, keys: Chunk) -> Chunk: ...
+    """`sum_{j <= i} (readers_i . values_j) keys_jk between_ijk`: each token's earlier writes, their values
+    read by its reader along the state's values, decayed to it along the keys (`scan._spread`)."""
+
+    @classmethod
+    def applied(cls, state: Chunk, readers: Chunk) -> Chunk: ...
+    """`readers state^T`: each token's reader contracted with the state along its values."""
+
+    @classmethod
     def decayed(cls, state: Chunk) -> Chunk: ...
     """The entering state decayed across the whole chunk, `gamma_last * h` along its keys."""
 
@@ -461,21 +503,34 @@ class Chunk(Expr):
     """`(I + lower)^-1 given` by forward substitution, a row a step."""
 
 
-def _identities(corrects: bool):
-    """The identities of the module's account, `wy` where tokens correct the state."""
+def _identities(corrects: bool, scalar: bool, values_read: bool = False):
+    """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
+    memory is read and then decayed, `(Q h) exp(G)`, as the template's output (`recurrence_algebra.
+    chunk_output`): a memory past fp32's range reads finite, within 2.5 times the fp32 recurrence's distance
+    from float64 (1.50e-1 at 2^124 against its 6.1e-2), where its queries decayed first read six times it
+    (ledger 2344, 12e501086c8). A decay a key's decays each key before the read. A readout along the state's
+    `values_read` takes each output along the keys: the entering state read and decayed along them, and each
+    earlier write's keys decayed to the token, scaled by its values' read (`spread`)."""
     values = Chunk.token("U")
     given, other, lower, left, right = vars_("given other lower left right", Chunk)
     h = Chunk.entering()
+    entering = Chunk.decay("entering")
+    queries = Chunk.token("Q")
+    if values_read:
+        memory = Chunk.applied(h, queries).times(entering)
+    else:
+        memory = queries.matmul(h).times(entering) if scalar else queries.times(entering).matmul(h)
     found = []
     if corrects:
         system = Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1).rows(Chunk.token("s"))
         corrected = Chunk.solve(system, values.minus(
             Chunk.token("C").times(Chunk.decay("entering")).rows(Chunk.token("s")).matmul(h)))
         found.append(rewrite(Chunk.loop(values)).to(Chunk.plain(corrected)))
+    local = (Chunk.spread(queries, given, Chunk.token("B")) if values_read
+             else Chunk.gram(queries, Chunk.token("B"), 0).matmul(given))
     found += [
         rewrite(Chunk.plain(given)).to(Chunk.pair(
-            Chunk.token("Q").times(Chunk.decay("entering")).matmul(h).plus(
-                Chunk.gram(Chunk.token("Q"), Chunk.token("B"), 0).matmul(given)).plus(Chunk.token("R")),
+            memory.plus(local).plus(Chunk.token("R")),
             Chunk.decayed(h).plus(Chunk.written(Chunk.token("B"), given)))),
         rewrite(Chunk.pair(left, right).outputs()).to(left),
         rewrite(Chunk.pair(left, right).state()).to(right),
@@ -490,12 +545,13 @@ def _identities(corrects: bool):
 @dataclasses.dataclass(frozen=True)
 class Extents:
     """A chunk's extents: its tokens, the state's keys and values, the decays' keys (1 for a scalar's), and
-    whether a product's operands are fp32 (TF32 at the default precision) or narrower."""
+    whether its readout reads the state along its values (`Parts.values_read`)."""
 
     tokens: int
     keys: int
     values: int
     decay_keys: int
+    values_read: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -536,15 +592,17 @@ def _shapes(extents: Extents):
     found += [fixed(made, tokens, tokens)
               for made in (Chunk.gram(a, b, 0), Chunk.gram(a, b, 1), Chunk.doubled(a))]
     found += [fixed(made, keys, values) for made in (Chunk.decayed(a), Chunk.written(a, b), a.state())]
-    found.append(fixed(a.outputs(), tokens, values))
+    found += [fixed(made, tokens, keys) for made in (Chunk.spread(a, b, t), Chunk.applied(a, b))]
+    found.append(fixed(a.outputs(), tokens, keys if extents.values_read else values))
     return ruleset(*found, name="chunk_shapes")
 
 
 def _leaves(extents: Extents) -> list:
     """The leaves' shapes, stated before saturation."""
     c, k, v, d = extents.tokens, extents.keys, extents.values, extents.decay_keys
-    shapes = {Chunk.token("B"): (c, k), Chunk.token("C"): (c, k), Chunk.token("Q"): (c, k),
-              Chunk.token("U"): (c, v), Chunk.token("R"): (c, v), Chunk.token("s"): (c, 1),
+    read, out = (v, k) if extents.values_read else (k, v)
+    shapes = {Chunk.token("B"): (c, k), Chunk.token("C"): (c, k), Chunk.token("Q"): (c, read),
+              Chunk.token("U"): (c, v), Chunk.token("R"): (c, out), Chunk.token("s"): (c, 1),
               Chunk.entering(): (k, v), Chunk.decay("entering"): (c, d), Chunk.decay("to_last"): (c, d),
               Chunk.decay("whole"): (d, 1), Chunk.decay("between"): (c, c)}
     return [fact for value, (rows, columns) in shapes.items()
@@ -561,7 +619,8 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, checked
     loop = Chunk.loop(values) if corrects else Chunk.plain(values)
     root = Chunk.pair(loop.outputs(), loop.state())
     graph.register(root, *_leaves(extents))
-    graph.run((_identities(corrects) | _shapes(extents)).saturate())
+    graph.run((_identities(corrects, extents.decay_keys == 1, extents.values_read)
+               | _shapes(extents)).saturate())
 
     def marginal(egraph: EGraph, node) -> cost.Seconds:
         if get_callable_args(node, Chunk.solve) is not None:
@@ -621,8 +680,9 @@ def _children(node: Chunk) -> list[Chunk]:
 
 
 CONSTRUCTORS = (Chunk.token, Chunk.entering, Chunk.decay, Chunk.loop, Chunk.plain, Chunk.pair, Chunk.outputs,
-                Chunk.state, Chunk.gram, Chunk.rows, Chunk.times, Chunk.matmul, Chunk.plus, Chunk.minus,
-                Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled, Chunk.substituted)
+                Chunk.state, Chunk.gram, Chunk.spread, Chunk.applied, Chunk.rows, Chunk.times, Chunk.matmul,
+                Chunk.plus, Chunk.minus, Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled,
+                Chunk.substituted)
 """Every constructor of the chunk's language, as `get_callable_args` matches a node."""
 
 
@@ -650,6 +710,13 @@ def _work(node: Chunk, extents: Extents, shape_of) -> Work:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)
         return Work(operations=3.0 * c * c * k, kernels=1.0)
+    if get_callable_args(node, Chunk.spread) is not None:
+        # The reads `Q U^T`, then each pair's keys decayed and applied: a scalar decay's a product, a decay a
+        # key's elementwise over the pairs' keys.
+        reads = product(c, v, c)
+        return reads + (product(c, c, k) if d == 1 else Work(operations=3.0 * c * c * k, kernels=1.0))
+    if get_callable_args(node, Chunk.applied) is not None:
+        return product(c, v, k)
     if get_callable_args(node, Chunk.doubled) is not None:
         # log2(C) levels, each squaring the power and applying it: two products of C by C.
         levels = max(math.ceil(math.log2(max(c, 2))), 1)

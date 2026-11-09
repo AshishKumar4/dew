@@ -27,7 +27,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.derivatives import contracted
+from dew.nn.derivatives import Surrogate, contracted, declared_derivative
+from dew.nn.programs import holes
 
 type Tree = Mapping[str, object]
 
@@ -152,24 +153,12 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     traced = _Traced()
     # What every layer reads crosses the rule as its arrays; its other leaves (a static field of the
     # attention metadata) are the rule's own.
-    held, structure = jax.tree.flatten(tuple(shared))
-    arrays = [position for position, leaf in enumerate(held) if isinstance(leaf, jax.Array | np.ndarray)]
-
-    def shared_of(given):
-        leaves = list(held)
-        for position, leaf in zip(arrays, given, strict=True):
-            leaves[position] = leaf
-        return jax.tree.unflatten(structure, leaves)
+    arrays, shared_of = holes(tuple(shared), lambda leaf: isinstance(leaf, jax.Array | np.ndarray))
 
     def forward_layer(x, slices, shared):
         weights_i, per_layer_i = slices
         return layer(weights_i, x, per_layer_i, *shared_of(shared))
 
-    # A rule whose cotangents are the step's new state, not a derivative: the step reads them as its update
-    # (`InBackward`), and its gate (`gated`) reaches the backward from the step's own trace, which a marked
-    # call (`dew.nn.derivatives.declared_derivative`) would hold apart from it.
-    @contracted("test_a_run_updating_in_its_backward_moves_as_its_step_would")
-    @jax.custom_vjp
     def run(weights, masters, moments, norms, x, per_layer, shared):
         def body(x, slices):
             return forward_layer(x, slices, shared), None
@@ -247,6 +236,10 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
         return (weights_out, moved if narrow else None, moments, written_norms, dx,
                 jax.tree.map(_zeros_like_input, per_layer), jax.tree.map(_zeros_like_input, shared))
 
-    run.defvjp(run_forward, run_backward)
-    return run(weights, masters, dict(moments), norms, x, per_layer,
-               tuple(held[position] for position in arrays))
+    # A rule whose cotangents are the step's new state, Dew's choice, never the run's derivative
+    # (`Surrogate`): the step reads them as its update (`InBackward`), its gate (`gated`) a value of the
+    # step's own trace the backward reads where it runs.
+    updating = contracted("test_a_run_updating_in_its_backward_moves_as_its_step_would")(
+        declared_derivative(Surrogate(), run, run_forward, run_backward))
+    return updating(weights, masters, dict(moments), norms, x, per_layer,
+                    tuple(arrays))

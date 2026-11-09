@@ -1,6 +1,5 @@
-"""The linear recurrence's decode step (`dew.nn.kernels.recurrence.step`): every combination of its
-hooks against its XLA form in float64, at its launch's config (`recurrence.COLUMNS`' column blocks, or a
-whole head where a hook reads one), and the continuation contract a
+"""The linear recurrence's decode step (`dew.nn.kernels.recurrence.step`, the recurrence template's step on
+Mosaic GPU): every combination of its hooks against its XLA form in float64, and the continuation contract a
 decode token keeps (an idle row untouched, a bf16 state rounded as it is held)."""
 
 import dataclasses
@@ -12,15 +11,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
-from tuned import each_config, taken
+from test_recurrence_chunk import ROUTES, on_route
 
-from dew.nn.kernels import recurrence, tuning
+from dew.nn.kernels import recurrence
 from dew.nn.precision import FP32_SUMS
 
-ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 64, 4
-"""The draws' shape: values two of the step launch's column blocks wide (`recurrence.COLUMNS`), so check 1
-reaches a head's later blocks' programs, as a gated delta net's 128-wide values take four (template numerics
-review 2026-10-26, P3-6)."""
+ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 3, 2, 4, 128, 128, 4
+"""The draws' shape: a model's 128 keys and values a head (Qwen3.5's, Kimi Linear's, Mamba2's state), the
+template step's warpgroup a value column a thread; three rows, the second idle (an interpreted call of 16
+rows took 6.2 s, armada jsf-steptime)."""
 """A decode token with grouped heads, idle rows and a four-tap history."""
 
 NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
@@ -73,44 +72,57 @@ ONE_TAP_SEEDS = {jnp.float32: 256, jnp.bfloat16: 256}
 """Each one-tap operand dtype's seeds, sized by `seeds_for` on armada (2026-10-20) on the whole tree."""
 
 
+def hook_id(form) -> str:
+    """A test id for a hook combination (`recurrence.Hooks`, or a form nested in it): its fields that differ
+    from their defaults, each `name=value`, so a field added or removed at its default renames no test (each
+    id the durations record holds; the whole repr renamed every id with `Hooks.floor`)."""
+    def value(given):
+        return f"{type(given).__name__}({hook_id(given)})" if dataclasses.is_dataclass(given) else str(given)
+
+    return ",".join(f"{field.name}={value(getattr(form, field.name))}" for field in dataclasses.fields(form)
+                    if field.default is dataclasses.MISSING or getattr(form, field.name) != field.default)
+
+
 def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32,
-             value_width: int = VALUE_WIDTH) -> recurrence.Step:
-    """A decode token's operands for `hooks`, `value_width` values a head, every third row from the second
-    idle."""
+             value_width: int = VALUE_WIDTH, key_width: int = KEY_WIDTH, rows: int = ROWS) -> recurrence.Step:
+    """A decode token's operands for `hooks` over `rows` rows, `value_width` values and `key_width` keys a
+    head, every third row from the second idle."""
     rng = np.random.default_rng(seed)
 
     def normal(*shape, scale=1.0):
         return jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32)
 
-    channels = 2 * KEY_HEADS * KEY_WIDTH + VALUE_HEADS * value_width
-    given = {'state': normal(ROWS, VALUE_HEADS, KEY_WIDTH, value_width, scale=0.3).astype(state_dtype),
-             'active': jnp.asarray(np.arange(ROWS) % 3 != 1)}
+    channels = 2 * KEY_HEADS * key_width + VALUE_HEADS * value_width
+    given = {'state': normal(rows, VALUE_HEADS, key_width, value_width, scale=0.3).astype(state_dtype),
+             'active': jnp.asarray(np.arange(rows) % 3 != 1)}
     if hooks.conv is not None:
-        given |= {'token': normal(ROWS, channels), 'held': normal(ROWS, TAPS - 1, channels),
+        given |= {'token': normal(rows, channels), 'held': normal(rows, TAPS - 1, channels),
                   'taps': normal(channels, TAPS, scale=0.5)}
+        if hooks.conv.bias:
+            given['conv_bias'] = normal(channels, scale=0.5)
     else:
-        given |= {'query': normal(ROWS, KEY_HEADS, KEY_WIDTH), 'key': normal(ROWS, KEY_HEADS, KEY_WIDTH) / 4,
-                  'value': normal(ROWS, VALUE_HEADS, value_width)}
+        given |= {'query': normal(rows, KEY_HEADS, key_width), 'key': normal(rows, KEY_HEADS, key_width) / 4,
+                  'value': normal(rows, VALUE_HEADS, value_width)}
     if hooks.gates is not None:
-        given['gate'] = normal(ROWS, VALUE_HEADS)
+        given['gate'] = normal(rows, VALUE_HEADS)
         if hooks.gates.write == 'sigmoid':
-            given['beta'] = normal(ROWS, VALUE_HEADS)
+            given['beta'] = normal(rows, VALUE_HEADS)
         given |= {'log_a': normal(VALUE_HEADS, scale=0.3), 'bias': normal(VALUE_HEADS, scale=0.3)}
     elif hooks.rated:
         # Mamba2's: the step through softplus is the write gate, the rate `A = -exp(A_log)` a head's.
-        given |= {'beta': jax.nn.softplus(normal(ROWS, VALUE_HEADS) - 1.0),
+        given |= {'beta': jax.nn.softplus(normal(rows, VALUE_HEADS) - 1.0),
                   'rate': -jnp.exp(normal(VALUE_HEADS, scale=0.5))}
     else:
         if hooks.decay == 'scalar':
-            given['log_decay'] = -jnp.abs(normal(ROWS, VALUE_HEADS, scale=0.2))
+            given['log_decay'] = -jnp.abs(normal(rows, VALUE_HEADS, scale=0.2))
         elif hooks.decay == 'vector':
-            given['log_decay'] = -jnp.abs(normal(ROWS, VALUE_HEADS, KEY_WIDTH, scale=0.2))
+            given['log_decay'] = -jnp.abs(normal(rows, VALUE_HEADS, key_width, scale=0.2))
         if hooks.gated_write:
-            given['beta'] = jax.nn.sigmoid(normal(ROWS, VALUE_HEADS))
+            given['beta'] = jax.nn.sigmoid(normal(rows, VALUE_HEADS))
     if hooks.skip:
         given['skip'] = normal(VALUE_HEADS)
     if hooks.output is not None:
-        given |= {'z': normal(ROWS, VALUE_HEADS, value_width), 'weight': normal(value_width)}
+        given |= {'z': normal(rows, VALUE_HEADS, value_width), 'weight': normal(value_width)}
     return recurrence.Step(**given)
 
 
@@ -145,21 +157,22 @@ def orbit(given: recurrence.Step, seed: int) -> recurrence.Step:
     return dataclasses.replace(given, **moved)
 
 
-def draw(hooks: recurrence.Hooks, seed: int, state_dtype=jnp.float32,
-         value_width: int = VALUE_WIDTH) -> tuple[recurrence.Step]:
+def draw(hooks: recurrence.Hooks, seed: int, state_dtype=jnp.float32, value_width: int = VALUE_WIDTH,
+         key_width: int = KEY_WIDTH, rows: int = ROWS) -> tuple[recurrence.Step]:
     """Fresh operands and an independent exact orbit, deterministically keyed by the draw's seed."""
     operand_seed, orbit_seed = (int(value) for value in np.random.SeedSequence(seed).generate_state(2))
-    return (orbit(operands(hooks, operand_seed, state_dtype, value_width), orbit_seed),)
+    return (orbit(operands(hooks, operand_seed, state_dtype, value_width, key_width, rows), orbit_seed),)
 
 
 def one_tap_operands(dtype, seed: int) -> recurrence.Step:
-    """A one-tap token, preserving the two dtypes' consecutive draws at the original seed."""
-    channels = 2 * 16 + 16
+    """A one-tap token over a head of a model's widths (`KEY_WIDTH`, `VALUE_WIDTH`, the launch's), preserving
+    the two dtypes' consecutive draws at the original seed."""
+    channels = 2 * KEY_WIDTH + VALUE_WIDTH
     rng = np.random.default_rng(seed)
     operands = {}
     for operand_dtype in (jnp.float32, jnp.bfloat16):
         operands[operand_dtype] = recurrence.Step(
-            jnp.asarray(rng.standard_normal((ROWS, 1, 16, 16)) * 0.3, jnp.float32),
+            jnp.asarray(rng.standard_normal((ROWS, 1, KEY_WIDTH, VALUE_WIDTH)) * 0.3, jnp.float32),
             token=jnp.asarray(rng.standard_normal((ROWS, channels)), operand_dtype),
             held=jnp.zeros((ROWS, 0, channels), operand_dtype),
             taps=jnp.asarray(rng.standard_normal((channels, 1)), operand_dtype))
@@ -185,84 +198,81 @@ def summed(hooks: recurrence.Hooks):
     return run
 
 
-def test_a_decode_step_is_tuned_by_what_it_was_called_with():
-    """A decode token's launch is recorded for tuning as its own lowering traces it (`tuning.seen`),
-    keyed by the state it was called with: a decode step's picks are found and stored by what it was
-    called with."""
-    hooks = HOOKS[0]
-    given = operands(hooks)
-    with tuning.seen() as seen:
-        jax.jit(functools.partial(recurrence.step, hooks)).lower(given)
-    state = jax.ShapeDtypeStruct(given.state.shape, given.state.dtype)
-    assert state in [dict(ba.autotuning_cache_key).get("state") for _, ba in seen]
-
-
-@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
+@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=hook_id)
 def test_every_hook_combination_steps_as_its_float64_form(hooks):
-    """A decode token through the launch, at its config, within tests/reference_error.py's
-    rule of the XLA form's fp32 run against its float64 run: its output, its state and, under a conv,
-    its moved history, which is the history's own bits (`summed`'s fp32 run). The idle row's output is
-    zeros and its state and history are its inputs' bits."""
+    """A decode token through the launch, the recurrence template's step on Mosaic GPU
+    (`templates.recurrence.step`, interpreted off a GPU), within tests/reference_error.py's rule of the XLA
+    form's fp32 run against its float64 run: its output, its state and, under a conv, its moved history,
+    which is the history's own bits. The idle row's output is zeros and its state and history are its
+    inputs' bits."""
     given = operands(hooks)
-    reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
-    reference = reference_fn(given)
-
-    configs = each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given)
-    # A column-split launch runs more than one block a head, its later programs' columns among them; a decay
-    # a key dimension's blocks are as wide as the draws' heads (`recurrence.KEYED_COLUMNS`), its later
-    # blocks checked at 80 columns (`test_a_head_wider_than_its_column_blocks_steps_every_column`).
-    assert all(config.block == 0 or VALUE_WIDTH // config.block > 1
-               or config.block == recurrence.KEYED_COLUMNS for config in configs), configs
-    for config in configs:
-        with tuning.pinned({recurrence.StepLaunch: config}):
-            step = jax.jit(functools.partial(recurrence.step, hooks))
-            assert_as_exact(step, summed(hooks), functools.partial(draw, hooks), f'{hooks} {config}',
-                            seeds={**SEEDS, **FORMED_SEEDS}[hooks], truth_fn=reference_fn)
-            out, history, state = step(given)
-        np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
-        np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
-        if hooks.conv is not None:
-            np.testing.assert_array_equal(np.asarray(history), np.asarray(reference[1]))
-            np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
+    step = jax.jit(functools.partial(recurrence.step, hooks))
+    assert_as_exact(step, summed(hooks), functools.partial(draw, hooks), f'{hooks}',
+                    seeds={**SEEDS, **FORMED_SEEDS}[hooks],
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
+    out, history, state = step(given)
+    np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
+    np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
+    if hooks.conv is not None:
+        moved = recurrence.step_reference(hooks, given)[1]
+        np.testing.assert_array_equal(np.asarray(history), np.asarray(moved))
+        np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
 
 
-UNEVEN = {recurrence.Hooks(decay='scalar'): 8,
-          recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
-          recurrence.Hooks(decay='vector'): 8}
-"""The hooks an 80-wide head steps under (the gated delta rule's, Mamba-2's rated scan with its skip, Kimi
-delta attention's decay a key dimension, five blocks a head) and their declared seeds."""
+NARROW = {recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
+          recurrence.Hooks(decay='scalar'): 8,
+          recurrence.Hooks(conv=recurrence.Conv('silu', order='vkq', bias=True), decay='scalar', delta=False,
+                           gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), skip=True): 8}
+"""Mamba2's step (its rated decay and skip), the gated delta rule's, and Mamba2's fused token (its conv over
+x, B and C with their bias, its step's gates and skip), over heads of 64 values, and their declared
+seeds."""
 
 
-@pytest.mark.parametrize('hooks', UNEVEN, ids=str)
-def test_a_head_wider_than_its_column_blocks_steps_every_column(hooks):
-    """A decode token over 80 value columns a head, at the launch's own config (unpinned): its output and
-    state within tests/reference_error.py's rule of the XLA form's fp32 run against its float64 run, every
-    column among them, so a head whose width no column block divides as many times as it launched them (80
-    of 32 took two programs, 64 columns) leaves none of its outputs unwritten or its state stale."""
-    width = 80
-    reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
+@pytest.mark.parametrize('hooks', NARROW, ids=hook_id)
+def test_heads_narrower_than_a_warpgroup_step_as_their_float64_form(hooks):
+    """A decode token over value heads 64 wide (Mamba2's, its state 128 keys by 64 values a head), two heads a
+    program's warpgroup (`templates.recurrence.step._block`): its output and state within
+    tests/reference_error.py's rule of the XLA form's fp32 run against its float64 run, each head's gates and
+    skip its own."""
     assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)), summed(hooks),
-                    functools.partial(draw, hooks, value_width=width), f'{hooks} {width} wide',
-                    seeds=UNEVEN[hooks], truth_fn=reference_fn)
+                    functools.partial(draw, hooks, value_width=64), f'{hooks} 64 wide', seeds=NARROW[hooks],
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
 
 
-def test_a_column_block_pin_is_refused_where_a_hook_reads_a_whole_head():
-    """A hook reading a head's whole state (a conv, the epilogue's norm) takes a whole-head launch: a pin
-    of a block of value columns is refused as the step traces, a whole-head pin taken."""
-    hooks = next(form for form in HOOKS + FORMED if form.conv is not None or form.output is not None)
-    given = operands(hooks)
-    step = functools.partial(recurrence.step, hooks)
-    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(8, 4)}), pytest.raises(tuning.Unpinnable):
-        jax.jit(step).trace(given)
-    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(0, 4)}):
-        assert taken(recurrence.StepLaunch, step, given) == [recurrence.Launch(0, 4)]
+def test_a_decode_token_over_three_warpgroups_of_keys_reads_its_last_keys():
+    """A decode token over 384 keys (three warpgroups', which `fits` takes), its query, key and memory
+    nonzero on the last 128 alone: the launch's output and state the float64 step's (check 1, its sums over
+    the keys each held subtree's, `_summed_keys`). The top subtree alone dropped those 128 keys, the output
+    zero (audit 2026-11-07, A18)."""
+    hooks = recurrence.Hooks(decay='scalar')
+    last = (np.arange(384) >= 256).astype(np.float32)
+
+    def confined(seed: int) -> tuple[recurrence.Step]:
+        (given,) = draw(hooks, seed, key_width=384)
+        return (dataclasses.replace(given, query=given.query * last, key=given.key * last,
+                                    state=given.state * last[:, None]),)
+
+    (given,) = confined(0)
+    out = recurrence.step(hooks, given)[0]
+    assert float(jnp.max(jnp.abs(out[0]))) > 0.0
+    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)), summed(hooks), confined,
+                    'a token over 384 keys, its last 128 alone', seeds=8,
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
 
 
-@pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)
-def test_a_bf16_state_steps_as_its_float64_form(hooks):
+@pytest.mark.parametrize('route', ROUTES)
+@pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=hook_id)
+def test_a_bf16_state_steps_as_its_float64_form(hooks, route):
     """A bf16 state is read and stepped in fp32 and written once, rounded stochastically by
     `round_to_bf16` from the token's key and value: within the rule of the XLA form's own bf16 run
-    against the float64 step, and the idle row's state its input's bits."""
+    against the float64 step, and the idle row's state its input's bits, on each route's bundle
+    (`on_route`)."""
+    with on_route(route):
+        bf16_state_steps_as_its_float64_form(hooks)
+
+
+def bf16_state_steps_as_its_float64_form(hooks):
+    """`test_a_bf16_state_steps_as_its_float64_form`'s checks on the route in force."""
     given = operands(hooks, seed=1, state_dtype=jnp.bfloat16)
     _, _, state = recurrence.step(hooks, given)
     assert state.dtype == jnp.bfloat16
@@ -278,15 +288,16 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
     state stays zero and the output is zero, in the launch and in its XLA form; and a one-tap conv's
     moved history is empty in both, its step the same as an unconvolved one's on the scaled token."""
     hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True)
-    ones = jnp.ones((2, 1, 16))
-    given = recurrence.Step(jnp.zeros((2, 1, 16, 16)), query=ones, key=ones, value=ones,
+    # A warpgroup's keys, as the launch steps them (`templates.recurrence.step.fits`).
+    ones = jnp.ones((2, 1, 128))
+    given = recurrence.Step(jnp.zeros((2, 1, 128, 128)), query=ones, key=ones, value=ones,
                             beta=jnp.zeros((2, 1)))
     for step in (recurrence.step, recurrence.step_reference):
         out, _, state = step(hooks, given)
         np.testing.assert_array_equal(np.asarray(out), 0.0)
         np.testing.assert_array_equal(np.asarray(state), 0.0)
     one_tap = recurrence.Hooks(conv=recurrence.Conv(None), decay='none', delta=False)
-    channels = 2 * 16 + 16
+    channels = 2 * KEY_WIDTH + VALUE_WIDTH
     for dtype in (jnp.float32, jnp.bfloat16):
         given = one_tap_operands(dtype, 3)
         for step in (recurrence.step, recurrence.step_reference):
@@ -342,17 +353,57 @@ def test_the_skip_takes_forward_and_reverse_mode():
     assert gradient.shape == skip.shape and bool(jnp.all(jnp.isfinite(gradient)))
 
 
+@pytest.mark.parametrize('per_key', [True, False], ids=['a decay a key dimension', "a head's decay"])
 @pytest.mark.parametrize('delta', [False, True], ids=['no delta rule', 'the delta rule'])
-def test_a_step_reads_its_updated_state(delta):
-    """A token's output is `q^T S'` of the updated state (`recurrence.update`), with the delta rule and
-    without: finite where the one-pass form's `(q . k) (write v)` overflowed, an fp32 key and query of 2^80
-    on one state channel against a write of 2^-80 and a value of 1 from a zero state with no decay, whose
-    updated state is 1 there and its readout exactly 2^80 (rows 1859 and 1962)."""
+def test_a_step_reads_its_updated_state(delta, per_key):
+    """A token's output (`recurrence.update`, `(g q)^T S + (q . (beta k)) c`), under a decay a key dimension
+    and a head's, with the delta rule and without: finite where the one-pass form's `(q . k) (write v)`
+    overflowed, an fp32 key and query of 2^80 on one state channel against a write of 2^-80 and a value of 1
+    from a zero state with no decay, whose updated state is 1 there and its readout exactly 2^80 (rows 1859
+    and 1962): the write gate scales the key before any sum."""
     channels, width = 32, 4
     query = key = jnp.zeros((1, channels), jnp.float32).at[0, 0].set(2.0 ** 80)
     value = jnp.ones((1, width), jnp.float32)
     state = jnp.zeros((1, channels, width), jnp.float32)
-    decay, write = jnp.ones((1, channels), jnp.float32), jnp.full((1, 1), 2.0 ** -80, jnp.float32)
+    decay = jnp.ones((1, channels if per_key else 1), jnp.float32)
+    write = jnp.full((1, 1), 2.0 ** -80, jnp.float32)
     out, updated = recurrence.update(state, query, key, value, decay, write, delta=delta)
     np.testing.assert_array_equal(updated, state.at[0, 0].set(1.0))
     np.testing.assert_array_equal(out, jnp.full((1, width), 2.0 ** 80, jnp.float32))
+
+
+@pytest.mark.parametrize("local", [True, False], ids=["per-shard", "partitioned"])
+def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
+    """A gated delta rule's decode token (`recurrence.step`, the template's step) over four rows split over
+    two compile-only H100s and compiled for them: run per shard (`manual_map`), its program launches the step
+    once, each call reading its shard's two rows of the state, and moves nothing (`kernel_compile.Expected`,
+    its route evidence). Left to the partitioner (the launch called on the whole batch), the same evidence
+    refuses the program: its operands gathered to every device."""
+    from jax.sharding import PartitionSpec
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import step as template
+
+    hooks = recurrence.Hooks(decay='scalar')
+    rows, heads, width = 4, 4, 128
+
+    def call():
+        def token(state, query, key, value, log_decay, beta):
+            given = recurrence.Step(state, query=query, key=key, value=value, log_decay=log_decay, beta=beta)
+            if local:
+                return recurrence.step(hooks, given)
+            return template.step(hooks, given, dtype=None, family=bundles.of('sm90', jnp.float32))
+
+        f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+        return token, (f32((rows, heads, width, width)), *(f32((rows, heads, width)),) * 3,
+                       f32((rows, heads)), f32((rows, heads)))
+
+    expected = Expected(axes=(("data", 2),), specs=(PartitionSpec("data"),) * 6,
+                        launches=frozenset({"recurrence_step"}),
+                        shards={"recurrence_step": (rows // 2, heads, width, width)})
+    from fla_gdn_support import KernelCase
+
+    cases = [KernelCase("decode token", call, expected=expected)]
+    failed = route_failures(cases, compile_mosaic_kernels(cases, "sm90"))
+    assert (failed == []) == local, failed

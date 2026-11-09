@@ -12,6 +12,7 @@ rows' arguments name.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -19,9 +20,8 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms, kept
 from flax import linen as nn
-from float64_terms import float64_terms
 from jax.sharding import Mesh, PartitionSpec
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, with_gradients
 from sharded import MOVES, assert_runs_per_shard
 from test_attention_template import (
     DTYPES,
@@ -358,6 +358,249 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
                     seeds=SEEDS)
 
 
+LOWERED = {
+    "fp32-64-full": ("sm90", jnp.float32, 64, False, False),
+    "fp32-128-causal": ("sm90", jnp.float32, 128, True, False),
+    "fp32-128-full": ("sm90", jnp.float32, 128, False, False),
+    **{f"bias-{generation_name}-{'causal' if causal else 'full'}":
+       (generation_name, jnp.bfloat16, 128, causal, True)
+       for generation_name in ("sm90", "sm80") for causal in (True, False)},
+}
+"""Calls lowered for a GPU on the named template: by the GPU, the operands' dtype, the head width, causal or
+full, and a bias that varies by query (`[1, H, Q, K]` fp32) or none."""
+
+
+@pytest.mark.parametrize("form", ["fast", "accurate"])
+@pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
+@pytest.mark.parametrize("name", LOWERED)
+def test_a_call_named_onto_the_template_lowers_for_a_gpu(name, differentiated, form):
+    """A call named onto the template (`implementation="template"`) lowered for an H100 or an A100, in either
+    form, inferred or differentiated: fp32 operands at widths 64 and 128, and bf16 under a bias that varies by
+    query, each pass on a mainloop that takes it, whichever the route derives (`generation.routes`: one
+    `attention_mainloop` route a pass). Its values are check 1's on the template's mainloops
+    (test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward,
+    test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.generation import run_precision
+    from dew.nn.precision import Numerics
+    generation_name, dtype, width, causal, biased = LOWERED[name]
+    shape = jax.ShapeDtypeStruct((1, 512, 2, width), dtype)
+    bias = (jax.ShapeDtypeStruct((1, 2, 512, 512), jnp.float32),) if biased else ()
+
+    def attend(query, key, value, *bias):
+        return scaled_dot_product_attention(query, key, value, bias=bias[0] if bias else None, causal=causal,
+                                            implementation="template")
+
+    def trained(query, key, value, *rest):
+        *bias, dout = rest
+        out, pull = jax.vjp(attend, query, key, value, *bias)
+        return out, pull(dout)
+
+    with run_precision(Numerics(forms=form)), generation.routes() as found:
+        if differentiated:
+            lowered_for(trained, (shape, shape, shape, *bias, shape), generation_name)
+        else:
+            lowered_for(attend, (shape, shape, shape, *bias), generation_name)
+    assert len([route for route in found if route.choice == "attention_mainloop"]) == 1 + differentiated
+
+
+def test_the_jax_nn_form_takes_values_of_the_querys_heads_beside_keys_of_fewer():
+    """The reference path's jax.nn form (`scale_logits`) over keys of one head and values of the query's two
+    (Z-Image's joint attention's) is, bit for bit, the same call over the keys repeated to the query's heads:
+    its query heads group over the keys' head only where the values share it (`_grouped_as_jax_nn`)."""
+    streams = jax.random.split(jax.random.key(4), 3)
+    query = jax.random.normal(streams[0], (2, 16, 2, 8), jnp.bfloat16)
+    key = jax.random.normal(streams[1], (2, 16, 1, 8), jnp.bfloat16)
+    value = jax.random.normal(streams[2], (2, 16, 2, 8), jnp.bfloat16)
+
+    def attend(key):
+        return scaled_dot_product_attention(query, key, value, implementation="reference", causal=True,
+                                            scale_logits=True)
+
+    repeated = jnp.repeat(key, 2, axis=2)
+    assert np.asarray(attend(key)).tobytes() == np.asarray(attend(repeated)).tobytes()
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize(("heads", "kv_heads"), [(4, 4), (4, 2), (8, 1)], ids=["mha", "gqa", "mqa"])
+def test_the_reference_scaling_its_logits_after_the_product_is_jax_nns_xla_attention(heads, kv_heads, causal):
+    """The reference path with the scale after the product (`scale_logits`) is jax.nn's xla attention
+    (`jax.nn.dot_product_attention`) bit for bit over bf16 operands: fp32 logits of their product at the
+    dot algorithm jax.nn names for them, its query heads grouped over their key head as jax.nn groups them,
+    scaled in fp32, masked and normalized in fp32, which the compile point's recognizer matches
+    written-out attention against (row 4783). fp32 operands' products this process sums in float64
+    (`precision.accumulated`, the test lane's wide CPU arithmetic), where jax.nn keeps XLA's sums; outside
+    it they agree too (et-scalebits3). A CPU's dot refuses fp16's algorithm, jax.nn's attention with it."""
+    dtype = jnp.bfloat16
+    streams = jax.random.split(jax.random.key(0), 3)
+    query = jax.random.normal(streams[0], (1, 16, heads, 32), dtype)
+    key, value = (jax.random.normal(stream, (1, 16, kv_heads, 32), dtype) for stream in streams[1:])
+    ours = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=causal, scale_logits=True,
+                                                             implementation="reference"))(query, key, value)
+    xla = jax.jit(lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal,
+                                                             implementation="xla"))(query, key, value)
+    assert np.asarray(ours).tobytes() == np.asarray(xla).tobytes()
+
+
+JAX_NN_FILL = -0.7 * float(jnp.finfo(jnp.float32).max)
+"""jax.nn's masked logit (`jax._src.nn.functions._get_large_negative`), its fp32 logits'."""
+
+
+def _rows_mask(queries: int, keys: int) -> jax.Array:
+    """A `[1, 1, queries, keys]` mask whose rows 3 and 7 see no key and every other row a key in three,
+    beside its own (rows 1 and 5 their own alone)."""
+    rows, columns = np.arange(queries)[:, None], np.arange(keys)[None]
+    seen = (columns % 3 == rows % 3) | (columns == rows)
+    seen[[1, 5]] = columns[0] == np.asarray([[1], [5]])
+    seen[[3, 7]] = False
+    return jnp.asarray(seen)[None, None]
+
+
+def _written_out(query, key, value, mask):
+    """Attention as a program writes it out: fp32 logits of the product scaled after it, every masked one
+    -inf, a softmax in fp32 rounded to the operands' dtype, its product with the values."""
+    heads = query.shape[-2]
+    key, value = (jnp.repeat(x, heads // x.shape[-2], axis=-2) for x in (key, value))
+    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key, preferred_element_type=jnp.float32)
+    logits = jnp.where(mask, logits * query.shape[-1] ** -0.5, -jnp.inf)
+    weights = jax.nn.softmax(logits, axis=-1).astype(query.dtype)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, value)
+
+
+@pytest.mark.parametrize("masked", [False, True], ids=["causal", "masked"])
+@pytest.mark.parametrize(("heads", "kv_heads"), [(4, 4), (4, 2)], ids=["mha", "gqa"])
+def test_the_reference_filling_as_jax_nn_is_jax_nns_xla_attention(heads, kv_heads, masked):
+    """The reference path with jax.nn's masked logit (`mask_fill`) and its scale after the product is
+    jax.nn's xla attention bit for bit over bf16 operands, a causal call and one whose mask leaves rows no
+    key, which read every value alike in both (row 4783)."""
+    streams = jax.random.split(jax.random.key(0), 3)
+    query = jax.random.normal(streams[0], (1, 16, heads, 32), jnp.bfloat16)
+    key, value = (jax.random.normal(stream, (1, 16, kv_heads, 32), jnp.bfloat16) for stream in streams[1:])
+    mask = _rows_mask(16, 16) if masked else None
+    ours = jax.jit(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, causal=not masked, mask=mask, scale_logits=True, mask_fill=JAX_NN_FILL,
+        implementation="reference"))(query, key, value)
+    xla = jax.jit(lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=not masked, mask=mask,
+                                                             implementation="xla"))(query, key, value)
+    assert np.asarray(ours).tobytes() == np.asarray(xla).tobytes()
+
+
+@pytest.mark.parametrize(("heads", "kv_heads"), [(4, 4), (4, 2)], ids=["mha", "gqa"])
+def test_the_reference_filling_with_minus_infinity_is_the_written_out_program(heads, kv_heads):
+    """The reference path with -inf for a masked logit and its scale after the product is attention written
+    out with `where(mask, logits, -inf)` bit for bit over bf16 operands, a row that sees no key NaN in both
+    (row 4783)."""
+    streams = jax.random.split(jax.random.key(0), 3)
+    query = jax.random.normal(streams[0], (1, 16, heads, 32), jnp.bfloat16)
+    key, value = (jax.random.normal(stream, (1, 16, kv_heads, 32), jnp.bfloat16) for stream in streams[1:])
+    mask = _rows_mask(16, 16)
+    ours = jax.jit(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, mask=mask, scale_logits=True, mask_fill=-jnp.inf,
+        implementation="reference"))(query, key, value)
+    written = jax.jit(_written_out)(query, key, value, mask)
+    # Widened, which is exact, so NumPy's comparison takes a NaN for a NaN (bfloat16's it does not).
+    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(written, np.float32))
+    assert np.isnan(np.asarray(ours, np.float32))[0, [3, 7]].all()
+
+
+def _documents(rows: int, queries: int) -> jax.Array:
+    """`[rows, queries]` documents: two a row, of 40 and the rest, beside padding (id 0) at queries 3 and 7,
+    which under causality see no key, every other query a key of its own document's before it."""
+    ids = np.where(np.arange(queries) < 40, 1, 2)
+    ids[[3, 7]] = 0
+    return jnp.asarray(np.broadcast_to(ids, (rows, queries)))
+
+
+@pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
+@pytest.mark.parametrize("fill", [JAX_NN_FILL, -2.0], ids=["jax-nn", "within-reach"])
+def test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_path(fill, sinks):
+    """A causal call on the template over packed documents with padding rows, which see no key, under a
+    finite masked logit (`mask_fill`): jax.nn's, which outweighs no key a row sees, so the template weighs
+    its masked keys nothing and a padding row reads every value alike (beside its sink, the sink's share);
+    and one within the logits' reach, which weighs a masked key beside them, the call the portable path's.
+    Its output and gradients on par with the portable path's (check 1)."""
+    documents = _documents(ROWS, QUERIES)
+
+    def call(implementation: str):
+        def run(query, key, value, sink_logits, dout):
+            def attend(query, key, value, sink_logits):
+                return scaled_dot_product_attention(query, key, value, causal=True, segment_ids=documents,
+                                                    mask_fill=fill, sinks=sink_logits if sinks else None,
+                                                    implementation=implementation)
+
+            out, pull = jax.vjp(attend, query, key, value, sink_logits)
+            return (out, *pull(dout)[:4 if sinks else 3])
+
+        return run
+
+    assert_as_exact(jax.jit(call("template")), jax.jit(call("reference")),
+                    drawing(QUERIES, QUERIES, jnp.bfloat16, sinks=True), f"template filled {fill:g}",
+                    seeds=SEEDS)
+
+
+def test_a_template_call_filling_with_minus_infinity_reads_nan_where_a_row_sees_no_key():
+    """A causal call on the template over packed documents with -inf for a masked logit: its padding rows,
+    3 and 7, which see no key, NaN, as the portable path's, and every value's gradient NaN with them (the
+    portable path's NaN weights reach every key); every other row and the query's and key's gradients on
+    par with it (check 1)."""
+    documents = _documents(ROWS, QUERIES)
+    seen = (documents != 0)[:, :, None, None]
+
+    def call(implementation: str):
+        def run(query, key, value, _sinks, dout):
+            def attend(query, key, value):
+                return scaled_dot_product_attention(query, key, value, causal=True, segment_ids=documents,
+                                                    mask_fill=-jnp.inf, implementation=implementation)
+
+            out, pull = jax.vjp(attend, query, key, value)
+            return (out, *pull(dout))
+
+        return run
+
+    draw = drawing(QUERIES, QUERIES, jnp.bfloat16, sinks=False)
+    ours, theirs = (jax.jit(call(implementation))(*draw(0)) for implementation in ("template", "reference"))
+    for mine, reference in ((ours[0], theirs[0]), (ours[3], theirs[3])):
+        np.testing.assert_array_equal(np.isnan(np.asarray(mine, np.float32)),
+                                      np.isnan(np.asarray(reference, np.float32)))
+    assert np.isnan(np.asarray(ours[0], np.float32))[:, [3, 7]].all()
+    assert np.isnan(np.asarray(ours[3], np.float32)).all()
+
+    def finite(implementation: str):
+        def run(*draw):
+            out, dq, dk, _ = call(implementation)(*draw)
+            return jnp.where(seen, out, 0), dq, dk
+
+        return run
+
+    assert_as_exact(jax.jit(finite("template")), jax.jit(finite("reference")), draw, "template filled -inf",
+                    seeds=SEEDS)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "template"])
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+def test_a_call_scaling_its_logits_after_the_product_is_on_par_with_flaxs_form(dtype, implementation):
+    """A causal call whose scale takes the fp32 logits after the product (`scale_logits`, jax.nn's form,
+    the reference path's `float32_einsum(query, key) * D ** -0.5`), on the reference path and on the
+    template, which scales its fp32 products so natively: its output and its gradients on par with the
+    reference path in flax's form, the query scaled before the product (check 1)."""
+    def call(implementation: str, *, scale_logits: bool):
+        def run(query, key, value, _sinks, dout):
+            def attend(query, key, value):
+                return scaled_dot_product_attention(query, key, value, causal=True, scale_logits=scale_logits,
+                                                    implementation=implementation)
+
+            out, pull = jax.vjp(attend, query, key, value)
+            return (out, *pull(dout))
+
+        return run
+
+    assert_as_exact(jax.jit(call(implementation, scale_logits=True)),
+                    jax.jit(call("reference", scale_logits=False)),
+                    drawing(QUERIES, KEYS, dtype, sinks=False), f"logits scaled after {implementation}",
+                    seeds=SEEDS)
+
+
 @pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])
 def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
@@ -469,7 +712,6 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
                     terms=terms)
 
 
-@pytest.mark.gpu(reason="the Mosaic backward's deterministic schedule, on an H100")
 def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient_is_zero():
     """attention_terms with a bias every row shares: the first query of a causal call keeps one key, so its
     query gradient is zero in float64, and its terms are not (a D from the rounded output rounds it to their
@@ -505,20 +747,15 @@ def an_fp16_call_on_an_h100_is_on_par(case):
 
 
 def _terms(case: dict):
-    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps (its
-    spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw `(query, key, value,
-    sinks, dout)`; the sinks' gradient, where the case has sinks, its float64 truth's own terms
-    (`float64_terms` of the reference path), as `attention_on_par` sizes it."""
+    """The float64 terms of `case`'s output and gradients, its sinks' among them (`attention_terms`), over
+    the keys it keeps (its spans as a mask, `case_keep`), under its sinks and softcap, a function of a draw
+    `(query, key, value, sinks, dout)`."""
     keep = case_keep(case)[:, None]
 
     def terms(query, key, value, sinks, dout):
-        found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))[:4]
-        if sinks is None:
-            # The sinks' gradient, which a call without sinks holds as None.
-            return (*found, None)
-        with jax.enable_x64(new_val=True):
-            truth = float64_terms(pulled("reference", case), *widened((query, key, value, sinks, dout)))[1]
-        return (*found, truth[4])
+        found = attention_terms(query, key, value, dout, keep, sinks=sinks, softcap=case.get("softcap"))
+        # The sinks' gradient, which a call without sinks holds as None.
+        return (*found, None) if sinks is None else tuple(found)
 
     return terms
 
@@ -529,12 +766,15 @@ def a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     """A causal call of `length` tokens, two query heads over one key head (`WIDTH` wide), through the
     template on whichever mainloop the GPU runs it, on par with the reference path (check 1): D, the
     refinement and the denominator are sums the mainloops run in sequence over its key tiles where the
-    reference sums by tree, so a ratio that grew with the sequence would show here (math review P2.5)."""
+    reference sums by tree, so a ratio that grew with the sequence would show here (math review P2.5).
+    Every entry is sized by the terms attention's float64 gradients carry through their cancellation
+    (`_causal_terms`): the first query keeps one key, so its gradient is float64 zero, which a mainloop
+    forming D from its rounded output (an A100's) holds to that rounding."""
     case = {"causal": True}
     draw = drawing(length, length, dtype, sinks=False, heads=2, kv_heads=1, rows=1)
     assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
                     f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS,
-                    truth_fn=_causal_truth(length))
+                    truth_fn=_causal_truth(length), terms=_causal_terms(length))
 
 
 TRUTH_ROWS = 1024
@@ -574,11 +814,30 @@ def _causal_truth(length: int):
     return truth
 
 
+def _causal_terms(length: int):
+    """The float64 terms of a causal call of `length` tokens (`attention_terms` over the keys each query
+    keeps), `TRUTH_ROWS` queries at a time as its truth is (`_causal_truth`): each block's output's and query
+    gradient's terms its own, the keys' and values' the root of the blocks' summed squares; a function of a
+    draw `(query, key, value, sinks, dout)`, the sinks' gradient none."""
+    def terms(query, key, value, sinks, dout):
+        del sinks
+        blocks = []
+        for first in range(0, length, TRUTH_ROWS):
+            rows = slice(first, first + TRUTH_ROWS)
+            keep = (np.arange(first, first + TRUTH_ROWS)[:, None] >= np.arange(length)[None, :])[None, None]
+            blocks.append(attention_terms(query[:, rows], key, value, dout[:, rows], keep))
+        out, d_query = (np.concatenate([block[leaf] for block in blocks], axis=1) for leaf in (0, 1))
+        d_key, d_value = (np.sqrt(sum(np.square(block[leaf]) for block in blocks)) for leaf in (2, 3))
+        return out, d_query, d_key, d_value, None
+
+    return terms
+
+
 def test_the_accurate_form_is_one_option_away():
     """A run's numerics in the accurate forms (`generation.run_precision`, `Numerics.forms`) run every
     template call in the accurate form (natural logits and the accurate products, `attention_route.FORMS`),
     its forward and gradients bitwise a call's that names that form, and the fast forms run the default, a
-    call's that names none; the two forms differ; a form the template does not have is refused. Bit for bit
+    call's that names none; a form the template does not have is refused. Bit for bit
     by construction: the forms resolve to the named form's arguments before the call traces, so the two
     calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
@@ -595,7 +854,6 @@ def test_the_accurate_form_is_one_option_away():
         want = jax.tree.leaves(jax.jit(functools.partial(routed, **named))(query, key, value))
         for mine, theirs in zip(found[form], want, strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
-    assert any(not np.array_equal(accurate, fast) for accurate, fast in zip(*found.values(), strict=True))
     with pytest.raises(ValueError):
         Numerics(forms="exact")
 
@@ -686,11 +944,9 @@ def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, whol
     is the compiled program's, which this CPU does not build)
     (bible §7: a new accelerator route qualifies through its real target lowering on a multi-device
     mesh)."""
-    import math
-
     from jax.sharding import AxisType, NamedSharding
 
-    from dew.training._lowering import custom_calls, operations
+    from dew.nn.kernels.lowered import custom_calls, operations
 
     devices = jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
                             devices=jax.devices()[:math.prod(axes.values())])
@@ -753,22 +1009,134 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
 
 
 def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
-    """A pass the Mosaic mainloop declines on a GPU runs the next mainloop that takes it, and its route
-    reports Mosaic's own reason (the analysis's code and detail) under the row that tracks lifting it, so
-    the kernel-route audit reads a gap and not an undeclared refusal (row 2545); a Triton refusal is its
-    inherent limit."""
+    """A pass the Mosaic mainloop declines on a GPU is taken by a later mainloop, and its route reports
+    Mosaic's own reason (the analysis's code and detail) under the row its requirement declares, so the
+    kernel-route audit reads a gap and not an undeclared refusal (row 2545), whichever mainloop takes it; a
+    Triton refusal is its inherent limit."""
     from dew.nn.kernels import selection
 
     declined = selection.Refusal("registers", "no tile holds the walk's registers")
     spans = selection.Refusal("dropout", "the Triton mainloop drops no probabilities")
-    route = selection.select(attention_route.MAINLOOP,
-                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=None))
-    assert (route.kernel, route.refusal.code, route.refusal.detail) == ("triton", "registers",
-                                                                         declined.detail)
-    assert route.refusal.row == "roadmap: the Mosaic template takes every call"
-    route = selection.select(attention_route.MAINLOOP,
-                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=spans))
-    assert route.kernel == "portable"
+    [requirement] = [requirement for requirement in attention_route.MAINLOOP.kernel("mosaic").supports
+                     if requirement.code == "declined"]
+    for triton in (None, spans):
+        route = selection.select(attention_route.MAINLOOP, attention_route._Pass(
+            on_gpu=True, on_mosaic=True, mosaic=declined, triton=triton))
+        assert route.kernel != "mosaic"
+        assert (route.refusal.code, route.refusal.detail, route.refusal.row) == (
+            "registers", declined.detail, requirement.row)
     [refused] = attention_route.MAINLOOP.kernel("triton").failed(
-        attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
+        attention_route._Pass(on_gpu=True, on_mosaic=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
+
+
+def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_linear_in_its_tokens():
+    """On a CPU 'auto' routes a call by time, jax.nn's xla attention where its training step's peak, as
+    Dew's footprint model derives it, fits the device's share of the process's memory
+    (`attention_kernels._dense_fits`, `generation.host_memory_share`): a causal fp32 training step of 8 heads
+    64 wide, the first of 1024 tokens doubled whose xla attention does not fit, takes the template, its
+    compiled temporaries below a byte a score, the template's plain-JAX mainloop's, which grow with the
+    tokens, and within the process's memory (rows 4826, 5283)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    heads, width, tokens = 8, 64, 1024
+    while attention_kernels._dense_fits(attention_case(
+            jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.float32),
+            jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.float32), causal=True)):
+        tokens *= 2
+    shape = jax.ShapeDtypeStruct((1, tokens, heads, width), jnp.float32)
+
+    def loss(query, key, value):
+        return jnp.sum(scaled_dot_product_attention(query, key, value, causal=True))
+
+    step = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+    analysis = step.lower(shape, shape, shape).compile().memory_analysis()
+    assert analysis is not None
+    assert analysis.temp_size_in_bytes < min(heads * tokens * tokens, generation.host_memory_share())
+
+
+@pytest.mark.parametrize(("rows", "tokens", "heads", "ran"),
+                         [(1, 1024, 32, "xla"), (1, 2048, 32, "template"), (512, 1024, 64, "template")],
+                         ids=["measured", "past-measured", "past-memory"])
+def test_an_a100s_fp32_call_takes_xla_only_where_its_receipt_measured_and_its_scores_fit(rows, tokens, heads,
+                                                                                         ran):
+    """An A100's fp32 causal call, 128 wide over 8 key heads, whose declared cell names jax.nn's xla
+    attention (`attention_kernels.DECLARED`, timed at 1 x 1024 tokens): the call its receipt measured takes
+    xla; a longer one is a cell none declares (`FP32_MEASURED`), and one whose xla attention would not fit the
+    A100's 80 GB (512 rows of 64 heads, 412 GB of training scores by Dew's footprint model,
+    `_dense_fits`) refuses it, each taking the template, whose temporaries grow with the tokens (row 5283)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+    from dew.nn.kernels import selection
+
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.float32)
+    key = jax.ShapeDtypeStruct((rows, tokens, 8, 128), jnp.float32)
+    with generation.assumed("sm80"):
+        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, causal=True))
+    assert route.kernel == ran
+
+
+@pytest.mark.parametrize(("rows", "heads", "ran"), [(1, 32, "inference"), (512, 64, "template")],
+                         ids=["fits", "past-memory"])
+def test_an_a100s_dense_bias_trains_on_xla_only_where_its_scores_fit(rows, heads, ran):
+    """An A100's bf16 call of 1024 tokens under a bias that varies by query, 128 wide over 8 key heads: it
+    infers on the template and trains on jax.nn's xla attention ('inference') where that fits the A100's
+    80 GB; one of 512 rows of 64 heads, whose xla attention holds over a terabyte of fp32 scores a training
+    step, takes the template whole (`attention_kernels._FITS`, row 5283)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+    from dew.nn.kernels import selection
+
+    query = jax.ShapeDtypeStruct((rows, 1024, heads, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, 1024, 8, 128), jnp.bfloat16)
+    bias = jax.ShapeDtypeStruct((rows, heads, 1024, 1024), jnp.float32)
+    with generation.assumed("sm80"):
+        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, bias=bias))
+    assert route.kernel == ran
+
+
+@pytest.mark.parametrize(("groups", "limits", "least"), [
+    ("0::/outer/inner\n", {"sys/fs/cgroup/memory.max": "max", "sys/fs/cgroup/outer/memory.max": "2147483648",
+                           "sys/fs/cgroup/outer/inner/memory.max": "4294967296"}, 2147483648),
+    ("4:cpu,cpuacct:/job\n5:memory:/outer/inner\n",
+     {"sys/fs/cgroup/memory/memory.limit_in_bytes": "9223372036854771712",
+      "sys/fs/cgroup/memory/outer/inner/memory.limit_in_bytes": "1073741824"}, 1073741824),
+    ("0::/system.slice/run.service\n", {"sys/fs/cgroup/memory.max": "3221225472"}, 3221225472),
+], ids=["v2-limiting-parent", "v1-nested", "v2-container"])
+def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, groups, limits, least):
+    """A CPU call's memory share reads the limits on this process's control groups (`/proc/self/cgroup`),
+    its own group's and every ancestor's (`generation.cgroup_memory_limits`): a parent's tighter limit
+    under cgroup v2, a nested group's under v1's memory controller, and a container's own group, its mount's
+    root, where the group its process names is not mounted."""
+    (tmp_path / "proc/self").mkdir(parents=True)
+    (tmp_path / "proc/self/cgroup").write_text(groups)
+    for path, limit in limits.items():
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(limit + "\n")
+    assert min(generation.cgroup_memory_limits(str(tmp_path))) == least
+
+
+@pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
+def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
+    """A causal call of block groups (Gemma 4's images, a decision row's blocks), which only spans express
+    (`AttentionCase.spans_only`), runs where its visibility stays spans, its forward and its training alike:
+    its compiled program's temporaries grow with its tokens, not their square, twice the tokens taking under
+    three times the bytes, where a dense `[S, S]` mask or the reference path's `B H S S` logits take four
+    times (rows 1495, 1953)."""
+    heads, width = 4, 64
+
+    def temporaries(tokens: int) -> int:
+        query, key, value = (jnp.ones((1, tokens, h, width), jnp.bfloat16) for h in (heads, 2, 2))
+        groups = jnp.repeat(jnp.arange(tokens // 128, dtype=jnp.int32), 128)[None]
+
+        def attended(query, key, value):
+            return scaled_dot_product_attention(query, key, value, causal=True, block_groups=groups)
+
+        step = jax.grad(lambda *operands: attended(*operands).astype(jnp.float32).sum(),
+                        argnums=(0, 1, 2)) if differentiated else attended
+        analysis = jax.jit(step).lower(query, key, value).compile().memory_analysis()
+        assert analysis is not None
+        return analysis.temp_size_in_bytes
+
+    assert temporaries(4096) <= 3 * temporaries(2048)

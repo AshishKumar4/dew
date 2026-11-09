@@ -354,15 +354,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {
-   "comparisons": 29,
+   "comparisons": 28,
    "lane": "Kernels"
   },
   "tests/test_llama4.py": {
    "comparisons": 6,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_llama_cpp_export.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_lm_engine_parity.py": {

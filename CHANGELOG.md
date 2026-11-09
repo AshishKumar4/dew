@@ -7,6 +7,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- FlashAttention's wrapper, `dew-flash-attn` 0.3.8, lowers its call for the GPU a host states (`targeting`), so a
+  host with no GPU, the CPU lock's `kernel-compile` extra with the CUDA runtime its library loads, compiles a
+  step ahead as the GPU's program with FlashAttention's kernel in it.
+- A distillation under a host layout (`Layout(host=("variables",))`) keeps its frozen teacher as it keeps
+  a frozen stack: each scanned run of the teacher's layers, its frozen split's beside its params, is one
+  bank beside the accelerator, which the teacher's forward reads a layer at a time, where the whole
+  teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
+  host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
+  does not restore into it; start such a run afresh from its teacher.
 - `dew.telemetry.benchmark.exclusive_window(cores=None)` holds a job's measured region alone on its node's GPUs
   where a node's session runs the job. It asks the session for a window (`$OUT/window`, a byte to
   `$SESSION/wake`), waits for the grant, synchronizes the device and runs the block; on exit it synchronizes,
@@ -129,7 +138,22 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post67: each Mosaic GPU object's PTX assembles for its own target, so a
+- Dew requires its JAX build 0.12.0.1.post71: an interpreted Mosaic GPU kernel's shared memory admits its own
+  devices alone, so a second kernel interpreted at once (a program's next execution under asynchronous dispatch,
+  or one from another thread) waits for the live one's clean-up instead of joining its memory and failing.
+- Dew's JAX build 0.12.0.1.post70: a serialized executable's output types unpickle with JAX's own
+  `AutoLayout`, so a loaded executable's outputs trace as a fresh run's do (a nested `jit` fed them traced twice,
+  and a step compiled ahead recompiled on the GPU).
+- Dew's JAX build 0.12.0.1.post69: a `cond` whose lowering drops a platform's branch still passes
+  that branch's ordered-effect tokens, and the Pallas lowering cache encodes each interned abstract value and dtype
+  once per key. Its CUDA plugins are post67's on every machine: aarch64's are built (ledger row 5211), so a GH200
+  that compiles for more than one GPU target assembles each object for its own capability too, and the `cuda12`
+  and `cuda13` extras name one plugin for x86_64 and aarch64 alike.
+- Dew's JAX build 0.12.0.1.post68: the Pallas lowering cache keys no setting a lowering never reads,
+  and a process may declare packages of its own sealed by their tree's digest (`JAX_PALLAS_LOWERING_CACHE_SOURCES`),
+  which Dew declares itself, so its kernels holding Dew's own code (an `inline_mgpu` body, a marked call) are
+  kept and read back across processes. Its CUDA plugins are post67's, whose fixes follow.
+- Dew's JAX build 0.12.0.1.post67: each Mosaic GPU object's PTX assembles for its own target, so a
   process that compiles kernels for two GPUs assembles each for its own capability (post67's x86_64 plugins;
   aarch64 keeps post45's until its own are built, ledger row 5211); a compile-only GPU client keys its platform
   by the loaded CUDA runtime, as a live client does, so a host's compile-ahead entries are the ones a live run
@@ -140,8 +164,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   times; post66: a Mosaic GPU fragmented array's negation and copysign are float
   instructions, so a WGMMA accumulator negated or sign-copied in a Pallas kernel lowers; post65: a host callback returns its results at its program's lowered
   precision, so a float64 callback compiled under `jax.enable_x64` and run on another thread keeps float64;
-  post64: Pallas Mosaic GPU can keep each kernel it lowers under a key of all
-  the lowering reads, which another process reads back (a 400-op kernel's 43-46 s lowering about 1 s); post62:
+  post64: Pallas Mosaic GPU keeps each kernel it lowers under a key of all
+  the lowering reads, which another process reads back (a 400-op kernel's 43-46 s lowering about 1 s), and
+  Dew's compilation cache keeps those lowerings beside its compiled programs (`<cache>/pallas`); post62:
   Pallas's Mosaic GPU interpreter runs a block-scaled tcgen05 MMA,
   its scales applied per block before the product, and copies scales to TMEM undoing their SMEM tiling; post61:
   Pallas's Mosaic GPU interpreter runs a thread map's role body with

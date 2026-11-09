@@ -6,7 +6,7 @@ import dataclasses
 import functools
 import importlib
 from collections.abc import Callable, Iterator, Mapping
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -16,8 +16,15 @@ from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurre
 from dew.nn.kernels.templates import resources
 from dew.nn.precision import l2norm
 
-COMPILED_SHAPES = {name: CASES[name] for name in ("0.8b", "9b", "27b", "wide keys")}
-"""The shapes every declared config compiles at (`gdn_cases`): the training shapes and the widest keys."""
+if TYPE_CHECKING:
+    from kernel_compile import Expected
+
+COMPILED_SHAPES = {**{name: CASES[name] for name in ("0.8b", "9b", "27b")},
+                   "wide keys": {**CASES["wide keys"], "width": fla_gdn.WIDEST_KEYS,
+                                 "columns": fla_gdn.WIDEST}}
+"""The shapes every declared config compiles at (`gdn_cases`): the training shapes, and the widest keys and
+values the port declares it takes (`fla_gdn.WIDEST_KEYS`, `fla_gdn.WIDEST`), so the compile boundary moves
+with the declared support."""
 
 
 class KernelCase(NamedTuple):
@@ -32,6 +39,9 @@ class KernelCase(NamedTuple):
     (`kernel_compile.mosaic_failures`)."""
     required: bool = True
     """A launch the runtime admits. False marks a rejected configuration compiled only for model evidence."""
+    expected: "Expected | None" = None
+    """What its program shows compiled on a mesh of the GPUs where it is a public route's
+    (`kernel_compile.Expected`: its launches, each one's shards, its collectives), else None."""
 
 
 def _pinned(launch, tiles, *args, compensated: bool = False, terms: bool = False, **kwargs):

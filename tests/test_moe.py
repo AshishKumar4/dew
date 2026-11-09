@@ -403,3 +403,78 @@ def test_float32_expert_routing_with_x64_keeps_its_output_and_gradients():
     for expected, actual in zip(jax.tree.leaves(results[0]), jax.tree.leaves(results[1]), strict=True):
         assert actual.dtype == expected.dtype == np.float32
         np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
+    """An expert layer whose matrices are packed NVFP4 banks in its `QUANTIZATION` collection, no parameter
+    beside them (a served 4-bit checkpoint's, row 4516: `quantization.expert_matrix`), multiplied as NVFP4
+    products (`gemm.nvfp4_product`): on par with the layer holding the banks' values as dense parameters in
+    the same compute dtype, bf16 (check 1, truth the values in float64)."""
+    from packed_experts import packed_banks
+    from reference_error import assert_as_exact
+
+    from dew.quantization import QUANTIZATION
+
+    # An NVFP4 matrix's depth is whole stages (`gemm.NVFP4_STAGE`, 256).
+    experts, width, hidden, tokens, top_k = 4, 256, 256, 24, 2
+    shapes = (("gate_proj", (width, hidden)), ("up_proj", (width, hidden)), ("down_proj", (hidden, width)))
+    banks = {name: packed_banks(experts, *shape, seed) for seed, (name, shape) in enumerate(shapes)}
+    dense = {"params": {name: {"kernel": jnp.asarray(values)} for name, (_, values) in banks.items()}}
+    packed = {QUANTIZATION: {name: {"kernel": bank} for name, (bank, _) in banks.items()}}
+
+    def layer(dtype):
+        return ExpertMLP(num_experts=experts, hidden_features=hidden, out_features=width, dtype=dtype)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 2)
+        x = jax.random.normal(streams[0], (tokens, width), jnp.bfloat16)
+        indices = jax.random.randint(streams[1], (tokens, top_k), 0, experts)
+        return x, jnp.full((tokens, top_k), 1.0 / top_k, jnp.float32), indices
+
+    assert_as_exact(jax.jit(lambda *inputs: layer(None).apply(packed, *inputs)),
+                    jax.jit(lambda *inputs: layer(jnp.bfloat16).apply(dense, *inputs)), draw,
+                    "packed experts", seeds=8, truth_fn=lambda *inputs: layer(None).apply(dense, *inputs))
+
+
+def test_a_scanned_runs_stacked_packed_banks_are_read_at_its_layer_as_that_layers_banks():
+    """An expert projection over a stack of three layers' packed NVFP4 banks read in place at a traced layer
+    (`Layered`, the banked decode of a scanned packed load: row 4861) is, bit for bit, the projection over
+    that layer's bank alone, its gathered rows read gathered and the output scattered to its slots alike."""
+    from packed_experts import packed_banks
+
+    from dew.nn.kernels import gemm
+    from dew.nn.moe import Gathered, Layered, expert_projection
+
+    banks = [packed_banks(4, 256, 128, seed)[0] for seed in range(3)]
+    stack = jax.tree.map(lambda *fields: jnp.stack([jnp.asarray(field) for field in fields]), *banks)
+    sizes = jnp.asarray([5, 0, 7, 4], jnp.int32)
+    rng = np.random.default_rng(4861)
+    tokens = jnp.asarray(rng.standard_normal((12, 256)), jnp.bfloat16)
+    rows = jnp.asarray(rng.permutation(16) % 12, jnp.int32)
+    slots = jnp.asarray(rng.permutation(16), jnp.int32)
+    inputs = Gathered(tokens, rows, slots)
+
+    def project(kernel):
+        return expert_projection(inputs, kernel, sizes, jnp.bfloat16, "auto", None, scatter=slots)
+
+    for layer, bank in enumerate(banks):
+        assert isinstance(bank, gemm.NvFp4)
+        got = jax.jit(project)(Layered(stack, jnp.asarray(layer)))
+        want = jax.jit(project)(jax.tree.map(jnp.asarray, bank))
+        assert np.asarray(got).tobytes() == np.asarray(want).tobytes(), layer
+
+
+def test_packed_banks_decode_into_the_parameters_an_export_writes():
+    """A served layer's packed banks decoded for an export or a merge (`quantization.decoded_expert_banks`):
+    each its values exactly, as the layer's `params` under its name, and the bank gone from `QUANTIZATION`;
+    the layer applied to them reads what the packed layer reads, to the dense product's rounding."""
+    from packed_experts import packed_banks
+
+    from dew.quantization import QUANTIZATION, decoded_expert_banks
+
+    bank, values = packed_banks(2, 256, 256, seed=3)
+    decoded = decoded_expert_banks({"params": {"router": {"kernel": jnp.zeros((4, 2))}},
+                                    QUANTIZATION: {"experts": {"up_proj": {"kernel": bank}}}})
+    assert QUANTIZATION not in decoded
+    np.testing.assert_array_equal(np.asarray(decoded["params"]["experts"]["up_proj"]["kernel"]), values)
+    np.testing.assert_array_equal(np.asarray(decoded["params"]["router"]["kernel"]), np.zeros((4, 2)))

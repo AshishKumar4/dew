@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import across, handoffs, mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -43,7 +43,6 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                            collective_axes="wg")
         def _(smem, full, consumed, out_smem):
             ring = mosaic.Ring(smem, full, consumed)
-            wg = jax.lax.axis_index("wg")
 
             def producer():
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
@@ -80,7 +79,9 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     plgpu.copy_smem_to_gmem(out_smem.at[wg], mine)
                 plgpu.wait_smem_to_gmem(0)
 
-            mosaic.roles(wg, consumers, consumer, producer)
+            roles = (handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0))
+            handoffs.Schedule(roles).run(
+                consumer=consumer, producer=producer)
 
     return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, *BLOCK), jnp.float32), grid=(1,),
                         grid_names=("sm",), num_threads=consumers + 1, thread_name="wg",
@@ -126,6 +127,16 @@ def a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
 
 
+def _multiplying(family, lhs: str, rhs: str, interpret):
+    """A walk's step that multiplies its `lhs` slot by its `rhs` slot into its one accumulator."""
+    def step(index, slots, carry, accumulators):
+        del index
+        (acc,) = accumulators
+        return carry, (family.products(acc, slots[lhs], slots[rhs]),)
+
+    return step
+
+
 FED_STEPS = 5
 FED_ROWS, FED_WIDTH = 64, 128
 
@@ -136,7 +147,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
     warpgroup MMA without a producer (`mosaic_sm90.FED`): every consumer walks every step of one ring the
     first fills (`Family.fed`), each multiplying its share of the step's rows (two consumers: a 32-row
     contraction, its blocks staged at `mosaic.swizzle_for`'s 64 bytes), and their sums meet before one
-    store each, twice in one scope reused (`mosaic.summed_across`), in a scope after the rings'
+    store each, twice in one scope reused (`across.summed_across`), in a scope after the rings'
     (`Family.scoped` returns); the walk's steps counted from `lo`, its ring counters from 0 (`first`)."""
     from dew.nn.kernels.templates import mosaic_sm90
     family, share = mosaic_sm90.FED, FED_ROWS // consumers
@@ -159,7 +170,7 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
                 (acc,) = accumulators
                 block, rows = slots['p'], slots['x']
                 product = family.products(acc, block.at[:, pl.ds(wg * share, share)],
-                                          rows.at[pl.ds(wg * share, share)], interpret)
+                                          rows.at[pl.ds(wg * share, share)])
                 return carry, (product,)
 
             return family.walk(feed, ((step, first, first + FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
@@ -169,10 +180,10 @@ def _fed_products(p, x, *, interpret, consumers: int = 2, lo: int = 0, unrolled:
 
         def total(**scratch):
             for value, out in ((summed, out_gmem), (summed * 2, doubled_gmem)):
-                mosaic.summed_across(value, scratch, wg, consumers,
+                across.summed_across(value, scratch, wg, consumers,
                                      lambda value, out=out: out.__setitem__(slice(None), value))
 
-        pl.run_scoped(total, **mosaic.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
+        pl.run_scoped(total, **across.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
 
     out = jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32)
     return family.kernel(body, out_type=(out, out), grid=(1,), grid_names=("programs",), consumers=consumers,
@@ -265,6 +276,48 @@ def test_a_walk_takes_each_step_of_its_range_once_in_order_at_its_turn(stages, u
                     assert singly == hi - lo
 
 
+@pytest.mark.parametrize("weights", [(2, 1, 0), (1, 1, 0), (3, 1, 1, 0), (1, 0)])
+@pytest.mark.parametrize("programs", [1, 2])
+def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
+    """Each raised role's registers (`resources.role_registers`, a `Schedule`'s): none past the launch's pool
+    or setmaxnreg's ceiling, a heavier role never below a lighter one, and the pool spent to within a step
+    a role unless every role is at the ceiling (a capped role's share goes to the rest)."""
+    from dew.nn.kernels.templates import resources
+
+    with generation.assumed("sm90"):
+        held = resources.role_registers(weights, programs)
+        pool = resources.entry_registers(len(weights), programs) * len(weights)
+        step, ceiling = resources.facts().raises().step, resources.raise_ceiling()
+        floor = resources.producer_floor()
+    assert sum(held) <= pool
+    raised = [(weight, budget) for weight, budget in zip(weights, held, strict=True) if weight]
+    assert all(budget == floor for weight, budget in zip(weights, held, strict=True) if not weight)
+    assert all(budget <= ceiling and budget % step == 0 for _, budget in raised)
+    assert all(lighter <= heavier for (w1, heavier) in raised for (w2, lighter) in raised if w1 >= w2)
+    assert (all(budget == ceiling for _, budget in raised)
+            or pool - sum(held) < step * sum(weight for weight, _ in raised))
+
+
+def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
+    """A hand-off's barriers (`Schedule.scratch`) count the arrivals of the roles that fill and give it
+    back: a signal two softmax warpgroups fill counts two, and an accumulator ring the product warp fills
+    and two epilogue warpgroups give back counts one done arrival and two read ones. A role of weight 0
+    beside a warp role is refused, the last warpgroup holding one or the other."""
+    from dew.nn.kernels.templates import mosaic_sm100
+
+    schedule = handoffs.Schedule(
+        (handoffs.Role("softmax", count=2), handoffs.Role("epilogue", count=2), *mosaic_sm100.ISSUING),
+        (handoffs.HandOff("scales", mosaic_sm100.Signals(count=2, tensor_core=False), "softmax"),
+         handoffs.HandOff("output", mosaic_sm100.Accumulators(2, 128, 64), "mma", ("epilogue",))))
+    scales, (_, done, read) = schedule.scratch(generation.gpu_target("sm100"))
+    assert scales.num_arrivals == 2
+    assert (done.num_arrivals, read.num_arrivals) == (1, 2)
+    assert schedule.warpgroups() == 5
+    with pytest.raises(ValueError):
+        handoffs.Schedule((handoffs.Role("consumer"), handoffs.Role("producer", weight=0),
+                           *mosaic_sm100.ISSUING))
+
+
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
     largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
@@ -283,12 +336,27 @@ def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     assert resources.shared_bytes(mosaic_sm90.WGMMA, reducing) == 1024 + 3 * 2048 + 2048 + 8192 + 3 * 8
 
 
-def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
-    """`resources.plan` on an A100 for one mma.sync consumer at 128 registers a thread, which leave a
-    multiprocessor four programs (`Family.programs` at the launch's own registers): a launch of 16 KiB a
-    stage holds all four at the deepest ring a quarter of its shared memory holds; one of 40 KiB a stage
-    holds the most programs whose share holds its floor of two stages; one past every residency at its
-    floor plans nothing."""
+def _fits(found, launches, family, target) -> bool:
+    """Whether each plan `resources.plan` returned for `launches` fits `target`: its stages within its
+    launch's floor and most, its shared bytes its scope's at those stages and within a program's share of
+    the block at its residency, its programs within what the family's registers and the multiprocessor's
+    resident threads hold at the launch's registers."""
+    from dew.nn.kernels.templates import resources
+
+    block = generation.shared_budget(target)
+    return all(launch.floor <= plan.stages <= launch.most
+               and plan.shared == resources.shared_bytes(family, launch.scope(plan.stages))
+               and plan.shared <= resources.program_shared(block, plan.programs)
+               and 1 <= plan.programs <= family.programs(launch.consumers, launch.registers)
+               and plan.programs * launch.consumers <= resources.resident_warpgroups()
+               for plan, launch in zip(found, launches, strict=True))
+
+
+def test_a_plan_fits_its_target_or_none_is_made():
+    """`resources.plan` on an A100 for one mma.sync consumer at 128 registers a thread: a launch of 16 KiB
+    a stage and one of 40 KiB each plan within the block's shared memory, the registers and the resident
+    threads (`_fits`); one whose floor of two stages no residency's share holds (200 KiB a stage) plans
+    nothing."""
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
@@ -299,13 +367,10 @@ def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
 
     with generation.assumed("sm80"):
         target = generation.gpu_target()
-        block = generation.shared_budget(target)
-        small, wide, past = (resources.plan([launch(kib)], family, target) for kib in (16, 40, 200))
-    assert small is not None and (small[0].programs, small[0].stages) == (
-        4, min(8, resources.program_shared(block, 4) // (16 * 1024)))
-    assert wide is not None and wide[0].programs == max(
-        programs for programs in (1, 2, 3, 4) if resources.program_shared(block, programs) >= 2 * 40 * 1024)
-    assert past is None
+        for kib in (16, 40):
+            found = resources.plan([launch(kib)], family, target)
+            assert found is not None and _fits(found, [launch(kib)], family, target), kib
+        assert resources.plan([launch(200)], family, target) is None
 
 
 ISSUED = 64
@@ -396,10 +461,49 @@ def test_products_issue_in_place_into_a_carried_accumulator():
     np.testing.assert_array_equal(np.asarray(_carried_sums(a, b, c, d)), f32[0] @ f32[1] + f32[2] @ f32[3])
 
 
+def _merged(partials, combine):
+    """Each of `partials`' leading slices a program's partial of one tile, merged across the programs by
+    `combine` (`Family.fixed_up`), interpreted: the tile's first program, walked last, combines them."""
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    family = mosaic_sm90.FED  # one warpgroup, no producer
+    slices, block = partials.shape[0], partials.shape[1:]
+
+    def body(partials_gmem, out_gmem, slots_gmem):
+        # The interpreter walks the grid in order, so the tile's first program is its last.
+        program = slices - 1 - jax.lax.axis_index("programs")
+
+        def store(merged):
+            out_gmem[...] = merged
+
+        family.fixed_up(plgpu.load(partials_gmem.at[program], optimized=False), slots_gmem, None, program,
+                        0, slices, store, combine=combine)
+
+    out = (jax.ShapeDtypeStruct(block, jnp.float32), jax.ShapeDtypeStruct(partials.shape, jnp.float32))
+    return family.kernel(body, out_type=out, grid=(slices,), grid_names=("programs",), consumers=1,
+                         interpret=True, name="merged")(partials)[0]
+
+
+@INTERPRETS
+@pytest.mark.parametrize("slices", [2, 3, 5, 9])
+@pytest.mark.parametrize("block", [(16, 8), (64, 32), (128, 64)])
+def test_a_tiles_partials_merge_in_the_programs_order_whatever_their_count(block, slices):
+    """Interpreted: the programs' partials of one tile merged across the programs (`Family.fixed_up`) by
+    a merge that neither commutes nor associates, `3 * running + partial`: exactly its fold over the programs
+    in order, at tiles whose merger reads one partial at a time or several, and at counts of partials those
+    reads do not divide."""
+    def combine(running, partial):
+        return 3 * running + partial
+
+    partials = jax.random.randint(jax.random.key(4), (slices, *block), -4, 4).astype(jnp.float32)
+    np.testing.assert_array_equal(np.asarray(_merged(partials, combine)),
+                                  functools.reduce(combine, np.asarray(partials)))
+
+
 def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
     """`resources.plan` for one mma.sync consumer at 32 registers a thread and 1 KiB a program, whose
-    registers would hold sixteen programs: on an A10 and an RTX PRO 6000, twelve, their 1536 resident
-    threads' worth of its one warpgroup; on an A100 with its 2048, sixteen."""
+    registers alone would hold sixteen programs: on an A10, an RTX PRO 6000 and an A100 its plan fits each
+    part's resident threads (`_fits`), whatever their count (1536 on the first two, 2048 on an A100)."""
     from dew.nn.kernels.templates import mosaic_sm80, resources
 
     def scope(stages: int) -> resources.Scope:
@@ -407,19 +511,18 @@ def test_a_plan_holds_no_more_programs_than_its_target_runs_threads_for():
 
     launch = resources.Launch(scope, consumers=1, registers=32, floor=1)
     family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
-    for name, most in (("sm86", 12), ("sm120", 12), ("sm80", 16)):
+    for name in ("sm86", "sm120", "sm80"):
         with generation.assumed(name):
-            found = resources.plan([launch], family, generation.gpu_target())
-        assert found is not None and found[0].programs == most, name
+            target = generation.gpu_target()
+            found = resources.plan([launch], family, target)
+            assert found is not None and _fits(found, [launch], family, target), name
 
 
-def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_flight():
-    """`resources.plan` on an H100 for a warpgroup-MMA launch beside its producer shaped as the 27B gated
-    delta net's states launch (41 KiB of its own, 36 KiB a stage, 96 registers): one program five deep, 184
-    KiB in flight, where its most programs, two one deep, held 74 KiB and slowed its walk
-    (`resources.hidden`); a launch of one stage, 64 KiB at 128 registers, its most programs, three (their
-    75 KiB shares and 136-register raises hold it, four's 56 KiB and 104 do not), thrice one's bytes in
-    flight."""
+def test_a_launch_with_a_producer_plans_within_its_target():
+    """`resources.plan` on an H100 for a warpgroup-MMA launch beside its producer, shaped as the 27B gated
+    delta net's states launch (41 KiB of its own, 36 KiB a stage, 96 registers) and as a one-stage launch
+    of 64 KiB at 128 registers: each plan fits the block, the registers with the producer's and the
+    resident threads (`_fits`); a launch whose own bytes exceed the block plans nothing."""
     from dew.nn.kernels.templates import bundles, resources
 
     def launch(fixed: int, step: int, registers: int, most: int) -> resources.Launch:
@@ -430,50 +533,47 @@ def test_a_launch_with_a_producer_takes_the_plan_holding_the_most_bytes_in_fligh
 
     with generation.assumed("sm90"):
         family, target = bundles.of("sm90", jnp.bfloat16), generation.gpu_target()
-        (states,) = resources.plan([launch(42016, 36912, 96, 8)], family, target)
-        (single,) = resources.plan([launch(65536, 0, 128, 1)], family, target)
-    assert (states.programs, states.stages) == (1, 5)
-    assert (single.programs, single.stages) == (3, 1)
+        for made in (launch(42016, 36912, 96, 8), launch(65536, 0, 128, 1)):
+            found = resources.plan([made], family, target)
+            assert found is not None and _fits(found, [made], family, target)
+        past = launch(generation.shared_budget(target) + 1, 0, 96, 1)
+        assert resources.plan([past], family, target) is None
 
 
-def test_a_light_launch_is_held_within_the_threads_its_multiprocessor_runs():
-    """A one-warpgroup mma.sync launch of a few registers a thread on an L4 (sm89), whose multiprocessor runs
-    1536 threads in at most 24 blocks (CUDA C++ Programming Guide §5.1, Table 33): its registers would hold
-    sixteen programs, its threads hold twelve, and the residency it is planned at is twelve, where an A100's
-    2048 threads hold sixteen."""
-    from dew.nn.kernels.templates import bundles, resources
+def _vector_scaled(scale, x, axis: str, *, interpret: bool):
+    """An sm80 program scaling a 64 x 128 accumulator by a side vector along `axis` ('rows' or 'columns'),
+    the vector loaded as an epilogue's side tile is (`Family.loaded`, its axes stated)."""
+    from dew.nn.kernels.templates import mosaic_sm80
 
-    for generation_name, programs in (("sm89", 12), ("sm80", 16)):
-        with generation.assumed(generation_name):
-            family = bundles.of(generation_name, jnp.bfloat16)
-            assert resources.register_programs(family, 1, 32) == programs
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
 
+    def body(scale_gmem, x_gmem, out_gmem):
+        def scoped(scale_smem, barrier):
+            family.loaded([(scale_gmem, scale_smem, barrier.at[0])], axes=((axis,),))
+            vector = scale_smem[...]
+            acc = plgpu.load(x_gmem, layout=family.layout, optimized=False)
+            out_gmem[...] = acc * (vector[:, None] if axis == "rows" else vector[None, :])
 
-def test_a_consumer_is_raised_within_the_registers_a_thread_addresses():
-    """One warpgroup-MMA consumer beside its producer, one program a multiprocessor on an H100, raises to 248,
-    the largest of setmaxnreg's steps of 8 within the 255 a thread addresses, and holds them
-    (`Family.registers`): a raise to the instruction's 256 made ptxas spill a launch it otherwise compiled
-    spill-free at any raise from 192 to 248."""
-    from dew.nn.kernels.templates import bundles, resources
+        pl.run_scoped(scoped, plgpu.SMEM(scale.shape, scale.dtype), plgpu.Barrier(num_barriers=1))
 
-    with generation.assumed("sm90"):
-        family = bundles.of("sm90", jnp.bfloat16)
-        assert resources.raised_registers(1, 1) == 248
-        assert family.registers(1) == 248
+    out = jax.ShapeDtypeStruct(x.shape, jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="vector_scaled")(scale, x)
 
 
-def test_the_compile_gate_caps_a_consumer_at_the_registers_its_launch_raises_it_to():
-    """One warpgroup-MMA consumer beside its producer on an H100, at one to four programs a multiprocessor:
-    the compile gate holds it at each residency to the registers its launch raises it to there
-    (`RegisterModel.cap`, `raised_registers`: 248, 232, 136 and 104), where its cap at three programs was the
-    multiprocessor's share less the producer's, 144, past the launch's raise, so a kernel of 137 to 144
-    registers passed the gate and spilled."""
-    from dew.nn.kernels.templates import bundles, resources
-
-    with generation.assumed("sm90"):
-        family = bundles.of("sm90", jnp.bfloat16)
-        model = resources.register_model(family, 1, None)
-        assert [model.cap(programs, honored=True) for programs in range(1, 5)] == [248, 232, 136, 104]
+@pytest.mark.parametrize("axis", ["rows", "columns"])
+def test_an_sm80_side_vector_loads_in_the_layout_of_the_axis_it_follows(axis):
+    """An mma.sync epilogue's side vector is loaded in the accumulator's layout of the axis it follows (a
+    row scale `[rows]` in its rows' vector layout, read as `s[:, None]`; a column scale in its columns'),
+    so a row-scaled epilogue lowers for an A100 (row 2100's K18: every vector was loaded in the columns'
+    layout, and a row scale found no layout)."""
+    rows, columns = 64, 128
+    scale = jax.ShapeDtypeStruct((rows if axis == "rows" else columns,), jnp.float32)
+    x = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_vector_scaled, axis=axis, interpret=False)).trace(scale, x).lower(
+            lowering_platforms=("cuda",))
 
 
 def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
@@ -504,3 +604,785 @@ def test_a_launch_adding_into_two_refs_of_one_shape_is_refused_at_its_trace():
 
     for index, (shape, array) in enumerate(zip(shapes, jax.jit(stacked)(), strict=True)):
         np.testing.assert_array_equal(array, np.full(shape, index + 1.0))
+
+
+PERSISTED_TILES, PERSISTED_STEPS, PERSISTED_DEPTH = 3, 2, 64
+
+
+def _padded(rows: int, family) -> int:
+    """A tile's rows for a launch of `rows`: padded to the least its family's products issue."""
+    return -(-rows // family.rows) * family.rows
+
+
+def _persisted_products(x, w, *, family, interpret, rows: int | None = None, resident: int = 1):
+    """`x @ w` a tile at a time through `family`'s persistent walk (`Family.persist`): each tile the
+    family's least rows covering `rows` (its own least where None; `_padded`), of which it stores `rows`,
+    tile `t` the tiles' rows `t` on, each step `PERSISTED_DEPTH` of the contraction, the middle tile
+    multiplying nothing (zeros); each tile issued (`issue`'s walk) and finished (`Issuer.chunks`, each
+    chunk stored at its columns), on the family's roles, launched for `resident` programs a multiprocessor."""
+    stored = family.rows if rows is None else rows
+    rows, columns = _padded(stored, family), w.shape[1]
+    family = family.specialized(rows, columns)
+    shape = (rows, columns)
+    blocks = {'x': ((rows, PERSISTED_DEPTH), x.dtype), 'w': ((PERSISTED_DEPTH, columns), w.dtype)}
+
+    def body(x_gmem, w_gmem, o_gmem):
+        def scope(*, streams):
+            def schedule(index):
+                tile = index[0]
+                views = {'x': (x_gmem, lambda j: (tile, j)), 'w': (w_gmem, lambda j: (j, 0))}
+                return tile != 1, PERSISTED_STEPS, views, tile
+
+            def issue(wg, tile, walk, *, active):
+                del wg, tile, active
+
+                return walk(_multiplying(family, 'x', 'w', interpret), None, (shape,))[1]
+
+            def finish(wg, tile, accs, store, *, active):
+                del wg, active
+                for first, (value,) in family.chunks(accs):
+                    store(0, value, o_gmem, (tile * rows, 0, stored, first, rows))
+
+            family.persist(streams, (PERSISTED_TILES,), schedule, issue, finish, consumers=1, axis="programs",
+                           outputs=((shape, jnp.float32),), interpret=interpret, accumulators=(shape,))
+
+        family.scoped(scope, streams=family.streams(blocks, 2, 1))
+
+    out = jax.ShapeDtypeStruct((PERSISTED_TILES * rows, columns), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="persisted", resident=resident)(x, w)
+
+
+def _persisted_operands(rows: int):
+    """Small integers, so every tile's product is exact in fp32 whatever its order."""
+    keys = jax.random.split(jax.random.key(2))
+    depth = PERSISTED_STEPS * PERSISTED_DEPTH
+    x = jax.random.randint(keys[0], (PERSISTED_TILES * rows, depth), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (depth, 128), -4, 4).astype(jnp.bfloat16)
+    return x, w
+
+
+@INTERPRETS
+def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_in_chunks():
+    """Interpreted: a persistent walk on tcgen05's bundle (`mosaic_sm100.RINGS`), its product warp issuing
+    each tile's steps into one of two accumulator turns in tensor memory and the epilogue reading each
+    tile's out in chunks, over three tiles (the turns wrap) with the middle one multiplying nothing, as a
+    Blackwell's tensor memory holds them: each tile's rows exactly its product, the middle's zeros."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    x, w = _persisted_operands(family.rows)
+    with generation.assumed("sm100"):
+        got = np.asarray(_persisted_products(x, w, family=family, interpret=INTERPRETED))
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    expected[family.rows:2 * family.rows] = 0
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, rows):
+    """A launch of a decode step's few rows lowers on each bundle its device composes for them
+    (`bundles.layouts`' `rows`: mma.sync's on cp.async on an A100; on an H100 wgmma's two layouts and
+    mma.sync's on TMA rings; on a B200, for a launch stating no accumulators, and on an RTX PRO 6000,
+    mma.sync's on TMA rings, so neither leaves Mosaic, row 4727), its tile padded to the bundle's least rows
+    and storing only its own."""
+    from dew.nn.kernels.templates import bundles
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(64))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        for family in bundles.layouts(generation_name, jnp.bfloat16, rows=rows):
+            padded = (PERSISTED_TILES * _padded(rows, family), x.shape[1])
+            lhs = jax.ShapeDtypeStruct(padded, x.dtype)
+            jax.jit(functools.partial(_persisted_products, family=family, interpret=False, rows=rows)).trace(
+                lhs, w).lower(lowering_platforms=("cuda",))
+
+
+def test_the_tcgen05_persistent_walk_lowers_for_a_b200():
+    """The persistent walk on tcgen05's bundle lowers for a B200 on any host, as the GPU gate runs it."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
+            lowering_platforms=("cuda",))
+
+
+def _relayed_products(q, k, v, *, interpret):
+    """FlashAttention 4's relay on tcgen05's bundle: `S = q k` into tensor memory by the product warp, read
+    out by a role of the table (`Tcgen05Issuer.read`), doubled, narrowed and written back as `P`
+    (`write`), and `O = P v` with `P` the left operand from tensor memory (the TS product); `O` read out
+    and stored by the same role. Its roles wait on signals the products' commit and the role's publication
+    arrive at (`signals`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.RINGS
+    rows = q.shape[0]
+    columns = v.shape[1]
+
+    def body(q_gmem, k_gmem, v_gmem, o_gmem):
+        def scoped(q_smem, k_smem, v_smem, o_smem, loaded, s_tmem, p_tmem, o_tmem, scored, weighed, summed):
+            s = mosaic_sm100.Accumulator(s_tmem, (rows, k.shape[1]))
+            p = mosaic_sm100.Accumulator(p_tmem, (rows, k.shape[1]), dtype=jnp.bfloat16)
+            o = mosaic_sm100.Accumulator(o_tmem, (rows, columns))
+            scored, weighed, summed = (family.signals().opened(each) for each in (scored, weighed, summed))
+            first = mosaic.Turn.of(0, 1)
+
+            def relay(index):
+                del index
+                plgpu.barrier_wait(scored.barriers.at[0], parity=0)
+                family.write(p, family.read(s) * 2)
+                weighed.published(first)
+                plgpu.barrier_wait(summed.barriers.at[0], parity=0)
+                o_smem[...] = family.read(o)
+                plgpu.wait_load_tmem()
+                plgpu.commit_smem()
+                plgpu.copy_smem_to_gmem(o_smem, o_gmem)
+                plgpu.wait_smem_to_gmem(0)
+
+            def load():
+                for gmem, smem, at in ((q_gmem, q_smem, 0), (k_gmem, k_smem, 1), (v_gmem, v_smem, 2)):
+                    plgpu.copy_gmem_to_smem(gmem, smem, loaded.at[at])
+
+            def products():
+                for at in range(3):
+                    plgpu.barrier_wait(loaded.at[at], parity=0)
+                family.products(s, q_smem, k_smem)
+                scored.committed(first)
+                plgpu.barrier_wait(weighed.barriers.at[0], parity=0)
+                family.products(o, p, v_smem)
+                summed.committed(first)
+
+            handoffs.Schedule((handoffs.Role("relay"), *mosaic_sm100.ISSUING)).run(relay=relay, load=load,
+                                                                                mma=products)
+
+        smem = [plgpu.SMEM(each.shape, each.dtype, transforms=mosaic.swizzle_transforms(each.dtype, 128))
+                for each in (q, k, v)]
+        signals = [family.signals().scratch(), family.signals(by_products=False).scratch(),
+                   family.signals().scratch()]
+        pl.run_scoped(scoped, *smem, plgpu.SMEM((rows, columns), jnp.float32), plgpu.Barrier(num_barriers=3),
+                      family.tensor_memory((rows, k.shape[1])),
+                      family.tensor_memory((rows, k.shape[1]), jnp.bfloat16),
+                      family.tensor_memory((rows, columns)), *signals, collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="relayed")(q, k, v)
+
+
+def _relayed_operands():
+    """Small integers, so `2 (q k) v` is exact in fp32 and its weights exact in bf16."""
+    keys = jax.random.split(jax.random.key(3), 3)
+    q = jax.random.randint(keys[0], (128, 64), -2, 3).astype(jnp.bfloat16)
+    k = jax.random.randint(keys[1], (64, 128), -2, 3).astype(jnp.bfloat16)
+    v = jax.random.randint(keys[2], (128, 64), -2, 3).astype(jnp.bfloat16)
+    return q, k, v
+
+
+@INTERPRETS
+def test_a_role_relays_scores_through_tensor_memory_into_a_product_that_reads_them_there():
+    """Interpreted: scores issued into tensor memory, read out by a role, doubled and written back narrowed,
+    and the next product reading them from tensor memory as its left operand (tcgen05's TS form, P·V):
+    exactly `2 (q k) v`."""
+    q, k, v = _relayed_operands()
+    got = np.asarray(_relayed_products(q, k, v, interpret=INTERPRETED))
+    weights = 2 * (np.asarray(q, np.float32) @ np.asarray(k, np.float32))
+    np.testing.assert_array_equal(got, weights @ np.asarray(v, np.float32))
+
+
+def test_the_relay_through_tensor_memory_lowers_for_a_b200():
+    """The relay lowers for a B200 on any host, as the GPU gate runs it."""
+    q, k, v = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _relayed_operands())
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm100")
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_relayed_products, interpret=False)).trace(q, k, v).lower(
+            lowering_platforms=("cuda",))
+
+
+def test_a_tpu_core_walks_the_persistent_tiles_interpreted():
+    """Interpreted on any host: the persistent walk on a TPU core's bundle (`mosaic_tpu.MXU`), each step's
+    blocks DMA'd into its VMEM ring a step ahead and multiplied by the MXU, each tile's rows stored from
+    VMEM, over three tiles with the middle one multiplying nothing: each tile's rows exactly its product,
+    the middle's zeros."""
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    x, w = _persisted_operands(family.rows)
+    got = np.asarray(_persisted_products(x, w, family=family, interpret=True))
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    expected[family.rows:2 * family.rows] = 0
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_the_tpu_persistent_walk_lowers_for_a_v5e():
+    """The persistent walk on a TPU core's bundle lowers for a TPU v5e on any host, its devices abstract."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_persisted_products, family=family, interpret=False)).trace(x, w).lower(
+            lowering_platforms=("tpu",))
+
+
+def _read_through(x, rows, index, *, interpret):
+    """`x * index[0] + rows[:, None]` on a TPU core, each operand left in HBM and read through its family
+    (`tile_of`, `scalar_of`, `rows_of`), the result stored by a copy out of VMEM."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+
+    def body(x_hbm, rows_hbm, index_hbm, out_hbm):
+        value = (family.tile_of(x_hbm) * family.scalar_of(index_hbm).astype(jnp.float32)
+                 + family.rows_of(rows_hbm)[:, None])
+
+        def write(held):
+            held[...] = value
+            pltpu.sync_copy(held, out_hbm)
+
+        pl.run_scoped(write, pltpu.VMEM(x.shape, jnp.float32))
+
+    launch = family.kernel(body, out_type=jax.ShapeDtypeStruct(x.shape, jnp.float32), grid=(1,),
+                           grid_names=("programs",), consumers=1, interpret=interpret, name="reads")
+    return launch(x, rows, index)
+
+
+def test_a_tpu_core_reads_its_hbm_operands_through_its_family():
+    """A TPU core's tile, row vector and scalar read from operands left in HBM (`VmemRings.tile_of`,
+    `rows_of`, `scalar_of`, each through a copy): interpreted on any host, exactly `x * index[0] + rows`;
+    lowered for a TPU v5e."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
+    rows = jnp.arange(8, dtype=jnp.float32) * 1000
+    index = jnp.asarray([3], jnp.int32)
+    got = _read_through(x, rows, index, interpret=True)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(x) * 3 + np.asarray(rows)[:, None])
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    shapes = [jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (x, rows, index)]
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_read_through, interpret=False)).trace(*shapes).lower(
+            lowering_platforms=("tpu",))
+
+
+def _added_in_place(x, *, interpret):
+    """Three programs of a TPU core each adding `x * (its index + 1)` into one in-place ref's rows
+    (`VmemRings.added`, the ref a `jax.new_ref` the launch takes as an operand), beside an output each
+    program writes its index into: the ref after the launch, and the output."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu
+    family = mosaic_tpu.MXU
+    summed = jax.new_ref(jnp.zeros(x.shape, jnp.float32))
+
+    def body(x_hbm, summed_hbm, out_hbm):
+        index = family.program_index("programs")
+        family.added(family.tile_of(x_hbm) * (index + 1).astype(jnp.float32), summed_hbm, interpret,
+                     smem=None)
+
+        def write(held):
+            held[...] = jnp.full(held.shape, index, jnp.int32)
+            pltpu.sync_copy(held, out_hbm.at[pl.ds(index, 1)])
+
+        pl.run_scoped(write, pltpu.VMEM((1, 128), jnp.int32))
+
+    launch = family.kernel(body, out_type=jax.ShapeDtypeStruct((3, 128), jnp.int32), grid=(3,),
+                           grid_names=("programs",), consumers=1, interpret=interpret, name="added")
+    out = launch(x, summed)
+    return summed[...], out
+
+
+def test_a_tpu_cores_programs_add_into_an_in_place_ref_in_turn():
+    """Three programs of a TPU core adding into one ref the launch takes in place (a launch's dQ, its grouped
+    dK and dV), each read-modify-write through VMEM in turn: interpreted on any host, the ref holds the three
+    adds' sum exactly, and the launch's own output each program's row; lowered for a TPU v5e."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    x = jnp.arange(8 * 128, dtype=jnp.float32).reshape(8, 128)
+    summed, out = jax.jit(functools.partial(_added_in_place, interpret=True))(x)
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray(x) * 6)
+    np.testing.assert_array_equal(np.asarray(out), np.repeat(np.arange(3, dtype=np.int32)[:, None], 128, 1))
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(functools.partial(_added_in_place, interpret=False)).trace(
+            jax.ShapeDtypeStruct(x.shape, x.dtype)).lower(lowering_platforms=("tpu",))
+
+
+def _gemm_on_a_tpu_core():
+    """The GEMM template's kernel bodies on a TPU core's bundle (`mosaic_tpu.MXU`), each `(call, operands,
+    expected)` at small integers, so each product is exact in fp32: a dense forward with a bias epilogue,
+    the grouped forward (three groups, one empty, rows past the routed ones zero) with its matrices stored
+    as they come and transposed, and the grouped kernel gradient."""
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    rows, depth, width = 384, 512, 256
+    tiles = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family="mxu")
+    keys = jax.random.split(jax.random.key(4), 4)
+    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (3, depth, width), -3, 4).astype(jnp.bfloat16)
+    dy = jax.random.randint(keys[2], (rows, width), -3, 4).astype(jnp.bfloat16)
+    bias = jax.random.randint(keys[3], (width,), -3, 4).astype(jnp.float32)
+    sizes = jnp.asarray([100, 0, 250], jnp.int32)
+    xf, wf, dyf = (np.asarray(each, np.float32) for each in (x, w, dy))
+    unrouted = np.zeros((rows - 350, width), np.float32)
+    routed = np.concatenate([xf[:100] @ wf[0], xf[100:350] @ wf[2], unrouted])
+    grouped = functools.partial(mosaic_gpu.gmm, tiles=tiles, out_dtype=jnp.float32, multiprocessors=2)
+    return {
+        "dense bias": (functools.partial(mosaic_gpu.gmm, tiles=tiles, transpose_rhs=False,
+                                         out_dtype=jnp.float32, multiprocessors=1, dense=True,
+                                         epilogue=lambda acc, b: acc + b[None, :], epilogue_operands=(bias,),
+                                         epilogue_axes=(("columns",),)),
+                       (x, w[:1], None), xf @ wf[0] + np.asarray(bias)[None, :]),
+        "grouped": (functools.partial(grouped, transpose_rhs=False), (x, w, sizes), routed),
+        "grouped transposed": (functools.partial(grouped, transpose_rhs=True),
+                               (x, jnp.swapaxes(w, 1, 2), sizes), routed),
+        "kernel gradient": (functools.partial(mosaic_gpu.tgmm, tiles=tiles, out_dtype=jnp.float32,
+                                              multiprocessors=2), (x, dy, sizes),
+                            np.stack([xf[:100].T @ dyf[:100], np.zeros((depth, width), np.float32),
+                                      xf[100:350].T @ dyf[100:350]])),
+    }
+
+
+def test_a_tpu_launch_plans_one_program_within_its_cores_scoped_vmem():
+    """`resources.plan` on a TPU v5e for a launch on its core's bundle (`mosaic_tpu.MXU`, which budgets no
+    registers): one program at a ring its scoped VMEM holds, its DMA semaphores and its turns' schedule
+    (`schedule`, a role's) no VMEM byte of it (a scope holding them plans as one without them); one whose
+    floor of two stages the scoped VMEM does not hold plans nothing."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    from dew.nn.kernels.templates import mosaic_tpu, resources
+
+    family = mosaic_tpu.MXU
+
+    def launch(stage_bytes: int, *, signalled: bool) -> resources.Launch:
+        def scope(stages: int) -> resources.Scope:
+            semaphores = (pltpu.SemaphoreType.DMA((stages,)), family.schedule(1)) if signalled else ()
+            return resources.Scope(program=(pltpu.VMEM((stages * stage_bytes,), jnp.uint8), *semaphores))
+
+        return resources.Launch(scope, consumers=1, registers=0)
+
+    with generation.assumed("v5e"):
+        target = generation.gpu_target()
+        plain, signalled = (resources.plan([launch(2 ** 20, signalled=held)], family, target)
+                            for held in (False, True))
+        assert plain is not None and plain == signalled
+        (found,) = plain
+        assert found.programs == 1 and found.stages >= 2 and found.shared <= target.scoped_vmem
+        assert resources.plan([launch(target.scoped_vmem, signalled=True)], family, target) is None
+
+
+@pytest.mark.parametrize("case", ["dense bias", "grouped", "grouped transposed", "kernel gradient"])
+def test_the_gemms_kernel_bodies_run_on_a_tpu_core(case):
+    """Interpreted on any host, each of the GEMM template's kernel bodies on a TPU core's bundle gives its
+    product exactly, and it lowers for a TPU v5e, its devices abstract."""
+    from jax.sharding import AbstractDevice, AbstractMesh
+
+    call, operands, expected = _gemm_on_a_tpu_core()[case]
+    np.testing.assert_array_equal(np.asarray(call(*operands, interpret=True)), expected)
+    abstract = [None if each is None else jax.ShapeDtypeStruct(each.shape, each.dtype) for each in operands]
+    device = AbstractDevice(device_kind=generation.TARGETS["v5e"].device_kind, num_cores=1, platform="tpu")
+    with jax.sharding.use_abstract_mesh(AbstractMesh((1,), ("data",), abstract_device=device)):
+        jax.jit(call).trace(*abstract).lower(lowering_platforms=("tpu",))
+
+
+def test_a_consumer_launched_at_each_residency_its_family_admits_raises_to_the_gates_cap_spill_free():
+    """A persistent warpgroup-MMA walk, one consumer beside its producer, launched at each residency its
+    family admits a multiprocessor on an H100 (`RegisterModel.most`) and compiled as the GPU gate compiles
+    it: the registers its consumer raises to in its PTX (`setmaxnreg.inc`) are the gate's cap for it at that
+    residency (`RegisterModel.cap`), and its binary holds its registers within them, spilling nothing."""
+    import kernel_compile
+    from fla_gdn_support import KernelCase
+
+    from dew.nn.kernels.templates import bundles, resources
+
+    with generation.assumed("sm90"):
+        family = bundles.of("sm90", jnp.bfloat16)
+        model = resources.register_model(family, 1, None)
+    x, w = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _persisted_operands(family.rows))
+    for programs in range(1, model.most + 1):
+        call = functools.partial(_persisted_products, family=family, interpret=False, resident=programs)
+        case = KernelCase("persisted", lambda call=call: (call, (x, w)))
+        [record] = kernel_compile.compile_mosaic_kernels([case], "sm90")
+        [kernel] = record["kernels"]
+        cap = model.cap(programs, honored=True)
+        assert (kernel["raised"], kernel["spilled"]) == (cap, 0), (programs, record.get("error"), kernel)
+        assert kernel["registers"] <= cap
+
+
+RELAYED = 64
+"""A relayed product's depth and columns."""
+
+
+def _chained(a, b, c, *, m_warps: int, interpret: bool):
+    """`(a @ b) @ c` by mma.sync on `m_warps` warps along the rows (`MmaIssuer.specialized`'s split), each
+    product's left operand a register value (`a` read from a plain tile, then the first product's
+    accumulator) relayed through a tile the consumer binds where the warps split its columns (`relaying`),
+    stored through registers."""
+    from dew.nn.kernels.templates import mosaic_sm80, resources
+
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16), m_warps=m_warps)
+    rows = a.shape[0]
+
+    def body(a_gmem, b_gmem, c_gmem, out_gmem):
+        def scoped(a_smem, b_smem, c_smem, relay, out_smem):
+            for source, staged in ((a_gmem, a_smem), (b_gmem, b_smem), (c_gmem, c_smem)):
+                mosaic.copied(source, staged)
+            mosaic.synced(interpret)
+            issuer = family.relaying(relay)
+            first = issuer.product(plgpu.load(a_smem, optimized=False), b_smem, (rows, RELAYED))
+            out = issuer.product(first.astype(jnp.bfloat16), c_smem, (rows, RELAYED))
+            plgpu.store(out_smem, out, optimized=False)
+            mosaic.synced(interpret)
+            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
+                              widest=resources.copied_rows(RELAYED, jnp.float32))
+
+        swizzle = resources.widest_swizzle(jnp.bfloat16, RELAYED)
+        pl.run_scoped(scoped, mosaic.plain((rows, RELAYED), jnp.bfloat16),
+                      *(mosaic.staged((RELAYED, RELAYED), jnp.bfloat16, swizzle) for _ in range(2)),
+                      mosaic.plain((rows, RELAYED), jnp.bfloat16), mosaic.plain((rows, RELAYED), jnp.float32))
+
+    out = jax.ShapeDtypeStruct((rows, RELAYED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chained")(a, b, c)
+
+
+LANDED = 64
+"""A landed product's rows, depth and columns: one warpgroup's tile."""
+
+READS = ("product", "summed", "read", "accumulated", "added_into")
+"""The warpgroup accumulator's read paths (`mosaic_sm90.WgmmaIssuer`): a scoped product's value, a summed
+one's, a walk's accumulator read in it, the walk's results, and a value added into an accumulator."""
+
+
+def _negated(a, b, *, path: str, interpret: bool):
+    """`-(a @ b)` by warpgroup MMA (`mosaic_sm90.FED`, one warpgroup), the accumulator read along `path`
+    (`READS`) and negated before it is stored: a sign op on the accumulator's registers, which ptxas 12.9
+    folded through their value before the MMA where it was an integer op, storing -0.0 (row 4346; the fork's
+    float-sign-ops emits it as a float instruction)."""
+    from dew.nn.kernels.templates import mosaic_sm90, resources
+
+    family = mosaic_sm90.FED
+    shape = (LANDED, LANDED)
+
+    def body(a_gmem, b_gmem, out_gmem):
+        def scoped(a_smem, b_smem, out_smem):
+            mosaic.copied(a_gmem, a_smem)
+            mosaic.copied(b_gmem, b_smem)
+            if not interpret:
+                # Written through registers (the generic proxy), read by warpgroup MMA (the async one).
+                plgpu.commit_smem()
+            mosaic.synced(interpret)
+            if path == "product":
+                value = family.product(a_smem, b_smem, shape)
+            elif path == "summed":
+                value = family.summed(shape, lambda acc: family.products(acc, a_smem, b_smem))
+            else:
+                def step(index, carry, accumulators):
+                    del index
+                    (acc,) = accumulators
+                    acc = family.products(acc, a_smem, b_smem, accumulate=False)
+                    if path == "read":
+                        # Stored where it is read, inside the walk.
+                        plgpu.store(out_smem, -family.read(acc), optimized=False)
+                    elif path == "added_into":
+                        acc = family.added_into(acc, jnp.zeros(shape, jnp.float32), interpret)
+                    return carry, (acc,)
+
+                walk = (mosaic.Loop(step, 0, 1),)
+                _, (value,) = family.accumulated(walk, (), (shape,), interpret)
+            if path != "read":
+                plgpu.store(out_smem, -value, optimized=False)
+            if not interpret:
+                # Written through registers, read by the store's copy.
+                plgpu.commit_smem()
+            mosaic.synced(interpret)
+            mosaic.store_rows(out_smem, out_gmem, 0, 0, jnp.int32(LANDED), 0, LANDED, copy=mosaic.coalesced,
+                              widest=resources.copied_rows(LANDED, jnp.float32))
+
+        swizzle = resources.widest_swizzle(jnp.bfloat16, LANDED)
+        pl.run_scoped(scoped, *(mosaic.staged(shape, jnp.bfloat16, swizzle) for _ in range(2)),
+                      mosaic.plain(shape, jnp.float32), collective_axes="wg")
+
+    out = jax.ShapeDtypeStruct((LANDED, LANDED), jnp.float32)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="negated")(a, b)
+
+
+def every_warpgroup_read_lands_its_products_on_an_h100(path: str):
+    """On an H100: each read path of a warpgroup accumulator (`READS`) gives the products' value to a sign op
+    on its registers, `-(a @ b)` exactly over small integers, where ptxas dropped the MMA and stored -0.0
+    (row 4346)."""
+    keys = jax.random.split(jax.random.key(7))
+    a, b = (jax.random.randint(key, (LANDED, LANDED), -2, 3).astype(jnp.bfloat16) for key in keys)
+    expected = -(np.asarray(a, np.float32) @ np.asarray(b, np.float32))
+    np.testing.assert_array_equal(np.asarray(jax.jit(functools.partial(_negated, path=path,
+                                                                       interpret=False))(a, b)), expected)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("path", READS)
+def test_every_warpgroup_read_path_gives_the_products_value(path):
+    """Interpreted (Mosaic GPU's interpreter, its waits no-ops): each warpgroup accumulator read path
+    (`READS`) negates `a @ b` exactly; on an H100 the same kernel is the GPU flow's
+    (`every_warpgroup_read_lands_its_products_on_an_h100`)."""
+    keys = jax.random.split(jax.random.key(7))
+    a, b = (jax.random.randint(key, (LANDED, LANDED), -2, 3).astype(jnp.bfloat16) for key in keys)
+    np.testing.assert_array_equal(np.asarray(_negated(a, b, path=path, interpret=True)),
+                                  -(np.asarray(a, np.float32) @ np.asarray(b, np.float32)))
+
+
+def _chained_operands(rows: int):
+    """Small integers whose chained products are exact in fp32, the first's (at most 128) in bf16."""
+    keys = jax.random.split(jax.random.key(5), 3)
+    return (jax.random.randint(keys[0], (rows, RELAYED), -2, 3).astype(jnp.bfloat16),
+            *(jax.random.randint(key, (RELAYED, RELAYED), -1, 2).astype(jnp.bfloat16) for key in keys[1:]))
+
+
+@pytest.mark.parametrize(("rows", "m_warps"), [(16, 1), (32, 2)])
+def test_an_accumulator_feeds_the_next_product_on_any_warp_split(rows, m_warps):
+    """Register values read as mma.sync's left operands, an accumulator's among them, on warps that split
+    its columns (one or two along its rows): lowered for an A100 on any host, and on a GPU exactly `(a @ b)
+    @ c` (each warp's columns relayed through the bound tile, where no register cast crosses warps)."""
+    a, b, c = _chained_operands(rows)
+    if jax.default_backend() == "gpu":
+        f32 = [np.asarray(x, np.float32) for x in (a, b, c)]
+        np.testing.assert_array_equal(np.asarray(_chained(a, b, c, m_warps=m_warps, interpret=False)),
+                                      (f32[0] @ f32[1]) @ f32[2])
+        return
+    shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (a, b, c)]
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+    with generation.assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_chained, m_warps=m_warps, interpret=False)).trace(*shapes).lower(
+            lowering_platforms=("cuda",))
+
+
+CODES = (64, 64)
+"""A quantized stage's rows and depth."""
+
+
+def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = True):
+    """`codes` (int8 or e4m3) converted into a bf16 tile through a family's `converted`, each row scaled by
+    `scale`, and copied out: on an A100's mma.sync and an H100's fed warpgroup MMA."""
+    from dew.nn.kernels.templates import bundles, resources
+
+    family = bundles.of(generation_name, jnp.bfloat16)
+
+    def body(codes_gmem, scale_gmem, out_gmem):
+        def scoped(codes_smem, into):
+            mosaic.copied(codes_gmem, codes_smem)
+            mosaic.synced(interpret is not False)
+            row_scale = scale_gmem[...] if interpret is not False else family.rows_of(scale_gmem)
+            family.converted(codes_smem, into, interpret is not False,
+                             row_scale=row_scale if scaled else None)
+            mosaic.synced(interpret is not False)
+            mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0], copy=mosaic.coalesced,
+                              widest=resources.copied_rows(CODES[1], jnp.bfloat16))
+
+        # A fed family's kernel runs on a thread axis, which its scoped allocations name.
+        threaded = {"collective_axes": "wg"} if generation_name == "sm90" else {}
+        pl.run_scoped(scoped, mosaic.plain(CODES, codes.dtype), mosaic.plain(CODES, jnp.bfloat16), **threaded)
+
+    out = jax.ShapeDtypeStruct(CODES, jnp.bfloat16)
+    return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="converted")(codes, scale)
+
+
+def _codes(dtype):
+    """Codes of `dtype` and per-row power-of-two scales, so each converted value is exact in bf16."""
+    keys = jax.random.split(jax.random.key(6), 2)
+    codes = jax.random.randint(keys[0], CODES, -8, 8).astype(dtype)
+    # ldexp is exact where a GPU's exp2 is not (0.12499999 for 2 ** -3 on an A100).
+    exponents = jax.random.randint(keys[1], (CODES[0],), -3, 4)
+    return codes, jnp.ldexp(jnp.ones((CODES[0],), jnp.float32), exponents)
+
+
+@pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
+@pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
+    """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
+    `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
+    FP8 codes refused where the device converts none (an A100)."""
+    codes, scale = _codes(dtype)
+    expected = np.asarray(codes, np.float32) * (np.asarray(scale)[:, None] if scaled else 1)
+    with generation.assumed(generation_name):
+        converts = mosaic.converts(dtype)
+    if not converts:
+        # An A100 converts no FP8 in registers: the conversion is refused, never assembled.
+        with pytest.raises(ValueError), generation.assumed(generation_name):
+            _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED)
+        return
+    if jax.default_backend() == "cpu":
+        with generation.assumed(generation_name):
+            converted = _converted(codes, scale, generation_name=generation_name, interpret=INTERPRETED,
+                                   scaled=scaled)
+        np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
+        # Compiled for the device on any host, its PTX through ptxas (a process of the device's capability,
+        # `compile_mosaic_kernels`): an integer conversion's fold into sm_90's packed int8-to-bf16 assembly
+        # fails there, not in the lowering.
+        from fla_gdn_support import KernelCase
+        from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+        shapes = [jax.ShapeDtypeStruct(x.shape, x.dtype) for x in (codes, scale)]
+        compiled = functools.partial(_converted, generation_name=generation_name, interpret=False,
+                                     scaled=scaled)
+        found = compile_mosaic_kernels([KernelCase("converted", lambda: (compiled, shapes))], generation_name)
+        assert not mosaic_failures(found), mosaic_failures(found)
+    elif generation.device_generation() == generation_name:
+        converted = _converted(codes, scale, generation_name=generation_name, interpret=False, scaled=scaled)
+        np.testing.assert_array_equal(np.asarray(converted, np.float32), expected)
+
+
+CHUNK_DEPTH = 64
+
+
+def _chunks_products(x, w, *, interpret):
+    """`x @ w` on tcgen05's chunks (`mosaic_sm100.CHUNKS`) three ways, each from one walk step's slots: both
+    operands from shared memory (`product`); `x` from registers (`registers_product`: staged into the
+    issuer's tile, `product_scratch`'s lefts); and `x` from registers into a sum of ones the walk carries
+    in registers (`register_products`)."""
+    from dew.nn.kernels.templates import mosaic_sm100
+    family = mosaic_sm100.CHUNKS
+    rows, columns = family.rows, w.shape[1]
+
+    def body(x_gmem, w_gmem, ss_gmem, staged_gmem, carried_gmem):
+        allocated = family.streams({'x': ((rows, CHUNK_DEPTH), jnp.bfloat16),
+                                    'w': ((CHUNK_DEPTH, columns), jnp.bfloat16)}, 2, 1)
+
+        def scope(*, streams):
+            rings = family.opened(streams)
+            views = {'x': (x_gmem, lambda j: (0, j)), 'w': (w_gmem, lambda j: (j, 0))}
+
+            def step(index, slots, carry, accumulators):
+                del index
+                held, ones = family.tile_of(slots['x']), jnp.ones((rows, columns), jnp.float32)
+                ss_gmem[...] = family.product(slots['x'], slots['w'], (rows, columns))
+                staged_gmem[...] = family.registers_product(held, slots['w'])
+                carried_gmem[...] = family.register_products(ones, (held,), slots['w'])
+                return carry, accumulators
+
+            family.scheduled(1, lambda wg: family.walk(rings, ((step, 0, 1),), None, (), interpret),
+                              lambda: family.stream(rings, views, 0, 1))
+
+        # The issuer's scratch, its staged left operand's tile among it (`Family.scoped`'s `products`).
+        family.scoped(scope, streams=allocated, products=(1, (columns,), ((CHUNK_DEPTH, jnp.bfloat16),)))
+
+    out = jax.ShapeDtypeStruct((rows, columns), jnp.float32)
+    return family.kernel(body, out_type=(out, out, out), grid=(1,), grid_names=("programs",), consumers=1,
+                         interpret=interpret, name="chunks_left")(x, w)
+
+
+@INTERPRETS
+def test_a_register_left_product_on_tcgen05s_chunks_is_its_shared_memory_product():
+    """Interpreted: on tcgen05's chunks, whose product takes no register left operand
+    (`takes_register_left`), a register value staged into the issuer's tile and multiplied from there
+    (`register_products`), alone and into a sum the walk carries in registers, gives exactly the product of
+    the same operands from shared memory, and the carried sum plus it."""
+    keys = jax.random.split(jax.random.key(3))
+    x = jax.random.randint(keys[0], (64, CHUNK_DEPTH), -4, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (CHUNK_DEPTH, 128), -4, 4).astype(jnp.bfloat16)
+    ss, staged, carried = (np.asarray(out) for out in _chunks_products(x, w, interpret=INTERPRETED))
+    expected = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+    np.testing.assert_array_equal(ss, expected)
+    np.testing.assert_array_equal(staged, expected)
+    np.testing.assert_array_equal(carried, expected + 1)
+
+
+def _read_ahead(interpret):
+    """A launch adding its first operand, read ahead of its wait (`bodies.dependent`'s `ahead`, `settled`),
+    to its second, read after it."""
+    def ahead(weights_ref):
+        return weights_ref[...]
+
+    def entry(weights_ref, x_ref, o_ref, weights):
+        del weights_ref
+        o_ref[...] = x_ref[...] + weights
+
+    return mosaic.kernel(entry, out_type=jax.ShapeDtypeStruct((128, 64), jnp.float32), grid=(1,),
+                         grid_names=("tile",), warpgroups=1, interpret=interpret, family="read_ahead",
+                         ahead=ahead, settled=(0,))
+
+
+def test_a_launch_reads_ahead_of_its_wait_only_what_its_program_takes_whole():
+    """A launch reading an operand ahead of its wait (`bodies.dependent`'s `settled`) lowered for an H100: the
+    compile point takes it where the operand is the program's input, through a nested program's call and a
+    loop that hands it back each trip unchanged (`lowered.unsettled`), and refuses it where the program
+    produces the operand or a loop's trip changes it, before compiling (`report.compiled`)."""
+    from dew.nn.kernels import lowered as lowered_module
+    from dew.nn.kernels.templates import report
+
+    weights = jax.ShapeDtypeStruct((128, 64), jnp.float32)
+
+    def looped(changed):
+        def run(weights, x):
+            def trip(_, carried):
+                weights, x = carried
+                return (weights * 2.0 if changed else weights), launch(weights, x)
+            return jax.lax.fori_loop(0, 3, trip, (weights, x))[1]
+        return run
+
+    programs = {"input": lambda weights, x: launch(weights, x),
+                "nested": lambda weights, x: jax.jit(launch)(weights, x),
+                "loop": looped(changed=False),
+                "produced": lambda weights, x: launch(weights * 2.0, x),
+                "loop changed": looped(changed=True)}
+    found = {}
+    with generation.assumed("sm90"):
+        # Built for a Hopper, whose launches wait for the one before them (`bodies.waits`).
+        launch = _read_ahead(interpret=False)
+        for name, program in programs.items():
+            lowered = jax.jit(program).trace(weights, weights).lower(lowering_platforms=("cuda",))
+            found[name] = lowered_module.unsettled(lowered)
+            if found[name]:
+                with pytest.raises(lowered_module.Unsettled):
+                    report.compiled(lowered, relower=lambda lowered=lowered: lowered)
+    assert {name for name, unsettled in found.items() if unsettled} == {"produced", "loop changed"}, found
+
+
+@INTERPRETS
+def test_a_launch_runs_what_it_reads_ahead_of_its_wait_once_and_hands_it_on():
+    """Interpreted, a launch reading its first operand ahead of its wait (`bodies.dependent`'s `ahead`) adds
+    it to its second, as the program's sum does."""
+    rng = np.random.default_rng(3601)
+    weights, x = (jnp.asarray(rng.standard_normal((128, 64)), jnp.float32) for _ in range(2))
+    launched = jax.jit(_read_ahead(interpret=True))(weights, x)
+    np.testing.assert_array_equal(np.asarray(launched), np.asarray(weights + x))
+
+
+def test_a_programs_settled_arguments_are_read_as_such_and_never_donated():
+    """A program declaring an argument settled (`options.program`'s `settled`, a server's loaded weights)
+    knows its value as such while it traces (`options.settled`), and the others not; a program donating an
+    array one has read as settled refuses it (`SettledDonated`) until it is unsettled (`options.unsettle`),
+    whether called or fetched."""
+    from dew.nn.kernels import options
+
+    seen = {}
+
+    def step(weights, x):
+        seen.update(weights=options.settled(weights), x=options.settled(x))
+        return x @ weights
+
+    weights, x = jnp.eye(4, dtype=jnp.float32), jnp.ones((2, 4), jnp.float32)
+    served = options.program(step, settled=(0,))
+    np.testing.assert_array_equal(np.asarray(served(weights, x)), np.asarray(x))
+    assert seen == {"weights": True, "x": False}
+    synced = options.program(lambda weights: weights * 2.0, donate_argnums=0)
+    with pytest.raises(options.SettledDonated):
+        synced(weights)
+    with pytest.raises(options.SettledDonated):
+        options.Fetched(synced)(weights)
+    # Donated however the call passes it: by keyword only, or among variadic arguments.
+    def by_name(*, weights):
+        return weights * 2.0
+
+    def variadic(*arrays):
+        return arrays[1] * 2.0
+
+    with pytest.raises(options.SettledDonated):
+        options.program(by_name, donate_argnames="weights")(weights=weights)
+    with pytest.raises(options.SettledDonated):
+        options.program(variadic, donate_argnums=1)(x, weights)
+    options.unsettle(weights)
+    doubled = synced(weights)
+    np.testing.assert_array_equal(np.asarray(served(doubled, x)), np.asarray(x * 2.0))

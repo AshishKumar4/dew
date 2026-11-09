@@ -1,32 +1,15 @@
 """The recurrence template's algebra (docs/design/kernel-templates.md §3): the chunked form of the update as
-named, pure functions on values, which every implementation of the chunked op calls and none rewrites. This
-rung covers `S' = T S + W` with T a diagonal decay times the delta rule's erase, E the identity, and a chunk's
-transition `(T, W)` dense (`transition`); the value-side decay E and the factored transitions follow with the
-families that need them. A token updates and reads, per head over a state `S` `[Dk, Dv]`,
+named, pure functions on a chunk's tiles, which the template's launches call and none rewrites. A token
+updates and reads, per head over a state `S` `[Dk, Dv]`,
 
     S' = (I - delta beta k k^T) Gamma S + iota k v^T,    o = S'^T q
 
-(`recurrence.update` is its one-token form). Within a chunk of C tokens:
-
-- `decays(g, documents) -> (grown, pairs)`: the decay from the chunk's start `exp(gc)`, the log decay `gc`
-  cumulated within the chunk, and each pair of positions' decay `exp(gc[s] - gc[t])`, every exponent
-  compensated;
-- `intra(k, kb, pairs) -> A`: the delta rule's strictly lower key-key system, `-(beta k k^T)` weighed by the
-  pairs;
-- `factor(A) -> L`: its triangular inverse `(I - A)^-1` (WY/UT), skipped where nothing is corrected;
-- `apply(L, kb, vb, entering) -> (W, U)`: the corrected write's two products, `L (beta k exp(gc))` and `L
-  (beta v)`;
-- `carry(S, step) -> (S', (S, v_new))`: one chunk across the memory, the corrected values `v_new = U - W S`
-  and the write `grown[-1] S + (k exp(gc[-1] - gc))^T v_new`;
-- `readout(q, entering, entered, k, pairs, v_new) -> o`: the memory entered read through the decayed
-  queries, plus the chunk's own pairs;
-- `compose(first, second)`: two spans' transitions `S -> T S + W` (`Span`) as one, associatively, for a scan
-  over shards or chunks run in parallel; `entering(span, axis)` the memory each shard of a sequence enters its
-  span with, their exclusive prefix across the mesh axis.
-
-Each works over any leading dimensions: the portable math (`recurrence_chunk.chunk_delta_rule`) calls them on
-`[B, H, NC, ...]` arrays, and a kernel's body on one chunk's tiles. Packed `documents` restart the decays at
-each document's first position (varlen).
+(`recurrence.update` is its one-token form). The portable route is the same forms derived from that update
+(`dew.algebra.scan`, run by the template's plain-JAX mainloop, `recurrence_chunk.xla_mainloop`), which issue
+their products through `portable` and read a chunk's memory through `remembered`. Across a sequence's shards,
+`compose(first, second)` joins two spans' transitions `S -> T S + W` (`Span`) associatively, and
+`entering(span, axis)` gives the memory each shard of a sequence enters its span with, their exclusive prefix
+across the mesh axis. Packed documents restart the decays at each document's first position (varlen).
 
 The algebra declares its products and issues none (the design's layering): every product goes through the
 caller's `issue(name, left, right)`, the mainloop's, by its name in `PRODUCTS`, which says what it multiplies;
@@ -34,7 +17,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -42,20 +25,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import derivatives
-from dew.nn.kernels.generation import linear_map
+from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
-from dew.nn.precision import (
-    compensated_add,
-    exact_float32,
-    float32_einsum,
-    float32_matmul,
-    two_product,
-    vanishing,
-)
-
-from . import recurrence
+from dew.nn.precision import compensated_add, compensated_sum, exact_float32, float32_matmul, two_product
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
 """A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
@@ -101,93 +75,11 @@ def portable(name: str, left, right):
     precision (`dew.nn.precision.exact_float32`), since a chunk's products carry the recurrent state,
     whose rounding every later chunk reads compounded, summed as Dew sums a CPU's float32 products
     (`float32_matmul`, which `accumulated`); the portable math takes its operands in at least float32
-    (`recurrence_chunk.chunked`), a `Transposed` one transposed."""
+    (`recurrence_chunk.xla_mainloop`), a `Transposed` one transposed."""
     del name
     left, right = (jnp.swapaxes(x.value, -1, -2) if isinstance(x, Transposed) else
                    x.value if isinstance(x, Exact) else x for x in (left, right))
     return float32_matmul(left, right, exact_float32(None))
-
-
-@program
-def _cumulated(g, documents=None, restarts=None):
-    """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)` (`compensated_add`),
-    restarting at each of packed `documents`' first positions and at each of `restarts` (`[..., C, F]`): one
-    program JAX traces once for their types, whose exact sums the portable math's forward and gradient each
-    traced afresh (row 3142)."""
-    zeros = jnp.zeros_like(g)
-    if documents is None and restarts is None:
-        return jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)
-
-    def segmented(left, right):
-        (left_start, *left_sum), (right_start, *right_sum) = left, right
-        total = compensated_add(left_sum, right_sum)
-        restarted = (jnp.where(right_start, kept, summed)
-                     for kept, summed in zip(right_sum, total, strict=True))
-        return left_start | right_start, *restarted
-
-    changed = jnp.zeros(g.shape, bool)
-    if documents is not None:
-        changed = changed | jnp.concatenate([jnp.ones_like(documents[..., :1, :], bool),
-                                             documents[..., 1:, :] != documents[..., :-1, :]], axis=-2)
-    if restarts is not None:
-        changed = changed | restarts
-    _, hi, lo = jax.lax.associative_scan(segmented, (changed, g, zeros), axis=g.ndim - 2)
-    return hi, lo
-
-
-def _decays(g, documents=None):
-    """Cumulate per-chunk log decays and build the pairwise decay between positions.
-
-    `g` is `[..., C, F]`: the C positions of a chunk and F decay channels. Returns the decay from the chunk's
-    start `grown = exp(gc)`, `gc` the inclusive cumulative sum over C, `[..., C, F]`, and `decay[..., s, t, f]
-    = exp(gc[s, f] - gc[t, f])` for s >= t, zero above the diagonal, `[..., C, C, F]`.
-
-    The references subtract two fp32 cumulative sums, so every exponent carries the rounding of the chunk's
-    whole accumulated magnitude, which exp turns into a relative error on every decay. Here the cumulative sum
-    is compensated (`compensated_add`) and the difference is a `(whole, part)` pair too, exp taken of each, so
-    a decay is as precise as its own exponent: the difference rounded to one fp32 lost up to half its ulp,
-    which put the gradients of the decay and the write gate under aligned keys 1.6 to 2.1 times the
-    token-by-token recurrence's distance from float64 on an A100; `grown` takes both halves too
-    (`grown_from`), where exp of the rounded sum carried its rounding into the memory's decay and put the
-    state's gradient near twice the reference's distance from float64. On a per-key-decay model's tiny fixture
-    that error dominated the gradient: over 16 orderings of the residual stream (an exact symmetry, so only
-    the rounding moves) the updated logits sat at an RMS 2.04 times the reference's distance from float64 with
-    plain sums on CPU and 1.83 on an RTX 4080, and 0.92 and 0.72 with these, against the reference's own 0.98.
-    Summing each pair's range instead (a segment sum) is as exact and made a per-key-decay layer's forward and
-    backward 25% slower; this costs about 1% (on an RTX 4080, a 32-head per-key-decay layer over 1024 tokens
-    47.6 against 48.0 ms, a 0.8B model's per-head-decay layer over 4096 16.3 against 16.5).
-
-    The gradient is the pairs' own (`_decays_tangent`): differentiating the difference of two prefixes sums a
-    pair's cotangent into its two ends with opposite signs, and the decay gradient, a row sum less a column
-    sum of the chunk's pairs, cancelled to fp32 noise wherever the prefixes ran long.
-
-    With packed `documents` `[..., C, 1]` (each position's document within its chunk), the sum restarts at
-    each document's first position and pairs of positions in different documents weigh zero, masked before
-    exp: a document's decays are its own tokens' alone, the ones it computes run by itself.
-
-    A token whose log decay vanishes (`precision.vanishing`: its decay, and every decay through it, zero)
-    restarts the sum too, taken as 0 within it, and every decay through it is zero, as the derived chunk's
-    (`dew.algebra.scan`): summed with the rest, a prefix holding -2**127 twice was -inf (its decays NaN) and
-    one holding -2**70 lost a later -1 to its rounding (a decay of 1 in place of `exp(-1)`)."""
-    vanished = g <= vanishing(g.dtype)
-    hi, lo = _cumulated(jnp.where(vanished, 0.0, g), documents, vanished)
-    chunk_size = hi.shape[-2]
-    # Each position's segment: the vanished tokens at or before it.
-    segments = jnp.cumsum(vanished.astype(jnp.int32), axis=-2)
-    inclusive = (jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
-                 & (segments[..., :, None, :] == segments[..., None, :, :]))
-    if documents is not None:
-        inclusive = inclusive & (documents[..., :, None, :] == documents[..., None, :, :])
-    # The decay from a document's start: zero past a vanished token since it.
-    entered = _cumulated(vanished.astype(g.dtype), documents)[0] == 0
-    whole, part = compensated_add((hi[..., :, None, :], lo[..., :, None, :]),
-                                  (-hi[..., None, :, :], -lo[..., None, :, :]))
-    # Masked before exp, as the references do. The unused positive
-    # differences can overflow, and an outer where alone leaves 0 * inf in
-    # the decay gradient.
-    whole, part = (jnp.where(inclusive, x, 0.0) for x in (whole, part))
-    grown = jnp.where(entered, grown_from(jnp.where(entered, hi, 0.0), jnp.where(entered, lo, 0.0)), 0.0)
-    return grown, jnp.where(inclusive, jnp.exp(whole) * jnp.exp(part), 0.0)
 
 
 LOG2_E = math.log2(math.e)
@@ -319,204 +211,6 @@ def grown_from(hi, lo):
     return grown + grown * lo
 
 
-def _ranged(decay, dg):
-    """The decay's tangent: each pair's decay times its range's tangent, `dg` summed over `(t, s]`, pair by
-    pair; a pair across documents weighs zero."""
-    width = dg.shape[-2]
-    strict = jnp.tril(jnp.ones((width, width), bool), -1)[..., None]
-    return decay * jnp.cumsum(jnp.where(strict, dg[..., :, None, :], 0.0), axis=-3)
-
-
-def _ranged_transpose(decay, cotangent):
-    """`_ranged`'s transpose: position i's gradient is the weighted cotangent of every pair whose range holds
-    it, `sum_{s >= i} sum_{t < i} cotangent[s, t] decay[s, t]`, two cumulative sums of the chunk's pairs, no
-    pair entering any sum it does not span."""
-    width = decay.shape[-3]
-    strict = jnp.tril(jnp.ones((width, width), bool), -1)[..., None]
-    weighted = jnp.cumsum(jnp.where(strict, cotangent * decay, 0.0), axis=-2)
-    before = jnp.concatenate([jnp.zeros_like(weighted[..., :, :1, :]), weighted[..., :, :-1, :]], axis=-2)
-    after = jnp.flip(jnp.cumsum(jnp.flip(before, axis=-3), axis=-3), axis=-3)
-    return jnp.moveaxis(jnp.diagonal(after, axis1=-3, axis2=-2), -1, -2)
-
-
-def _decays_tangent(primals, tangents):
-    """The pairs' own tangent, in forward and reverse mode alike: the decay's is each pair's range
-    (`_ranged`), and its transpose sums only the pairs spanning a position (`_ranged_transpose`). On a tiny
-    hybrid's packed decision rows (tests/test_decision_packing.py, joint) the prefix difference's gradient put
-    the per-head-decay layer's A_log 3.58 and dt_bias 4.49 times as far from float64 as the rows run alone,
-    against 2 allowed; with this and the memory write's decay row (`xla_chunk_states`) every backbone leaf sat
-    at 0.77-0.93, on six CPUs of two models. It costs the chunked rule's forward and backward 4% with a decay
-    per head and 26% with one per key dimension on CPU (2 x 4096 x 16 heads of 128: 1.508 against 1.564 s; 2 x
-    1024 x 8 heads, 1.936 against 2.440 s)."""
-    g, documents = primals
-    dg, _ = tangents
-    grown, decay = decays(g, documents)
-    return (grown, decay), (grown * _cumulated(dg, documents)[0],
-                            linear_map(_ranged, _ranged_transpose, decay, dg))
-
-
-decays = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order")(
-    derivatives.declared_tangent(derivatives.Protected(), _decays, _decays_tangent))
-
-
-def factor(a, issue: Issue = portable):
-    """Return (I - A)^-1 for strictly lower triangular `a` `[..., C, C]`, the chunked delta rules' `attn[i,
-    :i] += sum_k attn[i, k] attn[k, :i]` loop.
-
-    Built from its diagonal blocks, doubling their size: with X1 and X2 the inverses of two neighbouring
-    blocks, their union's is X1 and X2 on the diagonal and X2 A21 X1 below. Each block is a diagonal block of
-    the whole inverse, so every product stays the size of its entries. The series I + A + A^2 + ..., summed by
-    doubling powers of A, did not: on a 0.8B model's aligned keys the powers grew as binomials (1.8e17 at
-    C=64) and cancelled to an inverse whose entries are at most 1, 1e24 off in fp32. The first level is
-    written out rather than as products with one-wide identity blocks: XLA TPU rewrites a matmul by a
-    broadcast identity into a dilated convolution whose fusion fails register allocation on a v6e
-    (`live_range_finder.cc:57 RET_CHECK`, jax 0.11.2)."""
-    chunk_size = a.shape[-1]
-    if chunk_size == 1:
-        return jnp.ones_like(a)
-    width = 1 << (chunk_size - 1).bit_length()
-    if width != chunk_size:  # zero rows and columns extend it by the identity
-        pad = [(0, 0)] * (a.ndim - 2) + [(0, width - chunk_size)] * 2
-        return factor(jnp.pad(a, pad), issue)[..., :chunk_size, :chunk_size]
-    lead = a.shape[:-2]
-
-    def diagonal_blocks(size):
-        """`a`'s `[..., width // size, size, size]` blocks on the diagonal."""
-        count = width // size
-        blocked = a.reshape(*lead, count, size, count, size)
-        return jnp.moveaxis(jnp.diagonal(blocked, axis1=-4, axis2=-2), -1, -3)
-
-    # Two-wide blocks: [[1, 0], [a, 1]].
-    below = diagonal_blocks(2)[..., 1, 0]
-    one, zero = jnp.ones_like(below), jnp.zeros_like(below)
-    inverse = jnp.stack([jnp.stack([one, zero], -1), jnp.stack([below, one], -1)], -2)
-    size = 2
-    while size < width:
-        pairs = inverse.reshape(*lead, width // (2 * size), 2, size, size)
-        first, second = pairs[..., 0, :, :], pairs[..., 1, :, :]
-        joined = issue("merge", issue("merge", second, diagonal_blocks(2 * size)[..., size:, :size]), first)
-        top = jnp.concatenate([first, jnp.zeros_like(first)], -1)
-        inverse = jnp.concatenate([top, jnp.concatenate([joined, second], -1)], -2)
-        size *= 2
-    return inverse.reshape(*lead, width, width)
-
-
-def paired(name: str, left, right, decay, issue: Issue = portable):
-    """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk, `[..., C, C]`: one decay channel
-    scales the product `name` after it (`_decayed_product`), one per key dimension weighs each term of it. A
-    pair whose decay is zero (above the diagonal, across a document's start: `decays` masks its exponent)
-    weighs nothing, its derivatives included: selected, not multiplied by zero, where its product's tangent
-    may overflow (ledger 2470). Its depth is summed in two halves, then added (`_halved`): the chunk form's
-    solve and readout cancel what these sums carry where keys align, and one fp32 sum over the key width
-    put the portable math's output 1.52 times the token recurrence's distance from float64 where fp32
-    products sum in fp32 (1.34 in halves; ledger 2467)."""
-    if decay.shape[-1] == 1:
-        return _decayed_product(name, issue, left, right, decay[..., 0])
-
-    def summed(depth):
-        return float32_einsum('...sd,...td,...std->...st', left[..., depth], right[..., depth],
-                              decay[..., depth], precision=exact_float32(None))
-
-    return jnp.where(jnp.any(decay != 0, axis=-1), _halved(summed, left.shape[-1]), 0.0)
-
-
-def _halved(summed: Callable[[slice], jax.Array], depth: int) -> jax.Array:
-    """`summed(slice(None))`, a product's sum over its `depth`, as its two halves' sums added (`paired`)."""
-    half = depth // 2
-    return summed(slice(None, half)) + summed(slice(half, None))
-
-
-def _decayed_primal(name: str, issue: Issue, left, right, decay):
-    """`(left @ right^T) * decay` of the pairs whose decay is nonzero, zero elsewhere (`paired`), its depth in
-    two halves (`_halved`)."""
-    return jnp.where(decay != 0, _product(name, issue, left, right) * decay, 0.0)
-
-
-def _product(name: str, issue: Issue, left, right) -> jax.Array:
-    """`left @ right^T`, the product `name`, summed over the depth in two halves (`paired`)."""
-    return _halved(lambda depth: issue(name, left[..., depth], jnp.swapaxes(right[..., depth], -1, -2)),
-                   left.shape[-1])
-
-
-def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
-    """The product's tangent with each term weighed by its pair's decay before they are summed: the terms'
-    sum before the decay overflowed fp32 where the decayed tangent is finite (keys and queries near 2^63, the
-    two terms 2.6e38 and 8.5e37 past 3.4e38 against a decay of 0.6; ledger 2470)."""
-    left, right, decay = primals
-    d_left, d_right, d_decay = tangents
-    product = _product(name, issue, left, right)
-    weighed = (issue(name, d_left, jnp.swapaxes(right, -1, -2)) * decay
-               + issue(name, left, jnp.swapaxes(d_right, -1, -2)) * decay + product * d_decay)
-    kept = decay != 0
-    return jnp.where(kept, product * decay, 0.0), jnp.where(kept, weighed, 0.0)
-
-
-_decayed_product = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order")(
-    derivatives.declared_tangent(derivatives.Protected(), _decayed_primal,
-                                   _decayed_product_tangent, nondiff_argnums=(0, 1)))
-
-
-def intra(key, keyed, pairs, issue: Issue = portable):
-    """The delta rule's strictly lower system `A` `[..., C, C]`: `-sum_d keyed[s, d] key[t, d] pairs[s, t, d]`
-    for s > t, zero on and above the diagonal, `keyed` the write-gated keys `beta k`."""
-    chunk_size = pairs.shape[-2]
-    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-    return jnp.where(strict, -paired("intra", keyed, key, pairs, issue), 0.0)
-
-
-def apply(inverse, keyed, valued, entering, issue: Issue = portable):
-    """`(W, U)`: the corrected write's products `inverse @ (keyed * entering)` and `inverse @ valued`, or,
-    without the delta rule (`inverse` None), no correction and the gated values as they are."""
-    if inverse is None:
-        return jnp.zeros_like(keyed), valued
-    return issue("apply_w", inverse, keyed * entering), issue("apply_u", inverse, valued)
-
-
-def carry(state, step, issue: Issue = portable):
-    """One chunk across the memory `state` `[..., Dk, Dv]`: `step` is the chunk's keys, `W`, `U`, the decay
-    from its start `grown` (`decays`), the decay's last row `last` (`exp(gc[-1] - gc)`, zero for a packed
-    chunk's earlier documents) and `kept` (one where the memory entering passes through, zero where a document
-    starts in the chunk). Returns the memory leaving and `(the memory entering, v_new)`."""
-    k_i, w_i, u_i, grown_i, last_i, kept_i = step
-    v_corrected = u_i - issue("corrected", w_i, state)
-    return (state * jnp.swapaxes(grown_i[..., -1:, :], -1, -2) * kept_i
-            + issue("write", jnp.swapaxes(k_i * last_i, -1, -2), v_corrected), (state, v_corrected))
-
-
-def _last_token(state, token, delta: bool):
-    """One formed token `(key, value, log_decay, beta, start)` through the recurrence's own update."""
-    key, value, g, beta, start = token
-    state = jnp.where(start[..., None, None], 0.0, state)
-    return recurrence.update(state, jnp.zeros_like(key), key, value, jnp.exp(g), beta[..., None],
-                             delta=delta)[1]
-
-
-def peeled_carry(state, step, *, delta: bool, issue: Issue = portable):
-    """A chunk's WY write through its penultimate real token, then its last through the recurrence.
-
-    `step[:6]` is `carry`'s step, whose `grown`, `last` and `kept` stop at the penultimate token;
-    its keys, W and U still span the whole chunk, so the returned corrected values stay `U - W S`
-    for `readout`. `step[6:]` is the last real token (`_last_token`), not the chunk's padding.
-
-    Under aligned keys the WY write cancels separately rounded inverse/value paths: over 40
-    draws its final memory sat 1.567 and 1.541 times the scalar/vector recurrence's error from
-    float64, predominantly generated within each chunk, not accumulated across chunks. One
-    chronological erasure at its boundary holds those at 0.997 and 1.036, and the formed gates'
-    at 1.001 over 320 draws. The readout remains WY. At 2 x 4096 x 16 heads of 128, CPU forward
-    time was 0.914 against 0.711 s, and compiled peak memory 846.8 against 845.2 MB."""
-    prefix, products = carry(state, step[:6], issue)
-    return _last_token(prefix, step[6:], delta), products
-
-
-def readout(query, entering, entered, key, pairs, corrected, issue: Issue = portable):
-    """A chunk's output `[..., C, Dv]`: the memory it entered read through the decayed queries (`remembered`),
-    and the chunk's own pairs over its corrected values (the inclusive lower `pairs` read the token itself).
-    """
-    memory: jax.Array = remembered(query * entering, entered, issue)
-    local: jax.Array = remembered(paired("scores", query, key, pairs, issue), corrected, issue, "local")
-    return memory + local
-
-
 def _remembered(decayed, entered, issue: Issue = portable, name: str = "memory"):
     """A chunk's tokens reading through their decays, `decayed @ entered` (the product `name`): the memory the
     chunk entered read through its decayed queries ('memory'), or its corrected values through its scores
@@ -528,29 +222,41 @@ def _remembered(decayed, entered, issue: Issue = portable, name: str = "memory")
     0.97-1.22 (tests/test_recurrence_stability.py)."""
     return issue(name, decayed, entered)
 
-
 def _remembered_transpose(decayed, cotangent, issue: Issue, name: str):
     """`decayed^T @ cotangent`, the chunk's tokens summed from its last."""
     return issue(name, jnp.swapaxes(jnp.flip(decayed, -2), -1, -2), jnp.flip(cotangent, -2))
 
 
-def readout_entered_gradient(decayed_query, weights, scores, cotangent, issue: Issue = portable):
-    """`readout`'s gradient in the memory a chunk entered: `Q_entered^T do - W^T (scores^T do)`,
-    because its corrected values are `U - W S`. The token reductions run from the last
-    (`_remembered_transpose`), as the memory's adjoint a token at a time does."""
-    corrected = _remembered_transpose(scores, cotangent, issue, "local")
-    memory = _remembered_transpose(decayed_query, cotangent, issue, "memory")
-    return memory - issue("corrected", jnp.swapaxes(weights, -1, -2), corrected)
+LEFT_CHUNK = 8
+"""The read width each piece of a readout's gradient in its decayed operand sums (`_remembered_left`)."""
+
+
+def _remembered_left(entered, cotangent, issue: Issue, name: str, shape: tuple[int, ...]):
+    """`cotangent @ entered^T`, the readout's gradient in its decayed operand: over the read width in pieces
+    of LEFT_CHUNK, each piece's product issued and the pieces summed rounded once (`compensated_sum`), so
+    its rounding is a piece's whatever order a backend's product sums in. As one product of the whole width,
+    XLA:CPU's order put Mamba-2's C gradient 1.61 times the token scan's distance from float64 where a
+    chunk's decays reach e^-45 (row 4543). Summed back to the decayed operand's `shape` where `entered`'s
+    batch axes broadcast it (`unbroadcast`)."""
+    width = entered.shape[-1]
+    pieces = [issue(name, cotangent[..., start:start + LEFT_CHUNK],
+                    jnp.swapaxes(entered[..., start:start + LEFT_CHUNK], -1, -2))
+              for start in range(0, width, LEFT_CHUNK)]
+    left = pieces[0] if len(pieces) == 1 else compensated_sum(jnp.stack(pieces), (0,))
+    return left if left.shape == shape else unbroadcast(left, shape)
 
 
 def _remembered_tangent(issue, name, primals, tangents):
-    """The product's tangent, its `entered` side linear in `entered` with the transpose
-    `_remembered_transpose`, in forward and reverse mode alike."""
+    """The product's tangent, linear in each side: its `entered` side with the transpose
+    `_remembered_transpose`, its decayed side with `_remembered_left`, in forward and reverse mode alike."""
     decayed, entered = primals
     d_decayed, d_entered = tangents
     read = linear_map(lambda decayed, entered: issue(name, decayed, entered),
                       functools.partial(_remembered_transpose, issue=issue, name=name), decayed, d_entered)
-    return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
+    moved = linear_map(lambda entered, decayed: issue(name, decayed, entered),
+                       functools.partial(_remembered_left, issue=issue, name=name, shape=d_decayed.shape),
+                       entered, d_decayed)
+    return remembered(decayed, entered, issue, name), moved + read
 
 
 remembered = derivatives.contracted("test_the_chunked_delta_rule_holds_every_order")(
@@ -616,35 +322,23 @@ def entering(span: Span, axis: str, initial=None, issue: Issue = portable) -> ja
     return jnp.where(index > 0, before.applied(initial.astype(before.write.dtype), issue), initial)
 
 
-def transition(key, w, u, grown, last, kept, issue: Issue = portable) -> Span:
-    """A chunk's transition `(T, W)` (`Span`, `compose`): with `carry`'s operands, `T = grown[-1] kept - (k
-    last)^T W`
-    and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`. Packed documents keep the memory
-    entering only where `kept` because the operands are built so (`recurrence_chunk.chunked`): `W` is zero
-    outside the document the memory entering belongs to and `last` outside the chunk's last document; `kept`
-    alone gates only the decay's diagonal."""
-    decayed = jnp.swapaxes(key * last, -1, -2)
-    dk = key.shape[-1]
-    diagonal = jnp.eye(dk, dtype=grown.dtype) * jnp.swapaxes(grown[..., -1:, :], -1, -2) * kept
-    return Span(diagonal - issue("corrected", decayed, w), issue("write", decayed, u))
-
-
-def peeled_transition(key, w, u, grown, last, kept, token, *, delta: bool, issue: Issue = portable):
-    """The affine map of `peeled_carry`: the prefix's transition followed by its last real token.
-    Its linear part carries memory cotangents between chunks in the custom backward."""
-    linear, written = transition(key, w, u, grown, last, kept, issue)
-    k, _, g, beta, start = token
-    no_write = k, jnp.zeros_like(k), g, beta, start
-    return Span(_last_token(linear, no_write, delta), _last_token(written, token, delta))
-
-
 # A chunk's tiles. The functions below are the same algebra on one chunk of one head, as a mainloop's
 # program holds it: sub-chunks of SUB rows and column blocks, each operand a tile or a `Load`, which a
 # GPU mainloop reads from memory where it is used and the portable mainloop slices. Every mainloop calls
 # them as they are, so two mainloops at the same tiles compute the same values.
 
 SUB = 16
-"""Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from (fla's BC)."""
+"""Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from, the reduction contract's,
+not a tile's: fla's BC, whose substitution order the template's and the portable math's inverse take on every
+GPU and every family, so check 1 pairs their numbers with the port's and the mainloops with each other (a
+family's product rows set its tiles, not this: wgmma takes 64 rows, mma.sync 16)."""
+
+class Staged(Protocol):
+    """A tile staged once in shared memory (`key_block_pairs`' and `key_decayed_pairs_back`' `staged`), a
+    block of whose rows a product reads at a time."""
+
+    def rows(self, start, count: int) -> "Tile": ...
+
 
 class Tile(Protocol):
     """A tile a mainloop holds in memory: an operand its products take as it is, transposed or read in
@@ -867,10 +561,8 @@ def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue:
 
 
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
-    """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
-    memory's decay `exp2(g_last)`."""
-    gated = corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
-    return gated, raised(last, last_lo)
+    """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves."""
+    return corrected_values * range_decay(last, last_lo, gate, gate_lo)[:, None]
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
@@ -920,60 +612,62 @@ def _laid_references(reference: Callable[[int, int], tuple], c, index: jax.Array
     return jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
 
 
-def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
-                      gates: Callable[[int], tuple],
-                      reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
-                      chunk: int, strict: bool, rolled: bool, shifted: "Shifted", sub: int = SUB):
-    """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
-    g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
-    write-gated keys) and keys `keys(c)` of each key block `c` of `columns`, fp32, `gates(c)` its prefix
-    halves, over a chunk of `chunk` tokens. Each sub-chunk `s` of `sub` rows takes its first token's prefix
-    `reference(s, c)` (a column's vectors) as its pairs' common point: its rows gated down to it,
-    `r exp2(g - g_ref)`, against every key up to its end gated up from it, `k exp2(g_ref - g)`, one product a
-    sub-chunk and key block ('pairs'): fla_kda's sub-chunk factoring. Each factor is of the separated prefix
-    (`between`), its exponent
-    within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero.
-    The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
-    rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
-    attention's intra launch, 1170 registers a thread on an A100, 519 on an H100). The key blocks are a
-    rolled loop where `rolled`, else unrolled.
+def key_block_pairs(rows: Sequence[Callable[[], jax.Array]], keys: jax.Array, prefix: tuple,
+                    at: Callable[[int], tuple], summed: Callable[..., jax.Array],
+                    staged: Callable[[jax.Array], Staged], *, chunk: int,
+                    sub: int = SUB) -> Iterator[jax.Array]:
+    """A chunk's pairs' products under a decay a key dimension, one key block's for each of `rows` (each
+    forming its row when called: the queries, the write-gated keys; fp32) against the same `keys` (fp32), its
+    prefix halves `prefix`, unmasked `[C, C]` fp32 each, formed as they are taken, one output's row and
+    products at a time (a mainloop adds each to its sum before the next is formed), their factors formed once
+    for all of them: `sum_k r_ik k_jk exp2(g_ik - g_jk)` for row `i` in sub-chunk `s` and key `j` in an
+    earlier sub-chunk `t < s`, zero for `t >= s` (a sub-chunk's own pairs are `key_diagonal_pairs`', each its
+    own decay, as fla's token-parallel diagonal). The pair's decay splits at `s`'s first token `G_s` and `t`'s
+    last `E_t`, `exp2(g_i - G_s) exp2(G_s - E_t) exp2(E_t - g_j)`: the rows gated down to their own
+    sub-chunk's start and the keys up to their own's end, each one tile's exponentials whatever the outputs;
+    the middle factor a key's vector a pair of sub-chunks (`between` of `at(token)`, the prefix halves at a
+    token as a column's vectors), laid over the rows of `s`; one product a key sub-chunk `t` and output, the
+    keys of `t` against every row into the columns of `t` alone ('pairs', `summed`, an iterable of `(name,
+    lhs, rhs)` into an accumulator of a `shape`), the keys gated up staged once for every output's
+    (`staged(up).rows(start, count)`, the keys `start` to `start + count`, read transposed): masked to their
+    sub-chunk, each product's right operand a whole chunk of keys, four products a chunk's width each and the
+    keys staged again for each. Every exponent is at most zero. A sub-chunk's own pairs factored too, the
+    queries and keys decay-scaled around its first token and taken on the tensor cores, put a packed
+    document's first token's output, a row of 2.5e-5 where `q . k` cancels, at 0.83 of its size from
+    float64 on an A100 against 7e-3 taken each its own decay (row 5194, M-JS-48w). Kimi delta attention's two
+    intra launches gated their keys up once a sub-chunk, ten tile exponentials a key block, 72% of their
+    instructions fp32 (kda-stalls-h100 at 11704365b)."""
+    whole = separated(*prefix)
+    index, _ = _grid(prefix[0].shape)
+    blocks = chunk // sub
 
-    Each sub-chunk's factored product takes the keys before it alone, its factors' exponents at most zero at
-    any decay, and its own keys' pairs are each their own decay (`key_diagonal_pairs`, `shifted` its key
-    blocks' shifted reads): fla_kda's token-parallel diagonal (chunk_kda_fwd_intra_token_parallel), finite
-    wherever the recurrence is. Factored from bf16 operands at a declared floor, a packed document's first
-    token's own pairs cancelled to 3.6e-5 of their size and its output landed at 0.83 of it natively (row
-    5194, M-JS-48w)."""
-    def products(s, c, prefix, down):
-        place = s * sub
-        start_whole, start_fraction = separated(*reference(s, c))
-        start = start_whole[None, :], start_fraction[None, :]
-        index, _ = _grid(prefix[0].shape)
-        # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
-        before = index < place
-        yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
-               lambda: Transposed(jnp.where(before, keys(c) * between(start, prefix), 0.0)))
+    def laid(halves: Callable[[int], tuple], since: int = 0) -> tuple:
+        """`halves(s)` laid over the rows of each sub-chunk `s` from `since` on, zero above."""
+        found = (jnp.zeros(index.shape, jnp.float32),) * 2
+        for s in range(since, blocks):
+            found = tuple(jnp.where(index >= s * sub, half[None, :], under)
+                          for half, under in zip(halves(s), found, strict=True))
+        return found
 
-    def block(c, total):
-        # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
-        # live within its own turn. Its rows gated down at once, each to its own sub-chunk's first token:
-        # gated a sub-chunk at a time, every row was gated for each, and the exponentials were two thirds of
-        # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
-        prefix = separated(*gates(c))
-        index, _ = _grid(prefix[0].shape)
-        down = rows(c) * between(prefix, _laid_references(reference, c, index, chunk, sub))
-        return jax.lax.fori_loop(0, chunk // sub, lambda s, total: (
-            total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
+    starts = [separated(*at(s * sub)) for s in range(blocks)]
+    ends = [separated(*at(s * sub + sub - 1)) for s in range(blocks)]
+    down = between(whole, laid(starts.__getitem__))
+    up = staged(keys * between(laid(ends.__getitem__), whole))
 
-    total = jnp.zeros((chunk, chunk), jnp.float32)
-    if rolled:
-        total = jax.lax.fori_loop(0, columns, block, total)
-    else:
-        for c in range(columns):
-            total = block(c, total)
-    total = total + key_diagonal_pairs(rows, shifted, columns, gates, chunk=chunk, strict=strict, sub=sub)
-    lag = _lags(total.shape)
-    return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
+    def middle(t: int) -> jax.Array:
+        """`exp2(G_s - E_t)` on the rows of each sub-chunk `s` past `t`, zero above."""
+        factor = jnp.zeros(index.shape, jnp.float32)
+        for s in range(t + 1, blocks):
+            factor = jnp.where(index >= s * sub, between(starts[s], ends[t])[None, :], factor)
+        return factor
+
+    def columns(row: jax.Array, t: int) -> jax.Array:
+        # The left operand formed as its product stages it (`summed` calls it), so one is live at a time.
+        return summed([("pairs", lambda: row * middle(t), up.rows(t * sub, sub).T)], shape=(chunk, sub))
+
+    for row in rows:
+        gated = row() * down
+        yield jnp.concatenate([columns(gated, t) for t in range(blocks)], axis=1)
 
 
 Shifted = Callable[[int], Callable[[jax.Array], tuple]]
@@ -1040,8 +734,7 @@ def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value,
 # a product of tiles a mainloop holds as they are or reads transposed, no register tile transposed. A
 # decay's gradient leaves as its terms, the pairs `[C, C]` (each `(i, j)` a term through the prefix's range
 # `(j, i]`) and each token's terms through the range from its chunk's start `[C]`, which `summed_pairs`
-# and `summed_ranges` sum token by token. The accurate backward is the recurrence's own adjoint a token at a
-# time (`recurrence_chunk.chunk_delta_rule`'s).
+# and `summed_ranges` sum token by token.
 
 
 def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, out_grads: TileLoad,
@@ -1063,24 +756,26 @@ def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, o
 
 
 def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, queries: TileLoad, out_grad, local,
-                    gate, low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
+                    gate, low, last, last_low, kept: list, scale: float, dtype, issue: Issue
+                    ) -> tuple[list, jax.Array]:
     """One chunk of the memory's reverse recurrence (fla's dhu) under a decay a head: from the gradient of
     the memory leaving the chunk `grad`, its key slices `[K_i, BV]` fp32, the corrected values' gradient
     `dv = (k grad) exp2(g_last - g) + local` ('values_dv', the gradient cast to `dtype`) and the gradient of
     the memory the chunk entered, `grad exp2(g_last) + scale q^T (do exp2(g)) - w^T dv` ('reads', the
     decayed `do` fp32; 'weights_dv', `dv` cast to `dtype`). `last` and `last_low` are the chunk's last prefix
-    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles. Without the delta rule
+    halves as a row's vectors, `kept[i]` the memory's decay across the chunk as key slice `i`'s rows'
+    (`exp2(g_last)` `[K_i, 1]`), `queries(i)` and `weights(i)` key slice `i`'s tiles. Without the delta rule
     (`weights` None) nothing was corrected, and the memory entered takes no `w^T dv`."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
     dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
-    kept = raised(last, last_low)[:, None]
+
     def slice_entered(i, part):
         # A slice's terms in one expression, so each slice's products are live alone (formed slice by slice
         # into a list first, every slice's partial sum stayed live past the products: 128 bytes spilled in
         # an H100's reverse walk of Qwen3.5-27B's gated delta net).
-        entered = part * kept + issue("reads", queries(i).T, read) * scale
+        entered = part * kept[i] + issue("reads", queries(i).T, read) * scale
         return entered if weights is None else entered - issue("weights_dv", weights(i).T, dv.astype(dtype))
 
     return [slice_entered(i, part) for i, part in enumerate(grad)], dv
@@ -1210,34 +905,37 @@ def key_system_back(d_system, lower: Tile, dtype, issue: Issue) -> jax.Array:
 
 def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.Array], columns: int,
                            gates: Callable[[int], tuple], reference: Callable[[int, int], tuple],
-                           summed: Callable[..., jax.Array], *, chunk: int,
-                           emit: Callable[[str, int, int, jax.Array], None], shifted: "Shifted",
+                           summed: Callable[..., jax.Array], staged: Callable[[jax.Array], Staged], *,
+                           chunk: int, emit: Callable[[str, int, int, jax.Array], None], shifted: Shifted,
                            lower: Callable[[jax.Array, jax.Array], jax.Array], d_loads: list | None = None,
                            sub: int = SUB) -> None:
-    """`key_decayed_pairs`' transpose, its sub-chunk factoring the same: for each pairs' gradient
-    `d_pairs[p]` `[C, C]` (a tile, causal or strict as its pairs were, zero elsewhere, scaled as they were)
-    of rows `rows[p](c)` against the same keys `keys(c)` fp32, each key block `c`'s gradients to `emit`:
-    `('rows', p, c, d)` the rows' `sum_j dP_ij k_j exp2(g_i - g_j)` and `('keys', 0, c, d)` the keys',
-    summed over the pairs, `sum_p sum_i dP_ij r_i exp2(g_i - g_j)`, each `[C, BK]` fp32. Each sub-chunk `s`
-    takes its first token's prefix as the common point, as the forward does: `dP` against the keys gated up
-    from it to its end (`k exp2(g_ref - g)`), kept on the rows of `s` and gated down by `exp2(g - g_ref)`;
-    `dP^T` against the rows of `s` gated down to it, each key's then gated up from it, zero past its end
-    ('pairs'). As `key_decayed_pairs` takes its own, the sub-chunks are a rolled loop, the rows' and keys'
-    gradients carried across it, the gated rows formed as their product stages them and the keys' products
-    into one accumulator (`summed`): unrolled, every sub-chunk's tiles at once, an H100's launch spilled 1756
-    bytes a thread (kda-gate3 at ee3734584).
+    """The transpose of a chunk's factored pairs (`key_block_pairs`'), each at its sub-chunk's first token:
+    for each pairs' gradient `d_pairs[p]` `[C, C]` (a tile, causal or strict as its pairs were, zero
+    elsewhere, scaled as they were) of rows `rows[p](c)` against the same keys `keys(c)` fp32, each key
+    block `c`'s gradients to `emit`: `('rows', p, c, d)` the rows' `sum_j dP_ij k_j exp2(g_i - g_j)` and
+    `('keys', 0, c, d)` the keys', summed over the pairs, `sum_p sum_i dP_ij r_i exp2(g_i - g_j)`, each
+    `[C, BK]` fp32. Each sub-chunk `s` takes its first token's prefix as the common point, as the forward
+    did: `dP` against the keys gated up from it to its end (`k exp2(g_ref - g)`), kept on the rows of `s`
+    and gated down by `exp2(g - g_ref)`; `dP^T` against the rows of `s` gated down to it, each key's then
+    gated up from it, zero past its end ('pairs'): the pairs' gradients' rows of `s` against the gated
+    rows' own, each pairs' rows gated down staged once a key block (`staged(value)`; `d_pairs` staged as
+    they come), each a tile whose `rows(start, count)` a product takes, so the keys' products' depth is a
+    sub-chunk's, not the chunk's of masked rows. The sub-chunks are a rolled loop, the rows' and keys'
+    gradients carried across it, the keys' products into one accumulator (`summed`): unrolled, every
+    sub-chunk's tiles at once, an H100's launch spilled 1756 bytes a thread (kda-gate3 at ee3734584).
 
-    As `key_decayed_pairs`', the factored products take the keys before each sub-chunk alone and each
-    sub-chunk's own pairs are each their own decay
-    (`key_diagonal_pairs_back`, `lower` moving a tile's rows up to the keys they belong to, `d_loads` the
-    pairs' gradients' loads where `d_pairs` are tiles in memory)."""
+    The factored products take the keys before each sub-chunk alone, and each sub-chunk's own pairs are
+    each their own decay (`key_diagonal_pairs_back`: `shifted(c)` the key block's shifted reads, `lower`
+    moving a tile's rows up to the keys they belong to, `d_loads` the pairs' gradients' loads where `d_pairs`
+    are tiles in memory), as the forward takes them (`key_block_pairs`)."""
     for c in range(columns):
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
         down = between(prefix, _laid_references(reference, c, index, chunk, sub))
         key = keys(c)
+        gated_rows = [staged(row(c) * down) for row in rows]
 
-        def turn(s, carried, c=c, prefix=prefix, index=index, down=down, key=key):
+        def turn(s, carried, c=c, prefix=prefix, index=index, key=key, gated_rows=gated_rows):
             d_rows, d_keys = carried
             place = s * sub
             whole, fraction = separated(*reference(s, c))
@@ -1248,8 +946,9 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
             raised_keys = key * up
             d_rows = tuple(total + jnp.where(within, summed([("pairs", d_pair, raised_keys)]), 0.0)
                            for total, d_pair in zip(d_rows, d_pairs, strict=True))
-            gated = summed([("pairs", d_pair.T, lambda row=row: jnp.where(within, row(c) * down, 0.0))
-                            for d_pair, row in zip(d_pairs, rows, strict=True)], shape=index.shape)
+            gated = summed([("pairs", d_pair.rows(place, sub).T, down_rows.rows(place, sub))
+                            for d_pair, down_rows in zip(d_pairs, gated_rows, strict=True)],
+                           shape=index.shape)
             return d_rows, d_keys + up * gated
 
         zero = jnp.zeros(index.shape, jnp.float32)
@@ -1257,8 +956,8 @@ def key_decayed_pairs_back(d_pairs: list, rows: list, keys: Callable[[int], jax.
         d_rows = tuple(total * down for total in d_rows)
         d_rows, d_keys = key_diagonal_pairs_back(d_loads or [functools.partial(lambda x: x, d_pair)
                                                              for d_pair in d_pairs],
-                                                 [row(c) for row in rows], prefix, shifted(c), lower, d_rows,
-                                                 d_keys, sub=sub)
+                                                 [row(c) for row in rows], prefix, shifted(c), lower,
+                                                 d_rows, d_keys, sub=sub)
         for p, total in enumerate(d_rows):
             emit("rows", p, c, total)
         emit("keys", 0, c, d_keys)

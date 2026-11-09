@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, PartitionSpec
 
+from dew.nn.derivatives import KernelGlue
 from dew.nn.kernels import generation
 
 
@@ -19,7 +20,7 @@ def tripled(x, index):
     return generation.linear_tangent(
         lambda x, index: (jax.lax.stop_gradient(3 * x), ()),
         lambda saved, operands, cotangent: (4 * cotangent, np.zeros(operands[1].shape, jax.dtypes.float0)),
-        lambda x, index: 3 * x)(x, index)
+        lambda x, index: 3 * x, kind=KernelGlue())(x, index)
 
 
 def summed(x, index):

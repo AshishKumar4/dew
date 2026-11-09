@@ -308,6 +308,17 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
         assert ct.certified(fn, ints)[1] == [], fn
 
 
+def test_an_integer_division_is_held_at_every_64_bit_magnitude():
+    """An integer division truncates toward zero and wraps to its width: int64's least value, -2^63, over 3
+    is -3074457345618258602, and uint64's values past 2^63 divide as themselves, each held as XLA computes
+    it (row 1966's head review)."""
+    with jax.enable_x64(new_val=True):
+        signed = (np.int64([-(2 ** 63), -(2 ** 63), 7, -7, 2 ** 63 - 1]), np.int64([3, -3, -2, 2, -1]))
+        unsigned = (np.uint64([2 ** 64 - 1, 2 ** 63 + 5]), np.uint64([3, 2]))
+        for operands in (signed, unsigned):
+            assert ct.certified(jax.lax.div, *operands)[1] == [], operands
+
+
 def _first_equation(fn, operands, name):
     """The first `name` equation check 2 holds running `fn` on `operands` (`certified.observing`): its
     params, the operands its contract was given and its results."""
@@ -744,6 +755,71 @@ def test_the_recurrence_step_witness_holds_the_interpreted_mainloop(regime):
     held = rw.witness(run, rw.interpreted_lane())
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
+
+
+@INTERPRETS
+@pytest.mark.parametrize("begins", [1.0, 1.25], ids=["on the grid", "inside a chunk"])
+def test_the_recurrence_step_witness_holds_a_packed_call(begins):
+    """The step witness (row 2084 (e)) on a packed bf16 call of three chunks whose second document begins at
+    the second chunk or a quarter into it: the launches lay each document's chunks (`rw.laid_chunks`), its
+    first chunk entering the zero memory a document starts from, held as stored, and every record lies
+    inside its step's enclosure."""
+    import jax.numpy as jnp
+
+    operands = rw.draw(0, "mild")
+    chunk = rw.recorded(*operands, carried=False).chunk
+    starts = jnp.zeros((1, operands[0].shape[1]), bool).at[0, int(begins * chunk)].set(True)
+    run = rw.recorded(*operands, starts=starts, max_segments=2)
+    held = rw.witness(run, rw.interpreted_lane())
+    for name in rw.RECORDS:
+        assert np.all(held[name]), (name, np.mean(held[name]))
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_holds_a_decay_a_key_dimension_and_refuses_one_a_head():
+    """The step witness (row 2084 (e)) under a decay a key dimension (`rw.assert_key_decays_witnessed`):
+    every record of a bf16 call of three chunks inside its step's enclosure, and a kernel reading each
+    token's mean decay for all its keys refused."""
+    rw.assert_key_decays_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_holds_a_write_gate_on_the_keys_side_and_refuses_one_dropped():
+    """The step witness (row 2084 (e)) where the write gate takes the keys' side, Mamba2's SSD under the fast
+    forms (`rw.assert_keys_gated_witnessed`): every record a bf16 call of three chunks keeps inside its step's
+    enclosure, and a kernel reading every write gate as one refused."""
+    rw.assert_keys_gated_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_holds_values_passed_in_parts_and_refuses_them_rounded():
+    """The step witness (row 2084 (c), (d), (e)) where the launches hold the values they pass in parts
+    (`rw.assert_parts_witnessed`): an fp32 call with the delta rule and without it, and a bf16 call without it
+    unrounded (Lightning's), every record each keeps inside its step's enclosure; the fp32 call run in bf16
+    refused."""
+    rw.assert_parts_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_holds_the_fused_inference_walk_and_refuses_a_rounded_carry():
+    """The step witness (row 2084 (e)) of the fused inference walk (`rw.assert_walk_witnessed`): a bf16 call
+    no gradient follows, with the delta rule and without it, every record it keeps inside its step's
+    enclosure, and the walk from a memory rounded to bf16 where fp32 is held refused."""
+    rw.assert_walk_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_holds_the_delta_rules_fast_backward():
+    """The step witness (row 2084 (e)) of the delta rule's fast backward (`rw.assert_backward_witnessed`):
+    every record each of its launches keeps, for a bf16 call of three chunks, inside its step's enclosure."""
+    rw.assert_backward_witnessed(rw.interpreted_lane())
+
+
+@INTERPRETS
+def test_the_recurrence_step_witness_holds_a_decay_a_key_dimensions_fast_backward():
+    """The step witness (row 2084 (e)) of a decay a key dimension's fast backward
+    (`rw.assert_key_backward_witnessed`): every record each launch keeps inside its step's enclosure."""
+    rw.assert_key_backward_witnessed(rw.interpreted_lane())
 
 
 @INTERPRETS

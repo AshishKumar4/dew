@@ -49,16 +49,18 @@ def _attended(causal: bool, tokens: int, rows: int, *, reference: bool = False, 
     return run
 
 
-INTERPRETED_CASES = ("full",)
-"""The call forms the interpreter runs: a causal call's per-block walk fails Mosaic GPU's interpreter at the
-pinned JAX (an XLA RET_CHECK compiling a role's thread, a tuple of 8 leaves given 9 shardings), which its
-compile for a B200 does not (row 2422)."""
 
+@pytest.fixture(autouse=True)
+def _on_a_b200():
+    """Every call the Blackwell mainloop's: its kernels' facts a B200's, interpreted on this CPU too (its
+    tensor memory's columns, `attention_blackwell._forward`'s bound)."""
+    with generation.assumed("sm100"):
+        yield
 
 @INTERPRETS
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("width", list(SHAPES))
-@pytest.mark.parametrize("case", INTERPRETED_CASES)
+@pytest.mark.parametrize("case", CASES)
 def test_the_blackwell_forward_holds_check_1_interpreted(case, width, natural):
     """The forward of a `case` call of heads `width` wide, interpreted: as exact as the template's reference
     from float64 truth, its padded tokens (masked past the keys) and its grouped heads included."""
@@ -108,8 +110,9 @@ def _forward_of(query, key, value, *, causal: bool = False, **options):
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 def test_the_blackwell_forward_keeps_finite_the_sums_that_pass_fp32s_largest_interpreted(natural):
     """Two keys of zero queries and keys weigh their values of 2^127 equally: their sum passes fp32's
-    largest though their mean does not. The rows whose sums overflowed walk again shifting
-    (`algebra.walked_launches`), so the output is the mean, 2^127, not infinity."""
+    largest though their mean does not. A call some row of which can be scaled walks with its rows' sums
+    scaled (`algebra.SCALED_WALK`, the Mosaic template's scaled kernel), so the output is the mean, 2^127,
+    not infinity."""
     width = 64
     query = jnp.zeros((1, 128, 1, width), jnp.bfloat16)
     key = jnp.zeros((1, 2, 1, width), jnp.bfloat16)

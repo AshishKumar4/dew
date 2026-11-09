@@ -605,6 +605,76 @@ Training batches hold uint8 NHWC images and `source.inputs.tokenize(captions)`. 
 
 Prepared `DenoisingInputs` can supply encoded native conditions and initial latents. Explicit grids pass to `sample(times=..., final_denoise=False)` when the last latent is the result; without an explicit grid, the existing `steps` and final clean-prediction convention remain unchanged. Published tabulated PRK grids own their integer half-interval rule; ordinary native grids retain exact half-intervals.
 
+## GPU facts
+
+`dew.gpu_facts(part=None)` returns the facts Dew's kernels read of a GPU, as a frozen `dew.GpuFacts`. They
+come from the same target the kernel templates resolve, read at each call, never a separate copy:
+
+```python
+import dew
+
+h100 = dew.gpu_facts("sm90")       # a named part: a generation, a device kind, or an alias ("a100")
+print(h100.multiprocessors, h100.l2_bytes, h100.shared_per_block, h100.instruction_families)
+```
+
+`dew.gpu_facts()`, with no `part`, describes this process's first GPU: the multiprocessors, shared memory per block, clocks
+and L2 its CUDA driver reports, and Dew's table for the rest. Inside `dew.nn.kernels.generation.assumed(...)`
+it describes the assumed part. A named part reads the table alone. The fields are the part (its device
+kind), its CUDA generation and compute capability, the multiprocessor count and clock, memory bandwidth in
+bytes a second, L2 bytes, the shared memory a block may stage, a multiprocessor's registers, the most a
+thread holds, the most threads and blocks resident on it, the dense tensor peaks by dtype (a read-only
+mapping, FLOP a second), the matrix instruction families it issues and the kernel bundles Dew's templates
+compose there. A fact no source states is `None`. A process whose device isn't a GPU, and a part Dew
+doesn't know, raise `ValueError`.
+
+## Kernel choice
+
+Each op Dew dispatches (attention, decode, the dense and grouped products, the norms and gated products, the
+recurrences' scans) picks its kernel for the call it gets, by the kernels that take the call and the one
+its cell on the device declares measured fastest. Two surfaces override that pick, over one mechanism:
+
+```python
+import dew
+import jax
+import jax.numpy as jnp
+from dew.nn.norms import RMSNorm
+
+norm = RMSNorm()
+x = jnp.ones((2, 8))
+params = norm.init(jax.random.key(0), x)
+
+with dew.kernels.use(attention="xla", rms_norm="xla"):
+    y = jax.jit(norm.apply)(params, x)     # traced in the block: these ops run the named kernels
+
+layer = RMSNorm(implementation="xla")      # one layer's own kernel
+```
+
+`dew.kernels.use(**choices)` is a block: every call traced inside it runs the kernel the block names for
+its op, over the op's pick and over a call's own `implementation=`. Nested blocks keep the outer block's
+other choices and restore them on exit. JAX keys its trace and compile caches on the choices, so a
+function jitted outside the block traces again inside it. `dew.kernels.choices` names the ops a block can
+set; a name outside them raises `ValueError` listing them. A layer's or a call's `implementation=` names
+that call's kernel. A kernel named for a call it does not take raises `dew.kernels.KernelRefused`, a
+`ValueError` carrying the op (`choice`), the kernel and every requirement the call fails (`refusals`),
+rather than running another kernel in silence.
+
+A run's `RunConfig.kernels` (`--kernels attention xla`) is the block it enters around everything it traces,
+its steps', evaluations' and samples' (`RunConfig.traced`, beside its recorded precision). Its record keeps
+the choice, so a resume runs the kernels the run ran.
+
+## Compiling a plain JAX program
+
+`dew.jit(function, **jit_args)` compiles a plain JAX or Flax function as `jax.jit` does (static arguments,
+donation, placements) through Dew's compile point: its matrix products, alone or with the elementwise work
+after them (`x @ w`, `dy @ w.T`, `x.T @ dy`, and `jax.lax.ragged_dot`'s grouped forms), run Dew's kernel
+templates where their selectors give them on the device, and its softmax attention as `jax.nn.dot_product_attention`
+(its XLA form) and Flax's `dot_product_attention` write it, with no mask or a causal one built from positions,
+at the default scale, runs the kernel Dew's attention selector gives the call (FlashAttention, cuDNN, the
+template), on par with the program's own rather than bitwise. Everything else stays XLA's. A choice named by
+`dew.kernels.use` holds here as in a layer. `jax.grad(dew.jit(f))` and `dew.jit(jax.grad(f))` reach the same
+kernels: the first rewrites `f` as it traces, the second rewrites the joint program. The caller holds the
+returned program; call it, or read `.lower(...)` and `.trace(...)` as on a jit.
+
 ## Configuration and registries
 
 Code builds every model, preset, solver, dataset and metric from its class. A record names a class by its import path, `{"class": "dew.nn.backbones.dit:SimpleDiT", "fields": {...}}`, and a function as `{"function": "optax:adamw"}`; `RunConfig.from_dict` and `ModelConfig.build` import what a record names. Where a person writes a record or a flag, `dew.registry` maps short aliases (`simple_dit`) to those paths.

@@ -64,8 +64,7 @@ backward JAX differentiates does not run."""
 REVERSE_ONLY = (*FORWARD_ORDERS, "grad of grad")
 """The orders a reverse-only derivative over kernels with none of their own does not run (`jax.custom_vjp`):
 every order through a forward derivative, and reverse over reverse, its backward kernels' own derivative
-(a fused attention kernel's, ledger 2654, which `forward_mode_attention` serves forward; a recurrence
-port's, ledger 2655)."""
+(a fused attention kernel's, ledger 2654, which `forward_mode_attention` serves forward)."""
 
 
 def orders(fn, primals, direction, cotangent):
@@ -75,7 +74,8 @@ def orders(fn, primals, direction, cotangent):
     as programs nest it (ledger 2641): under a jit within a jit, within a scan's body, and a reverse
     derivative of the gradient along `direction` (reverse over reverse)."""
     def scalar(f):
-        return lambda *x: jnp.sum(f(*x) * cotangent)
+        return lambda *x: sum(jnp.sum(out * along) for out, along in zip(
+            jax.tree.leaves(f(*x)), jax.tree.leaves(cotangent), strict=True))
 
     def forward(f):
         return lambda *x: jax.jvp(f, x, direction)[1]

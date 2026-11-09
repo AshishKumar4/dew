@@ -6,10 +6,12 @@ routed size, each against transformers' logits (see test_hf_decoders).
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from flax.traverse_util import flatten_dict
 from interop_support import (
     clearing_selections,
     fixture_ids,
@@ -241,6 +243,249 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
+
+
+PACKED_CONFIG = {**fixture_config("gpt-oss-tiny"), "hidden_size": 256, "intermediate_size": 256,
+                 "num_attention_heads": 4, "head_dim": 64, "quantization_config": {"quant_method": "mxfp4"}}
+"""A GPT-OSS whose experts are whole NVFP4 stages deep (256, `gemm.NVFP4_STAGE`): the tiny fixture's 32
+wide is not, so its banks would stay dense."""
+
+
+def _mxfp4_gpt_oss(directory: Path) -> Path:
+    """A GPT-OSS checkpoint in the released MXFP4 layout under `directory`, `PACKED_CONFIG`'s geometry,
+    its weights a draw of the model exported (`PretrainedDecoder.save`) and its experts packed by the
+    released encoder (`quantize_mxfp4`)."""
+    from safetensors.numpy import load_file, save_file
+
+    dense = {key: value for key, value in PACKED_CONFIG.items() if key != "quantization_config"}
+    model = translate_config(dense).value
+    variables = nn.unbox(model.init(jax.random.key(0), np.zeros((1, 4), np.int32)))
+    PretrainedDecoder.from_model(model, variables).save(directory / "dense")
+    packed = {}
+    for name, tensor in load_file(str(directory / "dense" / "model.safetensors")).items():
+        if name.endswith(("gate_up_proj", "down_proj")):
+            blocks, scales = (np.asarray(part) for part in quantize_mxfp4(jnp.asarray(tensor)))
+            packed[name + "_blocks"], packed[name + "_scales"] = blocks, scales
+        else:
+            packed[name] = tensor
+    (directory / "mxfp4").mkdir()
+    save_file(packed, str(directory / "mxfp4" / "model.safetensors"))
+    (directory / "mxfp4" / "config.json").write_text(json.dumps(PACKED_CONFIG))
+    return directory / "mxfp4"
+
+
+def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
+    """An MXFP4 GPT-OSS loaded with its experts packed (`Pretrained.load`'s `packed_experts`, row 4516):
+    each expert matrix an NVFP4 bank in the `QUANTIZATION` collection, no parameter beside it, holding
+    exactly the values the dequantizing load decodes; its logits on par with that load's, both bf16 with
+    the stored weights' own dtype (check 1, truth the decoded load in fp32); and its export the source's
+    MXFP4 values."""
+    from dew.nn.kernels.gemm import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    source = _mxfp4_gpt_oss(tmp_path)
+    packed, decoded = (Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto",
+                                       attention_impl="xla", packed_experts=served)
+                       for served in (True, False))
+    banks = {".".join(path): bank for path, bank in flatten_dict(
+        dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
+    assert sorted(banks) == sorted(path for path in flat_tree(decoded.variables["params"])
+                                   if path.endswith(("gate_up_proj", "down_proj")))
+    params = flat_tree(packed.variables["params"])
+    for path, bank in banks.items():
+        assert isinstance(bank, NvFp4) and path not in params
+        values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
+        held = flat_tree(decoded.variables["params"])[path]
+        np.testing.assert_array_equal(values, np.asarray(held, np.float32))
+
+    wide = Pretrained.load(str(source), dtype="float32", attention_impl="xla")
+
+    def draw(seed: int):
+        return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
+
+    def logits(loaded):
+        return jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens))
+
+    assert_as_exact(logits(packed), logits(decoded), draw, "packed GPT-OSS experts", seeds=8,
+                    truth_fn=logits(wide))
+    from safetensors.numpy import load_file
+
+    stored = load_file(str(source / "model.safetensors"))
+    exported = packed.export()
+    # The released encoder takes a group's scale from its largest value, which a group whose codes reach
+    # half the format's largest alone states at half the stored scale: its values, not its bytes.
+    for stem in {name.removesuffix("_blocks") for name in stored if name.endswith("_blocks")}:
+        np.testing.assert_array_equal(
+            np.asarray(dequantize_mxfp4(exported[stem + "_blocks"], exported[stem + "_scales"])),
+            np.asarray(dequantize_mxfp4(stored[stem + "_blocks"], stored[stem + "_scales"])))
+
+
+def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_path):
+    """E8M0's 0x00 byte is the scale 2**-127, which a writer may give a group of nonzero codes as the
+    released encoder gives an all-zero group (`quantize_mxfp4`): a GPT-OSS whose first expert's groups
+    span bytes 0 to 17, one under byte 0 holding 0.5 and -0, and one of signed zeros under byte 200 far
+    past them, loads packed (`packed_experts`), the bank holding every value its dense load decodes to the
+    bit, signed zeros included, and exports the values its dense load exports."""
+    from safetensors.numpy import load_file, save_file
+
+    from dew.nn.kernels.gemm import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    source = _mxfp4_gpt_oss(tmp_path)
+    stored = dict(load_file(str(source / "model.safetensors")))
+    stem = next(name.removesuffix("_blocks") for name in sorted(stored) if name.endswith("down_proj_blocks"))
+    blocks, scales = stored[stem + "_blocks"].copy(), stored[stem + "_scales"].copy()
+    scales[0] = np.random.default_rng(0x8E0).integers(0, 18, scales[0].shape).astype(np.uint8)
+    scales[0, 0, 0], scales[0, 0, 1] = 0, 17
+    blocks[0, 0, 0, :2] = 0x81
+    blocks[0, 1, 2], scales[0, 1, 2] = 0x88, 200
+    stored[stem + "_blocks"], stored[stem + "_scales"] = blocks, scales
+    save_file(stored, str(source / "model.safetensors"))
+
+    packed, dense = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=flag)
+                     for flag in (True, False))
+    banks = {".".join(path): bank for path, bank in flatten_dict(
+        dict(packed.variables[QUANTIZATION]), is_leaf=lambda _, leaf: isinstance(leaf, NvFp4)).items()}
+    path = next(name for name in banks if name.endswith("down_proj") and ".layers_0." in f".{name}.")
+    bank = banks[path]
+    values = np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor)[:, None, None]
+    held = np.asarray(flat_tree(dense.variables["params"])[path], np.float32)
+    np.testing.assert_array_equal(values.view(np.uint32), held.view(np.uint32))
+    # An export writes the values back, which the released encoder may state at another scale than the
+    # source's bytes (`test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded`): values, bitwise.
+    exported, written = packed.export(), dense.export()
+    np.testing.assert_array_equal(
+        np.asarray(dequantize_mxfp4(exported[stem + "_blocks"], exported[stem + "_scales"])).view(np.uint32),
+        np.asarray(dequantize_mxfp4(written[stem + "_blocks"], written[stem + "_scales"])).view(np.uint32))
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(tmp_path):
+    """An MXFP4 GPT-OSS loaded packed onto a mesh whose expert axis takes two devices (`packed_experts`
+    with `mesh`): each bank's three leaves placed by its dense matrix's axes as the bank lays them out
+    (`quantization.expert_leaf_axes`), its words, block scales and tensor scales sharded on the expert
+    axis as the dense matrix's experts are, and its logits on par with the unplaced packed load's
+    (check 1)."""
+    from dew.distributed.placement import Layout, MeshSpec
+    from dew.nn.kernels.gemm import NvFp4
+    from dew.quantization import QUANTIZATION
+
+    source = _mxfp4_gpt_oss(tmp_path)
+    mesh = MeshSpec(expert=2)
+    placed = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+                             packed_experts=True, mesh=mesh)
+    held = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+                           packed_experts=True)
+    dense = Pretrained.load(str(source), dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+                            mesh=mesh)
+    params = dict(flatten_dict(dict(dense.variables["params"])))
+    banks = flatten_dict(dict(placed.variables[QUANTIZATION]),
+                         is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+    sharded = 0
+    for path, bank in banks.items():
+        experts = params[path].sharding.spec[0]
+        assert experts is not None
+        for leaf in (bank.words, bank.scales, bank.scale):
+            # A leaf under the layout's least sharded size stays whole, as a dense one does
+            # (`Layout.min_shard`): the gate-up banks' words are past it.
+            first = None if leaf.size < Layout().min_shard else experts
+            assert (tuple(leaf.sharding.spec) or (None,))[0] == first, (path, leaf.shape, leaf.sharding)
+            sharded += first is not None
+    assert sharded
+
+    def draw(seed: int):
+        return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
+
+    def logits(loaded):
+        return jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens))
+
+    assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=8)
+
+
+def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():
+    """An MXFP4 GPT-OSS loaded packed with its layers scanned (`packed_experts` with `scan_layers`, row
+    4861): the scan stacks each bank's three leaves as it stacks a dense matrix and slices a layer's back,
+    so its logits and their gradient are the unscanned packed load's bit for bit."""
+    import tempfile
+
+    source = _mxfp4_gpt_oss(Path(tempfile.mkdtemp()))
+    scanned, plain = (Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=True,
+                                      scan_layers=scan) for scan in (True, False))
+    tokens = jax.random.randint(jax.random.key(0), (2, 8), 0, PACKED_CONFIG["vocab_size"])
+
+    def loss(loaded):
+        return jax.jit(jax.value_and_grad(
+            lambda params: jnp.sum(loaded.model.apply({**loaded.variables, "params": params}, tokens) ** 2)))(
+                loaded.variables["params"])
+
+    # A scan is how the model runs, its stored tree the same (`Pretrained.load`'s `Scanning`).
+    (scanned_loss, scanned_grad), (plain_loss, plain_grad) = loss(scanned), loss(plain)
+    np.testing.assert_array_equal(np.asarray(scanned_loss), np.asarray(plain_loss))
+    jax.tree.map(lambda left, right: np.testing.assert_array_equal(np.asarray(left), np.asarray(right)),
+                 scanned_grad, plain_grad)
+
+
+def test_an_mxfp4_gpt_oss_whose_experts_are_no_whole_stages_loads_packed_as_it_loads_dense():
+    """The tiny MXFP4 fixture's experts, 32 deep, are no whole NVFP4 stages: loaded packed, each stays
+    dense, the load its dense load leaf for leaf, nothing held in `QUANTIZATION`."""
+    import tempfile
+
+    from safetensors.numpy import load_file, save_file
+
+    from dew.quantization import QUANTIZATION
+
+    directory = Path(tempfile.mkdtemp())
+    packed = {}
+    for name, tensor in load_file(str(GPT_OSS / "model.safetensors")).items():
+        if name.endswith(("gate_up_proj", "down_proj")):
+            blocks, scales = (np.asarray(part) for part in quantize_mxfp4(jnp.asarray(tensor)))
+            packed[name + "_blocks"], packed[name + "_scales"] = blocks, scales
+        else:
+            packed[name] = tensor
+    save_file(packed, str(directory / "model.safetensors"))
+    (directory / "config.json").write_text(json.dumps(
+        {**fixture_config("gpt-oss-tiny"), "quantization_config": {"quant_method": "mxfp4"}}))
+    served, plain = (Pretrained.load(str(directory), dtype="float32", attention_impl="xla",
+                                     packed_experts=flag) for flag in (True, False))
+    assert QUANTIZATION not in served.variables
+    for path, leaf in flat_tree(served.variables["params"]).items():
+        assert np.array_equal(np.asarray(leaf), np.asarray(flat_tree(plain.variables["params"])[path])), path
+
+
+def _packed_run(source: Path, directory: Path, steps: int):
+    """A run of `steps` steps of the MXFP4 GPT-OSS at `source` served packed (`packed_experts`), its
+    parameters trained by SGD around its frozen banks, each step checkpointed, and the state it ends with."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="xla", packed_experts=True)
+    objective = LMObjective(loaded.model, seq_len=8, ema_decay=None, variables=loaded.variables)
+    rows = [{"text": (np.arange(9, dtype=np.int32) + index) % PACKED_CONFIG["vocab_size"]}
+            for index in range(16)]
+    batches = compile(Memory(rows).shuffle(0).repeat().batch(8), read="memory",
+                      loading=Loading(workers=0, threads=1, read_buffer=1))
+    checkpoints = Checkpoints(str(directory), keep=3)
+    state = Trainer(objective, optax.sgd(1e-2), key=0, checkpoints=checkpoints).fit(
+        batches, steps=steps, checkpoint_every=1, log_every=100)
+    checkpoints.wait()
+    return state
+
+
+def test_a_resumed_run_over_packed_experts_trains_on_bitwise_as_an_uninterrupted_run(tmp_path):
+    """A run over an MXFP4 GPT-OSS served packed: two steps, a resume and a third land where three
+    uninterrupted steps do, every leaf of the state bitwise, the banks among them restored as written."""
+    source = _mxfp4_gpt_oss(tmp_path)
+    whole = _packed_run(source, tmp_path / "whole", 3)
+    _packed_run(source, tmp_path / "resumed", 2)
+    resumed = _packed_run(source, tmp_path / "resumed", 3)
+    for left, right in zip(jax.tree.leaves((whole.variables, whole.opt_state)),
+                           jax.tree.leaves((resumed.variables, resumed.opt_state)), strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
 @pytest.mark.network

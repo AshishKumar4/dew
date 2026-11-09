@@ -75,9 +75,10 @@ from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Coordinates, unboxed
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.derivatives import contracted, surrogate
+from dew.nn.fake_quant import fp4_codes, fp8_codes, straight_through
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.options import owned_program
-from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide
+from dew.nn.precision import accumulated, at_least_fp32, correctly_rounded_divide, float32_einsum
 from dew.nn.sharding import abstract
 
 if TYPE_CHECKING:
@@ -85,6 +86,7 @@ if TYPE_CHECKING:
 
     from dew.batch import Variables
     from dew.diffusion.process import Conditioning
+    from dew.nn.kernels.gemm import NvFp4
 
 QuantizedDtype = Literal["int8", "fp8"]
 """The gemm dtypes a run trains with: int8 on any backend, fp8 where the
@@ -529,6 +531,49 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
+def expert_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]) -> jax.Array | NvFp4:
+    """An expert bank's matrix `name` of `module` (`[experts, in, out]`): the packed bank its `QUANTIZATION`
+    collection holds under the name (`dew.nn.kernels.gemm.NvFp4`, a checkpoint's 4-bit experts served as
+    their codes, row 4516), else its parameter, `make()`."""
+    if module.has_variable(QUANTIZATION, name):
+        return module.get_variable(QUANTIZATION, name)
+    return make()
+
+
+def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> list[tuple[str | None, ...]]:
+    """The logical axes of each leaf of an expert bank's `matrix` (`expert_matrix`), its own `[experts, in,
+    out]` being `axes`: one leaf, the matrix; a packed bank's three (`NvFp4`), its words and block scales
+    `[experts, out, in / 8 or in / 16]` and its tensor scales `[experts]`, in its leaves' order."""
+    from dew.nn.kernels.gemm import NvFp4
+
+    if not isinstance(matrix, NvFp4):
+        return [tuple(axes)]
+    experts, inputs, outputs = axes
+    return [(experts, outputs, inputs), (experts, outputs, inputs), (experts,)]
+
+
+def decoded_expert_banks(variables: Variables) -> Variables:
+    """`variables` with each packed expert bank (`expert_matrix`) decoded into `params` under its name,
+    `[experts, in, out]` float32, each value its code times its block's scale times its expert's, exactly
+    (`NvFp4.decoded` times its factor), and the bank gone from `QUANTIZATION`: the float tree an export or
+    a merge takes, as `decoded_frozen_fp8` decodes a frozen FP8 site."""
+    from dew.nn.kernels.gemm import NvFp4
+
+    held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
+                        is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
+    banks = {path: bank for path, bank in held.items() if isinstance(bank, NvFp4)}
+    if not banks:
+        return variables
+    # Multiplied on the host: an MXFP4 group under the 0x00 byte holds float32 subnormals, which XLA's CPU
+    # arithmetic flushes to zero.
+    dense = {path: np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor, np.float32)[:, None, None]
+             for path, bank in banks.items()}
+    rest = {path: leaf for path, leaf in held.items() if path not in banks}
+    decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
+    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **dense})
+    return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
+
+
 MOVING: contextvars.ContextVar[bool] = contextvars.ContextVar("dew.quantization.MOVING", default=False)
 """Whether the products a trace forms multiply by moving weights (`moving_weights`)."""
 
@@ -689,8 +734,6 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     RN, and dequantizes by that reciprocal. Keeping both divisions holds
     the scale's last bits to the author's fake quantizer. Backward is Dew's STE.
     """
-    from dew.nn.fake_quant import straight_through
-
     qwix = _qwix()
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
     amax = jnp.asarray(spec.scale, jnp.float32) * jnp.float32(448)
@@ -708,14 +751,20 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
 
 
 def _cast(qwix: ModuleType, quotients: jax.Array, qtype: jax.typing.DTypeLike):
-    """`quotients`, already divided by their scales, cast to `qtype` as a Qwix QArray of unit scale:
-    a fixed range of the type's own bound gives a scale of exactly one (448 over E4M3's 448, 6 over
-    E2M1's 6), so the cast is the type's rounding alone and the caller sets the real scale. NVFP4
-    names its 16-wide blocks along the last axis, which Qwix requires of it and a fixed range,
-    always per tensor, leaves unread."""
+    """`quotients`, already divided by their scales, rounded to the type's nearest values, ties to even,
+    clamped to its bound (`dew.nn.fake_quant.fp8_codes`, `fp4_codes`), and cast to `qtype` as a Qwix
+    QArray of unit scale: a fixed range of the type's own bound gives a scale of exactly one (448 over
+    E4M3's 448, 6 over E2M1's 6), so the cast takes values the type holds, exactly on every backend, and
+    the caller sets the real scale. The type's rounding is Dew's arithmetic, not the cast's: XLA:CPU
+    converts a hoisted small loop's float32 to E2M1 through float16, rounding twice (-0.25004873 to
+    -0.25, then to -0, where E2M1's nearest is -0.5), and XLA GPU's default excess precision deletes a
+    float32 -> narrow -> float32 convert pair (`dew.nn.fake_quant`). NVFP4 names its 16-wide blocks
+    along the last axis, which Qwix requires of it and a fixed range, always per tensor, leaves
+    unread."""
     if qtype == jnp.float8_e4m3fn:
-        return qwix.quantize(quotients, qtype, calibration_method="fixed,448")
-    return qwix.quantize(quotients, qtype, tiled_axes={quotients.ndim - 1: 16}, calibration_method="fixed,6")
+        return qwix.quantize(fp8_codes(quotients), qtype, calibration_method="fixed,448")
+    return qwix.quantize(fp4_codes(quotients), qtype, tiled_axes={quotients.ndim - 1: 16},
+                         calibration_method="fixed,6")
 
 
 def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
@@ -738,7 +787,6 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     Dew deliberately uses the identity's straight-through gradient; the
     reference parity claim here covers the forward, not that backward.
     """
-    from dew.nn.fake_quant import straight_through
     from dew.nn.precision import rounded_operand
 
     qwix = _qwix()
@@ -756,7 +804,7 @@ def nvfp4_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     overall = jnp.full(scale.shape, spec.scale, jnp.float32)
     scale = scale * overall
     if spec.e4m3_scale:
-        scale = jnp.clip(scale, 0, 448).astype(jnp.float8_e4m3fn).astype(jnp.float32)
+        scale = fp8_codes(scale)
     eps = jnp.finfo(jnp.float8_e4m3fn if spec.e4m3_scale else jnp.float32).eps
     scale = jnp.where(scale == 0, jnp.asarray(eps, jnp.float32), scale)
     scale = correctly_rounded_divide(scale, overall)
@@ -784,8 +832,6 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) ->
     negative-zero FMA yields +0 for a zero code. The 32 pinned real q_proj
     rows and the author's exporter fixture hold this order bit for bit.
     """
-    from dew.nn.fake_quant import straight_through
-
     values = jax.lax.stop_gradient(x).astype(jnp.float32)
     groups = values.reshape(*x.shape[:-1], -1, 16)
     largest = jnp.max(jnp.abs(groups), -1)
@@ -795,7 +841,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: InputQuantizer, qwix: ModuleType) ->
     denominator = jnp.full(largest.shape, 6, jnp.float32) * global_scale
     normalized = largest * correctly_rounded_divide(jnp.ones_like(largest), denominator)
     saturated = jnp.minimum(normalized, 448)
-    scales = saturated.astype(jnp.float8_e4m3fn).astype(jnp.float32) * global_scale
+    scales = fp8_codes(saturated) * global_scale
     scales = jnp.where(scales >= 1e-5, scales, 1)
     spread = jnp.broadcast_to(scales[..., None], groups.shape).reshape(x.shape)
     quotients = values * correctly_rounded_divide(jnp.ones_like(values), spread)
@@ -1461,9 +1507,10 @@ def _complex_in_float() -> type:
 
         def einsum(self, einsum_str, *operands, **kwargs):
             # Qwix 0.1.8 quantizes a two-operand einsum alone and raises on any other
-            # (qwix/_src/providers/qt.py:119-121), which runs here as the unwrapped model runs it.
+            # (qwix/_src/providers/qt.py:119-121), which stays float here and sums as the unwrapped
+            # model sums it (`float32_einsum`: Dew's sums govern a product Qwix does not quantize).
             if len(operands) != 2 or not _real(*(operand.dtype for operand in operands)):
-                return jnp.einsum(einsum_str, *operands, **kwargs)
+                return float32_einsum(einsum_str, *operands, **kwargs)
             if not self._matched("einsum"):
                 return super().einsum(einsum_str, *operands, **kwargs)
             preferred = kwargs.pop("preferred_element_type", None)
@@ -1583,7 +1630,17 @@ def _providers() -> tuple[type, type]:
     (`_scaled_in_float32`)."""
 
     class QtProvider(_group_scaled_convolution(), _complex_in_float(), _grouped_convolution_gradient()):
-        pass
+        def ragged_dot(self, lhs, rhs, group_sizes, precision=None, preferred_element_type=None,
+                       group_offset=None, *, out_sharding=None):
+            # Qwix 0.1.8's takes no output sharding (qwix/_src/providers/qt.py:201-208), which a ragged
+            # product on a mesh with Explicit axes names (`grouped_matmul.ragged_placement`): a product no
+            # rule quantizes passes it to JAX's own, and a quantized one is constrained to it.
+            if not self._matched("ragged_dot"):
+                return jax.lax.ragged_dot(lhs, rhs, group_sizes, precision=precision,
+                                          preferred_element_type=preferred_element_type,
+                                          group_offset=group_offset, out_sharding=out_sharding)
+            out = super().ragged_dot(lhs, rhs, group_sizes, precision, preferred_element_type, group_offset)
+            return _honoured(out, None, out_sharding)
 
     return QtProvider, _serving_provider()
 

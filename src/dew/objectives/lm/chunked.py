@@ -53,7 +53,7 @@ from dew.nn.categorical import (
     segment_log_partition,
     target_loss,
 )
-from dew.nn.derivatives import contracted
+from dew.nn.derivatives import KernelGlue, Protected, contracted
 from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import (
     added_to,
@@ -467,7 +467,7 @@ def _bounded_head(hidden, table, targets, excluded, chunks: int, tile: tuple[int
     return contracted("test_the_lm_heads_hold_every_order_of_their_gradient")(
         linear_tangent(functools.partial(_bounded_head_fwd, *statics),
                        functools.partial(_bounded_head_bwd, *statics),
-                       functools.partial(_bounded_head_impl, *statics)))(
+                       functools.partial(_bounded_head_impl, *statics), kind=KernelGlue()))(
         hidden, table, targets, excluded, softcap, columns)
 
 
@@ -654,8 +654,8 @@ def _whole_head(hidden, table, targets, excluded, softcap, chunks: int, precisio
     tiled = functools.partial(_whole_head_impl, *statics)
     return contracted("test_the_lm_heads_hold_every_order_of_their_gradient")(
         linear_tangent(functools.partial(_whole_head_fwd, *statics),
-                       functools.partial(_whole_head_bwd, *statics), tiled, primal=tiled))(
-        hidden, table, targets, excluded, softcap, columns)
+                       functools.partial(_whole_head_bwd, *statics), tiled, primal=tiled,
+                       kind=Protected()))(hidden, table, targets, excluded, softcap, columns)
 
 
 def _whole_head_impl(chunks, precision, predict, temperature, picked, group, hidden, table, targets, excluded,
@@ -931,8 +931,8 @@ def _fused(hidden, table, labels, weights, columns, z_loss: float, cap, chunk: i
     return contracted("test_the_lm_heads_hold_every_order_of_their_gradient")(
         linear_tangent(functools.partial(_fused_fwd, *statics), functools.partial(_fused_bwd, *statics),
                        functools.partial(_fused_moved, *statics),
-                       primal=functools.partial(_fused_impl, *statics)))(hidden, table, labels, weights,
-                                                                           columns)
+                       primal=functools.partial(_fused_impl, *statics),
+                       kind=KernelGlue()))(hidden, table, labels, weights, columns)
 
 
 def _fused_impl(z_loss, cap, chunk, precision, predict, temperature, excluded, hidden, table, labels, weights,

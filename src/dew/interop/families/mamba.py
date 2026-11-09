@@ -15,7 +15,7 @@ import math
 from collections.abc import Mapping
 
 from dew import _records
-from dew.interop import mamba2
+from dew.interop import mamba2, mamba3
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_config import flag, integer
 from dew.interop.decoder_parts import DecoderFamily, DecoderFields, record_int, refuse, refuse_export
@@ -23,6 +23,7 @@ from dew.interop.layouts import ConfigLayout, ConfigPart, Nested, unread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
+from dew.nn.mixers.mamba3 import Mamba3Mixer
 
 LAYER: Mapping[str, tuple[str, ...]] = {
     "norm.weight": ("input_layernorm", "scale"),
@@ -105,6 +106,18 @@ MAMBA2 = DecoderFamily(
     "mamba2",
     "Mamba2ForCausalLM",
     routes=mamba2.ROUTES,
+    preserve_source_layout=True,
+    tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
+)
+
+MAMBA3 = DecoderFamily(
+    ("mamba3",),
+    mamba3.CONFIG,
+    lambda fields: isinstance(fields.mixer, Mamba3Mixer),
+    "mamba3",
+    "MambaLMHeadModel",
+    routes=mamba3.ROUTES,
+    packed=mamba3.PACKED,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
 )

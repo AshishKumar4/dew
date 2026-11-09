@@ -10,24 +10,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import mosaic, resources
+from dew.nn.kernels.templates import bodies, fed, mosaic, resources
 
 
-class WgmmaIssuer(mosaic.Issuer):
-    """wgmma's issuer and home: a warpgroup's 64 rows, products from shared memory or registers into a
-    warpgroup accumulator in the WGMMA layout, asynchronous until waited for, one step's in flight
-    (CUTLASS's sm90 `K_PIPE_MMAS`). Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a
-    warpgroup MMA: interpreted, such a product is the dot it would compute."""
-
-    name = "wgmma"
-    takes_tf32 = True
-    takes_fp8 = True
-    rows = 64
-    role_rows = 64
-    widest_product = 256
-    operands_in_registers = False
-    products_overlap = True
-    in_flight = 1
+class WgmmaLayout:
+    """A home whose 64-row tiles sit in registers in the WGMMA layout (`plgpu.Layout.WGMMA`), a thread two
+    adjacent columns of each 8 in a warp's 16 rows: its tiles', rows' and columns' layouts and what a thread
+    holds of them. wgmma's accumulators, and tcgen05's 64-row ones read out of tensor memory
+    (`mosaic_sm100.Tcgen05Chunks`), whose half-lane layout loads into it."""
 
     @property
     def lane_columns(self) -> int:
@@ -80,7 +70,25 @@ class WgmmaIssuer(mosaic.Issuer):
         # rows (DQROWPROOF64: 260 against ptxas's 255 and 512 bytes spilled; DQROWPROOF128: 184 at 64 rows).
         return -(-rows * jnp.dtype(dtype).itemsize // 128)
 
+
+class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
+    """wgmma's issuer and home: a warpgroup's 64 rows, products from shared memory or registers into a
+    warpgroup accumulator in the WGMMA layout, asynchronous until waited for, one step's in flight
+    (CUTLASS's sm90 `K_PIPE_MMAS`). Mosaic GPU's interpreter (jax 0.11.2) takes no register operand to a
+    warpgroup MMA: interpreted, such a product is the dot it would compute."""
+
+    name = "wgmma"
+    takes_tf32 = True
+    takes_fp8 = True
+    rows = 64
+    role_rows = 64
+    widest_product = 256
+    operands_in_registers = False
+    products_overlap = True
+    in_flight = 1
+
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             mosaic.committed()
@@ -90,19 +98,32 @@ class WgmmaIssuer(mosaic.Issuer):
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+    def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
-    def products(self, acc, lhs, rhs, interpret: bool):
+    def products(self, acc, lhs, rhs, *, accumulate: bool = True):
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         mosaic.committed()
         if interpret:
-            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+            fresh = jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+            return acc + fresh if accumulate else fresh
+        if not accumulate:
+            # A fresh product into a walk's accumulator: zeroed in its registers, then issued, no wait.
+            acc[...] = jnp.zeros(acc.shape, jnp.float32)
         plgpu.wgmma(acc, lhs, rhs)
         return acc
 
-    def register_products(self, acc, parts, rhs, interpret: bool):
+    def read(self, acc, *, first: int = 0, columns: int | None = None, pending: int = 0) -> jax.Array:
+        # A scoped warpgroup accumulator read once at most `pending` of the warpgroup's product groups are in
+        # flight (`wgmma_accumulator_load`'s wait), the later ones running on; interpreted, its value.
+        value = acc if isinstance(acc, jax.Array) else plgpu.wgmma_accumulator_load(acc, wait_n=pending)
+        return super().read(value, first=first, columns=columns)
+
+    def register_products(self, acc, parts, rhs):
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         for formed in parts:
             part = mosaic.unscaled_part(formed)
             mosaic.committed()
@@ -112,9 +133,10 @@ class WgmmaIssuer(mosaic.Issuer):
                 plgpu.wgmma(acc, part, rhs)
         return acc
 
-    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+    def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         """`Family.summed` into a scoped warpgroup accumulator: reading it (`acc_ref[...]`) waits on the
         products `issue` issued into it, so the value is theirs once they are done."""
+        interpret = bodies.interpreting()  # the launch's (`bodies.interpreting`)
         if interpret:
             return issue(self.zeros(shape))
 
@@ -135,11 +157,11 @@ class WgmmaIssuer(mosaic.Issuer):
 
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         if interpret:
-            return self.register_products(scale(acc), parts, rhs, interpret)
+            return self.register_products(scale(acc), parts, rhs)
         # The accumulator's value read once its products are done, scaled, stored back.
         plgpu.wgmma_wait(0)
         acc[...] = scale(acc[...])
-        return self.register_products(acc, parts, rhs, interpret)
+        return self.register_products(acc, parts, rhs)
 
     def settled(self, pending: int = 0) -> None:
         plgpu.wgmma_wait(pending)
@@ -175,8 +197,10 @@ class Wgmma(WgmmaIssuer, mosaic.RingFamily):
     (`mosaic.RingFamily`), multicast across a pair of multiprocessors where a cluster shares a ring's
     blocks."""
 
-    consumers = 2
-    most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
+    # Three consumers beside the producer, 504 of a lane's 512 registers raised (160 each, the producer's 24):
+    # FlashAttention 3's d64 forward's 192-row tile (hopper's tile_size_fwd_sm90, row 1299), which a
+    # derivation trying every count up to it takes where it holds.
+    consumers = 3
     cluster = 2  # TMA multicast to a pair, CUTLASS's grouped GEMM's and cuBLASLt's on an H100
 
 
@@ -184,8 +208,8 @@ WGMMA = Wgmma()
 """The wgmma family's bundle."""
 
 
-class WgmmaFed(mosaic.ConsumerFed, Wgmma):
-    """wgmma's bundle without a producer: its consumers feed their own rings (`mosaic.ConsumerFed`), each
+class WgmmaFed(fed.ConsumerFed, Wgmma):
+    """wgmma's bundle without a producer: its consumers feed their own rings (`fed.ConsumerFed`), each
     at its program's entry registers, the layout a tile whose consumers need more than a producer leaves
     them takes."""
 

@@ -5,7 +5,10 @@ mark, so a row is one process.
 
 - `projection`: `dew.nn.moe.expert_projection` forward and forward plus
   backward, at lm-moe's shape (8192 rows, 8 experts, bf16 compute, Dirichlet
-  routing), against a float64 oracle of the rounded operands.
+  routing), against a float64 oracle of the rounded operands; with
+  `--against`, the implementation against another in role-swapped pairs
+  (`dew.telemetry.benchmark.compared`), each call at the next of a pool of
+  routings, with its own A/A, which is the comparison to read across arms.
 - `adam`: one AdamW update over the lm-dense parameter tree, fp32, bf16 or
   8-bit moment storage (`OptimConfig.state_dtype`).
 - `step`: a whole training step of `lm-dense` (359.8M) or `lm-moe` (321.8M,
@@ -16,12 +19,15 @@ The docs/performance.md section "Kernel choices per generation" was measured
 with these commands, for example:
 
     PYTHONPATH=src python tools/benchmark_kernels.py projection --implementation pallas
+    PYTHONPATH=src python tools/benchmark_kernels.py projection --implementation mosaic_gpu \\
+        --against cutlass
     PYTHONPATH=src python tools/benchmark_kernels.py adam --state-dtype bfloat16
     PYTHONPATH=src python tools/benchmark_kernels.py step --path lm-moe --batch 4 \\
         --implementation auto --state-dtype bfloat16
 """
 
 import argparse
+import itertools
 import json
 
 import grouped_oracle
@@ -35,7 +41,7 @@ from benchmark_models import build_trainer, compiled_step, timed_steps
 from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
 from dew.optim import OptimConfig
-from dew.telemetry.benchmark import samples
+from dew.telemetry.benchmark import compared, samples
 from dew.telemetry.profile import Profiler
 
 
@@ -51,27 +57,62 @@ def peak_bytes() -> int | None:
     return stats.get("peak_bytes_in_use")
 
 
-def projection(args: argparse.Namespace) -> dict[str, object]:
-    rows, experts = args.rows, args.experts
-    width, features = (args.width, args.features) if args.shape == "up" else (args.features, args.width)
-    rng = np.random.default_rng(0)
+ROUTINGS = 16
+"""The routings a paired comparison's calls take in turn, one a call: a grouped product's time moved several
+percent from one routing seed to another (row 3616), so each arm meets the same ones in the same order."""
+
+
+def routed(rng: np.random.Generator, rows: int, experts: int) -> np.ndarray:
+    """A Dirichlet routing of `rows` rows over `experts` experts, its group sizes summing to `rows`."""
     sizes = np.floor(rng.dirichlet(np.ones(experts)) * rows).astype(np.int32)
     sizes[-1] += rows - sizes.sum()
-    x = jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16)
-    kernel = jnp.asarray(rng.normal(size=(experts, width, features)) / np.sqrt(width), jnp.float32)
-    cotangent = jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16)
-    group_sizes = jnp.asarray(sizes)
+    return sizes
 
+
+def projections(implementation: str) -> tuple:
+    """`implementation`'s expert projection compiled as the forward alone and as the forward plus backward
+    of the product's sum against a cotangent, each called as `(x, kernel, group_sizes, ...)`."""
     # Arrays are arguments, not closures: `program` keeps each function it compiled.
     def project(x, kernel, group_sizes):
-        return jnp.asarray(expert_projection(x, kernel, group_sizes, jnp.bfloat16,
-                                             args.implementation, None))
+        return jnp.asarray(expert_projection(x, kernel, group_sizes, jnp.bfloat16, implementation, None))
 
     def loss(x, kernel, group_sizes, cotangent):
         return jnp.sum(project(x, kernel, group_sizes).astype(jnp.float32) * cotangent.astype(jnp.float32))
 
-    forward = program(project)
-    both = program(jax.value_and_grad(loss, argnums=(0, 1)))
+    return program(project), program(jax.value_and_grad(loss, argnums=(0, 1)))
+
+
+def paired(args: argparse.Namespace, x, kernel, cotangent) -> dict[str, object]:
+    """`args.implementation` against `args.against` in `args.pairs` role-swapped pairs (`compared`) for the
+    forward and the forward plus backward, every call at the next of `ROUTINGS` routings: the median ratio of
+    the first's seconds to the second's, its interval, and the second's against itself (its A/A). Its cache
+    state: each arm compiled and warmed before its pairs, and no flush between calls, so a call reads
+    whatever of its operands the call before it left in L2."""
+    pool = [jnp.asarray(routed(np.random.default_rng(seed), args.rows, args.experts))
+            for seed in range(ROUTINGS)]
+    arms = [projections(implementation) for implementation in (args.implementation, args.against)]
+    result: dict[str, object] = {"against": args.against, "routings": ROUTINGS,
+                                 "cache": {"compile": "warm", "l2": "unflushed"}}
+    for index, (name, extra) in enumerate((("forward", ()), ("forward_backward", (cotangent,)))):
+        def drawn(function, extra=extra):
+            draws = itertools.cycle(pool)
+            return lambda: function(x, kernel, next(draws), *extra)
+
+        comparison = compared(drawn(arms[0][index]), drawn(arms[1][index]), pairs=args.pairs)
+        result[name] = {"ratio": comparison.ratio, "interval": comparison.interval, "alone": comparison.alone}
+    return result
+
+
+def projection(args: argparse.Namespace) -> dict[str, object]:
+    rows, experts = args.rows, args.experts
+    width, features = (args.width, args.features) if args.shape == "up" else (args.features, args.width)
+    rng = np.random.default_rng(0)
+    sizes = routed(rng, rows, experts)
+    x = jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16)
+    kernel = jnp.asarray(rng.normal(size=(experts, width, features)) / np.sqrt(width), jnp.float32)
+    cotangent = jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16)
+    group_sizes = jnp.asarray(sizes)
+    forward, both = projections(args.implementation)
     output = np.asarray(forward(x, kernel, group_sizes), np.float64)
     _, (dx, dk) = both(x, kernel, group_sizes, cotangent)
     oracle, dx_oracle, dk_oracle = grouped_oracle.products(x, kernel.astype(jnp.bfloat16), cotangent, sizes)
@@ -79,11 +120,14 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     def relative(value, reference):
         return float(np.abs(np.asarray(value, np.float64) - reference).max() / np.abs(reference).max())
 
-    return {"implementation": args.implementation, "shape": [rows, width, features, experts],
-            "groups": sizes.tolist(), "forward": timed(forward, (x, kernel, group_sizes), args.repeats),
-            "forward_backward": timed(both, (x, kernel, group_sizes, cotangent), args.repeats),
-            "forward_error": relative(output, oracle), "input_gradient_error": relative(dx, dx_oracle),
-            "kernel_gradient_error": relative(dk, dk_oracle)}
+    result = {"implementation": args.implementation, "shape": [rows, width, features, experts],
+              "groups": sizes.tolist(), "forward": timed(forward, (x, kernel, group_sizes), args.repeats),
+              "forward_backward": timed(both, (x, kernel, group_sizes, cotangent), args.repeats),
+              "forward_error": relative(output, oracle), "input_gradient_error": relative(dx, dx_oracle),
+              "kernel_gradient_error": relative(dk, dk_oracle)}
+    if args.against is not None:
+        result["paired"] = paired(args, x, kernel, cotangent)
+    return result
 
 
 def lm_dense_tree() -> dict[str, jax.Array]:
@@ -178,6 +222,9 @@ def main(argv: list[str] | None = None) -> None:
     project.add_argument("--width", type=int, default=768, help="the model width an up projection reads")
     project.add_argument("--features", type=int, default=2048, help="the expert width it writes")
     project.add_argument("--repeats", type=int, default=50)
+    project.add_argument("--against", default=None,
+                         help="an implementation to compare against in role-swapped pairs")
+    project.add_argument("--pairs", type=int, default=400, help="the paired comparison's pairs")
     update = modes.add_parser("adam")
     update.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32")
     update.add_argument("--repeats", type=int, default=30)

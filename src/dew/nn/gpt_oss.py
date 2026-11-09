@@ -3,8 +3,11 @@
 `dew.interop.codecs` reads and writes the MXFP4 checkpoints these experts ship in.
 """
 
+from __future__ import annotations
+
 import functools
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +15,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew import quantization
 from dew.mesh import LogicalAxes
 from dew.nn.activations import quick_gelu, swiglu_clamped
 from dew.nn.dense import Dense
@@ -26,8 +30,11 @@ from dew.nn.moe import (
     renormalized_softmax,
     weighs_one,
 )
-from dew.nn.precision import float32_dot_general
+from dew.nn.precision import float32_dot_general, projection_role
 from dew.nn.sharding import declared
+
+if TYPE_CHECKING:
+    from dew.nn.kernels.gemm import NvFp4
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),
@@ -65,13 +72,17 @@ class GptOssExperts(nn.Module):
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
         initializer = nn.initializers.variance_scaling(
             1.0, "fan_in", "truncated_normal", in_axis=-2, out_axis=-1, batch_axis=(0,))
-        gate_up = self.param("gate_up_proj", declared(initializer, FUSED_EXPERT_AXES["gate_up_proj"]),
-                             (self.num_local_experts, self.hidden_size, 2 * self.intermediate_size))
+        # A served checkpoint's packed banks stand in for the matrices where the module's collection holds
+        # them (`quantization.expert_matrix`: a 4-bit checkpoint's experts as their codes, row 4516).
+        gate_up = quantization.expert_matrix(self, "gate_up_proj", lambda: self.param(
+            "gate_up_proj", declared(initializer, FUSED_EXPERT_AXES["gate_up_proj"]),
+            (self.num_local_experts, self.hidden_size, 2 * self.intermediate_size)))
         gate_bias = self.param("gate_up_proj_bias",
                                declared(nn.initializers.zeros, FUSED_EXPERT_AXES["gate_up_proj_bias"]),
                                (self.num_local_experts, 2 * self.intermediate_size))
-        down = self.param("down_proj", declared(initializer, FUSED_EXPERT_AXES["down_proj"]),
-                          (self.num_local_experts, self.intermediate_size, self.hidden_size))
+        down = quantization.expert_matrix(self, "down_proj", lambda: self.param(
+            "down_proj", declared(initializer, FUSED_EXPERT_AXES["down_proj"]),
+            (self.num_local_experts, self.intermediate_size, self.hidden_size)))
         down_bias = self.param("down_proj_bias",
                                declared(nn.initializers.zeros, FUSED_EXPERT_AXES["down_proj_bias"]),
                                (self.num_local_experts, self.hidden_size))
@@ -80,16 +91,20 @@ class GptOssExperts(nn.Module):
         compute_dtype = expert_compute_dtype(x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
+        parameters = (gate_up, gate_bias, down, down_bias)
+        # Each leaf's axes: a packed bank's three its own (`quantization.expert_leaf_axes`).
+        axes = tuple(leaf for parameter, named in zip(parameters, FUSED_EXPERT_AXES.values(), strict=True)
+                     for leaf in quantization.expert_leaf_axes(parameter, named))
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute_dtype), x.astype(compute_dtype), indices,
-            (gate_up, gate_bias, down, down_bias), tuple(FUSED_EXPERT_AXES.values()),
+            parameters, axes,
             num_experts=self.num_local_experts,
             dispatch=self.dispatch, output_dtype=compute_dtype, initializing=self.is_initializing(),
             capacity_factor=self.capacity_factor)
         return jnp.sum(slots * weights[..., None], axis=-2)
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
-                 parameters: tuple[jax.Array, jax.Array, jax.Array, jax.Array], *,
+                 parameters: tuple[jax.Array | NvFp4, jax.Array, jax.Array | NvFp4, jax.Array], *,
                  dtype: Dtype) -> jax.Array:
         # Each bias is added to its expert's rows' sums before their one rounding (`expert_projection`);
         # a slot of no expert, past the routed rows, comes back zero from the dispatch.
@@ -140,8 +155,10 @@ class GptOssMLP(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
-        logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype, kernel_axes=("embed", "exp"),
-                       precision=self.precision, name="router", dot_general=float32_dot_general)(x)
+        with projection_role("router"):  # The router keeps the run's dtypes under a recipe.
+            logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
+                           kernel_axes=("embed", "exp"), precision=self.precision, name="router",
+                           dot_general=float32_dot_general)(x)
         k = self.num_experts_per_tok
         if weighs_one(k, normalized=True):  # Its weights renormalize over the chosen experts.
             fixed_router((*self.path, "router"), self.variables["params"]["router"])

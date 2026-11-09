@@ -7,7 +7,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
 import jax
@@ -20,10 +20,10 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
+    axes,
     bundles,
     layout,
     mosaic,
-    mosaic_sm90,
     operands,
     resources,
 )
@@ -45,43 +45,109 @@ from dew.nn.kernels.templates.attention import (
 from dew.nn.kernels.templates.cost import estimate
 from dew.nn.programs import CALLS, called, equations
 
-QUALIFIED = frozenset({mosaic_sm90.WGMMA.name, mosaic_sm90.FED.name})
-"""The bundles the attention mainloop is qualified on: wgmma's, with a producer and with consumers that
-feed their own rings (`mosaic_sm90.FED`). mma.sync's (an A100's) joins once every launch it derives
-compiles spill-free (the resource gate's sm80 cases, `GATED`; row 2078: check 1 held there,
-ET-2078-A100CHECK3)."""
+
+def few_rows(family: mosaic.Family, rows: int | None) -> bool:
+    """Whether a launch of `rows` rows takes `family` at tiles of fewer rows than a role's products cover: a
+    decode step's few packed rows (row 4042) on a family whose warps then lie along its tiles' columns
+    (`Family.specialized`: mma.sync's one warp of 16 rows, the four along its keys), its query tile the
+    issuer's rows (`query_rows`)."""
+    if rows is None or rows >= family.role_rows:
+        return False
+    padded = -(-rows // family.rows) * family.rows
+    return family.specialized(padded, family.role_rows) != family
+
+
+def fewer_rows(family: mosaic.Family) -> tuple[int, ...]:
+    """The consumer rows below a role's a backward launch takes on `family`, largest first: whole divisors of
+    the role's rows in the issuer's, each one its warps arrange themselves by (`Issuer.specialized`:
+    mma.sync's two warps of 16 rows at 32, its register operands then relayed through shared memory where
+    they cross warps, `Issuer.relay_bytes`); none on a family whose role is one issuer's rows (wgmma's)."""
+    return tuple(rows for rows in range(family.role_rows - family.rows, 0, -family.rows)
+                 if family.role_rows % rows == 0 and family.specialized(rows, rows) != family)
+
+
+def scopes_products(family: mosaic.Family) -> bool:
+    """Whether `family`'s issuer keeps its products' accumulators in scratch a launch scopes
+    (`Issuer.product_scratch`: tcgen05's chunks')."""
+    return bool(family.product_scratch(1, (family.rows,)))
+
+
+def qualified(family: mosaic.Family) -> bool:
+    """Whether the attention mainloop runs on `family`: one whose consumers issue their products
+    (`Family.issues_in_consumers`), whose walk's softmax and its rescales run between them in the registers
+    that hold them (wgmma's, mma.sync's, a TPU core's MXU); not tcgen05's, one warp issuing them into tensor
+    memory, which the Blackwell template walks (`attention_blackwell`)."""
+    return family.issues_in_consumers
 
 
 def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
     """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype`: the
-    shared registry's (`bundles.of`) where attention is qualified on its family (`QUALIFIED`); None elsewhere,
-    whose calls another mainloop takes by legality."""
-    family = None if generation_name is None else bundles.of(generation_name, dtype)
-    return family if family is not None and family.name in QUALIFIED else None
+    shared registry's (`bundles.of`) where attention is qualified on it (`qualified`); None elsewhere, whose
+    calls another mainloop takes by legality."""
+    # Every launch of the mainloop is written against the family's seams, a TPU core's among them (`tpu`),
+    # and scopes its issuer's product scratch (`scoped`: tcgen05's chunks, `Family.scoped`'s `products`).
+    family = None if generation_name is None else bundles.of(generation_name, dtype, scoped=True, tpu=True)
+    return family if family is not None and qualified(family) else None
 
 
-def layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
+def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
     """The bundles a launch of the attention mainloop takes on a device of `generation_name` for operands of
     `dtype`, in preference order (`bundles.layouts`: a producer's layout, then on warpgroup MMA the layout
-    whose consumers feed their own rings, `mosaic_sm90.FED`), where its family is qualified (`bundle`)."""
-    if generation_name is None or bundle(generation_name, dtype) is None:
+    whose consumers feed their own rings, `mosaic_sm90.FED`; given the launch's `rows`, each issuer the
+    device has, by the share of its rows they fill), where its family is qualified (`qualified`)."""
+    if generation_name is None:
         return ()
-    return tuple(family for family in bundles.layouts(generation_name, dtype) if family.name in QUALIFIED)
+    return tuple(family for family in bundles.layouts(generation_name, dtype, rows, scoped=True, tpu=True)
+                 if qualified(family))
+
+
+def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
+    """The least query tile a launch of `rows` rows takes on `family`: a role's whole swizzled rows
+    (`extents`), or the issuer's rows where the launch's rows are fewer than a role's (`few_rows`)."""
+    if few_rows(family, rows):
+        return -(-rows // family.rows) * family.rows
+    return extents(family, dtype, rows)[-1]
 
 
 def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     """The bundle `tiles` run on: the current device's (`generation.gpu_target`) layout their family names,
     which their legality matched (`MosaicForward.legal`). A config names its physical layout; which configs
     a call derives is the qualification's (`layouts`), so a config pinned on a family not yet qualified (an
-    A100's mma.sync, its resource witness) resolves too."""
-    found = {family.name: family for family in bundles.layouts(generation.gpu_target().generation, dtype)}
+    A100's mma.sync, its resource witness) resolves too. A forward's family is arranged for its consumer's
+    share, `block_q` x `block_k` (`Issuer.specialized`, as the GEMM's: mma.sync's warps by the share, whose
+    default 64-row atom no 32-row consumer's operands cast to); a backward's as `backward_family` arranges
+    it."""
+    # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
+    found = {family.name: family
+             for family in bundles.layouts(generation.gpu_target().generation, dtype, 1, scoped=True,
+                                           tpu=True)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
-    return family
+    if isinstance(tiles, Tiles):
+        return family.specialized(tiles.block_q, tiles.block_k)
+    return backward_family(family, tiles)
+
+
+def backward_family(family: mosaic.Family, tiles: "BackwardTiles") -> mosaic.Family:
+    """`family` arranged for a backward's `tiles`, whose launches transpose them (dQ's rows its queries,
+    dK/dV's its keys): by their smaller side where that is fewer rows than a role's (`fewer_rows`), else as
+    the family stands (four warps along a role's rows hold whole rows of the accumulators the products then
+    read from registers)."""
+    side = min(tiles.block_q, tiles.block_k)
+    return family.specialized(side, side) if side < family.role_rows else family
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
 `MosaicBackward.eligible`)."""
+
+
+def query_swizzle(family: mosaic.Family) -> int | None:
+    """The swizzle a forward stages its query block at, the left operand of its logits' product: the
+    narrowest where its family loads operands into registers (`Family.operands_in_registers`), 8-row tiles
+    32 bytes wide, so a load of the block's fragments one instruction deep (16 of a 16-bit row) is a whole
+    tile and its 8 rows' 16-byte reads take every bank once, where a plain block's 256-byte rows take one
+    bank group 8 times; layout inference's otherwise (`mosaic.staged`). The query is written once a tile."""
+    return mosaic.NARROWEST_SWIZZLE_BYTES if family.operands_in_registers else None
 
 
 def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str, int]:
@@ -106,7 +172,7 @@ class Tiles:
     block_k: int
     stages: int
     consumers: int
-    family: str = mosaic_sm90.WGMMA.name
+    family: str = dataclasses.field(kw_only=True)
     relaunch_k: int | None = None
     relaunch_consumers: int | None = None
     relaunch_columns: int | None = None
@@ -146,7 +212,7 @@ class BackwardTiles:
     stages: int
     consumers: int
     fused: bool = False
-    family: str = mosaic_sm90.WGMMA.name
+    family: str = dataclasses.field(kw_only=True)
     columns: int = 1
     dkv_family: str | None = None
     dkv_consumers: int | None = None
@@ -205,7 +271,8 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
     return whole(power_of_two(width), family.column_unit(dtype))
 
 
-def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> list:
+def _products(family: mosaic.Family, dtype, *products, narrow: bool = False, lhs_swizzle: int | None = None
+              ) -> list:
     """The phases a step's products hold where its family's read their operands from registers
     (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
     `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
@@ -214,13 +281,14 @@ def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> 
     transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
     stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
     fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
-    `narrow` (`Tiles.narrow`)."""
+    `narrow` (`Tiles.narrow`); a left operand in shared memory loaded at its stage's (`lhs_swizzle`: a
+    forward's query block, `query_swizzle`; the family's own where None)."""
     if not family.operands_in_registers:
         return []
     narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
     return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
                                                        lhs_parts=0 if register_lhs else 1,
-                                                       rhs_transposed=transposed,
+                                                       rhs_transposed=transposed, lhs_swizzle=lhs_swizzle,
                                                        rhs_swizzle=narrowest if transposed else None)
             for rows, depth, columns, beside, register_lhs, transposed in products]
 
@@ -247,6 +315,18 @@ def issued_into(family: mosaic.Family, acc, parts, rhs, interpret: bool):
     issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
     right = operands.Parts((rhs,), rhs.dtype)
     return issuer.summed((("part", part, right) for part in parts), into=acc)
+
+
+def issued_pairs(family: mosaic.Family, acc, pairs: Iterable, interpret: bool, *,
+                 shape: tuple[int, int] | None = None):
+    """`acc`, or a fresh fp32 accumulator of `shape` where None, with each of `pairs`' products (a left
+    operand in registers and a tile in shared memory, each formed as it is taken) issued into it in place,
+    in order, none read before the last (`operands.Issuer.summed`): an fp32 call's parts' products
+    (`attention_mosaic_forward._parted_products`), one accumulator where a product apiece copied each in and
+    out (et-fp32regs2: the guarded launch 248 registers and 24 bytes spilled where its bf16 one held 168)."""
+    issuer = operands.Issuer(_Issuing(family, interpret), {"part": 1}, restored=algebra.restored)
+    products = (("part", lhs, operands.Parts((rhs,), rhs.dtype)) for lhs, rhs in pairs)
+    return issuer.summed(products, shape) if acc is None else issuer.summed(products, into=acc)
 
 
 def _block(config: Tiles | BackwardTiles) -> int:
@@ -295,25 +375,74 @@ DROPPING = Refusal('dropout_places',
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
+def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
+                 products: tuple | None = None) -> resources.Scope:
+    """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
+    walks where it has them, `after_walks`) by lifetime (`Family.lifetimes`), its issuer's product scratch
+    where its `products` take one (`Family.product_held`, its tensor memory's addresses
+    `Issuer.product_addresses`), with the algebra's reductions' scratch where it `reduces` (a launch reducing
+    its scores, weights or cotangents across warps) and its `reducing_warpgroups`' scratch
+    (`resources.Scope`)."""
+    scoped, streams, *after = allocations
+    held, walks = family.lifetimes(streams)
+    return resources.Scope(program=(scoped, *family.product_held(products), *held), walks=walks,
+                           after=tuple((tile.shape, tile.dtype) for tile in (after[0] if after else ())),
+                           reduces=reduces, reducing_warpgroups=reducing_warpgroups,
+                           addresses=family.product_addresses(products))
+
+
 def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
     """A tile axis's extents on `family`, largest first: whole multiples of the rows a consumer's products
     cover (`Family.role_rows`) and of its swizzled rows (`Family.column_unit`; a tile's keys are its weights'
     product's depth, its queries the dK/dV launch's), at most what one copy moves (`Family.copy_extent`,
     where the family's copies bound it; else registers bound them, `fits`) and the call's `extent` in whole
     multiples (a longer tile holds padding alone)."""
-    unit = math.lcm(family.role_rows, family.column_unit(dtype))
+    return _multiples(family, math.lcm(family.role_rows, family.column_unit(dtype)), extent)
+
+
+def walked_extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
+    """A walked tile's extents on `family`, largest first: whole multiples of its swizzled rows
+    (`Family.column_unit`), a walked tile (a forward's or a dQ launch's keys, a dK/dV launch's queries) a
+    product's depth and no consumer's rows, within `extents`' bounds: mma.sync's walks take 32-row tiles,
+    where its 64-row unit held no guarded state at width 128 (FS-GUARD80-2) and no plain tile's stages at
+    width 256 (64 x 64 staged 199,696 bytes of an A100's 166,912, 64 x 32 134,160, et-d256e)."""
+    return _multiples(family, family.column_unit(dtype), extent)
+
+
+def _multiples(family: mosaic.Family, unit: int, extent: int) -> tuple[int, ...]:
+    """Whole multiples of `unit`, largest first, at most what one of `family`'s copies moves and the call's
+    `extent` in whole multiples (`extents`)."""
     top = -(-max(extent, 1) // unit)
     if family.copy_extent is not None:
         top = min(top, family.copy_extent // unit)
     return tuple(range(top * unit, 0, -unit))
 
 
+BACKWARD_CONSUMERS = 2
+"""The consumers a backward launch takes at most: its exchanges and splits pair them (a dK/dV block's column
+shares, a slot's query shares, `Family.exchange`'s two schedules). A third left a 64-row tile 21 rows a share
+and the accurate form 30 to 290 times the reference's error (045aa11863e). The forward's walk
+takes the family's every consumer (FlashAttention 3's d64 tile: three, 192 rows)."""
+
+
+def most_consumers(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> int:
+    """The consumers a launch of `tiles` takes at most on `family`: a forward's the family's own
+    (`Family.consumers`), a backward's at most `BACKWARD_CONSUMERS`."""
+    return family.consumers if isinstance(tiles, Tiles) else min(family.consumers, BACKWARD_CONSUMERS)
+
+
 def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
     """Whether a program of `family` takes `tiles`: its query and key tiles positive whole multiples of the
-    rows a role's products cover (`Family.rows`), and one to the family's count of consumers
-    (`Family.consumers`), whose turns its walks are written for."""
-    return (0 < tiles.consumers <= family.consumers and tiles.block_q > 0 and tiles.block_k > 0
+    rows a role's products cover (`Family.rows`), and one to its launch's count of consumers
+    (`most_consumers`), whose turns its walks are written for."""
+    return (0 < tiles.consumers <= most_consumers(family, tiles) and tiles.block_q > 0 and tiles.block_k > 0
             and tiles.block_q % family.rows == 0 and tiles.block_k % family.rows == 0)
+
+
+ROUNDED = Refusal('rounds', "a quantized model's weights round at their row's maximum in the anchored "
+                  "training walk's forward alone (`Hooks.rounds`), no dropping or resumed call's, and its "
+                  "backward is its quantization's own (`attention_quantized`)")
+"""Why the mainloops take a quantized call's forward alone, of neither a dropping nor a resumed call."""
 
 
 def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool,
@@ -324,12 +453,16 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     suite read."""
     hooks = Hooks() if hooks is None else hooks
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+    if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
+        return ROUNDED
     if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
         return DROPPING
-    if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
-        # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
-        # products do not take back (`mosaic.unscaled_part`).
-        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16")
+    if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):
+        # Dropped weights past the dtype's largest take scaled parts (`algebra.dropped_parts`), which the
+        # mainloop's sums in place do not take back (`mosaic.unscaled_part`).
+        return Refusal('dropout_rate', f"the Mosaic dropping walk takes {jnp.dtype(dtype).name} weights "
+                       f"within its range, not a multiplier of {hooks.drop.bound:g} (a rate of "
+                       f"{hooks.drop.rate:g})")
     if jnp.dtype(dtype) not in sixteen:
         return Refusal('dtype', f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}")
     if backward and not transposable(hooks):
@@ -359,16 +492,56 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
 
 
-def reducing(family: mosaic.Family, consumers: int, *hooks, guarded: bool = False) -> int:
+def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, flagged: bool = False,
+             scaled: bool = False, magnitudes: bool = False) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
-    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a hook's
-    unit row, which the fork selects by a reduction across warps (ledger 1428), and a `guarded` launch's
-    keys' value magnitudes, its tile's columns reduced across the warps holding them
-    (`Family.key_magnitudes`), so every warpgroup of a launch that runs a hook (`hooks`, its score and
-    output hooks, None where it has none) or guards; none otherwise."""
-    if guarded or any(hook is not None for hook in hooks):
+    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
+    `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
+    ledger 1428; an output hook's, untraced), a `flagged` launch's rows reduced to their block's flag (the
+    plain launch that flags its rows, `attention_mosaic_forward._Flags`), a `scaled` step's tile reduced
+    to its largest across the warps holding its rows (`algebra.running_parts`, an fp16 fused backward's), or
+    a scaled walk's keys' value `magnitudes`, its value tile's columns reduced across the warps holding them
+    (`Family.key_magnitudes`, `algebra.SCALED_WALK`), so every warpgroup of a launch that runs such a hook,
+    flags or scales; none otherwise."""
+    if flagged or scaled or magnitudes or hooked:
         return family.warpgroups(consumers)
     return 0
+
+
+def hook_reduces(hooks: Hooks | None) -> bool:
+    """Whether the score hook may reduce across warps (`reducing`): traced, never run, on a tile with its
+    pullback, it forms or reads a value but a scalar or a whole tile (a unit row, `k_pos[:1, :]`, ledger
+    1428; a sum along an axis) or nests a computation but a call's (a branch, a loop); a fingerprint (a keyed
+    launch's hook) counted so. Gemma 2's softcap forms none, so its launches reserve no scratch: its
+    backward's one launch 256 wide on an H100 fits beside it (row 3704: 233,568 bytes with it, past the
+    block's 232,448). False without a hook."""
+    if hooks is None or hooks.score_mod is None:
+        return False
+    if not callable(hooks.score_mod):
+        return True
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _hook_reduces(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _hook_reduces(score_mod, params: tuple) -> bool:
+    """`hook_reduces` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    tile = (TILE_SIDES[0], TILE_SIDES[0])
+    traced = _score_jaxprs(score_mod, params, tile, differentiated=True)
+    return any(_off_tile(jaxpr, tile) for jaxpr in traced)
+
+
+def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
+    """Whether an equation of `jaxpr` forms or reads a value but a scalar or a `tile`, or nests a computation
+    but a call's (a jitted helper's, a custom derivative's primal), whose own equations are read so."""
+    for eqn in jaxpr.eqns:
+        if any(getattr(var.aval, "shape", ()) not in ((), tile) for var in (*eqn.invars, *eqn.outvars)):
+            return True
+        nested = list(jax_core.jaxprs_in_params(eqn.params))
+        called = ("jaxpr" in eqn.params or "call_jaxpr" in eqn.params) and len(nested) == 1
+        if nested and not (called and not _off_tile(nested[0], tile)):
+            return True
+    return False
 
 
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
@@ -626,6 +799,13 @@ class _Hooked(NamedTuple):
     output: tuple[jax.Array, ...]
     initial: tuple[jax.Array, jax.Array, jax.Array] | None
     drop: Dropout | None = None
+    scales: tuple[jax.Array, jax.Array] | None = None
+    """A call over quantized keys and values' scales, the keys' and the values' `[B, Hk, Kp]` fp32, one a key
+    and key head in its row's key order (`attention_decode.attend`'s `scales`); None for 16-bit keys."""
+    magnitudes: jax.Array | None = None
+    """A scaled walk's keys' value magnitudes `[B, Hk, Kp]` fp32, each key's largest over the launch's value
+    columns (`attention_mosaic_forward._largest`), read a key tile's columns at a time as the keys' scales
+    are; None where a launch reads them from its value slots (a cache's walk)."""
 
 
 def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
@@ -642,14 +822,6 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
     return _Hooked(call.score_params, output, initial, hooks.drop)
 
 
-class _Guard(NamedTuple):
-    """A guarded launch's arrays (`algebra.walked_launches`): the rows that shift, `live` `[B, H, Qp]` (int32,
-    nonzero where live); its keys' value magnitudes, which a step's `algebra.room` reads, come from the value
-    tiles it walks (`Family.key_magnitudes`)."""
-
-    live: jax.Array
-
-
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
            keys_first: bool = False):
     """A hook parameter's values for a tile `like` of queries from `first` (and keys from `k_first`, a score
@@ -662,25 +834,21 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     never silently; a pointwise hook is the same function of either. A score tile whose rows are its keys
     (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`."""
     queries, keys = like.shape[::-1] if keys_first else like.shape
-    rows, columns = pl.ds(first, queries), pl.ds(k_first, keys)
-    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+    if kind is Kind.HEAD:
+        return ref[head]
+    if kind is not Kind.OUTPUT:
         row, head = shared_place(ref.shape, row, head)
-    match kind:
-        case Kind.HEAD:
-            return ref[head]
-        case Kind.QUERY:
-            if keys_first:
-                return algebra.across(family.columns_of(ref.at[row, head, rows]), like)
-            return algebra.expand(family.rows_of(ref.at[row, head, rows]), like)
-        case Kind.KEY:
-            if keys_first:
-                return algebra.expand(family.rows_of(ref.at[row, head, columns]), like)
-            return algebra.across(family.columns_of(ref.at[row, head, columns]), like)
-        case Kind.TILE:
-            tile = (row, head, columns, rows) if keys_first else (row, head, rows, columns)
-            return family.tile_of(ref.at[tile])
-        case Kind.OUTPUT:
-            return family.tile_of(ref.at[row, rows, head])
+    # Its block at the tile's place along each of its axes (`Kind.axes`), a tile parameter's keys-first
+    # copy's keys before its queries.
+    laid = kind.axes[:2] + kind.axes[2:][::-1] if keys_first and kind is Kind.TILE else kind.axes
+    places = {"batch": row, "heads": head, "queries": pl.ds(first, queries), "keys": pl.ds(k_first, keys)}
+    block = ref.at[axes.placed(laid, places)]
+    if kind in (Kind.TILE, Kind.OUTPUT):
+        return family.tile_of(block)
+    # A query's or a key's along the tile's rows or its columns, as the tile lays its queries.
+    along_rows = (kind is Kind.QUERY) != keys_first
+    return (algebra.expand(family.rows_of(block), like) if along_rows
+            else algebra.across(family.columns_of(block), like))
 
 
 class _Spans(NamedTuple):
@@ -694,10 +862,10 @@ class _Spans(NamedTuple):
 
     start: jax.Array
     end: jax.Array
-    lo: jax.Array
-    hi: jax.Array
-    full_lo: jax.Array
-    full_hi: jax.Array
+    lo: jax.Array | None
+    hi: jax.Array | None
+    full_lo: jax.Array | None
+    full_hi: jax.Array | None
     q_lo: jax.Array | None
     q_hi: jax.Array | None
     query_ids: jax.Array | None = None
@@ -802,6 +970,10 @@ def _spans_of(spec: algebra.Forward, call: PaddedCall, block_q: int, block_k: in
     (`algebra.seen`)."""
     if spec.form != "spans":
         return None
+    if call.per_span > 1:
+        # Each interval a position's packed rows (`KeySpans.per_span`): its programs read them by position
+        # and form their tiles' bounds themselves (`_Program.reach`, `_Program.bounds`), no block map in XLA.
+        return _Spans(call.start, call.end, None, None, None, None, None, None)
     blocks = block_map(KeySpans(call.start, call.end, call.query_ids, call.key_ids, call.key_rows),
                        block_q, block_k)
     start, end = (jnp.moveaxis(bound, 2, 1) if bound.ndim == 3 else bound for bound in (call.start, call.end))
@@ -825,10 +997,24 @@ class _Program[T: (Tiles, BackwardTiles)]:
     causal: bool
     queries: int | None = None
     splits: int = 1
+    per_span: int = 1
+    """The queries each of a spans call's intervals holds (`KeySpans.per_span`): more than one, its programs
+    read the intervals by position (`reach`, `bounds`)."""
+    parts: int = 1
+    """The bf16 parts each of an fp32 call's tiles is staged in, one above the other (`MosaicForward.parts`):
+    its products their parts' (`parted`)."""
+
+    def parted(self, tile, rows: int):
+        """`tile` as the parts its products take (`operands.Parts`, each `rows` rows of it, an fp32 tile's),
+        or itself where the call's operands are 16-bit."""
+        if self.parts == 1:
+            return tile
+        return operands.Parts(tuple(tile.at[pl.ds(part * rows, rows)] for part in range(self.parts)),
+                              jnp.float32)
 
     def split(self):
         """This program's slice of its query tile's keys (`splits`), 0 of one."""
-        return lax.rem(lax.axis_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
+        return lax.rem(self.family.program_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
 
     def padded(self, first) -> jax.Array | bool:
         """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
@@ -841,7 +1027,7 @@ class _Program[T: (Tiles, BackwardTiles)]:
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
         scheduler orders them; a full call's in order."""
-        index = lax.axis_index("q_tiles")
+        index = self.family.program_index("q_tiles")
         if self.splits > 1:
             index = lax.div(index, self.splits)
         return count - 1 - index if self.causal else index
@@ -849,7 +1035,8 @@ class _Program[T: (Tiles, BackwardTiles)]:
     def __post_init__(self):
         if not whole_tiles(self.family, self.tiles):
             raise ValueError(f"{self.tiles}: query and key tiles of whole {self.family.rows} rows and "
-                             f"{self.family.consumers} consumers at most ({self.family.name})")
+                             f"{most_consumers(self.family, self.tiles)} consumers at most "
+                             f"({self.family.name})")
 
     def walked(self, first):
         """The key tiles a query block from `first` reads: those holding the call's keys (none wholly past
@@ -877,17 +1064,81 @@ class _Program[T: (Tiles, BackwardTiles)]:
             # A block holding padding rows is whole nowhere: its padding sees no key (`algebra.seen`).
             count = jnp.where(self.padded(first), 0, self.whole(first, walked))
             return *self._sliced(jnp.int32(0), walked), lambda index: index < count
+        if spans.lo is None or spans.hi is None or spans.full_lo is None or spans.full_hi is None:
+            # Read by position (`_spans_of`): no block map.
+            return self._positions_reach(first, spans, row)
         block = lax.div(first, self.tiles.block_q)
-        full_lo, full_hi = spans.full_lo[row, block], spans.full_hi[row, block]
+        at = functools.partial(self._entry, row=row)
+        full_lo, full_hi = at(spans.full_lo, block), at(spans.full_hi, block)
 
         def whole(index):
             inside = (index >= full_lo) & (index < full_hi)
             if spans.query_doc is None or spans.key_doc is None:
                 return inside
-            doc = spans.query_doc[row, block]
-            return inside & (doc != 0) & (doc == spans.key_doc[row, index])
+            doc = at(spans.query_doc, block)
+            return inside & (doc != 0) & (doc == at(spans.key_doc, index))
 
-        return *self._sliced(spans.lo[row, block], spans.hi[row, block]), whole
+        return *self._sliced(at(spans.lo, block), at(spans.hi, block)), whole
+
+    def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, ...]]:
+        """The positions a query block from `first` holds rows of, in a call whose intervals each hold
+        `per_span` queries (`KeySpans.per_span`): each one's index, its interval `[start, end)` (batch row
+        `row`'s, read once) and whether the block holds its rows; as many as the block can hold,
+        statically."""
+        positions = spans.start.shape[1]
+        held = min(positions, self.tiles.block_q // self.per_span + 1)
+        at = lax.div(first, self.per_span)
+        found = []
+        for offset in range(held):
+            position = at + offset
+            # A position past the call's holds no row: read its last one's, unused.
+            index = jnp.minimum(position, positions - 1)
+            holds = (position < positions) & (position * self.per_span < first + self.tiles.block_q)
+            found.append((position, self._entry(spans.start, index, row=row),
+                          self._entry(spans.end, index, row=row), holds))
+        return found
+
+    def _positions_reach(self, first, spans: _Spans, row):
+        """`reach`'s for a call whose intervals each hold `per_span` queries: the key tiles from the first any
+        of its rows' intervals starts in to the last any ends in, none seen whole where the block holds a
+        padding row (a decode step's few rows of a tile), else those every one of its intervals covers."""
+        block_k, big = self.tiles.block_k, jnp.iinfo(jnp.int32).max
+        lo, hi, full_lo, full_hi = jnp.int32(big), jnp.int32(0), jnp.int32(0), jnp.int32(big)
+        for _, start, end, holds in self._positions(first, spans, row):
+            seen = holds & (end > start)
+            lo = jnp.where(seen, jnp.minimum(lo, lax.div(start, block_k)), lo)
+            hi = jnp.where(seen, jnp.maximum(hi, pl.cdiv(end, block_k)), hi)
+            full_lo = jnp.where(holds, jnp.maximum(full_lo, pl.cdiv(start, block_k)), full_lo)
+            full_hi = jnp.where(holds, jnp.minimum(full_hi, lax.div(end, block_k)), full_hi)
+        lo = jnp.minimum(lo, hi)
+        if self.padded(first) is not False:
+            full_hi = jnp.where(self.padded(first), full_lo, full_hi)
+
+        def whole(index):
+            return (index >= full_lo) & (index < full_hi)
+
+        return *self._sliced(lo, hi), whole
+
+    def bounds(self, first, spans: _Spans, row) -> tuple[tuple, jax.Array | None]:
+        """A query block's intervals and its ids as `_coords` reads them (`_query_bounds`), read once before
+        its walk; a call whose intervals each hold `per_span` queries its rows' from their positions', a
+        padding row's empty."""
+        family, count = self.family, self.tiles.block_q
+        if spans.lo is not None:
+            return _query_bounds(family, spans, row, first, count)
+        place = lax.div(first + family.iota((count,), 0), self.per_span)
+        start = end = place * 0
+        for position, low, high, holds in self._positions(first, spans, row):
+            mine = (place == position) & holds
+            start, end = jnp.where(mine, low, start), jnp.where(mine, high, end)
+        return ((family.as_row(start), family.as_row(end)),), None
+
+    def _entry(self, ref, index, *, row):
+        """A block map's entry `ref[row, index]` as the family reads a launch's scalar (`Family.scalar_of`: a
+        GPU thread's load, a TPU core's copy into its scalar memory, whose operands stay in HBM, where a load
+        lowers on no core: a v5e's documents call refused to lower, "ANY memory space can only be accessed
+        using async_copy")."""
+        return self.family.scalar_of(ref.at[row, pl.ds(index, 1)])
 
     def _sliced(self, lo, hi) -> tuple[jax.Array, jax.Array]:
         """`[lo, hi)` key tiles, this program's slice of them (`split`): the `splits` contiguous slices of a
@@ -907,16 +1158,19 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return self._first_reader(k_first, q_steps), jnp.int32(q_steps), lambda index: (
                 (index >= start) & (index < end))
         block = lax.div(k_first, self.tiles.block_k)
+        full_lo, full_hi = spans.full_lo, spans.full_hi
+        assert full_lo is not None and full_hi is not None, "a key block's walk reads its block map"
+        at = functools.partial(self._entry, row=row)
 
         def seen_whole(index):
-            inside = (block >= spans.full_lo[row, index]) & (block < spans.full_hi[row, index])
+            inside = (block >= at(full_lo, index)) & (block < at(full_hi, index))
             if spans.query_doc is None or spans.key_doc is None:
                 return inside
-            doc = spans.key_doc[row, block]
-            return inside & (doc != 0) & (doc == spans.query_doc[row, index])
+            doc = at(spans.key_doc, block)
+            return inside & (doc != 0) & (doc == at(spans.query_doc, index))
 
         assert spans.q_lo is not None and spans.q_hi is not None, "a key block's walk reads its readers"
-        return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
+        return at(spans.q_lo, block), at(spans.q_hi, block), seen_whole
 
     def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
         """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
@@ -953,6 +1207,15 @@ class _Program[T: (Tiles, BackwardTiles)]:
         start = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(start, lo))
         end = jnp.int32(q_steps if self.queries is None else min(self.queries // block_q, q_steps))
         return start, jnp.maximum(end, start)
+
+
+def _per_span(spec: algebra.Forward, spans: _Spans | None) -> int:
+    """The queries each of a launch's spans' intervals holds (`KeySpans.per_span`): its queries over its
+    positions where its programs read them by position (`_spans_of`), else 1."""
+    if spans is None or spans.lo is not None:
+        return 1
+    assert spec.queries is not None  # a call read by position states its queries (`_prepared`)
+    return spec.queries // spans.start.shape[1]
 
 
 def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:

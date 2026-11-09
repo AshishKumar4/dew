@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,9 +34,10 @@ from dew.nn.kernels.generation import (
     runtime_facts,
     triton_runs,
 )
+from dew.nn.kernels.lowered import custom_calls, triton_kernels
 from dew.nn.kernels.selection import Refusal
 from dew.telemetry import instrumentation
-from dew.training._lowering import KernelReport, custom_calls, kernel_report, triton_kernels
+from dew.training._lowering import KernelReport, kernel_report
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -174,8 +174,8 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     launch none, so the kernel report and the FLOP count leave them out alike, the step's Triton kernel its
     one launch (2958's review: a kernel of no runs once turned a live kernel's stated FLOPs unknown)."""
     from dew.nn.kernels import gemm
+    from dew.nn.kernels.lowered import kernel_calls
     from dew.telemetry.instrumentation import hlo_flops
-    from dew.training._lowering import kernel_calls
 
     def step(x, w, sizes):
         def body(carry):
@@ -199,6 +199,45 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None and flops.hardware == 0
     assert record["unsized"] == flops.unsized
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_conditional_launches_its_branch_of_the_most_stated_flops(generation):
+    """A grouped GEMM's forward in nested conditionals, a branch of one call beside one of two conditionals
+    whose branches make two and three, each call the one function its kernels lower once in
+    (`tuning.lowered_once`): the kernel report counts the branch of the most stated FLOPs alone, three
+    calls of one call's launches, and the FLOP count of the same program counts the same, as a run takes
+    one branch of each (the scaled attention forward's kernels beside the common ones,
+    `attention_algebra.may_scale`)."""
+    from dew.nn.kernels import gemm
+    from dew.telemetry.instrumentation import hlo_flops
+
+    def calls(x, w, sizes, count):
+        return sum(gemm.gemm(x * (index + 1), w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+                   for index in range(count))
+
+    def step(x, w, sizes, taken, inner):
+        def nested():
+            return jax.lax.cond(inner, lambda: calls(x, w, sizes, 2), lambda: calls(x, w, sizes, 3))
+
+        return jax.lax.cond(taken, lambda: calls(x, w, sizes, 1), nested)
+
+    x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes, flag = jax.ShapeDtypeStruct((2,), jnp.int32), jax.ShapeDtypeStruct((), jnp.bool_)
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+
+    def lowered_report(fn, *shapes):
+        with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+            lowered = jax.jit(fn).trace(*shapes).lower(lowering_platforms=("cuda",))
+        return lowered, kernel_report(found, lowered).record()
+
+    lowered, record = lowered_report(step, x, w, sizes, flag, flag)
+    _, alone = lowered_report(lambda x, w, sizes: calls(x, w, sizes, 1), x, w, sizes)
+    once = templated_calls(alone)
+    assert once and templated_calls(record) == {name: 3 * count for name, count in once.items()}
+    templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None and flops.hardware == sum(entry["flops"] for entry in templated) > 0
 
 
 @pytest.mark.parametrize(("start", "bound", "step", "bits", "signed", "trips"), [
@@ -228,20 +267,20 @@ def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
 
 
 def test_a_kernel_is_named_from_its_location_wherever_the_location_nests_the_name():
-    """A Mosaic GPU call's kernel name and launch (`_lowering._kernel_name`) from its location's name stack
+    """A Mosaic GPU call's kernel name and launch (`lowered._kernel_name`) from its location's name stack
     wherever the location nests it: its own, a call site's callee's, a fused location's part (a rewrite
     that merged operations); a location that carries no name gives none, and the report names the call by
     its hash."""
     from jax.extend.mlir import ir
 
-    from dew.training import _lowering
+    from dew.nn.kernels import lowered
 
     with ir.Context():
         named = ir.Location.name("jit(step)/attention_forward__l0123456789/mpmd_map")
         source = ir.Location.file("model.py", 1, 1)
         for location in (named, ir.Location.callsite(named, [source]), ir.Location.fused([source, named])):
-            assert _lowering._kernel_name(location) == ("attention_forward", "0123456789")
-        assert _lowering._kernel_name(ir.Location.fused([source])) is None
+            assert lowered._kernel_name(location) == ("attention_forward", "0123456789")
+        assert lowered._kernel_name(ir.Location.fused([source])) is None
 
 
 def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_unsized():
@@ -263,9 +302,9 @@ def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_un
 
     lowered = jax.jit(step).trace(tokens, kernel, cotangent, sizes).lower(lowering_platforms=("cuda",))
     record = kernel_report((), lowered).record()
-    assert [(entry["kind"], entry["name"], entry["calls"]) for entry in record["launches"]] == [
-        (None, "an_unknown_kernel", 1), ("grouped_gemm", "dew_cutlass_grouped_gemm", 1),
-        ("grouped_gemm", "dew_cutlass_grouped_gemm_k", 1)]
+    assert {(entry["kind"], entry["name"]): entry["calls"] for entry in record["launches"]} == {
+        (None, "an_unknown_kernel"): 1, ("grouped_gemm", "dew_cutlass_grouped_gemm"): 1,
+        ("grouped_gemm", "dew_cutlass_grouped_gemm_k"): 1}
     assert record["unsized"] == 1
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None
@@ -290,8 +329,8 @@ def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     with assumed("v6e"):
         lowered = jax.jit(step).trace(lhs, rhs, sizes).lower(lowering_platforms=("tpu",))
     record = kernel_report((), lowered).record()
-    assert [(entry["kind"], entry["name"], entry["flops"]) for entry in record["launches"]] == [
-        ("mosaic_tpu", "dew_gmm", GMM), ("mosaic_tpu", "dew_tgmm", GMM)]
+    assert {(entry["kind"], entry["name"]): entry["flops"] for entry in record["launches"]} == {
+        ("mosaic_tpu", "dew_gmm"): GMM, ("mosaic_tpu", "dew_tgmm"): GMM}
     assert record["unsized"] == 0
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None
@@ -403,6 +442,30 @@ def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop
     assert scanned["unsized"] == unrolled["unsized"] == counted.unsized
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_decoders_residual_norms_run_the_fused_kernel_on_a_data_parallel_step():
+    """A bf16 decoder whose layers norm each branch's output (`sandwich_norms`) and whose stack ends in its
+    final norm, its training step lowered for an H100 over two devices' automatic data axis with the fused
+    norm chosen (`dew.kernels.use`): every residual-shaped norm names its input's axes
+    (`decoder_block.residual_normed`), so each runs on its shard's rows and the step lowers with the norm's
+    kernels, where an unplaced call on an automatic axis is refused the kernel (row 822)."""
+    import optax
+
+    import dew
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from dew.training._lowering import Lowered
+
+    model = CausalTransformer(vocab_size=256, emb_features=128, num_layers=2, num_heads=2, mlp_features=256,
+                              max_seq_len=128, dtype=jnp.bfloat16, sandwich_norms=True)
+    trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0), lower_for="sm90")
+    state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+    with dew.kernels.use(rms_norm="pallas"), pytest.raises(Lowered) as lowered:
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
+    assert {"rms_norm_forward", "rms_norm_backward"} <= set(triton_kernels(lowered.value.lowered))
+
+
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
 def test_a_packed_delta_net_lowers_for_an_a100_whatever_documents_its_rows_declare(bound):
     """A bf16 gated delta net over packed rows of 128 tokens in 8 documents, their bound undeclared
@@ -447,9 +510,6 @@ def _experts_lowered(generation: str, implementation: str):
         return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
 
 
-COLLECTIVES = re.compile(r"stablehlo\.(all_gather|all_reduce|all_to_all|reduce_scatter|collective_permute|"
-                         r"collective_broadcast)")
-"""The collectives a lowered program states itself (a `shard_map`'s; XLA's partitioner adds its own later)."""
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_kernel_launches_only_where_every_axis_of_its_mesh_is_manual(generation):
@@ -585,9 +645,9 @@ PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
-def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, str]:
+def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, list]:
     """The Pallas launches (`custom_calls`) of `loss`'s value and gradient lowered for `generation`'s GPU on
-    an abstract mesh of `devices` that splits the rows, and the program's text."""
+    an abstract mesh of `devices` that splits the rows, and the program's operations (`_operations`)."""
     from jax.sharding import AbstractMesh, AxisType
 
     from dew.telemetry.instrumentation import custom_call_kind
@@ -598,7 +658,7 @@ def _kernel_launches(loss, args, generation: str, devices: int) -> tuple[list, s
             lowering_platforms=("cuda",))
     calls = [call for call in custom_calls(lowered)
              if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
-    return calls, lowered.as_text()
+    return calls, _operations(lowered)
 
 
 @pytest.mark.parametrize(("generation", "op"),
@@ -610,7 +670,7 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     only collective is the reduction of its replicated parameters' gradients over the data axis."""
     loss, args = PER_SHARD_STEPS[op](384)
     whole, _ = _kernel_launches(loss, args, generation, 1)
-    split, text = _kernel_launches(loss, args, generation, 2)
+    split, operations = _kernel_launches(loss, args, generation, 2)
 
     def elements(call) -> int:
         return sum(math.prod(shape) for shape in call.operands)
@@ -619,7 +679,7 @@ def test_every_kernel_launch_takes_its_own_devices_rows_on_a_two_device_mesh(gen
     assert whole and pairs, (op, [call.target for call in whole], [call.target for call in split])
     assert all(elements(on_two) < elements(on_one) for on_two, on_one in pairs), (
         op, [(elements(on_two), elements(on_one)) for on_two, on_one in pairs])
-    assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
+    assert {_collective(name) for name, *_ in operations if _collective(name)} <= {"all-reduce"}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -655,9 +715,11 @@ def test_a_per_group_bias_reaches_its_launch_at_its_groups_extent(generation):
 def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
     """Row 1705: a grouped product's consumers fused into its epilogue (`fuser.fuse` over
     `fused_gemm.fusible_gemm`: a SiLU of the scaled product plus a residual, cast to bf16), lowered for the
-    GPU, write only their bf16 result: no `[rows, N]` fp32 value, the product's accumulator or anything the
-    consumers compute from it, is a tensor of the program, so none is ever stored to global memory, and the
-    launch's results are the consumers' output alone."""
+    GPU, write only their bf16 result: the one launch's result is the consumers' bf16 `[rows, N]` output, no
+    operation of the program reads or writes an fp32 `[rows, N]` value (the product's accumulator or
+    anything the consumers compute from it), and compiled for the GPU its temporaries hold less than one
+    such value, so none is ever stored to global memory."""
+    import kernel_compile
     from jax.experimental.pallas import fuser
     from jax.sharding import AbstractMesh, AxisType
 
@@ -679,8 +741,13 @@ def test_a_fused_epilogues_intermediates_never_reach_global_memory(generation):
     calls = custom_calls(lowered)
     launches = [call for call in calls if custom_call_kind(call.target) in ("triton", "mosaic_gpu")]
     assert len(launches) == 1, [call.target for call in calls]
-    # No operation materializes the product in float32: the epilogue reads it within the kernel.
-    assert ((rows, width), "f32") not in result_types(lowered)
+    operations = _operations(lowered)
+    results = [results for _, target, _, results in operations if target == launches[0].target]
+    assert results == [(((rows, width), "bf16"),)], results
+    wide = ((rows, width), "f32")
+    assert not any(wide in operands + results for _, _, operands, results in operations)
+    memory = kernel_compile.lowered_for(fuser.fuse(fused), args, generation).compile().memory_analysis()
+    assert memory is not None and memory.temp_size_in_bytes < rows * width * 4, memory
 
 
 @pytest.mark.parametrize("generation", GPUS)
@@ -745,7 +812,7 @@ def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation
     """A Mamba layer, its selective scan the template's and its launches settled as the trainer settles
     them, lowers on this CPU for each GPU the template takes it on (an A100's and an H100's), forward and
     backward each a Mosaic GPU launch."""
-    from dew.training._lowering import kernel_calls
+    from dew.nn.kernels.lowered import kernel_calls
 
     names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))
              if call.kind == "mosaic_gpu"}
@@ -836,7 +903,7 @@ Operation = tuple[str, str, tuple, tuple]
 
 def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
     """Every operation of a lowered program in program order (its StableHLO module's walk, as
-    `dew.training._lowering.triton_calls` reads it)."""
+    `dew.nn.kernels.lowered.triton_calls` reads it)."""
     from jax.extend.mlir import ir
 
     found: list[Operation] = []
@@ -1017,12 +1084,13 @@ def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores
 @pytest.mark.parametrize("generation, claimed", [
     ("sm75", None), ("sm80", "mma.sync"), ("sm86", "mma.sync"), ("sm87", "mma.sync"),
     ("sm89", "mma.sync"), ("sm90", "wgmma"), ("sm100", "tcgen05"), ("sm103", "tcgen05"),
-    ("sm110", "tcgen05"), ("sm120", "mma.sync"), ("sm121", "mma.sync"), ("sm70", None), ("sm60", None),
-    ("v5e", "tpu"), ("cpu", None)])
+    ("sm110", "tcgen05"), ("sm120", "mma.sync"), ("sm121", "mma.sync"), ("sm130", "mma.sync"),
+    ("sm91", "mma.sync"), ("sm70", None), ("sm60", None), ("v5e", "tpu"), ("cpu", None)])
 def test_a_generations_instruction_family_is_its_compute_capabilitys(generation, claimed):
     """The family a template's mainloop claims comes from the compute capability alone, a GPU the table
-    names or not (sm87, sm110 and sm121 it does not); a Turing GPU (no bf16 MMA), one before it or a CPU
-    is in none."""
+    names or not (sm87, sm110 and sm121 it does not; an NVIDIA GPU past every rule, sm130 or sm91, mma.sync,
+    which every NVIDIA GPU from Ampere issues); a Turing GPU (no bf16 MMA), one before it or a CPU is in
+    none."""
     assert family(generation) == claimed
 
 
@@ -1048,6 +1116,72 @@ def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
         device_kind="NVIDIA H100 80GB HBM3"))
     assert (blackwell.multiprocessors, blackwell.shared_limit, blackwell.wgmma) == (148, 232448, False)
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
+
+
+def test_a_gpu_target_takes_the_clocks_bandwidth_and_l2_its_driver_reports():
+    """A real device's target takes its multiprocessor clock, its memory bandwidth (twice the memory clock
+    times the bus's bytes) and its L2 cache from the CUDA driver's attributes, read at the driver's
+    boundary (`read`, `dew._devices.gpu_attribute`'s signature); where no driver loads (`read` gives
+    None), the table's stay."""
+    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, L2_CACHE_SIZE, MEMORY_CLOCK_RATE
+    reported = {CLOCK_RATE: 1_755_000, MEMORY_CLOCK_RATE: 2_619_000, GLOBAL_MEMORY_BUS_WIDTH: 5120,
+                L2_CACHE_SIZE: 52_428_800}
+    device = SimpleNamespace(compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448,
+                             local_hardware_id=3, device_kind="NVIDIA H100 80GB HBM3")
+    table = GpuTarget("sm90", "NVIDIA H100 80GB HBM3", clock_hz=1830e6, memory_bandwidth=3350e9,
+                      l2_bytes=50 * 2 ** 20)
+    driven = runtime_facts(table, device, read=lambda ordinal, attribute: reported[attribute])
+    assert (driven.clock_hz, driven.memory_bandwidth, driven.l2_bytes) == (
+        1_755_000e3, 2 * 2_619_000e3 * 5120 / 8, 52_428_800)
+    undriven = runtime_facts(table, device, read=lambda ordinal, attribute: None)
+    assert (undriven.clock_hz, undriven.memory_bandwidth, undriven.l2_bytes) == (1830e6, 3350e9, 50 * 2 ** 20)
+
+
+def test_a_parts_gpu_facts_are_the_facts_its_kernels_read():
+    """`dew.gpu_facts` reads the target Dew's kernels resolve, for a named part (by generation, device kind or
+    alias alike) and for this process's device within `assumed`; its peaks read-only, a part Dew knows
+    nothing of and a process whose device is no GPU refused."""
+    import dew
+    from dew.nn.kernels import generation
+
+    target = generation.gpu_target("sm90")
+    facts = dew.gpu_facts("sm90")
+    assert facts == dew.gpu_facts(target.device_kind)
+    assert dew.gpu_facts("sm80") == dew.gpu_facts("a100")
+    assert (facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth, facts.l2_bytes,
+            facts.shared_per_block, facts.registers, facts.instruction_families) == (
+        target.multiprocessors, target.clock_hz, target.memory_bandwidth, target.l2_bytes,
+        generation.shared_budget(target), target.multiprocessor.registers, ("wgmma", "mma.sync"))
+    with generation.assumed("sm80"):
+        assert dew.gpu_facts() == dew.gpu_facts("sm80")
+    with pytest.raises(TypeError):
+        facts.dense_peaks["bf16"] = 0.0
+    with pytest.raises(ValueError):
+        dew.gpu_facts("not a gpu")
+    with pytest.raises(ValueError):
+        dew.gpu_facts()
+
+
+def test_a_block_chooses_its_ops_kernels_over_a_layers_own():
+    """`dew.kernels.use`, the public kernel choice: an RMSNorm layer naming XLA's norm runs it; within a block
+    choosing the Pallas norm (beside a nested block choosing another op's), the block's choice holds over the
+    layer's, so a row past the Pallas norm's 8192-feature register tile is refused (`KernelRefused`, its op
+    and kernel the block's) rather than run on XLA's in silence; past the block the layer's own runs again;
+    a block naming no op Dew dispatches is refused."""
+    import dew
+    from dew.nn.norms import RMSNorm
+
+    x = jnp.ones((2, 16384), jnp.float32)
+    norm = RMSNorm(implementation="xla")
+    params = norm.init(jax.random.key(0), x)
+    before = norm.apply(params, x)
+    with (dew.kernels.use(rms_norm="pallas"), dew.kernels.use(attention="xla"),
+          pytest.raises(dew.kernels.KernelRefused) as refused):
+        norm.apply(params, x)
+    assert (refused.value.choice, refused.value.kernel) == ("rms_norm", "pallas")
+    np.testing.assert_array_equal(norm.apply(params, x), before)
+    with pytest.raises(ValueError), dew.kernels.use(rms_nrom="pallas"):
+        pass
 
 
 def a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it():
@@ -1297,30 +1431,6 @@ def test_a_batchs_token_layout_split_over_its_tokens_compiles_no_loop_a_token():
     assert not loops, loops
 
 
-
-
-def result_types(lowered: jax.stages.Lowered) -> set[tuple[tuple[int, ...], str]]:
-    """The shape and element type of every array an operation of `lowered`'s StableHLO module results in,
-    its every function's and region's operations included."""
-    from jax.extend.mlir import ir
-
-    found = set()
-
-    def walked(operation) -> None:
-        for result in operation.results:
-            if isinstance(result.type, ir.RankedTensorType):
-                ranked = ir.RankedTensorType(result.type)
-                found.add((tuple(ranked.shape), str(ranked.element_type)))
-        for region in operation.regions:
-            for block in region.blocks:
-                for nested in block.operations:
-                    walked(nested.operation)
-
-    for operation in lowered.compiler_ir("stablehlo").body.operations:
-        walked(operation.operation)
-    return found
-
-
 # ------------------------------------------------------------------ a TPU topology, compiled ahead here
 
 
@@ -1468,8 +1578,8 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
     import tokamax
 
     from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates import attention_mosaic, attention_mosaic_program, report
-    from dew.training._lowering import KernelCall
 
     def spec(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
@@ -1486,7 +1596,7 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
                                                 "dense": True})
     assert gradient.padded(weights, tile) == 1 - 64 * 300 / (128 * 512)
     attention = attention_mosaic.MosaicForward()
-    tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2)
+    tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2, family="wgmma")
     scores = tokamax.BoundArguments(attention, {"query": spec(1, 100, 2, 64), "key": spec(1, 200, 2, 64)})
     assert attention.padded(scores, tiles) == 1 - 100 * 200 / (128 * 256)
 

@@ -28,6 +28,7 @@ so they must share a tokenizer, and a vocabulary mismatch is refused.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Generic, Literal
@@ -50,7 +51,6 @@ from dew.objectives.base import (
     OMITTED,
     TEACHER,
     Aux,
-    EMASpec,
     Objective,
     Omitted,
     Prediction,
@@ -188,10 +188,9 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         # frozen teacher reads the run's end.
         self.passes_progress = student.passes_progress
         averaged = student.ema
-        # The EMA follows what moves; the teacher never does.
-        self.ema = None if averaged is None else EMASpec(
-            decay=averaged.decay,
-            select=lambda path: path[0] != TEACHER and averaged.select(path))
+        # The EMA follows what moves, on the student's own clock; the teacher never does.
+        self.ema = None if averaged is None else replace(
+            averaged, select=lambda path: path[0] != TEACHER and averaged.select(path))
 
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
         """The student's record and batch steps: the teacher scores the batch the student reads."""
@@ -208,6 +207,32 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     def row_tokens(self, batch: Batch) -> int | None:
         """The tokens each row of the batch the student reads holds."""
         return self.student.row_tokens(batch)
+
+    def model_flops(self, model, batch: Batch) -> float:
+        """The student's forward, the frozen teacher's and the feature projections' on the batch's real
+        tokens; `model` is unread, each component counting its own."""
+        return (self.student.model_flops(None, batch) + self.teacher.model_flops(None, batch)
+                + self._projected_flops(batch))
+
+    def training_flops(self, model, batch: Batch) -> float:
+        """The student's forward and backward, the projections' three passes, and the teacher's forward
+        alone: its collection takes no gradient."""
+        return (self.student.training_flops(None, batch) + self.teacher.model_flops(None, batch)
+                + 3 * self._projected_flops(batch))
+
+    def _projected_flops(self, batch: Batch) -> float:
+        from dew.nn.flops import projection_flops
+        lengths = self.real_lengths(batch)
+        return sum(projection_flops(lengths, *shape) for shape in self._projection_shapes)
+
+    @functools.cached_property
+    def _projection_shapes(self) -> tuple[tuple[int, int], ...]:
+        """Each feature pair's projection, `[student, teacher]` widths, as `init` makes them (from an
+        abstract init): none where the pair's widths agree."""
+        if not self.features:
+            return ()
+        tree = jax.eval_shape(self.init, jax.random.key(0))
+        return tuple(leaf.shape for leaf in tree["params"].get(PROJECTIONS, {}).values())
 
     def inference_record(self) -> JSON:
         """The student's record: a saved distillation loads as the student it trained, on the
@@ -274,6 +299,14 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         if projections:
             tree["params"] = {**tree["params"], PROJECTIONS: projections}
         return tree
+
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """The student's stacks over its own tree, and the frozen teacher's below its collection
+        (`DecoderBank.root`), which a host layout banks where they lie, so the teacher's layers reach the
+        device one at a time as the student's do."""
+        return (*self.student.bank_sites(self.student_variables(store)),
+                *(replace(site, root=(TEACHER, *site.root))
+                  for site in self.teacher.bank_sites(store[TEACHER])))
 
     def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
         """The student's runs a pipeline over `stages` stacks (`Objective.stage_sites`), which its tree,

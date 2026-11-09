@@ -217,6 +217,8 @@ class ShortConvMixer(MixerBase):
     the layer has no keys to cache, no rope and no window."""
 
     residuals = ('conv',)
+    # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
+    packed_cache = True
 
     conv_L_cache: int = 3
     conv_bias: bool = False
