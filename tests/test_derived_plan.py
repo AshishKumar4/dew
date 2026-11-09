@@ -72,12 +72,15 @@ def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fi
 def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_there(monkeypatch, tmp_path):
     """With room for every rung, the derivation fits the base rung, which the search compiles first,
     as it did before any derivation: no rung above it is read. A device that states no memory leaves
-    the derivation nothing to judge against ("unstated"), and the search starts at the base rung too."""
+    the derivation nothing to judge against ("unstated"), and the search starts at the base rung too. The
+    plan records what the algebra pass cost its compiles: each program the search traced, its whole pass
+    in seconds (row 5339)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "fits"))
     free(monkeypatch, LIMIT)
     trainer = deep()
     compiled(trainer)
     assert [entry["label"] for entry in trainer.plan["derived"]] == ["fits"]
+    assert trainer.plan["passes"] and min(trainer.plan["passes"]) > 0
     assert trainer.plan["remat"] is None and trainer.plan["derived"][0]["remat"] is None
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "unknown"))
     monkeypatch.setattr(jax.Device, "memory_stats", lambda device: None)
