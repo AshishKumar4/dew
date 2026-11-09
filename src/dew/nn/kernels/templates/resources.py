@@ -54,8 +54,9 @@ THREADS = 128
 
 COPIED_REGISTERS = 32
 """The registers a thread holds for one copy of an output's rows out through registers (no TMA store before
-Hopper: `templates.mosaic.copied`), which bounds its rows (`copied_rows`): a whole 128 x 128 fp32 tile's 128
-beside the next tile's accumulator spilled on sm86 and sm89 at some shapes and held at others (DECIDE3)."""
+Hopper: `templates.swizzling.copied`), which bounds its rows (`copied_rows`): a whole 128 x 128 fp32
+tile's 128 beside the next tile's accumulator spilled on sm86 and sm89 at some shapes and held at others
+(DECIDE3)."""
 
 
 def copied_rows(columns: int, dtype) -> int:

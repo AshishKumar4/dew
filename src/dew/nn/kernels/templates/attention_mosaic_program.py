@@ -26,6 +26,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     operands,
     resources,
+    swizzling,
 )
 from dew.nn.kernels.templates.attention import (
     Draw,
@@ -146,14 +147,15 @@ def query_swizzle(family: mosaic.Family) -> int | None:
     narrowest where its family loads operands into registers (`Family.operands_in_registers`), 8-row tiles
     32 bytes wide, so a load of the block's fragments one instruction deep (16 of a 16-bit row) is a whole
     tile and its 8 rows' 16-byte reads take every bank once, where a plain block's 256-byte rows take one
-    bank group 8 times; layout inference's otherwise (`mosaic.staged`). The query is written once a tile."""
-    return mosaic.NARROWEST_SWIZZLE_BYTES if family.operands_in_registers else None
+    bank group 8 times; layout inference's otherwise (`swizzling.staged`). The query is written once a
+    tile."""
+    return swizzling.NARROWEST_SWIZZLE_BYTES if family.operands_in_registers else None
 
 
 def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str, int]:
     """The swizzles `Family.streams` stages the streams `names` at, which a launch's products read
     transposed: the narrowest where `tiles` stage them so (`Tiles.narrow`), the family's own otherwise."""
-    return dict.fromkeys(names, mosaic.NARROWEST_SWIZZLE_BYTES) if tiles.narrow else {}
+    return dict.fromkeys(names, swizzling.NARROWEST_SWIZZLE_BYTES) if tiles.narrow else {}
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -285,7 +287,7 @@ def _products(family: mosaic.Family, dtype, *products, narrow: bool = False, lhs
     forward's query block, `query_swizzle`; the family's own where None)."""
     if not family.operands_in_registers:
         return []
-    narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
+    narrowest = swizzling.NARROWEST_SWIZZLE_BYTES if narrow else None
     return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
                                                        lhs_parts=0 if register_lhs else 1,
                                                        rhs_transposed=transposed, lhs_swizzle=lhs_swizzle,

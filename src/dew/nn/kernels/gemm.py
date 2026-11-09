@@ -45,7 +45,7 @@ from dew import _cache
 from dew.algebra import bits
 from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
-from dew.nn.kernels.templates import axes as side_axes_of, mosaic
+from dew.nn.kernels.templates import axes as side_axes_of, swizzling
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import declared
@@ -1236,9 +1236,9 @@ def _rank_product(lhs: jax.Array, factor: jax.Array, scale: jax.Array, precision
 
 def _appended(base: jax.Array, rank_part: jax.Array, axis: int) -> jax.Array:
     """`base` with `rank_part` after it along `axis`, the rank padded with zeros to whole steps of the widest
-    depth the template's families take on its dtype (a 128-byte swizzle's row, `mosaic.SWIZZLE_BYTES`), so
+    depth the template's families take on its dtype (a 128-byte swizzle's row, `swizzling.SWIZZLE_BYTES`), so
     the extended depth divides into the base's own steps."""
-    step = mosaic.swizzle_columns(base.dtype, mosaic.SWIZZLE_BYTES)
+    step = swizzling.swizzle_columns(base.dtype, swizzling.SWIZZLE_BYTES)
     rank_part = rows_padded(rank_part.astype(base.dtype), axis, step)
     return jnp.concatenate([base, rank_part], axis=axis)
 

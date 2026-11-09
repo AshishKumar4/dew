@@ -894,7 +894,7 @@ def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     reading the experts' matrices whole (`kernel_compile.Expected`, its route evidence). Every tile width
     dividing 2880 is an odd multiple of 64, whose ragged store's one-row rung no warpgroup's strided layout
     holds: the template refused each such tile, so the call it was named for (row 4474), until that rung was
-    copied in a row's layout (`mosaic.copied`)."""
+    copied in a row's layout (`swizzling.copied`)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
     expected = Expected(axes=(("data", 1),), specs=(None, None, None),

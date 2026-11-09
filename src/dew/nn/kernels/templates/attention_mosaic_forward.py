@@ -32,7 +32,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, operands, product
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, operands, product, swizzling
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
@@ -164,7 +164,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
         scoped.append(family.staged_memory((consumers, block_k, value_width), dtype))
     if relays(family, tiles, peaks=peaks):
         # The weights' way to the values' product where the family's warps split them (`Family.relaying`).
-        scoped.append(family.staged_memory((consumers, block_q, block_k), dtype, mosaic.UNSWIZZLED))
+        scoped.append(family.staged_memory((consumers, block_q, block_k), dtype, swizzling.UNSWIZZLED))
     scoped += [family.load_barriers(consumers * parts), family.schedule(consumers)]
     # Its rings stage the keys and values as stored: quantized `codes` where given, an fp32 call's parts
     # one above the other.
@@ -180,7 +180,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     if not interpret or family.gathers_interpreted:
         return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
     # A copy a row of each swizzled tile's columns (`mosaic.Ring.parts`), where no lane-level copy runs.
-    unit = {name: mosaic.swizzle_columns(stored, swizzles.get(name, mosaic.SWIZZLE_BYTES)) for name in blocks}
+    unit = {name: swizzling.swizzle_columns(stored, swizzles.get(name, swizzling.SWIZZLE_BYTES))
+            for name in blocks}
     copies = {name: shape[0] * max(1, shape[1] // unit[name]) for name, (shape, _) in blocks.items()}
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, copies=copies)
 

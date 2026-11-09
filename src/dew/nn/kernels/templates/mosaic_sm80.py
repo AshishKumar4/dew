@@ -22,17 +22,26 @@ from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import bodies, handoffs, mosaic, persistent, product, report, resources
+from dew.nn.kernels.templates import (
+    bodies,
+    handoffs,
+    mosaic,
+    persistent,
+    product,
+    report,
+    resources,
+    swizzling,
+)
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
     """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
     vector's none, in whole 16-byte cp.async chunks, and a tile's none where it is read a row at a time
-    (`mosaic.UNSWIZZLED`)."""
+    (`swizzling.UNSWIZZLED`)."""
     shape, dtype = block
-    if len(shape) == 1 or swizzle == mosaic.UNSWIZZLED:
+    if len(shape) == 1 or swizzle == swizzling.UNSWIZZLED:
         return ()
-    return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
+    return swizzled(shape, dtype) if swizzle is None else swizzling.swizzle_transforms(dtype, swizzle)
 
 
 def _at(index_map, lo, step):
@@ -99,7 +108,7 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
 
             return lax.fori_loop(lo, hi, body, carry)
 
-        carry = pl.run_scoped(walked, *(mosaic.staged((stages, *shape), dtype, swizzles[name])
+        carry = pl.run_scoped(walked, *(swizzling.staged((stages, *shape), dtype, swizzles[name])
                                          for name, (shape, dtype) in blocks.items()))
     return carry
 
@@ -115,7 +124,7 @@ def _row_copied(source, table, slot, swizzle: int, interpret: bool) -> None:
 
         lax.fori_loop(0, slot.shape[0], copied, None)
         return
-    transforms = mosaic.swizzle_transforms(source.dtype, swizzle)
+    transforms = swizzling.swizzle_transforms(source.dtype, swizzle)
     refs = (plgpu.RefType(), plgpu.RefType(), plgpu.RefType(transforms))
     plgpu.inline_mgpu(arg_types=refs)(
         lambda ctx, source, rows, slot: gathered_rows.row_copies(source, rows, slot, swizzle=swizzle))(
@@ -124,9 +133,9 @@ def _row_copied(source, table, slot, swizzle: int, interpret: bool) -> None:
 
 def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
-    bytes allow and its cp.async copy tiles (`mosaic.copied_swizzle`), swizzled (bank-conflict-free
+    bytes allow and its cp.async copy tiles (`swizzling.copied_swizzle`), swizzled (bank-conflict-free
     ldmatrix), as jax's Ampere examples stage their operands."""
-    return mosaic.swizzle_transforms(dtype, mosaic.copied_swizzle(shape, dtype))
+    return swizzling.swizzle_transforms(dtype, swizzling.copied_swizzle(shape, dtype))
 
 
 def _depth_granule(ref, axis: int, instruction: int) -> int:
@@ -138,7 +147,7 @@ def _depth_granule(ref, axis: int, instruction: int) -> int:
                      and transform.permutation == (1, 0) for transform in ref.transforms) % 2
     if axis != (0 if transposed else 1):
         return instruction
-    return max(instruction, mosaic.swizzle_columns(ref.dtype, mosaic.swizzle_of(ref)))
+    return max(instruction, swizzling.swizzle_columns(ref.dtype, swizzling.swizzle_of(ref)))
 
 
 class Slots:
@@ -167,7 +176,7 @@ class Pipeline:
     blocks: dict
     stages: int
     swizzles: dict = dataclasses.field(default_factory=dict)
-    """The swizzle a stream's tiles stage at where `Mma.streams` names one (`mosaic.swizzle_for`)."""
+    """The swizzle a stream's tiles stage at where `Mma.streams` names one (`swizzling.swizzle_for`)."""
     gathered: tuple = ()
     """The streams whose step's rows a table gathers (a `Rows` view of one row a run): the warpgroup's own
     cp.async copies, a row a copy (`gathered.row_copies`), into slots of the walk's own, in the pipeline's
@@ -212,8 +221,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def column_unit(self, dtype) -> int:
         # A warp's lanes, whatever loader stages its tiles: the guarded attention walk's 32-column key
         # blocks held where its 64 held no tile's registers at width 128 (its fragments are registers), a
-        # TMA ring staging such a block at a 64-byte swizzle (`mosaic.staged`); cp.async's stores move rows
-        # through registers, a row's columns over a warp's lanes at least (`mosaic.copied`).
+        # TMA ring staging such a block at a 64-byte swizzle (`swizzling.staged`); cp.async's stores move rows
+        # through registers, a row's columns over a warp's lanes at least (`swizzling.copied`).
         del dtype
         return resources.THREADS // 4
 
@@ -275,7 +284,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         the widest its row bytes allow where None, `swizzled`, `_depth_granule`), the whole depth where it
         is narrower."""
         swizzle = resources.widest_swizzle(self.dtype, depth) if swizzle is None else swizzle
-        return max(self.fragment_depth(depth), min(depth, mosaic.swizzle_columns(self.dtype, swizzle)))
+        return max(self.fragment_depth(depth), min(depth, swizzling.swizzle_columns(self.dtype, swizzle)))
 
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
 
@@ -364,7 +373,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return 0 if self.m_warps == 4 else rows * depth * self.dtype.itemsize
 
     def relaying(self, tile) -> Self:
-        # A plain tile (`mosaic.plain`).
+        # A plain tile (`swizzling.plain`).
         return dataclasses.replace(self, relay=tile)
 
     @property
@@ -402,7 +411,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # unchanged (FS-C1-NARROW1-a100).
         instruction = self.fragment_depth(int(rhs.shape[0]))
         lhs_depth = max(_depth_granule(lhs, 1, instruction),
-                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=mosaic.swizzle_of(lhs)))
+                        self.lhs_fragment_depth(int(lhs.shape[1]), swizzle=swizzling.swizzle_of(lhs)))
         rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
@@ -594,7 +603,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             def copied(smem):
                 # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                mosaic.store_rows(smem, ref, *place, copy=mosaic.copied,
+                mosaic.store_rows(smem, ref, *place, copy=swizzling.copied,
                                   widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
             pl.run_scoped(copied, staging[output])
@@ -676,7 +685,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
-            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
+            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=swizzling.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
@@ -710,7 +719,7 @@ class Mma(MmaIssuer, CpAsync):
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
-        return tuple(mosaic.swizzle_columns(dtype, swizzle) for swizzle in (mosaic.SWIZZLE_BYTES, 64))
+        return tuple(swizzling.swizzle_columns(dtype, swizzle) for swizzle in (swizzling.SWIZZLE_BYTES, 64))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

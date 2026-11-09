@@ -9,7 +9,12 @@ import jax
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_gradient as gradient, mosaic
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_gradient as gradient,
+    mosaic,
+    swizzling,
+)
 from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
 from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -90,7 +95,7 @@ def _relay_tiles(family: mosaic.Family, consumers: int, rows: int, depth: int, d
     (`Family.relay_bytes`: a family arranged by fewer rows than a role's, `bundle_of`); none elsewhere."""
     if not family.relay_bytes(rows, depth):
         return []
-    return [family.staged_memory((consumers, rows, depth), dtype, mosaic.UNSWIZZLED)]
+    return [family.staged_memory((consumers, rows, depth), dtype, swizzling.UNSWIZZLED)]
 
 
 def _relayed(walk: _Backward, relay: list, index) -> _Backward:

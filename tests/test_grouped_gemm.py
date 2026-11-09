@@ -271,7 +271,7 @@ def the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla(depth):
 def the_template_takes_a_gpt_oss_width_as_exactly_as_xla():
     """On this GPU the template named (`mosaic_gpu`) for a projection 2880 wide, gpt-oss-120b's (every tile
     width dividing it an odd multiple of 64), its groups' rows odd, so each group's last tile stores a
-    one-row rung (an A100's in a row's layout, `mosaic.copied`: row 4474): its forward and both gradients
+    one-row rung (an A100's in a row's layout, `swizzling.copied`: row 4474): its forward and both gradients
     are as exact as XLA's ragged dot, from float64."""
     group_sizes = jnp.asarray([67, 69], jnp.int32)
 
