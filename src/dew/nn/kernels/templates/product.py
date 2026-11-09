@@ -4,6 +4,7 @@ kernels do not compute it where they do not. A template declares a product once,
 caller asked for, and keeps the declaration through every mainloop and its VJP's products."""
 
 import dataclasses
+import functools
 import itertools
 from collections.abc import Callable, Iterator
 
@@ -11,8 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.pairwise import pairwise_dot_general
-from dew.nn.precision import asks_default_precision, exact_products, products_dtype
+from dew.nn.precision import accumulated, asks_default_precision, exact_products, products_dtype
 
 HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The 16-bit dtypes the kernels multiply exactly."""
@@ -101,8 +101,9 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
     An FP8 product is its codes' in bfloat16, each exact there, accumulated in fp32: the FP8 contract's
     reference arm, the dequantized product with fp32 sums (testing.md, FP8 products). Any other product is
     `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are exact, and a float32 one's
-    summed as the CPU's vectorized dot sums it (`pairwise.pairwise_dot_general`, as every float32 contraction
-    `precision.accumulated` sums), so a mainloop's sums and the fp32 references they are held to sum alike."""
+    summed as every float32 contraction is (`precision.accumulated`: in float64 under Dew's wide test
+    arithmetic, else as the CPU's vectorized dot sums it), so a mainloop's sums and the fp32 references they
+    are held to sum alike."""
     if product.compute in EIGHT:
         return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,
                                    preferred_element_type=jnp.float32)
@@ -112,7 +113,8 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
                                        preferred_element_type=jnp.float64)
             return wide.astype(jnp.float32)
     if products_dtype(lhs, rhs) == jnp.dtype(jnp.float32):
-        return pairwise_dot_general(lhs, rhs, dimension_numbers)
+        contraction = functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers)
+        return accumulated(contraction, lhs, rhs, preferred_element_type=jnp.float32)
     return jax.lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32)
 
 
