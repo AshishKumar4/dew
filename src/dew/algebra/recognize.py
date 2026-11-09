@@ -719,6 +719,9 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
             if extras is None or len(extras) > 1:
                 continue
             logits_shape = (aval(q).shape[0], aval(q).shape[2], aval(q).shape[1], aval(k).shape[1])
+            # A mask or bias beside them reads the logits as the call does, broadcast to their shape.
+            if extras and not _broadcasts_to(aval(extras[0]).shape, logits_shape):
+                continue
             biases = [var for var in _addends(index, logits, anchor) if aval(var).shape == logits_shape]
             for extra in ([extras[0]] if extras else [None, *biases]):
                 given = () if extra is None else (extra,)
@@ -743,6 +746,13 @@ def _attended(q: jcore.Var, k: jcore.Var, v: jcore.Var) -> bool:
         aval(q).shape, aval(k).shape, aval(v).shape)
     return (batch == aval(k).shape[0] == aval(v).shape[0] and length == valued and shared == held
             and width == keyed and shared > 0 and heads % shared == 0)
+
+
+def _broadcasts_to(shape: tuple[int, ...], target: tuple[int, ...]) -> bool:
+    """Whether `shape` broadcasts to `target` itself: no more dimensions, each 1 or `target`'s from the right
+    (a mask `[4, 1, 64, 64]` beside logits `[1, 1, 64, 256]` does not)."""
+    return len(shape) <= len(target) and all(
+        size in (1, wanted) for size, wanted in zip(reversed(shape), reversed(target), strict=False))
 
 
 def _addends(index: fusion.Index, logits: int, anchor: jcore.Var) -> list[jcore.Var]:
