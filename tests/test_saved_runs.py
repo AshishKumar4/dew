@@ -27,6 +27,7 @@ from saved_run_products import unpacked
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
+from dew.decision.task import Decide
 from dew.inference.tasks import SavedRun
 from dew.registry import objectives
 from dew.training import LocalTracker
@@ -173,7 +174,8 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     recorded what it serialized (`evidence`), the resumed run holds its parameters in the dtypes it
     stored them in, scales its loss as it did, its count of finite steps going on, counts on from the
     examples it consumed (a run on the examples clock paused before its bound trains on to it), and
-    compiles its step at the rung it was admitted at."""
+    compiles its step at the rung it was admitted at. A decision run's new step lays a request's rows out
+    as the step it resumed does, whatever a later plan's layout derives."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
@@ -199,6 +201,13 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
     stepped = [step for step, _ in LocalTracker(run / "tracking").scalars()]
     assert max(stepped) > last if clocked else max(stepped) == last + 1
+    task = objectives[recorded_run.objective.name].saved_task
+    if task is Decide:
+        # The step the resume saved lays a request's rows out as the step it resumed does: a run saved
+        # under a data plan from before a request's questions shared a state reads a question a row,
+        # trains on so, and declares so at every step it saves (`DecisionObjective.bind_plan`).
+        saved, resumed_task = (Decide.from_run(str(run), step=step) for step in (last, int(state.step)))
+        assert resumed_task.layout == saved.layout
     if seen is not None:
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
         assert stored == seen["params"]
@@ -213,7 +222,6 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         assert not clocked or consumed == recorded_run.trainer.examples
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
         # Where its main recorded them: a run whose objective declared no task then recorded none.
-        task = objectives[recorded_run.objective.name].saved_task
         if task is not None and seen["version"] >= PRODUCTS and seen["products"] is not None:
             found = computed(run, int(state.step))
             assert found["products"] == unpacked(seen["products"], found["packs"])
