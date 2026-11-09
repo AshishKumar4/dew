@@ -824,7 +824,7 @@ _TWIN: dict[str, PreTrainedModel] = {}
 
 
 def _twin_built(origin: ModelSource, config: PretrainedConfig, weights: Mapping[str, np.ndarray],
-                registered: tuple[type[PretrainedConfig], type[PreTrainedModel]] | None) -> None:
+                registered: tuple[type, object] | None) -> None:
     """In the twin's process: the reference's float32 model of `config` and `weights` and its float64 twin,
     each built by the source's own constructor (`origin`, `source_twin`) as the probe built the reference,
     so whatever its code attaches to what it builds (a hook on a gradient) is attached here too.
@@ -871,6 +871,9 @@ def _departed(ours: Mapping[str, np.ndarray], theirs: Mapping[str, np.ndarray],
             found.append(f"{name} at draw {draw}: {' and '.join(broken)} values are not all finite")
             continue
         mine, own = (held[arm] - held["the twin's"] for arm in ("Dew's", "the source's float32"))
+        if not (np.all(np.isfinite(mine)) and np.all(np.isfinite(own))):
+            found.append(f"{name} at draw {draw}: its arms' differences from the twin overflow float64")
+            continue
         whole = (_scaled_rms(mine.reshape(1, -1))[0], _scaled_rms(own.reshape(1, -1))[0])
         width = mine.shape[-1] if mine.ndim >= 2 else mine.size
         each = (_scaled_rms(mine.reshape(-1, width)), _scaled_rms(own.reshape(-1, width)))
@@ -1173,7 +1176,7 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         except Exception as error:
             raise _unavailable(model_type, f"{name} does not run its shrunken config "
                                f"({type(error).__name__}: {error})") from error
-        registered = _registered(model_type, source, reference)
+        registered = _registered(model_type, source, config)
         with Isolated() as twin:
             probed = _Source(reference, twin)
             try:
@@ -1186,17 +1189,19 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             return _candidates(model_type, name, reasons, sized, probed, fields)
 
 
-def _registered(model_type: str, source: ModelSource, reference: PreTrainedModel
-                ) -> tuple[type[PretrainedConfig], type[PreTrainedModel]] | None:
-    """The config class and the causal LM transformers' auto classes built `reference` of
-    (`ModelSource.causal_lm`), which the twin's process registers alike (`_twin_built`), so a type a script
-    registered at runtime builds there; None for a source's remote code, which its auto classes do not
-    build. A class the running script defines itself (`__main__`) has no module that process imports, so
-    the probe is refused there, naming it."""
+def _registered(model_type: str, source: ModelSource, config: PretrainedConfig) -> tuple[type, object] | None:
+    """The config class of `config` and the causal LM transformers' auto classes register for it, the
+    constructor `ModelSource.causal_lm` builds by (which may return another class, a factory's), which the
+    twin's process registers alike (`_twin_built`), so a type a script registered at runtime builds there;
+    None for a source's remote code, which its auto classes do not build. A class the running script
+    defines itself (`__main__`) has no module that process imports, so the probe is refused there, naming
+    it."""
+    from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
+
     if source.remote is not None:
         return None
-    classes = (type(reference.config), type(reference))
-    scripted = [kind.__name__ for kind in classes if kind.__module__ == '__main__']
+    classes = (type(config), MODEL_FOR_CAUSAL_LM_MAPPING[type(config)])
+    scripted = [str(kind) for kind in classes if kind.__module__ == '__main__']
     if scripted:
         raise _unavailable(model_type, f"its classes {scripted} are defined in the running script "
                            "(`__main__`), which the process tier 2 builds its float64 twin in "
