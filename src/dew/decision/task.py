@@ -316,14 +316,39 @@ class Decide(SavedRunTask, InItsForm):
     """The run checkpoint the weights came from, when they came from a run."""
     processor: Processor | None = None
     """The backbone's own processor, which prepares a request's images for it."""
+    derives_sharing: bool = field(default=True, repr=False, compare=False)
+    """Whether the task states how a request's questions share a state where its layout states none
+    (`QuestionLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
+    rows out as they were declared (`released`, `_recorded`), a layout that states none a question a row."""
+
+    sharing: tuple[int | None, int | None] | None = field(default=None, repr=False, compare=False)
+    """The sharing (`QuestionLayout.shared_state`) the layout the task was given states, and the sharing the
+    task states for it (`layout`), carried by a task that replaces its layout but not its sharing
+    (`dataclasses.replace`); None until the task reads its layout."""
 
     def __post_init__(self) -> None:
         # A request's questions are scored over one copy of its state where the backbone and head read each
         # question as its own row (`QuestionLayout.shared_for`).
-        if isinstance(self.layout, QuestionLayout):
+        if isinstance(self.layout, QuestionLayout) and self.derives_sharing:
             from dew.decision.shared_state import shared_for
 
-            object.__setattr__(self, "layout", shared_for(self.layout, self.model.backbone, self.model.head))
+            given = self.layout.shared_state
+            # A layout whose sharing is still the one the task stated keeps the statement it came from; one
+            # replaced with sharing of its own states it.
+            if self.sharing is not None and given == self.sharing[1]:
+                given = self.sharing[0]
+            laid = shared_for(replace(self.layout, shared_state=given), self.model.backbone, self.model.head)
+            object.__setattr__(self, "sharing", (given, laid.shared_state))
+            object.__setattr__(self, "layout", laid)
+
+    @property
+    def declared(self) -> Layout:
+        """The layout as the task was given it, its sharing as stated (`sharing`): what a run trained from
+        the task lays its rows out by under a data plan before they shared a state
+        (`DecisionObjective.stated`)."""
+        if not isinstance(self.layout, QuestionLayout) or self.sharing is None:
+            return self.layout
+        return replace(self.layout, shared_state=self.sharing[0])
 
     @classmethod
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
@@ -370,9 +395,10 @@ class Decide(SavedRunTask, InItsForm):
         them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
         model = DecisionModel(bundle.model, bundle.head)
         variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
+        # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
-                   processor=bundle.processor, precision=bundle.numerics)
+                   processor=bundle.processor, precision=bundle.numerics, derives_sharing=False)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
@@ -395,8 +421,11 @@ class Decide(SavedRunTask, InItsForm):
         processor = None if settings.processor is None else load_processor(settings.processor, backbone)
         # Its passes pad to the options the run trained at, so a server compiles their programs up front.
         budget = Budget(options=settings.options)
+        # Its rows laid out as the run recorded them: a layout that states no sharing, from a run saved
+        # before rows shared a state (`dew.data.plan.SHARED_STATE`), a question a row as it trained.
         return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
-                   name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget)
+                   name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
+                   derives_sharing=False)
 
     @classmethod
     def default_step(cls, directory: str) -> int | None:

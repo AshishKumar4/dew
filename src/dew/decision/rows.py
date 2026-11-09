@@ -836,9 +836,10 @@ class PackedRows(pygrain.MapTransform):
     max_length: int
     option_slots: int | None = None
     spans_in_context: bool = False
-    documents: int | None = None
+    documents: int | None = dataclasses.field(default=None, repr=False, metadata={ADDED: True})
     """The most documents a window of rows over one state holds (`Encoded.forked`): its rows' shared parts
-    and their questions' own parts, a shape a window keeps fixed (`DecisionInputs.parents`)."""
+    and their questions' own parts, a shape a window keeps fixed (`DecisionInputs.parents`). Added since runs
+    were saved, so a window of none writes the step a run always recorded (`dew._records.ADDED`)."""
 
     def map(self, element: Batch) -> Batch:
         units = np.asarray(element["tokens_segment_ids"])

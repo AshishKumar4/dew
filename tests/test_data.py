@@ -398,13 +398,13 @@ def test_a_position_saved_under_plan_version_10_resumes_as_10_read_it(workers):
     second input, resumes under this Dew's version (`IN_ORDER`) as 10 read it, in the workers its position
     names (`_PerShare.resumed_at`): on the batches 10's read goes on to, bit for bit, and its positions name
     10 still."""
-    from dew.data.plan import FILE_SHARDS, IN_ORDER
+    from dew.data.plan import FILE_SHARDS, IN_ORDER, PLAN_VERSIONS
 
     chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
              .flat_map(_Spread()).batch(4))
     earlier = compile(chain, seed=5, loading=Loading(workers=workers), plan_version=FILE_SHARDS)
     now = compile(chain, seed=5)
-    assert earlier.plan.version == FILE_SHARDS and now.plan.version == IN_ORDER
+    assert earlier.plan.version == FILE_SHARDS and now.plan.version == PLAN_VERSIONS[-1] >= IN_ORDER
     reader = earlier.train(DataPartition())
     try:
         whole = listed(reader, 12)
