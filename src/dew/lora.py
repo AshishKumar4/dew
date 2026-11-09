@@ -1378,8 +1378,19 @@ def _component(components: frozenset[str], module: str) -> tuple[str, str]:
 # PEFT configuration
 # --------------------------------------------------------------------------
 
-_REFUSED_FLAGS = ("fan_in_fan_out", "use_dora", "lora_bias", "modules_to_save",
-                  "trainable_token_indices", "target_parameters")
+_READ_FIELDS = frozenset({"peft_type", "r", "lora_alpha", "rank_pattern", "alpha_pattern", "use_rslora",
+                          "lora_dropout", "bias", "base_model_name_or_path", "revision"})
+"""The PEFT `LoraConfig` fields `_Config.read` reads."""
+
+_INERT_FIELDS = frozenset({"task_type", "inference_mode", "auto_mapping", "peft_version", "init_lora_weights",
+                           "target_modules", "exclude_modules", "layers_to_transform", "layers_pattern",
+                           "runtime_config", "megatron_core", "qalora_group_size"})
+"""The PEFT `LoraConfig` fields (peft 0.21.2's) that change nothing a loaded adapter computes, so their values
+need not be read: the config's record (its task, mode, auto classes and release), its initialization, which
+its weights replace, the modules it adapts, which its weights state, how a run offloads it, Megatron's
+module path, and QA-LoRA's group size, which only `use_qalora` reads. Every other field set to a value is
+one this loader does not carry: an activated LoRA's invocation tokens, QA-LoRA, DoRA, a layer replication,
+Arrow's or KaSA's routing, a bias, saved modules, trainable tokens or parameters, and any PEFT adds."""
 
 
 @dataclass(frozen=True)
@@ -1398,7 +1409,10 @@ class _Config:
     def read(cls, config: Mapping[str, object], where: str) -> _Config:
         if config.get("peft_type", "LORA") != "LORA":
             raise ValueError(f"{where} is a {config['peft_type']} adapter, not LoRA")
-        refused = [name for name in _REFUSED_FLAGS if config.get(name)]
+        # A field unset is absent, null, false, zero or empty, as PEFT writes every field it leaves at rest.
+        unset = (None, False, 0, "", [], {})
+        refused = sorted(name for name, value in config.items()
+                         if name not in _READ_FIELDS | _INERT_FIELDS and value not in unset)
         if config.get("bias", "none") != "none":
             refused.append("bias")
         if refused:
