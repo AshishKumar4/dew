@@ -274,7 +274,7 @@ fitted to them, and a rule set ships only with measured receipts.
 ## 3. Verification
 
 All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of their own:
-- check 1 is `assert_as_exact` as it applies `tests/check1_statistics.py` today: each tensor's pooled RMS distance
+- check 1 is `assert_as_exact` as it applies `src/dew/parity.py` today: each tensor's pooled RMS distance
   to the float64 truth against the reference's at `PARITY`, its worst row at `ROW_FACTOR`, and narrow rows at
   `NARROW_FACTORS`. This doc names those constants and never restates them, so it cannot drift from the gate.
 - check 2 (bible §7, "never wrong"): where a rewritten operation has a certified bound (`tests/certified.py`),

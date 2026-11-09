@@ -37,7 +37,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.experimental.xla_metadata import set_xla_metadata
 
 from dew.nn.kernels import generation, launches
-from dew.nn.kernels.templates import across, bodies, persistent, product, report, resources
+from dew.nn.kernels.templates import across, bodies, handoffs, persistent, product, report, resources
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -125,9 +125,6 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
     return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else ())
 
 
-_RESIDENT: contextvars.ContextVar[int] = contextvars.ContextVar("resident", default=1)
-"""The programs a multiprocessor holds at once of the launch being traced (`kernel`'s `resident`): its roles
-raise their registers to that residency's share (`roles`)."""
 
 
 def _is_ref(operand) -> bool:
@@ -138,13 +135,12 @@ def _is_ref(operand) -> bool:
 def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | None = None,
             settled: tuple[int, ...] = ()) -> Callable:
     """The launch `built` (`launches.kernel`, which holds each call per shard), each call traced at its
-    residency (`_RESIDENT`) under the name `kernel`: a launch built once for every call of its facts checks
-    each call's own; and
-    refused at its trace where two of the refs it adds into in place share a shape and a dtype, which
-    `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's share of the work
-    its cost states (the rest its own recomputation), where given, as its custom call's frontend attribute
-    (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads, and the operands it reads ahead of its
-    wait, `settled` (`bodies.SETTLED`), which the compile point checks."""
+    residency (`bodies.RESIDENT`) under the name `kernel`: a launch built once for every call of its facts
+    checks each call's own; and refused at its trace where two of the refs it adds into in place share a shape
+    and a dtype, which `stacked_zeros` makes one ref (row 3180). Its call declares `model_flops`, the model's
+    share of the work its cost states (the rest its own recomputation), where given, as its custom call's
+    frontend attribute (`instrumentation.MODEL_FLOPS`), which Dew's FLOP count reads, and the operands it
+    reads ahead of its wait, `settled` (`bodies.SETTLED`), which the compile point checks."""
     stated = {**({} if model_flops is None else {MODEL_FLOPS: str(model_flops)}),
               **({bodies.SETTLED: ",".join(map(str, settled))} if settled else {})}
 
@@ -161,11 +157,11 @@ def checked(built: Callable, kernel: str, resident: int = 1, model_flops: int | 
             raise ValueError(f"{kernel} adds into two refs of one shape and dtype ({kinds}): XLA may take "
                              "their zeros for one value and pass one buffer for both (row 3180); stack them "
                              "into one ref (`stacked_zeros`)")
-        token = _RESIDENT.set(resident)
+        token = bodies.RESIDENT.set(resident)
         try:
             return built(*operands)
         finally:
-            _RESIDENT.reset(token)
+            bodies.RESIDENT.reset(token)
 
     return launch
 
@@ -961,6 +957,17 @@ def plain(shape: tuple, dtype):
     return plgpu.SMEM(shape, dtype, transforms=(plgpu.PlainTransform(),))
 
 
+def workspace(shape: tuple, dtype, *, interpret) -> jax.Ref:
+    """A ref a launch writes in place and reads back, no declared output (a balanced tail's partials, a split
+    decode's slices' states), started uninitialized: on a GPU XLA's AllocateBuffer (`lax.empty`, no memset,
+    as no slot is read before a program writes it); interpreted, NaN, as the interpreter starts an output
+    (`uninitialized_memory='nan'`), so a slot read before any program writes it reaches the outputs as NaN
+    (`tests/kernel_outputs.py`'s sentinel), which a CPU's zeroed allocation would hide."""
+    if interpret:
+        return jax.new_ref(jnp.full(shape, jnp.nan, dtype))
+    return jax.new_ref(lax.empty(shape, dtype))
+
+
 def laid(condition, like: jax.Array) -> jax.Array:
     """The scalar `condition` laid over `like`, a vector predicate of its shape: Mosaic GPU's warpgroup
     semantics select under no scalar predicate (`jnp.where` passes a scalar condition as it is; the fused
@@ -1016,40 +1023,6 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
     if swizzle is None:
         return plgpu.SMEM(shape, dtype)
     return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
-
-
-def roles(wg, consumers: int, consumer, producer) -> None:
-    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)`, the last
-    `producer()` (`tabled`'s one row)."""
-    tabled(wg, ((consumers, consumer),), producer)
-
-
-def tabled(wg, table: tuple, producer) -> None:
-    """Each warpgroup's role in a cooperative block from a role table: each of `table`'s rows, `(count,
-    body)` in turn, its `count` warpgroups running `body(index)` (`index` the warpgroup's own among
-    them), every one with its register budget raised to its share at the launch's residency
-    (`resources.raised_registers`, `_RESIDENT`); the warpgroup after them runs `producer()` with its
-    lowered to `resources.producer_floor`, where the GPU's compile honors them
-    (`resources.RAISES_HONORED`)."""
-    total = sum(count for count, _ in table)
-    first = 0
-    for count, body in table:
-        # The first row's warpgroups are those below its count, each its own index: no bound and no shift
-        # is traced for it, so a one-row table builds the same kernel `roles` built (an attention
-        # forward's spill-free registers on an H100 turn on it, test_attention_mosaic's compile gate).
-        within = wg < first + count if first == 0 else (wg >= first) & (wg < first + count)
-
-        @pl.when(within)
-        def _(body=body, first=first):
-            plgpu.set_max_registers(resources.raised_registers(total, _RESIDENT.get()), action="increase")
-            body(wg if first == 0 else wg - first)
-
-        first += count
-
-    @pl.when(wg == total)
-    def _():
-        plgpu.set_max_registers(resources.producer_floor(), action="decrease")
-        producer()
 
 
 class Slots:
@@ -1744,7 +1717,7 @@ class Transport[Allocated, Opened](abc.ABC):
     def warpgroups(self, consumers: int) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
         family streams from a role of its own (`roles`)."""
-        return consumers
+        return self.roles(consumers).warpgroups()
 
     def program_index(self, name: str) -> jax.Array:
         """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
@@ -1801,9 +1774,16 @@ class Transport[Allocated, Opened](abc.ABC):
         (`streams`), and what it returns: the program's one scope (`scoped`'s)."""
 
     @abc.abstractmethod
-    def roles(self, consumers: int, consumer, producer) -> None:
-        """Each role of a program: `consumer(index)` the compute roles', `producer()` the loads' where the
-        family streams from a role of its own."""
+    def roles(self, consumers: int) -> handoffs.Schedule:
+        """A program's roles: its `consumers` compute warpgroups ('consumer') and the producer's ('producer')
+        where the family streams from a role of its own."""
+
+    def scheduled(self, consumers: int, consumer, producer):
+        """The family's roles run (`roles`): `consumer(index)` on its compute roles and `producer()` on
+        its producer's where it has one; the consumers' value where they are its every warpgroup."""
+        schedule = self.roles(consumers)
+        bodies = {"consumer": consumer, "producer": producer}
+        return schedule.run(**{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,
@@ -1861,7 +1841,7 @@ class Transport[Allocated, Opened](abc.ABC):
             self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), walk.carry, (),
                       interpret)
 
-        self.roles(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
+        self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
@@ -2203,9 +2183,6 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def depths(self, dtype) -> tuple[int, ...]:
         return (swizzle_columns(dtype, SWIZZLE_BYTES),)
 
-    def warpgroups(self, consumers: int) -> int:
-        return consumers + 1
-
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
@@ -2230,8 +2207,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
                              collective_axes="wg")
 
-    def roles(self, consumers: int, consumer, producer) -> None:
-        roles(lax.axis_index("wg"), consumers, consumer, producer)
+    def roles(self, consumers: int) -> handoffs.Schedule:
+        return handoffs.Schedule((handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0)))
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
@@ -2288,7 +2265,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
                                in_flight=in_flight, unrolled=unrolled)
 
-        pl.run_scoped(lambda *smems: self.roles(consumers, consuming(smems), producer), *staging,
+        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), producer), *staging,
                       collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,

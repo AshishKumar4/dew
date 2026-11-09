@@ -18,6 +18,7 @@ the attention mainloop's); every other template's Mosaic launch is ineligible on
 next route by legality."""
 
 import dataclasses
+from collections.abc import Callable
 
 import jax.numpy as jnp
 
@@ -44,40 +45,66 @@ class MmaFed(mosaic_sm80.MmaIssuer, fed.ConsumerFed):
     in its own registers, warpgroup MMA's producer's uniform ones."""
 
 
+@dataclasses.dataclass(frozen=True)
+class Launch:
+    """What a launch states of its call that a composition reads (`Composition.takes`): it states its tiles'
+    accumulators (`stated`, `Transport.persist`'s `accumulators`: the GEMM template's), its program scopes the
+    issuer's product scratch (`scoped`, `Issuer.products_in`: the recurrence template's), it is written
+    wholly against the family's seams (`tpu`, the module's account)."""
+
+    stated: bool = False
+    scoped: bool = False
+    tpu: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class Composition:
+    """A bundle, declared once: `build(dtype)` composes it for operands of `dtype`, and `takes(launch)` says
+    whether a launch's call may run on it (`Launch`)."""
+
+    build: Callable[[jnp.dtype], mosaic.Family]
+    takes: Callable[[Launch], bool] = lambda launch: True
+
+
+COMPOSITIONS: dict[str, tuple[Composition, ...]] = {
+    # tcgen05 on TMA rings, its accumulators in tensor memory: persisted a tile in full-lane tensor memory
+    # and read out in chunks for a launch that states its tiles' accumulators; scoped a product in half-lane
+    # tensor memory and read back into registers in the WGMMA layout (row 4747) for a launch holding its
+    # 64-row tiles in registers between products whose program scopes the issuer's product scratch. A
+    # launch stating neither takes the next issuer.
+    mosaic_sm100.RINGS.name: (Composition(lambda dtype: mosaic_sm100.RINGS, lambda launch: launch.stated),
+                              Composition(lambda dtype: mosaic_sm100.CHUNKS,
+                                          lambda launch: launch.scoped and not launch.stated)),
+    # wgmma: TMA rings a producer fills, then rings its consumers fill.
+    mosaic_sm90.WGMMA.name: (Composition(lambda dtype: mosaic_sm90.WGMMA),
+                             Composition(lambda dtype: mosaic_sm90.FED)),
+    # mma.sync, which every NVIDIA GPU from sm80 issues: TMA rings its consumer fills where the device moves
+    # blocks by TMA, cp.async where it does not (`legal`).
+    mosaic_sm80.Mma.name: (Composition(MmaFed), Composition(mosaic_sm80.Mma)),
+    # A TPU core's MXU, for a launch written wholly against the family's seams.
+    "tpu": (Composition(lambda dtype: mosaic_tpu.MXU, lambda launch: launch.tpu),),
+}
+"""Every bundle, by matrix issuer (`generation.Architecture.issuers`' names), each issuer's in preference
+order: the one declaration a launch's selection (`groups`) and its tile's name (`named`) both read."""
+
+
 def groups(generation_name: str, dtype, *, stated: bool = False, scoped: bool = False, tpu: bool = False
            ) -> tuple[tuple[mosaic.Family, ...], ...]:
     """The bundles a launch on a device of `generation_name` (`'sm80'`, the assumed or a real one's) may run
     for operands of `dtype`, by matrix issuer, most capable first (`generation.Architecture.issuers`, stated
-    per device, never implied by a generation's number), each issuer composed with every loader, its
-    accumulator home and execution with it, in the issuer's order, those the device runs (`legal`):
-
-    - tcgen05 on TMA rings, its accumulators in tensor memory: persisted a tile in full-lane tensor memory and
-      read out in chunks (`mosaic_sm100.RINGS`) for a launch that states its tiles' accumulators (`stated`,
-      `Transport.persist`'s `accumulators`: the GEMM template's); scoped a product in half-lane tensor
-      memory and read back into registers in the WGMMA layout (`mosaic_sm100.CHUNKS`, row 4747) for a launch
-      holding its 64-row tiles in registers between products whose program scopes the issuer's product
-      scratch (`scoped`, `Issuer.products_in`: the recurrence template's). A launch stating neither takes the
-      next issuer.
-    - wgmma: TMA rings a producer fills (`mosaic_sm90.WGMMA`), then rings its consumers fill
-      (`mosaic_sm90.FED`).
-    - mma.sync, which every NVIDIA GPU from sm80 issues: TMA rings its consumer fills where the device moves
-      blocks by TMA (`MmaFed`), cp.async where it does not (`mosaic_sm80.Mma`).
-    - A TPU core's MXU (`mosaic_tpu.MXU`), for a launch written wholly against the family's seams (`tpu`,
-      the module's account).
-
-    A launch takes the first group whose bundles take its call, so a device's own issuer runs it where it can
-    and the next where not. None where the device issues
-    none of them (a CPU, a GPU before Ampere)."""
+    per device, never implied by a generation's number): each issuer's compositions (`COMPOSITIONS`) that
+    take the launch (`Launch`: `stated`, `scoped`, `tpu`) and the device runs (`legal`), in the issuer's
+    order. A launch takes the first group whose bundles take its call, so a device's own issuer runs it where
+    it can and the next where not. None where the device issues none of them (a CPU, a GPU before
+    Ampere)."""
     architecture = generation.architecture(generation_name)
     if architecture is None or (architecture.family != "tpu"
                                 and generation.capability(generation_name) is None):
         return ()
-    tcgen05 = (mosaic_sm100.RINGS,) if stated else (mosaic_sm100.CHUNKS,) if scoped else ()
-    composed = {mosaic_sm100.RINGS.name: tcgen05,
-                mosaic_sm90.WGMMA.name: (mosaic_sm90.WGMMA, mosaic_sm90.FED),
-                mosaic_sm80.Mma.name: (MmaFed(jnp.dtype(dtype)), mosaic_sm80.Mma(jnp.dtype(dtype))),
-                "tpu": (mosaic_tpu.MXU,) if tpu else ()}
-    found = (tuple(family for family in composed[issuer] if legal(family, architecture))
+    launch = Launch(stated=stated, scoped=scoped, tpu=tpu)
+    found = (tuple(family for family in (composition.build(jnp.dtype(dtype))
+                                         for composition in COMPOSITIONS[issuer] if composition.takes(launch))
+                   if legal(family, architecture))
              for issuer in architecture.issuers)
     return tuple(group for group in found if group)
 
@@ -125,12 +152,10 @@ def layouts(generation_name: str, dtype, rows: int | None = None, *, stated: boo
 
 
 def named(name: str, dtype) -> mosaic.Family:
-    """The bundle named `name` (`mosaic.Family.name`, a launch's tile's) for operands of `dtype`."""
-    for composed in (mosaic_sm80.Mma, MmaFed):
-        if composed.name == name:
-            return composed(jnp.dtype(dtype))
-    for bundle in (mosaic_sm90.WGMMA, mosaic_sm90.FED, mosaic_sm100.RINGS, mosaic_sm100.CHUNKS,
-                   mosaic_tpu.MXU):
-        if bundle.name == name:
-            return bundle
+    """The bundle named `name` (`mosaic.Family.name`, a launch's tile's) for operands of `dtype`: the
+    composition declared so (`COMPOSITIONS`)."""
+    for compositions in COMPOSITIONS.values():
+        for composition in compositions:
+            if (family := composition.build(jnp.dtype(dtype))).name == name:
+                return family
     raise ValueError(f"no Mosaic GPU bundle is named {name!r}")
