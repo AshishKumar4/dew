@@ -650,6 +650,22 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
                     "tier 3 cohere2 dropping call", seeds=DROPPING_SEEDS, truth_fn=truth)
 
 
+def test_a_probe_whose_attention_logits_lie_far_apart_reads_its_causal_mask():
+    """Seed-OSS-36B's release (tests/test_verified_mapping.py's) on the probe's shrunken config: its random
+    weights put a row's attention logits over 120 apart, where float32 rounds the softmax weight of a key
+    its mask keeps to zero, and every layer's mask is still causal, so tier 3 runs it on Dew's attention
+    (`admitted`)."""
+    from test_verified_mapping import SEED_OSS
+
+    from dew.interop import verify
+    from dew.interop.torchax_fallback import admitted
+
+    source = verify.ModelSource("seed_oss")
+    fields = verify.shallow(source, verify.shrink(SEED_OSS, source))
+    admission = admitted(verify.Unmapped("seed_oss", {}, {**fields, "model_type": "seed_oss"}))
+    assert admission.attends, admission.why
+
+
 def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
     """OpenAI GPT's layers compute their attention in their own code, asking transformers' attention
     interface nothing: the torchax route, which a load asks for though the type has a family of its own,
