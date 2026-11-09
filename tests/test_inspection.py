@@ -616,14 +616,16 @@ def test_a_preference_runs_watched_layers_read_each_halfs_real_tokens_alone():
 
     pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5], "chosen_mask": [0, 0, 1, 0],
             "rejected_mask": [0, 0, 1]}
-    (batch,) = list(Memory([pair] * 2).pipe(presets.preferences, seq_len=6, batch=2))
+    (batch,) = list(Memory([pair] * 2).pipe(presets.preferences, seq_len=6, batch=1))
     run = Trainer(DPOObjective(decoder(), 5), optax.sgd(RATE), key=jax.random.key(0),
                   mesh=MeshSpec().build(jax.devices()[:1]),
                   inspection=Inspection(modules=("*MLP",), targets=("params",)))
     ids = np.asarray(batch["input_ids"])
-    padding = np.arange(ids.shape[-1]) >= np.array([4, 3])[None, :, None]
+    padding = np.asarray(batch["real_mask"]) == 0
+    # The first pair's chosen half's last real token, unmarked by its completion mask.
+    chosen = (np.asarray(batch["pair_ids"]) == 1) & (np.asarray(batch["halves"]) == 1)
     last = np.zeros(ids.shape, bool)
-    last[:, 0, 3] = True
+    last[0, np.flatnonzero(chosen[0])[-1]] = True
 
     def summaries(rows):
         return {name: value for name, value in inspected(run, {**batch, "input_ids": rows}).items()

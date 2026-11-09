@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import assert_certified
-from entered_support import LAYOUTS, assert_entered_as_own_rows
+from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through
 from reference_error import (
     assert_as_exact,
@@ -335,12 +335,11 @@ def test_padded_rows_preserve_the_memory_and_the_history():
 
 
 @pytest.mark.parametrize("layout", list(LAYOUTS))
-def test_documents_that_enter_another_read_its_memory_and_history_as_their_own_rows_do(layout):
-    """Kimi delta attention over rows of shared parts and the documents that enter them gives each
-    document's tokens, and the gradients through them, what its own row of the part it enters and itself
-    gives (check 1; `entered_support`, row 1506)."""
+def test_documents_that_continue_another_read_its_memory_and_history_as_their_own_rows_do(layout):
+    """Kimi delta attention over forks (`dew.batch.Forks`) gives each document's tokens, and the gradients
+    through them, what its own row of its ancestors and itself gives (check 1; `forks_support`)."""
     module, _, variables = layer_and_params(-5.0)
-    assert_entered_as_own_rows(module, variables, E, layout, "Kimi delta attention")
+    assert_forks_as_own_rows(module, variables, E, layout, "Kimi delta attention")
 
 
 def test_a_decode_token_on_the_fused_step_is_the_layers_own():

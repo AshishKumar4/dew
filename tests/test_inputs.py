@@ -139,7 +139,7 @@ def test_every_token_id_parser_reads_ids_by_one_law(parser):
     def read(ids: list) -> list[int]:
         if parser == "preference":
             pair = PreferencePair(seq_len=4).map({"chosen": ids, "rejected": ids})
-            return pair["input_ids"][0, : len(ids)].tolist()
+            return pair["text"][pair["halves"] == 1].tolist()
         if parser == "prompt":
             return list(_prompt_ids(ByteTokenizer(), ids, None, "prompt", None))
         if parser == "request":

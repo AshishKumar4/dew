@@ -53,6 +53,7 @@ from dew.batch import (
     PathFilter,
     Variables,
     freeze,
+    laid_coordinates,
     leaves_by_path,
     merge,
     prefix_groups,
@@ -86,6 +87,7 @@ from dew.nn.protocols import (
     CountedPredictionTraining,
     CrossAttending,
     DecoderTraining,
+    ForkedCalls,
     Lacks,
     LayerStates,
     Looped,
@@ -273,6 +275,13 @@ def _with_columns(prepared: ModelInputs, columns: Mapping[str, jax.Array | np.nd
         if name in prepared.token_fields:
             raise ValueError(f"{name} must come from either ModelInputs or the packing column")
     return {**prepared.token_fields, **columns}
+
+
+def _predicted(states: jax.Array, before: jax.Array) -> jax.Array:
+    """`states` `[B, S, ...]` read at each target's predecessor's slot `before` `[B, S]`
+    (`Forks.predecessors`, a row's first token's -1 read as its first slot, which scores nothing)."""
+    at = jnp.maximum(before, 0).reshape(*before.shape, *(1,) * (states.ndim - 2))
+    return jnp.take_along_axis(states, at, axis=1)
 
 
 def _prepared(tokens: ModelInputs | jax.Array, coordinates: Coordinates | None = None,
@@ -821,6 +830,15 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                              "blocks beyond its own source, so depths are refused with blocks")
         refuse_block_reading(self.model, "a batch's blocks")
 
+    def shares_prefixes(self, train: bool = False) -> bool:
+        """Whether rows that begin alike are scored over one copy of their prefix (`token_scores` of rows
+        whose coordinates carry forks, `dew.data.forked_rows.ForkedRows`): where the model computes each
+        document over its ancestors as its own row does
+        (`ForkedCalls`; in a training step with `train`, no dropout drawing) and no in-context step reads
+        a row's tokens in its order."""
+        return (self.adaptation is None and isinstance(self.model, ForkedCalls)
+                and self.model.fork_refusal(train) is None)
+
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      coordinates: Coordinates | None = None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
@@ -877,6 +895,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         `progress` is the run's progress a model whose computation changes over
         a run reads (`dew.nn.progress`), which a training loss passes
         (`Objective.progress`); the run's end by default.
+
+        Rows whose `coordinates` carry forks (`dew.batch.Forks`, a shared
+        prefix laid out once) score each token from its predecessor's state
+        (`_predecessors`), as each document's own row of its ancestors scores it.
         """
         prepared = _prepared(tokens, coordinates)
         self._refuse_blocks(prepared, depths)
@@ -906,6 +928,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         with self._watched(prepared, watched):
             hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
                                                    layers, progress)
+        before = self._predecessors(prepared, depths)
+        if before is not None:
+            # Each target's state its predecessor's, a document's first token's its parent's last.
+            hidden = _predicted(hidden, before)
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
         qk = gathered.get("qk", {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
@@ -920,33 +946,49 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
-            # Depth d's state at p scores the target d further out, so its
-            # targets are the shifted row's from d on.
-            states = self.model.apply(
-                params, gathered['prediction_inputs']['states'] if stream_depth else hidden,
-                inputs, train=train, rngs=rngs,
-                method="mtp_hidden_states",
-                mutable=collections or False, **packing)
-            if collections:
-                # A routed depth balances, counts and indexes like a trunk layer.
-                states, depth_sown = states
-                if routing:
-                    sown = {**(sown or {}), **depth_sown.get(ROUTER_COLLECTION, {})}
-                if qk_stats:
-                    qk = {**(qk or {}), **depth_sown.get("qk", {})}
-                if indexer:
-                    kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
-            depth_scores = self._depth_scores(params, states, targets, prepared, roles, losses.dtype, table,
-                                              rows)
-        passes = self._exit_scores(params, gathered, targets, losses) if exits else None
+            depth_scores, (sown, qk, kls) = self._depth_pass(
+                params, gathered['prediction_inputs']['states'] if stream_depth else hidden, inputs, targets,
+                prepared, roles, losses.dtype, table, rows, (sown, qk, kls), (routing, qk_stats, indexer),
+                train=train, rngs=rngs, collections=collections, packing=packing)
+        passes = self._exit_scores(params, gathered, targets, losses, before) if exits else None
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole, inspected, moved, passes)
 
-    def _exit_scores(self, params, gathered, targets, losses):
+    def _depth_pass(self, params, source, inputs, targets, prepared, roles, dtype, table, rows, records,
+                    asked, *, train, rngs, collections: list[str], packing: dict):
+        """The prediction depths' scores (`_depth_scores`) from the trunk's `source` states, and the
+        trunk's `records` (`(sown, qk, kls)`) with the depths' added to each the call `asked` for: a routed
+        depth balances, counts and indexes like a trunk layer. Depth d's state at p scores the target d
+        further out, so its targets are the shifted row's from d on."""
+        states = self.model.apply(params, source, inputs, train=train, rngs=rngs, method="mtp_hidden_states",
+                                  mutable=collections or False, **packing)
+        if collections:
+            states, depth_sown = states
+            names = (ROUTER_COLLECTION, "qk", INDEXER_COLLECTION)
+            records = tuple({**(held or {}), **depth_sown.get(name, {})} if wanted else held
+                            for held, name, wanted in zip(records, names, asked, strict=True))
+        return self._depth_scores(params, states, targets, prepared, roles, dtype, table, rows), records
+
+    def _predecessors(self, prepared, depths: bool) -> jax.Array | None:
+        """Each target's predecessor's slot among the inputs `[B, seq_len]` where the rows' coordinates carry
+        forks (`Forks.predecessors`), None where they carry none."""
+        laid = laid_coordinates(prepared.token_fields)
+        if laid is None or laid.forks is None:
+            return None
+        if depths or self.adaptation is not None or prepared.token_fields.get(BLOCKS_FIELD) is not None:
+            raise ValueError("prediction depths, blocks and in-context steps read a row's tokens in its "
+                             "order, which forks do not lay out; lay the rows whole")
+        assert laid.segments is not None
+        return laid.forks.predecessors(laid.segments)[:, 1:]
+
+    def _exit_scores(self, params, gathered, targets, losses, before=None):
         """A looped decoder's per-pass losses, each earlier pass's states as its forward gathered them
-        (`Looped.exit_passes`) through the head as the last pass's go (`_head_scores`), the last pass's
-        `losses`, beside every pass's exit-gate logit."""
+        (`Looped.exit_passes`) through the head as the last pass's go (`_head_scores`), each target's from
+        its predecessor's state where forks give them (`before`), the last pass's `losses`, beside every
+        pass's exit-gate logit."""
         states, logits = self._looped().exit_passes(gathered)
+        if before is not None:
+            states = tuple(_predicted(state, before) for state in states)
         earlier = tuple(self.head_terms(self.model, params, state, targets, predict=False)[0]
                         for state in states)
         return (*earlier, losses), logits
@@ -1035,9 +1077,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         """The targets this objective scores at `depth` (`scored_targets`), its `loss_role`'s alone,
         in `xp`: the loss's weights on the device and the FLOP count's on the host read one rule."""
         mask, documents = token_layout(fields, xp=xp)
+        laid = laid_coordinates(fields)
         return scored_targets(xp, tokens, self.pad_id, mask, documents, depth, roles=roles,
                               role=None if self.loss_role is None else int(self.loss_role),
-                              blocks=fields.get(BLOCKS_FIELD))
+                              blocks=fields.get(BLOCKS_FIELD), forks=None if laid is None else laid.forks)
 
     def _layer_states(self) -> LayerStates:
         """The model as the reader of its layers' states that a request for `layers` needs."""

@@ -330,11 +330,11 @@ class MultiHeadLatentAttention(LinearProducts):
     """
 
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
-                                                 "key_valid", "position_bias", "tree_parents"})
+                                                 "key_valid", "position_bias", "forks"})
     """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), a dense layer's pairwise mask or key
     runs, the key positions they are read at, its keys' validity and a position bias, on an uncached call,
     as the standard attention reads them, and its pairwise mask or key runs over its cache on a cached one,
-    a tree call's among them (`AttentionMetadata.tree_parents`, `_cached_visibility`); an indexed layer
+    and its forks' runs on either (`call_visibility`, `_cached_visibility`); an indexed layer
     narrows its keys by the documents, the rows' validity and its own selection alone, and refuses them
     (`_check_call`)."""
 
@@ -827,7 +827,7 @@ class MultiHeadLatentAttention(LinearProducts):
         own = None if metadata is None else [
             name for name, given in (("pairwise_mask", metadata.pairwise_mask),
                                      ("key_runs", metadata.key_runs),
-                                     ("tree_parents", metadata.tree_parents),
+                                     ("forks", metadata.forks),
                                      ("key_valid", metadata.key_valid),
                                      ("key_positions", metadata.key_positions),
                                      ("position_bias", metadata.position_bias)) if given is not None]
@@ -920,24 +920,30 @@ class MultiHeadLatentAttention(LinearProducts):
             latent, rot = append.store.plain(latent)[:, :, 0], rot[:, :, 0]
             key, value = self._expand(latent, rot)
             own = self._cached_visibility(call.metadata, positions if logical_positions is None
-                                          else logical_positions, x.shape[:2], key.shape[1])
+                                          else logical_positions, x.shape[:2], key.shape[1], positions)
             mask = self._visible(positions, key.shape[1]) if own is None else own
             query_basis = None
         return q_rot, key, value, mask, query_basis, own is not None
 
-    def _cached_visibility(self, metadata, turned, shape: tuple[int, int], total: int) -> jax.Array | None:
+    def _cached_visibility(self, metadata, turned, shape: tuple[int, int], total: int,
+                           written) -> jax.Array | None:
         """A dense layer's cached call's own visibility `[B, 1, T, total]` over the cache's `total` slots
         (`call_visibility`, `visibility_mask`), None where it states none: its pairwise mask or key runs,
-        a tree call's each token's cache and ancestors, over the slots that hold a token, each key at its
-        slot unless the call places it (`attention_key_positions`), each query at its rotary position
-        `turned`, which the window and the chunk read."""
+        its forks' each token's cache and ancestors after the call's first slot (`written` `[B, T]`, each
+        token's slot), every cached key before it (a layer's cache reads a row's keys together,
+        `packed_cache_refusal`), over the slots that hold a token, each key at its slot unless the call
+        places it (`attention_key_positions`), each query at its rotary position `turned`, which the window
+        and the chunk read."""
         if metadata is None:
             return None
         batch, length = shape
         turned = jnp.broadcast_to(turned, shape)
         slots = jnp.broadcast_to(jnp.arange(total), (batch, total))
+        written = jnp.asarray(written, jnp.int32).reshape(batch, length)
+        first = jnp.min(jnp.where(written >= 0, written, total), axis=-1)
         own = call_visibility(metadata, turned, batch=batch, queries=length, keys=total, key_places=slots,
-                              sliding_window=self.sliding_window, cached=True)
+                              sliding_window=self.sliding_window, cached=True,
+                              anchor=(first, jnp.zeros_like(first)))
         if own is None:
             return None
         # The runs index the cache's slots; the queries' and keys' places count a window and a chunk.
@@ -1084,6 +1090,14 @@ class MLAMixer(MixerBase):
     """
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
+    # A dense layer reads each token's ancestors' keys and its own (`call_visibility`).
+    reads_forks = True
+
+    def fork_refusal(self) -> str | None:
+        """An indexed layer's: it selects among every key before each query in the row's order, which a
+        fork's prefix and branches hold apart (`MultiHeadLatentAttention._check_call`)."""
+        return ("an indexed mla layer selects among every key before each query in the row's order"
+                if self.indexed else None)
     reads_phase = True
 
     q_lora_rank: int | None = None

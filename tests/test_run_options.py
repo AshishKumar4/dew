@@ -174,13 +174,13 @@ WITNESSED_ON = {"DecideSettings": {
     "blocked": ("layout.blocks", "layout.segments", "layout.split", "specials"),
     "lettered": ("layout.labels",),
     "merged": ("layout.unit",),
-    "shared": ("layout.shared_state", "layout.siblings")}}
+    "shared": ("layout.shared_state",)}}
 """The settings whose options are witnessed one an armada map task (`shards`), each on the run of `TASK_RUNS`
 that witnesses it, by its builder's name: a run's unset save and one option's alternatives a task, where the
 four DecideSettings runs witnessing in turn took 700 s on one core (row 2788). A decision run's head over a
 backbone that reads no blocks witnesses its layout's reads, order and framing; one over a backbone that reads
 blocks its segments, splits and the blocks it reads; a letter readout its labels; a tokenizer that merges its
-unit; rows over one state their sharing and siblings, which only such a row takes (the runs' turns: each
+unit; rows over one state their sharing, which only such a row takes (the runs' turns: each
 option on the first run that witnessed it)."""
 
 ALTERNATIVE_UNITS = {"layout.split": 3}

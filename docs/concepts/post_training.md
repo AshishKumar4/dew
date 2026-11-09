@@ -186,7 +186,7 @@ DPO compares how much the policy prefers one answer over the other with how much
 
 `presets.preferences` reads any dataset of pairs: a file, a Hub dataset or records in memory. Each row has `chosen`, `rejected`, `chosen_mask` and `rejected_mask`; each mask is as long as its ID list. Without a mask, every token counts as a completion token. Give explicit masks for prompt-and-answer data.
 
-A loaded batch holds `input_ids` and `completion_mask`, both `[B, 2, S]`. Index 0 of the middle axis is the chosen sequence and index 1 the rejected one. Shorter rows are right-padded to `S` (`pad_id`, default 0) with mask weight zero; rows that are too long raise. The preset's `seq_len` is the full row width `S`, so use `DPOObjective(model, seq_len=S - 1)`.
+Each pair is laid out once: the prompt its two halves share (their common prefix before either completion) is written once, and each half's rest continues it (`dew.batch.Forks`), each token at the place its own half gives it. The preset packs pairs first-fit into windows of `2 * S` tokens, several pairs a window, so the prompt is computed once for both halves and padding stays small. A loaded batch holds `input_ids` `[B, 2 * S]` with each token's pair (`pair_ids`), half (`halves`: 1 chosen, 2 rejected, 0 the shared prompt), completion mark, place and document; rows that are too long raise. `share=False` writes both halves whole, as a model with dropout trains (`TokenScorer.shares_prefixes`). A model that reads one document a row takes `segments=1` on the preset and the objective: each window then holds one half, a pair's two windows in turn, and the loss reads a pair's halves by its number across the batch however the windows hold them. The preset's `seq_len` is a half's longest `S`, so use `DPOObjective(model, seq_len=S - 1)`; `dew.data.preferences.windows` and `pair_windows` build the same windows from pairs held in memory.
 
 The objective sums the next-token log-probabilities over each completion and applies the log-sigmoid preference loss. `beta` (default 0.1) must be positive; it scales the comparison between policy and reference. Validation measures the perplexity of the chosen answers under the policy, which alone does not measure how often the preferred answer wins or how good the responses are.
 
@@ -213,9 +213,9 @@ rows = [
      "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]},
 ]
 row_width = 4
-data = Memory(rows * 4).repeat().pipe(presets.preferences, seq_len=row_width, batch=8, pad_id=0)
+data = Memory(rows * 4).repeat().pipe(presets.preferences, seq_len=row_width, batch=8)
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
-                          num_heads=2, mlp_features=32, max_seq_len=row_width)
+                          num_heads=2, mlp_features=32, max_seq_len=2 * row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
 trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3).build(2), key=jax.random.key(0))
 initial = trainer.initial_state()
@@ -472,7 +472,7 @@ Calls that recorded `routed_experts` add a `routed_experts` column, `[rows, widt
 - `"score"` trains them on their verifier reward, like a completed session. Use it for single-turn RLVR, where a completion cut off after a closed answer can still be graded, and where masking every budget-hit draw of a short budget would leave nothing to train on. `examples/train_rlvr.py` uses it, the behaviour of the rollout it replaced.
 - `"zero"` trains them on a verifier reward of 0 whatever the verifier said, keeping the step rewards their calls earned, which penalizes running long (SkyRL's `zero_reward_on_non_stop`).
 
-`rows_needed(chain_lengths(sessions, width, truncation=...), width)` counts the rows `pack` would fill. `advantages` are group-relative over `(task, group)`. `sessions.session_metrics(sessions, batch, latencies=..., version=..., truncation=...)` reports calls per chain, the masked share of sampled ids by status, mean reward and reward by component, the latency tail and version lag; the mismatch between trainer and engine is the loss's own metric. Where a batch's sessions come from two or more sources (`Session.source`, a prompt's `PromptRecord.data_source`), it reports each named source's status shares and mean trained reward beside the batch's, as `source/<source>/status/<name>` and `source/<source>/reward/mean`; a step whose sessions come from one source reports none.
+`packed_rows(sessions, width, truncation=..., share=...)` counts the rows `pack` would fill. With `share`, `pack` lays the prompt a group's chains begin with once (`dew.data.forked_rows.ForkedRows`), each chain's rest a document continuing it (`fork_parents`), so the policy computes a group's prompt once for its chains and scores every sampled id as its chain alone does; `RolloutScheduler.sampled` and `served` share where the objective's model computes a shared prefix as each chain's own (`TokenScorer.shares_prefixes`). `advantages` are group-relative over `(task, group)`. `sessions.session_metrics(sessions, batch, latencies=..., version=..., truncation=...)` reports calls per chain, the masked share of sampled ids by status, mean reward and reward by component, the latency tail and version lag; the mismatch between trainer and engine is the loss's own metric. Where a batch's sessions come from two or more sources (`Session.source`, a prompt's `PromptRecord.data_source`), it reports each named source's status shares and mean trained reward beside the batch's, as `source/<source>/status/<name>` and `source/<source>/reward/mean`; a step whose sessions come from one source reports none.
 
 `GRPOObjective` trains a packed batch directly. `packed_log_probs(params, batch)` scores each ID against its own chain's prefix. A scheduler that rescores the proximal policy stores the result as `old_log_probs`; otherwise the behavior likelihoods are used in its place.
 
