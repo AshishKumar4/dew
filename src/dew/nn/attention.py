@@ -902,7 +902,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
         key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
         key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None,
-        wide_logits=wide_logits).ran
+        dropout_places=dropout_places, wide_logits=wide_logits).ran
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
@@ -1110,7 +1110,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
                    block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-                   dropout: bool = False, wide_logits: bool = False, named: str = 'auto') -> AttentionCase:
+                   dropout: bool = False, dropout_places: template.DropPlaces | None = None,
+                   wide_logits: bool = False, named: str = 'auto') -> AttentionCase:
     """The `AttentionCase` of a call `scaled_dot_product_attention` takes under the `named`
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
@@ -1137,6 +1138,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout,
+        drop_placed=dropout_places is not None and (dropout_places.queries is not None
+                                                    or dropout_places.keys is not None),
         form=generation.numerics().forms)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
@@ -1152,7 +1155,8 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
                            image_groups=None, key_valid=None, key_runs=None, places=None,
-                           dropout: bool = False, wide_logits: bool = False) -> Route:
+                           dropout: bool = False, dropout_places: template.DropPlaces | None = None,
+                           wide_logits: bool = False) -> Route:
     """The route an `AttentionImpl` takes for this call on this host (`Route.ran` its kernel,
     `Route.forced` what forced it), as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
@@ -1171,7 +1175,8 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                           key_value_seq_lengths=key_value_seq_lengths,
                           key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                           image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
-                          dropout=dropout, wide_logits=wide_logits, named=implementation)
+                          dropout=dropout, dropout_places=dropout_places, wide_logits=wide_logits,
+                          named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
         return select(ATTENTION, case, None if implementation == 'auto' else implementation)
     if implementation == 'xla':

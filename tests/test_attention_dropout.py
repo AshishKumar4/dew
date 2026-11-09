@@ -532,6 +532,30 @@ def test_the_gpu_mainloops_refuse_the_draws_they_do_not_take_at_every_entry():
         attention_triton.backward(query, key, value, spans, hooks, query, residuals=residuals, interpret=True)
 
 
+@pytest.mark.parametrize(("exchange", "ran"), [("heads", "template"), ("gathered keys", "reference")])
+def test_a_sequence_exchanges_dropping_bf16_call_on_a_gpu_runs_where_its_draw_is_drawn(exchange, ran):
+    """A bf16 training call with probability dropout inside a sequence exchange on an H100 (assumed on this
+    CPU): a heads exchange's slice holds every query and key, so its draw is at its own query and key places
+    (`template.DropPlaces`' None) and the template takes it on the Mosaic dropping walk; a gathered-keys
+    exchange's slice draws at its queries' global places, which that walk does not read (`DROPPING`), so the
+    call takes the reference path, not the template's serial plain-JAX mainloop (`attention_route.drops`)."""
+    from dew.nn.attention import resolve_implementation
+
+    query = jax.ShapeDtypeStruct((2, 64, HEADS, WIDTH), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((2, 64, KV_HEADS, WIDTH), jnp.bfloat16)
+    rows, heads = jnp.arange(2), jnp.arange(HEADS)
+    places = (template.DropPlaces(rows, heads) if exchange == "heads"
+              else template.DropPlaces(rows, heads, jnp.arange(64, 128)))
+    with generation.assumed("sm90"):
+        route = resolve_implementation('auto', query, key, causal=True, dropout=True, dropout_places=places)
+        assert route.kernel == ran
+    drop = template.Dropout(seed_words(0), places.rows, places.heads, RATE, places.queries, places.keys)
+    for backward in (False, True):
+        declined = attention_mosaic.refused(jnp.bfloat16, WIDTH, WIDTH, template.Hooks(drop=drop),
+                                            backward=backward, family=mosaic_sm90.WGMMA)
+        assert (declined is None) == (ran == "template")
+
+
 def three_identical_keys():
     """One zero query of width 16 over three identical keys (first coordinate 1), values (0.75, 3u, 0, ...)
     with u = 2^-23, and dO = (1, 1, 0, ...), in bf16: at a rate of 1/2 each kept product is 2 (0.75 + 3u)."""
