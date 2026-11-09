@@ -342,8 +342,8 @@ def shortcut_forcing_loss(f: Predictor, clean: jax.Array, noise: jax.Array, tau:
     its data, one constant, is consistent across its own half steps, so its bootstrap error is zero: with
     the x-prediction's error on a seventh of the frames (`K_max` 64), the dynamics trained on still clips
     forecast their next frame with 0.22 to 0.25 of the mean frame's error, where diffusion forcing leaves
-    0.048 (H100, 3,000 updates, row 4802). Its error at every step anchors each to the data: 0.055, the
-    bootstrap kept for few-step sampling."""
+    0.048 (H100, 3,000 updates), and 0.184 against 0.025 at 12,000 (row 4802). Its error at every step
+    anchors each to the data: 0.055, and 0.025 at 12,000, the bootstrap kept for few-step sampling."""
     level = tau.reshape(*tau.shape, *(1,) * (clean.ndim - tau.ndim))
     step = d.reshape(level.shape)
     noisy = (1 - level) * noise + level * clean
