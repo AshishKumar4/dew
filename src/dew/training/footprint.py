@@ -506,8 +506,9 @@ def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[
     for index, equation in products:
         (contracted, batched) = equation.params["dimension_numbers"]
         for operand, contracting, batch in zip(equation.invars[:2], contracted, batched, strict=True):
-            kept = isinstance(operand, jcore.Var) and operand not in frontier.inputs and (
-                frontier.buffered(operand) or operand in shared)
+            if not isinstance(operand, jcore.Var) or operand in frontier.inputs:
+                continue
+            kept = frontier.buffered(operand) or operand in shared
             if kept and product_order(operand, contracting, batch) is not None:
                 copied[index] = copied.get(index, 0) + device_share(operand)
     return (copied, [(readers[0], readers[-1], device_share(value)) for value, readers in shared.items()],
