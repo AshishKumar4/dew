@@ -1307,7 +1307,8 @@ def _tiny_row(dew_ulps):
             y = jnp.dot(x, w, precision="highest")
             tiny = x[:1, :w.shape[1]] * 2.0 ** -60
             if ulps:
-                tiny = (tiny.astype(jnp.float64) * (1 + ulps * unit)).astype(tiny.dtype)
+                # One rounding of the exact product, in either arm's dtype (1 + ulps units is exact in both).
+                tiny = tiny * jnp.asarray(1 + ulps * unit, tiny.dtype)
             return {"y": jnp.concatenate([y, tiny])}
         return product
 
@@ -1753,6 +1754,35 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
     if not proxy:
         with pytest.raises(ValueError):
             recorder.record_case("site", draw, evaluate, None, truth_proxy=squared)
+
+
+def test_a_paired_recording_holds_its_sizing_draws_one_at_a_time():
+    """A paired recording (`record_case`'s `dew`) reads each of its sizing's pilot draws as it draws it and
+    never again, so its arrays do not pile up across the sizing: while one is evaluated, at most the one
+    before it is still held."""
+    import weakref
+
+    from reference_error import SIZING_FROM
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    draw, evaluate = _squared_case(300)
+    drawn, pilots, alive = [], [], []
+
+    def drawing(seed):
+        drawn.append(seed)
+        return draw(seed)
+
+    def evaluating(inputs):
+        reference, truth = evaluate(inputs)
+        if drawn[-1] >= SIZING_FROM:
+            alive.append(sum(held() is not None for held in pilots))
+            pilots.append(weakref.ref(reference["y"]))
+        return reference, truth
+
+    recorder.record_case("site", drawing, evaluating, summary=True,
+                         dew=jax.jit(lambda inputs: {"y": inputs["x"] * inputs["x"] - 1}))
+    assert len(pilots) > 2 and max(alive) <= 1
 
 
 def test_check_one_holds_an_empty_leaf_exact_by_construction():
@@ -2308,6 +2338,38 @@ def test_a_site_that_stacks_examples_is_judged_by_its_examples_paired_ratios_and
     with pytest.raises(GateFailure):
         assert_as_exact(stacked_arm(0, 3.0, every=5), reference, stacked_examples, "a fifth three times off",
                         seeds=seeds, truth_fn=exact_rows, examples=True)
+
+
+def test_a_recorded_site_that_stacks_examples_is_judged_by_its_recorded_examples():
+    """A site whose leaves stack examples, recorded as the reference's evidence alone (`record_case`'s
+    summary), keeps each example's evidence, so check 1 over the recording judges Dew by its examples as
+    it does live: an equally exact pair passes, and Dew three times off on a fifth of each draw's examples
+    is refused."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        return dict(zip(("x", "scale", "sizes"), stacked_examples(seed), strict=True))
+
+    def evaluate(inputs):
+        return stacked_arm(1)(**inputs), exact_rows(**inputs)
+
+    recorded = recorder.record_case("stacked", draw, evaluate, summary=True, examples=True,
+                                    dew=lambda inputs: stacked_arm(0)(**inputs))
+    seeds = int(recorded["stacked.seeds"])
+    drawn, reference, truth = indexed_recording(
+        dict(recorded), "stacked", seeds, inputs_of=draw,
+        truth_fn=lambda inputs: {"rows": jnp.asarray(inputs["x"], jnp.float64)})
+
+    def dew(factor):
+        return as_given(lambda index, inputs: stacked_arm(0, factor, every=5)(**inputs))
+
+    assert_as_exact(dew(1.0), reference, drawn, "recorded stacked", seeds=seeds, truth_fn=truth,
+                    examples=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(dew(3.0), reference, drawn, "recorded, a fifth three times off", seeds=seeds,
+                        truth_fn=truth, examples=True)
 
 
 def bits_apart():

@@ -575,6 +575,102 @@ def test_a_product_too_small_for_cublas_takes_no_workspace():
         assert with_workspace - without == workspace
 
 
+def test_an_input_a_product_reads_with_its_batch_inside_is_copied_once_for_every_product_reading_it_so():
+    """A product reads an input whose batch dimensions are not its leading ones through a copy laid out
+    with them leading, its free and contracting dimensions after (layout assignment fixes a parameter's
+    layout, so XLA copies it): one copy for every product that reads it in that order, held from the
+    first to the last of them; an input laid out with its batch dimensions leading is read as it is, as
+    is one whose other dimensions stand contracting first (a GEMM reads either operand transposed). An
+    attention's queries and keys stored [B, T, H, D] were so copied on an H100, which the derivation
+    missed (row 5290: 256 x 64 tokens, 4 heads of 256, 0.49 GB compiled against 0.42 derived)."""
+    from dew.training.footprint import peak_bytes
+
+    inner = jax.ShapeDtypeStruct((4, 8, 2, 16), jnp.float32)  # [B, T, H, D], 4096 bytes
+    leading = jax.ShapeDtypeStruct((4, 2, 8, 16), jnp.float32)  # [B, H, T, D]
+    weights = jax.ShapeDtypeStruct((4, 2, 16, 8), jnp.float32)  # [B, H, D, S], contracting first
+
+    def once(rows, weights):
+        return jnp.einsum("bthd,bhds->bhts", rows, weights)
+
+    def twice(rows, weights, other):
+        return jnp.einsum("bthd,bhds->bhts", rows, weights), jnp.einsum("bthd,bhds->bhts", rows, other)
+
+    def peak(function, *shapes):
+        return peak_bytes(jax.make_jaxpr(function)(*shapes).jaxpr, "gpu", Workspace(0, 0))
+
+    output = 4 * 2 * 8 * 8 * 4
+    assert peak(once, inner, weights) == 4096 + output
+    def laid(rows, weights):
+        return jnp.einsum("bhtd,bhds->bhts", rows, weights)
+
+    assert peak(laid, leading, weights) == output
+    # Its batch between its rows and its columns, as a GEMM takes it (`MatrixLayout::For`): no copy.
+    middle = jax.ShapeDtypeStruct((8, 4, 16), jnp.float32)  # [M, B, K]
+    columns = jax.ShapeDtypeStruct((4, 16, 8), jnp.float32)  # [B, K, N]
+
+    def between(rows, columns):
+        return jnp.einsum("mbk,bkn->bmn", rows, columns)
+
+    assert peak(between, middle, columns) == 4 * 8 * 8 * 4
+    # Both outputs held to the end, and the one copy until the second product has read it.
+    assert peak(twice, inner, weights, weights) == 4096 + 2 * output
+
+
+def test_a_gpu_product_holds_an_operand_xla_may_make_beside_its_own():
+    """On a GPU two fused values of one size, each made for its own product from a buffer both read and
+    neither from the other, are siblings XLA may fuse into one fusion writing both (`FuseSiblings`, its cost
+    model deciding): the later product holds the earlier's operand beside its own, as an attention's
+    gradient on an H100 held its probabilities in bf16, for its values' gradient, beside its scores'
+    cotangent, both made from its scores (row 5290: 2 x 2048 tokens, 4 heads over 1, 0.41 GB compiled
+    against 0.34 derived)."""
+    from dew.training.footprint import peak_bytes
+
+    rows = jax.ShapeDtypeStruct((64, 32), jnp.float32)
+    columns = jax.ShapeDtypeStruct((32, 64), jnp.float32)
+    left, right = jax.ShapeDtypeStruct((64, 16), jnp.bfloat16), jax.ShapeDtypeStruct((64, 16), jnp.float32)
+
+    def program(rows, columns, left, right):
+        scores = rows @ columns
+        return jnp.exp(scores).astype(jnp.bfloat16) @ left, (scores * 2.0) @ right
+
+    # Both siblings ready before the first product, so made beside it, the second held from there to its
+    # own product: the scores, both siblings and the first product's result at once.
+    jaxpr = jax.make_jaxpr(program)(rows, columns, left, right).jaxpr
+    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 16384 + 16384 + 8192 + 2048
+
+    # Siblings read from an input's storage alike: the second held from the first product to its own.
+    square = jax.ShapeDtypeStruct((64, 64), jnp.float32)
+
+    def stored(rows, left, right):
+        return jnp.exp(rows).astype(jnp.bfloat16) @ left, (rows * 2.0) @ right
+
+    jaxpr = jax.make_jaxpr(stored)(square, left, right).jaxpr
+    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 16384 + 8192 + 2048
+
+    # A value read before its sibling's fusion makes it is made for that read, as before: the first
+    # product holds its own operand beside the span of the second's sibling, made beside it, and its
+    # output, reduced away before the second.
+    wide = jax.ShapeDtypeStruct((64, 4096), jnp.float32)
+
+    def reread(rows, wide, left, right):
+        grown = jnp.exp(rows)
+        return jnp.sum(grown @ wide), (rows * 2.0) @ left, grown @ right
+
+    jaxpr = jax.make_jaxpr(reread)(square, wide, right, right).jaxpr
+    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 2**20 + 2 * 16384
+
+    # A value computed from another through a product is no sibling of it: no fusion makes both.
+    weights = jax.ShapeDtypeStruct((64, 64), jnp.float32)
+
+    def dependent(rows, columns, weights, other):
+        scores = rows @ columns
+        first = jnp.exp(scores) @ weights
+        return (scores + first) @ other
+
+    jaxpr = jax.make_jaxpr(dependent)(rows, columns, weights, weights).jaxpr
+    assert peak_bytes(jaxpr, "gpu", Workspace(0, 0)) == 3 * 16384
+
+
 def test_a_computed_value_read_in_two_orders_is_copied_for_the_second():
     """XLA lays a computed value out once: a product returned flat both as it is and transposed holds the
     product and a reordered copy, where its transpose alone would be the product laid out for it."""

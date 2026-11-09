@@ -1764,13 +1764,15 @@ class RunConfig:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
         stages, `data_seed` and `data_plan_version`, the training read bounded to `trainer.examples` where
         the run counts them, or to `trainer.epochs` passes over its source examples where its read has no
-        record count, so its length is read off the loader this returns."""
+        record count, so its length is read off the loader this returns; its loading workers sized for
+        `trainer.steps` (`dew.data.Loading.resolved`)."""
         # At the version `resumed` resolves (itself where `prepare` or `readied` resolved it; a run built
         # alone, `build_run`, resolves it here), which it always states.
         planned = self.resumed(("data_plan_version",)).data_plan_version
         assert planned is not None
-        return fitted(dataset, validation, objective=objective, seed=self.data_seed,
-                      examples=self.trainer.examples, epochs=self.trainer.epochs, plan_version=planned)
+        trainer = self.trainer
+        return fitted(dataset, validation, objective=objective, seed=self.data_seed, plan_version=planned,
+                      examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -2083,26 +2085,23 @@ class RunConfig:
         return self.prepare().inspected(trainer.name or "inspected")
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
-        """The run's optimizer as it trains under `name`: each group it names that claims the modules its
-        objective draws fresh beside a loaded base matching those that hold a parameter
-        (`ParamGroup.fresh`, `trained_modules`). Where it names none, a resumed run trains in the groups
-        its record names, as its optimizer state holds them (none for a record written before runs took
-        them), and a new run that draws such modules in their default groups (`OptimConfig.fresh_groups`).
+        """The run's optimizer as it trains under `name`: a resumed run trains in the groups its record
+        names, as its optimizer state holds them (its own for a record written before runs took them); a
+        new run that draws modules fresh beside a loaded base in the groups that claim them, each matching
+        those that hold a parameter (`ParamGroup.fresh`, `trained_modules`): its own, or its named ones
+        with the fresh group beside them, or none named, the default groups (`OptimConfig.fresh_groups`).
         Every process agrees on the groups before any records them."""
         def resolved() -> JSON:
             named = self.optim.param_groups
-            if not named:
-                checkpoints = self.trainer.checkpoints(name)
-                saved = epath.Path(checkpoints.directory) / RUN_FILE
-                recorded = recorded_param_groups(saved) if checkpoints.resumed(
-                    self.trainer.resume) is not None and saved.exists() else None
-                if recorded is not None:
-                    return to_record(recorded, tuple[ParamGroup, ...])
-            groups = named or self.optim.fresh_groups()
-            modules, leaves = trained_modules(objective, objective.fresh_modules()) if any(
-                group.fresh for group in groups) else ((), ())
-            if not named and not modules and not leaves:
-                return to_record((), tuple[ParamGroup, ...])
+            checkpoints = self.trainer.checkpoints(name)
+            saved = epath.Path(checkpoints.directory) / RUN_FILE
+            recorded = recorded_param_groups(saved) if checkpoints.resumed(
+                self.trainer.resume) is not None and saved.exists() else None
+            if recorded is not None:
+                return to_record(recorded, tuple[ParamGroup, ...])
+            modules, leaves = trained_modules(objective, objective.fresh_modules())
+            # A group named fresh claims what the run draws, or is refused where it draws none (`with_fresh`).
+            groups = self.optim.fresh_groups() if modules or leaves else named
             claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
             return to_record(claimed.param_groups, tuple[ParamGroup, ...])
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))

@@ -22,7 +22,11 @@ import json
 import logging
 import math
 import os
+import statistics
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -315,10 +319,22 @@ again. 32 workers of a 100-record pipeline held 7.07 GiB resident against 0.23 G
 two cores of a shared workstation (`Loading`), 219 MiB each."""
 
 
-SAMPLED_BATCHES = 5
-"""The batches automatic loading measures to size its buffers (`Loading.resolved`), as many as
-Grain's own pick samples."""
+SAMPLED_BATCHES = 9
+"""The batches automatic loading measures to size its buffers and its workers (`Loading.resolved`): the
+first, which opens the read, and eight after it, over which a step that makes several batches' rows at
+once is paid (a decision run's packer filled four batches in one of 115 ms and served three in about
+1 ms each)."""
 
+
+@functools.cache
+def worker_start_seconds() -> float:
+    """How long a loading worker of this process takes to start, measured once: a fresh interpreter of this
+    one's importing what a worker of a read imports to run its steps (Grain and Dew's data lowering), as
+    each worker does before its first record (`Loading.resolved`)."""
+    began = time.perf_counter()
+    subprocess.run([sys.executable, "-c", "import grain.python, dew.data.lowering"], check=True,
+                   capture_output=True)
+    return time.perf_counter() - began
 
 @dataclasses.dataclass(frozen=True)
 class Host:
@@ -329,6 +345,14 @@ class Host:
 
     cpus: int
     memory: int
+    worker_start: float | None = None
+    """How long a loading worker takes to start here, in seconds; measured on this process's host where
+    None (`worker_start_seconds`)."""
+
+    @property
+    def started(self) -> float:
+        """A loading worker's start here, as stated or as this process's host measures it."""
+        return worker_start_seconds() if self.worker_start is None else self.worker_start
 
     @classmethod
     def current(cls, cgroup: Path | None = None, root: Path = cgroups.ROOT) -> Host:
@@ -394,6 +418,22 @@ class Loading:
     a shared workstation, the first batch of a 100-record pipeline took 17.8 s
     and 7.07 GiB resident across 33 processes with 32 workers, against under
     0.1 s and 0.23 GiB with none.
+
+    A training read whose chain names no loading reads with automatic workers
+    (`workers="auto"`, `dew.data.compile.compile`), which `resolved` sizes from
+    what it measures: workers where the Python a batch takes over the batches the
+    run reads, its stated steps, pays for their starts, as many as cost the run
+    least, at most as many as the host's CPUs and memory hold, else none. In the
+    training process the records' Python holds the interpreter the step's
+    dispatch needs: a decision run's encoding held it 59% of the run on a GH200,
+    and four workers took its step from 20.9 to 10.5 ms (row 4862). Workers
+    change no record and no order: a global order's batches are the ones its
+    records' indices make, and a read cut per share
+    hands on its inputs in their order (`dew.data.lowering._Build.in_order`), so
+    its batches and its position are a read in none's. A stream cut per share,
+    which its workers would read each in shards of its own, its batches their
+    count's, reads in the process under automatic loading; a count it names
+    reads it in that many.
     """
 
     workers: int | Literal["auto"] = 0
@@ -405,12 +445,20 @@ class Loading:
     cache: bool = True
     """Whether a run reads its chains' leading deterministic steps from the records an earlier run
     made of the same records (`dew.data.cache.automatic_root`), which changes none of them."""
+    host: Host | None = None
+    """The host automatic workers are sized for (`resolved`): this process's (`Host.current`) where None,
+    or another's, its CPUs, memory and a worker's start as it states them."""
 
-    def resolved(self, records: pygrain.IterDataset, *, reads: int, host: Host | None = None) -> Loading:
+    def resolved(self, records: pygrain.IterDataset, *, reads: int, batches: int | None = None) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
-        by default) from its CPUs and its memory together, as tf.data's autotuning budgets both.
-        Grain's own pick (`pick_performance_config`) reads memory alone, takes the machine's CPU
-        count where a container may run on a few of them, and counts one batch for each worker.
+        by default) from its CPUs and its memory together. The sizing is static: it reads the batches'
+        bytes, the CPUs and the memory once, as a read opens, and measures no throughput, so it never
+        changes the count as the read runs. Grain 0.2.18, which Dew pins, has no autotuning that
+        measures: its `autotune` and `AutotuneParameter` raise NotImplementedError. Its static pick
+        (`pick_performance_config`) sizes workers from memory alone, `ram_budget_mb` over one batch's
+        bytes, capped at `multiprocessing.cpu_count()`, the machine's CPUs, where a container or a
+        job's affinity may run on a few of them (`Host.current` reads both), so it starts a worker for
+        each of the machine's CPUs on a large host.
 
         A worker for each CPU, as tf.data's parallelism takes each schedulable one, where there is
         more than one: on one CPU a worker adds a process and no parallelism, so the reading process
@@ -422,13 +470,35 @@ class Loading:
         than that half holds. `records` are the batches the read makes without workers,
         `SAMPLED_BATCHES` of which are measured; `reads` is how many reads make one: one where the
         order is read by batch, its rows where it streams records. A read that makes no batch reads
-        without workers."""
+        without workers.
+
+        Workers take the read's Python off the training process, whose step's dispatch waits on the
+        interpreter it holds (a decision run's encoding: 20.9 against 10.5 ms a step in four workers on
+        a GH200, row 4862), and each costs a process's start first, its imports, which Grain starts one
+        after another. They start where they pay for themselves over the run, as many as cost the run
+        least where it waits on them, the count beside the square root of the mean time a sampled batch
+        takes to make, read in turn with no thread reading ahead, each after the first, which opens the
+        read, times the `batches` the run reads (its planned steps), over a worker's start there
+        (`Host.started`), at most as many as the CPUs and the memory hold. On a GH200 a decision run of
+        1,500 steps, 15 ms of Python a batch, took 100 s in the process at 20 ms a step; 64 workers, the
+        CPUs', 168 s at 12.4 ms; 13, as many as its Python pays the starts of, 136 s at 11.1 ms. A short
+        run, one whose batches take no Python to speak of, or one whose length nothing states (None),
+        which no measure shows they pay for, reads in the process."""
         if self.workers != "auto":
             return self
-        sampled = list(itertools.islice(records, SAMPLED_BATCHES))
+        reading, sampled, seconds = iter(records), [], []
+        for _ in range(SAMPLED_BATCHES):
+            began = time.perf_counter()
+            batch = next(reading, None)
+            if batch is None:
+                break
+            sampled.append(batch)
+            seconds.append(time.perf_counter() - began)
         if not sampled:
             return dataclasses.replace(self, workers=0)
-        host = Host.current() if host is None else host
+        # Their mean, which a step making several batches at once is paid in, as the run pays it.
+        python = statistics.fmean(seconds[1:] or seconds)
+        host = Host.current() if self.host is None else self.host
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)
         budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
@@ -437,7 +507,17 @@ class Loading:
             cpus = min(cpus, self.max_workers)
         read_buffer = min(self.read_buffer, budget // read)
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
-        workers = max(0, min(cpus, budget // held))
+        workers = 0 if batches is None else max(0, min(cpus, budget // held))
+        if workers and batches is not None and (started := host.started) > 0:
+            # W workers started one after another, then reading P seconds of Python a batch over B batches,
+            # cost W + R / W starts where the run waits on them, R = B * P / start: least at the integer
+            # beside sqrt(R) that costs less, k + 1 over k where R > k * (k + 1); none where R < 1.
+            paid = python * batches / started
+            least = math.isqrt(int(paid))
+            workers = 0 if paid < 1 else min(workers, least + 1 if paid > least * (least + 1) else least)
+        if not workers:
+            _log.info("automatic loading reads in the process: %s batches of %.2f ms of Python each, on %d "
+                      "CPUs", batches, python * 1e3, host.cpus)
         _log.info("automatic loading reads in %d workers holding %d reads ahead, sized for %d CPUs and "
                   "%.2f GiB", workers, read_buffer, host.cpus, budget / 2**30)
         return dataclasses.replace(self, workers=workers, read_buffer=read_buffer)

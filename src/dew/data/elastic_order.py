@@ -8,6 +8,7 @@ from __future__ import annotations
 import collections
 import itertools
 from collections.abc import Callable, Mapping, Sequence
+from typing import overload
 
 import grain.python as pygrain
 
@@ -16,12 +17,44 @@ from dew.batch import Batch
 from dew.data.storage import MIRRORS, carried_mirrors
 
 type Grouping = Callable[[], Callable[[Sequence], Batch]]
-"""What makes a worker's group of inputs one element (`lowering._Grouped`): called once a read opens."""
+"""What makes a worker's group of inputs one element (`handoff._Grouped`): called once a read opens."""
+
+
+class _Gathered(pygrain.MapDataset):
+    """`rows`' inputs from `start` on in groups of `size` consecutive ones, each gathered by index and
+    grouped (`grouping`), the last group the inputs that remain: Grain's batch of a map, which a Grain
+    step that drops inputs (a filter's, read as None) refuses to follow, read input by input. An endless
+    order, which Grain's repeat states as `sys.maxsize` inputs, holds as many groups as that counts."""
+
+    def __init__(self, rows: pygrain.MapDataset, start: int, size: int,
+                 grouping: Callable[[Sequence], Batch]):
+        super().__init__(rows)
+        self._rows, self._start, self._size, self._grouping = rows, start, size, grouping
+        self._groups = -(-max(len(rows) - start, 0) // size)
+
+    def __len__(self) -> int:
+        return self._groups
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Batch: ...
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return self.slice(index)
+        first = self._start + index * self._size
+        last = min(first + self._size, len(self._rows))
+        return self._grouping([self._rows[at] for at in range(first, last)])
+
+    def __str__(self) -> str:
+        return f"_Gathered(start={self._start}, size={self._size})"
 
 
 class _InputOrder(pygrain.IterDataset):
     """An elastic read's indexed rows read in its loading workers (`_Build.handed`), in the inputs'
-    order whatever their count: groups of `size` consecutive inputs (`lowering._Grouped`), group k read by
+    order whatever their count: groups of `size` consecutive inputs (`handoff._Grouped`), group k read by
     worker k mod W, which Grain's interleave of the workers hands on in turn, so group after group
     in order. Its position is the input its next group begins at, so a resume opens its workers
     there (`rows[next:]`) on any count; `size` is the chain's batch, the same on every topology, so
@@ -46,8 +79,7 @@ class _InputOrderIterator(pygrain.DatasetIterator):
             ordered = self._ordered
             # Each group a dataset element of its own, so the workers' slices of them, every W-th,
             # interleave back into the inputs' order.
-            groups = ordered.rows[self._next:].batch(ordered.size, drop_remainder=False,
-                                                     batch_fn=ordered.grouping())
+            groups = _Gathered(ordered.rows, self._next, ordered.size, ordered.grouping())
             self._reads = iter(ordered.read(groups))
             self._reads.start_prefetch()
         return self._reads
@@ -172,7 +204,7 @@ class _Kept(pygrain.IterDataset):
     """The groups of `size` consecutive rows of the stream `rows` that one loading worker keeps
     (`_StreamOrder`): every group whose number is its slice's (`set_slice`, which stops here, so Grain never
     deals the stream's shards between the workers), from the stream's `position` where given, the first
-    `opening` rows long, each grouped (`lowering._Grouped`) with the stream's position after it."""
+    `opening` rows long, each grouped (`handoff._Grouped`) with the stream's position after it."""
 
     def __init__(self, rows: pygrain.IterDataset, size: int, position: Mapping[str, object] | None,
                  grouping: Grouping, opening: int | None = None):
