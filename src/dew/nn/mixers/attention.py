@@ -123,8 +123,7 @@ def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
     return jnp.where(jnp.asarray(positions) >= 0, index, 1)
 
 
-def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_images: bool,
-                            bidirectional_blocks: bool) -> str | None:
+def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool) -> str | None:
     """Why attention over `ctx` cannot run a serving step's mixed call
     (`dew.nn.inputs.Admitted`), or None: it reads a cache, dense or one page
     pool, whole and causal, and nothing a row carries besides."""
@@ -136,7 +135,6 @@ def mixed_attention_refusal(ctx: MixerContext, *, alibi: bool, bidirectional_ima
         "keys shared from another layer": ctx.kv_shared,
         "bidirectional attention": not ctx.causal,
     }
-    del bidirectional_images, bidirectional_blocks
     named = [reason for reason, refused in refusals.items() if refused]
     return None if not named else ", ".join(named)
 
@@ -1470,9 +1468,7 @@ class CausalSelfAttention(nn.Module):
     def _mixed_positions(self, admitted: Admitted, valid) -> jax.Array:
         """Each token's slot in its row, `[1, tokens]`, -1 for padding: a
         decoding row's token at its cursor, a prompt's after its row's start."""
-        refusal = mixed_attention_refusal(self.ctx, alibi=self.alibi,
-                                          bidirectional_images=self.bidirectional_images,
-                                          bidirectional_blocks=self.bidirectional_blocks)
+        refusal = mixed_attention_refusal(self.ctx, alibi=self.alibi)
         if refusal is not None:
             raise ValueError(f"a mixed serving step needs plain attention; {self.name}: {refusal}")
         index = self.get_variable("cache", "cache_index")
@@ -1827,8 +1823,7 @@ class AttentionMixer(MixerBase):
     packed_cache = True
 
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
-        return mixed_attention_refusal(ctx, alibi=self.alibi, bidirectional_images=self.bidirectional_images,
-                                       bidirectional_blocks=self.bidirectional_blocks)
+        return mixed_attention_refusal(ctx, alibi=self.alibi)
 
     def __post_init__(self):
         if self.temperature_tuning is not None:
