@@ -1715,6 +1715,12 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
     shares = task_seconds(tests, cases, log, time.monotonic() - began, expired)
+    # Where the task ran out of time, the file whose test started last is the one it was spent in (executed.py
+    # logs each visit): its row is the deadline's red; a file pytest reported is graded by its own cases, the
+    # exit the interrupt's, not its; and one with none is not graded but run again (`STALE`), never a red of
+    # its tests (Main, 2026-11-09: train 745 filed six files packed beside a hung one as reds "at 0.0 s").
+    stood = followed.visited(followed.log_events(log)) if expired else []
+    running = stood[-1] if stood else None
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         failed = [(case, kind, node) for case in own for kind in ("failure", "error")
@@ -1726,20 +1732,27 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                    if "could not import" in f"{node.get('message')} {node.text}"]
         counted = counts.get(name, {})
         deselected = bool(counted) and counted["collected"] == counted["deselected"]
-        exited = exit_red(returncode, cases, own, deselected, name)
-        unaccounted = ([] if exited or (report.is_file() and (own or deselected))
+        spent = expired and name == running
+        unreached = expired and not spent and not own and not deselected
+        exited = [] if expired and not spent else exit_red(returncode, cases, own, deselected, name)
+        unaccounted = ([] if exited or unreached or (report.is_file() and (own or deselected))
                        else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
                                                             else "pytest reported none of its tests, and its "
                                                                  "collection shows them not all deselected")])
         red += skipped + exited + unaccounted
-        if expired:
+        if spent or (expired and running is None):
             red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
+        if unreached:
+            spender = running or "its other files"
+            red.append(f"not graded: its task's {deadline:.0f} s were spent in {spender}, before pytest "
+                       "reported any test of it; it runs again")
         # A failed case with no class path is a file that did not collect, no test of it.
         nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
         whole = skipped or exited or unaccounted or not nodes or any(not case.get("classname")
                                                                       for case, _, _ in failed)
-        cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
-                 else red_as("nodes", nodes))
+        cause = ({} if not red else red_as(STALE, []) if unreached
+                 else red_as("deadline", []) if spent or (expired and running is None)
+                 else red_as("whole", []) if whole else red_as("nodes", nodes))
         # A file that never started in a task that ran out of time has no seconds (`deadline_shares`): its
         # row is `unobserved`, and armada weighs no plan by it.
         unobserved = name not in shares
