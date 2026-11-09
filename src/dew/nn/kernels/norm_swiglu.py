@@ -79,7 +79,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 from dew.mesh import logical_spec
-from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import launches
 
 from ..precision import (
@@ -339,19 +339,17 @@ class _Logical:
     def __call__(self, y: jax.Array) -> jax.Array:
         traced = _traced(self.function, self.shape)
 
-        @jax.custom_jvp
         def applied(y):
             (out,) = _on_tile(traced.jaxpr, traced.consts, self.shape, y.shape, y)
             return out
 
-        @applied.defjvp
-        def _(primals, tangents):
+        def tangent(primals, tangents):
             derived = _tangents(self.function, self.shape)
             out, tangent = _on_tile(derived.jaxpr, derived.consts, self.shape, primals[0].shape, *primals,
                                     *tangents)
             return out, tangent
 
-        return applied(y)
+        return declared_tangent(KernelGlue(), applied, tangent)(y)
 
 
 def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
