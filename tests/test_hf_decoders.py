@@ -103,6 +103,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
   nonzero selection bias, grouped sigmoid routing and optional latent projections.
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -290,6 +291,67 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64)),
                     torch_logits(reference), token_draw(0x0A3, reference.config.vocab_size, ids.shape),
                     "float32 logits", seeds=ACCURATE_SEEDS, truth_fn=torch_logits(wide, float64))
+
+
+USERS_FP32_SEEDS = 8
+"""The float32 gradient site's declared check-1 seeds, sized by `seeds_for` paired on a GPU."""
+
+
+def a_float32_decoders_gradients_under_a_users_fp32_policy_are_as_exact_as_transformers_on_a_gpu():
+    """A float32 decoder trained as a user's float32 run trains it, under the numerics such a run takes by
+    default (`Numerics` at the 32-true dtypes, JAX's default precision, the fast forms, through
+    `generation.run_precision`): its cross entropy's gradient of every parameter on a GPU is as exact as
+    transformers' float32 one there, both from transformers' float64 one (check 1 over drawn ids of the
+    fixture's shape), each Dew gradient read in the release's layout (`WeightLayout.export`). The logits'
+    own cell (`a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu`) holds
+    the forward under the accurate policy; this one holds the backward a user's run takes."""
+    import torch
+    from interop_support import token_draw
+    from transformers import AutoModelForCausalLM
+
+    from dew.nn.kernels import generation
+    from dew.nn.precision import DTYPE_PRESETS, Numerics
+    from tools.torch_precision import float64, float64_twin
+
+    directory = FIXTURES / "qwen3-tiny"
+    shape = np.load(directory / "input_ids.npy").shape
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
+    shapes_of = {layout.name: layout for layout in loaded.weight_layouts}
+    device = "cuda"
+    narrow = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").to(device).eval()
+    wide = float64_twin(narrow)
+    named = dict(narrow.named_parameters())
+
+    def loss(variables, ids):
+        logits = loaded.model.apply(variables, ids)
+        chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], -1)
+        return -jnp.mean(chosen)
+
+    with jax.default_matmul_precision(None), generation.run_precision(Numerics(DTYPE_PRESETS["32-true"])):
+        ids = jnp.zeros(shape, jnp.int32)
+        gradient = jax.jit(jax.grad(loss)).trace(loaded.variables, ids).lower().compile()
+
+    @as_given
+    def ours(ids):
+        grads = gradient(loaded.variables, jnp.asarray(ids, jnp.int32))
+        return {name: np.asarray(layout.export(grads), np.float64).reshape(named[name].shape)
+                for name, layout in shapes_of.items() if name in named}
+
+    def torch_gradients(model, precision):
+        @as_given
+        def run(ids):
+            model.zero_grad(set_to_none=True)
+            tokens = torch.from_numpy(np.asarray(ids, np.int64)).to(device)
+            with precision():
+                model(tokens, labels=tokens).loss.backward()
+                held = dict(model.named_parameters())
+                return {name: held[name].grad.double().cpu().numpy() for name in shapes_of if name in held}
+        return run
+
+    # Compiled once under the policy, as a run under it compiles: the gate runs it as given.
+    assert_as_exact(ours, torch_gradients(narrow, contextlib.nullcontext),
+                    token_draw(0x0A4, narrow.config.vocab_size, shape), "float32 gradients",
+                    seeds=USERS_FP32_SEEDS, truth_fn=torch_gradients(wide, float64))
 
 
 @pytest.mark.parametrize(("name", "stale"), [
