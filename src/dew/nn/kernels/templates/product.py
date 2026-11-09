@@ -54,11 +54,11 @@ def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
     `compute` whole and sum in fp32, so a portable route computes it."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs, compute=compute),
+    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs),
                    _refusal(compute, operands, above, precision))
 
 
-def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bool:
+def promoted(*, above: bool, outputs: tuple) -> bool:
     """Whether a product promotes each depth step's partial apart (`exact_sums`): where an output is fp32,
     whose sums a 16-bit output's one rounding hides, and the product is asked above the default precision
     (`above`). At the default precision a 16-bit product's fp32 sums are the tensor cores' own, as cuBLAS's
@@ -67,9 +67,8 @@ def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bo
     sums, 40 to 60 times closer to float64 than the reference, cost an H100 1.10-2.06x their time (W124) and
     an A100 the 128 x 128 tile; row 4331's premise (M-NS-1: 1.661x XLA's error at depth 128, 3.88x at 512)
     did not reproduce. An underfilled wave's split of the contraction (`gemm.mosaic_gpu.split_count`)
-    shortens each sum as cuBLAS's split-K does. `compute`, the operands' dtype, no longer decides it (an
-    FP8 product promotes apart, `declared`)."""
-    del compute
+    shortens each sum as cuBLAS's split-K does. An FP8 product promotes apart whatever its outputs
+    (`declared`)."""
     return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}
 
 
