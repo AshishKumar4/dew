@@ -1511,6 +1511,7 @@ mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "lightning_attention": "dew.nn.mixers.lightning:LightningAttentionMixer",
     "mamba": "dew.nn.mixers.mamba:MambaMixer",
     "mamba2": "dew.nn.mixers.mamba2:Mamba2Mixer",
+    "mamba3": "dew.nn.mixers.mamba3:Mamba3Mixer",
     "memory": "dew.nn.mixers.memory:InContextMemoryMixer",
     "mla": "dew.nn.mla:MLAMixer",
     "mlp": "dew.nn.mixers.mlp:MLPMixer",
