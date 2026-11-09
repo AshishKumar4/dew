@@ -766,3 +766,24 @@ def test_a_dreamer_runs_cooldown_leaves_its_replay_as_the_run_left_it(tmp_path):
                         cooldowns=cooldowns, **options)
     for one, other in zip(plain, bits(again), strict=True):
         np.testing.assert_array_equal(one, other)
+
+
+def test_an_equal_objective_built_anew_counts_its_update_from_the_first_ones_trace():
+    """An objective built anew, equal to one whose update's work was traced (`traced_update_flops`), as a
+    refit or a resume in the same process builds it, reads that count and traces nothing, where one of
+    other settings traces its own (row 3873: each of a resumed run's fits traced its loss twice more)."""
+    from dew.telemetry.compiles import Compiles
+
+    rng = np.random.default_rng(3)
+    windows = {"observation": jnp.asarray(rng.normal(size=(2, 5, 1)), jnp.float32),
+               "action": jnp.asarray(rng.uniform(-1, 1, (2, 5, 1)), jnp.float32),
+               "reward": jnp.asarray(rng.normal(size=(2, 5)), jnp.float32),
+               "first": jnp.zeros((2, 5), bool).at[:, 0].set(True), "last": jnp.zeros((2, 5), bool),
+               "terminal": jnp.zeros((2, 5), bool)}
+    counted = DreamerV3Objective(tiny(), imagination=3).training_flops(None, windows)
+    with Compiles(None) as again:
+        assert DreamerV3Objective(tiny(), imagination=3).training_flops(None, windows) == counted
+    assert [program for program in again.programs if program.kind == "traced"] == []
+    with Compiles(None) as other:
+        DreamerV3Objective(tiny(), imagination=4).training_flops(None, windows)
+    assert any(program.kind == "traced" for program in other.programs)

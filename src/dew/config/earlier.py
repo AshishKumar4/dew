@@ -33,14 +33,15 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     (`earlier_newton_schulz`); a profile window's capture options as its capture's (`earlier_profile`); a
     decision run's option text as its rows wrote it (`earlier_option_text`), and the fewest options its
     rows drew "none of the above" on as they drew it (`earlier_none_of_the_above`); a world model's
-    tokenizer's positions as it learned them (`earlier_tokenizer_positions`); its data plan version
+    tokenizer's and its dynamics model's positions as they learned them (`earlier_tokenizer_positions`,
+    `earlier_dynamics_positions`); its data plan version
     as the one it read by (`earlier_data_plan`); a chain's store under the fields its class renamed since,
     by today's names (`dew.data.records.earlier_chains`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     earlier = earlier_none_of_the_above(earlier_profile(earlier_newton_schulz(earlier_trainer(record))))
-    earlier = earlier_option_text(earlier_tokenizer_positions(earlier))
+    earlier = earlier_option_text(earlier_dynamics_positions(earlier_tokenizer_positions(earlier)))
     return records.earlier_chains(earlier_data_plan(earlier), _chains())
 
 
@@ -80,6 +81,9 @@ DECISION_OBJECTIVE = "dew.decision.objective:DecisionObjective"
 CAUSAL_TOKENIZER = "dew.objectives.world_model:CausalTokenizer"
 """Dreamer 4's tokenizer's import path, as a saved run's record names its model (`ModelConfig.name`)."""
 
+DYNAMICS = "dew.objectives.world_model:Dynamics"
+"""Dreamer 4's dynamics model's import path, as a saved run's record names its model (`ModelConfig.name`)."""
+
 
 def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.Aliases, path: str,
                      argument: str, earlier: JSON) -> Mapping[str, object]:
@@ -115,6 +119,14 @@ def earlier_tokenizer_positions(record: Mapping[str, object]) -> Mapping[str, ob
     reads "learned", as it trained (`_earlier_default`; row 4669: the default became "rotary"). Carried to
     1.0 (ledger 1552)."""
     return _earlier_default(record, "model", models, CAUSAL_TOKENIZER, "positions", "learned")
+
+
+def earlier_dynamics_positions(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved world-model run's record whose dynamics model (`Dynamics`) states its `positions` nowhere:
+    saved before rotary positions, its tokens knew their frame and place by learned vectors alone, so it
+    reads "learned", as it trained (`_earlier_default`; row 4802: the default became "rotary"). Carried
+    to 1.0 (ledger 1552)."""
+    return _earlier_default(record, "model", models, DYNAMICS, "positions", "learned")
 
 
 def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:

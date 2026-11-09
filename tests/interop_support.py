@@ -215,6 +215,17 @@ def next_token_losses(model, ids):
     return torch.nn.functional.cross_entropy(logits[:, :-1].transpose(1, 2), ids[:, 1:], reduction="none")
 
 
+def dew_next_token_loss(loaded, params, ids):
+    """A loaded Dew model's (`Pretrained.load`) mean cross entropy at each next token of `ids` under `params`,
+    with its logits: the loss whose gradient a decoder's parity holds against transformers'."""
+    import jax
+    import jax.numpy as jnp
+
+    logits = loaded.model.apply({**loaded.variables, "params": params}, ids)
+    chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], -1)
+    return -jnp.mean(chosen), logits
+
+
 def extract_fixture(archive: Path, directory: Path) -> Path:
     with tarfile.open(archive) as source:
         source.extractall(directory, filter="data")

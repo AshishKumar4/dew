@@ -1115,7 +1115,6 @@ def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_pr
     prefix a block read whole, every other key within the window), from that mask's float64 run
     (check 1), the prefix's own targets left out."""
     from block_support import block_causal
-    from reference_error import seeds_for
     from token_support import write_token_corpus
 
     from dew.batch import TEXT_KEY
@@ -1166,5 +1165,5 @@ def test_a_recorded_prefix_run_trains_a_windowed_latent_attention_reading_its_pr
     # The gate runs the truth in float64 (check 1), the float64 model over the saved weights.
     truth = masked(restored.model.clone(dtype=jnp.float64), restored.variables)
     reference = masked(restored.model, restored.variables)
-    seeds = seeds_for(reference, draw, "recorded mla prefix run", truth_fn=truth)
-    assert_as_exact(dew, reference, draw, "recorded mla prefix run", seeds=seeds, truth_fn=truth)
+    # The count `seeds_for` sized.
+    assert_as_exact(dew, reference, draw, "recorded mla prefix run", seeds=32, truth_fn=truth)

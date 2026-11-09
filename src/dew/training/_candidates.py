@@ -6,14 +6,17 @@ fit check holds beside it (`candidate_for`), and the same step lowered for a GPU
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import functools
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Hashable
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.batch import CLOSES_WINDOW, Batch
@@ -21,7 +24,8 @@ from dew.distributed.batches import batch_shardings, prefetched_bytes
 from dew.distributed.placement import Placement, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import owned_program, trace_context
+from dew.nn.kernels.templates import report
 from dew.nn.sharding import Schedule
 from dew.state import TrainState, apart, together
 from dew.training import staging
@@ -65,12 +69,102 @@ class Stepping[LossT, EffectsT]:
     split: int | None
 
 
+KEPT_CANDIDATES = 4
+"""The traced steps a process keeps for a trainer built anew to read (`candidate_for`), the latest: each
+holds its lowered module."""
+
+_CANDIDATES: collections.OrderedDict[Hashable, Candidate] = collections.OrderedDict()
+_KEEPING = threading.Lock()
+
+
+def _shaped(tree) -> Hashable:
+    """`tree`'s structure and each leaf's abstract value and placement (an array's, a NumPy array's, a
+    shape's, a scalar's beside its type, which tells True from 1), or the leaf itself where it is none."""
+    def leaf(value) -> Hashable:
+        if isinstance(value, jax.Array | jax.ShapeDtypeStruct | np.ndarray | np.generic | bool | int | float
+                      | complex):
+            aval = jax.typeof(value)
+            return type(value), aval.shape, aval.dtype, aval.weak_type, getattr(value, "sharding", None)
+        return value
+    leaves, structure = jax.tree.flatten(tree)
+    return structure, tuple(map(leaf, leaves))
+
+
+def _shapes(tree):
+    """`tree` with each array leaf as its shape, dtype and placement, as a kept step holds a batch it
+    traced over and none of its values."""
+    return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                          sharding=getattr(leaf, "sharding", None))
+                        if hasattr(leaf, "dtype") else leaf, tree)
+
+
+def _footprinted(footprint: Footprint | None) -> Hashable:
+    """`footprint` as a value, its resident bytes by name in order."""
+    if footprint is None:
+        return None
+    return tuple((field.name, tuple(sorted(value.items())) if field.name == "resident" else value)
+                 for field in dataclasses.fields(footprint) for value in (getattr(footprint, field.name),))
+
+
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
                                    schedule: Schedule, placement, replicated, split: int, narrow: bool,
                                    launches: str | None, lowering: bool = True, *,
                                    mesh: Mesh | AbstractMesh | None = None,
                                    platforms: tuple[str, ...] | None = None, capacity: int | None = None,
                                    footprint: Footprint | None = None, derived: bool = True) -> Candidate:
+    """`_candidate`'s step, or the one an equal trainer traced in this process over the same shapes
+    (`Trainer._step_key`; row 3873: each fit of a resumed run traced its step again, 6.5 to 12.9 s, and
+    lowered it, 9 s), its pipeline's schedule the one its microbatches make; a trainer whose step no value
+    states traces its own."""
+    stated = stepping.trainer._step_key()
+    # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
+    # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
+    key = None if stated is None else (
+        stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
+        # No launch record lowers as an empty one (`_candidate`'s untuned lowering).
+        launches or "[]",
+        lowering, mesh, platforms, capacity, _footprinted(footprint), derived, stepping.rows, stepping.split,
+        stepping.prefetch, stepping.examples, report.refused_launches(), trace_context())
+    if key is not None:
+        with _KEEPING:
+            if (kept := _CANDIDATES.get(key)) is not None:
+                _CANDIDATES.move_to_end(key)
+                sampled = _sampled(stepping, kept, batch, placement, replicated, split, platforms)
+                return dataclasses.replace(kept, sampled=sampled)
+    candidate = _candidate(stepping, state, batch, schedule, placement, replicated, split, narrow, launches,
+                           lowering, mesh=mesh, platforms=platforms, capacity=capacity, footprint=footprint,
+                           derived=derived)
+    if key is not None:
+        # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
+        # builds the reader's own).
+        with _KEEPING:
+            _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None)
+            while len(_CANDIDATES) > KEPT_CANDIDATES:
+                _CANDIDATES.popitem(last=False)
+    return candidate
+
+
+def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Candidate, batch: Batch,
+                              placement, replicated, split: int, platforms: tuple[str, ...] | None
+                              ) -> Callable[[], jax.stages.Lowered] | None:
+    """The sampled step `candidate`'s reader lowers (`Candidate.sampled`), its own trainer's, as the step
+    lowers, over the same arguments, for the same platforms: none without an inspection."""
+    if stepping.trainer.inspection is None:
+        return None
+    watched = step_program(stepping, candidate.shapes, candidate.copies, candidate.shardings, placement,
+                           replicated, split, sampled=True)
+    part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
+    given = placed_shapes(batch, placement)
+    return functools.partial(lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
+                             *apart(candidate.prepared), given, part)
+
+
+def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
+                                schedule: Schedule, placement, replicated, split: int, narrow: bool,
+                                launches: str | None, lowering: bool = True, *,
+                                mesh: Mesh | AbstractMesh | None = None,
+                                platforms: tuple[str, ...] | None = None, capacity: int | None = None,
+                                footprint: Footprint | None = None, derived: bool = True) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
     alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
     `launches` are its kernel launches where a record holds them, which settle their configs before it
@@ -128,14 +222,10 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
             (local_devices(trainer.device_mesh) or [*trainer.device_mesh.devices.flat])[0], split,
             functools.partial(consumes_where_made, stepping, prepared, micro, window, shapes),
             max(cuts, default=0), capacity)
-    # The sampled step lowers as the step does, over the same arguments, for the same platforms.
-    watched = None if trainer.inspection is None else step_program(
-        stepping, shapes, copies, shardings, placement, replicated, split, sampled=True)
-    sampled = None if watched is None else functools.partial(
-        lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
-        *apart(prepared), given, part)
-    return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                     lower.report() if lowering else KernelReport((), ()), footprint, sampled)
+    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
+                          lower.report() if lowering else KernelReport((), ()), footprint)
+    return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
+                                                           split, platforms))
 
 
 def consumes_where_made[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], prepared: TrainState,
