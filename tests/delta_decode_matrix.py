@@ -114,17 +114,20 @@ LAYERS = {
 """Each layer the decode matrix runs, by its `layer` axis value."""
 
 
-def _decoded(module, kernel: str, state: str):
+def _decoded(module, kernel: str, state: str, found: list | None = None):
     """`module`'s `DECODED` tokens decoded in turn on `kernel`: each token's output, and the conv history and
-    recurrent state (the cache's `state`) they leave."""
+    recurrent state (the cache's `state`) they leave; the routes the tokens take into `found` where given, as
+    they trace (a draw's prefill takes the chunked op's, none of the tokens')."""
     def decode(variables, cache, tokens):
         outs = []
-        with generation.chosen(delta_decode=kernel, **REFERENCES):
+        with (generation.chosen(delta_decode=kernel, **REFERENCES), generation.routes() as routes):
             for at in range(DECODED):
                 out, after = module.apply({**variables, "cache": cache}, tokens[:, at:at + 1],
                                           MixerCall(decode=True), mutable=["cache"])
                 outs.append(out)
                 cache = after["cache"]
+        if found is not None:
+            found.extend(routes)
         return jnp.concatenate(outs, axis=1), cache["conv_state"], cache[state]
     return decode
 
@@ -188,10 +191,11 @@ def on_par(case: tuple[str, ...]) -> None:
     layer = LAYERS[named["layer"]]
     held = jnp.dtype(named["state"])
     module = layer.make()
-    with generation.routes() as found:
-        assert_as_exact(_decoded(module, named["kernel"], layer.state), _decoded(module, "xla", layer.state),
-                        functools.partial(layer.drawn, held=held), "-".join(case), seeds=FEWEST_SEEDS,
-                        truth_fn=_decoded(module.clone(dtype=jnp.float64), "xla", layer.state))
+    found = []
+    assert_as_exact(_decoded(module, named["kernel"], layer.state, found),
+                    _decoded(module, "xla", layer.state), functools.partial(layer.drawn, held=held),
+                    "-".join(case), seeds=FEWEST_SEEDS,
+                    truth_fn=_decoded(module.clone(dtype=jnp.float64), "xla", layer.state))
     taken = _choices(found)
     assert all(choice in CHOICES or REFERENCES.get(choice) == kernel for choice, kernel in taken), taken
     assert ("delta_decode", named["kernel"]) in taken
