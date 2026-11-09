@@ -11,9 +11,10 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, with_gradients
 from test_mixers import tiny
-from test_recurrence_chunk import hosted, marked, sigmoid, softplus
+from test_recurrence_chunk import ROUTES, hosted, marked, on_route, sigmoid, softplus
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 
+from dew.nn.kernels import generation
 from dew.nn.mixers.mamba3 import Carried, chunk_mamba3, recurrent_mamba3, step_mamba3
 from dew.nn.scatter import gather_positions
 from dew.registry import mixers
@@ -43,6 +44,9 @@ RESET_TERMS = False
 their gradients are exactly zero in the recurrence and in the chunked form alike (`chunk_mamba3` drops them),
 held to the reference's own residue there, zero; tracing the recurrence's float64 terms for them took 244 s
 and 10 GB a packed site (jsf-m3prof1)."""
+NARROW_SEEDS = {None: 8, "sm80": 8}
+"""The bf16 layer's chunked-form site's declared seeds by route (`on_route`), sized by `seeds_for` on armada,
+paired."""
 MIMO_DECODER_SEEDS = {"mamba3 mimo raw": 16, "mamba3 mimo policy": 16}
 """The MIMO decoder's draws' declared seeds, raw and under the policy, sized by `seeds_for` on armada."""
 
@@ -82,6 +86,23 @@ def chunked(x, dt, A, B, C, lam, theta, state, *, starts):
     out, carried = chunk_mamba3(x, dt, A, B, C, lam, theta, entering(state, theta.shape[-1], x.shape[2]),
                                 starts=starts, chunk_size=CHUNK)
     return out, carried.state
+
+
+def narrow_draw(seed: int):
+    """`draw`'s operands of one rank as a bf16 layer hands them over (`x`, `B` and `C` in bf16), at a small
+    `lambda` (under 0.05) and no turning (`theta` zero): a token's own write nearly all the trapezoid's
+    previous one, which its rank terms take back off in fp32 (`_rank_terms`), so the chunked op's output
+    rounded narrower shows at every token as the cancelled write's rounding; unturned, the keys and queries
+    the op reads are the operands' own."""
+    x, dt, A, B, C, lam, theta, state, _ = draw(1, seed)
+    x, B, C = (t.astype(jnp.bfloat16) for t in (x, B, C))
+    return x, dt, A, B, C, 0.05 * lam, jnp.zeros_like(theta), state
+
+
+def chunked_on(kernel: str, *operands):
+    """`chunked` over packed documents on `kernel` (`generation.chosen`'s name for the chunked op's)."""
+    with generation.chosen(gated_delta_rule=kernel):
+        return chunked(*operands, starts=marks(DOCUMENTS))
 
 
 def real_tokens():
@@ -138,6 +159,21 @@ def test_the_chunked_form_is_as_exact_as_the_recurrence(packed, rank):
     reference = jax.jit(with_gradients(functools.partial(recurrent_mamba3, starts=starts)))
     assert_as_exact(dew, reference, functools.partial(draw, rank), f'mamba3 packed={packed} rank={rank}',
                     seeds=SEEDS[packed, rank], terms=RESET_TERMS)
+
+
+@pytest.mark.parametrize('route', ROUTES)
+def test_a_bf16_layers_chunked_form_on_the_template_is_as_exact_as_on_the_portable_math(route):
+    """Mamba-3's chunked form on a bf16 layer's operands (`narrow_draw`) on the recurrence template, on each
+    GPU's route (`on_route`), output and final state on par with it on the portable math (check 1), which
+    hands the chunked op's output on in fp32, the dtype the form asks: rounded to bf16 first, a document's
+    first output was a tenth from float64 at a lambda of 0.01 (jsf-m3wide-pin). The bar is the form's own
+    portable math: a bf16 layer's turned keys and queries round to bf16 before the op, as mamba_ssm's
+    kernel rounds them (`mamba3_siso_fwd.py` at e9594ce1c73, its rotated `k_pre_block` and `q_pre_block`
+    cast back to their dtype), 1.6e-3 from float64 on every route where the recurrence turns them in fp32."""
+    with on_route(route):
+        assert_as_exact(jax.jit(functools.partial(chunked_on, 'mosaic_gpu')),
+                        jax.jit(functools.partial(chunked_on, 'xla')), narrow_draw, f'mamba3 bf16 {route}',
+                        seeds=NARROW_SEEDS[route])
 
 
 @pytest.mark.parametrize('rank', RANKS)
