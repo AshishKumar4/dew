@@ -1077,6 +1077,21 @@ def test_an_a100s_fp32_call_takes_xla_only_where_its_receipt_measured_and_its_sc
     assert route.kernel == ran
 
 
+def test_a_call_naming_xla_runs_it_past_a_devices_memory():
+    """An A100's fp32 causal call whose xla attention would not fit the A100's 80 GB (512 rows of 64 heads,
+    `_dense_fits`) runs jax.nn's xla attention where it names it, as a step compiled ahead for a larger
+    device does: the fit is the route's preference, not the kernel's capability (`_FITS`)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+    from dew.nn.kernels import selection
+
+    query = jax.ShapeDtypeStruct((512, 1024, 64, 128), jnp.float32)
+    key = jax.ShapeDtypeStruct((512, 1024, 8, 128), jnp.float32)
+    with generation.assumed("sm80"):
+        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, causal=True), "xla")
+    assert route.kernel == "xla"
+
+
 @pytest.mark.parametrize(("rows", "heads", "ran"), [(1, 32, "inference"), (512, 64, "template")],
                          ids=["fits", "past-memory"])
 def test_an_a100s_dense_bias_trains_on_xla_only_where_its_scores_fit(rows, heads, ran):
