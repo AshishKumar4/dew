@@ -60,7 +60,7 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
                          f"documents together ({refusal}); prefill each document into a row of its own")
     if coordinates is not None and coordinates.forks is not None:
         # A trust boundary: a caller that asks the model first lays such rows whole (`ForkedCalls`).
-        refusal = decoder_refusals.forked(model, train)
+        refusal = decoder_refusals.forked(model, train, joint=coordinates.forks.joint)
         if refusal is not None:
             raise ValueError(f"documents that continue another (Forks) are computed as their own rows "
                              f"only where every layer reads each from its ancestors and itself alone; "

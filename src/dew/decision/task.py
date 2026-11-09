@@ -69,6 +69,7 @@ from dew.decision.questions import (
     Question,
     ScoreAnswer,
 )
+from dew.decision.shared_state import fork_depth, joint
 from dew.inference import scoring
 from dew.inference.tasks import (
     InItsForm,
@@ -962,7 +963,8 @@ class Decide(SavedRunTask, InItsForm):
         laid = [read.map(window) for window, _ in windows]
         batch = {name: np.stack([window[name] for window in laid]) for name in laid[0]}
         inputs = laid_out(batch, bounds.segments, spans_in_context=in_context,
-                          whole_blocks=whole_blocks_of(self.layout), attention=self.layout.attention)
+                          whole_blocks=whole_blocks_of(self.layout), attention=self.layout.attention,
+                          fork_depth=fork_depth(self.layout), joint_forks=joint(self.layout))
         padded = RowPlan(None, len(windows), shape.rows, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
         plan = RowPlan.over(mesh_of(held), shape.rows)
@@ -1148,7 +1150,8 @@ class Decide(SavedRunTask, InItsForm):
         for batch in reader(DataPartition()):
             inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context,
                               whole_blocks=whole_blocks_of(self.layout),
-                              attention=self.layout.attention)
+                              attention=self.layout.attention, fork_depth=fork_depth(self.layout),
+                              joint_forks=joint(self.layout))
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -1644,12 +1647,14 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
 
 def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False,
              whole_blocks: bool = False,
-             attention: tuple[tuple[tuple[int, ...], ...], int] | None = None) -> DecisionInputs:
+             attention: tuple[tuple[tuple[int, ...], ...], int] | None = None,
+             fork_depth: int = 1, joint_forks: bool = False) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
     holding at most `max_segments` rows, the questions' spans in each row's context where
     `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
     `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
-    says (`Layout.attention`)."""
+    says (`Layout.attention`), its documents' chains at most `fork_depth` long and each row's read
+    together where `joint_forks` (`dew.decision.shared_state.fork_depth`, `Forks.joint`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -1667,7 +1672,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           parents=given("parents"),
                           reads=None if attention is None else attention[0],
                           fragments=1 if attention is None else attention[1], max_segments=max_segments,
-                          spans_in_context=spans_in_context, whole_blocks=whole_blocks and "blocks" in batch)
+                          spans_in_context=spans_in_context, whole_blocks=whole_blocks and "blocks" in batch,
+                          fork_depth=fork_depth, joint_forks=joint_forks)
 
 
 def whole_blocks_of(layout: Layout) -> bool:

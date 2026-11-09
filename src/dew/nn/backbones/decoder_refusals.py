@@ -73,7 +73,7 @@ def packed_cache(decoder: CausalTransformer) -> str | None:
     return _layer(decoder, lambda mixer, _: mixer.packed_cache_refusal())
 
 
-def forked(decoder: CausalTransformer, train: bool = False) -> str | None:
+def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = False) -> str | None:
     """Why a call over forks (`dew.batch.Forks`) would not compute each document over its ancestors as its
     own row does, or None (`dew.nn.protocols.ForkedCalls`): a bidirectional decoder, whose shared prefix
     reads each branch's tokens; in training, dropout, which draws each row's
@@ -84,7 +84,9 @@ def forked(decoder: CausalTransformer, train: bool = False) -> str | None:
     token; cross-attention reads each tree's own context (`Forks.trees`), a context a tree."""
     if not decoder.causal:
         return "a bidirectional decoder reads each token's later tokens, which a fork's branches hold apart"
-    if train and (decoder.dropout_rate or decoder.embedding_dropout_rate or decoder.attention_dropout_rate):
+    # A joint tree is one row, its masks drawn once for it as its own row draws them (`Forks.joint`).
+    if train and not joint and (decoder.dropout_rate or decoder.embedding_dropout_rate
+                                or decoder.attention_dropout_rate):
         return "dropout draws each row's masks apart, which a shared prefix draws once"
     if decoder.engram is not None:
         return decoder.engram.fork_refusal()
