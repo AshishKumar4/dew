@@ -1813,7 +1813,7 @@ def fitted[Entry](
     record count, but states the source examples a pass holds
     (`Loader.pass_examples`), reads it bounded to that many passes, as
     `examples` bounds it (`Loader.epochs`), in the one compile (`_staged`)."""
-    objective = None if objective is None else objective.at(plan_version)
+    objective = objective.at(plan_version)
     if not isinstance(dataset, (Dataset, Loader)):
         if examples is not None:
             raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
