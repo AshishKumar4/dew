@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
-from generation_support import runs
+from generation_support import COMPILES_ON_CPU, runs
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import ROUTES, chunk_on, cotangents, formed, on_route, routed, token_by_token
 from test_recurrence_mosaic import (
@@ -400,3 +400,27 @@ def test_a_decay_a_key_dimensions_first_token_takes_no_gradient_where_its_sequen
     later[:, 0] = False
     dg = np.asarray(grads[1].log_decay)
     assert later.any() and np.all(dg[later] == 0.0)
+
+
+@COMPILES_ON_CPU
+def test_a_saved_fp32_gradient_under_the_highest_precision_runs_the_numbers_its_route_took():
+    """An fp32 call's gradient on the template under its fast forms, in a remat saving the delta rule's
+    names (`DELTA_RULE_RESIDUALS`) within a caller's 'highest' product precision, lowered for an H100 on
+    this CPU (`kernel_compile.lowered_for`): its fast backward runs at the numbers the selector gave the
+    call (`recurrence_chunk.chunk`'s `rounded`), not the accurate forms' the remat's pullback read later
+    under 'highest', whose solve no sm90 thread holds (`base.Unfitted` natively, M-JS-63)."""
+    from fla_sites import ruled
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.lowered import kernel_calls
+
+    hooks = case_hooks("a ragged length")
+    given, (dout, dfinal) = drawn(jnp.float32, 0, **SHAPES["a ragged length"])
+    arrays = {"q": given.query, "k": given.key, "v": given.value, "g": given.log_decay, "beta": given.beta,
+              "h0": given.state, "dy": dout, "dfinal": dfinal}
+    run = formed("fast", functools.partial(chunk_on, "mosaic_gpu", hooks))
+    saved = jax.checkpoint(run, policy=RematPolicy(save=DELTA_RULE_RESIDUALS).checkpoint_policy())
+    abstract = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), arrays)
+    with generation.assumed("sm90"), jax.default_matmul_precision("highest"):
+        lowered = lowered_for(lambda arrays: ruled(saved, arrays), (abstract,), "sm90")
+    assert any(call.name.startswith("recurrence_values_back") for call in kernel_calls(lowered, unrun=True))
