@@ -96,6 +96,17 @@ bf16 forwards on tcgen05's chunks (products into scoped tensor memory, read back
 weights staged for the values' product: the Blackwell fold's H1)."""
 
 
+def _template_step(query, key, value):
+    """A training step's attention on the public call's template route, causal: its output's sum's gradients
+    in the query, key and value."""
+    from dew.nn.attention import scaled_dot_product_attention
+
+    def loss(query, key, value):
+        out = scaled_dot_product_attention(query, key, value, implementation="template", causal=True)
+        return out.astype(jnp.float32).sum()
+    return jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
+
+
 @COMPILES_ON_CPU
 def test_the_public_template_route_runs_each_shards_rows_and_heads_with_no_collective():
     """The public call on the template (`scaled_dot_product_attention`), causal, forward and backward, its
@@ -108,20 +119,12 @@ def test_the_public_template_route_runs_each_shards_rows_and_heads_with_no_colle
     from jax.sharding import PartitionSpec
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
-    from dew.nn.attention import scaled_dot_product_attention
-
     rows, tokens, heads, kv_heads, width = 4, 256, 8, 4, 64
 
     def call():
-        def step(query, key, value):
-            def loss(query, key, value):
-                out = scaled_dot_product_attention(query, key, value, implementation="template", causal=True)
-                return out.astype(jnp.float32).sum()
-            return jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
-
         def shaped(kv):
             return jax.ShapeDtypeStruct((rows, tokens, kv, width), jnp.bfloat16)
-        return step, (shaped(heads), shaped(kv_heads), shaped(kv_heads))
+        return _template_step, (shaped(heads), shaped(kv_heads), shaped(kv_heads))
 
     spec = PartitionSpec("data", None, "tensor", None)
     expected = Expected(axes=(("data", 2), ("tensor", 2)), specs=(spec, spec, spec),
@@ -408,6 +411,28 @@ def test_a_deterministic_backward_compiles_spill_free_as_its_model_decides(width
     register model's decision ptxas's."""
     test_the_backward_compiles_spill_free_as_its_model_decides(generation_name="sm90", width=width,
                                                                accurate=False, hooks="none")
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("deterministic", [False, True], ids=["one-launch", "deterministic"])
+@pytest.mark.parametrize("tokens", [16, 32])
+def test_a_short_training_calls_backward_compiles_spill_free_for_an_a100(tokens, deterministic, request):
+    """A bf16 training step's template attention over fewer tokens than a role's 64 rows, four query heads
+    over two 32 wide, its backward one launch or, under --xla_gpu_deterministic_ops, two, lowered and
+    compiled by ptxas for an A100 on this CPU, within its shared memory and spilling nothing: a backward's
+    tiles hold a role's rows of keys however few the call's (`attention_mosaic._role_rows`), where a
+    forward's few-query tile (`query_rows`) under 64 query rows lowered in neither launch ("Cannot cast to
+    layout" of 16 key rows to a consumer's 64; at 32 the one launch's "cannot relayout"; row 5326)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    if deterministic:
+        request.getfixturevalue("with_deterministic_ops")
+    query = jax.ShapeDtypeStruct((8, tokens, 4, 32), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((8, tokens, 2, 32), jnp.bfloat16)
+    case = KernelCase("short step", lambda: (_template_step, (query, key, key)), {})
+    found = compile_mosaic_kernels([case], "sm80")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 @COMPILES_ON_CPU
