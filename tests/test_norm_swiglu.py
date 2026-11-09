@@ -67,8 +67,9 @@ def fused_activated(epsilon: float, activation):
     """The fused RMS norm with `activation` after it (`norm_swiglu.rms_norm`'s epilogue), as `fused_seam`
     is."""
     def portable(x, scale):
-        return stream_rms_normalized(x, None, scale, epsilon, x.dtype, False, False, True,
-                                     implementation="xla", activation=activation)[1]
+        return stream_rms_normalized(x, None, scale, epsilon, x.dtype, scale_offset=False,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla",
+                                     activation=activation)[1]
 
     return lambda x, scale: norm_swiglu.rms_norm(x, scale, epsilon, x.dtype, offset=False, after_cast=False,
                                                  portable=portable, epilogue=activation)
