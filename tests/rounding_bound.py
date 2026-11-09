@@ -33,6 +33,7 @@ import numpy as np
 from arm_arithmetic import unrewritten
 from float64_terms import SUMS, _static, _target, evaluated_on, walked
 
+from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn.precision import compensated_add
 
 EXACT = frozenset({
@@ -58,24 +59,11 @@ those axes, bounded as any sum is (`_weight`)."""
 ONCE = frozenset({"add", "add_any", "sub", "mul", "div", "sqrt", "square", "reduce_precision"})
 """IEEE 754's correctly rounded operations: one rounding, at most u times the result."""
 
-ULPS = {"exp": 1.42, "log": 2.05, "log1p": 3.64, "expm1": 1.21, "logistic": 2.49, "tanh": 4.9,
-        "erf": 6.71, "rsqrt": 2.8, "sin": 1.07, "cos": 1.07}
-"""Each elementary function's error bound, in units of u times its true result: the largest of XLA
-CPU's float32 implementations over every normal float32 input whose result is a normal float32, read
-exhaustively against float64 references (2^32 inputs each, 11-02; sin and cos 11-08, 1.0606 each, a
-rotary position's), rounded up at the second decimal.
-XLA CPU flushes subnormal inputs to zero, so the bound holds where no elementary function reads one."""
-
 SCATTERS = {"scatter": jax.lax.scatter, "scatter-add": jax.lax.scatter_add,
             "scatter-mul": jax.lax.scatter_mul, "scatter-min": jax.lax.scatter_min,
             "scatter-max": jax.lax.scatter_max}
 """The scatters by primitive, each of whose equations holds its combining computation in its operands' dtype,
 which a float64 evaluation of a float32 program builds again (`TapRule.primitive`)."""
-
-DRAWS = 8
-"""The tap draws a rounding scale averages (`rounding_scale`): over 8 draws its root mean square is at least
-0.41 of its expectation in 995 of 1000 elements (a chi-square of 8 degrees of freedom's 0.005 quantile is
-1.344, and sqrt(1.344 / 8) = 0.41)."""
 
 SCALES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 """Each function's compiled rounding scale (`rounding_scale`) of a static program, by its arguments' tree,
