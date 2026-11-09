@@ -2402,8 +2402,10 @@ def test_a_paired_product_without_an_epilogue_is_refused():
 
 @lowers("sm90")
 def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper():
-    """A side operand given back with its dimension of one, for which Mosaic's layout inference finds no
-    layout: a Hopper call's forward and kernel gradient with such a prologue lower (GMMGATE-h100-8)."""
+    """A side operand given back with its dimension of one, broadcast across its tile
+    (`grouped_matmul._unsqueezed`), which Mosaic's layout inference lays out where it found no layout for the
+    dimension of one itself (GMMGATE-h100-8): a Hopper call's forward and kernel gradient with such a
+    prologue lower on the template's launch, named."""
     drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]
     dew = _drop(_dew(CASES["broadcast axes"]))
 
@@ -2411,8 +2413,11 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper():
         return sum(jnp.sum(out.astype(jnp.float32)) for out in dew(*drawn))
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+    with (generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh),
+          jax.default_matmul_precision("default"), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes):
         jax.jit(jax.grad(loss, argnums=range(len(drawn)))).trace(*drawn).lower(lowering_platforms=("cuda",))
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
 
 
 
