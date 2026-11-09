@@ -179,6 +179,15 @@ def summed_rows(a: jax.Array, b: jax.Array) -> jax.Array:
     return jnp.sum(a * b, axis=-1)
 
 
+def read(sums: jax.Array, cotangent: jax.Array) -> jax.Array:
+    """A row's `sums` as its cotangent reads them for D (`split_delta`, `off_anchor_delta`): nothing of a
+    column the cotangent is exactly 0 in. D is `sum_j p_j (v_j · dO)`, each key's product its own, so a
+    column an unseen key's infinite value poisons in the sums (its weight 0 times the value, a NaN in the
+    forward's product) adds nothing where dO reads none of it, as the reference's D: the derived forms'
+    gradients at fp16's largest were NaN where the reference's are finite."""
+    return jnp.where(cotangent == 0, 0.0, sums)
+
+
 def nearer_centre(anchor: jax.Array, about_anchor: jax.Array, about_zero: jax.Array, key_index: jax.Array
                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """D's centre, the nearer to D of the anchor key's `dP` (`anchor`) and zero, each sum's difference from
@@ -202,7 +211,8 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     reference's output is, so none overflows where the sums are near fp32's largest; the initial state's
     share is its weight over the total times its values' mean's product with dO (`mean0`). Each row's
     product with dO is `rows`', the issuer's own that forms dP (`summed_rows` in a kernel's body,
-    `interpreted_rows` off a GPU), so c and the anchor key's dP sum alike and cancel exactly."""
+    `interpreted_rows` off a GPU), so c and the anchor key's dP sum alike and cancel exactly; the sums as dO
+    reads them (`read`)."""
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = rows(anchor_value, cotangent)
@@ -211,8 +221,9 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     others = state.others * expand(over, state.others)
     own = expand(state.own * over, anchor_value)
     others_total = expand(state.others_total * over, anchor_value)
-    about_zero = rows(others + own * anchor_value, cotangent) + state_weight * mean0
-    about_anchor = rows(others - others_total * anchor_value, cotangent) + state_weight * (mean0 - anchor)
+    about_zero = rows(read(others + own * anchor_value, cotangent), cotangent) + state_weight * mean0
+    about_anchor = (rows(read(others - others_total * anchor_value, cotangent), cotangent)
+                    + state_weight * (mean0 - anchor))
     return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
@@ -230,7 +241,7 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     `NORMALIZED` holds normalized sums (an output residual's, `normalized_rows`), its total 1. Each sum is
     taken over the total before its product with dO, as the reference's output is, so none overflows where
     the sums are near fp32's largest (a state's). Each row's product with dO is `rows`'
-    (`off_anchor_delta`'s)."""
+    (`off_anchor_delta`'s), of the sums as dO reads them (`read`)."""
     over = jnp.where(normalized_rows(shift), 1.0, inverse(power2(total, -shift)))
     # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
     # and the state's share of D about the anchor with it (row 2466).
@@ -240,9 +251,9 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     anchor = rows(anchor_value, cotangent)
     others = others * expand(over, others)
     own, others_total = own * over, others_total * over
-    about_zero = rows(split_output(others, own, anchor_value), cotangent)
-    about_anchor = (rows(others - expand(others_total, anchor_value) * anchor_value, cotangent)
-                    - state_weight * anchor)
+    about_zero = rows(read(split_output(others, own, anchor_value), cotangent), cotangent)
+    off_anchor = others - expand(others_total, anchor_value) * anchor_value
+    about_anchor = rows(read(off_anchor, cotangent), cotangent) - state_weight * anchor
     return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
