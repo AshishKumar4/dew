@@ -11,9 +11,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import document_firsts
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.mainloop import (
     PARTS,
     Call,
@@ -32,7 +34,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     block_of,
     family_of,
     per_key_refusal,
-    value_unit,
+    values_unit,
 )
 
 
@@ -41,32 +43,42 @@ def zero_padded(x, axis: int, size: int):
     return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
-def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int):
+def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int,
+            documents: int | None = None):
     """A call's tokens `chunk` at a time: `(chunks, taken [chunks], sequences [N, 5], laid, unlaid)`, each
-    chunk's tokens, each sequence's first chunk, chunks, row and whether it begins and ends its row
-    (`_states`), and the maps from `[B, T, ...]` to the chunks' rows `[chunks * C, ...]` (a chunk's rows past
-    its tokens zero) and back. An aligned call's chunks are its rows' own, unmoved."""
+    chunk's tokens, each sequence's first chunk, chunks, the memory it enters and leaves and whether it
+    takes that memory and gives it back (`chunked_launch.Sequences`' spans: its row's where it begins and
+    ends its row, or where each of a row's first `documents` documents enters a memory of its own,
+    `prepared`, its document's; `_states`), and the maps from `[B, T, ...]` to the chunks' rows
+    `[chunks * C, ...]` (a chunk's rows past its tokens zero) and back. An aligned call's chunks are its
+    rows' own, unmoved."""
     tokens = batch * length
     if starts is None and length % chunk == 0:
         chunks = tokens // chunk
+        # Each row one sequence, entering its first document's memory where its documents have their own.
         sequences = np.stack([np.arange(batch) * (length // chunk), np.full(batch, length // chunk),
-                              np.arange(batch), np.ones(batch), np.ones(batch)], 1)
+                              np.arange(batch) * (documents or 1), np.ones(batch), np.ones(batch)], 1)
 
         return (chunks, jnp.full((chunks,), chunk, jnp.int32), jnp.asarray(sequences, jnp.int32),
                 lambda x: x.reshape(tokens, *x.shape[2:]), lambda x: x.reshape(batch, length, *x.shape[1:]))
     if starts is None:
-        spans = chunked_launch.sequences(batch, length, chunk=chunk)
+        spans = chunked_launch.sequences(batch, length, chunk=chunk, documents=documents)
+    elif documents is not None:
+        # A row's first `documents` documents, the last running to the row's end, as the memories are laid.
+        given = document_firsts(starts, documents) if firsts is None else firsts[:, :documents]
+        spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * documents, given),
+                                         chunk=chunk, documents=documents)
     else:
-        documents = length if max_segments is None else max_segments
-        spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (documents + 1), firsts),
+        most = length if max_segments is None else max_segments
+        spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (most + 1), firsts),
                                          chunk=chunk)
     table, seqs = jnp.asarray(spans.chunks), jnp.asarray(spans.spans)
     chunks, taken = table.shape[0], table[:, 1]
-    first, count = seqs[:, 0], seqs[:, 1]
+    count = seqs[:, 1]
     sizes = -(-count // chunk)
     live = count > 0
-    sequences = jnp.stack([jnp.cumsum(sizes) - sizes, sizes, first // length, live & (first % length == 0),
-                           live & ((first + count) % length == 0)], 1).astype(jnp.int32)
+    memory, takes, gives = seqs[:, 5], live & (seqs[:, 6] == 1), live & (seqs[:, 7] == 1)
+    sequences = jnp.stack([jnp.cumsum(sizes) - sizes, sizes, memory, takes, gives], 1).astype(jnp.int32)
     place = jnp.arange(chunk)
     real = (place[None, :] < taken[:, None]).reshape(-1)
     index = jnp.where(real, (table[:, :1] + place[None, :]).reshape(-1), tokens)
@@ -170,6 +182,8 @@ class _Run:
     key_width: int
     value_width: int
     batch: int
+    documents: int | None
+    """Each row's documents entering memories of their own (`prepared`), None where a row's is one."""
     q: jax.Array
     k: jax.Array
     v: jax.Array
@@ -192,13 +206,46 @@ class _Run:
     u: jax.Array | None = None
     """The states launch's values: the weighted values under the delta rule, else the values laid."""
     h0: jax.Array | None = None
-    """Each row's initial memory `[B * HV * Dk, Dv]` fp32, as the states launch takes it."""
+    """Each memory's entering `[M * HV * Dk, Dv]` fp32 (a row's, or each document's), as the states launch
+    takes it."""
+
+    @property
+    def memories(self) -> int:
+        """The memories the call enters and leaves, `M`: a row's each, or each of its documents'."""
+        return self.batch * (self.documents or 1)
+
+    def given(self) -> jax.Array:
+        """Whether each memory `[M]` is one a sequence gives back (`_layout`'s fifth column): a row's last
+        does; a document past a row's last takes none and gives back what it entered."""
+        gives = (self.sequences[:, 1] > 0) & (self.sequences[:, 4] == 1)
+        return jnp.zeros((self.memories,), bool).at[self.sequences[:, 2]].max(gives, mode="drop")
+
+    def shaped(self, memory: jax.Array) -> jax.Array:
+        """Memories `[M * HV * Dk, Dv]` as the call's `[B, HV, Dk, Dv]` (`[B, D, HV, Dk, Dv]` a document's
+        each)."""
+        width, columns = self.call.width, self.call.value_width
+        memory = memory.reshape(self.memories, self.call.heads, width, columns)[:, :, :self.key_width,
+                                                                                 :self.value_width]
+        return memory if self.documents is None else memory.reshape(self.batch, self.documents,
+                                                                      *memory.shape[1:])
 
     def final_of(self, final: jax.Array) -> jax.Array:
-        """A states walk's final memories `[B * HV * Dk, Dv]` as the call's `[B, HV, Dk, Dv]`."""
-        width, columns = self.call.width, self.call.value_width
-        return final.reshape(self.batch, self.call.heads, width, columns)[:, :, :self.key_width,
-                                                                          :self.value_width]
+        """A states walk's final memories `[M * HV * Dk, Dv]` as the call's (`shaped`), a memory no sequence
+        gives back the one it entered."""
+        def each(memory):
+            return memory.reshape(self.memories, -1)
+
+        return self.shaped(jnp.where(self.given()[:, None], each(final), each(self.h0)))
+
+
+def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool) -> tuple:
+    """`mainloop._intra`'s scores, system where it `solves`, and prefix halves, each sub-chunk's own pairs
+    added from a launch of their own (`own_pairs.intra_own`), on the entries the walk leaves zero, each
+    rounded once: their sums exact in the outputs' forms."""
+    *walked, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves)
+    own = own_pairs.intra_own(q, k, hi, lo, beta, taken, call, scale=scale,
+                              products=("scores", "system") if solves else ("scores",))
+    return (*(found + mine for found, mine in zip(walked, own, strict=True)), hi, lo)
 
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
@@ -225,11 +272,9 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         raise NotImplementedError(refused)
     scale = key_width ** -0.5 if scale is None else scale
     block = block_of(family)
-    # The values padded to whole blocks where a fast backward reads them (its launches a block at a time),
-    # for a forward keeping nothing to whole value tiles (`value_unit`) its walks' and output's blocks divide
-    # (`Call.value_block`).
-    unit = block if keeps else math.lcm(value_unit(family), tiles.block_v * tiles.walkers,
-                                        tiles.block_o or tiles.block_v)
+    # The values padded to whole steps (`values_unit`) its walks' and output's blocks divide.
+    unit = math.lcm(values_unit(family, kept=keeps, per_key=per_key), tiles.block_v * tiles.walkers,
+                    tiles.block_o or tiles.block_v)
     width, columns = -(-key_width // block) * block, -(-value_width // unit) * unit
     q, k = (zero_padded(x.astype(dtype), 3, width) for x in (q, k))
     v = zero_padded(v.astype(dtype), 3, columns)
@@ -237,13 +282,17 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
     # reference's own fp32 (Mamba-2's `dt`).
     beta = (beta.astype(dtype) if delta else beta).astype(jnp.float32)
-    h0 = (jnp.zeros((batch, heads, width, columns), jnp.float32) if h0 is None
-          else zero_padded(zero_padded(h0.astype(jnp.float32), 2, width), 3, columns))
-    if starts is not None:
+    # Each document's own memory `[B, D, HV, Dk, Dv]` (`Chunk.entered`'s, gathered), as a row's are laid.
+    documents = None if h0 is None or h0.ndim == 4 else h0.shape[1]
+    memories = batch * (documents or 1)
+    h0 = (jnp.zeros((memories, heads, width, columns), jnp.float32) if h0 is None
+          else zero_padded(zero_padded(h0.astype(jnp.float32).reshape(memories, *h0.shape[-3:]), 2, width), 3,
+                           columns))
+    if starts is not None and documents is None:
         starts = jnp.asarray(starts, bool)
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts,
-                                                     chunk=tiles.chunk)
+                                                     chunk=tiles.chunk, documents=documents)
     rows = chunks * tiles.chunk
     given = Operand(rows, _parts(dtype, family, rounded), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
@@ -266,7 +315,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         # A decay a key dimension's prefix halves `[R, HV * Dk]` and its scores, and its system where the
         # call solves it (no inverse given), one launch's (`_intra`).
         solves = delta and kept is None and inverse is None
-        scores, *system, hi, lo = _intra(q, k, decays, beta, taken, call, scale=scale, solves=solves)
+        scores, *system, hi, lo = _paired(q, k, decays, beta, taken, call, scale=scale, solves=solves)
     else:
         # A decay a head's a head's row of vectors `[HV, R]`.
         hi, lo = (x.reshape(rows, heads).T for x in algebra.prefix(decays.reshape(chunks, call.chunk, -1)))
@@ -303,8 +352,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         if kept is None:
             w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
     h0 = h0.reshape(-1, columns)
-    run = _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta, a, w, keys,
-               scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0)
+    run = _Run(call, tiles, dtype, scale, key_width, value_width, batch, documents, q, k, v, hi, lo, beta, a,
+               w, keys, scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0)
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected) = kept
