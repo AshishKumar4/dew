@@ -1592,9 +1592,11 @@ class Transport[Allocated, Opened](abc.ABC):
     (`base.TemplateOp.registers` None) and a core runs one program of it (`resources.register_programs`)."""
 
     @abc.abstractmethod
-    def registers(self, consumers: int, programs: int = 1) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
         """The registers a thread of each of `consumers` consumer roles may hold, `programs` programs a
-        multiprocessor at once; asked of a family that budgets them alone (`budgets_registers`)."""
+        multiprocessor at once, beside a producer role lowered to `producer` where the family has one
+        (`roles`; setmaxnreg's least where None); asked of a family that budgets them alone
+        (`budgets_registers`)."""
 
     def warpgroups(self, consumers: int) -> int:
         """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
@@ -1656,14 +1658,16 @@ class Transport[Allocated, Opened](abc.ABC):
         (`streams`), and what it returns: the program's one scope (`scoped`'s)."""
 
     @abc.abstractmethod
-    def roles(self, consumers: int) -> handoffs.Schedule:
+    def roles(self, consumers: int, producer: int | None = None) -> handoffs.Schedule:
         """A program's roles: its `consumers` compute warpgroups ('consumer') and the producer's ('producer')
-        where the family streams from a role of its own."""
+        where the family streams from a role of its own, lowered to `producer` registers a thread
+        (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
-    def scheduled(self, consumers: int, consumer, producer):
-        """The family's roles run (`roles`): `consumer(index)` on its compute roles and `producer()` on
-        its producer's where it has one; the consumers' value where they are its every warpgroup."""
-        schedule = self.roles(consumers)
+    def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None):
+        """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)` on its compute
+        roles and `producer()` on its producer's where it has one; the consumers' value where they are its
+        every warpgroup."""
+        schedule = self.roles(consumers, floor)
         bodies = {"consumer": consumer, "producer": producer}
         return schedule.run(**{role.name: bodies[role.name] for role in schedule.roles})
 
@@ -1980,13 +1984,13 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         self.published()
         return into
 
-    def programs(self, consumers: int, registers: int | None = None) -> int:
+    def programs(self, consumers: int, registers: int | None = None, producer: int | None = None) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
-        consumer roles holding `registers` (None: the family's budget, `registers`): at warpgroup MMA's
-        budget, one, its consumers raised to the register file's share beside its producer
-        (`resources.consumer_registers`). Each stages its share of the multiprocessor's shared memory
-        (`resources.program_shared`), which may hold no tile at that many."""
-        return resources.register_programs(self, consumers, registers)
+        consumer roles holding `registers` (None: the family's budget, `registers`) beside a producer
+        lowered to `producer`: at warpgroup MMA's budget, one, its consumers raised to the register file's
+        share beside its producer (`resources.consumer_registers`). Each stages its share of the
+        multiprocessor's shared memory (`resources.program_shared`), which may hold no tile at that many."""
+        return resources.register_programs(self, consumers, registers, producer)
 
     def fixed_up(self, summed, partials, ready, program, first, gathered, store,
                  combine=operator.add, firsts=None) -> None:
@@ -2100,8 +2104,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     stores_through_registers = False
     copy_extent = 256
 
-    def registers(self, consumers: int, programs: int = 1) -> int:
-        return resources.consumer_registers(consumers, programs)
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
+        return resources.consumer_registers(consumers, programs, producer)
 
     def column_unit(self, dtype) -> int:
         return swizzling.swizzle_columns(dtype, swizzling.SWIZZLE_BYTES)
@@ -2133,8 +2137,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
                              collective_axes="wg")
 
-    def roles(self, consumers: int) -> handoffs.Schedule:
-        return handoffs.Schedule((handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0)))
+    def roles(self, consumers: int, producer: int | None = None) -> handoffs.Schedule:
+        return handoffs.Schedule((handoffs.Role("consumer", consumers), handoffs.Role("producer", weight=0)),
+                                 floor=producer)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,

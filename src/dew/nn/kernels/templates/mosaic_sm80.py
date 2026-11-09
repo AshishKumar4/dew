@@ -528,7 +528,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def lhs(self) -> plgpu_core.SomeLayout:
         """The layout a tile loaded through registers takes (`loaded`): its issuer's left operand's."""
 
-    def registers(self, consumers: int, programs: int = 1) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
         # Each role at its thread's share of the multiprocessor's 64K registers: two programs' 256 threads
         # hold 255 each.
         _one(consumers)
@@ -558,7 +558,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
 
-    def roles(self, consumers: int) -> handoffs.Schedule:
+    def roles(self, consumers: int, producer: int | None = None) -> handoffs.Schedule:
         _one(consumers)
         return handoffs.Schedule((handoffs.Role("consumer"),), axis=None)
 

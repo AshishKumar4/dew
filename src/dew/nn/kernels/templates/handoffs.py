@@ -60,6 +60,10 @@ class Schedule:
     axis: str | None = "wg"
     """The axis a program's warpgroups index along (`kernel`'s); None for a program with none (an sm80
     program's, a TPU core's), whose one role runs at index 0."""
+    floor: int | None = None
+    """The registers a thread of its lowered warpgroup holds: setmaxnreg's least where None
+    (`resources.producer_floor`), a launch's own where its producer's issue loop holds more
+    (`Family.roles`)."""
 
     def __post_init__(self):
         raised = [role for role in self.roles if role.weight]
@@ -88,7 +92,8 @@ class Schedule:
         """Each role's registers a thread, `programs` programs held by a multiprocessor at once
         (`resources.role_registers`); a warp role's its warpgroup's."""
         weights = tuple(role.weight for role in self.raised for _ in range(role.count))
-        budgets = resources.role_registers(weights + (0,) * (len(self.raised) < len(self.roles)), programs)
+        budgets = resources.role_registers(weights + (0,) * (len(self.raised) < len(self.roles)), programs,
+                                           floor=self.floor)
         held, first = {}, 0
         for role in self.roles:
             held[role.name] = budgets[first] if role.weight else budgets[-1]

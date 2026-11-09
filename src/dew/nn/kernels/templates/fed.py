@@ -81,11 +81,11 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     loader = 0
     """The consumer that issues the loads."""
 
-    def registers(self, consumers: int, programs: int = 1) -> int:
+    def registers(self, consumers: int, programs: int = 1, producer: int | None = None) -> int:
         return resources.entry_registers(consumers, programs)
 
 
-    def roles(self, consumers: int) -> Schedule:
+    def roles(self, consumers: int, producer: int | None = None) -> Schedule:
         # Every warpgroup a consumer, its value the program's, for a scope after the walk's.
         return Schedule((Role("consumer", consumers),))
 
