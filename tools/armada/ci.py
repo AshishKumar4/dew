@@ -1719,6 +1719,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # logs each visit): its row is the deadline's red; a file pytest reported is graded by its own cases, the
     # exit the interrupt's, not its; and one with none is not graded but run again (`STALE`), never a red of
     # its tests (Main, 2026-11-09: train 745 filed six files packed beside a hung one as reds "at 0.0 s").
+    # A task stalled before any test started (its collection) has no such file: each of its rows is the
+    # deadline's.
     stood = followed.visited(followed.log_events(log)) if expired else []
     running = stood[-1] if stood else None
     for name in tests:
@@ -1733,7 +1735,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         counted = counts.get(name, {})
         deselected = bool(counted) and counted["collected"] == counted["deselected"]
         spent = expired and name == running
-        unreached = expired and not spent and not own and not deselected
+        unreached = expired and running is not None and not spent and not own and not deselected
         exited = [] if expired and not spent else exit_red(returncode, cases, own, deselected, name)
         unaccounted = ([] if exited or unreached or (report.is_file() and (own or deselected))
                        else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()

@@ -125,9 +125,10 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     the file at its old green time, as its row held what its task's wall time gave a file in proportion to its
     tests' times, none of which the interrupted test had. Past its deadline a task times the file its tests
     were running in at its own tests' seconds and the wall time no file's tests account for, at least what the
-    file needs; a file that finished, at its tests' own seconds; and a file that never started, at none: its
-    row says `unobserved`, for armada to weigh no plan by, and names its file at 0 in its timings, so armada
-    leaves out of its file timings a file it shares with other rows."""
+    file needs; a file that finished, at its tests' own seconds, graded by them; and a file that never started,
+    at none: its row says `unobserved`, for armada to weigh no plan by, names its file at 0 in its timings, so
+    armada leaves out of its file timings a file it shares with other rows, and is stale, run again, never a red
+    of its tests (Main, 2026-11-09)."""
     deadline = 8.0
     written(tmp_path, {"test_first.py": "import time\n\n\ndef test_first():\n    time.sleep(0.5)\n",
                        "test_stuck.py": "import time\n\n\ndef test_stuck():\n    time.sleep(600)\n",
@@ -141,7 +142,7 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     first, stuck, never = (rows[f"3.12:tests/test_{name}.py"] for name in ("first", "stuck", "never"))
     slept = first["tests"]["tests/test_first.py::test_first"]
-    assert {row["kind"] for row in rows.values()} == {"deadline"}
+    assert (first["exitCode"], stuck["kind"], never["kind"]) == (0, "deadline", ci.STALE)
     assert slept >= 0.5 and first["seconds"] == slept
     # The file the deadline stopped holds the wall time the finished file's own did not.
     assert stuck["seconds"] + slept >= deadline
