@@ -244,23 +244,35 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     tables = (None, None) if gather is None else tuple(gather)
 
+    def gathered(lhs, rhs, tables):
+        # Each operand's rows at its table's entries, by XLA.
+        return tuple(operand if table is None else operand[table]
+                     for operand, table in zip((lhs, rhs), tables, strict=True))
+
     def kernel(lhs, rhs, group_sizes, prologue_arrays, tables, *, interpret):
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast,
                                      prologue_dtypes=_dtypes(prologue, lhs, sides))
         product = declared(lhs.dtype, precision, outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
+        tabled = any(table is not None for table in tables)
         call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, sides,
-                                        None if gather is None else tables, out_dtype=out_dtype,
+                                        tables if tabled else None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
         launch = grouped_matmul.launched(*call, product=product, whole=seen_whole(lhs) and seen_whole(rhs))
         # A kernel gradient is one product: no launch takes it apart.
-        return launch() if callable(launch) else portable(lhs, rhs, group_sizes, prologue_arrays, tables)
+        if callable(launch):
+            return launch()
+        if tabled:
+            # No launch reads the rows where they lie (an fp32 call's, which only Mosaic GPU's gathering
+            # producer would): the rows gathered first, the grouped launches taking the product, never XLA's
+            # ragged dot over every group's matrix (row 5213's, as `_gemm`'s).
+            return kernel(*gathered(lhs, rhs, tables), group_sizes, prologue_arrays, (None, None),
+                          interpret=interpret)
+        return portable(lhs, rhs, group_sizes, prologue_arrays, tables)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, tables):
-        # Gathered rows gathered by XLA (`gather`).
-        lhs, rhs = (operand if table is None else operand[table]
-                    for operand, table in zip((lhs, rhs), tables, strict=True))
+        lhs, rhs = gathered(lhs, rhs, tables)
         routed = _routed(group_sizes, lhs.shape[0])
         if prologue is not None:
             sides = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
