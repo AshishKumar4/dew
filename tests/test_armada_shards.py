@@ -300,7 +300,8 @@ def test_a_marked_parameter_is_a_site_of_its_own_whose_tasks_run_it_alone(ci, tm
     2026-11-09: test_recurrence's hook combinations each a check-1 site of its own seeds); a marked parameter
     with no literal id, or of a test parametrized twice, is refused, naming its line."""
     out = site_checkout(tmp_path, PARAMETERS)
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps({"tests/test_site.py::test_form[plain]": 1.0}))
+    recorded = {"tests/test_site.py::test_form[plain]": 1.0}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(recorded))
     assert ci.sites("tests/test_site.py") == {
         "test_form[one]": ci.Mark(units=staged_units(2), per_task=8, line=8, timed=2),
         "test_form[two-rated]": ci.Mark(units=staged_units(4), per_task=8, line=9, timed=4)}
