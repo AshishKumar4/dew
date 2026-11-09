@@ -20,7 +20,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import mosaic, persistent
+from dew.nn.kernels.templates import handoffs, mosaic, persistent
 
 STAGES = 2
 """The slots a stream's ring holds: a step's blocks arrive while the step before it multiplies (Pallas
@@ -265,10 +265,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
     def program_scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams)
 
-    def roles(self, consumers: int, consumer, producer) -> None:
+    def roles(self, consumers: int) -> handoffs.Schedule:
         _one(consumers)
-        del producer
-        consumer(0)
+        return handoffs.Schedule((handoffs.Role("consumer"),), axis=None)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,

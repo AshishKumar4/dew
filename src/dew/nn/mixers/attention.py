@@ -1172,13 +1172,12 @@ class CausalSelfAttention(nn.Module):
             # The provider's stashed keys carry the full history, read as its own cache is.
             key_places, history = held
             if S == 1:
-                (mask, _), causal = self._decode_masks(positions, B, kv_len, None, history,
-                                                       documents=segment_ids is not None), False
+                (mask, _), causal = self._decode_masks(positions, B, kv_len, None, history), False
             else:
                 last = jnp.max(jnp.asarray(positions).reshape(B, S), axis=-1, keepdims=True)
-                named = history if segment_ids is not None else None
-                documents, causal, window = self._cached_call(positions, named,
-                                                              jnp.arange(kv_len)[None, :] <= last)
+                documents, causal, window = self._cached_call(positions, history,
+                                                              jnp.arange(kv_len)[None, :] <= last,
+                                                              named=segment_ids is not None)
             # A quantized provider stashed its keys in the cache's rotation.
             rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
             if rotation is not None:
@@ -1248,16 +1247,16 @@ class CausalSelfAttention(nn.Module):
         query = append.query(query)
         history = {**self._kept_groups(append, attention_metadata), DOCUMENTS: append.documents(segment_ids)}
         if S == 1:
-            # A step naming its document (a row prefilled packed) reads that document's keys alone; one
-            # naming none continues its row's one document, the decode kernels' plain step.
+            # A step reads its own document's keys alone, as the cache numbers it (`KVCache.documents`): one
+            # naming none continues its row's last, so a row prefilled packed reads that document, never an
+            # earlier one, whatever the caller passes.
             (mask, starts), causal = self._decode_masks(
-                positions, B, key.shape[-3], cached_validity(self, key.shape[-3]), history,
-                documents=segment_ids is not None), False
+                positions, B, key.shape[-3], cached_validity(self, key.shape[-3]), history), False
             cursor = mask
         else:  # several tokens appended after the keys their rows held
-            named = history if segment_ids is not None else None
-            documents, causal, window = self._cached_call(positions, named,
-                                                          cached_validity(self, key.shape[-3]))
+            documents, causal, window = self._cached_call(positions, history,
+                                                          cached_validity(self, key.shape[-3]),
+                                                          named=segment_ids is not None)
         key_places = append.places(places) if self._reads_places else jnp.arange(key.shape[-3])
         if kv_store is not None and self.ctx.kv_store_key is not None:
             kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places, history)
@@ -1461,8 +1460,7 @@ class CausalSelfAttention(nn.Module):
         window = None if window is None or window >= self.ctx.max_seq_len else window
         history = {name: store.read_groups(name)[:rows] for name in groups}
         starts = (None if window is None else
-                  self._decode_masks(positions[:rows, None], rows, self.ctx.max_seq_len, None, history,
-                                     documents=False)[1])
+                  self._decode_masks(positions[:rows, None], rows, self.ctx.max_seq_len, None, history)[1])
         # A piece reading its groups whole sees its group's keys past its own slot (`visibility_mask`), which
         # the work list's spans, each its query's slot, do not state: its keys by the mask below.
         if not groups and self._one_work_list(store, query):
@@ -1586,20 +1584,21 @@ class CausalSelfAttention(nn.Module):
         # A read ahead of the store's dispatch (`KVStore.decode`), which reports the route it runs.
         return selected(PAGED, case).name != 'gathered'
 
-    def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array], *,
-                      documents: bool) -> tuple[jax.Array, jax.Array | None]:
+    def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array]
+                      ) -> tuple[jax.Array, jax.Array | None]:
         """The layer's decode mask over the cache's filled slots (`valid`, None for every slot up to the
         query's), and each row's first key under its window `[rows]`, None where the layer narrows
         nothing: the kernels stand in for the mask with each row's key count and that start
         (`_decode_attention`). A window at least the cache's capacity narrows nothing. A token of a block
         read whole sees its block's earlier keys past the window too, its first key the earlier of the
         window's and the block's (the call's spans over the groups the cache keeps, `history`), so the
-        step keeps its decode kernel. With `documents`, the query reads its own document's keys alone (the
-        cache's `DOCUMENTS`): its row's last, contiguous, from its first slot, which bounds the row's first
-        key too.
+        step keeps its decode kernel. Where the cache keeps its keys' documents (`DOCUMENTS` in `history`, as
+        `KVCache.documents` numbers them whether or not the call names one; a serving store's pages keep
+        none, a request a row), the query reads its own document's keys alone: its row's last, contiguous,
+        from its first slot, which bounds the row's first key too.
         """
         own_start = None
-        if documents:
+        if DOCUMENTS in history:
             held = history[DOCUMENTS]
             slot = jnp.maximum(jnp.asarray(positions, jnp.int32).reshape(rows, -1)[:, :1], 0)
             same = held == jnp.take_along_axis(held, slot, axis=1)
@@ -1621,26 +1620,30 @@ class CausalSelfAttention(nn.Module):
         first = spans.start[:, 0]
         return seen, first if own_start is None else jnp.maximum(first, own_start)
 
-    def _cached_call(self, positions, history: dict[str, jax.Array] | None, held
+    def _cached_call(self, positions, history: dict[str, jax.Array], held, *, named: bool
                      ) -> tuple[CrossDocuments, bool, int | None]:
         """A cache call of several tokens at `positions` `[B, S]` (-1 for padding) over the keys
-        `held` `[B, K]` marks filled, as its documents, causality and window: one document a row, whose
-        last keys are the call's tokens, appended in order after the keys the row held; or, a call naming
-        its documents (its cache's `history`), each token's and each held key's as the cache keeps them
-        (`DOCUMENTS`), in ascending order along the slots (`CrossDocuments`). Causality and the layer's
+        `held` `[B, K]` marks filled, as its documents, causality and window, each token's and each held
+        key's document as the cache keeps them (`DOCUMENTS`, its `history`'s, which `KVCache.documents`
+        numbers whether or not the call names any): a call naming its documents (`named`) by them, in
+        ascending order along the slots (`CrossDocuments`); one naming none continues its row's last
+        document, so it is one document a row, whose last keys are the call's tokens, the keys of that
+        document alone (a row prefilled packed reads none of an earlier one). Causality and the layer's
         window, where it narrows the K keys, align to those keys, which is the cache's own mask
         (`causal_attention_mask` over the slots); flash reads one document a row as packed sequences, and no
         kernel needs a mask for them."""
         window = self.ctx.sliding_window
         held = jnp.asarray(held, bool)
-        if history is None:
-            documents = CrossDocuments(jnp.asarray(jnp.asarray(positions) >= 0, jnp.int32),
-                                       held.astype(jnp.int32))
-        else:
-            kept = history[DOCUMENTS]
-            slots = jnp.asarray(positions, jnp.int32).reshape(kept.shape[0], -1)
-            own = jnp.where(slots >= 0, jnp.take_along_axis(kept, jnp.maximum(slots, 0), axis=1), 0)
+        kept = history[DOCUMENTS]
+        slots = jnp.asarray(positions, jnp.int32).reshape(kept.shape[0], -1)
+        own = jnp.where(slots >= 0, jnp.take_along_axis(kept, jnp.maximum(slots, 0), axis=1), 0)
+        if named:
             documents = CrossDocuments(own, jnp.where(held, kept, 0))
+        else:
+            # The call's one document, its row's last: its tokens' and its keys', every other key none.
+            last = jnp.max(own, axis=-1, keepdims=True)
+            documents = CrossDocuments(jnp.asarray(slots >= 0, jnp.int32),
+                                       jnp.asarray(held & (kept == last), jnp.int32))
         return documents, True, None if window is None or window >= held.shape[-1] else window
 
     def _paged(self, append: Append, query: jax.Array, positions: jax.Array, starts=None,

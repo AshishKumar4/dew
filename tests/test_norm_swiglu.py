@@ -242,7 +242,8 @@ def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_
     """Row 821: the fused norm applies an activation after it (`RMSNorm.activation`, a U-Net's output norm's
     swish) where `norm_swiglu.elementwise` holds: every equation maps each element alone and Pallas's Triton
     lowering takes it. Activations of one element each, exact gelu's erfc aside, take the kernel; one that
-    reads other elements or positions takes XLA's."""
+    reads other elements, positions or its operand's extents (`y / y.shape[-1]`, which a padded tile divides
+    by its own width) takes XLA's."""
     from dew.nn import activations
 
     for function in (jax.nn.silu, jax.nn.swish, activations.silu, jax.nn.relu, activations.gelu_tanh,
@@ -252,7 +253,8 @@ def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_
     jitted = jax.jit(lambda x: x * positions)
     for function in (activations.gelu_exact, jax.nn.softmax, lambda x: jnp.cumsum(x, -1), lambda x: x.T,
                      lambda x: x + jnp.arange(3.0), lambda x: x.sum(-1), lambda x: x * positions,
-                     lambda x: jitted(x), lambda x: x + jnp.ones((2, 3), x.dtype)):
+                     lambda x: jitted(x), lambda x: x + jnp.ones((2, 3), x.dtype), lambda x: x / x.shape[-1],
+                     lambda x: x * x.size):
         assert not norm_swiglu.elementwise(function), function
     x = jnp.ones((4, 64), jnp.bfloat16)
     with generation.assumed("sm90"):

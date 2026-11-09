@@ -66,6 +66,7 @@ outputs and every gradient against float64, not bitwise against XLA's
 differently rounded autodiff.
 """
 import dataclasses
+import enum
 import functools
 import math
 from collections.abc import Callable, Hashable
@@ -276,9 +277,49 @@ def elementwise(function) -> bool:
     (distinct extents, so a transpose shows, and two shapes, so an array built at one input's shape fails
     the other), every equation, nested ones too, reads and writes only the input's shape or scalars, none of
     them positional (`_POSITIONAL`), and each one Pallas's Triton lowering takes (an exact gelu's erfc it
-    takes none of); every array it closes over a scalar. A callable that does not trace on an array
+    takes none of); every array it closes over a scalar; and its program the same at both shapes but for
+    the shapes themselves, so no value reads the input's extents (`y / y.shape[-1]` is a row's mean at the
+    row's width alone, which a padded tile does not have). A callable that does not trace on an array
     (TypeError, ValueError) is none."""
-    return all(_maps_alone(function, shape) for shape in PROBES)
+    if not all(_maps_alone(function, shape) for shape in PROBES):
+        return False
+    first, second = (jax.make_jaxpr(function)(jax.ShapeDtypeStruct(shape, jnp.float32)) for shape in PROBES)
+    return _alike(first, second, *PROBES)
+
+
+def _alike(first, second, shape, other) -> bool:
+    """Whether two traces of one function, at input `shape` and `other`, are one program but for those
+    shapes: equation by equation the same primitives, literals and constants, and the same parameters, a
+    parameter that is the input's shape at each taken as one, nested programs alike; a parameter that is
+    no value (a custom derivative's rule, a sharding) is its object's own, traced apart."""
+    def same(a, b) -> bool:
+        if isinstance(a, jax.extend.core.ClosedJaxpr) and isinstance(b, jax.extend.core.ClosedJaxpr):
+            return programs(a, b)
+        if isinstance(a, jax.extend.core.Jaxpr) and isinstance(b, jax.extend.core.Jaxpr):
+            return equations(a, b)
+        if isinstance(a, tuple) and isinstance(b, tuple):
+            return (a, b) == (shape, other) or (len(a) == len(b) and all(map(same, a, b)))
+        if isinstance(a, jax.extend.core.Literal) and isinstance(b, jax.extend.core.Literal):
+            return np.array_equal(a.val, b.val)
+        if isinstance(a, int | float | complex | str | np.ndarray | np.generic | np.dtype | enum.Enum | None):
+            return type(a) is type(b) and np.array_equal(a, b) if isinstance(a, np.ndarray) else a == b
+        # Any other parameter (a custom derivative's rule, a sharding) is the object's own, traced apart.
+        return type(a) is type(b)
+
+    def equations(a, b) -> bool:
+        return len(a.eqns) == len(b.eqns) and all(
+            x.primitive is y.primitive and x.params.keys() == y.params.keys()
+            and all(same(x.params[key], y.params[key]) for key in x.params)
+            and all(same(u, v) for u, v in zip(x.invars, y.invars, strict=True)
+                    if isinstance(u, jax.extend.core.Literal) or isinstance(v, jax.extend.core.Literal))
+            for x, y in zip(a.eqns, b.eqns, strict=True))
+
+    def programs(a, b) -> bool:
+        return (len(a.consts) == len(b.consts)
+                and all(np.array_equal(u, v) for u, v in zip(a.consts, b.consts, strict=True))
+                and equations(a.jaxpr, b.jaxpr))
+
+    return programs(first, second)
 
 
 PROBES = ((2, 3), (5, 7))
