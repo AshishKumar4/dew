@@ -690,12 +690,16 @@ class Planned:
     keys: tuple[list[bytes], ...] | None
 
 
-def planned(sessions: Sequence[Session], width: int, *, truncation: str, share: bool = False) -> Planned:
-    """`sessions`' chains under `truncation`, read for `planned_rows`: their keys only where `share`."""
+def planned(sessions: Sequence[Session], width: int, *, truncation: str, share: bool = False,
+            first: int = 0) -> Planned:
+    """`sessions`' chains under `truncation`, read for `planned_rows`: their keys only where `share`, each
+    chain's sampled ids its own as `pack` holds them (`_chain_rows`), numbered from `first`, so no chain of
+    another plan read with it shares one."""
     built = _built(sessions, width, truncation)
     if not built or not share:
         return Planned(tuple(len(chain.tokens) for chain in built), None)
     rows, carried = _chain_rows(built)
+    carried["sampled"] = [np.where(chain >= 0, chain + first, chain) for chain in carried["sampled"]]
     return Planned(tuple(len(row) for row in rows), tuple(
         token_keys(np.asarray(row, np.int64), np.arange(len(row)),
                    [carried[name][number] for name in carried])
