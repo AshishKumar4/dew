@@ -1448,12 +1448,18 @@ class CausalSelfAttention(nn.Module):
         # A chunk or metadata mask replaces `cursor` and keeps the gather; a window the kernels read
         # as each row's first key (`starts`).
         plain_step = append is not None and mask is cursor and S == 1 and bias is None and not sowing
-        if append is not None and plain_step and self._pages(append.store, query[:, 0], starts is not None,
-                                                             sinks is not None):
-            attention = self._paged(append, query, jnp.asarray(positions).reshape(B, S)[:, 0], starts, sinks)
-        elif plain_step:
-            attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0],
-                                               starts, sinks)
+        if plain_step:
+            step = functools.partial(self._plain_step, append, query, key, value,
+                                     jnp.asarray(positions).reshape(B, S)[:, 0], sinks=sinks)
+            if starts is not None and (self.ctx.sliding_window is None
+                                       or self.ctx.sliding_window >= key.shape[-3]):
+                # A start that is the row's own document's alone (`_decode_masks`) narrows only a row
+                # holding several: a step whose rows hold one each runs as an unstarted step, through
+                # the kernels a start turns away (a TPU's paged kernel, cuDNN's).
+                attention = nn.cond(jnp.any(starts > 0), lambda module: step(module, starts),
+                                    lambda module: step(module, None), self)
+            else:
+                attention = step(self, starts)
         else:
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
@@ -1464,6 +1470,16 @@ class CausalSelfAttention(nn.Module):
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held),
                 'context')
         return attention
+
+    @staticmethod
+    def _plain_step(append, query, key, value, positions, module, starts, *, sinks):
+        """A plain decode step of `module` (the layer): through the paged kernel where its device's takes
+        the step (`_pages`), else through the layer's attention (`_decode_attention`), from each row's
+        first key `starts` where given."""
+        if append is not None and module._pages(append.store, query[:, 0], starts is not None,
+                                                sinks is not None):
+            return module._paged(append, query, positions, starts, sinks)
+        return module._decode_attention(query, key, value, positions, starts, sinks)
 
     def _mixed_positions(self, admitted: Admitted, valid) -> jax.Array:
         """Each token's slot in its row, `[1, tokens]`, -1 for padding: a
@@ -1659,7 +1675,8 @@ class CausalSelfAttention(nn.Module):
         step keeps its decode kernel. Where the cache keeps its keys' documents (`DOCUMENTS` in `history`, as
         `KVCache.documents` numbers them whether or not the call names one; a serving store's pages keep
         none, a request a row), the query reads its own document's keys alone: its row's last, contiguous,
-        from its first slot, which bounds the row's first key too.
+        from its first slot, which bounds the row's first key too. A start that is that alone narrows a
+        row only where it holds several documents, which the step decides as it runs (`_attended`).
         """
         own_start = None
         if DOCUMENTS in history:
