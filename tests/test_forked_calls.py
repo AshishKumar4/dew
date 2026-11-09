@@ -135,6 +135,13 @@ def test_forked_rows_lay_each_prefix_once_and_each_row_back_at_its_tokens():
     apart = ForkedRows.pack(ROWS, WIDTH, fields={"sampled": sampled})
     assert int(np.sum(np.asarray(apart.coordinates.segments) > 0)) == sum(map(len, ROWS))
     assert apart.coordinates.forks is None
+    # Each token's tree, the group its document's chain of ancestors roots in (`Forks.trees`): the four
+    # rows over the prompt one tree, the fifth another.
+    trees = np.asarray(forks.coordinates.forks.trees(forks.coordinates.segments)).reshape(-1)
+    owned = [{(int(slot) // WIDTH, int(trees[slot])) for slot in np.asarray(forks.index[number, :len(row)])}
+             for number, row in enumerate(ROWS)]
+    assert all(len(held) == 1 and next(iter(held))[1] > 0 for held in owned)
+    assert owned[0] == owned[1] == owned[2] == owned[3] != owned[4]
 
 
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():

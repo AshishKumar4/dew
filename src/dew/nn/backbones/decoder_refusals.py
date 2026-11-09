@@ -78,10 +78,10 @@ def forked(decoder: CausalTransformer, train: bool = False) -> str | None:
     own row does, or None (`dew.nn.protocols.ForkedCalls`): a bidirectional decoder, whose shared prefix
     reads each branch's tokens; in training, dropout, which draws each row's
     masks apart where a shared prefix draws them once; engram's n-gram hashes (`Engram.fork_refusal`),
-    its mixture's block routing or capacity (`Mixture.fork_refusal`), cross-attention, which reads each
-    row's own context where a window holds several rows' documents, or a layer whose mixer reads no forks
-    (`MixerBase.fork_refusal`). Attention, the recurrent mixers and tokenwise layers read each document
-    from its ancestors alone; a learned position embedding reads the places forks give each token."""
+    its mixture's block routing or capacity (`Mixture.fork_refusal`), or a layer whose mixer reads no
+    forks (`MixerBase.fork_refusal`). Attention, the recurrent mixers and tokenwise layers read each
+    document from its ancestors alone; a learned position embedding reads the places forks give each
+    token; cross-attention reads each tree's own context (`Forks.trees`), a context a tree."""
     if not decoder.causal:
         return "a bidirectional decoder reads each token's later tokens, which a fork's branches hold apart"
     if train and (decoder.dropout_rate or decoder.embedding_dropout_rate or decoder.attention_dropout_rate):
@@ -90,8 +90,6 @@ def forked(decoder: CausalTransformer, train: bool = False) -> str | None:
         return decoder.engram.fork_refusal()
     if decoder.mixture is not None and (refusal := decoder.mixture.fork_refusal()) is not None:
         return refusal
-    if decoder.cross_attention is not None:
-        return "cross-attention reads each row's own context, which a window of several rows' documents holds"
     return _layer(decoder, lambda mixer, _: mixer.fork_refusal())
 
 
