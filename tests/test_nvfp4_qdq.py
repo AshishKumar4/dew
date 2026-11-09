@@ -56,7 +56,7 @@ def test_a_scanned_input_quantizer_rounds_each_quotient_once():
     values = np.random.default_rng(0).uniform(-6, 6, (2, 8, 64)).astype(np.float32)
     values[..., ::16] = 6
     values[..., 1:1 + TIES.size] = TIES
-    spec = InputQuantizer.nvfp4(1.0, False)
+    spec = InputQuantizer.nvfp4(1.0, e4m3_scale=False)
     scanned = jax.jit(lambda xs: jax.lax.scan(lambda carry, x: (carry, nvfp4_input_qdq(x, spec)), 0, xs)[1])
     np.testing.assert_array_equal(np.asarray(scanned(jnp.asarray(values))),
                                   values.astype(ml_dtypes.float4_e2m1fn).astype(np.float32))
