@@ -37,7 +37,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
-    attention_portable,
+    attention_mosaic,
     bodies,
     handoffs,
     mosaic,
@@ -112,33 +112,42 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic GPU's interpreter)."""
     if reason := refused(query, spans, hooks):
         raise NotImplementedError(reason)
+    walked = functools.partial(_walked, query, key, value, spans, scale=scale, natural=natural, tiles=tiles,
+                               interpret=interpret)
+    if not algebra.headroom(value.dtype):
+        return walked()
+    # A call some row of which can be scaled (`algebra.may_scale`) takes the template's scaled Mosaic op
+    # (`attention_mosaic.MosaicForward.scaled`, its own tcgen05 config): this mainloop's softmax warpgroup
+    # holds no second product for a scaled tile's small weights. Every other call, every ordinary input's,
+    # takes this launch, bit for bit the scaled walk's there.
+    return lax.cond(algebra.may_scale(value, keys_axis=1),
+                    lambda: attention_mosaic.forward(query, key, value, spans, scale=scale, natural=natural,
+                                                     interpret=interpret, scaled=True),
+                    walked)
+
+
+def _walked(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, *, scale: float | None,
+            natural: bool, tiles: Tiles, interpret: bool) -> jax.Array:
+    """`forward`'s launch, unscaled, under the fold's guard over whole launches
+    (`algebra.walked_launches`)."""
     value_width = value.shape[-1]
     # The query taken by its scale's power of two before its products (`prescaled`), so a logit finite at
     # the call's scale is finite in the product.
     query, scale, power = prescaled(query, scale)
     # Queries and keys padded to whole tiles of both: a program's query block and a walk's key tile.
     call = padded_call(query, key, value, spans, Hooks(), math.lcm(TCGEN05.rows, tiles.block_k))
-    spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=scale, natural=natural,
-                           headroom=algebra.headroom(value.dtype), prescale=power)
+    spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=scale, natural=natural, prescale=power)
     # Swizzled tiles hold whole 64-element rows of 16-bit operands.
     call = dataclasses.replace(call, **{name: jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % 64),))
                                         for name, array in (("query", call.query), ("key", call.key),
                                                             ("value", call.value))})
 
-    def launch(form: algebra.Forward, live: jax.Array | None):
-        if live is None:
-            return _forward(call.query, call.key, call.value, spec=form, tiles=tiles, interpret=interpret)
-        # The rows whose weighted values overflowed, rewalked shifting on the plain-JAX mainloop over the
-        # same padded call (the rare launch, `algebra.walked_launches`); its maxima and overflows are not
-        # read.
-        out, _ = attention_portable.padded_walk(form, call, Hooks(), block_q=TCGEN05.rows,
-                                                block_k=tiles.block_k, residuals=False)
-        return out, jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
+    def launch(form: algebra.Forward, live: jax.Array | None, into=None):
+        del live, into
+        out, maxima = _forward(call.query, call.key, call.value, spec=form, tiles=tiles, interpret=interpret)
+        return out, maxima, None
 
-    def kept(live: jax.Array, guarded: jax.Array, plain: jax.Array) -> jax.Array:
-        return jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded, plain)
-
-    out = algebra.walked_launches(spec, launch, kept)
+    out = algebra.walked_launches(spec, launch)
     return out[:, :call.queries, :, :value_width]
 
 
@@ -304,7 +313,7 @@ def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: 
             # operands of every earlier part's weights live to there, 24 registers a part, 250 of 255 and the
             # denominator spilled at width 64 (ptxas for a B200, tests/test_attention_blackwell.py's compile).
             weights = lax.optimization_barrier(algebra.weights(spec, logits(read, index, part, masked)[0], m))
-            total = (algebra.denominator_after(total, alpha, weights) if part == 0
+            total = (algebra.denominator_after(total, alpha, weights.sum(axis=-1)) if part == 0
                      else total + weights.sum(axis=-1))
             narrowed = algebra.narrow(weights, dtype)
             for slot, p_tmem in enumerate(scratch.p_tmems):
@@ -343,9 +352,9 @@ def _part(scores: Accumulator, part: int) -> jax.Array:
 def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, blocks: int) -> None:
     """The correction warpgroup: each step's rescale of the output's accumulator in tensor memory, once the
     last `P V` is in it, by the factor the softmax hands it (`CHUNK` columns at a time), published for the
-    next `P V`; then the epilogue: the output, and each row's maximum and whether its weighted values
-    overflowed (`algebra.walked_launches`' guards)."""
-    out_ref, maxima_ref, over_ref = outs
+    next `P V`; then the epilogue: the output, and each row's maximum (`algebra.walked_launches`' fold
+    guard)."""
+    out_ref, maxima_ref = outs
     rows = TCGEN05.rows
     value_width = int(scratch.acc_tmem.shape[1])
     output = Accumulator(scratch.acc_tmem, (rows, value_width))
@@ -372,17 +381,15 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
     mosaic.stored((out,), (out_ref.at[block.row, pl.ds(block.first, rows), block.head],), smem=scratch.o_smem,
                   wait=False)
     places = (block.row, block.head, pl.ds(block.first, rows))
-    # The rows' maxima, and the overflows of their sums, through the denominator's stage; a row that saw no
-    # key -inf (`algebra.reached`'s convention).
-    over = algebra.overflowed(acc).astype(jnp.float32)
+    # The rows' maxima through the denominator's stage, which the fold's guard reads; a row that saw no key
+    # -inf (`algebra.reached`'s convention).
     m = jnp.where(algebra.no_keys(total), -jnp.inf, m)
-    mosaic.stored((m, over), (maxima_ref.at[places], over_ref.at[places]), smem=scratch.l_smem)
+    mosaic.stored((m,), (maxima_ref.at[places],), smem=scratch.l_smem)
 
 
 def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpret: bool):
     """The launch at `tiles`: the output `[B, Qp, H, Dv]` and each row's running maximum in the walk's units
-    and whether its weighted values overflowed, `[B, H, Qp]` each (`algebra.walked_launches`' plain
-    launch)."""
+    `[B, H, Qp]` (`algebra.walked_launches`' plain launch)."""
     batch, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
     group = heads // kv_heads
@@ -400,7 +407,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                   "values": resources.widest_swizzle(dtype, value_width)})
     roles = schedule(rows, block_k)
 
-    def kernel(q_ref, k_ref, v_ref, out_ref, maxima_ref, over_ref, *refs):
+    def kernel(q_ref, k_ref, v_ref, out_ref, maxima_ref, *refs):
         (q_smem, q_loaded, key_refs, value_refs, score_refs, p_even, p_odd, p_full, acc_tmem, o_done, scales,
          scaled, corrected, rows_smem, finished, o_smem, l_smem) = refs
         opened = RINGS.opened({name: dict(zip(rings[name], refs, strict=True))
@@ -413,8 +420,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
         block = _Block(spec.form == "causal", blocks, block_k)
         roles.run(
             softmax=lambda _: _softmax(block, scratch, spec=spec, tiles=tiles, blocks=blocks, dtype=dtype),
-            correction=lambda _: _correction(block, scratch, (out_ref, maxima_ref, over_ref), spec=spec,
-                                             blocks=blocks),
+            correction=lambda _: _correction(block, scratch, (out_ref, maxima_ref), spec=spec, blocks=blocks),
             load=functools.partial(_load, block, scratch, k_ref, v_ref, group=group, tiles=tiles),
             mma=functools.partial(_products, block, scratch, q_ref))
 
@@ -430,12 +436,11 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                mosaic.plain((2, rows), jnp.float32), finished,
                mosaic_sm100.operand((rows, value_width), dtype, value_width), mosaic_sm100.vector(rows))
     rows_type = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
-    out, maxima, over = TCGEN05.kernel(
-        kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type,
-                          rows_type),
+    out, maxima = TCGEN05.kernel(
+        kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
         interpret=bodies.interpreted(interpret), warpgroups=roles.warpgroups(),
         # A name a form (the default's fold and its natural rewalk compile apart).
         name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)
-    return out, maxima, over > 0
+    return out, maxima

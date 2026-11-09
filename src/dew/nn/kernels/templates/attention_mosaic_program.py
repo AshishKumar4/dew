@@ -492,18 +492,18 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
 
 
-def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, guarded: bool = False,
-             scaled: bool = False) -> int:
+def reducing(family: mosaic.Family, consumers: int, hooked: bool, *, flagged: bool = False,
+             scaled: bool = False, magnitudes: bool = False) -> int:
     """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
     reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a
     `hooked` launch's hook's (`hook_reduces`: a unit row, which the fork selects by a reduction across warps,
-    ledger 1428; an output hook's, untraced), and a `guarded` launch's keys' value magnitudes, its tile's
-    columns reduced across the warps holding them (`Family.key_magnitudes`), or a launch's rows reduced to
-    their block's flag (`guarded` too: the plain launch that flags its rows,
-    `attention_mosaic_forward._Flags`), or a `scaled` step's tile reduced to its largest across the warps
-    holding its rows (`algebra.running_parts`, an fp16 fused backward's), so every warpgroup of a launch that
-    runs such a hook, guards or scales; none otherwise."""
-    if guarded or scaled or hooked:
+    ledger 1428; an output hook's, untraced), a `flagged` launch's rows reduced to their block's flag (the
+    plain launch that flags its rows, `attention_mosaic_forward._Flags`), a `scaled` step's tile reduced
+    to its largest across the warps holding its rows (`algebra.running_parts`, an fp16 fused backward's), or
+    a scaled walk's keys' value `magnitudes`, its value tile's columns reduced across the warps holding them
+    (`Family.key_magnitudes`, `algebra.SCALED_WALK`), so every warpgroup of a launch that runs such a hook,
+    flags or scales; none otherwise."""
+    if flagged or scaled or magnitudes or hooked:
         return family.warpgroups(consumers)
     return 0
 
@@ -802,6 +802,10 @@ class _Hooked(NamedTuple):
     scales: tuple[jax.Array, jax.Array] | None = None
     """A call over quantized keys and values' scales, the keys' and the values' `[B, Hk, Kp]` fp32, one a key
     and key head in its row's key order (`attention_decode.attend`'s `scales`); None for 16-bit keys."""
+    magnitudes: jax.Array | None = None
+    """A scaled walk's keys' value magnitudes `[B, Hk, Kp]` fp32, each key's largest over the launch's value
+    columns (`attention_mosaic_forward._largest`), read a key tile's columns at a time as the keys' scales
+    are; None where a launch reads them from its value slots (a cache's walk)."""
 
 
 def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
@@ -816,17 +820,6 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
     output = tuple(_columns(value, unit) if param.kind == Kind.OUTPUT else value
                    for value, param in zip(call.output_params, hooks.output_params, strict=True))
     return _Hooked(call.score_params, output, initial, hooks.drop)
-
-
-class _Guard(NamedTuple):
-    """A guarded launch's arrays (`algebra.walked_launches`): the rows that shift, `live` `[B, H, Qp]` (int32,
-    nonzero where live); its keys' value magnitudes, which a step's `algebra.room` reads, come from the value
-    tiles it walks (`Family.key_magnitudes`), or an fp32 call's from `magnitudes` `[B, KV, Kp]` fp32, each
-    key's largest over all its values' columns (`MosaicForward.parts`: its value blocks fewer columns than a
-    transposed load's rows take)."""
-
-    live: jax.Array
-    magnitudes: jax.Array | None = None
 
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,

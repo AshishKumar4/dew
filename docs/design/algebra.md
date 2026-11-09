@@ -826,7 +826,7 @@ derived one replaced is deleted with it, check 1 holding the derived forms to XL
 The template's own forms run in three places:
 - the accurate forms (the compensated exponent, the largest weight held to 1, raw logits, the anchor test,
   the keyed sums);
-- compensated running sums and the headroom guard's shifted sums;
+- compensated running sums and the scaled walk's sums at each row's power of two (`SCALED_WALK`);
 - representations the template keeps: the compensated prefix, the inverse by doubling, the launch structure.
 Those are rounding and representation choices the fast class does not make. The replacement rule holds:
 a derived form replaces a hand-written one only where it states the walk, passes check 1 and is no slower.

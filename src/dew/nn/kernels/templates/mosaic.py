@@ -1566,9 +1566,10 @@ class Issuer[Accumulator](abc.ABC):
     def key_magnitudes(self, tile) -> jax.Array:
         """Each key's largest value magnitude, fp32, from a values tile `tile` `[keys, columns]` in shared
         memory: read transposed, its keys an accumulator tile's columns, and reduced over its own columns,
-        so the vector is in a column's layout (`column`, a logits tile's keys'), as `algebra.room` reads
-        it; no pass over the values outside the launch. In the values' own dtype until the reduction is
-        done (a magnitude's maximum is exact in any), so the tile holds half an fp32 tile's registers."""
+        so the vector is in a column's layout (`column`, a logits tile's keys'), as
+        `attention_algebra.weighed_reach` reads it; no pass over the values outside the launch. In the values'
+        own dtype until the reduction is done (a magnitude's maximum is exact in any), so the tile holds half
+        an fp32 tile's registers."""
         values = plgpu.load(tile.transpose((1, 0)), layout=self.layout, optimized=False)
         return jnp.max(jnp.abs(values), axis=0).astype(jnp.float32)
 
@@ -1999,6 +2000,13 @@ class Transport[Allocated, Opened](abc.ABC):
         """Waits until at most `pending` of this thread's deferred stores (`stored(wait=False)`) still read
         their shared tiles: a family that stores through registers has none."""
         del pending
+
+    def at_store(self, index: jax.Array) -> jax.Array:
+        """A view's `index` (its first row) formed where a store reads it (`stored`): through an optimization
+        barrier (`opaque`) on a GPU, whose copy is addressed by a 64-bit offset the compiler would otherwise
+        form wherever the index is first known, before a walk that reads it too, and hold across the walk
+        (16 bytes spilled of an H100's fp32 attention forward at its raise of 160, et-zerorow's SASS)."""
+        return opaque(index)
 
     @abc.abstractmethod
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:

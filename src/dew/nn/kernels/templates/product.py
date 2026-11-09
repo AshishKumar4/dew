@@ -184,11 +184,12 @@ class Exact:
 @jax.tree_util.register_pytree_node_class
 class Scaled:
     """A register operand stored scaled, its product taken back by `2**exponent` (traced: an fp16 part held
-    at its tile's, or each row's, largest magnitude's scale): a mainloop issues its product into an
-    accumulator of its own, which no unscaled product shares, and restores it. A pytree of both, so a
-    branch's parts leave it (`lax.cond`)."""
+    at its tile's, or each row's, largest magnitude's scale; or a static number: a scaled walk's small
+    weights, `attention_algebra.small_parts`): a mainloop issues its product into an accumulator of its own,
+    which no unscaled product shares, and restores it. A pytree of both, so a branch's parts leave it
+    (`lax.cond`)."""
 
-    def __init__(self, value: jax.Array, exponent: jax.Array):
+    def __init__(self, value: jax.Array, exponent: jax.Array | float):
         self.value, self.exponent = value, exponent
 
     def tree_flatten(self):

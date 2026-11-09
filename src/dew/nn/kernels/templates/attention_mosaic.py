@@ -17,9 +17,16 @@ import jax.numpy as jnp
 import tokamax
 
 from dew._devices import deterministic_ops_requested
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, cost, mosaic, product, resources
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_portable,
+    cost,
+    mosaic,
+    product,
+    resources,
+)
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -37,6 +44,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     logit_scale,
+    output_split,
     power_of_two,
     prescale,
 )
@@ -49,10 +57,9 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
     _trained_forward,
+    _whole,
     certified_walk,
     forward_products,
-    guarded_columns,
-    guarded_tiles,
 )
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations, staged_parts, stores_typed
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -323,6 +330,10 @@ class MosaicForward(_Mainloop[Tiles]):
     rounds: float | None = None
     """A quantized model's weights' bound (`Hooks.rounds`), which the anchored training walk rounds them to
     at each row's maximum: a call that keeps its split residuals' alone. None where its weights stay whole."""
+    scaled: bool = False
+    """Whether its kernels walk scaled (`algebra.SCALED_WALK`): the op a call some row of which can be scaled
+    launches in its common op's place (`_fwd`, `algebra.may_scale`), its own config derived from its own
+    registers and shared memory (`scales_in_kernel`), which may be smaller than the common op's."""
 
     def _hooks(self, score_params, output_params, initial, drop) -> Hooks:
         """The call's hooks from its parameters, state and draw, its static hooks the op's."""
@@ -337,19 +348,56 @@ class MosaicForward(_Mainloop[Tiles]):
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
         spans = self.spans(start, end, query_ids, key_ids)
-        form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret}
-        match residuals:
-            case Kept.SPLIT:
-                if scales is not None:
-                    raise NotImplementedError("a quantized cache's keys are read by inference alone")
-                return _trained_forward(query, key, value, spans, hooks, **form), None
-            case Kept.NONE | Kept.OUTPUT:
-                # The inference walk, its rows beside the output where it keeps them.
-                return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
-                                      out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
-                                      table=table, sources=sources, subtracted=self.subtracted,
-                                      scales=scales, parts=self.parts,
-                                      **form), None
+        # A rare call's scaled op states no work to Dew's FLOP count, as the fold's rewalk does not: the
+        # common op's is the step's (`_launch_flops`).
+        form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret,
+                "counts": not self.scaled}
+        scaled = self.scaled or self.cached(table, sources, scales)
+
+        def launched():
+            match residuals:
+                case Kept.SPLIT:
+                    if scales is not None:
+                        raise NotImplementedError("a quantized cache's keys are read by inference alone")
+                    return _trained_forward(query, key, value, spans, hooks, scaled=scaled, **form)
+                case Kept.NONE | Kept.OUTPUT:
+                    # The inference walk, its rows beside the output where it keeps them.
+                    return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
+                                          out_dtype=self.out_dtype, masked=self.masked, splits=self.splits,
+                                          table=table, sources=sources, subtracted=self.subtracted,
+                                          scales=scales, parts=self.parts, scaled=scaled, **form)
+
+        if scaled or hooks.rounds is not None or not algebra.headroom(value.dtype):
+            return launched(), None
+        # A call some row of which can be scaled (`algebra.may_scale`) launches the scaled op's kernels (its
+        # own config, `scaled`), every other call, every ordinary input's, this op's unscaled ones, bit for
+        # bit the scaled walk's there.
+        may = algebra.may_scale(_whole(value, self.parts), keys_axis=1,
+                                initial=None if initial is None else initial.acc,
+                                amplified=1.0 if drop is None else drop.bound)
+        arguments = (query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
+                     drop, table, sources, scales)
+
+        def rare():
+            # A pin of this op's where the scaled op can take it, else its own config
+            # (`tuning.pinned_where_taken`): its registers and shared memory are not the common op's. Where no
+            # config of it fits the target (an A100's training walk, its small weights' tier past a thread's
+            # registers), the template's plain-JAX walk, scaled.
+            scaled_op = dataclasses.replace(self, scaled=True)
+            with tuning.pinned_where_taken(scaled_op, scaled_op.bind(*arguments, residuals=residuals,
+                                                                     interpret=interpret)):
+                if scaled_op.fitted(arguments, residuals, interpret):
+                    return scaled_op(*arguments, residuals=residuals, interpret=interpret)
+            whole = tuple(_whole(array, self.parts) for array in (query, key, value))
+            return _portable(whole, spans, hooks, residuals, scale=self.scale, natural=self.natural,
+                             block_q=config.block_q, block_k=config.block_k)
+
+        return jax.lax.cond(may, rare, launched), None
+
+    def fitted(self, arguments: tuple, residuals: Kept, interpret: bool) -> bool:
+        """Whether some config of the op holds a call of `arguments` on the target, legal there (`fits`)."""
+        return bool(self.fits(self.bind(*arguments, residuals=residuals, interpret=interpret),
+                              generation.gpu_target()))
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -375,12 +423,10 @@ class MosaicForward(_Mainloop[Tiles]):
                 and self._launch_legal(ba, relaunch, target))
 
     def _launch_legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
-        """`_Mainloop.legal`'s for one launch at `config`, and on a plain launch whose sums can pass fp32's
-        largest (`algebra.headroom`), a guarded key tile its consumers' registers hold beside it
-        (`guarded_tiles`), which the launch walks where the plain one overflowed."""
+        """`_Mainloop.legal`'s for one launch at `config`."""
         if not super().legal(ba, config, target):
             return False
-        query, value = ba.arguments["query"], ba.arguments["value"]
+        query = ba.arguments["query"]
         # A quantized call's codes converted where the device converts them (`mosaic.converts`: an FP8 cache
         # on sm_89 on), its call the gathered keys' path elsewhere.
         codes = _codes_of(ba.arguments["key"], ba.arguments.get("scales"))
@@ -403,14 +449,7 @@ class MosaicForward(_Mainloop[Tiles]):
         # in them (`_pages_hold`).
         tiles = (config.block_k, config.relaunch_k or config.block_k)
         page = _page(ba)
-        if page is not None and not all(_pages_hold(page, tile, family) for tile in tiles):
-            return False
-        computed = _computed(ba)
-        if ba.arguments["residuals"] is Kept.SPLIT or not algebra.headroom(computed):
-            return True
-        columns = guarded_columns(family, value.shape[3], computed, parts=self.parts)
-        width = _width(query.shape[3], family, query.dtype)
-        return guarded_tiles(family, config, columns, computed, width, parts=self.parts) is not None
+        return page is None or all(_pages_hold(page, tile, family) for tile in tiles)
 
     def resident(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
@@ -592,11 +631,34 @@ class MosaicForward(_Mainloop[Tiles]):
                                            min(config.stages, steps), out_dtype=out_dtype, page=page,
                                            codes=_codes_of(ba.arguments["key"], ba.arguments.get("scales")),
                                            parts=self.parts)
-        # Its guarded launch reduces its keys' magnitudes across warps (`reducing`'s `guarded`).
-        guarded = algebra.headroom(_computed(ba)) and ba.arguments.get("residuals") is not Kept.SPLIT
+        # An inference launch may flag its rows for the fold's rewalk, and a cache's scaled walk reads its
+        # keys' value magnitudes from its value slots (`algebra.SCALED_WALK`; another scaled walk the call's,
+        # `attention_mosaic_forward._largest`), each a reduction across warps (`reducing`).
+        flagged = ba.arguments.get("residuals") is not Kept.SPLIT
+        arguments = ba.arguments
+        cached = self.cached(arguments.get("table"), arguments.get("sources"), arguments.get("scales"))
         return resources.shared_bytes(family, launch_scope(family, allocations, reducing(
-            family, config.consumers, self.score_reduces or self.output_mod is not None, guarded=guarded),
+            family, config.consumers, self.score_reduces or self.output_mod is not None, flagged=flagged,
+            magnitudes=cached and self.scales_in_kernel(ba)),
             products=forward_products(config, value_width, query.dtype, parts=self.parts)))
+
+    def cached(self, table, sources, scales) -> bool:
+        """Whether a call walks a cache's keys (masked, split, paged, by rows or over codes: a decode step's
+        or a serving step's, which the memory bounds), whose kernel scales its rows' sums every tile where
+        they could pass fp32's largest (`algebra.SCALED_WALK`): a pass over its values before it, to launch
+        it unscaled, would cost the step's bandwidth. Every other call's common kernel holds no scale, a call
+        some row of which can be scaled launching the scaled op's (`scaled`, `_fwd`)."""
+        return (self.masked or self.splits > 1 or table is not None or sources is not None
+                or scales is not None)
+
+    def scales_in_kernel(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether the call's kernel walks scaled (the `scaled` op's, a `cached` call's; values that can pass
+        fp32's largest, no rounded weights): it reads its keys' value magnitudes and holds its small weights'
+        tier (`algebra.at_scale`)."""
+        arguments = ba.arguments
+        return ((self.scaled or self.cached(arguments.get("table"), arguments.get("sources"),
+                                            arguments.get("scales")))
+                and self.rounds is None and algebra.headroom(_computed(ba)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles, *, peaks: bool = False,
                   columns: int | None = None) -> int | None:
@@ -617,7 +679,8 @@ class MosaicForward(_Mainloop[Tiles]):
         value_width = columns or config.columns or _width(value.shape[-1], family, query.dtype)
         residuals = ba.arguments.get("residuals")
         return _forward_registers(family, config, value_width, query.dtype, residuals is Kept.SPLIT,
-                                  natural=natural, params=params, width=width, parts=self.parts)
+                                  natural=natural, params=params, width=width, parts=self.parts,
+                                  scaled=self.scales_in_kernel(ba))
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -641,6 +704,25 @@ class MosaicForward(_Mainloop[Tiles]):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
+
+
+def _portable(operands: tuple, spans: KeySpans, hooks: Hooks, residuals: Kept, *, scale: float | None,
+              natural: bool, block_q: int, block_k: int):
+    """`MosaicForward`'s outputs on the plain-JAX mainloop at query blocks `block_q` and key tiles `block_k`
+    (`attention_portable.xla_mainloop`), its walk scaled where its rows' sums could pass fp32's largest
+    (`algebra.SCALED_WALK`): a call the scaled op fits no config for (`MosaicForward.fits`). The output, with
+    `Kept.SPLIT` the training walk's residuals and with `Kept.OUTPUT` its output's as the inference walk keeps
+    them (`output_split`, no anchor key)."""
+    config = attention_portable.Tiles(block_q, block_k, math.lcm(block_q, block_k))
+    query, key, value = operands
+    if residuals is Kept.NONE:
+        return attention_portable.xla_mainloop(config, query, key, value, spans, hooks, scale=scale,
+                                               natural=natural)
+    out, maximum, total, anchors, split = attention_portable.xla_mainloop(
+        config, query, key, value, spans, hooks, scale=scale, natural=natural, residuals=True)
+    if residuals is Kept.OUTPUT:
+        return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+    return out, maximum, total, anchors, split
 
 
 def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple, *, grads: str | None = None,
@@ -702,7 +784,7 @@ def _mask_places(family: mosaic.Family, block_q: int, block_k: int) -> list:
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
-                       parts: int = 1) -> int:
+                       parts: int = 1, scaled: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -722,16 +804,28 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
     weights. A key tile whose indices do not fold holds its masks' places (`_mask_places`). An fp32 call's
     `parts` (`MosaicForward.parts`) issue its logits' products' terms into one accumulator and form its
-    weights' parts one at a time, its remainder fp32 and the part beside the weights
-    (`attention_mosaic_forward._parted_products`)."""
+    weights' parts one at a time from its fp32 weights, held whole across them, its remainder fp32 and the
+    part in the operands' dtype beside them (`attention_mosaic_forward._parted_products`: priced as 16-bit
+    weights, the fp32 forward at 64 x 64 on three consumers, width 64, counted 100 where ptxas needed 152,
+    and spilled 16 bytes at the 128 three consumers leave, et-fp32model). A `scaled` walk's
+    (`MosaicForward.scales_in_kernel`) holds beside its step its weights at the scale and its small weights
+    raised, fp32, the small ones' parts, and a part's product's own accumulator `[bq, Dv]` fp32
+    (`algebra.at_scale`, `attention_mosaic_forward._accumulated`): priced as one fp32 tile and the
+    accumulator, the H100's scaled forward at width 128 spilled 232 bytes (et-scaled-b2); its natural form's
+    exponential raises the small ones within the step, beside its tiles and the weights at the scale (priced
+    apart from them, its rewalk needed 248 of the 228 priced and spilled 44 bytes, et-scaledneed); an fp32
+    call's parts walk its weights at the scale its own fp32 weights (priced apart, its decode step's 292
+    refused the 64 x 64 tile ptxas holds in 240, et-fp32decneed); a family whose products read registers its
+    values' fragments beside the parts' products (unpriced, an A100's at width 128 spilled 128 bytes at 255).
+    """
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
     step = [logits, weights, *([weights] if residuals else [])]
     if parts > 1:
-        # The part taken from its weights' remainder, which takes the weights' place (`_parted_products`).
-        step += [weights]
+        # Its weights fp32, their remainder fp32 and the part taken from it (`_parted_products`).
+        step = [logits, logits, logits, weights, *([weights] if residuals else [])]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
         if family.operands_in_registers:
@@ -741,9 +835,27 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
             # its peak, census80b), ptxas 255 registers and 48 to 56 bytes spilled where the step priced 252.
             step.append((block_k, value_width * family.rhs_copies, dtype))
     step += _mask_places(family, block_q, block_k)
+    scaled_terms, core = [], list(step)
+    if scaled:
+        # Its small weights raised from their exponents, fp32, and a part's product's own accumulator beside
+        # the walk's while it issues (`operands.Issuer.summed`). An fp32 call's parts walk holds its weights
+        # at the scale as the step's fp32 weights and forms the small ones' parts in turn as it forms theirs
+        # (`_parted_products`); a 16-bit call's holds its weights at the scale fp32 beside them, and the small
+        # ones' three parts (`algebra.small_parts`), a family whose products read registers its values'
+        # block's fragments whole beside them, which the weights' product and each part's read.
+        accumulator = (block_q, value_width, jnp.float32)
+        scaled_terms = [logits] if parts > 1 else [logits, logits]
+        step += [*scaled_terms, accumulator]
+        if parts == 1:
+            step += [weights] * (3 if jnp.dtype(dtype).itemsize == 2 else 1)
+            if family.operands_in_registers and not residuals:
+                step.append((block_k, value_width * family.rhs_copies, dtype))
     phases = [step]
     if natural:
-        phases.append([logits] * 2 + [bits])
+        # The exponential's terms (`algebra.natural_exp`); a scaled walk's raise its small weights within its
+        # step (`algebra.raised_weights`), beside the step's own tiles and its weights at the scale, before
+        # their parts and the parts' accumulator.
+        phases.append([logits] * 2 + [bits] + ([*core, *scaled_terms] if scaled else []))
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
     if scopes_products(family):
@@ -833,7 +945,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False, out_dtype=None,
             masked: bool = False, splits: int = 1, table: jax.Array | None = None,
             sources: jax.Array | None = None, subtracted: bool = False,
-            scales: tuple[jax.Array, jax.Array] | None = None) -> jax.Array:
+            scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False) -> jax.Array:
     ...
 
 
@@ -843,7 +955,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             residuals: Literal[Kept.SPLIT, Kept.OUTPUT], interpret: bool = False,
             out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
             sources: jax.Array | None = None, subtracted: bool = False,
-            scales: tuple[jax.Array, jax.Array] | None = None
+            scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False
             ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
@@ -852,7 +964,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False, out_dtype=None, masked: bool = False, splits: int = 1,
             table: jax.Array | None = None, sources: jax.Array | None = None, subtracted: bool = False,
-            scales: tuple[jax.Array, jax.Array] | None = None):
+            scales: tuple[jax.Array, jax.Array] | None = None, scaled: bool = False):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
     `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
@@ -872,7 +984,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     (`MosaicForward.splits`), which XLA merges (`attention_decode`). With `scales` (an inference walk's),
     `key` and `value` are quantized codes, int8 or an FP8, and `scales` the keys' and the values'
     `[B, Hk, K]` fp32, one a key and key head in its row's key order: the call reads the keys and values they
-    dequantize to, each converted to the query's dtype in its program (`_Codes`).
+    dequantize to, each converted to the query's dtype in its program (`_Codes`). `scaled` launches the
+    scaled op whatever the call's values (`MosaicForward.scaled`: a mainloop whose own kernel holds no scale
+    gives it a call some row of which can be scaled, `attention_blackwell.forward`).
     """
     if residuals is Kept.SPLIT:
         # The training walk reads an interval a query (`KeySpans.per_query`); the inference walk by position.
@@ -880,6 +994,13 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
                              subtracted=subtracted, scales=scales)
+    if scaled:
+        op = dataclasses.replace(op, scaled=True)
+        if not op.fitted(args, residuals, interpret):
+            # No config of the scaled op fits the target: the template's plain-JAX walk, scaled.
+            whole = tuple(_whole(array, op.parts) for array in (query, key, value))
+            return _portable(whole, spans, hooks or Hooks(), residuals, scale=scale, natural=natural,
+                             block_q=64, block_k=64)
     return op(*args, residuals=residuals, interpret=interpret)
 
 

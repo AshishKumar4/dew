@@ -19,13 +19,13 @@ from dew.nn.kernels.templates.attention_backward_algebra import derived_backward
 
 def walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.Keys],
          rows: Callable[[jax.Array], jax.Array], resumed: tuple[jax.Array, jax.Array, jax.Array] | None,
-         block_q: int, width: int, *, live: jax.Array | None, training: bool, dropping: bool = False):
+         block_q: int, width: int, *, training: bool, dropping: bool = False):
     """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`, in `spec`'s form) from the initial
-    state `resumed` `(m0, total0, acc0)` or none: the plain walk (`algebra.plain_walk`), or with `training`
-    the training walk carrying the anchor key and split sums (`algebra.training_walk`, `rows(keys)` each key's
-    value row), at each row's maximum found first where its weights round there (`algebra.anchored_walk`,
-    `Forward.rounds`); on the guarded path its `live` rows shifting (`algebra.started`)."""
-    start = algebra.started(spec, resumed, block_q, width, live)
+    state `resumed` `(m0, total0, acc0)` or none (`algebra.started`, at its rows' scale where the walk is
+    scaled): the plain walk (`algebra.plain_walk`), or with `training` the training walk carrying the anchor
+    key and split sums (`algebra.training_walk`, `rows(keys)` each key's value row), at each row's maximum
+    found first where its weights round there (`algebra.anchored_walk`, `Forward.rounds`)."""
+    start = algebra.started(spec, resumed, block_q, width)
     if training and spec.rounds is not None:
         return algebra.anchored_walk(spec, lo, hi, keys_at, start)
     if training:
@@ -33,27 +33,19 @@ def walk(spec: algebra.Forward, lo, hi, keys_at: Callable[[jax.Array], algebra.K
     return algebra.plain_walk(spec, lo, hi, keys_at, start)
 
 
-def finished(spec: algebra.Forward, walked, keys_at: Callable[[jax.Array], algebra.Keys],
-             rows: Callable[[jax.Array], jax.Array], bounds,
+def finished(spec: algebra.Forward, walked, rows: Callable[[jax.Array], jax.Array],
              resumed: tuple[jax.Array, jax.Array, jax.Array] | None, *, training: bool, output_mod=None,
              output_params: tuple = ()) -> tuple:
     """A program's outputs from its walk (`walk`): the normalized output, its rows' maximum and denominator
-    (`algebra.finish`), and with `training` its anchor keys and split sums (`algebra.split_residuals`), a
-    guarded walk's live rows' from the normalized pass at the walk's final statistics and anchors
-    (`algebra.normalized_pass`, from the initial state's share)."""
+    (`algebra.finish`), and with `training` its anchor keys and split sums and their rows' shift
+    (`algebra.split_residuals`)."""
     state = algebra.joined(walked, rows) if training else walked
     out, m, denominator = algebra.finish(spec, state, initial=resumed is not None, output_mod=output_mod,
                                          output_params=output_params)
     if not training:
         return out, m, denominator
     split, arg, own, others_total = walked
-
-    def normalized():
-        return algebra.normalized_pass(spec, state.m, m, denominator, arg.key, keys_at, bounds,
-                                       split.acc.shape[-1],
-                                       None if resumed is None else (resumed[0], resumed[2]))
-
-    return (out, m, denominator, arg.key, *algebra.split_residuals(split, own, others_total, normalized))
+    return (out, m, denominator, arg.key, *algebra.split_residuals(split, own, others_total))
 
 
 def off_anchor_pass(lo, hi, formed: Callable[[jax.Array], tuple[jax.Array, jax.Array, jax.Array]],
