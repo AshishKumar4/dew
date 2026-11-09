@@ -11,6 +11,7 @@ partly, with key heads split in the other order from the query heads, or with he
 rows' arguments name.
 """
 
+import contextlib
 import functools
 import math
 
@@ -1135,10 +1136,10 @@ def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, gr
 @pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
 def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
     """A causal call of block groups (Gemma 4's images, a decision row's blocks), which only spans express
-    (`AttentionCase.spans_only`), runs where its visibility stays spans, its forward and its training alike:
-    its compiled program's temporaries grow with its tokens, not their square, twice the tokens taking under
-    three times the bytes, where a dense `[S, S]` mask or the reference path's `B H S S` logits take four
-    times (rows 1495, 1953)."""
+    (`AttentionCase.spans_only`), runs on the template where its visibility stays spans, its forward and its
+    training alike: its compiled program's temporaries grow with its tokens, not their square, twice the
+    tokens taking under three times the bytes, where a dense `[S, S]` mask or the reference path's `B H S S`
+    logits take four times (rows 1495, 1953)."""
     heads, width = 4, 64
 
     def temporaries(tokens: int) -> int:
@@ -1146,7 +1147,8 @@ def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
         groups = jnp.repeat(jnp.arange(tokens // 128, dtype=jnp.int32), 128)[None]
 
         def attended(query, key, value):
-            return scaled_dot_product_attention(query, key, value, causal=True, block_groups=groups)
+            return scaled_dot_product_attention(query, key, value, causal=True, block_groups=groups,
+                                                implementation="template")
 
         step = jax.grad(lambda *operands: attended(*operands).astype(jnp.float32).sum(),
                         argnums=(0, 1, 2)) if differentiated else attended
@@ -1155,3 +1157,23 @@ def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
         return analysis.temp_size_in_bytes
 
     assert temporaries(4096) <= 3 * temporaries(2048)
+
+
+@pytest.mark.parametrize(("target", "tokens", "ran"), [
+    ("sm90", 512, "template"), ("v6e", 512, "template"), (None, 512, "plain"), (None, 1 << 20, "template")],
+    ids=["h100", "tpu", "cpu", "cpu-past-its-memory"])
+def test_a_call_only_spans_express_runs_where_any_call_on_its_device_does(target, tokens, ran):
+    """A causal call over its documents' key runs (a forked decision row's, `AttentionCase.spans_only`): a GPU
+    and a TPU run it on the template, which alone reads the runs as spans; a CPU runs it where it runs the
+    call without them, jax.nn's xla attention (or, under Dew's wide arithmetic, the reference path) over the
+    dense mask the runs mean where its scores fit the host, else the template (a forked call took the
+    template's plain-JAX mainloop on a CPU, and a run recorded fast its accurate route)."""
+    from dew.nn.attention import resolve_implementation
+
+    query = jax.ShapeDtypeStruct((1, tokens, 4, 64), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, 2, 64), jnp.bfloat16)
+    runs = jax.ShapeDtypeStruct((1, tokens, 2, 2), jnp.int32)
+    with contextlib.nullcontext() if target is None else generation.assumed(target):
+        spanned = resolve_implementation('auto', query, key, causal=True, key_runs=runs)
+        plain = resolve_implementation('auto', query, key, causal=True)
+    assert spanned.kernel == (plain.kernel if ran == "plain" else ran)
