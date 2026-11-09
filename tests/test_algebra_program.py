@@ -337,6 +337,39 @@ def test_a_rewrite_is_recorded_in_the_kernel_report():
     assert made.seconds > 0
     assert made.spliced == 1
 
+
+def test_a_programs_whole_pass_is_recorded_by_either_entry():
+    """Each program's whole pass is recorded in seconds whichever entry runs it (`report.passes`, row 5339):
+    the compile point's rewrite of a jit's trace (`options.program`) and a function's own
+    (`algebra.rewritten`, which recorded none), each at least what its region's derivation took, which it
+    holds."""
+    x, y, a = rows(3, (8, 64), (8, 64), (8, 64))
+    for run in (lambda: options.program(lambda x, y, a: two_sums(x, y, a)).compiled(x, y, a),
+                lambda: algebra.rewritten(two_sums)(x, y, a)):
+        with report.refusals():
+            run()
+            passes, [made] = report.passes(), report.rewrites()
+        assert passes
+        assert sum(passes) >= made.seconds > 0
+
+
+def test_a_region_no_rule_may_fire_in_is_recorded_unpriced():
+    """A window whose values the program bounds none of builds no terms (`rules.reorderable`), so nothing
+    prices it: its record holds no price where one a rule fires in holds both (row 5340: its 0.0 before and
+    after read as a region that costs nothing)."""
+    def unbounded(x, y, a):
+        return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
+
+    x, y, a = rows(5, (8, 64), (8, 64), (8, 64))
+    with report.refusals():
+        algebra.rewritten(unbounded)(x, y, a)
+        [left] = report.rewrites()
+        algebra.rewritten(two_sums)(x, y, a)
+        fired = report.rewrites()[-1]
+    assert (left.before, left.after, left.iterations, left.spliced) == (None, None, 0, 0)
+    assert fired.after < fired.before
+
+
 def test_a_program_the_rules_cannot_rewrite_is_kept_as_traced():
     """A program whose math no rule's left side reads (no sum of two reductions, products or contractions,
     no reduction of a product), in its own body or in a scan's, is left as traced: none of its regions is

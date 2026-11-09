@@ -55,6 +55,24 @@ def test_a_rewritten_program_computes_what_the_program_computes():
         assert_as_exact(jax.jit(algebra.rewritten(fn)), jax.jit(fn), draw, fn.__name__, seeds=16)
 
 
+def summed_gradient(x, y, a):
+    """The gradient of two bounded sums' squares (`two_sums`) in each operand, as autodiff writes it: the
+    backward's own products and sums over the cotangent, which a rewrite of the forward never shows the
+    rules."""
+    return jax.grad(lambda x, y, a: jnp.sum(two_sums(x, y, a) ** 2), argnums=(0, 1, 2))(x, y, a)
+
+
+def test_a_rewritten_backward_computes_what_the_backward_computes():
+    """A rewritten gradient is on par with the gradient as autodiff wrote it against that gradient in
+    float64 (check 1; docs/design/algebra.md §3, rewritten backwards): a rule that reads only a backward's
+    patterns is held here, where JAX's derivative of a rewritten forward never runs it."""
+    def draw(seed):
+        return rows(seed, (8, 64), (8, 64), (8, 64))
+
+    assert_as_exact(jax.jit(algebra.rewritten(summed_gradient)), jax.jit(summed_gradient), draw,
+                    "a rewritten gradient", seeds=16)
+
+
 def test_linearity_joins_two_reductions_into_one_pass():
     """Two sums of one scale's products become one sum over the joined products: the rewritten program reads
     its rows in one reduction where the program read them in two."""
@@ -73,6 +91,26 @@ def test_each_rule_holds_its_right_side_to_its_left_side():
     over drawn and adversarial operands, as its set states its instances (`algebra.rules.instances`)."""
     for name, (left, right, draw) in algebra.rules.instances().items():
         assert_as_exact(jax.jit(right), jax.jit(left), draw, name, seeds=16)
+
+
+def test_each_rule_holds_its_rounding_class_on_its_adversarial_families():
+    """Each registered rule on its adversarial families (`rules.Drawn.adversarial`: rows of zero, one
+    element a row, cancelling and near-equal operands), by its set's rounding class (docs/design/algebra.md
+    §3): an `exact` or `bounded` rule's right side is on par with its left against the float64 truth
+    (check 1) on every one; a `reorders` rule's is finite wherever its left side is and exactly zero wherever
+    its left side is."""
+    for name, (left, right, draw) in algebra.rules.instances().items():
+        rounding = algebra.rules.RULES[name.split(": ", 1)[0]].rounding
+        written, made = jax.jit(left), jax.jit(right)
+        for family, drawn in draw.adversarial().items():
+            if rounding != "reorders":
+                assert_as_exact(made, written, drawn, f"{name}, {family}", seeds=16)
+                continue
+            for seed in range(4):
+                operands = drawn(seed)
+                reference, value = np.asarray(written(*operands)), np.asarray(made(*operands))
+                assert np.isfinite(value[np.isfinite(reference)]).all(), (name, family, seed)
+                assert not value[reference == 0].any(), (name, family, seed)
 
 
 def test_each_rewrites_right_side_holds_check_2():
