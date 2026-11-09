@@ -1299,7 +1299,7 @@ class ExpertMLP(nn.Module):
         slots = tokens.slots if isinstance(tokens, Gathered) else None
 
         # The same residual names as the dense MLP's, so one remat policy
-        # covers both (mixer_base.RESIDUALS).
+        # covers both (residuals.RESIDUALS).
         if self.activation == 'relu2':
             up = checkpoint_name(linear(tokens, kernels[0]), Residual.UP_PROJ)
             hidden = relu2(up)

@@ -58,7 +58,7 @@ from ..ngpt import NGPT, stepped
 from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
-from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
+from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS, Residual
 from ..sharding import RESIDUAL, constrain, declared
 
 if TYPE_CHECKING:
@@ -532,16 +532,17 @@ class RematPolicy:
 
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
-    'all_but_delta_memory': RematPolicy(recompute=('delta_memory',)),
-    'minimal_with_scan_and_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'scan', 'conv', *MLP_RESIDUALS)),
-    'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'conv', *MLP_RESIDUALS)),
+    'all_but_delta_memory': RematPolicy(recompute=(Residual.DELTA_MEMORY,)),
+    'minimal_with_scan_and_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.SCAN, Residual.CONV,
+                                                     *MLP_RESIDUALS)),
+    'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.CONV, *MLP_RESIDUALS)),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
-    'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
+    'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.CONTEXT, *MLP_RESIDUALS)),
     'save_dot_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS),
-    'save_dot_with_context_except_mlp': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context')),
-    'save_dot_except_mlpwi': RematPolicy(save=(*ATTENTION_RESIDUALS, 'down_proj')),
+    'save_dot_with_context_except_mlp': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.CONTEXT)),
+    'save_dot_except_mlpwi': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.DOWN_PROJ)),
     'save_qkv_proj': RematPolicy(save=QKV_RESIDUALS),
-    'save_out_proj': RematPolicy(save=('o_proj',)),
+    'save_out_proj': RematPolicy(save=(Residual.O_PROJ,)),
     'minimal_offloaded': RematPolicy(offload=ATTENTION_RESIDUALS + MLP_RESIDUALS),
     'qkv_proj_offloaded': RematPolicy(offload=QKV_RESIDUALS),
 }

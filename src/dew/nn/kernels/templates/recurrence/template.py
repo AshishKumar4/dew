@@ -245,7 +245,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         # The chunks' inverses kept for the fast backward, as fla's keeps its `A`, and the launches' memories,
         # weighted keys and corrected values, as the port keeps its memory, but where the block's remat rung
         # recomputes them (`recomputed`). Each is named as the port names its own, so a rung that saves names
-        # keeps them rather than replaying the forward's launches for them (`mixer_base.DELTA_RESIDUALS`).
+        # keeps them rather than replaying the forward's launches for them (`residuals.DELTA_RESIDUALS`).
         out, final, (inverse, kept) = chunk_forward.kept_forward(*operands[:6], starts=operands[6],
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide,

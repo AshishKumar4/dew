@@ -209,7 +209,7 @@ class MixerBase:
     the GPU turns them off (`GpuTarget.triton_gemm_fusions`)."""
 
     residuals: ClassVar[tuple[str, ...] | None] = None
-    """The names (`dew.nn.mixer_base.RESIDUALS`) the mixer this kind
+    """The names (`dew.nn.residuals.RESIDUALS`) the mixer this kind
     builds marks for a remat policy to keep, or every name where None: a
     decoder skips a remat rung that keeps nothing more of its layers' names
     than the next (`CausalTransformer.recompute_more`). The class's default,

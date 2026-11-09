@@ -40,6 +40,7 @@ from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
+from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -824,7 +825,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     forward and its own pullback in reverse mode, and the portable tangent, in the kernels' dtypes, in
     forward mode however a jit, a scan or a remat staged the call, where a kernel's custom VJP gives none
     (row 2395). The training kernel's forward runs as it is (not `nested`), so the residuals its port names
-    (`dew.nn.mixer_base.DELTA_RESIDUALS`) are a remat policy's to keep. The cells' products differ
+    (`dew.nn.residuals.DELTA_RESIDUALS`) are a remat policy's to keep. The cells' products differ
     (`PORT_CELLS`, `SCAN_CELLS`, or a template that trains no such call), and a trace cannot tell them apart
     before its gradient is asked. A training kernel that refused the call refuses where a gradient is
     traced, not a forward alone. Where both products are the portable math's (a CPU's, or a device no
@@ -1013,7 +1014,7 @@ def recomputed_memory() -> bool:
     template's call takes it as an argument (`template.mosaic_rule`'s `recomputed`), so the selectors' binds
     (`port_kernel`, `scan_kernel`) and the run's (`template_rule`) read it alike, and a launch a compile
     refused under the rung is the one the route judges (row 4133)."""
-    return "delta_memory" in RECOMPUTED.get()
+    return Residual.DELTA_MEMORY in RECOMPUTED.get()
 
 
 @contextlib.contextmanager

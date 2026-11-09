@@ -113,7 +113,7 @@ class GptOssExperts(nn.Module):
         projected = jnp.asarray(expert_projection(
             tokens, gate_up, sizes, dtype, self.implementation, self.precision, bias=gate_bias))
         # The dense MLP's residual names, the interleaved gate and up one product as a packed MLP's
-        # (mlp.py), so one remat policy covers every MLP (mixer_base.RESIDUALS).
+        # (mlp.py), so one remat policy covers every MLP (residuals.RESIDUALS).
         projected = checkpoint_name(checkpoint_name(projected, Residual.GATE_PROJ), Residual.UP_PROJ)
         gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
         activated = (up + 1) * quick_gelu(gate)

@@ -983,7 +983,7 @@ class CausalSelfAttention(nn.Module):
         them and column-parallel under a tensor axis (each shard a run of whole heads); the output gate
         where it gates, else None; and the keys and values `qkv_proj` packs beside the query, else
         None. The projections carry the names a remat policy saves or offloads
-        (mixer_base.RESIDUALS)."""
+        (residuals.RESIDUALS)."""
         B, S, _ = x.shape
         projected_kv = None
         group = self._group()

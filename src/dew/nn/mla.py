@@ -544,7 +544,7 @@ class MultiHeadLatentAttention(LinearProducts):
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
-        # (mixer_base.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (residuals.RESIDUALS); kv_b_proj is the fused K/V one.
         gate = None
         if self.q_lora_rank is None:
             q_resid = None
