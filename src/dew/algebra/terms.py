@@ -46,12 +46,14 @@ BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "r
                     "or", "xor"})
 UNARY = frozenset({"neg", "exp", "exp2", "log", "log2", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign",
                    "tanh", "logistic", "integer_pow", "square", "sin", "cos", "erf", "erf_inv", "floor",
-                   "ceil", "round", "is_finite", "not"})
+                   "ceil", "round", "is_finite", "not", "optimization_barrier"})
 COMPARISONS = frozenset({"lt", "le", "eq", "ne", "ge", "gt"})
 REDUCTIONS = {"reduce_sum": "sum", "reduce_max": "max", "reduce_min": "min"}
 SHAPES = frozenset({"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims"})
 """The primitives of the language (§1): elementwise arithmetic and comparisons, casts, the layout changes, the
-reductions a rule reads, and products (`dot_general`). Every other equation is a leaf of the region."""
+reductions a rule reads, and products (`dot_general`); an optimization barrier among the unaries, whose value
+is its operand's, which no rule rewrites through (a value rounded once before its readers, as a declaration's
+dropped products are). Every other equation is a leaf of the region."""
 RESCALE = "rescale"
 """A binary no program holds: a derived walk's rescale of a carried state from its first operand's anchor to
 its second's where the declaration states its own (`derive.Reduction.rescale`), evaluated by that function
@@ -274,7 +276,9 @@ def parameter_key(value) -> Hashable:
     its mesh, partitions, memory and logical device order; an array by its dtype, shape and bytes' digest; a
     function by its module and name, a partial one with its bound arguments. Any other object is its type's
     name and the object itself, compared by its own equality, never by its printed form, which a key kept in
-    another process cannot read (`opaque`). `value` is any parameter JAX's primitives take, which share no
+    another process cannot read (`opaque`); an object that cannot be hashed (JAX's `WrappedFun` of a
+    derivative rule, hashing an `Unhashable` tree) by its identity, held alive by the key (`_Identity`), so
+    it is equal to itself alone. `value` is any parameter JAX's primitives take, which share no
     type."""
     if value is None or isinstance(value, (bool, str)):
         return type(value).__name__, value
@@ -324,7 +328,28 @@ def parameter_key(value) -> Hashable:
                                         for name, part in value.items()), key=repr))
     if isinstance(value, types.FunctionType):
         return "function", value.__module__, value.__qualname__
+    try:
+        hash(value)
+    except TypeError:
+        # A function JAX wraps (a derivative rule's `WrappedFun`) hashes its parts, an `Unhashable` tree among
+        # them: keyed by its identity.
+        return "object", _named(type(value)), _Identity(value)
     return "object", _named(type(value)), value
+
+
+class _Identity:
+    """An unhashable parameter as a key: equal to a key of the same object alone, the object held."""
+
+    __slots__ = ("held",)
+
+    def __init__(self, held):
+        self.held = held
+
+    def __hash__(self) -> int:
+        return id(self.held)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _Identity) and other.held is self.held
 
 
 def opaque(key) -> Hashable:
@@ -432,14 +457,10 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
         _typed(dtypes, magnitudes, env[var], var, magnitude)
         leaves += 1
 
+    literal = _literals(forms, literals, shapes, dtypes, magnitudes)
+
     def read(atom) -> Node:
-        if isinstance(atom, jcore.Literal):
-            literals.append(_held(atom.val))
-            term = forms.literal(len(literals) - 1)
-            shapes.append((term, _shape(atom)))
-            _typed(dtypes, magnitudes, term, atom, _magnitude(atom.val))
-            return term
-        return env[atom]
+        return literal(atom) if isinstance(atom, jcore.Literal) else env[atom]
 
     def magnitude_of(atom) -> Magnitude | None:
         return _magnitude(atom.val) if isinstance(atom, jcore.Literal) else magnitudes[key(env[atom])]
@@ -751,6 +772,33 @@ def _held(value: np.ndarray | complex) -> np.ndarray | complex:
     return np.array(value) if isinstance(value, np.ndarray) else value
 
 
+def _literals[Node: (Term, Skeleton)](forms: type[Node], literals: list, shapes: list, dtypes: dict,
+                                      magnitudes: dict) -> Callable[[jcore.Literal], Node]:
+    """A region's reader of its literals into `literals`: each once by its value as the program holds it
+    (`literal_key`), so equal constants are one term."""
+    index: dict[Hashable, int] = {}
+
+    def literal(atom: jcore.Literal) -> Node:
+        named = literal_key(atom)
+        if named not in index:
+            index[named] = len(literals)
+            literals.append(_held(atom.val))
+        term = forms.literal(index[named])
+        shapes.append((term, _shape(atom)))
+        _typed(dtypes, magnitudes, term, atom, _magnitude(atom.val))
+        return term
+
+    return literal
+
+
+def literal_key(atom: jcore.Literal) -> Hashable:
+    """A literal's identity in a region: its dtype, shape and bits, so two literals are one term where they
+    are the same constant, and never where they round apart. Its weak type is no part of it: an equation's
+    types are settled where it is traced, so a weak and a strong literal of one dtype compute alike."""
+    value = np.asarray(atom.val)
+    return str(value.dtype), value.shape, value.tobytes()
+
+
 def _shape(atom) -> tuple[int, ...]:
     """An array value's shape; a value of no shape (a token, a key's) has none the rules read."""
     return tuple(atom.aval.shape) if isinstance(atom.aval, ShapedArray) else ()
@@ -841,7 +889,9 @@ def value_of(term: Term, value: Callable[[Term], jax.Array], region_: Region, le
     for constructor in (Term.unary, Term.convert, Term.shaped, Term.reduce):
         if (args := get_callable_args(term, constructor)) is not None:
             primitive, given = region_.params[integer(args[-1])]
-            return primitive.bind(value(args[0]), **given)
+            made = primitive.bind(value(args[0]), **given)
+            # A barrier of one value binds as a primitive of many results, its one result its value.
+            return made[0] if primitive.multiple_results else made
     raise ValueError(f"a term of no known constructor: {term}")
 
 

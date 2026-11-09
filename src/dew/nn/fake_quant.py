@@ -105,11 +105,22 @@ def fp8_scaled_blocks(x, block: int):
     return blocks, _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
 
 
+def fp8_codes(values):
+    """`values` (fp32, a block over its scale) rounded to E4M3FN, ties to even, clamped to +-448: an FP8
+    block's codes (`fp8_rounded`'s, before its scale)."""
+    return _round_e4m3fn(jnp.clip(values, -_E4M3_MAX, _E4M3_MAX))
+
+
+def fp4_codes(values):
+    """`values` (fp32, a block over its scale) rounded to E2M1, ties to even, clamped to +-6: an FP4
+    block's codes (`fp4_rounded`'s under a power-of-two scale, before its scale)."""
+    return _e2m1(jnp.clip(values, -_E2M1_MAX, _E2M1_MAX))
+
+
 def fp8_rounded(x, blocks, scale):
     """`x` as E4M3 of its `blocks` over their `scale` (`fp8_scaled_blocks`), clamped to +-448, times the
     scale."""
-    rounded = _round_e4m3fn(jnp.clip(blocks / scale, -_E4M3_MAX, _E4M3_MAX))
-    return straight_through(x, (rounded * scale).reshape(x.shape))
+    return straight_through(x, (fp8_codes(blocks / scale) * scale).reshape(x.shape))
 
 
 def fake_quant_fp8(x, block: int):
@@ -135,10 +146,7 @@ def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
 def fp4_rounded(x, blocks, scale, e4m3_scale: bool):
     """`x` as E2M1 of its `blocks` over their `scale` (`fp4_scaled_blocks`), clamped to +-6, times the
     scale: an E4M3 scale compared against (`_e2m1_quotient`), a power of two divided by exactly."""
-    if e4m3_scale:
-        rounded = _e2m1_quotient(blocks, scale)
-    else:
-        rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
+    rounded = _e2m1_quotient(blocks, scale) if e4m3_scale else fp4_codes(blocks / scale)
     return straight_through(x, (rounded * scale).reshape(x.shape))
 
 

@@ -38,6 +38,7 @@ from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
+    attention_decode,
     attention_mosaic,
     attention_portable,
     attention_triton,
@@ -64,9 +65,9 @@ class Family:
     arguments (`template.spans`); the rows `[B, Q]` that see no key, whose output and gradients are
     zero (`empty`); whether the default form holds it (`folded`), False only for the fold's documented
     divergences (`algebra.Forward.base2`), which run natural alone; whether its one divergence is its
-    weighted values' sums passing fp32's largest (`overflows`), which a walk guarding its sums' headroom
-    (`algebra.Forward.headroom`) keeps finite in either form; the slices the decode kernel cuts
-    each row's keys into (`splits`), whose states it merges; whether it is a decode step's alone
+    weighted values' sums passing fp32's largest (`overflows`), which a walk scaling its rows' sums
+    (`algebra.SCALED_WALK`) keeps finite in either form; the slices the decode kernel cuts each row's keys
+    into (`splits`), whose states it merges; whether it is a decode step's alone
     (`decode_only`), a shape the template's interpreted mainloops would take too long over, which its
     template twin covers in fewer programs; and whether its queries' products with the keys pass fp32's
     largest before the scale (`query_first`), where jax's attention, which scales its products, overflows,
@@ -151,7 +152,13 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a product past fp32's largest before a small scale, float32": 8,
          "a product past fp32's largest before a small scale, bfloat16": 8,
          "a decode step's sink near fp32's largest and one key": 8,
-         "documents of one key": 8}
+         "documents of one key": 8,
+         "a share in bf16's subnormal band on a value near its largest": 32,
+         "a share in bf16's subnormal band, the denominator's rest in a later tile": 32,
+         "small values beside unseen ones near fp32's largest, float32": 16,
+         "small values beside unseen ones near fp32's largest, bfloat16": 16,
+         "a row of small values beside one that overflows in its tile, float32": 16,
+         "a row of small values beside one that overflows in its tile, bfloat16": 16}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
 1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
 
@@ -194,12 +201,12 @@ def _small_weight(dtype, *, queries: int, logits: tuple[float, float], sizes: tu
                   rows: int = 128, cases: int = 1, decode_only: bool = False) -> Family:
     # `queries` queries a row over 32 keys of which two are seen: a key of logit 0 and one whose logit is a
     # quarter of each query's size (drawn in `sizes`, else 4) times its key's -l, l drawn in `logits`, on a
-    # value of 2^e, e drawn in [120, 126]: its share of the output, which a weight shifted for the sums'
+    # value of 2^e, e drawn in [120, 126]: its share of the output, which a weight scaled for the sums'
     # headroom before it is narrowed would lose. At logits of -80 to -87 the weight is a normal fp32 and
-    # bf16 at their exponent's edge, which a weight shifted before it is narrowed would flush
-    # (`Room.small`). One key tile a row, so the family's many rows stay cheap to interpret; `cases`
-    # independent cases a row, each its own document of `queries` queries over its own two keys
-    # (`CrossDocuments`), so a draw holds rows times cases of them in few programs.
+    # bf16 at their exponent's edge, which a weight scaled before it is narrowed would flush
+    # (`algebra.at_scale`'s small weights). One key tile a row, so the family's many rows stay cheap to
+    # interpret; `cases` independent cases a row, each its own document of `queries` queries over its own
+    # two keys (`CrossDocuments`), so a draw holds rows times cases of them in few programs.
     count = queries * cases
 
     def draw(seed):
@@ -228,7 +235,8 @@ def _mixed_columns(seed: int, rows: int = 128, small: tuple[float, float] = (5e2
                    small_cotangent: bool = False):
     # One query a row over four keys of logit 0 whose values near fp32's largest in the first column
     # overflow its sum, and a fifth of logit -85 whose value 1e30 sits alone in the second column: the
-    # guarded walk shifts the row, and the second column's share, about 1e-7, must survive it.
+    # normalized walk holds the row's sums over its denominator, and the second column's share, about 1e-7,
+    # must survive it.
     key = np.zeros((rows, 5, 1, 16), np.float32)
     key[:, 4, 0, 0] = -_uniform(seed, 80.0, 86.0, (rows,))
     value = np.zeros((rows, 5, 1, 16), np.float32)
@@ -275,6 +283,84 @@ def _tiny_beside_large(seed: int, rows: int = 128):
     (dout,) = _normal(seed + 2, (rows, 1, 1, 16))
     return (np.zeros((rows, 1, 1, 16), np.float32), np.zeros((rows, 4, 1, 16), np.float32), value, None,
             dout * np.float32(2.0 ** -8))
+
+
+def _subnormal_band(seed: int, rows: int = 64, *, later: bool = False):
+    """One query a row over three keys seen (with `later`, of 64, the third in the second key tile): the
+    first of logit 0 on a value near bf16's largest in its second column, the second whose weight over the
+    denominator is a drawn 2^-133 to 2^-126, bf16's subnormal band, on a value near bf16's largest in its
+    first column, and the third of weight a drawn 1/200 to 1/2, which takes the denominator past 1; every
+    other value 0. The reference rounds the second key's share to its subnormal and keeps its product, 2^-6
+    to 2^1, which a weight halved past the denominator's binade rounds to zero (Main's counterexample to a
+    power-of-two scale at the denominator's binade). The first key's weighted value passes 2^127, so the
+    scaled walk scales the row (`algebra.SCALED_WALK`) and takes the second's weight, below fp32's least
+    normal at that scale, in its small weights' product, raised (`algebra.at_scale`), so it keeps every bit
+    the reference does. Every other key, which its documents leave unseen (`_band_seen`), sits at a logit
+    of -10^4, a weight of 0 in any form, so a decode step, which reads a row's keys whole, reads the same
+    row."""
+    keys, third = (64, 32) if later else (3, 2)
+    other = _uniform(seed, 1.0 / 200, 0.5, (rows,))
+    share = 2.0 ** _uniform(seed + 1, -133.0, -126.0, (rows,))
+    key = np.zeros((rows, keys, 1, 16), np.float32)
+    key[:, :, 0, 0] = -1e4
+    key[:, 0, 0, 0] = 0.0
+    key[:, 1, 0, 0] = np.log(share * (1.0 + other))
+    key[:, third, 0, 0] = np.log(other)
+    value = np.zeros((rows, keys, 1, 16), np.float32)
+    value[:, 1, 0, 0] = _uniform(seed + 2, 2.0 ** 127, 3.3e38, (rows,))
+    value[:, 0, 0, 1] = _uniform(seed + 4, 2.9e38, 3.3e38, (rows,))
+    (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
+    return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout * np.float32(2.0 ** -4)
+
+
+def _band_seen(*, later: bool) -> tuple[np.ndarray, dict]:
+    """`_subnormal_band`'s keys seen and their spans: the first three, or with `later` the first two and the
+    second key tile's first, each of the one document its query reads (`CrossDocuments`)."""
+    keys, third = (64, 32) if later else (3, 2)
+    ids = np.zeros(keys, np.int32)
+    ids[[0, 1, third]] = 1
+    seen = np.broadcast_to(ids[None, :] == 1, (64, 1, 1, keys)).copy()
+    return seen, {"segment_ids": CrossDocuments(np.ones((64, 1), np.int32), np.tile(ids, (64, 1)))}
+
+
+def _masked_outlier(seed: int, rows: int = 64):
+    """One query a row over eight keys of equal logits, the first four seen and the last four past its
+    length: the seen keys' values a drawn 2^-125 to 2^-120 in their first column and a draw in [-1, 1) times
+    2^-120 past it, the unseen ones' first column near fp32's largest. A key the row does not see weighs
+    nothing, so no value it holds scales the row's sums or flushes the small ones it reads. The cotangent
+    reads none of the first column: a backward forms every key's `dO · vᵀ`, an unseen one's too, which a
+    cotangent on that column carries past fp32's largest (the reference's fp32 and FlashAttention's alike)."""
+    value = np.zeros((rows, 8, 1, 16), np.float32)
+    value[:, :4, 0, 0] = 2.0 ** _uniform(seed, -125.0, -120.0, (rows, 4))
+    value[:, :4, 0, 1:] = _uniform(seed + 1, -1.0, 1.0, (rows, 4, 15)) * np.float32(2.0 ** -120)
+    value[:, 4:, 0, 0] = _uniform(seed + 2, 2.5e38, 3.3e38, (rows, 4))
+    (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
+    dout[..., 0] = 0.0
+    return (np.zeros((rows, 1, 1, 16), np.float32), np.zeros((rows, 8, 1, 16), np.float32), value, None,
+            dout)
+
+
+def _separated_rows(seed: int, rows: int = 64):
+    """Two queries a row of one query tile over eight keys of equal logits, each its own document: the first
+    sees the first four, whose values hold a drawn 2^-125 to 2^-120 in their first column and a draw in
+    [-1, 1) times 2^-120 past it; the second sees the last four, whose values near fp32's largest pass it
+    in their sum. Each row's sums are its own: the second's size moves nothing of the first's."""
+    value = np.zeros((rows, 8, 1, 16), np.float32)
+    value[:, :4, 0, 0] = 2.0 ** _uniform(seed, -125.0, -120.0, (rows, 4))
+    value[:, :4, 0, 1:] = _uniform(seed + 1, -1.0, 1.0, (rows, 4, 15)) * np.float32(2.0 ** -120)
+    value[:, 4:, 0, 0] = _uniform(seed + 2, 2.5e38, 3.3e38, (rows, 4))
+    (dout,) = _normal(seed + 3, (rows, 2, 1, 16))
+    # The cotangent times 2^-8, so its products with the large values stay finite in the reference's dP.
+    return (np.zeros((rows, 2, 1, 16), np.float32), np.zeros((rows, 8, 1, 16), np.float32), value, None,
+            dout * np.float32(2.0 ** -8))
+
+
+SEPARATED = CrossDocuments(np.tile(np.asarray([1, 2], np.int32), (64, 1)),
+                           np.tile(np.asarray([1] * 4 + [2] * 4, np.int32), (64, 1)))
+"""`_separated_rows`' documents: the first query reads the first four keys, the second the last four."""
+
+SEPARATED_SEEN = (SEPARATED.query[:, None, :, None] == SEPARATED.key[:, None, None, :]).copy()
+"""`SEPARATED`'s keys each query sees `[64, 1, 2, 8]`."""
 
 
 def _anchor_relative(seed: int, rows: int = 64):
@@ -413,7 +499,7 @@ def _resumed_beside_overflow(seed):
     # One query a row of zeros, so both of its keys weigh alike, resumed from a state of denominator 1 at a
     # drawn maximum in [-1, 1) whose weighted values hold a draw in the second column alone; the keys'
     # values near fp32's largest in the first column overflow its sum, and the cotangent reads the second
-    # column alone, the state's: a guarded training walk's normalized split sums carry the state's share.
+    # column alone, the state's: a normalized training walk's split sums carry the state's share.
     m = _uniform(seed, -1.0, 1.0, (RESUMED, 1, 1))
     acc = np.zeros((RESUMED, 1, 1, 16), np.float32)
     acc[..., 1] = _uniform(seed + 1, -1.0, 1.0, (RESUMED, 1, 1))
@@ -447,7 +533,8 @@ def _fp16_beside_a_large_state(seed):
     # One query a row of zeros over two keys whose values near fp16's largest sit in the first column,
     # resumed at maximum 0 from a state of denominator 2^124 to 2^126 whose weighted values are it times a
     # draw in [2, 2.5) in that column: its sums near fp32's largest, which fp16 values never take past it
-    # (`algebra.headroom`: an fp16 call compiles no guard), so the output is the state's mean, finite.
+    # (`algebra.headroom`: an fp16 call's walk is not normalized), so the output is the state's mean,
+    # finite.
     total = 2.0 ** np.floor(_uniform(seed, 124.0, 127.0, (RESUMED, 1, 1)))
     acc = np.zeros((RESUMED, 1, 1, 16), np.float32)
     acc[..., 0] = total * _uniform(seed + 1, 2.0, 2.5, (RESUMED, 1, 1))
@@ -534,7 +621,7 @@ def _families() -> dict[str, Family]:
         # The fold's divergences at extreme inputs, which run in the accurate form alone (docs/design/
         # kernel-templates.md, §3, the exponent's forms): a logit near fp32's largest, whose contracted
         # weight is 0 or infinite; values near fp32's largest, whose weighted sum overflows where a walk
-        # does not guard its sums (every mainloop's default does, `overflows`); a sink there.
+        # does not normalize its sums (every mainloop's default does, `overflows`); a sink there.
         "a logit near fp32's largest": Family(_near_max_logit(1), _kept(1, 1), folded=False),
         # Folded at scale 1/4, the backward takes the base-2 maximum back to natural units, which near fp32's
         # largest rounds the key's own weight away from 1, as at logits near 1e30.
@@ -576,7 +663,7 @@ def _families() -> dict[str, Family]:
         "a decode step's weight at the exponent's edge on a large value, float32": edge_step("float32"),
         "a decode step's weight at the exponent's edge on a large value, bfloat16": edge_step("bfloat16"),
         # Their one divergence in the default form is their sums passing fp32's largest (`overflows`): the
-        # fold's sum of those values overflows where a walk does not guard its sums.
+        # fold's sum of those values overflows where a walk does not normalize its sums.
         "a small column beside an overflowing one": Family(_mixed_columns, np.ones((128, 1, 1, 5), bool),
                                                            folded=False, overflows=True),
         # Its values near 1, so the column's output is near fp32's least normal, a shifted product of
@@ -615,6 +702,21 @@ def _families() -> dict[str, Family]:
         "a subnormal share beside 255 equal weights, bfloat16": Family(
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
             overflows=True, dtype="bfloat16"),
+        # A share in bf16's subnormal band on a value near its largest, its denominator past 1 in its own key
+        # tile or a later one (the running denominator then smaller than the final one).
+        "a share in bf16's subnormal band on a value near its largest": Family(
+            _subnormal_band, *_band_seen(later=False), folded=False, dtype="bfloat16"),
+        "a share in bf16's subnormal band, the denominator's rest in a later tile": Family(
+            functools.partial(_subnormal_band, later=True), *_band_seen(later=True), folded=False,
+            dtype="bfloat16"),
+        # A row of small values beside keys it does not see whose values near fp32's largest (its length's
+        # padding), and rows of one query tile of either size, each its own.
+        **{f"small values beside unseen ones near fp32's largest, {dtype}": Family(
+            _masked_outlier, np.broadcast_to(np.arange(8) < 4, (64, 1, 1, 8)).copy(),
+            {"lengths": np.full(64, 4)}, dtype=dtype) for dtype in ("float32", "bfloat16")},
+        **{f"a row of small values beside one that overflows in its tile, {dtype}": Family(
+            _separated_rows, SEPARATED_SEEN, {"segment_ids": SEPARATED}, folded=False, overflows=True,
+            dtype=dtype) for dtype in ("float32", "bfloat16")},
     }
     return {**families, **_structured_families()}
 
@@ -803,7 +905,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
     deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
-    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    tiles = attention_portable.Tiles(32, 32, attention_triton.BLOCK)
     mainloop = functools.partial(_differentiable, family)
 
     def triton_forward(*operands):
@@ -818,15 +920,14 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
         return attention_mosaic.forward(*operands, **forward_options)
 
     def mosaic_backward(query, key, value, spans, hooks, dout):
-        # From the mainloop's own training forward's residuals, a guarded one's (its overflowed rows walk
-        # again guarded, in the launch's form).
+        # From the mainloop's own training forward's residuals.
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              **forward_options)[1:]
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)
 
-    portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
-                        functools.partial(attention_portable.backward, **tiles, **options))
+    portable = mainloop(functools.partial(attention_portable.xla_mainloop, tiles, **forward_options),
+                        functools.partial(attention_portable.backward, tiles, **options))
     mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
     def two_launch_backward(*operands):
         with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
@@ -943,9 +1044,77 @@ def default_is_finite(family_name: str, mainloop_name: str) -> None:
 
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
 def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
-    """The plain-JAX mainloop, which walks under the default's guards (`algebra.walked`: its sums' headroom,
-    the fold's reach), finite in the default form over every family (`default_is_finite`)."""
+    """The plain-JAX mainloop, its rows' sums scaled where they could pass fp32's largest
+    (`algebra.SCALED_WALK`) and under the fold's guard (`algebra.walked`), finite in the default form over
+    every family (`default_is_finite`)."""
     default_is_finite(family, "portable")
+
+
+BAND_FAMILIES = ("a share in bf16's subnormal band on a value near its largest",
+                 "a share in bf16's subnormal band, the denominator's rest in a later tile")
+"""The families of a share in bf16's subnormal band, which each reference's form weighs differently."""
+
+
+def _normalized_first(family: Family) -> Callable:
+    """A reference that rounds its logits to the call's dtype and normalizes its weights before narrowing
+    them for their product with the values (torch's scaled dot-product attention's math path: its product
+    of the query and keys in the inputs' dtype, the softmax over it, then the weights narrowed)."""
+    def attend(query, key, value, extra):
+        del extra
+        logits = jnp.einsum("bqhd,bkhd->bhqk", query, key, preferred_element_type=jnp.float32)
+        logits = (logits.astype(query.dtype).astype(jnp.float32) * query.shape[-1] ** -0.5)
+        weights = jax.nn.softmax(jnp.where(jnp.asarray(family.keep), logits, -jnp.inf), axis=-1)
+        out = jnp.einsum("bhqk,bkhd->bqhd", weights.astype(value.dtype), value,
+                         preferred_element_type=jnp.float32)
+        return out.astype(query.dtype)
+
+    return attend
+
+
+def _unnormalized(family: Family) -> Callable:
+    """A reference that narrows its weights at the row's maximum unnormalized for their product with the
+    values and divides the sums by the fp32 weights' sum after it (FlashAttention's: its `P` in the inputs'
+    dtype, its row sums in fp32), so a small share keeps the bits its denominator would take."""
+    def attend(query, key, value, extra):
+        del extra
+        logits = jnp.einsum("bqhd,bkhd->bhqk", query, key,
+                            preferred_element_type=jnp.float32) * query.shape[-1] ** -0.5
+        logits = jnp.where(jnp.asarray(family.keep), logits, -jnp.inf)
+        weights = jnp.exp(logits - jnp.max(logits, axis=-1, keepdims=True))
+        sums = jnp.einsum("bhqk,bkhd->bqhd", weights.astype(value.dtype), value,
+                          preferred_element_type=jnp.float32)
+        return (sums / jnp.swapaxes(weights.sum(axis=-1), 1, 2)[..., None]).astype(query.dtype)
+
+    return attend
+
+
+REFERENCE_FORMS = {"jax's attention": lambda family: _reference(family, anchored=False),
+                   "normalized first": _normalized_first, "unnormalized": _unnormalized}
+"""The references' forms a share in bf16's subnormal band is held to (`BAND_FAMILIES`)."""
+
+
+@pytest.mark.parametrize("form", REFERENCE_FORMS)
+@pytest.mark.parametrize("family", BAND_FAMILIES)
+def test_a_share_in_bf16s_subnormal_band_is_on_par_with_every_references_form(family, form):
+    """The plain-JAX mainloop's output and gradients over a share in bf16's subnormal band on a value near
+    its largest (`_subnormal_band`), check 1 against each reference form a site of Dew's names
+    (`REFERENCE_FORMS`): jax's attention, which normalizes its weights before narrowing them, torch's math
+    path, which rounds its logits to the inputs' dtype first, and FlashAttention's, which narrows them
+    unnormalized and keeps the bits a share's denominator would take. The scaled walk takes the share's
+    weight, below fp32's least normal at its row's scale, in its small weights' product, raised
+    (`algebra.at_scale`)."""
+    seeds, cases = SEEDS[family], FAMILIES[family]
+    draw = _cast(cases, cases.draw)
+    # Every row of the family is scaled (its training residuals' shift past 0), so the share takes the small
+    # weights' product.
+    query, key, value, _, _ = draw(0)
+    *_, split = attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                                query, key, value, _spans(cases, query, key), residuals=True)
+    assert np.all(np.asarray(split.shift) > 0)
+    reference = as_given(jax.jit(with_gradients(REFERENCE_FORMS[form](cases))))
+    truth = with_gradients(_reference(cases, anchored=True))
+    portable = jax.jit(with_gradients(_mainloops(cases, {})["portable"]))
+    assert_as_exact(portable, reference, draw, f"portable against {form}", seeds=seeds, truth_fn=truth)
 
 
 MOSAIC_FAMILIES = [family for family in TEMPLATE_FAMILIES if _mosaic_takes(FAMILIES[family])]
@@ -960,31 +1129,30 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",
                        "a small column beside an overflowing one",
                        "a cotangent on a small column beside an overflowing one",
-                       "a column near fp32's least normal beside an overflowing one")
+                       "a column near fp32's least normal beside an overflowing one",
+                       "a resumed state beside an overflowing column")
 """The families whose Pallas-Triton default-form check runs on a GPU alone, compiled as its route runs it
-(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (137 to 257
-s, rows 1849, 2193; `GPU_ONLY`)."""
+(tests/test_gpu_attention.py): their draws interpreted take past the CPU suite's 120 s target (123 to 257
+s, rows 1849, 2193, 4344; `GPU_ONLY`)."""
 
 
-@pytest.mark.parametrize("family", [
-    family for family in TEMPLATE_FAMILIES
-    if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES])
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
+                                    if family not in GPU_TRITON_FAMILIES])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_truth_is_at_fp32s_edges(family):
-    """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
-    fp32's largest (`default_is_finite`): it guards its sums' headroom in either form, as the template's
-    production route runs it on an sm80 or later GPU. It
-    walks without the fold's reach (`algebra.walked`), so the fold's other divergences remain an open
-    defect (ledger 1637)."""
+    """The Triton mainloop's default form finite over every family (`default_is_finite`): its rows' sums
+    scaled where they could pass fp32's largest (`algebra.SCALED_WALK`) and its launches under the fold's
+    guard as the Mosaic mainloop's are (`algebra.walked_launches`), as the template's production route runs
+    it on an sm80 or later GPU (ledger 1637)."""
     default_is_finite(family, "triton")
 
 
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
                                     if FAMILIES[family].overflows and family not in GPU_ONLY["frozen rows"]])
-def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
+def test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass(family):
     """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
-    pass fp32's largest, finite wherever the rounded truth is: a guarded forward's live rows carry normalized
-    split sums, which only the split pass reads, so it takes that pass wherever the values can overflow
-    (`attention_triton.backward`), in either form."""
+    pass fp32's largest, finite wherever the rounded truth is: the forward's rows hold their sums at their
+    scale (`algebra.SCALED_WALK`, `Split.shift`), and the backward takes D from them, the split pass,
+    wherever the values can be scaled (`attention_triton.backward`), in either form."""
     seeds, family_of = SEEDS[family], FAMILIES[family]
 
     def forward(*operands):
@@ -1003,11 +1171,9 @@ def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_p
 def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     """fp32, the default form: one query over one key of logit m0 = 24576.005859375 (folded below the fold's
     reach, `algebra.FOLD_REACH`, and naturalized back below m0), resumed from a state of maximum m0,
-    denominator 1 and values 1023 * 2^118, the key's value the same: the plain walk's weighted values
-    overflow, so the guarded walk's live row takes its split sums from the normalized pass, whose share of
-    the state is taken at the walk's own maximum, at most 1 (`algebra.normalized_pass`); at the naturalized
-    one it passed 1 and overflowed the share. The plain-JAX mainloop's output and gradients are finite, as
-    the reference's are (`_resumed_attention`)."""
+    denominator 1 and values 1023 * 2^118, the key's value the same: their weighted sum passes fp32's
+    largest, which the walk's sums, at the row's scale (`algebra.SCALED_WALK`), never hold. The plain-JAX
+    mainloop's output and gradients are finite, as the reference's are (`_resumed_attention`)."""
     m0, size = 24576.005859375, 1023.0 * 2.0 ** 118
 
     def first(fill, *shape):
@@ -1152,13 +1318,79 @@ DECODED_ON_CPU = [case for case in DECODED if case not in GPU_ONLY["decode"]]
 @pytest.mark.parametrize("family, form", DECODED_ON_CPU,
                          ids=[f"{family}-{form}" for family, form in DECODED_ON_CPU])
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
-    """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its guarded launch and merge),
+    """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its launch and merge),
     each row's keys the first `K` of its cache, check 1 over the family's draws."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, FORMS[form])
     assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
                     f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
+
+
+TEMPLATE_DECODED = list(dict.fromkeys(family for family, _ in DECODED
+                                     if jnp.dtype(FAMILIES[family].dtype).itemsize == 2
+                                     and not FAMILIES[family].decode_only))
+"""The decode steps the template's decode takes (`attention_decode.attend`), in its one form, the raw fold
+(no fold's reach, as the decode kernel's): 16-bit operands; a decode step's alone (`Family.decode_only`) too
+long for its interpreted mainloop."""
+
+
+@pytest.mark.skipif(not INTERPRETED and generation.device_generation() != "sm90",
+                    reason="the template's decode runs on warpgroup MMA's Mosaic mainloop")
+@pytest.mark.parametrize("family", TEMPLATE_DECODED)
+def test_the_template_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):
+    """The template's decode (`attention_decode.attend`: packed rows, sliced keys, merged), interpreted on a
+    CPU as an H100 runs it and compiled on an H100, each row's keys its first `K`: check 1 over the family's
+    draws, as the decode kernel it replaces is held (testing.md: decode holds the default's claims)."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+    lengths = family.spans.get("lengths")
+
+    def decoded(query, key, value, sinks):
+        count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
+        spans = template.spans(1, key.shape[1], query.shape[0], lengths=jnp.asarray(count, jnp.int32))
+        hooks = (None if sinks is None
+                 else template.Hooks(initial=template.sinks(sinks, query.shape[0], 1, value.shape[-1])))
+        target = generation.assumed("sm90") if INTERPRETED else contextlib.nullcontext()
+        with target:
+            return attention_decode.attend(query, key, value, spans, hooks, interpret=INTERPRETED)
+
+    def forward(seed):
+        return _cast(family, family.draw)(seed)[:4]
+
+    assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
+                    f"template decode {family.dtype}", seeds=seeds,
+                    truth_fn=_reference(family, anchored=True))
+
+def test_a_decode_steps_logits_past_the_folds_reach_weigh_as_the_references():
+    """bf16, the default form: one query over two keys whose products are 2^30 and 2^30 + 128, an fp32 ulp
+    apart (logits 2^28 and 2^28 + 32), their values the first two unit vectors: the reference weighs the
+    first exp(-32). A fold that scales each logit before the difference (`algebra.Forward.base2`) rounds it
+    at log2(e) times its size, 32 here, and weighed the first exp2(-32), 2.3e-10 against 1.27e-14; the decode
+    kernel's raw fold (`algebra.Forward.subtracted`) scales the raw products' difference after it is taken,
+    so its output is the float64 truth's in bf16, one slice or two, with no natural rewalk (row 1955)."""
+    width = 16
+
+    def first(rows, *fills):
+        array = np.zeros((1, rows, 1, width), np.float32)
+        for at, fill in fills:
+            array[(0, *at)] = fill
+        return jnp.asarray(array, jnp.bfloat16)
+
+    query = first(1, ((0, 0, 0), 2.0 ** 15), ((0, 0, 1), 1.0))
+    key = first(2, ((0, 0, 0), 2.0 ** 15), ((1, 0, 0), 2.0 ** 15), ((1, 0, 1), 128.0))
+    value = first(2, ((0, 0, 0), 1.0), ((1, 0, 1), 1.0))
+    logits = np.asarray([2.0 ** 28, 2.0 ** 28 + 32])
+    weights = np.exp(logits - logits.max()) / np.exp(logits - logits.max()).sum()
+    truth = np.zeros(width, np.float64)
+    truth[:2] = weights
+    for splits in (1, 2):
+        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+        with target, tuning.pinned({decode_attention.DecodeAttention: decode_attention.Split(splits)}):
+            out = decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray([2], jnp.int32),
+                                          interpret=INTERPRETED)
+        np.testing.assert_array_equal(np.asarray(out[0, 0, 0]), np.asarray(truth.astype(jnp.bfloat16)),
+                                      err_msg=f"{splits} slices")
+
 
 DECODED_OVERFLOWS = list(dict.fromkeys(family for family, _ in DECODED if FAMILIES[family].overflows))
 """The decode steps (`DECODED`) whose one divergence in the default form is their sums passing fp32's
@@ -1169,7 +1401,7 @@ largest."""
 def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
     """The decode kernel's default form, interpreted on a CPU and compiled on a GPU, finite wherever the
     rounded truth is (`assert_finite`) over the families whose weighted values' sums pass fp32's largest: it
-    guards its sums' headroom in either form (`algebra.Forward.headroom`)."""
+    scales its rows' sums in either form (`algebra.SCALED_WALK`)."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, None)
     assert_finite(jax.jit(decoded), _reference(family, anchored=True), forward,
@@ -1181,12 +1413,14 @@ SUBNORMAL_SHARE_SEEDS = {"float32": 8, "bfloat16": 16}
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
-    """The subnormal-share family's training forward in both mainloops: every row overflows, so its split
-    sums are the normalized pass's (shift -1, the anchor its largest logit's key). The share of the key whose
-    normalized weight is below fp32's least normal, alone in `B`'s second column, held element-wise to
-    float64 as exactly as the reference's own fp32 arithmetic for it (its weight `e / T` and that times the
-    value), each share a row of one value (check 1 over the family's draws): a check of its rows, which a
+def test_a_scaled_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
+    """The subnormal-share family's training forward in both mainloops: every row's sums would pass fp32's
+    largest, so its split sums are at its scale (`algebra.SCALED_WALK`, its shift the scale's exponent, the
+    anchor its largest logit's key). The share of the key whose normalized weight is below fp32's least
+    normal, its weight at the row's scale below it too (taken in the small weights' product, raised,
+    `algebra.at_scale`), alone in `B`'s second column, over the denominator at that scale, held element-wise
+    to float64 as exactly as the reference's own fp32 arithmetic for it (its weight `e / T` and that times
+    the value), each share a row of one value (check 1 over the family's draws): a check of its rows, which a
     leaf's RMS beside the first column's would not see."""
     draw = _cast(Family(_subnormal_share, np.ones((64, 1, 1, 256), bool), dtype=dtype), _subnormal_share)
     spans = template.spans(1, 256, 64)
@@ -1216,18 +1450,21 @@ def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
                                             interpret=INTERPRETED)
 
     def portable(query, key, value, *_):
-        return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, residuals=True, natural=True)
+        return attention_portable.xla_mainloop(attention_portable.Tiles(32, 32, attention_triton.BLOCK),
+                                               query, key, value, spans, residuals=True, natural=True)
 
     for name, attend in (("triton", triton), ("portable", portable)):
         query, key, _, _, _ = draw(0)
-        _, _, _, anchors, split = attend(*draw(0))
-        np.testing.assert_array_equal(np.asarray(split.shift), -1.0, err_msg=name)
+        _, _, _, anchors, _ = attend(*draw(0))
         np.testing.assert_array_equal(np.asarray(anchors), logits_of(query, key, np.float64).argmax(axis=-1),
                                       err_msg=name)
         @as_given
         def found(*drawn, attend=attend):
-            return np.asarray(attend(*drawn)[4].others[..., 1], np.float64)[..., None]
+            # `B`'s second column over the denominator at the row's scale, in float64: no rounding of ours.
+            _, _, total, _, split = attend(*drawn)
+            shift = np.exp2(np.asarray(split.shift, np.float64))
+            others = np.asarray(split.others[..., 1], np.float64) * shift
+            return (others / np.asarray(total, np.float64))[..., None]
 
         assert_as_exact(found, fp32, draw, f"{name} {dtype} subnormal share",
                         seeds=SUBNORMAL_SHARE_SEEDS[dtype], truth_fn=exact)

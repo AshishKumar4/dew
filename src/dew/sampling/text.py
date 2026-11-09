@@ -95,6 +95,7 @@ from dew.sampling.decoding import (
     Typical,
 )
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Speculative, Strategy
+from dew.sampling.trees import TreeBlock
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
@@ -544,6 +545,18 @@ def _refuse_generation(model: nn.Module) -> None:
         raise ValueError(refusal)
 
 
+def _step_places(state: DecoderState, width: int, tree: TreeBlock | None, capacity: int | None
+                 ) -> tuple[dict[str, jax.Array], jax.Array | None]:
+    """A decode step's attention visibility and its tokens' places: a tree's tokens each read the row's prefix
+    and their own ancestors, at their depths' places (`TreeBlock`); a chain's each its predecessors, at the
+    places the rows reach. A windowed layer windows the runs over the keys' places (`call_visibility`): the
+    prefix's slots' as the chain's cache reads them, a node's its depth past the root's."""
+    if tree is not None:
+        return ({"attention_key_runs": tree.runs(), "attention_key_positions": tree.key_positions(capacity)},
+                tree.positions())
+    return {}, None if state.positions is None else state.positions[:, None] + jnp.arange(width)[None, :]
+
+
 def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None,
                progress: Progress = END) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
@@ -576,20 +589,21 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     depths = depths or 0
     recorded = [] if blocks is None else ["prediction_inputs"]
     original = rebuild_position(model)
+    capacity = model.max_seq_len if isinstance(model, Bounded) else None
 
-    def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True
-            ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
+    def run(state: DecoderState, tokens: jax.Array, valid: jax.Array, *, rebuilds: bool = True,
+            tree: TreeBlock | None = None) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
+        visibility, places = _step_places(state, width, tree, capacity)
 
         def append(valid):
-            # The step's tokens laid out once (`Coordinates`): the real ones, at the places the rows reach.
-            laid = laid_out(tokens.shape, valid=valid, positions=None if state.positions is None else
-                            state.positions[:, None] + jnp.arange(width)[None, :])
+            # The step's tokens laid out once (`Coordinates`): the real ones, at their places.
+            laid = laid_out(tokens.shape, valid=valid, positions=places)
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
                 decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
                 method="states_and_logits" if exposed else None, capture_intermediates=False, **at,
-                **adapter_field(state.adapters))
+                **adapter_field(state.adapters), **visibility)
 
         history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         if original is not None and history is not None and lengths is not None:
@@ -650,11 +664,13 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     # `run`'s rebuild reseeds the depths through these ops, bound once they are made.
     crossed = None if original is None else functools.partial(crosses, original)
     if blocks is not None:
-        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1], crosses=crossed)
+        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1], crosses=crossed,
+                         capacity=capacity)
     elif not depths or not exposed:
-        made = DecodeOps(advance, reindex, run, crosses=crossed)
+        made = DecodeOps(advance, reindex, run, crosses=crossed, capacity=capacity)
     else:
-        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths, crosses=crossed)
+        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths, crosses=crossed,
+                         capacity=capacity)
     return made
 
 
@@ -777,7 +793,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
-    drafting = isinstance(strategy, Speculative)
+    drafting = isinstance(strategy, Speculative | strategies.TreeSpeculative)
     ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None, progress)
     state, real = prefill_state(model, params, inputs, ops, rounding=rounding_keys(keys), progress=progress)
     start = StepState(

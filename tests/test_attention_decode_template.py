@@ -13,11 +13,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS
+from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_decode
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_decode,
+    bundles,
+)
 
 KEYS = 256
 SEEDS = 8
@@ -45,14 +50,26 @@ def _hooks(hook: str, heads: int, positions: int, sinks: jax.Array) -> template.
     return None
 
 
-def _drawn(positions: int, heads: int, kv_heads: int, dtype):
+def _drawn(positions: int, heads: int, kv_heads: int, dtype, width: int = 64):
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 4)
-        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, 64), dtype)
-        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, 64), dtype)
+        query = jax.random.normal(streams[0], (len(LENGTHS), positions, heads, width), dtype)
+        key, value = (jax.random.normal(stream, (len(LENGTHS), KEYS, kv_heads, width), dtype)
                       for stream in streams[1:3])
         sinks = jax.random.normal(streams[3], (heads,), jnp.float32)
         return query, key, value, sinks
+
+    return draw
+
+
+def _operands(query_shape: tuple[int, ...], keys: int):
+    """A draw of bf16 queries `query_shape` `[rows, T, 8, 64]` and two rows' keys and values over `keys`, two
+    heads 64 wide."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], query_shape, jnp.bfloat16)
+        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.bfloat16) for stream in streams[1:])
+        return query, key, value
 
     return draw
 
@@ -61,14 +78,16 @@ def _drawn(positions: int, heads: int, kv_heads: int, dtype):
 @pytest.mark.parametrize("hook", HOOKS)
 @pytest.mark.parametrize("call", CALLS)
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
-def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dtype):
-    """A decode step through the template (`attention_decode.attend`) under the interpreter as an H100 runs
-    it, on par with the reference path over the same keys (check 1): packed, sliced and merged."""
+@pytest.mark.parametrize("device", ["sm90", "sm80"])
+def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dtype, device):
+    """A decode step through the template (`attention_decode.attend`) under the interpreter as an H100 or an
+    A100 runs it, its few packed rows a 16-row tile of mma.sync's (row 4042), on par with the reference path
+    over the same keys (check 1): packed, sliced and merged."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
 
     def ours(query, key, value, sinks):
-        with generation.assumed("sm90"):
+        with generation.assumed(device):
             return attention_decode.attend(query, key, value, spans, _hooks(hook, heads, positions, sinks),
                                            interpret=True)
 
@@ -76,19 +95,49 @@ def test_a_decode_step_through_the_template_is_on_par_interpreted(call, hook, dt
         return template.reference(query, key, value, spans, _hooks(hook, heads, positions, sinks))
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(positions, heads, kv_heads, dtype),
-                    f"template decode {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
+                    f"template decode {device} {call} {hook} {jnp.dtype(dtype).name}", seeds=SEEDS)
+
 
 
 @INTERPRETS
+def test_a_256_wide_decode_step_whose_split_launch_does_not_fit_is_on_par_interpreted():
+    """A 256-wide bf16 decode step (Qwen3.5-0.8B's heads: 8 query heads over 2 key heads) on an H100, whose
+    split launch's fp32 slices and the query's stage pass its shared memory, runs a slice a row through the
+    template (`attention_decode.plan`), on par with the reference path (check 1)."""
+    spans = _spans(1)
+
+    def ours(query, key, value, sinks):
+        del sinks
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, None, interpret=True)
+
+    def reference(query, key, value, sinks):
+        del sinks
+        return template.reference(query, key, value, spans, None)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(1, 8, 2, jnp.bfloat16, 256),
+                    "template decode 256 wide bfloat16", seeds=SEEDS)
+
+@INTERPRETS
+@pytest.mark.parametrize("page", [None, 4])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
-def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted(call):
+def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interpreted(call, page):
     """A decode step whose first row's query is 2^16 times a drawn one (its folded logits past
     `algebra.FOLD_REACH`, where the fold's rounding moves its weights) and whose second row's is drawn: the
     first row walked again in the natural form by the masked launch (`algebra.walked_launches`), the second
-    kept folded, each on par with the reference path (check 1)."""
+    kept folded, each on par with the reference path (check 1); over a dense cache, and a paged pool of
+    4-key pages, whose rewalk at its own tiles reads them through the one-key table its gather does
+    (`attention_mosaic_forward.paged_reads`)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     drawn = _drawn(positions, heads, kv_heads, jnp.bfloat16)
+    table = None if page is None else jnp.asarray(
+        np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page), jnp.int32)
+
+    def pooled(cache):
+        # [B, K, KV, D] as pools [KV, P, page, D] holding each row's keys at the pages its table names.
+        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
+        return pages[:, jnp.argsort(table.reshape(-1))]
 
     def draw(seed: int):
         query, key, value, _ = drawn(seed)
@@ -96,10 +145,40 @@ def test_a_decode_rows_logits_past_the_folds_reach_walk_again_natural_interprete
 
     def ours(query, key, value):
         with generation.assumed("sm90"):
-            return attention_decode.attend(query, key, value, spans, interpret=True)
+            if table is None:
+                return attention_decode.attend(query, key, value, spans, interpret=True)
+            return attention_decode.attend(query, pooled(key), pooled(value), spans, interpret=True,
+                                           table=table)
 
     assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
-                    f"template decode past the fold's reach {call}", seeds=SEEDS)
+                    f"template decode past the fold's reach {call} {'dense' if page is None else page}",
+                    seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("far", [False, True], ids=["no-rewalk", "a-row-rewalked"])
+@pytest.mark.parametrize("call", ["one-query", "verify-four"])
+def test_every_output_a_decode_steps_launches_declare_is_written_interpreted(call, far):
+    """Each launch of a decode step writes every output it declares on every path (NSNAN-2): its masked
+    rewalk, whose programs that walk nothing write nothing, rewalks into the plain launch's outputs in place
+    and declares none of its own, a merging walk's unsplit. Under JAX's NaN check (`jax.debug_nans`), which
+    the Mosaic interpreter's unwritten outputs (NaN) trip, a step whose rows need no rewalk and one whose
+    first row's query is 2^16 times a drawn one (past the fold's reach, rewalked natural) run op by op, so
+    the check reads each launch's outputs, their result bit for bit the unchecked run's."""
+    positions, heads, kv_heads = CALLS[call]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    if far:
+        query = query.at[0].multiply(2.0 ** 16)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    unchecked = np.asarray(ours(query, key, value))
+    with jax.debug_nans(new_val=True):
+        checked = np.asarray(ours(query, key, value))
+    assert checked.tobytes() == unchecked.tobytes()
 
 
 @INTERPRETS
@@ -119,10 +198,6 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
 
     def ours(query, key, value, sinks):
         with generation.assumed("sm90"):
-            rows, row_spans, _ = attention_decode.packed(query, spans, heads)
-            work = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
-                                         target=generation.gpu_target())
-            assert work.slices == 1, work
             return attention_decode.attend(query, key, value, spans, hooked(sinks), interpret=True)
 
     def draw(seed: int):
@@ -136,6 +211,25 @@ def test_a_decode_step_whose_programs_fill_the_gpu_finishes_each_row_in_its_walk
 
     assert_as_exact(jax.jit(ours), jax.jit(lambda q, k, v, s: template.reference(q, k, v, spans, hooked(s))),
                     draw, f"template decode of one slice a row {hook}", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_split_decode_step_at_aligned_keys_beside_an_empty_row_is_on_par_interpreted():
+    """A decode step on an H100 of two rows over 4096 keys, its four programs' keys cut into slices (`plan`)
+    whose states merge by their masses (`algebra.merged_slices`): the first row reads every key, whole key
+    tiles and whole slices, the second none. On par with the reference path (check 1), the empty row zero.
+    The merge at fp32's edges is the stability suite's (tests/test_attention_stability.py's template
+    decode at fp32's edges)."""
+    keys = 4096
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, 0], jnp.int32))
+    draw = _operands((2, 1, 8, 64), keys)
+
+    def ours(query, key, value):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans, interpret=True)
+
+    assert_as_exact(jax.jit(ours), jax.jit(lambda *operands: template.reference(*operands, spans)), draw,
+                    "template decode split at aligned keys", seeds=SEEDS)
 
 
 @INTERPRETS
@@ -156,14 +250,8 @@ def test_a_work_lists_rows_read_their_cache_rows_in_place_interpreted():
     def reference(query, key, value):
         return template.reference(query, key[sources], value[sources], spans)
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        query = jax.random.normal(streams[0], (3, 4, 8, 64), jnp.bfloat16)
-        key, value = (jax.random.normal(stream, (2, KEYS, 2, 64), jnp.bfloat16) for stream in streams[1:])
-        return query, key, value
-
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode over a work list's rows",
-                    seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _operands((3, 4, 8, 64), KEYS),
+                    "template decode over a work list's rows", seeds=SEEDS)
 
 
 @INTERPRETS
@@ -215,19 +303,61 @@ def a_verify_block_through_the_route_is_on_par(drafts: int) -> None:
                     f"verify block of {drafts} through the route", seeds=SEEDS)
 
 
+def served_small_pages() -> tuple[int, ...]:
+    """The pages fewer than a key tile holds whose decode this GPU's family serves
+    (`attention_mosaic._pages_hold`): 16, 4 and 1 key where its loading warpgroup gathers a tile's rows
+    through the table (`Transport.gathers_rows`), none where it does not."""
+    family = bundles.of(generation.device_generation(), jnp.bfloat16)
+    return (16, 4, 1) if family.gathers_rows else ()
+
+
+def a_paged_decode_step_of_small_pages_is_on_par(page: int) -> None:
+    """A GPU cell (tests/test_gpu_attention.py): a decode step over a paged pool of `page` keys a page, fewer
+    than its key tile holds, compiled on this GPU, its tiles' rows gathered through the table by the loading
+    warpgroup's cp.async copies (`gathered.Ring`, row 4772), 32 query heads over 8 key heads over 4096 keys
+    in a shuffled table: on par with the reference path over the pool gathered dense (check 1)."""
+    keys, kv_heads = 4096, 8
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+    per_row = keys // page
+    table = jnp.asarray(np.random.default_rng(page).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+
+    def gathered(pool):
+        rows = pool[:, table]
+        return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(2, keys, kv_heads, pool.shape[-1])
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jax.random.normal(streams[0], (2, 1, 32, 128), jnp.bfloat16)
+        pools = (jax.random.normal(stream, (kv_heads, 2 * per_row, page, 128), jnp.bfloat16)
+                 for stream in streams[1:])
+        return (query, *pools)
+
+    def ours(query, key_pool, value_pool):
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+
+    def reference(query, key_pool, value_pool):
+        return template.reference(query, gathered(key_pool), gathered(value_pool), spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"paged decode of {page}-key pages on a GPU",
+                    seeds=SEEDS)
+
+
 PAGE = 128
 """A paged cache's keys a page: whole key tiles of the derived decode launch's."""
 
 
 @INTERPRETS
-@pytest.mark.parametrize("page", [PAGE, 16])
+@pytest.mark.parametrize(("device", "page"),
+                         [("sm90", PAGE), ("sm90", 16), ("sm90", 1), ("sm80", 16), ("sm80", 4), ("sm80", 1)])
 @pytest.mark.parametrize("call", ["one-query", "verify-four"])
-def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page):
+def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, page, device):
     """A decode step over a paged cache (pools `[KV, P, page, D]` and their page table, each row's pages in an
     order of its own, some the other row's neighbours), read by the template where its table maps each key
     tile, on par with the reference path over the cache gathered dense (check 1): pages of whole key tiles,
-    and pages of 16 keys, the docs' (docs/concepts/inference.md), several to a key tile, each loaded on its
-    own (`mosaic.Pieces`, row 3648)."""
+    and pages of 16, 4 and 1 keys, the docs' (docs/concepts/inference.md), several to a key tile, its rows
+    gathered through the table a key at a time (`attention_mosaic_forward.paged_reads`, row 4772): an
+    H100's by its loading warpgroup's ring, an A100's by its one warpgroup's cp.async copies in its
+    pipeline's groups (`mosaic_sm80._gathered_walk`)."""
     positions, heads, kv_heads = CALLS[call]
     spans = _spans(positions)
     per_row = KEYS // page
@@ -239,7 +369,7 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
         return jnp.transpose(rows, (1, 2, 3, 0, 4)).reshape(len(LENGTHS), KEYS, kv_heads, pool.shape[-1])
 
     def ours(query, key_pool, value_pool):
-        with generation.assumed("sm90"):
+        with generation.assumed(device):
             return attention_decode.attend(query, key_pool, value_pool, spans, interpret=True, table=table)
 
     def reference(query, key_pool, value_pool):
@@ -252,20 +382,83 @@ def test_a_paged_decode_step_through_the_template_is_on_par_interpreted(call, pa
                  for stream in streams[1:])
         return query, *pools
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call} {page}",
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"template paged decode {call} {page} {device}",
                     seeds=SEEDS)
 
 
+
+QUANTIZED = [(device, page, stored) for stored in ("int8", "float8_e4m3fn")
+             for device, page in (("sm90", "dense"), ("sm90", 16), ("sm80", "dense"), ("sm80", 16),
+                                  ("sm80", 128))
+             if stored == "int8" or device == "sm90"]
+"""The quantized decode's devices, layouts and codes: dense, pages of 16 keys several to a key tile, their
+rows gathered (`Transport.gathers_rows`), and on an A100 of whole key tiles; FP8 codes where the device
+converts them (`mosaic.converts`, sm_89 on)."""
+
+
+@INTERPRETS
+@pytest.mark.parametrize(("device", "page", "stored"), QUANTIZED)
+def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page, stored):
+    """A decode step over a quantized cache (`dew.nn.kv_cache.quantize`: codes a token and head, each with its
+    fp32 scale), its codes read and dequantized in the walk (`attention_decode.attend`'s `scales`, ledger
+    3624), dense or paged (`QUANTIZED`), on par with the reference path over the keys and values the cache
+    dequantizes them to (check 1), as an H100 and an A100 run it."""
+    from dew.nn.kv_cache import dequantize, quantize
+
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    layout = "dense" if page == "dense" else "paged"
+    page = KEYS if page == "dense" else page
+    per_row = KEYS // page
+    table = jnp.asarray(np.random.default_rng(7).permutation(2 * per_row).reshape(2, per_row), jnp.int32)
+
+    def pooled(rows):
+        # `[B, K, KV, ...]` as a pool `[KV, P, page, ...]` holding row `b`'s page `j` at `table[b, j]`.
+        held = jnp.moveaxis(rows.reshape(len(LENGTHS), per_row, page, *rows.shape[2:]), 3, 0)
+        pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
+        return pool.at[:, table].set(held)
+
+    def ours(query, key, value):
+        (k_codes, k_scale), (v_codes, v_scale) = (quantize(array, stored) for array in (key, value))
+        scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
+        with generation.assumed(device):
+            if layout == "dense":
+                return attention_decode.attend(query, k_codes, v_codes, spans, interpret=True, scales=scales)
+            return attention_decode.attend(query, pooled(k_codes), pooled(v_codes), spans, interpret=True,
+                                           table=table, scales=scales)
+
+    def reference(query, key, value):
+        dequantized = (dequantize(*quantize(array, stored), query.dtype) for array in (key, value))
+        return template.reference(query, *dequantized, spans)
+
+    def draw(seed: int):
+        query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
+        return query, key, value
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"quantized decode {layout} {page} {stored} {device}", seeds=SEEDS)
+
+
 def test_packing_a_calls_heads_into_its_rows_is_undone_by_unpacking():
-    """A key head's group of query heads as its rows (`packed`) and back (`unpacked`): the query as it was,
-    each packed row's keys its query's."""
+    """A key head's group of query heads as its rows (`packed`) and back (`template.ungrouped_rows`): the
+    query as it was, each packed row's keys its query's."""
     query = jax.random.normal(jax.random.key(0), (2, 3, 8, 16))
     spans = _spans(3)
     rows, row_spans, _ = attention_decode.packed(query, spans, 2)
-    assert rows.shape == (2, 12, 2, 16)
-    np.testing.assert_array_equal(attention_decode.unpacked(rows, 8), query)
-    np.testing.assert_array_equal(row_spans.start, np.repeat(np.asarray(spans.start), 4, axis=1))
+    np.testing.assert_array_equal(template.ungrouped_rows(rows, 8), query)
+    np.testing.assert_array_equal(row_spans.per_query().start,
+                                  np.repeat(np.asarray(spans.per_query().start), 4, axis=1))
 
+
+
+def test_a_packed_steps_spans_mean_its_rows_own_to_every_reader():
+    """A decode step's packed rows keep one interval a position (`KeySpans.per_span`); every mainloop and the
+    reference read them as each row's own: the reference over the packed rows and spans is the reference over
+    the same rows with an interval a row, bit for bit (row 4487)."""
+    query, key, value, _ = _drawn(4, 8, 2, jnp.float32)(0)
+    rows, packed_spans, _ = attention_decode.packed(query, _spans(4), 2)
+    np.testing.assert_array_equal(template.reference(rows, key, value, packed_spans),
+                                  template.reference(rows, key, value, packed_spans.per_query()))
 
 def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each slice's softmax state over its keys `cuts[s]` to `cuts[s + 1]`, and one more of no key: its output
@@ -286,6 +479,27 @@ def _states(logits: jax.Array, values: jax.Array, cuts) -> tuple[jax.Array, jax.
     return jnp.stack(outs, axis=1), maximum, total
 
 
+@COMPILES_ON_CPU
+@pytest.mark.parametrize("page", [16, 4, 1])
+def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100(page):
+    """A decode step over a paged pool of `page` keys a page, fewer than its derived key tile holds, lowered
+    and compiled for an H100 (compile-only, `kernel_compile.lowered_for`): its key tiles' rows gathered
+    through the table by the loading warpgroup's cp.async copies (`gathered.Ring`, row 4772), whatever the
+    page, where pages under 8 keys derived no launch before."""
+    from kernel_compile import lowered_for
+
+    keys, kv_heads, width = 4096, 8, 128
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+    query = jax.ShapeDtypeStruct((2, 1, 32, width), jnp.bfloat16)
+    pool = jax.ShapeDtypeStruct((kv_heads, 2 * keys // page, page, width), jnp.bfloat16)
+    table = jax.ShapeDtypeStruct((2, keys // page), jnp.int32)
+
+    def decode(query, key_pool, value_pool, table):
+        return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
+
+    assert "mosaic_gpu" in lowered_for(decode, (query, pool, pool, table), "sm90").compile().as_text()
+
+
 @pytest.mark.parametrize("slices", [1, 3, 7])
 def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices):
     """Slices of a row's keys, each its output normalized, its maximum and its denominator, a slice of no
@@ -297,7 +511,7 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
         initial = template.Initial(sink, jnp.ones_like(sink), jnp.zeros((*sink.shape, values.shape[-1])))
         spec = algebra.Forward("spans", 40, ids=False, scale=1.0, natural=True, initial=True)
         out, maximum, total = _states(logits, values, cuts)
-        return attention_decode.merged(spec, out, maximum, total, initial)
+        return algebra.merged_slices(spec, out, maximum, total, initial)
 
     def whole(logits, values, sink):
         scores = jnp.concatenate([logits, jnp.transpose(sink, (0, 2, 1))[..., None]], axis=-1)
@@ -310,3 +524,76 @@ def test_merging_a_rows_slices_and_its_initial_state_is_its_whole_softmax(slices
                 jax.random.normal(streams[1], (2, 3, 1, 40, 8)), jax.random.normal(streams[2], (2, 1, 3)))
 
     assert_as_exact(jax.jit(ours), jax.jit(whole), draw, f"decode merge over {slices} slices", seeds=SEEDS)
+
+
+
+RESUMED = 1e38
+"""A resumed state's maximum, finite, past fp32's largest in a raw fold's units at a scale of 1/8 (fp16's
+decode 64 wide leaves its scale whole, `template.prescale`): audit A6's, infinite there unsaturated."""
+
+
+def _resumed(maximum: jax.Array, acc: jax.Array) -> template.Initial:
+    """A resumed state of `maximum` `[..., Q]` whose first row's is `RESUMED`, a denominator of 1 and the
+    sums `acc`."""
+    return template.Initial(maximum.at[0].set(RESUMED), jnp.ones_like(maximum), acc)
+
+
+@pytest.mark.parametrize("slices", [1, 3])
+def test_merging_slices_with_a_resumed_maximum_past_fp32s_largest_in_raw_units_keeps_its_share(slices):
+    """A row's slices in the raw fold's units fp16's decode takes (`attention_decode._spec`: a scale of 1/8),
+    merged in XLA with a resumed state whose first row's maximum is `RESUMED` (`algebra.merged_slices`): the
+    state's maximum saturates there as the walk's does (`algebra.initial_state`, `raw_maximum`), so that row
+    is the state's own sums over its denominator, every row on par with the whole softmax (check 1)."""
+    cuts = np.linspace(0, 40, slices + 1).astype(int)
+    spec = attention_decode._spec(jnp.zeros((2, 3, 1, 64), jnp.float16), template.spans(3, 40, 2),
+                                  template.Hooks(), scale=None)
+
+    def ours(logits, values, maximum, acc):
+        out, peak, total = _states(logits, values, cuts)
+        return algebra.merged_slices(spec, out, peak / spec.scale, total, _resumed(maximum, acc))
+
+    def whole(logits, values, maximum, acc):
+        initial = _resumed(maximum, acc)
+        m = jnp.transpose(initial.m, (0, 2, 1))
+        peak = jnp.maximum(jnp.max(logits, axis=-1), m)
+        weights, own = jnp.exp(logits - peak[..., None]), jnp.exp(m - peak)
+        state = own[..., None] * jnp.swapaxes(initial.acc, 1, 2)
+        sums = jnp.einsum("bqhk,bqhkd->bqhd", weights, values) + state
+        return sums / (jnp.sum(weights, axis=-1) + own)[..., None]
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 4)
+        return (4.0 * jax.random.normal(streams[0], (2, 3, 1, 40)),
+                jax.random.normal(streams[1], (2, 3, 1, 40, 8)), jax.random.normal(streams[2], (2, 1, 3)),
+                jax.random.normal(streams[3], (2, 1, 3, 8)))
+
+    assert_as_exact(jax.jit(ours), jax.jit(whole), draw,
+                    f"decode merge resumed past raw fp32 over {slices} slices", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_split_decode_step_resumed_past_fp32s_largest_in_raw_units_keeps_its_share_interpreted():
+    """An fp16 decode step on an H100 of two rows over 4096 keys, 8 query heads over 2 and 64 wide, its keys
+    cut into slices merged with a resumed state whose first row's maximum is `RESUMED`
+    (`Hooks.initial`): the state's maximum saturates in the raw fold's units (`algebra.initial_state`), so
+    that row is the state's own sums over its denominator, on par with the reference path (check 1)."""
+    keys = 4096
+    spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys // 2], jnp.int32))
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 5)
+        query = jax.random.normal(streams[0], (2, 1, 8, 64), jnp.float16)
+        key, value = (jax.random.normal(stream, (2, keys, 2, 64), jnp.float16) for stream in streams[1:3])
+        return (query, key, value, jax.random.normal(streams[3], (2, 8, 1)),
+                jax.random.normal(streams[4], (2, 8, 1, 64)))
+
+    def ours(query, key, value, maximum, acc):
+        with generation.assumed("sm90"):
+            return attention_decode.attend(query, key, value, spans,
+                                           template.Hooks(initial=_resumed(maximum, acc)), interpret=True)
+
+    def reference(query, key, value, maximum, acc):
+        return template.reference(query, key, value, spans, template.Hooks(initial=_resumed(maximum, acc)))
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode split resumed past raw fp32",
+                    seeds=SEEDS)

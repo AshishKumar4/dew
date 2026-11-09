@@ -41,6 +41,7 @@ from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
     POOLED,
     ROW_CURSORS,
+    SCALES,
     TABLE,
     as_words,
     from_words,
@@ -491,9 +492,20 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     flat = jnp.concatenate([jnp.where(fed, last, pad_id), jnp.where(valid, tokens, pad_id).reshape(-1)])
     real = jnp.concatenate([fed, valid.reshape(-1)])
     scored = jnp.concatenate([jnp.arange(rows), rows + jnp.arange(pieces) * width + width - 1])
+    fields = admission.prompts.token_fields
+
+    def grouped(name: str) -> jax.Array | None:
+        """The pieces' tokens' `name` groups (`kv_cache.GROUPS`, image or block) where they carry them, -1 at
+        the fed rows' tokens and at padding, as a prefill of their own reads them; None where they carry
+        none, the model's own default."""
+        if name not in fields:
+            return None
+        return jnp.concatenate([jnp.full((rows,), -1, jnp.int32),
+                                jnp.where(valid, jnp.asarray(fields[name], jnp.int32), -1).reshape(-1)])[None]
     (_, logits), updated = model.apply(
         {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True,
         coordinates=coordinates(flat[None].shape, valid=real[None]),
+        image_groups=grouped("image_groups"), block_groups=grouped("block_groups"),
         admitted=Admitted(slots=admission.slots, cursors=admission.cursors,
                           tables=admission.tables if isinstance(placement, Paged) else None,
                           continuing=placement.continuing),
@@ -643,6 +655,9 @@ def state_shardings(mesh: Mesh | None, state: Slots, *, offloaded: bool = False)
             return placed(leaf, *layers, "activation_batch")
         if paged:
             return placed(leaf, *layers, "activation_kv", "pages")
+        if leaf_name(path) in SCALES:
+            # A dense cache's scales head-major, `[rows, heads, capacity]` (`dew.nn.kv_cache.scale_shape`).
+            return placed(leaf, *layers, "activation_batch", "activation_kv")
         return placed(leaf, *layers, "activation_batch", None, "activation_kv")
 
     rows = jax.tree.map(lambda leaf: placed(leaf, "activation_batch"), state)

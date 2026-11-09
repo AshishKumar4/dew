@@ -1,5 +1,5 @@
 """Float-range and nested-derivative contracts of attention's seams: the fused attention call in forward
-mode, its kernels' reverse rules, the paged decode kernel (ledger 2641; the harness is
+mode, its kernels' reverse rules, the paged decode kernel, a head's sinks (ledger 2641; the harness is
 tests/contract_support.py)."""
 
 import itertools
@@ -10,6 +10,7 @@ import pytest
 from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 
 from dew.nn import attention, kv_cache
+from dew.nn.kernels.templates import attention as template, attention_quantized
 
 
 def plain_attention(query, key, value):
@@ -43,6 +44,22 @@ def test_a_fused_attention_call_in_forward_mode_holds_every_order(edge):
                     truth_fn=plain_attention, plain_fn=plain_attention)
 
 
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_heads_sinks_hold_every_order(edge):
+    """`template.sinks`' spread of each head's sink over its batch rows and queries (reverse mode one
+    compensated sum, row 4524): every order runs, finite wherever float64 is a normal float32 and the plain
+    broadcast is."""
+    (values,) = normal_draw(4524, (3,), scale=EDGES[edge])
+    (direction,) = normal_draw(4525, (3,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(4526, (2, 3, 5))
+
+    def plain(values):
+        return jnp.broadcast_to(values[None, :, None], (2, 3, 5))
+
+    assert_contract(lambda values: template.sinks(values, 2, 5, 4).m, (values,), (direction,), cotangent,
+                    f"a head's sinks {edge}", plain_fn=plain)
+
+
 @pytest.mark.parametrize(("implementation", "edge"), list(itertools.product(("template", "tpu"), EDGES)))
 def test_a_fused_attention_kernel_holds_its_reverse_orders(implementation, edge):
     """The template's route (`attention_route._attend`) and splash (`splash._attention`, interpreted off a
@@ -56,6 +73,27 @@ def test_a_fused_attention_kernel_holds_its_reverse_orders(implementation, edge)
 
     assert_contract(fused, primals, direction, cotangent, f"{implementation} attention {edge}",
                     truth_fn=plain_attention, plain_fn=plain_attention, without=REVERSE_ONLY)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_quantized_attention_holds_its_reverse_orders(edge):
+    """A quantized model's attention on the template (`attention_quantized.attend`, row 4858), a reverse-only
+    custom derivative: its primal and its straight-through reverse derivative run, finite wherever float64
+    is a normal float32 and the plain attention formula is, at queries, keys and values whose products near
+    float32's ends, over a causal call. Its other orders do not run (`REVERSE_ONLY`)."""
+    primals, direction, cotangent = attention_draw(4858, (1, 128, 2, 64), edge)
+    spans = template.spans(128, 128, 1, causal=True)
+
+    def plain(query, key, value):
+        causal = jnp.tril(jnp.ones((128, 128), bool))
+        logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) * query.shape[-1] ** -0.5
+        return jnp.einsum("bhqk,bkhd->bqhd", jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), axis=-1),
+                          value)
+
+    assert_contract(lambda query, key, value: attention_quantized.attend(query, key, value, spans,
+                                                                         template.Hooks()),
+                    primals, direction, cotangent, f"quantized attention {edge}", truth_fn=plain,
+                    plain_fn=plain, without=REVERSE_ONLY)
 
 
 @pytest.mark.parametrize("edge", EDGES)

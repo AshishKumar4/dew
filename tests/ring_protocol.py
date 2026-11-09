@@ -94,6 +94,9 @@ class _Interpreter:
         name, params = equation.primitive.name, equation.params
         if name == "axis_index":
             return [np.int32(self.thread if params["axis_name"] == THREAD_AXIS else 0)]
+        if name == "layout_cast":
+            # A register layout's statement (`plgpu.layout_cast`), its value its operand's.
+            return [values[0]]
         # A call's program, read where every reader reads it (`dew.nn.programs.called`).
         inner = called(equation)
         if inner is not None:

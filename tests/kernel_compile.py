@@ -21,7 +21,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
+from typing import NamedTuple
 
 import compile_evidence
 import jax
@@ -30,11 +33,12 @@ import numpy as np
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
+from sharded import collective_axes
 
 from dew.nn.kernels import grouped_matmul
-from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
+from dew.nn.kernels.generation import assumed, capability, gpu_target
+from dew.nn.kernels.lowered import kernel_calls, triton_kernels
 from dew.nn.kernels.templates import report, resources
-from dew.training._lowering import kernel_calls, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
 MOSAIC_REFUSED = re.compile(r"smem_bytes=(\d+) > max_smem_bytes=\d+")
@@ -182,22 +186,45 @@ def staged_copy(shape: tuple[int, ...], dtype):
                         scratch_types=[plgpu.SMEM(shape, dtype), plgpu.Barrier(num_barriers=1)])
 
 
-def _device(generation: str) -> Mesh:
-    """A one-device mesh of a compile-only device of `generation`."""
-    return Mesh(np.array(compile_only_gpus(generation)), ("data",))
+class Expected(NamedTuple):
+    """What a public route's program shows compiled for a mesh of its GPUs (a case's `expected`): the mesh
+    (`axes`, each axis's devices), each positional argument's placement on it (`specs`, a `PartitionSpec`
+    each, None replicated), the launches it runs (`launches`, its kernel calls' names), an array a device's
+    call of a launch reads (`shards`, by launch: some call of it reads an operand of this shape, a shard's
+    where it runs per shard), and every collective it moves or sums by (`collectives`, each `(op, mesh
+    axes)`: exactly these, `sharded.collective_axes` of its compiled program). A case missing any of them,
+    or showing others, fails (`route_failures`)."""
+
+    axes: tuple[tuple[str, int], ...]
+    specs: tuple
+    launches: frozenset[str]
+    shards: Mapping[str, tuple[int, ...]] = MappingProxyType({})
+    collectives: frozenset[tuple[str, frozenset[str]]] = frozenset()
 
 
-def lowered_for(fn, args, generation: str):
-    """`fn` traced on `args`, its abstract leaves placed on a compile-only device of the CUDA `generation`
-    (`_device`), and lowered as on that GPU (`assumed`, `gpu_mesh`) within its block's shared memory: what XLA
-    compiles for it, never run."""
-    mesh = _device(generation)
-    replicated = NamedSharding(mesh, PartitionSpec())
-    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
-                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
+def _device(generation: str, axes: tuple[tuple[str, int], ...] = (("data", 1),)) -> Mesh:
+    """A mesh of compile-only devices of `generation`, of `axes` (one device's by default)."""
+    sizes = tuple(size for _, size in axes)
+    devices = compile_only_gpus(generation, count=int(np.prod(sizes)))
+    return Mesh(np.array(devices).reshape(sizes), tuple(name for name, _ in axes))
+
+
+def lowered_for(fn, args, generation: str, expected: Expected | None = None):
+    """`fn` traced on `args`, its abstract leaves placed on compile-only devices of the CUDA `generation`
+    (`_device`: one, replicated, or `expected`'s mesh, each argument by its spec), and lowered as on that GPU
+    (`assumed`, the mesh's abstract devices) within its block's shared memory: what XLA compiles for it,
+    never run."""
+    mesh = _device(generation) if expected is None else _device(generation, expected.axes)
+    specs = (None,) * len(args) if expected is None else expected.specs
+    def placed_on(arg, sharding: NamedSharding):
+        return jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding)
+                            if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, arg)
+
+    placed = tuple(placed_on(arg, NamedSharding(mesh, spec or PartitionSpec()))
+                   for arg, spec in zip(args, specs, strict=True))
     # Deviceless Mosaic lowering defaults to Hopper's limit, not this target's.
     # Its bound checks the total allocation, including barriers outside the scratch estimate.
-    with (assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)),
+    with (assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
           mgpu_core.artificial_shared_memory_limit(gpu_target(generation).shared_limit)):
         return jax.jit(fn).trace(*placed).lower()
 
@@ -217,7 +244,7 @@ def failures(found: list[dict]) -> list[str]:
 
 def compile_kernels(cases, generation: str) -> list[dict]:
     """Each case (`name`, `call()` giving the kernel and abstract operands) on the CUDA `generation`,
-    lowered as on that GPU on this host (`assumed`, `gpu_mesh`) and compiled by XLA for a compile-only
+    lowered as on that GPU on this host (`assumed`, `lowered_for`) and compiled by XLA for a compile-only
     device of it, never run: its name, the generation's block limit, and the shared bytes its Triton
     kernels launch with (the most of any; those XLA refused, where it refused one), or the error.
 
@@ -260,7 +287,7 @@ def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
 
 def _compiled(case, generation: str, record: dict,
               directory: str | None = None) -> tuple[list[str], dict[str, int]] | None:
-    """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
+    """`case` lowered as on the CUDA `generation` (`lowered_for`) and compiled by XLA for a
     compile-only device of it: XLA's thunk sequences and the lowered program's Triton calls by name
     (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
     refused. Given a `directory`, its Mosaic GPU kernels' evidence too (`_printed`): `record['estimates']`
@@ -268,10 +295,11 @@ def _compiled(case, generation: str, record: dict,
     (`report.binaries`), `record['modules']` each one's kernel hash, by kernel name, and in `directory` the
     PTX Mosaic prints as it compiles, a `<kernel>.ptx` each."""
     fn, args = case.call()
+    expected = getattr(case, "expected", None)
     estimating = _printed(MOSAIC_GPU_DUMP_RESOURCES="1") if directory else contextlib.nullcontext([])
     try:
         with estimating as estimated:
-            lowered = lowered_for(fn, args, generation)
+            lowered = lowered_for(fn, args, generation, expected)
     except Exception as error:  # A case that does not lower is its own failure.
         # One a block's shared memory does not hold asks its bytes, as XLA's refusal of a Triton kernel does.
         refused = MOSAIC_REFUSED.search(str(error))
@@ -309,6 +337,8 @@ def _compiled(case, generation: str, record: dict,
             record["binaries"] = [dataclasses.asdict(found)
                                   for found in report.binaries(executable, decoded=True)]
             write_modules("".join(printed), directory)
+        if expected is not None:
+            record["route"] = _route(lowered, executable, _device(generation, expected.axes))
         return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
 
 
@@ -357,6 +387,50 @@ def write_modules(printed: str, directory: str) -> None:
         if path.exists():
             raise ValueError(f"two PTX modules of {path.stem}")
         path.write_text("//\n" + PTX_MODULE + part)
+
+
+def _route(lowered, executable, mesh: Mesh) -> dict:
+    """What a compiled route shows (`Expected`): its launches by name, the operands each of their calls
+    reads, and its collectives over `mesh`, JSON's types (a record a process of its own writes back)."""
+    calls = kernel_calls(lowered, unrun=True)
+    shards: dict[str, list] = {}
+    for call in calls:
+        shards.setdefault(call.name, []).append([list(shape) for shape in call.operands])
+    return {"launches": sorted(shards), "shards": shards,
+            "collectives": sorted([op, sorted(axes)]
+                                  for op, axes in collective_axes(executable.as_text(), mesh))}
+
+
+def route_failures(cases, found: list[dict]) -> list[str]:
+    """Each routed case (its `expected`) whose compiled program misses a launch it states, reads no shard it
+    states in any call of a launch, or moves or sums by collectives other than the plan's, or that left no
+    program to read: the route's own evidence, beside its kernels' resources."""
+    failed = []
+    for case, record in zip(cases, found, strict=True):
+        if (expected := getattr(case, "expected", None)) is None:
+            continue
+        if (route := record.get("route")) is None:
+            why = record.get("error", "none")
+            failed.append(f"{case.name}: no compiled program states its route ({why})")
+            continue
+        if missing := sorted(expected.launches - set(route["launches"])):
+            failed.append(f"{case.name}: no launch of {', '.join(missing)} (it ran {route['launches']})")
+        for name, shape in expected.shards.items():
+            calls = route["shards"].get(name, [])
+            if not any(list(shape) in operands for operands in calls):
+                failed.append(f"{case.name}: no call of {name} reads a {list(shape)} shard "
+                              f"(its calls read {calls})")
+        collectives = {(op, frozenset(axes)) for op, axes in route["collectives"]}
+        if collectives != expected.collectives:
+            failed.append(f"{case.name}: collectives {sorted(map(_named, collectives))}, where its plan "
+                          f"states {sorted(map(_named, expected.collectives))}")
+    return failed
+
+
+def _named(collective: tuple[str, frozenset[str]]) -> str:
+    """A collective as a failure names it: its op over its axes."""
+    op, axes = collective
+    return f"{op} over {'/'.join(sorted(axes)) or 'no axis'}"
 
 
 def mosaic_kernels(record: dict) -> list[dict]:
@@ -508,6 +582,8 @@ PTXAS = Path(next(iter(_NVCC.submodule_search_locations or ()))) / "bin" / "ptxa
 ENTRY = re.compile(r"(\.maxntid[^\n]*\n)")
 OCCUPANCY = re.compile(r"\.minnctapersm[^\n]*\n")
 RAISE = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 \d+;")
+RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
+"""A raise's registers (`RAISE`'s), as a kernel record states them (`raised`)."""
 
 
 RELOCATABLE = not resources.RAISES_HONORED
@@ -689,6 +765,10 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
                 if kernel["module"] is not None and name in printed:
                     PTX[kernel["module"]] = printed[name]
+                # The registers its consumers raise to, as its PTX states (`setmaxnreg.inc`); None where they
+                # raise none or no PTX was printed for it.
+                ptx = printed.get(name, PTX.get(kernel["module"], ""))
+                kernel["raised"] = int(raise_.group(1)) if (raise_ := RAISED.search(ptx)) else None
                 if least:
                     kernel["least"] = _least(kernel["module"], generation)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
@@ -764,6 +844,24 @@ def mosaic_failures(found: list[dict]) -> list[str]:
     return failed
 
 
+def model_failures(found: list[dict]) -> list[str]:
+    """Each kernel whose register model decides otherwise than ptxas (its admission or its residency, at
+    the model that decided its launch: `_register_evidence`) and each launch no model states: what a
+    family's gate fails once its models match the compiler (row 1971, bible §6), beside `mosaic_failures`'
+    spills and allocations."""
+    failed = []
+    for record in found:
+        for row in _register_evidence(record):
+            if row.get("kind") == "unmodelled":
+                failed.append(f"{row['case_id']}: a launch no register model states ({row['reason']})")
+            elif row.get("agrees") is False:
+                predicted, compiled = row["predicted"], row["compiled"]
+                failed.append(f"{row['case_id']}: the model's {predicted['total']} registers decide "
+                              f"{predicted['admits']} at {predicted['detail']} programs, ptxas's "
+                              f"{compiled['quantities']} decide {compiled['admits']} at {compiled['detail']}")
+    return failed
+
+
 def compiled_kernels(record: dict) -> set[str]:
     """The names of the kernels `record` compiled, as its models name them (`Report.kernel`)."""
     return {_report(kernel).kernel for kernel in record.get("kernels", ())}
@@ -776,11 +874,15 @@ def _report(kernel: dict) -> Report:
 
 
 def _register_evidence(record: dict) -> list[dict]:
+    """Each modelled kernel's evidence: its decision under the model that decided its launch, the one its
+    launch lowered (`lowered_models`, whose residency its need was searched at, `_needs`), else the case's
+    declared one for its name; and its spills and unmodelled launches."""
     rows = []
     for kernel in record.get("kernels", ()):
         found = _report(kernel)
+        lowered = found.traced in record.get("lowered_models", {})
         for source, key in (("models", found.kernel), ("lowered_models", found.traced)):
-            if (stated := record.get(source, {}).get(key)) is None:
+            if (stated := record.get(source, {}).get(key)) is None or (source == "models" and lowered):
                 continue
             model = resources.RegisterModel(**stated)
             need = kernel.get("need")

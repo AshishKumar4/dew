@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import inspect
 import threading
 import weakref
 from collections.abc import Callable, Hashable, Iterator, Mapping
@@ -219,6 +220,9 @@ def collecting() -> Iterator[dict[str, jax.stages.Compiled]]:
         _COLLECTED.reset(token)
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
+_PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_passing", default=False)
+"""Whether an `OuterProgram`'s trace, which the algebra pass reads whole, encloses the current call."""
+
 
 def release() -> None:
     """Drop every live program's compiled executables (`OuterProgram.released`), as `jax.clear_caches`
@@ -229,6 +233,37 @@ def release() -> None:
         program.released()
 
 
+_SETTLED: contextvars.ContextVar[frozenset[int]] = contextvars.ContextVar("settled", default=frozenset())
+"""The identities of the settled arguments' values (`OuterProgram`'s `settled`) while their program traces."""
+
+_MARKED: weakref.WeakValueDictionary[int, jax.Array] = weakref.WeakValueDictionary()
+"""The arrays a program has read as settled (`OuterProgram.held`), by identity (an array has no hash): no Dew
+program donates one."""
+
+
+def _marked(array: jax.Array) -> bool:
+    return _MARKED.get(id(array)) is array
+
+
+class SettledDonated(ValueError):
+    """A program donating an array another reads as settled (`OuterProgram.held`)."""
+
+
+def settled(value) -> bool:
+    """Whether `value` is, as its program was handed it, an argument the program declares settled
+    (`program`'s `settled`): one its launches may read ahead of their wait (`bodies.dependent`), which the
+    compile point holds to an input of the program no operation of it produces (`lowered.unsettled`)."""
+    return id(value) in _SETTLED.get()
+
+
+def unsettle(*arrays: jax.Array) -> None:
+    """`arrays` no longer read as settled, so a program may donate them (a weight sync writing them in place);
+    the next call reading them settled waits for them again (`OuterProgram.held`)."""
+    for array in arrays:
+        if _marked(array):
+            del _MARKED[id(array)]
+
+
 class OuterProgram:
     """`function` jitted (`jax.jit`, under `arguments`), every compile of it read through the kernel
     templates' reports (`dew.nn.kernels.templates.report.compiled`): where a launch's kernel spills, its
@@ -237,14 +272,17 @@ class OuterProgram:
     is, it runs the executable that what jit keys its own on chooses (`_keyed`): the static arguments,
     the others' structure, shapes, dtypes and placements, and the trace context, the `CACHED` latest compiled;
     `lower` and `trace` are its jit's. Called within another trace (a `jax.grad`, a `jax.vmap`, an
-    enclosing jit), it is its jit, which the enclosing program compiles as its own."""
+    enclosing jit), it is its jit, which the enclosing program compiles as its own. Its `settled` arguments
+    (positions) are those no executable of the run writes, which its launches may read ahead of their wait
+    (`settled`, `bodies.dependent`): a call blocks once on each array of them not yet settled and marks it,
+    and no Dew program donates a marked array (`unsettle` first)."""
 
     CACHED: ClassVar[int] = 4096
     """The executables a program keeps, the latest compiled, so its cache is bounded as jit's is: a call of
     one compiled before reads it without refreshing its place (row 3326)."""
 
-    def __init__(self, function: Callable, **arguments):
-        self.function, self.arguments = function, arguments
+    def __init__(self, function: Callable, *, settled: tuple[int, ...] = (), **arguments):
+        self.function, self.arguments, self.settled = function, arguments, tuple(settled)
         self.jitted = self._jitted()
         # The static positions and names as jit resolves them, the ones given and those it infers.
         numbers, names = arguments.get("static_argnums"), arguments.get("static_argnames")
@@ -268,10 +306,18 @@ class OuterProgram:
             self._executables.clear()
 
     def _jitted(self) -> jax.stages.Wrapped:
-        """Its jit, of a callable of its own, past JAX's trace cache (a relowering's, `compiled`)."""
+        """Its jit, of a callable of its own, past JAX's trace cache (a relowering's, `compiled`), its
+        settled arguments' values known as such while it traces (`settled`)."""
         @functools.wraps(self.function)
         def traced(*args, **kwargs):
-            return self.function(*args, **kwargs)
+            if not self.settled:
+                return self.function(*args, **kwargs)
+            token = _SETTLED.set(frozenset(id(leaf) for leaf in jax.tree.leaves(
+                self._given(args, kwargs, self.settled))))
+            try:
+                return self.function(*args, **kwargs)
+            finally:
+                _SETTLED.reset(token)
         return jax.jit(traced, **self.arguments)
 
     def _traced(self, jitted: jax.stages.Wrapped, args: tuple, kwargs: dict) -> jax.stages.Traced:
@@ -279,49 +325,106 @@ class OuterProgram:
         lowering, its trace, its executable and every relowering read one program (docs/design/algebra.md
         §6.7): the pass reads the trace jit made, which lowers as it is where no rule changes it; a program
         a rule changes is traced afresh from its rewritten program (`program.replaying`). Its switch is in
-        JAX's trace context, so a held program traces afresh as it changes."""
-        traced = jitted.trace(*args, **kwargs)
-        rewritten = algebra.rewritten_program(traced.jaxpr)
-        if rewritten is traced.jaxpr:
-            return traced
-        replay = algebra.program.replaying(rewritten, jax.tree.structure(traced.out_info), self.numbers,
-                                           self.names)
-        return jax.jit(functools.wraps(self.function)(replay), **self.arguments).trace(*args, **kwargs)
+        JAX's trace context, so a held program traces afresh as it changes. A program called within the
+        trace is part of this one, which the pass reads whole (`_nested`)."""
+        token = _PASSING.set(True)
+        try:
+            traced = jitted.trace(*args, **kwargs)
+            rewritten = algebra.rewritten_program(traced.jaxpr)
+            if rewritten is traced.jaxpr:
+                return traced
+            replay = algebra.program.replaying(rewritten, jax.tree.structure(traced.out_info), self.numbers,
+                                               self.names)
+            return jax.jit(functools.wraps(self.function)(replay), **self.arguments).trace(*args, **kwargs)
+        finally:
+            _PASSING.reset(token)
+
+    @functools.cached_property
+    def _rewriting(self) -> Callable:
+        """The function rewritten as it traces (`algebra.rewritten`): where no trace of it is read first, the
+        pass reads the program it makes there."""
+        @functools.wraps(self.function)
+        def traced(*args, **kwargs):
+            return algebra.rewritten(self.function, static_argnums=self.numbers,
+                                     static_argnames=tuple(self.names), kernels=True)(*args, **kwargs)
+        return traced
 
     @functools.cached_property
     def _eager(self) -> jax.stages.Wrapped:
         """Its jit called under an eager transformation, which traces it where no trace of it can be read
-        first: the function rewritten as it traces (`algebra.rewritten`), one program as its compiles'."""
-        @functools.wraps(self.function)
-        def traced(*args, **kwargs):
-            return algebra.rewritten(self.function, static_argnums=self.numbers,
-                                     static_argnames=tuple(self.names))(*args, **kwargs)
-        return jax.jit(traced, **self.arguments)
+        first: the function rewritten as it traces (`_rewriting`), one program as its compiles'."""
+        return jax.jit(self._rewriting, **self.arguments)
 
     @functools.cached_property
-    def _nested(self) -> jax.stages.Wrapped:
-        """Its jit within another trace: the enclosing program's own options are the ones it compiles under,
-        as JAX takes compiler options on the outermost jit alone."""
+    def _nested(self) -> dict[bool, jax.stages.Wrapped]:
+        """Its jit within another trace, the enclosing program's own options the ones it compiles under, as
+        JAX takes compiler options on the outermost jit alone, keyed by whether the pass reads the
+        enclosing program whole (`_PASSING`): as written where it does (one of these, `_traced`); rewritten
+        as it traces where it does not, so a transformation outside it (`jax.grad` of it within a plain
+        `jax.jit`) reads the pass's program, the templates' derivatives among it (row 3450)."""
         arguments = {name: value for name, value in self.arguments.items() if name != "compiler_options"}
-        return jax.jit(self.function, **arguments)
+        return {whole: jax.jit(self.function if whole else self._rewriting, **arguments)
+                for whole in (True, False)}
 
     def __call__(self, *args, **kwargs):
         # Within a staging trace the enclosing program compiles this one as part of its own, under its
         # own options (`_nested`); under an eager transformation alone, or `jax.disable_jit`, its jit
         # compiles itself with its options, or runs the function as Python.
         if staged():
-            return self._nested(*args, **kwargs)
+            return self._nested[_PASSING.get()](*args, **kwargs)
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self._eager(*args, **kwargs)
         if _COLLECTED.get() is not None:
             return shapes_of(self.compiled(*args, **kwargs).out_info)
+        self.held(args, kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
 
+    def _given(self, args: tuple, kwargs: dict, numbers: tuple[int, ...],
+               names: tuple[str, ...] = ()) -> list:
+        """The values a call gives its arguments at positions `numbers` and named `names`, however it passes
+        them: a position among the call's positional arguments (a variadic one's included), or a fixed
+        parameter's passed by keyword; a name among its keyword arguments, or a fixed parameter's passed by
+        position (jit's own resolution of `donate_argnums` and `donate_argnames`)."""
+        fixed = []
+        for parameter in inspect.signature(self.function).parameters.values():
+            if parameter.kind not in (inspect.Parameter.POSITIONAL_ONLY,
+                                      inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                break
+            fixed.append(parameter.name)
+        given = [args[number] if number < len(args) else kwargs[fixed[number]] for number in numbers
+                 if number < len(args) or (number < len(fixed) and fixed[number] in kwargs)]
+        given += [kwargs[name] if name in kwargs else args[fixed.index(name)] for name in names
+                  if name in kwargs or (name in fixed and fixed.index(name) < len(args))]
+        return given
+
+    def held(self, args: tuple, kwargs: dict) -> None:
+        """A call's arguments held to the settled ones' contract: each array of its `settled` arguments not
+        marked waited for (its writer's last launch done, so none of its launches overlaps it) and marked;
+        an array it donates (by position or name, as jit resolves them) refused where it is marked
+        (`SettledDonated`)."""
+        for leaf in jax.tree.leaves(self._given(args, kwargs, self.settled)):
+            if isinstance(leaf, jax.Array) and not _marked(leaf):
+                jax.block_until_ready(leaf)
+                _MARKED[id(leaf)] = leaf
+        if not _MARKED:
+            return
+        numbers, names = api_util.infer_argnums_and_argnames(inspect.signature(self.function),
+                                                             self.arguments.get("donate_argnums"),
+                                                             self.arguments.get("donate_argnames"))
+        for path, leaf in jax.tree_util.tree_leaves_with_path(self._given(args, kwargs, numbers, names)):
+            if isinstance(leaf, jax.Array) and _marked(leaf):
+                raise SettledDonated(f"{self.function.__qualname__} donates its argument "
+                                     f"{jax.tree_util.keystr(path)}, which a program reads as settled: "
+                                     "unsettle it first (`options.unsettle`) or write a new array")
+
     def executable(self, *args, **kwargs) -> jax.stages.Compiled:
         """The executable a call with these arguments runs, compiled at the first: called with the dynamic
-        arguments alone, as a caller that calls it every step does, building no dispatch key."""
+        arguments alone, as a caller that calls it every step does, building no dispatch key. These
+        arguments held to the settled ones' contract (`held`); a caller running the executable again holds
+        each call's (`Fetched`)."""
+        self.held(args, kwargs)
         key, _, _ = self._keyed(args, kwargs)
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
@@ -414,7 +517,7 @@ def _signature(leaf) -> Hashable:
 
 
 def program[**P, R](function: Callable[P, R], *models: Held,
-                    step: Mapping[str, Option] | None = None,
+                    step: Mapping[str, Option] | None = None, settled: tuple[int, ...] = (),
                     **arguments: Unpack[JitArguments]) -> OuterProgram:
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`), and, where it is part of a training step, the step's own beside them
@@ -426,10 +529,12 @@ def program[**P, R](function: Callable[P, R], *models: Held,
     load's, a server's (its steps, `dew.inference.serving_kernel.decode_programs`, their own options as
     `step`) or a simulator's, but those whose owner keeps them: an objective's (`Objective.program`, for
     what runs its modules, a rollout over an environment included), and a closure's or a bound method's a
-    run makes (`owned_program`)."""
+    run makes (`owned_program`). Its `settled` arguments are those no executable of the run writes
+    (`OuterProgram`'s), a server's loaded weights."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
-        function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
+        function, tuple(sorted(options.items())), settled=tuple(settled),
+        static_argnums=arguments.get("static_argnums"),
         static_argnames=arguments.get("static_argnames"), donate_argnums=arguments.get("donate_argnums"),
         donate_argnames=arguments.get("donate_argnames"),
         in_shardings=_Placed.of(arguments["in_shardings"]) if "in_shardings" in arguments else None,
@@ -445,6 +550,15 @@ def owned_program[**P, R](function: Callable[P, R], *models: Held,
     would keep it and the run it closes over (a trainer, its objective and their arrays) for good."""
     return OuterProgram(function, compiler_options={**compiler_options(*models), **(step or {})},
                         **arguments)
+
+
+def jit[**P, R](function: Callable[P, R], **arguments: Unpack[JitArguments]) -> OuterProgram:
+    """`function` compiled through Dew's compile point, as `jax.jit` compiles it (its static arguments, the
+    arguments it donates, its placements): a plain JAX or Flax program's products, alone or with their
+    elementwise consumers, run the kernel templates where their selectors give them (`dew.algebra.fusion`;
+    `dew.kernels.use` names a choice), under the algebra pass, its gradients' too, whichever order
+    `jax.grad` and it take. Its caller holds the program (`owned_program`)."""
+    return owned_program(function, **arguments)
 
 
 class Fetched:
@@ -468,6 +582,8 @@ class Fetched:
         executable = self._executables.get(context)
         if executable is None:
             executable = self._executables[context] = self.program.executable(*args, **kwargs)
+        else:
+            self.program.held(args, kwargs)
         return executable(*args, **kwargs)
 
 
@@ -493,7 +609,7 @@ class _Placed(NamedTuple):
 
 @functools.cache
 def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option], ...], *,
-                     static_argnums: int | tuple[int, ...] | None = None,
+                     settled: tuple[int, ...] = (), static_argnums: int | tuple[int, ...] | None = None,
                      static_argnames: str | tuple[str, ...] | None = None,
                      donate_argnums: int | tuple[int, ...] | None = None,
                      donate_argnames: str | tuple[str, ...] | None = None,
@@ -514,4 +630,4 @@ def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option]
         arguments["in_shardings"] = in_shardings.tree()
     if out_shardings is not None:
         arguments["out_shardings"] = out_shardings.tree()
-    return OuterProgram(function, compiler_options=dict(options), **arguments)
+    return OuterProgram(function, settled=settled, compiler_options=dict(options), **arguments)

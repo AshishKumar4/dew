@@ -73,6 +73,10 @@ SMEM_ALIGNMENT = 1024
 BARRIER_BYTES = 8
 """A barrier's shared memory."""
 
+TMEM_ADDRESS_BYTES = 4
+"""The shared memory a tensor memory allocation keeps its address in (Mosaic GPU's `tcgen05.alloc` writes the
+column it allocated to a 32-bit word there), unaligned as a barrier is."""
+
 
 def allocated(*sizes: int) -> int:
     """The shared memory allocations of `sizes` bytes take, each rounded up to `SMEM_ALIGNMENT`."""
@@ -96,17 +100,18 @@ def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
-                      rhs_parts: int = 1, rhs_transposed: bool = False,
+                      rhs_parts: int = 1, rhs_transposed: bool = False, lhs_swizzle: int | None = None,
                       rhs_swizzle: int | None = None) -> list:
     """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
-    products read registers (`Family.operands_in_registers`), none where they read shared memory: its left
-    operand's loaded depth (`Family.lhs_fragment_depth`), its right one's at its stage's swizzle
-    (`Family.rhs_fragment_depth`; `rhs_swizzle` bytes, the family's default where None), each in the warps
+    products read registers (`Family.operands_in_registers`), none where they read shared memory: each
+    operand's loaded depth at its stage's swizzle (`Family.lhs_fragment_depth`, `Family.rhs_fragment_depth`;
+    `lhs_swizzle`, `rhs_swizzle` bytes, the family's default where None), each in the warps
     replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated for its parts (an
     fp32 operand split into 16-bit parts): GEMM's, recurrence's and attention's products'."""
     if not family.operands_in_registers:
         return []
-    return ([(rows * family.lhs_copies, family.lhs_fragment_depth(depth), lhs)] * lhs_parts
+    left = (rows * family.lhs_copies, family.lhs_fragment_depth(depth, swizzle=lhs_swizzle), lhs)
+    return ([left] * lhs_parts
             + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed, swizzle=rhs_swizzle),
                 columns * family.rhs_copies, rhs)] * rhs_parts)
 
@@ -124,7 +129,9 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     share = rows // consumers
     fragments = operand_fragments(family, share, depth, columns, dtype, dtype,
                                  rhs_transposed=rhs_transposed)
-    accumulator = (share, columns, jnp.float32)
+    # The accumulator's columns its consumer holds at once: all of them, or an epilogue's chunk of one held
+    # in tensor memory (`Issuer.chunk_columns`).
+    accumulator = (share, family.chunk_columns(columns), jnp.float32)
     walk = live_registers(family, [accumulator], fragments)
     if not (family.stores_through_registers and stored):
         return walk
@@ -136,7 +143,10 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
 def program_shared(block: int, programs: int) -> int:
     """The shared memory each of `programs` programs a multiprocessor runs at once may stage, on a GPU whose
     block holds `block` bytes: the multiprocessor's (the block's and one reservation,
-    `Multiprocessor.reserved_shared`) split between them, less each one's own reservation."""
+    `Multiprocessor.reserved_shared`) split between them, less each one's own reservation; one program's
+    the whole block (a TPU core's, whose scoped VMEM no reservation shares)."""
+    if programs == 1:
+        return block
     reserved = facts().reserved_shared
     return (block + reserved) // programs - reserved
 
@@ -161,16 +171,24 @@ def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
          group_row_tiles: int | None = None, *, cluster: int = 1) -> int:
     """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
     blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
-    that reads each operand fewest times from the device. The rows' and the columns' blocks balanced
+    that reads each operand fewest times from the device, or a grouped walk's every column tile where
+    the band reaches them. The rows' and the columns' blocks balanced
     (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
     where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
     each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
-    reads once a group. A cluster of `cluster` multiprocessors is one program, its tile `cluster` row
-    tiles (`group_row_tiles` counts a group's clusters' tiles)."""
+    reads once a group. A grouped walk's band that reaches every column tile takes them all, whatever
+    their count: a power of two below it would leave a last band that walks every row tile again (row
+    4053: the H100 grouped forward's three or six column tiles in bands of two or four read its tokens
+    twice, 1.39x CUTLASS's bytes, M-NS-3). A dense walk's stays a power of two: its snake's division by
+    another count took the registers a 128 x 256 kernel gradient had left (ptxas 240 and 44 bytes
+    spilled at a band of three, NS4053-1), which the register model does not see. A cluster of
+    `cluster` multiprocessors is one program, its tile `cluster` row tiles (`group_row_tiles` counts a
+    group's clusters' tiles)."""
     programs, rows = multiprocessors // cluster, block_m * cluster
     balanced = math.sqrt(programs * rows / block_n)
     spanning = programs / group_row_tiles if group_row_tiles else 0.0
-    return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
+    wide = max(1, min(int(max(balanced, spanning)), column_tiles))
+    return column_tiles if group_row_tiles and wide == column_tiles else 1 << (wide.bit_length() - 1)
 
 
 RAISES_HONORED = True
@@ -206,20 +224,39 @@ def raise_ceiling() -> int:
 
 
 def raised_registers(consumers: int, programs: int = 1, producer: int | None = None) -> int:
-    """The registers each of `consumers` consumer warpgroups raises a thread's to (`roles`' setmaxnreg),
-    `programs` programs held by a multiprocessor at once: the program's launch pool at that residency less
-    the producer's, shared among them in setmaxnreg's steps and at most `raise_ceiling` (one consumer's
-    248 at one program and 232 at two; two consumers' 240 at one). The pool is what the program launches with
-    (`entry_registers`), which setmaxnreg moves between a program's warps and never past ("The total number
-    of registers allocated to all warps in the CTA cannot exceed the initial CTA launch", NVIDIA forums
-    302068): four consumers' 640 threads launch at 96 a thread, so they hold 104, where the multiprocessor's
-    share would ask 112 and wait for registers no warp gives back. The producer lowers to `producer` a thread
-    (`producer_floor`, a model's own where it states another, `RegisterModel.cap`)."""
-    producer = producer_floor() if producer is None else producer
-    step = facts().raises().step
-    pool = entry_registers(consumers + 1, programs) * (consumers + 1) * THREADS
-    share = (pool - producer * THREADS) // (consumers * THREADS)
-    return min(raise_ceiling(), share // step * step)
+    """The registers each of `consumers` consumer warpgroups raises a thread's to beside a producer that
+    lowers to `producer` a thread (`producer_floor`, a model's own where it states another,
+    `RegisterModel.cap`): `role_registers` of equal weights (one consumer's 248 at one program and 232 at two;
+    two consumers' 240 at one)."""
+    return role_registers((1,) * consumers + (0,), programs, floor=producer)[0]
+
+
+def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | None = None) -> tuple[int, ...]:
+    """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg
+    (`handoffs.Schedule`'s roles), `programs` programs held by a multiprocessor at once: a warpgroup of weight
+    0 lowers to `floor` (`producer_floor`), and the rest of the program's launch pool is shared among the
+    others by weight, in setmaxnreg's steps and at most `raise_ceiling`, a share past the ceiling given back
+    to the rest. The pool is what the program launches with (`entry_registers`), which setmaxnreg moves
+    between a program's warps and never past ("The total number of registers allocated to all warps in the CTA
+    cannot exceed the initial CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a
+    thread, so they hold 104, where the multiprocessor's share would ask 112 and wait for registers no warp
+    gives back."""
+    floor = producer_floor() if floor is None else floor
+    step, ceiling = facts().raises().step, raise_ceiling()
+    pool = (entry_registers(len(weights), programs) * len(weights) - floor * weights.count(0)) * THREADS
+    raised = {index: weight for index, weight in enumerate(weights) if weight}
+    held = {}
+    while raised:
+        share = pool // (sum(raised.values()) * THREADS)
+        capped = [index for index, weight in raised.items() if share * weight >= ceiling]
+        if not capped:
+            held |= {index: share * weight // step * step for index, weight in raised.items()}
+            break
+        for index in capped:
+            held[index] = ceiling
+            pool -= ceiling * THREADS
+            del raised[index]
+    return tuple(held.get(index, floor) for index in range(len(weights)))
 
 
 def consumer_registers(consumers: int, programs: int = 1) -> int:
@@ -245,12 +282,14 @@ class Scope:
     an `emit_pipeline`'s slots); tiles scoped `after` the walks, each `(shape, dtype)`; whether the
     program `reduces` across warps, reserving its family's scratch (`Family.reduction_scratch`); and its
     `reducing_warpgroups`, each reserving its share where its arithmetic reduces implicitly
-    (`Family.warpgroup_reduction_scratch`, the kernel's)."""
+    (`Family.warpgroup_reduction_scratch`, the kernel's); and its `addresses`, the unaligned words its
+    kernel keeps beside them (a tensor memory allocation's address, `TMEM_ADDRESS_BYTES`)."""
     program: tuple = ()
     walks: tuple = ()
     after: tuple = ()
     reduces: bool = False
     reducing_warpgroups: int = 0
+    addresses: int = 0
 
 
 def _count(barriers) -> int:
@@ -262,20 +301,43 @@ def _barrier(leaf) -> bool:
     return isinstance(leaf, (plgpu.Barrier, plgpu.ClusterBarrier))
 
 
+def _semaphore(leaf) -> bool:
+    """Whether a scope's `leaf` is a semaphore (a TPU core's DMA or regular one, `pltpu.SemaphoreType`): an
+    extended dtype held in the core's semaphore memory, no byte of its VMEM."""
+    return jnp.issubdtype(leaf.dtype, jax.dtypes.extended)
+
+
+PACKED_BITS = {jnp.dtype(jnp.float4_e2m1fn): 4, jnp.dtype(jnp.int4): 4, jnp.dtype(jnp.uint4): 4}
+"""The dtypes Mosaic GPU stores two to a byte (their `itemsize` reads 1), by their bits: an E2M1 operand of
+Blackwell's block-scaled products' (row 4519's NVFP4 arm)."""
+
+
+def element_bits(dtype) -> int:
+    """The bits an element of `dtype` takes in memory: its itemsize's, but a packed dtype's
+    (`PACKED_BITS`)."""
+    return PACKED_BITS.get(jnp.dtype(dtype), jnp.dtype(dtype).itemsize * 8)
+
+
+def stored_bytes(shape: tuple, dtype) -> int:
+    """The bytes an array of `shape` and `dtype` takes in memory, a packed dtype's two elements a byte."""
+    return math.prod(shape) * element_bits(dtype) // 8
+
+
 def scratch_bytes(family: "Family", scope: Scope) -> int:
-    """The shared memory a program of `scope` asks for besides its barriers, as Mosaic GPU's resource
-    estimate counts it (its `smem_scratch_bytes`): every array rounded up to `SMEM_ALIGNMENT`
-    (`allocated`), the walks the largest of them, the tiles scoped after the walks the larger of them and
-    the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside the program's
-    otherwise, and the family's reduction scratch where the program reduces (`Family.reduction_scratch`)
-    and its warpgroups' shares where they reduce implicitly (`Family.warpgroup_reduction_scratch`)."""
+    """The shared memory a program of `scope` asks for besides its barriers and semaphores (`_semaphore`),
+    as Mosaic GPU's resource estimate counts it (its `smem_scratch_bytes`): every array rounded up to
+    `SMEM_ALIGNMENT` (`allocated`), the walks the largest of them, the tiles scoped after the walks the
+    larger of them and the walks on a family that scopes its walks apart (`Family.walks_scoped`) and beside
+    the program's otherwise, and the family's reduction scratch where the program reduces
+    (`Family.reduction_scratch`) and its warpgroups' shares where they reduce implicitly
+    (`Family.warpgroup_reduction_scratch`)."""
     def arrays(tree) -> list[int]:
-        return [math.prod(leaf.shape) * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(tree)
-                if not _barrier(leaf)]
+        return [stored_bytes(leaf.shape, leaf.dtype) for leaf in jax.tree.leaves(tree)
+                if not _barrier(leaf) and not _semaphore(leaf)]
 
     sizes = arrays(scope.program)
     walks = [allocated(*arrays(walk)) for walk in scope.walks]
-    after = [math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in scope.after]
+    after = [stored_bytes(shape, dtype) for shape, dtype in scope.after]
     if family.walks_scoped:
         walks += [allocated(size) for size in after]
     else:
@@ -288,10 +350,10 @@ def scratch_bytes(family: "Family", scope: Scope) -> int:
 
 def shared_bytes(family: "Family", scope: Scope) -> int:
     """The shared memory a program of `scope` asks for: its scratch (`scratch_bytes`), then every
-    barrier (`BARRIER_BYTES`)."""
+    barrier (`BARRIER_BYTES`) and every address word (`Scope.addresses`)."""
     barriers = sum(_count(leaf.num_barriers) for tree in (scope.program, scope.walks)
                    for leaf in jax.tree.leaves(tree) if _barrier(leaf))
-    return scratch_bytes(family, scope) + BARRIER_BYTES * barriers
+    return scratch_bytes(family, scope) + BARRIER_BYTES * barriers + scope.addresses
 
 
 MOST_STAGES = 8
@@ -342,7 +404,10 @@ def register_programs(family: "Family", consumers: int, registers: int | None = 
     the most at whose share (`Family.registers` at that residency, a raise's where the family's roles raise)
     its consumers hold them, beside its producer's where its layout has one. A launch's own need sets its
     residency: two programs of a one-consumer launch at 127 registers ran its walk 1.35 times as fast as one
-    (FS-WHY3-h100)."""
+    (FS-WHY3-h100). A core whose family budgets no registers (a TPU's, `Family.budgets_registers`) runs
+    one."""
+    if not family.budgets_registers:
+        return 1
     warpgroups = family.warpgroups(consumers)
     need = family.registers(consumers) if registers is None else registers
     for programs in range(resident_warpgroups() // warpgroups, 0, -1):
@@ -359,8 +424,10 @@ class RegisterModel:
     GPU's compile to (tests/kernel_compile.py `decisions`): a consumer thread's registers (None where a case
     states only its budget), the family's budget for them at its consumers (`Family.registers`), its
     consumer warpgroups, the most programs its family runs a multiprocessor (`Family.programs`), the
-    allocator's step (`Family.register_step`), a producer warpgroup's registers a thread (0 without one) and
-    the scratch its planner sized (`scratch_bytes`, None where unstated)."""
+    allocator's step (`Family.register_step`), a producer warpgroup's registers a thread (0 without one),
+    the scratch its planner sized (`scratch_bytes`, None where unstated) and the registers of the
+    multiprocessor it runs on (`file`, `Multiprocessor.registers`), its own fact: no residency it states
+    reads another device's."""
     registers: int | None
     budget: int
     consumers: int
@@ -369,12 +436,13 @@ class RegisterModel:
     producer: int
     shared: int | None = None
     family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
+    file: int = dataclasses.field(kw_only=True)
 
     def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
         """Residency at this consumer allocation, bounded by the launch's other resources."""
         producer = self.producer if honored or not self.producer else registers
         allocated = _register_allocation(registers, self.consumers, producer, self.step)
-        return min(self.most, facts().registers // allocated) if allocated else self.most
+        return min(self.most, self.file // allocated) if allocated else self.most
 
     def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
         """The consumer cap that leaves room for `programs` copies of this launch: the registers the launch
@@ -409,7 +477,8 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
         if tmem:
             most = min(most, (target.tmem_columns or 0) // tmem)
     return RegisterModel(registers, family.registers(consumers), consumers, most, family.register_step,
-                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family)
+                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family,
+                         file=facts().registers)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -447,7 +516,7 @@ def placed(launches_of: Callable, layouts: tuple["Family", ...], target, *,
     (`launches_of(layout)`, None where the layout takes none of them; `plan`). A program whose consumers'
     registers a producer's layout holds keeps its producer, whose loads overlap no consumer's issue; one
     whose consumers need more than a producer leaves them runs on a layout without it, its first consumer
-    issuing the loads (`mosaic.ConsumerFed`). None where no layout holds them."""
+    issuing the loads (`fed.ConsumerFed`). None where no layout holds them."""
     for layout in layouts:
         launches = launches_of(layout)
         planned = None if launches is None else plan(launches, layout, target, programs=programs)
@@ -495,7 +564,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
     block = generation.shared_budget(target)
     plans = []
     for launch in launches:
-        if launch.registers > family.registers(launch.consumers):
+        if family.budgets_registers and launch.registers > family.registers(launch.consumers):
             return None
         most = family.programs(launch.consumers, launch.registers)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
@@ -519,7 +588,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
 def widest_swizzle(dtype, columns: int) -> int:
     """The widest swizzle, in bytes, a row of `columns` elements of `dtype` fills (`plgpu.find_swizzle`): the
     one a block staged at its rows' width takes, as layout inference and jax's Ampere examples stage it."""
-    return plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
+    return plgpu.find_swizzle(columns * element_bits(dtype))
 
 
 def addresses(tiles) -> int:

@@ -183,11 +183,14 @@ jobs:
       run: |
         if [ -z "$DEW_TEST_CACHE" ]; then
           case "$GITHUB_REF_NAME" in
-            # From the last push whose run went green: a newer push cancels a pending run (the group's), and only
-            # the newest tip of a branch fixed forward needs a run, which covers what the cancelled ones changed.
+            # From the last push whose run finished, green or red, whose rows its run recorded: a newer push cancels
+            # a pending run (the group's), and only the newest tip of a branch fixed forward needs a run, which covers
+            # what the cancelled ones changed. Never the last green one alone: a base red for days made every run's
+            # policy span every lock and harness change since, and every run cold (2026-11-07: 90 minutes a run).
             base/kernels)
-              green="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=base/kernels&status=success"
-              from=$(gh api "$green&per_page=1" -q '.workflow_runs[0].head_sha // empty')
+              ran="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=base/kernels&status=completed"
+              from=$(gh api "$ran&per_page=100" -q '[.workflow_runs[] | select(.conclusion == "success" or
+                .conclusion == "failure")][0].head_sha // empty')
               git cat-file -e "${from:-$BEFORE}^{commit}" 2>/dev/null && from=${from:-$BEFORE} || from=origin/main ;;
             *) from=origin/main ;;
           esac

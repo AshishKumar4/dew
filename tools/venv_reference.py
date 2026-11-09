@@ -45,6 +45,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
                    "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
                    "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")},
+         "llama-cpp": {"test": "test_llama_cpp_export", "worker": "llama_cpp_worker.py",
+                       "reference": "ggml-org/llama.cpp 7fe450e19305b828c199d602c23a8337aaa1f03b (v0.5.0)",
+                       "license": "MIT", "host": True, "outputs": True},
          "vllm-replay": {"test": "test_engine_replay", "worker": "vllm_replay_worker.py", "device": "cuda",
                          "reference": ("vllm-project/vllm 0.30.0 (its CUDA 12.9 build) with "
                                        "huggingface/transformers 5.16.1"),

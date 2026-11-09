@@ -28,8 +28,10 @@ import dataclasses
 import functools
 
 import attention_inplace_operands as inplace
+import attention_kernels_matrix as kernels_matrix
 import attention_matrix as matrix
 import attention_triton_stages as triton_stages
+import decode_matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -102,8 +104,8 @@ def test_the_attention_kernels_run_on_this_gpu(part):
     """Every kernel cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together, a part's share of them (`in_parts`); the Mosaic cells on an H100 alone."""
     run_cells(parted([
-        *sweep(triton.every_config_on_a_gpu, triton.attention_triton.FORWARD_STEPS),
-        *sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_STEPS),
+        *sweep(triton.every_config_on_a_gpu, triton.FORWARD_TILES),
+        *sweep(triton.every_backward_config_on_a_gpu, triton.BACKWARD_TILES),
         # The Pallas-Triton dK/dV launch's prescaled query on an H100: right and repeating (the pipeliner's
         # race, attention_triton_stages).
         *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
@@ -151,6 +153,9 @@ def test_the_attention_kernels_run_on_this_gpu(part):
         *(Cell(f"a verify block of {drafts} through the route is on par",
                functools.partial(decode_template.a_verify_block_through_the_route_is_on_par, drafts))
           for drafts in (4, 8, 16)),
+        *(Cell(f"a paged decode step of {page}-key pages is on par",
+               functools.partial(decode_template.a_paged_decode_step_of_small_pages_is_on_par, page))
+          for page in decode_template.served_small_pages()),
     ], part, KERNEL_PARTS))
 
 
@@ -233,6 +238,23 @@ def test_the_attention_matrix_holds_on_this_gpu(part):
     reference path at every pair of axis values the route serves, each cell on its own GPU, without XLA's
     deterministic ops (a deterministic run never derives the one launch its cells pin), a part's share."""
     run_cells(parted(cells_of(matrix.a_routes_training_step_is_on_par), part, MATRIX_PARTS))
+
+
+@pytest.mark.usefixtures("without_deterministic_ops")
+def test_the_attention_kernels_matrix_holds_on_this_gpu():
+    """The attention op's kernels' check-1 matrix (tests/kernel_matrix.py): each GPU kernel's training step
+    through the public call on par with the reference path at every pair of axis values it serves, each cell
+    on its own GPU, without XLA's deterministic ops (FlashAttention's and cuDNN's refuse a deterministic
+    call)."""
+    run_cells(cells_of(kernels_matrix.a_kernels_training_step_is_on_par))
+
+
+@pytest.mark.usefixtures("without_deterministic_ops")
+def test_the_decode_matrix_holds_on_this_gpu():
+    """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
+    the reference path at every pair of axis values its selectors serve, each cell on its own GPU, without
+    XLA's deterministic ops (cuDNN's decode refuses a deterministic call)."""
+    run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
 
 
 MOSAIC_PARTS = 8

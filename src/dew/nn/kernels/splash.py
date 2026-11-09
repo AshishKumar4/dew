@@ -54,9 +54,11 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
 )
 
 from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
-from dew.nn.derivatives import contracted
+from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
 from dew.nn.kernels import generation, launches
 from dew.nn.kernels.options import program
+from dew.nn.kernels.templates import product
+from dew.nn.precision import compensated_sum, products_dtype
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
@@ -412,6 +414,7 @@ def _forward_step(
     head_dim_v: int,
     attn_logits_soft_cap: float | None,
     mask_function: MaskFunction | None,
+    interpret: bool,
 ):
     """One key compute block of the forward's online softmax: its logits, the running maximum and
     denominator, and the output's running sum, rescaled."""
@@ -431,7 +434,8 @@ def _forward_step(
     m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
     assert m_prev.shape == (bq, NUM_LANES)
     assert l_prev.shape == (bq, NUM_LANES)
-    qk = lax.dot_general(q_ref[...], k_ref[slice_k, :], NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    qk = _dot(q_ref[...], k_ref[slice_k, :], NT_DIM_NUMBERS, _precision(q_ref.dtype, k_ref.dtype),
+              interpret=interpret)
     assert qk.shape == (bq, bkv_compute)
     assert isinstance(slice_k, pl.Slice)
     # Where the iteration space is shrunk (local attention), a key block's program id is not its place:
@@ -464,7 +468,8 @@ def _forward_step(
     alpha = jnp.exp(m_prev - m_next)
     l_next = l_curr + alpha * l_prev
     m_scratch_ref[...], l_scratch_ref[...] = m_next, l_next
-    o_curr = lax.dot_general(s_curr, v_ref[slice_k, :].astype(jnp.float32), NN_DIM_NUMBERS)
+    o_curr = _dot(s_curr, v_ref[slice_k, :].astype(jnp.float32), NN_DIM_NUMBERS, _precision(v_ref.dtype),
+                  interpret=interpret)
     alpha_o = jnp.tile(alpha, (1, pl.cdiv(head_dim_v, NUM_LANES)))[..., : o_scratch_ref.shape[-1]]
     o_scratch_ref[:] = alpha_o * o_scratch_ref[:] + o_curr
 
@@ -635,6 +640,7 @@ def _forward(
         mask_value=call.mask_value,
         attn_logits_soft_cap=call.attn_logits_soft_cap,
         mask_function=call.mask_function,
+        interpret=bool(call.interpret),
     )
     with jax.named_scope(name):
         out, logsumexp = launches.pallas_call(
@@ -690,6 +696,7 @@ def _dq_kernel(
     attn_logits_soft_cap: float | None,
     mask_function: MaskFunction | None,
     delta: bool,
+    interpret: bool,
 ):
     """dQ over a (head, query block, key block) grid, or with `delta` each query's delta (`_dq`)."""
     del sinks_ref  # its gradient is the backward's own (`_backward`)
@@ -708,7 +715,8 @@ def _dq_kernel(
         k, v = k_ref[...], v_ref[...]
         logsumexp = jnp.expand_dims(logsumexp_ref[0], -1)
         do = do_ref[...]
-        qk_uncapped = lax.dot_general(q_ref[...], k, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        qk_uncapped = _dot(q_ref[...], k, NT_DIM_NUMBERS, _precision(q_ref.dtype, k.dtype),
+                           interpret=interpret)
         k_slice = pl.ds(0, bkv)
         assert isinstance(k_slice, pl.Slice)
         qk = _apply_mask_and_soft_cap(
@@ -726,7 +734,7 @@ def _dq_kernel(
             mask_function=mask_function,
         )
         p = jnp.exp(qk - logsumexp)
-        dp = lax.dot_general(do.astype(v.dtype), v, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+        dp = _dot(do.astype(v.dtype), v, NT_DIM_NUMBERS, _precision(v.dtype), interpret=interpret)
         if delta:
             # Dew: the block's share of the query's delta, sum_k p * dp, lane-broadcast.
             dq_scratch_ref[...] += jnp.broadcast_to(
@@ -734,9 +742,8 @@ def _dq_kernel(
             )
             return
         ds = _through_soft_cap((dp - jnp.expand_dims(di_ref[0], -1)) * p, qk_uncapped, attn_logits_soft_cap)
-        dq_scratch_ref[...] += lax.dot_general(
-            ds.astype(k.dtype), k, NN_DIM_NUMBERS, preferred_element_type=jnp.float32
-        )
+        dq_scratch_ref[...] += _dot(ds.astype(k.dtype), k, NN_DIM_NUMBERS, _precision(k.dtype),
+                                    interpret=interpret)
 
     @pl.when(j == grid_width - 1)
     def end():
@@ -811,6 +818,7 @@ def _dq(
         attn_logits_soft_cap=call.attn_logits_soft_cap,
         mask_function=call.mask_function,
         delta=delta,
+        interpret=bool(call.interpret),
     )
     name = _kernel_name(segment_ids is not None, "delta" if delta else "dq")
     with jax.named_scope(name):
@@ -858,6 +866,7 @@ def _dkv_step(
     bkv_compute: int,
     attn_logits_soft_cap: float | None,
     mask_function: MaskFunction | None,
+    interpret: bool,
 ):
     """One key compute block of the dK/dV kernel: its logits, keys along its sublanes, its weights from the
     log-sum-exp, and dV's and dK's products added into their running sums."""
@@ -881,7 +890,7 @@ def _dkv_step(
     logsumexp = logsumexp_ref[:1, :]
     do = do_ref[...]
     di = di_ref[:1, :]
-    qk_uncapped = lax.dot_general(k, q, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    qk_uncapped = _dot(k, q, NT_DIM_NUMBERS, _precision(k.dtype, q.dtype), interpret=interpret)
     assert isinstance(slice_k, pl.Slice)
     qk = _apply_mask_and_soft_cap(
         qk_uncapped,
@@ -899,11 +908,11 @@ def _dkv_step(
         mask_function=mask_function,
     )
     p = jnp.exp(qk - logsumexp)
-    dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
+    dv = _dot(p.astype(do.dtype), do, NN_DIM_NUMBERS, _precision(do.dtype), interpret=interpret)
     dv_scratch_ref[slice_k, :] = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
-    dp = lax.dot_general(v, do, NT_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    dp = _dot(v, do, NT_DIM_NUMBERS, _precision(v.dtype, do.dtype), interpret=interpret)
     ds = _through_soft_cap((dp - di) * p, qk_uncapped, attn_logits_soft_cap)
-    dk = lax.dot_general(ds.astype(do.dtype), q, NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
+    dk = _dot(ds.astype(do.dtype), q, NN_DIM_NUMBERS, _precision(do.dtype, q.dtype), interpret=interpret)
     dk_scratch_ref[slice_k, :] = dk.astype(dk_scratch_ref.dtype) + dk_scratch_ref[slice_k, :]
 
 
@@ -1061,6 +1070,7 @@ def _dkv(
         attn_logits_soft_cap=call.attn_logits_soft_cap,
         bkv=bkv,
         mask_function=call.mask_function,
+        interpret=bool(call.interpret),
     )
     name = _kernel_name(segment_ids is not None, "dkv")
     sizes = {"block_q_dkv": bq, "block_kv_dkv": bkv, "block_kv_dkv_compute": bkv_compute}
@@ -1101,9 +1111,26 @@ def _dkv(
 _NONDIFF = ("blocks", "call")
 
 
-@contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")
-@functools.partial(jax.custom_vjp, nondiff_argnames=_NONDIFF)
-def _attention(
+def _precision(*dtypes) -> lax.Precision | None:
+    """Dew: a product of float32 operands at full float32 precision, a narrower one at the default: a TPU's
+    default runs a float32 product as one bf16 pass, which left splash's float32 output 5.1e-4 rms from
+    float64 against 1.9e-7 and its sinks' gradient 0.104 against 5.8e-4 (row 1331)."""
+    return lax.Precision.HIGHEST if all(jnp.dtype(dtype) == jnp.float32 for dtype in dtypes) else None
+
+
+def _dot(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision: lax.Precision | None, *,
+         interpret: bool) -> jax.Array:
+    """Dew: a kernel's product into fp32 at `precision` (`_precision`); interpreted on a CPU, the product its
+    operands declare there issued by the declaration's owner (`product.interpreted`), as every interpreted
+    template's is, so its sums are the ones its reference's contractions take on that CPU."""
+    if interpret:
+        declared = product.declared(products_dtype(lhs, rhs), precision, outputs=(jnp.float32,))
+        return product.interpreted(declared, lhs, rhs, dimension_numbers)
+    return lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32,
+                           precision=precision)
+
+
+def _attending(
     fwd_mask_info: mask_info_lib.MaskInfo,
     dq_mask_info: mask_info_lib.MaskInfo,
     dkv_mask_info: mask_info_lib.MaskInfo,
@@ -1146,12 +1173,17 @@ def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Ar
     if sinks is not None:
         # Dew: each query's D is di, the dQ kernel's own sum_k p * dp, not the rounded output's
         # rowsum(o * do).
+        # Dew: summed over its queries once rounded (`compensated_sum`), as the reference's softmax VJP
+        # sums them closer than one float32 reduction (row 1331).
         sinks_exp = -jnp.exp(sinks[..., None].astype(jnp.float32) - logsumexp.astype(jnp.float32))
-        dsinks = jnp.sum(sinks_exp * di, axis=-1).astype(sinks.dtype)
+        dsinks = compensated_sum(sinks_exp * di, (sinks_exp.ndim - 1,)).astype(sinks.dtype)
     return None, None, None, dq, dk, dv, None, dsinks
 
 
-_attention.defvjp(_attention_fwd, _attention_bwd)
+# Dew: one declared derivative of a kernel's glue (`dew.nn.derivatives`), its `blocks` and `call` static.
+_attention = contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")(
+    declared_derivative(KernelGlue(), _attending, _attention_fwd, _attention_bwd,
+                        nondiff_argnums=(8, 9)))
 
 
 def _collapsed(mask_info: mask_info_lib.MaskInfo) -> mask_info_lib.MaskInfo:

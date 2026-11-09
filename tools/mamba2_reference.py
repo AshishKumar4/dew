@@ -295,18 +295,31 @@ document's tokens writing it, the padded rows' outputs, twelve tokens and seven 
 c868cbbc6), the tangent's 24 tokens of one row and the tiny model's (eight wide) hidden states and logits
 (m2-sizing at 4412b99f9: each unresolved in the recorder's own planning)."""
 
+WEIGHED = frozenset({"tangent"})
+"""The sites that declare check 1's weighed check (`assert_as_exact`'s `conditioning`), recorded whole with
+its own seeds past the unweighted check's, their rounding scale read from transformers' computation
+transcribed in JAX (`ssd_support.transformers_tangent`): the tangent's SSD scan output cancels on some
+tokens, which every arm's rounding amplifies unevenly, so its unweighted pool stays heavy-tailed at any
+count (row 5287)."""
+
 
 def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
     """A site's recording (`record_case`): `reference(site, inputs, dtype)` in fp32 and in torch float64 on
     each draw, Dew's float64 `twin(site, inputs)` held to the latter at every seed (the test's truth, Dew's
-    float64 path, `indexed_recording`'s `truth_fn`); sized paired with Dew's arm at `PAIRED`'s sites."""
+    float64 path, `indexed_recording`'s `truth_fn`); sized paired with Dew's arm at `PAIRED`'s sites; at
+    `WEIGHED`'s, recorded whole with the weighed check's seeds, transformers' transcribed computation held
+    to its float64 run at every seed too."""
     import jax
+    import ssd_support as support
     from recorded_references import record_case
     from reference_error import assert_computes_the_oracle, chain_roundings, widened
 
     exact_run = jax.jit(lambda inputs: twin(site, inputs))
+    transcribed = jax.jit(support.transformers_tangent) if site in WEIGHED else None
     with jax.enable_x64(new_val=True):
         roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
+        copied_roundings = (None if transcribed is None
+                            else chain_roundings(jax.make_jaxpr(transcribed)(widened(draw(0)))))
 
     def evaluate(inputs):
         with torch.no_grad():
@@ -318,8 +331,17 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
         for name, value in exact.items():
             assert_computes_the_oracle(found[name], value, f"transformers float64 {site} {name}",
                                        roundings=roundings)
+            if transcribed is not None:
+                with jax.enable_x64(new_val=True):
+                    copied = np.asarray(transcribed(widened(inputs))[name])
+                assert_computes_the_oracle(copied, value, f"transformers {site} {name} transcribed",
+                                           roundings=copied_roundings)
         return narrow, exact
 
+    if site in WEIGHED:
+        return record_case(site, draw, evaluate, store_inputs=False,
+                           dew=jax.jit(lambda inputs: twin(site, inputs)),
+                           conditioning_program=lambda index, inputs: support.transformers_tangent(inputs))
     if site in PAIRED:
         return record_case(site, draw, evaluate, store_inputs=False, summary=True,
                            dew=jax.jit(lambda inputs: twin(site, inputs)))
@@ -327,13 +349,16 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
                        summary=True)
 
 
-def write_seeded() -> None:
+def write_seeded(only: str | None = None) -> None:
     """Fresh draws with transformers' fp32 and torch-float64 outputs at each site: the scan's native inputs
     under an orbit ('scan', 'carried', 'step', 'starts'), a mixer's weights and hidden states ('layer',
     'layer_bf16', 'decoded', 'padded', 'packed', 'tangent') and a model's ('model_padded', 'model_scored',
     'model_decoded').
 
-    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded [SITE]
+
+    With SITE, that site alone is recorded again, every other site's entries kept as the recording holds
+    them.
     """
     import ssd_support as support
     from recorded_references import provenance, save
@@ -348,11 +373,18 @@ def write_seeded() -> None:
                     and value.tobytes() == other.tobytes()), f"transformers seed {seed}: {name} differs"
         return inputs
 
-    stored = {}
+    from reference_error import recording
+
+    destination = SSD / "ssd_seeded.npz"
+    stored = ({} if only is None else
+              {name: value for name, value in recording(destination).items()
+               if not name.startswith(f"{only}.") and name != "provenance"})
     references = {**dict.fromkeys(support.SCAN_SITES, scan_reference),
                   **dict.fromkeys(support.LAYER_SITES, layer_reference),
                   **dict.fromkeys(support.MODEL_SITES, model_reference)}
     for site, reference in references.items():
+        if only is not None and site != only:
+            continue
         inputs_of, twin = support.mamba2_site(site)
         # The scan's draws checked against their regeneration at the fixture's geometry.
         stored.update(_recorded(site, draw if site in support.SCAN_SITES else inputs_of, twin, reference))
@@ -360,7 +392,6 @@ def write_seeded() -> None:
         f"transformers {transformers.__version__}", transformers_record()["revision"], "cpu",
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
         truth="transformers reference in torch float64 through src/_dew_torch/precision.py")
-    destination = SSD / "ssd_seeded.npz"
     written = save(destination, stored, reference=f"transformers {transformers.__version__}",
                    license="Apache-2.0")
     print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
@@ -423,8 +454,8 @@ def write_interop() -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["seeded"]:
-        write_seeded()
+    if sys.argv[1:2] == ["seeded"]:
+        write_seeded(*sys.argv[2:3])
     elif sys.argv[1:] == ["interop"]:
         write_interop()
     elif sys.argv[1:] == ["float64"]:

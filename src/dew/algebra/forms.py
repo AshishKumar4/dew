@@ -6,8 +6,7 @@ the one switch the templates take their derived forms behind (`derived`)."""
 
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import jax
@@ -16,7 +15,6 @@ from egglog import get_callable_args
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-from dew._cache import DERIVED
 from dew.algebra import program, terms
 from dew.nn import programs
 from dew.nn.precision import float32_dot_general
@@ -24,9 +22,11 @@ from dew.nn.precision import float32_dot_general
 
 class Accumulated(NamedTuple):
     """A reduction's step a mainloop's accumulator takes (`Derived.step`'s `stepped`): its state rescaled by
-    the row `factor` plus the tile's `weights @ values`, each value as the step evaluates it."""
+    the row `factor` (None for a sum that takes no rescale) plus the tile's product of `weights` and
+    `values`, under the declaration's own dimension numbers (`a @ b`, or `aᵀ @ b` for a sum over the
+    weights' rows), each value as the step evaluates it."""
 
-    factor: jax.Array
+    factor: jax.Array | None
     weights: jax.Array
     values: jax.Array
 
@@ -61,7 +61,9 @@ class Derived(NamedTuple):
     (the carry, and a chunk's outputs from the state entering it); its `backward(tiles, state, d_state,
     d_outputs)` is a chunk's adjoint: the cotangent of the state entering it and of each of its operands, from
     the state entering it and the cotangents of the state leaving it and of its outputs (a reduction's
-    backward is a declaration of its own, None here). A reduction's `slots(shapes)` names each carried state's
+    backward is a declaration of its own, None here), the derivative of its `replay(tiles, h)`, the chunk
+    walked token by token from the state `h` entering it: its outputs and the state leaving it, which forward
+    mode differentiates too. A reduction's `slots(shapes)` names each carried state's
     role (`max`, `sum`, `contraction`: the reduction that made it) and shape in the state's order, so a
     template holds each where its mainloop holds that value; its `step(state, tiles, product=, stepped=,
     outputs=)` takes a mainloop's own matrix product (`evaluator`) and its own step (`stepped(states,
@@ -86,6 +88,7 @@ class Derived(NamedTuple):
     backward: Callable | None = None
     prepare: Callable = lambda tiles: tiles
     slots: Callable | None = None
+    replay: Callable | None = None
 
 
 class Program(Protocol):
@@ -157,11 +160,17 @@ def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturatio
         if form is None:
             return None
 
-        def call(*arguments):
-            flat, tree = jax.tree.flatten(arguments)
-            closed, shapes = jax.make_jaxpr(lambda *values: form(*jax.tree.unflatten(tree, list(values))),
-                                            return_shape=True)(*flat)
-            outputs = program.rewrite(closed, flat, accurate=accurate, saturation=saturation)
+        def call(*arguments, **keywords):
+            # Its arrays traced, its other arguments (a mainloop's issuer, a flag) bound as they are.
+            arrays, fill = programs.holes((arguments, keywords),
+                                          lambda leaf: isinstance(leaf, (jax.Array, np.ndarray)))
+
+            def traced(*values):
+                given, named = fill(values)
+                return form(*given, **named)
+
+            closed, shapes = jax.make_jaxpr(traced, return_shape=True)(*arrays)
+            outputs = program.rewrite(closed, arrays, accurate=accurate, saturation=saturation)
             return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
 
         return call
@@ -173,10 +182,11 @@ def rewritten(derived: Derived, *, accurate: bool, saturation: program.Saturatio
 
 def inlined(function: Callable) -> Callable:
     """`function` with each choice by the platform a program lowers for (`lax.platform_dependent`, a `cond` on
-    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, and each call
-    of a jitted function traced inline (Dew's product under a wide CPU arithmetic is a jitted choice), so its
-    product enters the e-graph as one whatever the platform; a form evaluates products as Dew's
-    (`evaluated`)."""
+    a `platform_index`: Dew's products under a wide arithmetic) traced as its default branch, each call of a
+    jitted function traced inline (Dew's product under a wide CPU arithmetic is a jitted choice), so its
+    product enters the e-graph as one whatever the platform, and each placement on a mesh as its operand
+    (a sharding constraint in a declaration traced under a mesh: a tile is placed already); a form
+    evaluates products as Dew's (`evaluated`)."""
     def run(*values):
         closed = jax.make_jaxpr(function)(*values)
         outputs = evaluated_inline(closed.jaxpr, closed.consts, values)
@@ -185,8 +195,35 @@ def inlined(function: Callable) -> Callable:
     return run
 
 
+PLACEMENTS = frozenset({"reshard", "sharding_constraint", "mesh_cast"})
+"""The equations that place a value on a mesh and leave it as it is (each output its operand), taken as
+the identity where a walk's tiles are traced (`evaluated_inline`)."""
+
+
+def _platform_default(equation: jcore.JaxprEqn,
+                      producers: Mapping[jcore.Var, jcore.JaxprEqn]) -> jcore.Jaxpr | None:
+    """The branch a choice by the platform a program lowers for (`lax.platform_dependent`: a `cond` on a
+    `platform_index`, `producers` mapping each value to its equation) takes on a platform it names no branch
+    for, its default; None for any other equation, or a choice without one. Read so in Dew's own programs
+    alone (a form's walk, a declaration recognition traces), where each choice computes one function on every
+    branch, which differ in rounding, order or implementation alone: a depthwise convolution's Triton or lax
+    form (dew.nn.conv), a TPU's barrier or none, a CPU's float64 sums, blocked sums and exact bf16 products
+    (dew.nn.precision), the same bf16 bits through a CUDA cast, an S5 scan scanned or chunked (dew.nn.ssm),
+    and a kernel or its portable fallback (dew.nn.kernels.gemm). A program's own choices may compute
+    different functions, and stay as written."""
+    if equation.primitive.name != "cond" or not equation.invars:
+        return None
+    index = equation.invars[0]
+    chooser = producers.get(index) if isinstance(index, jcore.Var) else None
+    if chooser is None or chooser.primitive.name != "platform_index":
+        return None
+    platforms = chooser.params["platforms"]
+    return equation.params["branches"][platforms.index(None)] if None in platforms else None
+
+
 def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
-    """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`)."""
+    """`jaxpr`'s outputs over `values`, each platform choice its default branch's (`inlined`) and each
+    placement its operand (`PLACEMENTS`)."""
     env: dict = {}
 
     def read(atom):
@@ -196,35 +233,19 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
     env.update(zip(jaxpr.invars, values, strict=True))
     producers = {out: equation for equation in jaxpr.eqns for out in equation.outvars}
     for equation in jaxpr.eqns:
-        branches = equation.params.get("branches") if equation.primitive.name == "cond" else None
-        index = equation.invars[0] if equation.invars else None
-        chooser = producers.get(index) if branches and isinstance(index, jcore.Var) else None
-        if branches and chooser is not None and chooser.primitive.name == "platform_index":
-            default = branches[-1]
+        if (default := _platform_default(equation, producers)) is not None:
             operands = [read(atom) for atom in equation.invars[1:]]
             outs = evaluated_inline(default.jaxpr, default.consts, operands)
         elif (called := programs.called(equation)) is not None:
             # A call's program (`dew.nn.programs.called`), its constants with it.
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
+        elif equation.primitive.name in PLACEMENTS:
+            # Its values its operands': a tile a walk reads is placed already.
+            outs = [read(atom) for atom in equation.invars]
         else:
             outs = bound(equation, map(read, equation.invars))
         env.update(zip(equation.outvars, outs, strict=True))
     return [read(atom) for atom in jaxpr.outvars]
-
-
-@contextlib.contextmanager
-def derived(on: bool = True) -> Iterator[None]:
-    """Within the block, the templates take their algebra's derived forms (`derive`, `scan`) where they hold
-    them in place of their hand-written ones (`on`), or the hand-written ones: a context of JAX's trace
-    (`dew._cache.DERIVED`), so a program held across the switch traces afresh. The one switch the derived and
-    hand-written forms swap behind, which check 1 drives both ways (docs/design/algebra.md §6.9)."""
-    with DERIVED(on):
-        yield
-
-
-def derived_on() -> bool:
-    """Whether the templates take their derived forms here (`derived`)."""
-    return bool(DERIVED.value)
 
 
 def evaluated(region: terms.Region, form: terms.Term, leaves: Sequence,
@@ -237,15 +258,26 @@ PLAIN_PRODUCT = (((1,), (0,)), ((), ()))
 """A matrix product's dimension numbers, `a @ b`: the left's last axis with the right's first, no batch."""
 
 
-class Operand(NamedTuple):
+def _oriented(numbers, ranks: tuple[int, int]) -> tuple[bool, bool] | None:
+    """Whether each operand of a contraction of one axis of each of two matrices (`ranks` 2), no batch axis,
+    is taken transposed to make it `[m, k] @ [k, n]` (`PLAIN_PRODUCT`'s): the left's where it contracts its
+    first axis, the right's where it contracts its second; None for any other contraction."""
+    (left, right), batch = numbers
+    if batch != ((), ()) or len(left) != 1 or ranks != (2, 2):
+        return None
+    return left[0] == 0, right[0] == 1
+
+
+class Operand[T](NamedTuple):
     """A leaf's value given by its type and the call that acquires it (`load`), which an evaluation calls
     where a form first reads the leaf (`evaluator`): a mainloop's operand whose acquisition waits on its
     pipeline (a Mosaic step's value slot, its partner's turn) is acquired after what the form computes
-    before it (a step's weights)."""
+    before it (a step's weights). `T` the value as the mainloop's products take it: an array, a tile in
+    memory, or an fp32 tile's parts."""
 
     shape: tuple[int, ...]
     dtype: object
-    load: Callable[[], jax.Array]
+    load: Callable[[], T]
 
 
 def _scaled(operand: terms.Term, value: Callable[[terms.Term], jax.Array]) -> tuple:
@@ -260,20 +292,22 @@ def _scaled(operand: terms.Term, value: Callable[[terms.Term], jax.Array]) -> tu
 
 
 def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping[Hashable, jax.Array], *,
-              product: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
+              product: Callable[..., jax.Array] | None = None,
               chosen: Mapping[Hashable, terms.Term] | None = None,
               exponential: tuple[str, Callable[..., jax.Array]] | None = None,
+              named: Callable[[terms.Term, terms.Term], str] | None = None,
               rescale: Callable[[jax.Array, jax.Array], jax.Array] | None = None
               ) -> Callable[[terms.Term], jax.Array]:
-    """The values of a region's forms, each term once however many forms read it: its leaves the given
-    values (`leaves`, by index; None for one no form reads) and the outputs of the region's equations
-    outside the language over them, their inputs in the forms `chosen` names for them (by `terms.key`)
-    where given, each term `known` names (by `terms.key`) its value there, each matrix product
-    `product(a, b)` where a caller holds its own (a mainloop's issuer) and every other product Dew's
+    """The values of a region's forms, each term once however many forms read it: its leaves the given values
+    (`leaves`, by index; None for one no form reads) and the outputs of the region's equations outside the
+    language over them, their inputs in the forms `chosen` names for them (by `terms.key`) where given,
+    each term `known` names (by `terms.key`) its value there, each matrix product `product(a, b)` where a
+    caller holds its own (a mainloop's issuer; `product(name, a, b)` where `named` names each product's
+    role from its operands' terms, an issuer staging each role apart) and every other product Dew's
     (`float32_dot_general`), each exponential a declaration implements by its own (`exponential`: the
-    language's name of its base and its function, `exponential(x, scale=1.0)`, `derive.Reduction.exponential`;
-    a product with a literal its `scale`, `_scaled`) and each rescale of two
-    anchors by the declaration's (`rescale`, `terms.RESCALE`), every other term the engine's
+    language's name of its base and its function, `exponential(x, scale=1.0)`,
+    `derive.Reduction.exponential`; a product with a literal its `scale`, `_scaled`) and each rescale of
+    two anchors by the declaration's (`rescale`, `terms.RESCALE`), every other term the engine's
     (`terms.value_of`)."""
     values = dict(known)
     outside = {leaf: opaque for opaque in region.opaque for leaf in opaque.outputs}
@@ -300,10 +334,15 @@ def evaluator(region: terms.Region[terms.Term], leaves: Sequence, known: Mapping
             left, right, index = args
             _, params = region.params[terms.integer(index)]
             numbers = jax.tree.map(int, params["dimension_numbers"])
-            if product is not None and numbers == PLAIN_PRODUCT:
-                made = product(value(left), value(right))
+            a, b = value(left), value(right)
+            if product is not None and (oriented := _oriented(numbers, (a.ndim, b.ndim))) is not None:
+                # Any one-axis contraction of two matrices is the mainloop's product of them oriented as it
+                # takes them, `[m, k] @ [k, n]`: a transposed operand's product its own, never Dew's.
+                a, b = (operand.T if flip else operand
+                        for operand, flip in zip((a, b), oriented, strict=True))
+                made = product(a, b) if named is None else product(named(left, right), a, b)
             else:
-                made = float32_dot_general(value(left), value(right), params["dimension_numbers"],
+                made = float32_dot_general(a, b, params["dimension_numbers"],
                                            precision=params.get("precision"),
                                            preferred_element_type=params.get("preferred_element_type"))
         elif (exponential is not None and (args := get_callable_args(term, terms.Term.unary)) is not None

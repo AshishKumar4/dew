@@ -9,6 +9,8 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
+from dew.nn.programs import on_host
+
 from .common import _sigma_integrator, given
 from .sigma import _ancestral
 
@@ -145,7 +147,7 @@ class DPMSolverSDE:
 
     def init(self, x, times, process, *, key):
         schedule = _sigma_integrator("DPMSolverSDE", process)
-        with jax.ensure_compile_time_eval():
+        with on_host():
             sigmas = schedule.sigmas(jnp.asarray(times, jnp.float32))
             if times.shape[0] > 1 and bool(jnp.any(sigmas[:-1] <= 0)):
                 raise ValueError("sigma=0 source has no finite update: DPMSolverSDE "

@@ -110,9 +110,10 @@ JVP's forward and backward bodies, by the site's declared class:
 Each site declares its class where it defines its derivative (`dew.nn.derivatives`: `declared_derivative` or
 `declared_tangent` with its kind, or `surrogate`; §6.10), so the class is read from the site, never inferred. A
 bare custom derivative in `src/dew` is to fail a slop check, not take a default. Each declaring function wraps
-`jax.custom_vjp` or `jax.custom_jvp` and returns the derivative as one marked call of its kind, its primal,
-forward and backward one span (`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments
-and its `nondiff_argnums` bound in), so the check (SLOP026, row 4012) refuses `jax.custom_vjp` and
+`jax.custom_vjp` or `jax.custom_jvp` around its primal and its rules, each one marked call of its kind
+(`dew.nn.derivatives.bound_span`: its arrays the operands, its other arguments and its `nondiff_argnums` bound
+in), the custom rule outermost, so a differentiated call traces its rules alone, each where it runs, and the
+check (SLOP026, row 4012) refuses `jax.custom_vjp` and
 `jax.custom_jvp` anywhere in `src/dew` but `dew/nn/derivatives.py` (a reference to JAX's `custom_vjp_call_p` is
 no application). Rows 4026 to 4030 declare each lane's sites; the check lands after them. Until a site is
 declared, its custom call's bodies are rewritten as any glue is (§6.2), reorderings over its values held by
@@ -249,7 +250,26 @@ fitted to them, and a rule set ships only with measured receipts.
 - **Fusion:** a search over algebraic forms, fusion boundaries and template compositions for a region of a step
   (a norm, a projection and an activation, for example), built from the toolkit's composed primitives and its work
   scheduler. Applied to a whole decoder layer, its output is a generated megakernel, checked in as a dev-time
-  output.
+  output. Built today (`dew.algebra.fusion`): each product the GEMM template takes (x @ W, dy @ Wᵀ, xᵀ @ dy, and
+  `ragged_dot_general`'s grouped forms), alone or with its elementwise consumers, is substituted at the compile
+  point where its selector gives the template the launch, its consumers into the epilogue where fused prices
+  less; so a plain JAX program compiled through Dew runs the templates its products match (row 3450).
+- **Recognition (compile time, row 4783):** a region of a program is written as one of Dew's calls (its
+  attention, RMSNorm, stream and gated norms, SwiGLU) only where the e-graph proves the region computes that call
+  (`dew.algebra.recognize`). Each call's math is declared once, as the call itself on its portable path
+  (`implementation='xla'`, attention's `'reference'`), the arithmetic its kernels are held to; no account
+  of a spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
+  (`exp`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
+  its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill, which the
+  kernels take as the program holds it), each choice the call takes tried. The region's equations and each
+  candidate's declaration over the same operands enter one term region in a normal form (nested programs
+  inlined, constants of masks and divisors folded, a square a product, a narrow float's correctly rounded
+  arithmetic its float32 arithmetic rounded once, axes of one element erased, equal equations once),
+  saturate under exactly the rule sets the call's numerics admit (`rules.admitted`: the exact sets alone
+  under the accurate forms), and the region is the call's where each of its results shares its
+  declaration's e-class and the call's selector gives it a kernel of Dew's. A different constant, cast,
+  axis, statistic or rounding point is another program and stays as traced: a reordering matches only
+  where the fast forms admit it and the engine can bound what it makes (§6.3).
 
 ## 3. Verification
 
@@ -341,7 +361,7 @@ because its Python API is still marked as subject to change.
 | `dew.algebra.program` | The compile-time pass (`rewritten`), its switch (`passes`) and its report |
 | `dew.algebra.derive` | A monoid walk's declaration (`Reduction`) and its derived forms; the derivation context every derivation keys on (`context`) |
 | `dew.algebra.scan`, `dew.algebra.carry` | A recurrence's declaration (`Scan`) and its chunk forms, split into what every chunk computes at once and what its carry runs in sequence |
-| `dew.algebra.forms` | What every derivation shares: the derived forms (`Derived`), their refusal, their evaluation, and the switch the templates take them behind (`derived`) |
+| `dew.algebra.forms` | What every derivation shares: the derived forms (`Derived`), their refusal and their evaluation |
 | `dew.algebra.generate` | Parked (§6.11): the dev-time generator and its `--check` |
 | `dew.algebra.bits` | Bit-level forms (§7): a declared GF(2)-linear transform of a stored word, its cheapest instruction form over the integer pipes and its proof |
 
@@ -768,12 +788,12 @@ state's anchor), each comparison decided both ways and each maximum by each orde
 the two sides' difference zero as a rational function of exponentials. A declaration that carries no state
 (a tile's) is certified tile by tile. Extraction is priced, so a declaration's forms can take another
 structure at another tile. The suite enumerates every tile the mainloops' derivations emit for an A100, an
-H100 and an RTX PRO 6000 and certifies each distinct structure at a small tile of it, each axis's extent
-past one and the kernel tile's equal extents equal (tests/test_algebra_laws.py). No proof runs at trace
-time.
+H100 and an RTX PRO 6000 and certifies each distinct structure at a small tile of it, at two and at three
+walked elements, each other axis's extent past one and the kernel tile's equal extents equal
+(tests/test_algebra_laws.py). No proof runs at trace time.
 
-Behind the one switch (`dew.algebra.forms.derived`, in JAX's trace context), the templates take their derived
-forms where the declarations state the walk:
+The templates compute by their derived forms where the declarations state the walk; each hand-written form a
+derived one replaced is deleted with it, check 1 holding the derived forms to XLA's reference:
 
 - The attention forward. Every mainloop's step, merge and finish take the declaration's forms, with the sums
   in the mainloop's own accumulator and every product through its own issuer. The declaration covers
@@ -794,7 +814,7 @@ forms where the declarations state the walk:
   tile declaration (`softmax_cotangents`) over its own products. Both cover hooks' slopes, dropout, the
   first pass's D and initial states.
 - The recurrence. The plain-JAX path runs `derive_scan`'s chunk forms with their carry split
-  (`derived_rule`), differentiated at every order (the decays' and the solve's rules through
+  (`recurrence_chunk.xla_mainloop`), differentiated at every order (the decays' and the solve's rules through
   `generation.linear_tangent`: reverse mode their protected rules, forward mode their own tangent), its
   carries typed as every operand varies, its decays' prefix restarting at a token whose decay vanishes in
   its dtype (`dew.nn.precision.vanishing`, a segmented compensated scan: a span through it is zero, and no later span's sum
@@ -806,7 +826,7 @@ forms where the declarations state the walk:
 The template's own forms run in three places:
 - the accurate forms (the compensated exponent, the largest weight held to 1, raw logits, the anchor test,
   the keyed sums);
-- compensated running sums and the headroom guard's shifted sums;
+- compensated running sums and the scaled walk's sums at each row's power of two (`SCALED_WALK`);
 - representations the template keeps: the compensated prefix, the inverse by doubling, the launch structure.
 Those are rounding and representation choices the fast class does not make. The replacement rule holds:
 a derived form replaces a hand-written one only where it states the walk, passes check 1 and is no slower.
@@ -863,9 +883,10 @@ class Derived(NamedTuple):           # dew.algebra.forms
     finish: Callable                 # (state, operands) -> the outputs the walk reduces
     mapped: Callable                 # a tile's outputs along the walked axis; a scan's (prepared, state)
     report: Mapping                  # what the derivation decoupled and its rounding class
-    backward: Callable | None = None # a scan's chunk adjoint; a reduction's backward is a declaration of its own
+    backward: Callable | None = None # a scan's chunk adjoint, its replay's derivative; a reduction's backward is a declaration of its own
     prepare: Callable = ...          # a tile's values that read no state, for every tile at once
     slots: Callable | None = None    # a reduction's carried states' roles (max, sum, contraction) and shapes
+    replay: Callable | None = None   # a scan's chunk walked token by token: (outputs, state leaving) from (chunk, h)
 
 def derive(declaration: Reduction, *, accurate: bool, saturation: Saturation) -> Derived: ...
 def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int = FORMS_HELD) -> Derived: ...
@@ -874,19 +895,24 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
 - `step` takes the walk's tile as the template forms it: logits scaled, coordinates, and the mask and score
   hook applied. Places and tile layouts are the schedule's, not the algebra's.
 - The hand-written forms (`attention_algebra`, `recurrence_algebra`) are adapted to the same coarse interface.
-  The derived and hand-written forms then swap behind one switch, which check 1 drives both ways.
 - A generated form replaces the hand-written one when it meets both bars of §4: bible §4's efficiency on every
   scoreboard row and GPU type the route serves, and bible §6's stability suite and accuracy gate against the
-  float64 truth. Its internals need not decompose into the hand-written functions.
+  float64 truth. Its internals need not decompose into the hand-written functions. The replacement deletes
+  what it replaces in the same change: no switch keeps a hand form beside its derived one.
 - The rule sets derivation needs beside §6.4's:
   - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
     log-sum-exp and moment merges;
   - `linear_scan`: a token's algebra over its state and its affine forms; the chunk's identities, compact
     WY, the state-space dual, a solve's inverse by doubling or its substitution, and a solve's linearity.
-    A scan's adjoint is its forms' derivative;
-  - `error_free`: the compensated sum, the natural exponent through `two_product` and `2**k`, and an argmax
-    anchor's split identity. Under accurate numerics, extraction keeps these wherever the hand-written form's
-    error bound requires them.
+    A scan's adjoint is its token update's, replayed per chunk (the owner, 2026-11-07): from each chunk's
+    entering state, a checkpoint a chunk, its tokens walked by the update's affine parts and differentiated,
+    each token's state cotangent erased before its decay's is formed. Forward mode and every higher order
+    take the same replay; the forward's value stays the forms'. The forms' own derivative cancelled
+    independently rounded inverse, decay and readout paths (row 1966);
+  - no `error_free` set: the accurate numerics admit only exact rewrites, so a compensated form is the
+    declaration's own numerics (`Reduction.exponential`, `rescale`: the natural exponent through
+    `two_product` and `2**k`) or the mainloop's own step over the derived parts (`Derived.step`'s `stepped`:
+    the compensated and the guarded sums, an argmax anchor's split), never a rewrite extraction chooses.
 
 ### 6.10 Marked regions and custom derivatives
 
@@ -1050,12 +1076,34 @@ about it is an estimate.
   of the challenge's price, a rotation by 6, shifts by 2 and 6 and the rotation's by 2 and four masked XORs,
   in 27 seconds (left shifts to 6 places: 2.3 seconds, the test's). No form without a right-moving shift
   exists within three left shifts.
-- **Not in the vocabulary yet** (row 4050): PRMT's byte permutes, LOP3's other linear tables (a three-way
-  XOR, a bit select), and transforms that are not linear (a rounding pack, an integer decode through fp16
-  arithmetic), whose search over LOP3's truth tables, IADD3 and HFMA2 is a bit-vector synthesis (Z3) and whose
-  proof over a 32-bit word is Z3's equivalence. Each joins when a consumer's transform needs it: sm80's FP8
-  and FP4 epilogue packing (row 3733) is the first. No target varies the vocabulary: the pipes and rates above
-  hold from sm75 to sm120, so the search takes no target.
+- **Transforms that are not linear** (row 4050): an encode's rounding and saturation is no GF(2)-linear map,
+  so its form takes the integer pipes' arithmetic beside the linear instructions (`BitOp`'s others: LOP3 of
+  any table, IADD3, IMAD, minima and maxima, an arithmetic shift, shifts by a value, a compare and a select,
+  PRMT's literal byte selection), each with its PTX (`_written`). Its reference is a jax.numpy function of
+  uint32 words (`encoded`: fp32 to e4m3, e5m2 or e2m1, round to nearest even, saturated finite, a NaN as
+  its NaN code), proven exhaustively over every fp32 word against ml_dtypes' cast. Its form is found at
+  development time by `tools/superoptimize_bits.py` (Z3 its dependency, not Dew's): the reference's jaxpr
+  traced into the vocabulary, then each window of up to three steps that only its last step leaves replaced
+  by a cheaper program of one or two, its operations, operands, immediates and tables unknowns, by
+  counterexample-guided synthesis, a replacement taken only where Z3 proves it equal on every value of the
+  window's inputs. For the three encodes it finds the same program, 41 issues to 37 (`x != 0` as
+  `min(x, 1)`, two adds as one IADD3, a select and a mask as one), its constants the minifloat's:
+  `encode_form`, proven against `encoded` on every fp32 word by its test, and its PTX run on the GPU against
+  its own evaluation. Windows of four steps into three found nothing further (2026-11-06, one round within
+  its bounds). Whether its PTX beats the compiler's lowering of `encoded` is its consumer's measurement
+  (sm80's FP8 and FP4 epilogue, row 3733).
+- **Decodes searched** (2026-11-06, the tool's `e4m3-decode-*`, `e5m2-decode-*` and `e8m0` references): an
+  FP8 word's four codes into two bfloat16 pairs in their natural byte order take 13 steps a register (11
+  issues on the ALU, two IMADs placing two fields in one multiply), from a seed of 15 or 16; the free layout's
+  linear form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights
+  stores them in its free layout once (`BitForm.prepared`), as NVFP4's does, and no natural-order form is
+  checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8 steps: no
+  cheaper program within the windows. Neither has a consumer yet (sm80's FP8 weights, sm100's MX).
+- **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3
+  must zero its other bits, and a three-way XOR with a mask takes four operands, which LOP3 does not; a
+  byte selection adds nothing a free layout's encoder does not, and a fixed layout's byte moves are the
+  non-linear vocabulary's (the e4m3 and e5m2 decodes in their natural byte order need three classes of bits
+  in a half, which one LOP3 under one mask does not separate).
 
 ### 7.4 Interface with the GEMM template (its first consumer, row 3733)
 

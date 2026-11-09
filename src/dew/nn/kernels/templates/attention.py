@@ -36,8 +36,9 @@ import jax
 import jax.numpy as jnp
 
 from dew._hashing import fmix32
-from dew.nn.kernels import tuning
-from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.derivatives import Protected, contracted
+from dew.nn.kernels import generation, tuning
+from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
 
 
 @jax.tree_util.register_dataclass
@@ -57,6 +58,18 @@ class KeySpans:
     key_ids: jax.Array | None
     keys: int = dataclasses.field(metadata={"static": True})
     form: str = dataclasses.field(default="spans", metadata={"static": True})
+    per_span: int = dataclasses.field(default=1, metadata={"static": True})
+    """The consecutive queries each interval of a call of one run and no documents holds, `start` and `end`
+    then `[B, Q // per_span]`: a key head's packed rows of one position (`attention_decode.packed`), or a
+    call's every query where lengths and starts alone bound its keys (`spans`), which a program reads by
+    position (`per_query` repeats them)."""
+
+    def per_query(self) -> "KeySpans":
+        """These spans an interval a query (`per_span` 1)."""
+        if self.per_span == 1:
+            return self
+        start, end = (jnp.repeat(bound, self.per_span, axis=1) for bound in (self.start, self.end))
+        return KeySpans(start, end, self.query_ids, self.key_ids, self.keys, self.form)
 
 
 def within(keys: jax.Array, start: jax.Array, end: jax.Array,
@@ -78,6 +91,7 @@ def within(keys: jax.Array, start: jax.Array, end: jax.Array,
 def dense(spans: KeySpans) -> jax.Array:
     """Whether each key is visible to each query (`within`), every one: `[B, Q, K]` boolean, by broadcasting
     alone, so a batch-sharded call's spans take no gather."""
+    spans = spans.per_query()
     keys = jnp.arange(spans.keys)[None, None, :]
     ids = (None if spans.query_ids is None or spans.key_ids is None
            else (spans.query_ids[:, :, None], spans.key_ids[:, None, :]))
@@ -90,6 +104,7 @@ def dense(spans: KeySpans) -> jax.Array:
 def reads(spans: KeySpans) -> jax.Array:
     """Whether each query sees a key, `[B, Q]`: one of its intervals holds one, of its document where the
     call has ids, counted among that document's keys in index order however the documents lie (`_runs`)."""
+    spans = spans.per_query()
     start, end = spans.start, spans.end
     runs = start.ndim == 3
     if spans.query_ids is None or spans.key_ids is None:
@@ -117,8 +132,14 @@ def _runs(query_ids: jax.Array | None, key_ids: jax.Array | None, batch: int, qu
     def row(wanted, held):
         order = jnp.argsort(held, stable=True)
         ordered = held[order]
-        return (order.astype(jnp.int32), jnp.searchsorted(ordered, wanted, side="left").astype(jnp.int32),
-                jnp.searchsorted(ordered, wanted, side="right").astype(jnp.int32))
+        # Each search one sort of the keys' and queries' ids together, no loop: a loop's log2(K) trips ran
+        # as a GPU launch each (M-DD-10: a speculative verify of 4 queries over 4096 keys 284 us against its
+        # 22 us attention), and unrolled, their gathers chained into `_searched`'s unrolled steps, which
+        # XLA:CPU took past four minutes to compile a decode step over a paged pool (tests/test_kv_cache.py's
+        # greedy decodes, red at ce05446f953; either unrolled alone, or this sort, 15 to 30 s).
+        return (order.astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="left", method="sort").astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="right", method="sort").astype(jnp.int32))
 
     return jax.vmap(row)(query_ids, key_ids)
 
@@ -143,7 +164,17 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
         return jnp.where(live & right, middle + 1, low), jnp.where(live & ~right, middle, high)
 
     steps = max(values.shape[1], 1).bit_length()
-    return jax.lax.fori_loop(0, steps, step, (lo, hi))[0]
+
+    def search(*, launched: bool) -> Callable[[], jax.Array]:
+        return lambda: jax.lax.fori_loop(0, steps, step, (lo, hi), unroll=launched)[0]
+
+    # Unrolled into one program where a loop's trips are launches of their own (`generation.by_trips`, a
+    # GPU's: `dew.nn.documents._searched`), a loop elsewhere: unrolled on a CPU, its steps' shared selects and
+    # shifts sent XLA:CPU's LLVM loop vectorizer into a recursion exponential in them (VPlan's
+    # `onlyFirstLaneUsed`, a walk of each value's users with no visited set; LLVM 7a1922aff makes it a
+    # worklist, past stock jaxlib's LLVM), its compile of a prefix run's step unfinished past 900 s (rolled
+    # there, 80 s).
+    return generation.by_trips(search)
 
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
@@ -264,7 +295,19 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     if valid is not None:
         query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
-    return KeySpans(start, end, query_ids, key_ids, keys, form)
+    return _by_row(KeySpans(start, end, query_ids, key_ids, keys, form), causal, sliding_window, chunk,
+                   segment_ids, valid, runs, slots)
+
+
+def _by_row(spans: KeySpans, causal: bool, *narrowings) -> KeySpans:
+    """`spans` one interval a row (`KeySpans.per_span` its queries) where lengths and starts alone bound a
+    call's keys, every query's alike, which a program reads by position, so no block map is formed over its
+    queries (a grouped decode step's packed heads, `dew.nn.decode_geometry.grouped_query`); else as they
+    are. `narrowings` are the call's others: a window, a chunk, documents, validity, runs and slots."""
+    queries = spans.start.shape[1]
+    if spans.form != "spans" or queries <= 1 or causal or any(x is not None for x in narrowings):
+        return spans
+    return KeySpans(spans.start[:, :1], spans.end[:, :1], None, None, spans.keys, spans.form, queries)
 
 
 def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
@@ -435,11 +478,22 @@ def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
     return jnp.where(jnp.all(blocks == first, axis=-1), first[..., 0], 0)
 
 
+def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int) -> tuple:
+    """The key tiles `[lo, hi)` a query block of `block_q` queries from `first_query` walks in a call of no
+    spans, by its form (`attention_algebra.Forward.form`): under the causal one the tiles at or before its
+    last query, else every tile of the `keys`. A call of spans walks its `BlockMap`'s (`block_map`)."""
+    tiles = -(-keys // block_k)
+    if form == "causal":
+        return 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
+    return 0, tiles
+
+
 def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     """The `BlockMap` of `spans` at `block_q` by `block_k` tiles. One interval a query is a call of one
     run: each run's tile envelope over a block's queries and its tiles every query of the block sees whole,
     the envelopes merged into their sorted union where a call has several (`_merged`), the widest run's
     whole tiles the block's, and each key block read by the query blocks some range of which holds it."""
+    spans = spans.per_query()
     runs = spans.start.ndim == 3
     keys = spans.keys
     key_blocks = -(-keys // block_k)
@@ -533,6 +587,27 @@ class Kind(enum.Enum):
     OUTPUT = "output"
     """`[B, Q, H, Dv]`: one value an output entry, the output tile's `[block_q, Dv]` (a gate)."""
 
+    @property
+    def axes(self) -> tuple[str, ...]:
+        """The parameter's logical axes by name, in its layout's order (`templates/axes.py`'s vocabulary):
+        'batch', 'heads', 'queries', 'keys' and 'width'. Each backend composes its blocks, its loads and
+        its broadcasts from them (`axes.named`, `axes.placed`, `scored`), so none restates a kind's
+        layout."""
+        return _KIND_AXES[self]
+
+
+_KIND_AXES = {Kind.HEAD: ("heads",), Kind.QUERY: ("batch", "heads", "queries"),
+              Kind.KEY: ("batch", "heads", "keys"), Kind.TILE: ("batch", "heads", "queries", "keys"),
+              Kind.OUTPUT: ("batch", "queries", "heads", "width")}
+
+
+def scored(tile: jax.Array, kind: Kind) -> jax.Array:
+    """A score parameter's values over its own tile axes (`Kind.axes`' queries and keys, as a launch loads
+    them) as the score tile's `[queries, keys]`: a singleton along the axis it does not vary on."""
+    if "queries" not in kind.axes:
+        return tile[None, :]
+    return tile if "keys" in kind.axes else tile[:, None]
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -558,10 +633,26 @@ class Initial:
 
 def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     """The `Initial` of one value-free logit a query head, `values` `[H]`, in fp32 or their own wider
-    dtype (`at_least_fp32`)."""
+    dtype (`at_least_fp32`), each head's gradient its rows' terms summed once rounded (`_spread_sinks`)."""
     wide = at_least_fp32(values.dtype)
-    m = jnp.broadcast_to(values.astype(wide)[None, :, None], (batch, values.shape[0], queries))
+    m = _spread_sinks((batch, values.shape[0], queries))(values.astype(wide))
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
+
+
+@functools.cache
+def _spread_sinks(shape: tuple[int, int, int]) -> Callable:
+    """A head's sink, `[H]`, read by every batch row and query of `shape` `[B, H, Q]` (`sinks`),
+    differentiated at every order (`generation.linear_tangent`): reverse mode sums its rows' cotangents in
+    one compensated reduction, rounded once (`compensated_sum`), forward mode takes the broadcast's own
+    tangent. A sink's gradient sums a term a row, which XLA's float32 reduction left 1.4 times as far from
+    float64 as the sum rounded once, beside a reference whose sum YNNPACK's fusions take (row 4524)."""
+    def spread(values: jax.Array) -> jax.Array:
+        return jnp.broadcast_to(values[None, :, None], shape)
+
+    return contracted("test_a_heads_sinks_hold_every_order")(
+        generation.linear_tangent(lambda values: (spread(values), None),
+                                  lambda saved, operands, cotangent: (compensated_sum(cotangent, (0, 2)),),
+                                  spread, kind=Protected()))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -712,6 +803,19 @@ class Dropout:
         return Draw((self.seed[0], self.seed[1]), self.rows[row], self.heads[head], self.rate, self.queries,
                     self.keys)
 
+    @property
+    def bound(self) -> float:
+        """The multiplier a kept entry takes, every draw's (`Draw.bound`)."""
+        return 1.0 / (1.0 - self.rate)
+
+
+def coded(p: jax.Array, bound: float) -> jax.Array:
+    """Weights `p` at most 1 (at their row's maximum) as a quantized model's codes of them: Qwix's symmetric
+    integer quantization by the row's largest weight, 1, `round(bound p)` clipped to the type's largest,
+    `floor(bound)` (int8's bound 127.5, `qwix/_src/core/numerics.py`'s `get_symmetric_bound`, and largest
+    127)."""
+    return jnp.minimum(jnp.round(bound * p), math.floor(bound))
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -722,7 +826,11 @@ class Hooks:
     normalized output `[..., q, Dv]`, pointwise in its entries too (a gate, a scale): a kernel applies it
     to an output tile whose head width pads to a power of two. A pytree whose callables are static and
     whose parameters and state are its leaves, so a compiled call takes new values of them. `drop` is
-    probability dropout's weights hook (`Dropout`), absent where None."""
+    probability dropout's weights hook (`Dropout`), absent where None. `rounds`, static, is a quantized
+    model's weights hook: each weight in the value product its code at its row's maximum
+    (`coded`, `round(rounds p)` clipped, a Qwix int8 rule's bound 127.5, whose weights
+    quantize by each row's largest, 1 at the maximum), the denominator the weights themselves, absent where
+    None."""
 
     score_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     score_params: tuple[Param, ...] = ()
@@ -730,6 +838,7 @@ class Hooks:
     output_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     output_params: tuple[Param, ...] = ()
     drop: Dropout | None = None
+    rounds: float | None = dataclasses.field(default=None, metadata={"static": True})
 
 
 def shared_place(shape: tuple[int, ...], row, head) -> tuple:
@@ -768,6 +877,24 @@ def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
 def logit_scale(width: int, scale: float | None) -> float:
     """A call's logit scale: `scale`, else attention's default, the inverse root of its head `width`."""
     return width ** -0.5 if scale is None else scale
+
+
+def grouped_rows(query: jax.Array, kv_heads: int) -> jax.Array:
+    """`query` `[B, T, H, D]` as `[B, T·G, KV, D]` over its `kv_heads` key heads, `G = H // KV`: row `t·G + g`
+    query head `k·G + g` of position `t`, so a key head's query heads are rows of its one walk over its keys
+    (a decode step's grouped query, which both decode kernels take, row 4135)."""
+    batch, positions, heads, width = query.shape
+    group = heads // kv_heads
+    rows = query.reshape(batch, positions, kv_heads, group, width).transpose(0, 1, 3, 2, 4)
+    return rows.reshape(batch, positions * group, kv_heads, width)
+
+
+def ungrouped_rows(out: jax.Array, heads: int) -> jax.Array:
+    """`grouped_rows`' inverse on an output `[B, T·G, KV, Dv]`: `[B, T, H, Dv]`."""
+    batch, rows, kv_heads, width = out.shape
+    group = heads // kv_heads
+    shaped = out.reshape(batch, rows // group, group, kv_heads, width).transpose(0, 1, 3, 2, 4)
+    return shaped.reshape(batch, rows // group, heads, width)
 
 
 def prescale(dtype, width: int, scale: float | None) -> tuple[float, float]:
@@ -881,7 +1008,11 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                               preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
 
     drop = hooks.drop
-    if drop is None:
+    if hooks.rounds is not None:
+        # The codes at the row's maximum (`Hooks.rounds`), its denominator the weights' own.
+        acc = acc0 * carried[..., None] + valued(coded(p, hooks.rounds))
+        normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+    elif drop is None:
         acc = acc0 * carried[..., None] + valued(p)
         normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
     else:
@@ -961,6 +1092,18 @@ def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
     return product.interpreted(declared, a, b, (((a.ndim - 1,), (0,)), ((), ())))
 
 
+def interpreted_rows(a: jax.Array, b: jax.Array) -> jax.Array:
+    """Each row's `a · b` over the last axis, fp32, as `interpreted_dot` issues a product off a GPU: D's and
+    the anchor's products with dO (`attention_gradient.off_anchor_delta`'s `rows`), summed as the CPU arm's
+    dP is, so the anchor key's dP and c cancel exactly."""
+    from dew.nn.kernels.templates import product
+    from dew.nn.precision import products_dtype
+
+    declared = product.declared(products_dtype(a, b), None, outputs=(jnp.float32,))
+    batch = tuple(range(a.ndim - 1))
+    return product.interpreted(declared, a, b, (((a.ndim - 1,), (b.ndim - 1,)), (batch, batch)))
+
+
 def power_of_two(width: int) -> int:
     """The power of two from 16 that holds `width`: a head width a kernel tiles."""
     return max(16, 1 << (width - 1).bit_length())
@@ -1015,6 +1158,9 @@ class PaddedCall:
     `table[b, s // page]`), its `key` and `value` its pools flattened, `[KV, P·page, D]`."""
     page: int | None = None
     """A paged call's keys a page: its pools' `[KV, P, page, D]`, their own."""
+    per_span: int = 1
+    """The queries each of `start`'s and `end`'s intervals holds (`KeySpans.per_span`), unpadded where more
+    than one: a program reads them by position."""
 
     @property
     def key_rows(self) -> int:
@@ -1030,11 +1176,12 @@ class PaddedCall:
 
 
 def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-                block: int, table: jax.Array | None = None, *, query_block: int | None = None
-                ) -> PaddedCall:
+                block: int, table: jax.Array | None = None, *, query_block: int | None = None,
+                by_position: bool = False) -> PaddedCall:
     """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
     whole `block`s (a backend's largest tile), its queries at whole `query_block`s instead where a launch
-    walks no key block of its own over them (an inference forward's), its head widths at powers of two. A
+    walks no key block of its own over them (an inference forward's), its head widths at powers of two, its
+    spans an interval a query unless the caller's programs read them `by_position` (`KeySpans.per_span`). A
     paged call's (`table`, its page table) `key` and `value` are its pools `[KV, P, page, D]`, flattened,
     padded in their widths alone: its keys are its table's slots, whole blocks where its page is."""
     queries, width = query.shape[1], query.shape[3]
@@ -1065,12 +1212,18 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
         padded_key, padded_value = pool(key, padded_d), pool(value, padded_dv)
     else:
         padded_key, padded_value = pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv)
-    return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value,
-                   pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q),
+    # Intervals each of several queries' (a decode step's packed positions) stay a position each where the
+    # caller's programs read them by position (`by_position`: the Mosaic forward's); an interval a query
+    # elsewhere.
+    if not by_position:
+        spans = spans.per_query()
+    start, end = ((spans.start, spans.end) if spans.per_span > 1
+                  else (pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q)))
+    return PaddedCall(pad(query, padded_q, padded_d), padded_key, padded_value, start, end,
                    pad_ids(spans.query_ids, padded_q), pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
-                   queries, keys, table, page)
+                   queries, keys, table, page, spans.per_span)
 
 
 def kept_dtype(dtype) -> str:
@@ -1182,8 +1335,9 @@ class Split(NamedTuple):
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
     with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
     keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum and at each row's
-    `2^-shift` `[B, H, Q]` (`attention_algebra.room`), or normalized over the natural denominator where the
-    shift is `attention_algebra.NORMALIZED` (a guarded walk's live row, `normalized_rows`)."""
+    `2^-shift` `[B, H, Q]` (its scale, `attention_algebra.Scale`), or normalized over the natural denominator
+    where the shift is `attention_algebra.NORMALIZED` (an output residual's, `output_split`;
+    `normalized_rows`)."""
 
     others: jax.Array
     own: jax.Array

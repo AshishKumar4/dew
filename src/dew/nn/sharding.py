@@ -41,7 +41,7 @@ import contextvars
 import dataclasses
 import math
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -448,6 +448,19 @@ def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs
                          check_vma=False)
 
 
+def on_shards(local: Callable, spec: jax.sharding.PartitionSpec, operands: Sequence[jax.Array | None],
+              whole: Collection[int] = (), out_specs=None):
+    """`local(*operands)` on each shard (`manual_map`), each operand placed by its role: as `spec` along its
+    leading dimensions (a token mask `[B, S]` beside activations `[B, S, D]`), whole on every shard where
+    its index is in `whole` (a weight or a conv's taps, whose gradient the transpose sums over the
+    shards), or absent (None); the outputs placed as `out_specs`, `spec` unless given (row 1923: one
+    builder of a kernel's per-shard specs from its operands' roles)."""
+    specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if index in whole
+                  else jax.sharding.PartitionSpec(*spec[:operand.ndim])
+                  for index, operand in enumerate(operands))
+    return manual_map(local, specs, spec if out_specs is None else out_specs)(*operands)
+
+
 def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:
     """The mesh axes the rule table splits a `[B, T, H, ...]` activation's rows and heads over
     (`HEADS`), its heads whole where their split does not divide the `groups` they read (a delta
@@ -588,17 +601,26 @@ def per_shard(kernel: str) -> None:
 
 
 def parameter_path(path) -> Suffix:
-    """The parameter's own path: the trailing run of dict keys under a leaf.
+    """The parameter's own path: the trailing run of dict keys under a leaf, and where the leaf is a field
+    of a registered dataclass held in that run (a packed bank's, `dew.nn.kernels.gemm.NvFp4`: its leaves
+    its fields), the field's name last.
 
     An optimizer state nests a copy of the parameter tree inside its own
-    structure, so what identifies a parameter is where its path ends.
+    structure, so what identifies a parameter is where its path ends; an attribute before the run (a
+    train state's `params`, an optimizer state's `mu`) is the container's, not the parameter's.
     """
+    def named(entry) -> bool:
+        return isinstance(entry, jax.tree_util.DictKey) and isinstance(entry.key, str)
+
+    field = ()
+    if len(path) > 1 and isinstance(path[-1], jax.tree_util.GetAttrKey) and named(path[-2]):
+        field, path = (path[-1].name,), path[:-1]
     names = []
     for entry in reversed(path):
-        if not isinstance(entry, jax.tree_util.DictKey) or not isinstance(entry.key, str):
+        if not named(entry):
             break
         names.append(entry.key)
-    return tuple(reversed(names))
+    return (*reversed(names), *field)
 
 
 _BOXED: contextvars.ContextVar[Mapping[Suffix, LogicalAxes]] = contextvars.ContextVar(

@@ -14,6 +14,7 @@ from dew.batch import Coordinates
 
 from ..inputs import AttentionMetadata, CrossContext, check_tree, coordinates_of, numbered_blocks
 from ..progress import Progress
+from . import decoder_refusals
 
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
@@ -51,15 +52,16 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
                          "visibility; pass one")
     if model.engram is None and (model.mixture is None or not model.mixture.media_bias):
         media_mask = None
-    if decode and coordinates is not None and coordinates.max_segments > 1:
-        raise ValueError(
-            "packed rows cannot append to a decode cache: it stores no document ids, so a cached "
-            "call would attend across documents; prefill each document into a row of its own")
+    if decode and coordinates is not None and coordinates.max_segments > 1 and (
+            refusal := decoder_refusals.packed_cache(model)) is not None:
+        raise ValueError(f"packed rows cannot append to this decoder's cache, which would read their "
+                         f"documents together ({refusal}); prefill each document into a row of its own")
     if tree is not None:  # N-gram hashes and routing blocks read the tokens in their order.
         routed = model.mixture is not None and model.mixture.routing_block is not None
         positions = None if coordinates is None else coordinates.positions
         check_tree(tree, tokens.shape[1], decode=decode, ordered=model.engram is not None or routed,
-                   positioned=positions is not None or rotary_positions is not None)
+                   positioned=positions is not None or rotary_positions is not None,
+                   entered=coordinates is not None and coordinates.entered is not None)
     engram_ids = (None if model.engram is None else model.engram_hashes(tokens, coordinates, decode,
                                                                       media_mask))
     if context is not None and context.segments is not None:

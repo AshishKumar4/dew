@@ -4,6 +4,7 @@ kernels do not compute it where they do not. A template declares a product once,
 caller asked for, and keeps the declaration through every mainloop and its VJP's products."""
 
 import dataclasses
+import functools
 import itertools
 from collections.abc import Callable, Iterator
 
@@ -11,7 +12,7 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.precision import asks_default_precision
+from dew.nn.precision import accumulated, asks_default_precision, exact_products, float64_sum, products_dtype
 
 HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 """The 16-bit dtypes the kernels multiply exactly."""
@@ -36,28 +37,49 @@ class Product:
     refusal: str | None
 
 
+SUMMED_DEPTH = 128
+"""The depth an exactly summed partial covers on a family whose accumulator carries across steps
+(`mosaic.Issuer.summed_window`): DeepSeek-V3's promotion interval for FP8 sums, 128."""
+
+
 def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
              operands: tuple = ()) -> Product:
     """The product a caller asks for with `precision` (explicitly or through
     `jax_default_matmul_precision`), multiplying in `compute` into `outputs`' dtypes from operands (or
     masters) of `operands`' dtypes. The kernels sum in fp32 and offset groups in int32, so x64 is
     refused, and an operand fp32 does not hold (a complex master), whose gradient they cannot write;
-    their fp32 products are TF32, which only the default precision asks for."""
+    their fp32 products are TF32, which only the default precision asks for. A declared dot algorithm
+    whose products are not `compute`'s whole ones (TF32's, bf16 parts of an fp32 product, F64's:
+    `precision.exact_products`) is refused too, forward and gradient alike: the kernels multiply
+    `compute` whole and sum in fp32, so a portable route computes it."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs),
-                   _refusal(compute, operands, above))
+    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs, compute=compute),
+                   _refusal(compute, operands, above, precision))
 
 
-def promoted(*, above: bool, outputs: tuple) -> bool:
-    """Whether a product asked for above the default precision (`above`) promotes each depth step's
-    partial apart: where an output is fp32, whose IEEE sums a 16-bit output's one rounding hides."""
+def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bool:
+    """Whether a product promotes each depth step's partial apart (`exact_sums`): where an output is fp32,
+    whose sums a 16-bit output's one rounding hides, and the product is asked above the default precision
+    (`above`). At the default precision a 16-bit product's fp32 sums are the tensor cores' own, as cuBLAS's
+    are: a dense kernel gradient's tensor-core sums were 0.98-1.00 of XLA's (cuBLAS's) RMS error from
+    float64 at 8192 tokens and at depths of 128 to 2048 on an A100 and an H100 (M-EM-3), where its exact
+    sums, 40 to 60 times closer to float64 than the reference, cost an H100 1.10-2.06x their time (W124) and
+    an A100 the 128 x 128 tile; row 4331's premise (M-NS-1: 1.661x XLA's error at depth 128, 3.88x at 512)
+    did not reproduce. An underfilled wave's split of the contraction (`gemm.mosaic_gpu.split_count`)
+    shortens each sum as cuBLAS's split-K does. `compute`, the operands' dtype, no longer decides it (an
+    FP8 product promotes apart, `declared`)."""
+    del compute
     return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}
 
 
-def _refusal(compute: jnp.dtype, operands: tuple, above: bool) -> str | None:
+def _refusal(compute: jnp.dtype, operands: tuple, above: bool, precision: PrecisionLike = None
+             ) -> str | None:
     if jax.config.jax_enable_x64:
         return "x64 widens the kernels' int32 group offsets"
+    if compute not in EIGHT and not exact_products(precision, compute):
+        return ("a declared dot algorithm narrows or widens the products, which the kernels multiply whole "
+                "with fp32 sums")
     # An operand fp32 holds is no complex one and none wider (8-bit floats promote implicitly to nothing).
     if any(jnp.issubdtype(dtype, jnp.complexfloating) or jnp.dtype(dtype).itemsize > 4
            for dtype in (compute, *operands)):
@@ -81,20 +103,28 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
     `jax.enable_x64` for its own ops; the kernels' refusal of x64 (`declared`) is their int32 offsets'.
     An FP8 product is its codes' in bfloat16, each exact there, accumulated in fp32: the FP8 contract's
     reference arm, the dequantized product with fp32 sums (testing.md, FP8 products). Any other product is
-    `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are exact."""
+    `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are exact, and a float32 one's
+    summed as every float32 contraction is (`precision.accumulated`: in float64 under Dew's wide test
+    arithmetic, else as the CPU's vectorized dot sums it), so a mainloop's sums and the fp32 references they
+    are held to sum alike."""
     if product.compute in EIGHT:
         return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,
                                    preferred_element_type=jnp.float32)
+    contraction = functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers)
     if product.compute == jnp.dtype(jnp.float32) and product.promoted:
-        with jax.enable_x64(new_val=True):
-            wide = jax.lax.dot_general(lhs.astype(jnp.float64), rhs.astype(jnp.float64), dimension_numbers,
-                                       preferred_element_type=jnp.float64)
-            return wide.astype(jnp.float32)
+        # In float64 at HIGHEST, whatever fp32 algorithm the caller bound (`precision.float64_sum`): under
+        # check 1's `FP32_SUMS` a float64 dot stating none narrowed its operands back to fp32.
+        return float64_sum(contraction, lhs, rhs, dtype=jnp.float32)
+    if products_dtype(lhs, rhs) == jnp.dtype(jnp.float32):
+        return accumulated(contraction, lhs, rhs, preferred_element_type=jnp.float32)
     return jax.lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32)
 
 
 BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
 """bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
+
+EXACT_PARTS = -(-(jnp.finfo(jnp.float32).nmant + 1) // (jnp.finfo(jnp.bfloat16).nmant + 1))
+"""The bf16 parts that hold an fp32 value's whole significand (`formed`): three, 8 bits each of its 24."""
 
 
 def bf16_parts(x: jax.Array, count: int, *, saturating: int) -> Iterator[jax.Array]:
@@ -154,11 +184,12 @@ class Exact:
 @jax.tree_util.register_pytree_node_class
 class Scaled:
     """A register operand stored scaled, its product taken back by `2**exponent` (traced: an fp16 part held
-    at its tile's, or each row's, largest magnitude's scale): a mainloop issues its product into an
-    accumulator of its own, which no unscaled product shares, and restores it. A pytree of both, so a
-    branch's parts leave it (`lax.cond`)."""
+    at its tile's, or each row's, largest magnitude's scale; or a static number: a scaled walk's small
+    weights, `attention_algebra.small_parts`): a mainloop issues its product into an accumulator of its own,
+    which no unscaled product shares, and restores it. A pytree of both, so a branch's parts leave it
+    (`lax.cond`)."""
 
-    def __init__(self, value: jax.Array, exponent: jax.Array):
+    def __init__(self, value: jax.Array, exponent: jax.Array | float):
         self.value, self.exponent = value, exponent
 
     def tree_flatten(self):

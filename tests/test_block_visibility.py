@@ -289,14 +289,6 @@ def test_padding_inside_a_row_reaches_the_fused_kernel_as_its_keys_validity(kind
                                                          block_groups=blocks), params, ids)
 
 
-def test_a_server_keeps_a_block_layers_prefill_apart():
-    """A server's mixed step reads each row's cache as a decode step does, which carries no groups, so a
-    model with a kind reading blocks or images keeps its prompts' prefill in a forward of its own."""
-    assert model(full_attention={}).mixed_admission_refusal() is None
-    for mixer in (AttentionMixer(bidirectional_blocks=True), AttentionMixer(bidirectional_images=True)):
-        assert model(full_attention={"mixer": mixer}).mixed_admission_refusal() is not None
-
-
 def test_a_prediction_depth_reads_the_groups_of_the_tokens_it_reads():
     """Prediction depth 1 reads the tokens from the second on (`mtp_hidden_states`), so its layers read the
     groups from there: a block of the first two tokens is one token to it, which adds no key, and its

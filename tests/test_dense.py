@@ -16,7 +16,8 @@ from flax import linen as nn
 from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn.conv import Conv
-from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dense import Dense, DenseGeneral, _accumulated_dot_general
+from dew.nn.kernels import gemm
 from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
 from dew.quantization import Quantization, quantize_for_serving
 
@@ -73,10 +74,13 @@ CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
 def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
     """Flax's parameters bit for bit, but for a batched kernel, which draws each batch member alone
     (`test_a_batched_kernel_draws_each_member_at_its_own_fan_in`), and with flax's parameters, its
-    biases zero, flax's output where both sum their fp32 products as XLA does (`FP32_SUMS`): each pair
-    drawn or computed in one program (ledger 3178)."""
+    biases zero, flax's output where both sum their fp32 products alike (`FP32_SUMS`): a layer naming no
+    product of its own sums a CPU's fp32 products blocked and pairwise (`dew.nn.pairwise`, row 4863), so
+    flax's is given Dew's plain product; each pair drawn or computed in one program (ledger 3178)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
+    if isinstance(theirs, nn.Dense | nn.DenseGeneral) and theirs.dot_general is None:
+        theirs = theirs.clone(dot_general=gemm.dot_general(_accumulated_dot_general))
     variables, drawn = jax.jit(lambda key: [layer.init(key, x) for layer in (theirs, mine)])(
         jax.random.key(0))
     if getattr(theirs, "batch_dims", ()):
@@ -307,6 +311,18 @@ BIASED_SEEDS = {False: 8, True: 8}
 DenseGeneral, sized by `seeds_for` paired with Dew's projection on the CPU and an A100."""
 
 
+def _torch_linear(dtype):
+    """torch's nn.Linear in `dtype` over the drawn inputs, kernel and bias, its output as float64:
+    `run(x, kernel, bias)`."""
+    import torch
+
+    def run(x, kernel, bias):
+        weight, shift, inputs = (torch.tensor(np.asarray(a, np.float64)).to(dtype)
+                                 for a in (kernel.T, bias, x))
+        return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
+    return as_given(run)
+
+
 @pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
 def test_a_biased_bf16_projection_is_as_exact_as_torchs(general):
     """A bfloat16 projection with a bias, Llama's and Qwen's query, key and value, is on par with
@@ -327,15 +343,35 @@ def test_a_biased_bf16_projection_is_as_exact_as_torchs(general):
         params = {"params": {"kernel": kernel.astype(jnp.bfloat16), "bias": bias.astype(jnp.bfloat16)}}
         return layer.apply(params, x.astype(jnp.bfloat16))
 
-    def linear(dtype):
-        def run(x, kernel, bias):
-            weight, shift, inputs = (torch.tensor(np.asarray(a, np.float64)).to(dtype)
-                                     for a in (kernel.T, bias, x))
-            return torch.nn.functional.linear(inputs, weight, shift).double().numpy()
-        return as_given(run)
+    assert_as_exact(projected, _torch_linear(torch.bfloat16), draw, "projection", seeds=BIASED_SEEDS[general],
+                    truth_fn=_torch_linear(torch.float64))
 
-    assert_as_exact(projected, linear(torch.bfloat16), draw, "projection", seeds=BIASED_SEEDS[general],
-                    truth_fn=linear(torch.float64))
+
+@pytest.mark.parametrize("general", [False, True], ids=["dense", "general"])
+def test_a_bf16_projection_with_an_fp32_bias_rounds_its_product_and_bias_once(general):
+    """A bfloat16 projection whose bias is stored at fp32, a mixed-precision model's, adds that bias to its
+    fp32 product and rounds once, as torch's addmm rounds product and bias (row 634): on par with torch's
+    bfloat16 nn.Linear over the same bfloat16 inputs and kernel and the bias rounded to bfloat16, as
+    autocast feeds it, from its float64 run over the drawn values (check 1)."""
+    import torch
+
+    layer = (DenseGeneral(32, dtype=jnp.bfloat16, param_dtype=jnp.float32) if general
+             else Dense(32, dtype=jnp.bfloat16, param_dtype=jnp.float32))
+
+    def draw(seed):
+        """The inputs and the kernel, each a bfloat16 value, and the bias an fp32 one."""
+        rng = np.random.default_rng(seed)
+        x, kernel = (np.asarray(jnp.asarray(value, jnp.bfloat16), np.float32)
+                     for value in (rng.standard_normal((512, 64)), rng.standard_normal((64, 32)) * 0.1))
+        return x, kernel, rng.standard_normal(32).astype(np.float32)
+
+    def projected(x, kernel, bias):
+        params = {"params": {"kernel": jnp.asarray(kernel, jnp.float32),
+                             "bias": jnp.asarray(bias, jnp.float32)}}
+        return layer.apply(params, jnp.asarray(x, jnp.bfloat16))
+
+    assert_as_exact(projected, _torch_linear(torch.bfloat16), draw, "fp32-biased projection",
+                    seeds=BIASED_SEEDS[general], truth_fn=_torch_linear(torch.float64))
 
 
 def test_an_adapter_adds_its_branch_to_the_layers_rounded_output():

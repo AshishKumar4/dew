@@ -36,13 +36,14 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
                           static_argnums=static_argnums)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6, 7))
+@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6, 7, 8))
 def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                        fp32_statistics: bool, activation=None):
+                        fp32_statistics: bool, activation=None, weight_first: bool = False):
     """Normalize `x` by its root mean square, then apply `scale`.
 
     The families differ on which side of the cast the weight goes, which
-    `scale_after_cast` picks. `scale` of None is the weightless norm.
+    `scale_after_cast` picks, and on its association, which `weight_first`
+    picks (`precision.rms_weighted`). `scale` of None is the weightless norm.
     `fp32_statistics` of False computes the square, the mean and the
     normalization in the input's dtype. `activation` (None for none) runs
     on the result before its last cast to `dtype`, as `GroupNorm`'s does.
@@ -69,17 +70,21 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
     # the weight's product and gradient in fp32.
     rounded = normalized if not after_cast else (
         lambda y: rounded_to(y if normalized is None else normalized(y), dtype))
-    y = activated(rms_weighted(x, inverse, weight=weight, rounded=rounded))
+    y = activated(rms_weighted(x, inverse, weight=weight, rounded=rounded, weight_first=weight_first))
     return (rounded_to(y, dtype) if after_cast else y).astype(dtype)
 
 
 def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
-                   fp32_statistics: bool, *, implementation: str = 'auto', axes=None):
+                   fp32_statistics: bool, *, implementation: str = 'auto', axes=None,
+                   weight_first: bool = False):
     """Normalize the last axis and apply an optional vector weight.
 
     `scale_offset` adds one to the stored weight; `scale_after_cast` rounds
     the normalized activation before multiplying and rounds the product
-    again. `fp32_statistics=False` retains the input-dtype arithmetic.
+    again; `weight_first` folds the weight into the inverse RMS before the
+    rows, as Flax's `nn.RMSNorm` associates it (`x * (inverse * weight)`, Dew's
+    own `(x * inverse) * weight`), with no cast between.
+    `fp32_statistics=False` retains the input-dtype arithmetic.
     `implementation` selects the generation's measured kernel by default;
     off a GPU, 'pallas' too runs XLA's arithmetic. The fused VJP retains only the
     narrow input, weight and per-row mean square, not fp32 activations.
@@ -89,12 +94,13 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     them a split mesh runs XLA.
     """
     return stream_rms_normalized(x, None, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                 fp32_statistics, implementation=implementation, axes=axes)[1]
+                                 fp32_statistics, implementation=implementation, axes=axes,
+                                 weight_first=weight_first)[1]
 
 
 def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset: bool,
                           scale_after_cast: bool, fp32_statistics: bool, *, implementation: str = 'auto',
-                          axes=None, activation=None):
+                          axes=None, activation=None, weight_first: bool = False):
     """A pre-norm block's seam: the residual stream `x` plus `branch` (None
     adds nothing) and that stream's `rms_normalized`, as `(stream, normed)`.
 
@@ -103,18 +109,24 @@ def stream_rms_normalized(x, branch, scale, epsilon: float, dtype, scale_offset:
     reads the two addends once and writes the sum beside the norm, and its
     reverse adds the stream's own cotangent to the norm's in the same pass.
     XLA's add and norm are the portable path and the oracle. `activation`
-    (None for none) runs on the norm before its last cast, on XLA's path.
+    (None for none) runs on the norm before its last cast, in the kernel where
+    it is elementwise (`norm_swiglu.elementwise`), else on XLA's path.
+    `weight_first` as `rms_normalized`'s.
     """
+    if weight_first and scale_after_cast and scale is not None:
+        raise ValueError("a weight folded into the inverse (weight_first) multiplies before any cast; "
+                         "scale_after_cast multiplies after one")
     chosen = norm_swiglu.rms_kernel(implementation, x, scale, dtype, fp32_statistics, branch=branch,
-                                    axes=axes, activated=activation is not None)
+                                    axes=axes, epilogue=activation)
     def portable(x, branch, scale):
         stream = x if branch is None else x + branch
         return stream, _xla_rms_normalized(stream, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                           fp32_statistics, activation)
+                                           fp32_statistics, activation, weight_first)
 
     if chosen == 'pallas':
         return norm_swiglu.stream_rms_norm(x, branch, scale, epsilon, dtype, scale_offset, scale_after_cast,
-                                           portable, axes=axes)
+                                           portable, axes=axes, weight_first=weight_first,
+                                           epilogue=activation)
     return portable(x, branch, scale)
 
 

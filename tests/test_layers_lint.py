@@ -41,6 +41,17 @@ def test_a_module_the_contract_leaves_out_or_an_allowed_import_is_no_crossing(tm
     assert list(layers.crossings(root, CONTRACT)) == []
 
 
+def test_a_kernel_reaching_above_the_network_layer_crosses_its_contract(tmp_path):
+    """The kernels' contract (row 4340): a module under dew.nn.kernels importing a feature package above the
+    network layer is a crossing; the network layer and telemetry are its own."""
+    root = tree(tmp_path, {"dew.nn.kernels.report": "from dew.training import Trainer\n",
+                           "dew.nn.kernels.timed": "import dew.telemetry\nfrom dew.nn import layers\n",
+                           "dew.training.trainer": "", "dew.telemetry.__init__": "", "dew.nn.layers": ""})
+    found = [crossing for crossing in layers.crossings(root) if crossing.module.startswith("dew.nn.kernels")]
+    contract = "kernels import nothing above the network layer"
+    assert found == [layers.Crossing(contract, "dew.nn.kernels.report", "dew.training")]
+
+
 def test_a_package_init_resolves_its_relative_imports_from_itself(tmp_path):
     root = tree(tmp_path, {"dew.data.__init__": "from .plan import Plan\nfrom ..training import Trainer\n",
                            "dew.data.plan": ""})

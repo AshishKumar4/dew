@@ -10,7 +10,7 @@ long and fading memories, steep then mild decays), held as test_recurrence_stabi
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
   form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype. Mamba2's rated
   decay runs under both forms (`forms_of`): the accurate ones held to the portable math, the fast ones, its
-  16-bit numbers mamba_ssm's (`mainloop.prepared`), to the port of mamba_ssm's kernels, as recorded
+  16-bit numbers mamba_ssm's (`chunk_forward.prepared`), to the port of mamba_ssm's kernels, as recorded
   mamba_ssm holds them at the same inputs (test_mamba_ssd).
 
 Natively on a GPU of a family the mainloop claims, in its GPU flow (tests/test_gpu_recurrence.py: interpreted,
@@ -36,7 +36,6 @@ from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cot
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
-from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop, template
 
 pytestmark = pytest.mark.kernel
@@ -46,12 +45,12 @@ HOOKS = SITES['scalar delta']
 
 def forms_of(hooks) -> tuple[str | None, ...]:
     """The run's forms a form's checks run under: the rated scan's fast and accurate both, whose numbers
-    differ (mamba_ssm's rounding, `mainloop.prepared`, and three fp32 parts); the accurate ones for a form
-    whose queries and keys its l2 norm widens, an fp32 call, whose fast numbers take its operands in two
+    differ (mamba_ssm's rounding, `chunk_forward.prepared`, and three fp32 parts); the accurate ones for a
+    form whose queries and keys its l2 norm widens, an fp32 call, whose fast numbers take its operands in two
     bf16 parts past TF32's bits (`mainloop.FAST_PARTS`), held to recorded fla-core's TF32 by
-    test_recurrence_mosaic and not to an fp32 arm (the gated net's final memory 42 to 52 times its fp32
-    port's distance from float64, interpreted and on an H100, row 3962); any other form's the run's own
-    (None), which its numbers do not read."""
+    test_recurrence_mosaic and not to an fp32 arm (the gated net's final memory 42 to 52 times its fp32 port's
+    distance from float64, interpreted and on an H100, row 3962); any other form's the run's own (None), which
+    its numbers do not read."""
     if hooks.rated:
         return ('fast', 'accurate')
     return ('accurate',) if hooks.l2norm else (None,)
@@ -86,7 +85,7 @@ def fast_backward(operands: Chunk) -> bool:
     tiles = template.MOSAIC.derived(bound, target)
     return template.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
                                    operands.beta, operands.state, tiles=tiles,
-                                   family=mainloop.family_of() or bundles.INTERPRETED, target=target,
+                                   family=mainloop.issued()[0], target=target,
                                    starts=operands.starts)
 
 
@@ -217,7 +216,7 @@ def test_an_fp32_rated_scan_through_the_template_stays_finite_interpreted(forms)
 @pytest.mark.parametrize(('name', 'regime', 'forms'),
                          [(name, regime, forms) for name, regime, product, forms in CASES
                           if product == 'forward' and regime in INTERPRETED])
-@pytest.mark.check1_shards(seeds=256, per_task=64)
+@pytest.mark.check1_shards(seeds=256, per_task=16)
 def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, regime, forms):
     """Each form's 16-bit forward through the template, interpreted off a GPU under the regimes that grow its
     tiles most, held as its GPU flow cell is: finite, and its output and final memory on par from float64
@@ -225,7 +224,9 @@ def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, 
     (`recurrence_chunk.chunk_rounding`) put its final memory 2.1e4 times the portable math's distance from
     float64 unseen off a GPU (row 3962). Whole, the cells took 27 to 151 s (Kimi delta attention's aligned
     keys 128, the rated scan's decays near zero under the accurate forms 151, stab-case at d51a2d2cf): a site
-    each, sharded over the most seeds a cell declares."""
+    each, sharded over the most seeds a cell declares, sixteen draws a task, where every cell's 64 a task
+    took 966.6 s, Kimi delta attention's decays near zero 329 of it (train 625's CI, armada job
+    20261105212801-7b615468)."""
     the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 

@@ -33,7 +33,6 @@ from reference_error import (
     assert_as_exact,
     equations,
     torch_with_gradients,
-    widened,
     with_gradients,
     without_ynn,
 )
@@ -45,7 +44,11 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.generation import chosen
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
+from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.nn.mixers.mamba2 import Mamba2Mixer
+from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
 
@@ -88,7 +91,7 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64,
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 512,
          'learned hybrid decode': 8, 'layouts': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
@@ -187,12 +190,19 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
     assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
 
 
+RECORDS_A_DRAW = 16
+"""The old decoder records a draw of the old record's check 1 holds
+(`test_old_decoder_record_keeps_zero_dropout_and_computes_its_export`)."""
+
+
 def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     """A decoder record from before dropout builds with every rate zero and computes what its
     serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
     reference, and the same pre-dropout program exported in float64 from the same source its truth,
-    over the export's own weights and drawn ids (the two are different programs, which no bits
-    bind)."""
+    over drawn weights of the export's tree and drawn ids (the two are different programs, which no
+    bits bind). A draw is RECORDS_A_DRAW such records: the export takes its fixture's two rows of four
+    tokens alone, and over one record a norm's 8 scales spread their ratio past what 512 seeds
+    resolve (0.14 to 11 over 64 draws), where Dew's pooled ratio is 0.72 to 1.04 at every leaf."""
     from flax.traverse_util import unflatten_dict
     from jax import export
 
@@ -217,23 +227,34 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
     current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
 
+    initialized = jax.jit(jax.vmap(lambda key, ids: nn.unbox(model.init(key, ids))))
+
     def draw(seed):
-        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
-        return (ids.astype(held["ids"].dtype),)
-
-    @as_given
-    def ours(ids):
-        with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
-            return jax.device_get(current(params, ids))
-
-    @as_given
-    def theirs(ids):
+        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, (RECORDS_A_DRAW, *held["ids"].shape))
+        ids = ids.astype(held["ids"].dtype)
         with jax.default_device(cpu):
-            return jax.device_get(exported(params, ids))
+            keys = jax.random.split(jax.random.key(seed), RECORDS_A_DRAW)
+            return jax.device_get(initialized(keys, ids)), ids
 
-    def truth(ids):
+    def each(run, weights, ids, stack):
+        """`run` over each record of a draw, its results stacked by `stack`."""
+        results = [run(jax.tree.map(lambda leaf, at=at: leaf[at], weights), ids[at])
+                   for at in range(RECORDS_A_DRAW)]
+        return jax.tree.map(lambda *leaves: stack(leaves), *results)
+
+    @as_given
+    def ours(weights, ids):
+        with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
+            return each(lambda *record: jax.device_get(current(*record)), weights, ids, np.stack)
+
+    @as_given
+    def theirs(weights, ids):
+        with jax.default_device(cpu):
+            return each(lambda *record: jax.device_get(exported(*record)), weights, ids, np.stack)
+
+    def truth(weights, ids):
         with jax.enable_x64(new_val=True), jax.default_device(cpu):
-            return jax.device_get(wide.call(widened(params), ids))
+            return each(wide.call, weights, ids, jnp.stack)
 
     assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
                     truth_fn=truth)
@@ -900,17 +921,66 @@ def test_a_packed_document_reads_like_the_document_alone(rng):
                     truth_fn=alone(float64(model)))
 
 
-def test_a_packed_row_refuses_a_decode_cache(rng):
-    """A cache stores no document ids, so a packed row appended to one would attend across its
-    documents: the model refuses it, and runs the same row and positions into a cache without
-    its segments."""
-    model = tiny()
-    ids, segment_ids, positions = packed_pair(rng)
-    params = nn.unbox(model.init(rng, ids))
-    model.apply(params, ids, decode=True, positions=positions, mutable=["cache"])
-    with pytest.raises(ValueError):
-        model.apply(params, ids, decode=True, positions=positions, segment_ids=segment_ids,
-                    mutable=["cache"])
+@pytest.mark.parametrize(("mixer", "layout"), [
+    (None, None), (None, KVCache(page_size=4)),
+    (GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
+                        linear_value_head_dim=8), None),
+    (ParallelMixer(branches=(ParallelBranch("mamba", Mamba2Mixer(num_heads=4, head_dim=8, state_size=8,
+                                                                  n_groups=1, chunk_size=4), 1.3, 0.7),
+                             ParallelBranch("attention", AttentionMixer(), 0.8, 0.6))), None)],
+    ids=["dense", "paged", "gated-delta", "mamba2-beside-attention"])
+def test_a_packed_prefill_decodes_its_last_document_as_that_document_alone(mixer, layout):
+    """A row of two documents and its padding (segment 0) prefilled into a cache (`segment_ids`), then
+    single-token steps continuing its last document, each naming its one document (a call's first continues
+    its row's last, `dew.batch.Coordinates.starts`): every layer reads each document's own keys over the
+    cache (`dew.nn.kv_cache.DOCUMENTS`), each recurrent layer resets its state at the document's start, and
+    the padding writes none, so the second document's prefill logits
+    and every step's are on par (check 1) with the second document prefilled alone into a cache of its own
+    and decoded the same steps, the truth one uncached float64 call over that document and the steps'
+    tokens."""
+    model = tiny(**({} if layout is None else {"kv_cache": layout}),
+                 **({} if mixer is None else {"mixer": mixer}))
+    first, second, padding, steps = 6, 4, 2, 3
+    prompt = first + second + padding
+    segment_ids = jnp.asarray([[1] * first + [2] * second + [0] * padding] * 2)
+    positions = jnp.asarray([list(range(first)) + list(range(second)) + [0] * padding] * 2)
+
+    def cached(model, params, ids, **prefill):
+        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+        return model.apply({**params, "cache": cache}, ids, decode=True, mutable=["cache"], **prefill)
+
+    def stepped(model, params, state, ids, named):
+        logits = []
+        for step in range(steps):
+            token = ids[:, prompt + step:prompt + step + 1]
+            out, state = model.apply({**params, **state}, token, decode=True, mutable=["cache"],
+                                     **({"positions": jnp.full((2, 1), second + step),
+                                         "segment_ids": jnp.ones((2, 1), jnp.int32)} if named else {}))
+            logits.append(out)
+        return logits
+
+    @jax.jit
+    def packed(params, ids):
+        # The padding's validity stated too, every slot marked: the cache takes the real tokens alone.
+        prefill, state = cached(model, params, ids[:, :prompt], positions=positions, segment_ids=segment_ids,
+                                attention_mask=jnp.ones((2, prompt), bool))
+        return jnp.concatenate([prefill[:, first:first + second],
+                                *stepped(model, params, state, ids, named=True)], axis=1)
+
+    @jax.jit
+    def alone(params, ids):
+        prefill, state = cached(model, params, ids[:, first:first + second])
+        return jnp.concatenate([prefill, *stepped(model, params, state, ids, named=False)], axis=1)
+
+    wide = float64(model)
+
+    def truth(params, ids):
+        tokens = jnp.concatenate([ids[:, first:first + second], ids[:, prompt:prompt + steps]], axis=1)
+        return wide.apply(params, tokens)
+
+    assert_as_exact(packed, alone, drawn(model, length=prompt + steps),
+                    f"packed prefill decoded {type(mixer).__name__} {'dense' if layout is None else 'paged'}",
+                    seeds=SEEDS['packed alone'], truth_fn=truth)
 
 
 def test_padding_in_a_packed_row_reaches_no_query(rng):
@@ -1467,7 +1537,7 @@ def test_root_multipliers_scale_around_blocks_that_keep_their_own(extra):
 def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):
     """A decode step's grouped query heads reach the kernel as their key
     head's query positions, [rows, group, kv_heads, width]
-    (`decode_attention.grouped_query`), so a kernel reads each key head once
+    (`decode_geometry.grouped_query`), so a kernel reads each key head once
     (cuDNN ran each query head on its own and padded the lone query to two:
     0.154 against 0.146 ms a layer of Qwen3-0.6B at 64 rows on an RTX 4080).
     The steps decode on par with what the full pass computes (check 1)."""
@@ -1623,9 +1693,7 @@ def test_a_parallel_layer_reads_its_branches_initializers_and_indexers():
     publishes what its later layers read (`MixerBase.publishes`); and a latent attention branch carrying
     an indexer is the decoder's indexed mixer, which an indexer's training reads."""
     from dew.nn.deepseek_v4 import DeepseekV4Mixer
-    from dew.nn.mixers.mamba2 import Mamba2Mixer
     from dew.nn.mixers.mlp import MLPMixer
-    from dew.nn.mixers.parallel import ParallelBranch, ParallelMixer
     from dew.nn.mla import MLAMixer
 
     def beside(name, mixer):

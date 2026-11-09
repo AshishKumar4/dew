@@ -16,12 +16,14 @@ import dataclasses
 import functools
 import inspect
 import logging
+import os
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
+    from dew.nn.derivatives import TangentKind
     from dew.nn.precision import Numerics
 
     from .selection import Refusal
@@ -30,12 +32,14 @@ _log = logging.getLogger(__name__)
 
 @dataclasses.dataclass(frozen=True)
 class Assumption:
-    """The device `assumed` stands in for the default device's: its generation, and its facts (`target`)
-    where it was given them. Equal wherever the generation and every fact are (`_facts`), as JAX's trace
-    key reads it, not by a target's identity or its partial hash."""
+    """The device `assumed` stands in for the default device's: its generation, its facts (`target`)
+    where it was given them, and whether its kernels are `interpreted` on this process's platform. Equal
+    wherever the generation, every fact and the mode are (`_facts`), as JAX's trace key reads it, not by a
+    target's identity or its partial hash."""
     generation: str
     target: GpuTarget | None = dataclasses.field(default=None, compare=False, hash=False)
     facts: Hashable = None
+    interpreted: bool = False
 
 
 def assumption() -> Assumption | None:
@@ -47,20 +51,23 @@ def assumption() -> Assumption | None:
 
 
 @contextlib.contextmanager
-def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
+def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False) -> Iterator[None]:
     """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
     process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
     kernel choice and refusal acts as on that GPU while a step traces and lowers for one on
     a CPU (`dew.training._lowering`). Given a target's facts (a GPU no row names, its multiprocessors,
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
-    and costed by them alone. None assumes nothing. JAX keys its trace and compile caches on the device
-    assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again for another."""
+    and costed by them alone. `interpreted`, the kernels run where the process places them (`backend` the
+    placed platform's) by the device's own bundles and facts, which Mosaic GPU's interpreter runs
+    (`interpreted_target`): an interpreted check of that device's route on a CPU. None assumes nothing.
+    JAX keys its trace and compile caches on the device assumed (`dew._cache.KERNEL_ASSUMED`), so a
+    function jitted for one traces again for another."""
     from dew import _cache
 
     if isinstance(generation, GpuTarget):
-        value = Assumption(generation.generation, generation, _facts(generation))
+        value = Assumption(generation.generation, generation, _facts(generation), interpreted)
     else:
-        value = None if generation is None else Assumption(generation)
+        value = None if generation is None else Assumption(generation, interpreted=interpreted)
     with _cache.KERNEL_ASSUMED(value):
         yield
 
@@ -78,8 +85,9 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
-                     'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue', 'grouped_matmul', 'narrow_copies',
+CHOICES = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode',
+                     'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
+                     'grouped_matmul', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block',
                      'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
 """The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
 selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
@@ -195,27 +203,41 @@ class Multiprocessor:
 @dataclasses.dataclass(frozen=True)
 class Architecture:
     """The facts every device of one instruction family shares, from its compute capability (a TPU's
-    generation): the family a template's mainloop claims (`family`), its dense tensor-core FLOPs per clock per
+    generation), each component a template's bundle composes from stated per device, never implied by a
+    generation's number (`templates.bundles.groups`): the matrix instruction families it issues, most capable
+    first (`issuers`; the first the family a template's mainloop claims, `family`, and Hopper's warpgroup MMA,
+    `wgmma`, one of them), the multiprocessors a cluster's TMA multicast reaches (`cluster`), whether its
+    tensor instructions read block-scaled operands (`block_scales`), its dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in fp32; 'tf32'; '8bit': FP8
     operands, E4M3 or E5M2, where the family's tensor instructions multiply them natively; 'fp32': IEEE fp32
-    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Hopper's warpgroup MMA, Blackwell's
-    tensor memory columns (PTX ISA, tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and
-    the VMEM a kernel may raise its limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block
-    into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline` and
-    `copy_gmem_to_smem`), where below it they copy by cp.async. `dependent_launch`: PTX's grid dependency
-    control (`griddepcontrol`, programmatic dependent launch), sm_90 on. A family of None is no template's:
-    its devices' facts serve the rest of Dew (MFU's peaks). Its CUDA multiprocessor's resources
-    (`multiprocessor`), None on a TPU."""
+    on the CUDA cores, the rate a dot at Precision.HIGHEST takes), Blackwell's tensor memory columns (PTX ISA,
+    tcgen05.alloc), and on a TPU the scoped VMEM limit at XLA's default and the VMEM a kernel may raise its
+    limit to (`vmem_bytes`). `tma`: JAX's Mosaic GPU pipelines move a block into shared memory by TMA, which
+    it picks from compute capability 9.0 on (its `emit_pipeline` and `copy_gmem_to_smem`), where below it they
+    copy by cp.async. `dependent_launch`: PTX's grid dependency control (`griddepcontrol`, programmatic
+    dependent launch), sm_90 on. No issuer is no template's: its devices' facts serve the rest of Dew (MFU's
+    peaks). Its CUDA multiprocessor's resources (`multiprocessor`), None on a TPU."""
 
-    family: str | None
+    issuers: tuple[str, ...]
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     multiprocessor: Multiprocessor | None = Multiprocessor()
-    wgmma: bool = False
     tma: bool = False
     dependent_launch: bool = False
     tmem_columns: int | None = None
     scoped_vmem: int | None = None
     vmem_bytes: int | None = None
+    cluster: int = 1
+    block_scales: bool = False
+
+    @property
+    def family(self) -> str | None:
+        """The instruction family a template's mainloop claims the device by: the most capable it issues."""
+        return self.issuers[0] if self.issuers else None
+
+    @property
+    def wgmma(self) -> bool:
+        """Whether the device issues Hopper's warpgroup MMA."""
+        return 'wgmma' in self.issuers
 
 
 # Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x boost clock: A100 312 TF
@@ -234,24 +256,30 @@ class Architecture:
 # Resident blocks and threads a multiprocessor holds are the CUDA C++ Programming Guide's (§5.1, Table 33):
 # 7.5 16 and 1024, 8.0 32 and 2048, 8.6 16 and 1536, 8.9 24 and 1536, 9.0 and 10.0 32 and 2048, 12.x 24 and
 # 1536; setmaxnreg is sm_90a's, sm_100f's and sm_120f's (PTX ISA, `SETMAXNREG`).
-_AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
+_AMPERE = Architecture(('mma.sync',), {'16bit': 2048, 'tf32': 1024, 'fp32': 128},
                        Multiprocessor(resident_threads=2048, resident_blocks=32, register_raises=None))
-_AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256},
+_AMPERE_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, 'fp32': 256},
                                 Multiprocessor(register_raises=None))
-_ADA = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
+_ADA = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
                     Multiprocessor(resident_blocks=24, register_raises=None))
 # Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
-_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128},
+_TURING = Architecture((), {'16bit': 1024, 'fp32': 128},
                        Multiprocessor(resident_threads=1024, register_raises=None))
-_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
-                       Multiprocessor(resident_threads=2048, resident_blocks=32), wgmma=True, tma=True,
-                       dependent_launch=True)
-# Blackwell's tcgen05 family.
-_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
+# Hopper issues wgmma (sm_90a) and mma.sync, its TMA multicast to a pair of multiprocessors a cluster (the
+# pair CUTLASS's grouped GEMM and cuBLASLt take on an H100).
+_HOPPER = Architecture(('wgmma', 'mma.sync'), {'16bit': 4096, 'tf32': 2048, '8bit': 8192, 'fp32': 256},
+                       Multiprocessor(resident_threads=2048, resident_blocks=32), tma=True,
+                       dependent_launch=True, cluster=2)
+# Blackwell's tcgen05 family: tcgen05 (sm_100a) and mma.sync, no wgmma; tensor memory, a pair's 2-CTA
+# products and multicast, block-scaled operands (PTX ISA, tcgen05.mma's kind::mxf8f6f4 and mxf4nvf4).
+_BLACKWELL = Architecture(('tcgen05', 'mma.sync'), {'16bit': 8192, 'tf32': 4096, '8bit': 16384, 'fp32': 256},
                           Multiprocessor(resident_threads=2048, resident_blocks=32), tmem_columns=512,
-                          tma=True, dependent_launch=True)
+                          tma=True, dependent_launch=True, cluster=2, block_scales=True)
 # Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates.
-_BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
+# Its components are those PTX's forward compatibility gives every NVIDIA GPU after it too: mma.sync and
+# cp.async from sm_80, TMA and grid dependency control from sm_90, no arch-specific instruction (wgmma's
+# sm_90a, tcgen05's sm_100a), which no capability implies.
+_BLACKWELL_CONSUMER = Architecture(('mma.sync',), {'16bit': 1024, 'tf32': 512, '8bit': 2048, 'fp32': 256},
                                    Multiprocessor(resident_blocks=24), tma=True, dependent_launch=True)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072) and the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's).
@@ -259,15 +287,18 @@ _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, '8bi
 # over 40 SMs at 1590 MHz -> 1024 and 128.
 # VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
 # GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
+_TPUS = {'v5e': Architecture(('tpu',), {'16bit': 131072}, None, scoped_vmem=16 * 2 ** 20,
                              vmem_bytes=128 * 2 ** 20),
-         'v6e': Architecture('tpu', {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
+         'v6e': Architecture(('tpu',), {'16bit': 524288}, None, vmem_bytes=128 * 2 ** 20)}
 
 
 def architecture(generation: str) -> Architecture | None:
     """The instruction family `generation` belongs to, from its compute capability alone, one rule a
-    capability (a TPU's generation), so a device no row names (B300, sm103) takes its family's facts;
-    None outside every family Dew knows (a GPU before Turing, a TPU no rule states, a CPU)."""
+    capability (a TPU's generation), so a device no row names (B300, sm103) takes its family's facts, and
+    an NVIDIA GPU past every rule (a capability Dew states none for yet) takes consumer Blackwell's, whose
+    components PTX's forward compatibility gives it (mma.sync, cp.async and TMA): the Mosaic templates run
+    wherever CUDA does (row 4727). None outside every family Dew knows (a GPU before Ampere, a TPU no rule
+    states, a CPU)."""
     found = capability(generation)
     if found is None:
         return _TPUS.get(generation)
@@ -280,15 +311,13 @@ def architecture(generation: str) -> Architecture | None:
         return _HOPPER
     if major in (10, 11):
         return _BLACKWELL
-    if major == 12:
-        return _BLACKWELL_CONSUMER
-    return None
+    return _BLACKWELL_CONSUMER if major >= 9 else None
 
 
 def family(generation: str) -> str | None:
     """The instruction family a template's mainloop claims `generation` by ('mma.sync', 'wgmma',
-    'tcgen05', 'tpu'), seen or unseen: a claim is a family, never a list of devices; None outside every
-    family (a Turing GPU, a CPU)."""
+    'tcgen05', 'tpu'), seen or unseen (an NVIDIA GPU past every rule claimed by mma.sync, `architecture`):
+    a claim is a family, never a list of devices; None outside every family (a Turing GPU, a CPU)."""
     found = architecture(generation)
     return None if found is None else found.family
 
@@ -348,6 +377,13 @@ class GpuTarget:
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
+    memory: int | None = None
+    """The named device's memory in bytes, its datasheet's, which a call's footprint is held to where the
+    device is assumed and absent (`device_memory`; an attached device states its allocator's own limit)."""
+    l2_bytes: int | None = None
+    """The L2 cache's bytes, which a launch whose operands are re-read across its programs (a split
+    contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
+    it, else unknown; a real device's own (`runtime_facts`)."""
     measured: Mapping[str, Measured] = dataclasses.field(default_factory=dict, hash=False)
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
@@ -376,7 +412,7 @@ class GpuTarget:
     @property
     def architecture(self) -> Architecture:
         """The target's instruction family's facts (`architecture`), none where it belongs to none."""
-        return architecture(self.generation) or Architecture('')
+        return architecture(self.generation) or Architecture(())
 
     @property
     def tensor_rates(self) -> Mapping[str, int]:
@@ -531,12 +567,15 @@ class GpuTarget:
 TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
-              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
+              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9,
+              memory=16 * 10 ** 9),
     # A dependent step on XLA's path: an A100-SXM4-40GB's loop iteration, 5.96 us (FS-STEP-SECONDS1-a100,
     # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
-              memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              memory_bandwidth=2039e9, memory=80 * 10 ** 9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # The Ampere Tuning Guide's "Increased L2 Capacity": A100's 40 MB.
+              l2_bytes=40 * 2 ** 20,
               # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
               # and 225.25).
               kernel_step_seconds=225.3e-9,
@@ -548,11 +587,11 @@ TARGETS = {target.generation: target for target in (
               # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12},
                'NVIDIA RTX A6000': {'bf16': 154.8e12}}, multiprocessors=72,
-              clock_hz=1695e6, memory_bandwidth=600e9),
+              clock_hz=1695e6, memory_bandwidth=600e9, memory=24 * 10 ** 9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), multiprocessors=58,
-              clock_hz=2040e6, memory_bandwidth=300e9, triton_gemm_fusions=False),
+              clock_hz=2040e6, memory_bandwidth=300e9, memory=24 * 10 ** 9, triton_gemm_fusions=False),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
@@ -562,7 +601,10 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
-              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              clock_hz=1830e6, memory_bandwidth=3350e9, memory=80 * 10 ** 9, triton_gemm_fusions=False,
+              step_seconds=4.93e-6,
+              # The Hopper Tuning Guide's "Increased L2 Capacity": H100's 50 MB.
+              l2_bytes=50 * 2 ** 20,
               # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
               # an H100: Qwen3.5-4B's at 2 x 4096 tokens under 'full' holds 36.6 GiB of temporaries, 29
               # layers' four [8192, 9216] product operands at its peak and no layer's gradient, its weight
@@ -588,7 +630,10 @@ TARGETS = {target.generation: target for target in (
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
-              clock_hz=1965e6, memory_bandwidth=8e12,
+              # HGX B200's 1,440 GB of HBM3e over its 8 GPUs.
+              clock_hz=1965e6, memory_bandwidth=8e12, memory=180 * 10 ** 9,
+              # The Blackwell Tuning Guide's "Increased L2 Capacity" (1.4.2.2): GB200's GPU, 126 MB.
+              l2_bytes=126 * 2 ** 20,
               # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
               # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
               # gradients run after the backward, which the derivation bounds from above by running all
@@ -601,7 +646,8 @@ TARGETS = {target.generation: target for target in (
     # only XLA's own fusions in a compile-only target; a B300 run reads its own (`runtime_facts`).
     GpuTarget('sm103', 'NVIDIA B300', 227 * 1024,
               dense_peaks={'NVIDIA B300': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=160,
-              clock_hz=1965e6, memory_bandwidth=8e12,
+              # HGX B300's 2.3 TB of HBM3e over its 8 GPUs, 288 GB each (NVIDIA's HGX table).
+              clock_hz=1965e6, memory_bandwidth=8e12, memory=288 * 10 ** 9,
               # The B200's step above compiled for a B300 holds 13.9 GiB, 5.6 with the head fused: some
               # weight gradients late, bounded from above as on a B200 (row 3341's calibration).
               late_weight_gradients=True),
@@ -611,6 +657,8 @@ TARGETS = {target.generation: target for target in (
               # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
               # whitepaper, p.12).
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
+              # Its 96 GB of GDDR7 (the Server Edition's datasheet).
+              memory=96 * 10 ** 9,
               # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
               # and 137.66).
               step_seconds=3.68e-6, kernel_step_seconds=137.7e-9),
@@ -637,9 +685,18 @@ def capability(generation: str) -> tuple[int, int] | None:
 
 
 INTERPRETED_GENERATION = "sm90"
-"""The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
-interpreted bundle's (`templates.bundles.INTERPRETED`, wgmma's); the algebra pass prices a CPU process's
-forms by its facts too (`dew.algebra.cost.target`)."""
+"""The generation whose bundles and facts an interpreted launch takes where no GPU is assumed
+(`interpreted_target`): wgmma's, whose producer role, TMA rings and barriers Mosaic GPU's interpreter
+models; the algebra pass prices a CPU process's forms by its facts too (`dew.algebra.cost.target`)."""
+
+
+def interpreted_target() -> GpuTarget:
+    """The target an interpreted launch runs a bundle of (`templates.bundles.of`) and is sized by: the GPU
+    `assumed` stands in for, else `INTERPRETED_GENERATION`'s, so a CPU's check of a device's route runs
+    that device's bundles at its facts (`assumed(..., interpreted=True)`)."""
+    found = assumption()
+    return gpu_target() if found is not None and found.generation.startswith('sm') else gpu_target(
+        INTERPRETED_GENERATION)
 
 
 def gpu_target(identifier: str | None = None) -> GpuTarget:
@@ -690,20 +747,18 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
     its Mosaic GPU kernels to that GPU's instructions, for that GPU on any host (`TrainerConfig.lower_for`;
-    the kernel benchmark's oracle; tests/kernel_compile.py). Its devices state their compute capability, which
-    Mosaic GPU lowers for (its `utils._infer_arch`; a device that states none it takes for sm90's, and an
-    sm80 kernel's cp.async waits do not lower), but an sm90's, which Mosaic's default already is: stated,
-    its `9.0` sends a warpgroup-MMA kernel's ptxas a lower default SM than the sm_90a its PTX targets
-    ('SM version specified by .target is higher than default SM version assumed', FAM-contract3). JAX
-    0.12's abstract device states it (`AbstractDevice.compute_capability`)."""
+    the kernel benchmark's oracle). Its devices state their compute capability, which Mosaic GPU lowers for
+    (its `utils._infer_arch`; a device that states none it takes for sm90's, and an sm80 kernel's cp.async
+    waits do not lower), as a mesh of compile-only devices of the generation does (`compile_only_gpus`, whose
+    `abstract_mesh` a caller holding one takes), so one GPU's programs trace on one abstract mesh (row
+    3915). JAX 0.12's abstract device states it (`AbstractDevice.compute_capability`)."""
     from jax.sharding import AbstractDevice, AbstractMesh
     target = gpu_target(generation)
     version = capability(generation)
     if not target.generation.startswith('sm') or target.shared_limit is None or version is None:
         raise ValueError(f"no CUDA target for {generation!r}")
-    stated = None if version == (9, 0) else '.'.join(map(str, version))
     device = AbstractDevice(device_kind=target.device_kind, num_cores=None, platform='cuda',
-                            compute_capability=stated)
+                            compute_capability='.'.join(map(str, version)))
     return AbstractMesh(mesh.axis_sizes, mesh.axis_names, axis_types=mesh.axis_types, abstract_device=device)
 
 
@@ -738,18 +793,18 @@ def _shared_memory(device) -> int | None:
 
 
 @functools.cache
-def _clocks(ordinal: int) -> tuple[tuple[str, float], ...]:
-    """The visible GPU `ordinal`'s multiprocessor clock and device-memory bandwidth (twice the memory
-    clock times the bus's bytes, as CUDA's deviceQuery derives it), which jax's Device does not carry,
-    from the CUDA driver (`dew._devices.gpu_attribute`), read once a process; none where no
-    driver loads."""
-    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, MEMORY_CLOCK_RATE, gpu_attribute
+def _driver_facts(ordinal: int, read: Callable[[int, int], int | None]) -> tuple[tuple[str, float], ...]:
+    """The visible GPU `ordinal`'s facts jax's Device does not carry, as the CUDA driver reports them
+    (`read`: an attribute of a GPU, `dew._devices.gpu_attribute`), read once a process: its
+    multiprocessor clock, its device-memory bandwidth (twice the memory clock times the bus's bytes, as
+    CUDA's deviceQuery derives it) and its L2 cache's bytes; none where no driver loads."""
+    from dew._devices import CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, L2_CACHE_SIZE, MEMORY_CLOCK_RATE
 
-    clock, memory_clock, bus = (gpu_attribute(ordinal, attribute)
-                                for attribute in (CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH))
-    if clock is None or memory_clock is None or bus is None:
-        return ()
-    return ('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)
+    clock, memory_clock, bus, l2 = (read(ordinal, attribute) for attribute in (
+        CLOCK_RATE, MEMORY_CLOCK_RATE, GLOBAL_MEMORY_BUS_WIDTH, L2_CACHE_SIZE))
+    clocks = (() if clock is None or memory_clock is None or bus is None else
+              (('clock_hz', clock * 1e3), ('memory_bandwidth', 2 * memory_clock * 1e3 * bus / 8)))
+    return (*clocks, *(() if l2 is None else (('l2_bytes', l2),)))
 
 
 def _one_kind(devices) -> None:
@@ -766,13 +821,18 @@ def _one_kind(devices) -> None:
                          "be of one kind")
 
 
-def runtime_facts(target: GpuTarget, device) -> GpuTarget:
+def runtime_facts(target: GpuTarget, device, *, read: Callable[[int, int], int | None] | None = None
+                  ) -> GpuTarget:
     """`target` with the facts a real CUDA `device` reports of itself in place of the table's: its
-    multiprocessors, its block's shared memory, its clock and memory bandwidth (`_clocks`), read free at
+    multiprocessors, its block's shared memory, its clock, memory bandwidth and L2 cache from the CUDA
+    driver (`_driver_facts`, read by `read`, `dew._devices.gpu_attribute` by default), read free at
     runtime, its family's facts its capability's (`architecture`). A GPU the table does not name so
     keeps every resource a kernel's requirements and cost read."""
+    if read is None:
+        from dew._devices import gpu_attribute
+        read = gpu_attribute
     facts = {'multiprocessors': _multiprocessors(device), 'shared_limit': _shared_memory(device),
-             **dict(_clocks(device.local_hardware_id))}
+             **dict(_driver_facts(device.local_hardware_id, read))}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None})
 
 
@@ -787,8 +847,11 @@ def tpu(target: GpuTarget) -> bool:
 
 
 def shared_budget(target: GpuTarget) -> int:
-    """The shared memory, in bytes, a program on `target` may stage: the block's own, which a real
-    device reports (`runtime_facts`), else `SHARED_BUDGET`."""
+    """The scratch memory, in bytes, a program on `target` may stage: a GPU block's shared memory, which a
+    real device reports (`runtime_facts`), else `SHARED_BUDGET`; a TPU core's scoped VMEM
+    (`Architecture.scoped_vmem`), where it is known."""
+    if tpu(target) and target.scoped_vmem is not None:
+        return target.scoped_vmem
     return target.shared_limit or SHARED_BUDGET
 
 
@@ -833,6 +896,66 @@ def device_target(device) -> GpuTarget:
     reports of itself (`runtime_facts`), its multiprocessors among them. What a program compiled for a target
     is checked against before it loads (`dew.training.ahead.BuildTarget`)."""
     return _resolved(device, _generation(device), device.platform == 'gpu')
+
+
+@dataclasses.dataclass(frozen=True)
+class GpuFacts:
+    """The facts Dew's kernels read of a GPU, read-only (`gpu_facts`): its part (the device kind), CUDA
+    `generation` and compute `capability`, its `multiprocessors`, their clock (`clock_hz`), its memory's
+    bandwidth (bytes a second) and L2 cache (`l2_bytes`), the shared memory a block may stage
+    (`shared_per_block`, bytes), a multiprocessor's 32-bit `registers`, the most a thread holds
+    (`thread_registers`) and the most threads and blocks resident on it at once, the dense tensor peaks by
+    dtype (`dense_peaks`, FLOP a second), and the matrix instruction families it issues and the kernel
+    bundles Dew's templates compose there (`bundles`, for bf16 operands). A fact no source states is None."""
+
+    part: str
+    generation: str
+    capability: tuple[int, int] | None
+    multiprocessors: int | None
+    clock_hz: float | None
+    memory_bandwidth: float | None
+    l2_bytes: int | None
+    shared_per_block: int
+    registers: int | None
+    thread_registers: int | None
+    resident_threads: int | None
+    resident_blocks: int | None
+    dense_peaks: Mapping[str, float]
+    instruction_families: tuple[str, ...]
+    bundles: tuple[str, ...]
+
+
+def gpu_facts(part: str | None = None) -> GpuFacts:
+    """The facts Dew's kernels read of a GPU (`GpuFacts`), read from the target they resolve, never a copy
+    of it: this process's GPU's where `part` is None, what its driver reports of itself (multiprocessors,
+    shared memory, clocks and L2, `runtime_facts`), or, within `assumed`, the assumed part's; else a named
+    part's, by generation ('sm90'), device kind ('NVIDIA H100 80GB HBM3') or alias ('a100'). Raises
+    `ValueError` for a process whose device is not a GPU and for a part Dew knows nothing of."""
+    from types import MappingProxyType
+
+    import jax
+
+    from dew.nn.kernels.templates import bundles
+
+    if part is None and assumption() is None and jax.local_devices()[0].platform != 'gpu':
+        raise ValueError(f"this process's device is a {jax.local_devices()[0].platform}, not a GPU; "
+                         f"name a part to read its facts")
+    target = gpu_target(part)
+    if capability(target.generation) is None:
+        raise ValueError(f"Dew knows no GPU named {part!r}")
+    resources = target.architecture.multiprocessor
+    return GpuFacts(
+        part=target.device_kind, generation=target.generation, capability=capability(target.generation),
+        multiprocessors=target.multiprocessors, clock_hz=target.clock_hz,
+        memory_bandwidth=target.memory_bandwidth, l2_bytes=target.l2_bytes,
+        shared_per_block=shared_budget(target),
+        registers=resources and resources.registers,
+        thread_registers=resources and resources.thread_registers,
+        resident_threads=resources and resources.resident_threads,
+        resident_blocks=resources and resources.resident_blocks,
+        dense_peaks=MappingProxyType(dict(target._part(target.dense_peaks) or {})),
+        instruction_families=target.architecture.issuers,
+        bundles=tuple(bundle.name for bundle in bundles.layouts(target.generation, 'bfloat16')))
 
 
 def _resolved(device, generation: str, real: bool) -> GpuTarget:
@@ -891,15 +1014,17 @@ class _Routes:
 
 
 @contextlib.contextmanager
-def routes() -> Iterator[list[Route]]:
+def routes(*, alone: bool = False) -> Iterator[list[Route]]:
     """Collect every `Route` a dispatch reports while code runs or traces in the block, in order: what
     a step's trace within `assumed(target)` on a CPU shows of that target's kernels. Each block is a
     fresh collection JAX keys its traces on (`dew._cache.KERNEL_ROUTES`), so a function traced before
-    traces, and reports, again; a block nested in another reports to both."""
+    traces, and reports, again; a block nested in another reports to both, unless `alone` (a decision
+    that traces a call it may not take, the compile point's, whose routes no program runs)."""
     from dew import _cache
 
     collected = _Routes()
-    with _cache.KERNEL_ROUTES((*_cache.KERNEL_ROUTES.value, collected)):
+    enclosing = () if alone else _cache.KERNEL_ROUTES.value
+    with _cache.KERNEL_ROUTES((*enclosing, collected)):
         yield collected.found
 
 
@@ -937,7 +1062,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     return found
 
 
-def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
+def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
                    live_cotangents: bool = False, primal: Callable | None = None,
                    nested: bool = True) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
@@ -954,38 +1079,41 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     `portable`'s and its pullback's, so a higher order (`jax.jvp` of `jax.grad`, `jax.grad` of
     `jax.jvp`) differentiates through XLA while each level's value comes from the kernels; what
     `saved` holds is a function of the operands, whose tangents carry it. This composes with
-    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse.
+    `jax.vmap` of a gradient, the gradient of a `jax.vmap` and forward over reverse. Each of the three is
+    declared as the caller's `kind` (`dew.nn.derivatives.declared_tangent`): a kernel's glue (`KernelGlue`),
+    a rule its numerics need as written (`Protected`), or one written to restructure algebra (`Algebra`),
+    which is what the algebra pass reads of it.
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
     cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
     that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
-    it is, not as a custom JVP of its own: a value it names (`checkpoint_name`) is a residual a remat
-    policy can keep, and no higher order differentiates through it (a kernel's custom VJP takes none)."""
+    it is on its operands held still (`stop_gradient`), not as a custom JVP of its own: a value it names
+    (`checkpoint_name`) is a residual a remat policy can keep, and no order differentiates the kernels'
+    forward, whose custom VJP takes none (what it saves reaches `pulled` alone, whose tangent reads the
+    operands': run as it was, a jvp of a gradient through a named kernel reached Mosaic GPU's call, which
+    no JAX rule differentiates, row 2655)."""
     import jax
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
-    from dew.nn.derivatives import contracted
+    from dew.nn.derivatives import contracted, declared_tangent
 
-    @contracted("test_an_embedding_lookup_holds_every_order")
-    @jax.custom_jvp
-    def produced(*operands):
-        return forward(*operands)
-
-    @produced.defjvp
-    def _(primals, tangents):
+    def produced_jvp(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
         return (output, saved), (jax.jvp(portable, primals, tangents)[1], zero_from_primal(saved))
 
-    @contracted("test_an_embedding_lookup_holds_every_order")
-    @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
-    def pulled(saved, operands, cotangent, live):
+    def producing(*operands):
+        return forward(*operands)
+
+    produced = contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, producing, produced_jvp))
+
+    def pulled_by(saved, operands, cotangent, live):
         arguments = (saved, operands, cotangent) if live is None else (saved, operands, cotangent, live)
         return backward(*arguments)
 
-    @pulled.defjvp
-    def _(live, primals, tangents):
+    def pulled_jvp(live, primals, tangents):
         _, operands, cotangent = primals
         _, doperands, dcotangent = tangents
 
@@ -996,13 +1124,11 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
         return pulled(*primals, live), jax.jvp(pullback, (operands, cotangent), (doperands, dcotangent))[1]
 
-    @contracted("test_an_embedding_lookup_holds_every_order")
-    @jax.custom_jvp
-    def bounded(*operands):
-        return forward(*operands)[0] if primal is None else primal(*operands)
+    pulled = contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, pulled_by, pulled_jvp, nondiff_argnums=(3,)))
 
     def bounded_jvp(primals, tangents):
-        output, saved = (produced if nested else forward)(*primals)
+        output, saved = produced(*primals) if nested else forward(*jax.lax.stop_gradient(primals))
         # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)
@@ -1031,8 +1157,22 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
         return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
 
-    bounded.defjvp(bounded_jvp, symbolic_zeros=True)
-    return bounded
+    def bounding(*operands):
+        return forward(*operands)[0] if primal is None else primal(*operands)
+
+    return contracted("test_an_embedding_lookup_holds_every_order")(
+        declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
+
+
+def unbroadcast(cotangent, shape: tuple[int, ...]):
+    """`cotangent`, of the shape an operand of `shape` was broadcast to, summed back to `shape`, as JAX pulls
+    a broadcast back."""
+    import jax
+    import jax.numpy as jnp
+
+    _, pulled = jax.vjp(lambda wide: jnp.broadcast_to(wide, cotangent.shape),
+                        jnp.zeros(shape, cotangent.dtype))
+    return pulled(cotangent)[0]
 
 
 def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):
@@ -1152,6 +1292,22 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
+LAUNCHED_TRIPS = ('cuda', 'rocm')
+"""The lowering platforms whose XLA loops run each trip's kernels as launches of their own (a GPU's: a binary
+search's log2(K) trips cost a speculative verify 284 us beside its 22 us attention, M-DD-10), so a loop
+unrolled into one program saves a launch a trip; a CPU's and a TPU's loop runs within its one program."""
+
+
+def by_trips[T](branch: Callable[..., Callable[[], T]]) -> T:
+    """`branch(launched=...)()` for the platform a program lowers for (`jax.lax.platform_dependent`),
+    `launched` whether that platform's loop trips are launches of their own (`LAUNCHED_TRIPS`): a loop's
+    choice to unroll where that saves the launches, and to stay a loop elsewhere."""
+    import jax
+
+    return jax.lax.platform_dependent(**{platform: branch(launched=True) for platform in LAUNCHED_TRIPS},
+                                      default=branch(launched=False))
+
+
 def placed_platform() -> str:
     """The platform of the devices the context places a call on: the set mesh's, else the default
     device's (`jax.default_device`), else `jax.default_backend()`, 'gpu' for CUDA's and ROCm's. A
@@ -1174,24 +1330,85 @@ def gpu_placed() -> bool:
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
-def cuda_lowered() -> bool:
-    """Whether a library's CUDA call lowers here for the call's target: on this process's own GPU
-    (`gpu_placed`), or within `assumed` on a GPU host whose own GPU is the assumed generation's, where a
-    compile ahead's program for that GPU's compile-only devices lowers it as for its own (an FFI target
-    the library registered, and the facts it reads of the GPU: FlashAttention's, dew_flash_attn)."""
+def host_memory_share() -> int:
+    """A CPU device's share of the memory this process can hold, in bytes: the least of its host's physical
+    memory, its control groups' limits (`cgroup_memory_limits`: a container's, a service's) and its address
+    space's (`RLIMIT_AS`), over the process's CPU devices, which share it (a forced count of them)."""
+    import resource
+
     import jax
-    if gpu_placed():
-        return True
-    found = assumption()
-    return (found is not None and jax.default_backend() == 'gpu'
-            and _generation(jax.local_devices()[0]) == found.generation)
+
+    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"), *cgroup_memory_limits()]
+    address, _ = resource.getrlimit(resource.RLIMIT_AS)
+    if address != resource.RLIM_INFINITY:
+        limits.append(address)
+    return min(limits) // max(1, jax.local_device_count('cpu'))
+
+
+CGROUP_MEMORY = {2: ("sys/fs/cgroup", "memory.max"), 1: ("sys/fs/cgroup/memory", "memory.limit_in_bytes")}
+"""Each cgroup version's memory hierarchy, its mount under the root, and the file a group states its limit in
+(the kernel's cgroup-v2 and cgroup-v1 memory documentation)."""
+
+
+def cgroup_memory_limits(root: str = "/") -> list[int]:
+    """The memory limits on the control groups this process runs in (`/proc/self/cgroup`: v2's unified
+    group, v1's memory controller's), each group's own and every ancestor's up to its hierarchy's mount
+    (`CGROUP_MEMORY`), any of which bounds it; a group its mount does not show (a container's, whose own group
+    is its mount's root) states its limit at that root. `root` is the filesystem's, which a test builds."""
+    limits = []
+    with contextlib.suppress(OSError):
+        with open(os.path.join(root, "proc/self/cgroup")) as groups:
+            listed = groups.read().splitlines()
+        for line in listed:
+            _, controllers, group = line.split(":", 2)
+            version = 2 if not controllers else 1 if "memory" in controllers.split(",") else None
+            if version is None:
+                continue
+            mount, name = CGROUP_MEMORY[version]
+            parts = [part for part in group.split("/") if part]
+            for depth in range(len(parts), -1, -1):
+                # 'max' (v2's none) reads as no number.
+                with (contextlib.suppress(OSError, ValueError),
+                      open(os.path.join(root, mount, *parts[:depth], name)) as limit):
+                    limits.append(int(limit.read().strip()))
+    return limits
+
+
+def device_memory() -> int | None:
+    """The bytes one device a call is chosen for holds: the least allocator limit of the devices this
+    process places it on (`placed_devices`; `Device.memory_stats`' `bytes_limit`, what an allocation fails
+    against, under the process's memory fraction); an assumed and absent GPU's datasheet's
+    (`GpuTarget.memory`); a CPU's share of the process's (`host_memory_share`); None where none is known (an
+    assumed TPU, a device that states none)."""
+    platform = backend()
+    if platform == 'cpu':
+        return host_memory_share()
+    if assumption() is None:
+        limits = [stats['bytes_limit'] for device in placed_devices()
+                  if 'bytes_limit' in (stats := device.memory_stats() or {})]
+        return min(limits, default=None)
+    return gpu_target().memory if platform == 'gpu' else None
+
+
+def placed_devices() -> list:
+    """This process's devices the context places a call on, as `placed_platform` reads the context: the
+    default device where no mesh is set and one is (`jax.default_device`), else the local devices of the
+    placed platform."""
+    import jax
+
+    device = jax.config.jax_default_device
+    if (jax.sharding.get_abstract_mesh().abstract_device is None and device is not None
+            and not isinstance(device, str)):
+        return [device]
+    return jax.local_devices(backend=placed_platform())
 
 
 def backend() -> str:
     """The platform a call's code is chosen for: `placed_platform()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
-    platform acts as on that device while a step traces for it on another."""
-    if (found := assumption()) is None:
+    platform acts as on that device while a step traces for it on another; an `interpreted` assumption's
+    the placed platform's, where its kernels run."""
+    if (found := assumption()) is None or found.interpreted:
         return placed_platform()
     generation = found.generation
     if generation.startswith('sm'):

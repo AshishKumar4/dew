@@ -401,6 +401,9 @@ class SourceOptions:
     scan_layers: bool = False
     """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
     (`Pretrained.load`'s `scan_layers`): a step's program grows with the period, not the depth."""
+    packed_experts: bool = False
+    """An MXFP4 source's routed experts served as their codes, NVFP4 banks the expert layers multiply
+    as they are (`Pretrained.load`'s `packed_experts`, row 4516): its experts' memory a quarter of bf16's."""
     param_dtype: str | None = None
     """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
@@ -426,7 +429,7 @@ class SourceOptions:
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
                 "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers,
-                "step": self.step, "ema": self.ema}
+                "packed_experts": self.packed_experts, "step": self.step, "ema": self.ema}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -447,6 +450,7 @@ class SourceBuild(TypedDict, total=False):
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
     scan_layers: bool
+    packed_experts: bool
     step: int | str | None
     ema: bool | None
 
@@ -1244,10 +1248,12 @@ class RunConfig:
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers",)
+    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers", "packed_experts")
     """The model and source fields, by name, that say how a model's layers execute and not what they
     compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
-    (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`)."""
+    (`layers_N`) and compute the same step, and a source's experts packed or decoded hold the same values
+    (its MXFP4 codes, which an export writes back alike), so a run resumes under either
+    (`check_resume`)."""
 
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
@@ -1278,6 +1284,10 @@ class RunConfig:
     stage or the training batch."""
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
+    kernels: dict[str, str] = dataclasses.field(default_factory=dict)
+    """The kernel the run runs for each op it names (`dew.kernels.use`, ops `dew.kernels.choices`), for
+    every program it traces, its steps', evaluations' and samples' (`traced`): `--kernels attention xla`.
+    None named, each op's pick for its call (row 4649)."""
     data_plan_version: int | None = None
     """The data plan version the run reads its order by (`dew.data.plan.PLAN_VERSIONS`): None for the
     saved run's it resumes, or else this Dew's, which `resumed` resolves on every path a run trains by and
@@ -2002,8 +2012,7 @@ class RunConfig:
             # state restored.
             self._agree_resume(checkpoints, built, dataset, steps)
             agreed("run metadata", record_run)
-            # Every program the run traces takes its recorded precision policy.
-            with generation.run_precision(trainer.precision):
+            with self.traced():
                 state = built.fit(
                     # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
                     dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
@@ -2033,6 +2042,16 @@ class RunConfig:
             _closed(tracker, checkpoints, sys.exception(),
                     rollout if isinstance(rollout, Closeable) else None)
 
+    @contextlib.contextmanager
+    def traced(self) -> Iterator[None]:
+        """The block every program the run traces is traced within (its steps', evaluations' and samples'):
+        its recorded precision policy (`generation.run_precision`) and its kernel choices
+        (`dew.kernels.use`), which JAX keys its trace caches on."""
+        import dew.kernels
+
+        with generation.run_precision(self.trainer.precision), dew.kernels.use(**self.kernels):
+            yield
+
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
                                          steps: int | None, rollout: Rollout | None,
                                          name: str) -> CompiledAhead:
@@ -2047,7 +2066,7 @@ class RunConfig:
         held = epath.Path(self.trainer.directory(name)).is_dir()
         trainer = self.built(objective, mesh, rollout,
                              checkpoints=self.trainer.checkpoints(name) if held else None)
-        with generation.run_precision(self.trainer.precision):
+        with self.traced():
             # The run's bound in examples as its data was compiled to it (`viewed`).
             return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None,
                                    self.trainer.resume)
@@ -2066,7 +2085,7 @@ class RunConfig:
         held = epath.Path(run.trainer.directory(name)).is_dir()
         trainer = run.built(objective, run.trainer.mesh, rollout,
                             checkpoints=run.trainer.checkpoints(name) if held else None)
-        with generation.run_precision(run.trainer.precision):
+        with run.traced():
             # The run's bound in examples as its data was compiled to it: its `examples`, or its `epochs`'
             # passes over a read with no record count (`fitted`).
             batch = first_step_batch(trainer, loader, steps, loader.examples if steps is None else None)

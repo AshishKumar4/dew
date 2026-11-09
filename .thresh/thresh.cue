@@ -148,7 +148,6 @@ seams: "grouped-cells": {
 	paths:   ["src/dew/nn/kernels/grouped_matmul.py"]
 	entries: "DECLARED"
 	declared: {
-		"(mma.sync, grouped input_gradient)": "Triton's grouped input gradient on an A100 (FSCELLS1-a100, FSCELLS2-a100)"
 		"(mma.sync, dense forward)":          "XLA's dense forward on an A100 (DENSE1)"
 		"(mma.sync, dense input_gradient)":   "XLA's dense input gradient on an A100 (DENSE1)"
 		"(mma.sync, dense kernel_gradient)":  "XLA's dense kernel gradient on an A100 (DENSE1)"
@@ -169,6 +168,16 @@ seams: "join-cells": {
 		"(gate_up, sm80)":     "the gate and up projections joined on an A100 (dbf402f36)"
 		"(delta_gates, sm80)": "a delta net's gates joined on an A100 (e5198da4e)"
 		"(delta_gates, sm90)": "a delta net's gates joined on an H100 (e5198da4e)"
+	}
+}
+
+seams: "nvfp4-cells": {
+	kind:    "declared-set"
+	purpose: "each cell runs an NVFP4 product's packed kernel on a receipt that shows it faster than decoding the matrix once a call"
+	paths:   ["src/dew/nn/kernels/gemm.py"]
+	entries: "NVFP4_CELLS"
+	declared: {
+		"(sm80, decode)": "the packed kernel at 1-64 rows on an A100 (PACKED_FASTER, W13-a100-4-M-NS-8b-a100)"
 	}
 }
 
@@ -204,6 +213,7 @@ seams: "kernel-choices": {
 	declared: {
 		attention:          "the attention kernel, a choice a dispatch reports"
 		attention_mainloop: "the attention_mainloop kernel, a choice a dispatch reports"
+		blockwise_fp8:      "the blockwise_fp8 kernel (a blockwise-scaled FP8 product, row 4518), a choice a dispatch reports"
 		decode:             "the decode kernel, a choice a dispatch reports"
 		delta_decode:       "the delta_decode kernel, a choice a dispatch reports"
 		delta_gates:        "the delta_gates kernel, a choice a dispatch reports"
@@ -213,6 +223,9 @@ seams: "kernel-choices": {
 		gemm_prologue:      "the gemm_prologue kernel, a choice a dispatch reports"
 		grouped_matmul:     "the grouped_matmul kernel, a choice a dispatch reports"
 		local_attention:    "the local_attention kernel, a choice a dispatch reports"
+		low_rank:           "the low_rank kernel (LoRA's adapted product fused or apart, row 1304), a choice a dispatch reports"
+		mxfp8:              "the mxfp8 kernel (an MX product on block-scaled tensor cores or decoded, row 4519), a choice a dispatch reports"
+		nvfp4:              "the nvfp4 kernel (an NVFP4 matrix's product decoded in stage or once a call, row 3621), a choice a dispatch reports"
 		mla:                "the mla kernel, a choice a dispatch reports"
 		narrow_copies:      "the narrow_copies kernel, a choice a dispatch reports"
 		paged_decode:       "the paged_decode kernel, a choice a dispatch reports"

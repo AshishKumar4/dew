@@ -15,6 +15,7 @@ import threading
 import time
 import tomllib
 import urllib.parse
+import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -168,6 +169,10 @@ class _PinnedReader(io.BufferedReader):
             self.pin.close()
 
 
+_MIRRORS: weakref.WeakSet = weakref.WeakSet()
+"""Every mirror this process opened and still holds (`mirror_metrics`)."""
+
+
 class BoundedFileCache(WholeFileCacheFileSystem):
     """A filecache with an LRU byte limit and cross-process reader pins.
 
@@ -198,6 +203,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         self._dew_misses = 0
         self._dew_downloaded = 0
         self._dew_wait = 0.0
+        _MIRRORS.add(self)
 
     def __getattribute__(self, name: str):
         if name.startswith("_dew_") or name == "metrics":
@@ -349,7 +355,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
 def mirror_metrics() -> dict[str, float]:
     """What this process's mirrors (`dewcache::`) did, summed over every one it opened, as a run logs it
     beside its data metrics (`data/mirror/...`, row 4299): none where it opened none."""
-    held = [mirror.metrics() for mirror in BoundedFileCache._cache.values()]
+    held = [mirror.metrics() for mirror in _MIRRORS]
     if not held:
         return {}
     return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}

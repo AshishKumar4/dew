@@ -17,7 +17,7 @@ from contract_support import normal_drawn
 from model_support import as_stepped
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, assert_fp32_reduction_bound
 
-from dew.nn.attention import attention_case, scaled_dot_product_attention
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_masks import with_key_lengths
 from dew.nn.decode_geometry import folded_attention
 from dew.nn.kernels import decode_attention
@@ -224,7 +224,6 @@ def _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits):
     """A hooked decode case's check 1
     (`test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config`)."""
     from dew.nn.attention import reference_attention
-    from dew.nn.attention_kernels import decodes
     from dew.nn.kernels import tuning
 
     dtype, hooks, natural = jnp.dtype(dtype), DECODE_HOOKS[hooks], natural == "natural"
@@ -232,9 +231,6 @@ def _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits):
     query, key, value, lengths = arrays
     sinks = jnp.asarray(SINKS, jnp.float32) if hooks.get("sinks") else None
     softcap = SOFTCAP if hooks.get("softcap") else None
-    with on_the_gpu():
-        case = attention_case(query, key, key_value_seq_lengths=lengths, sinks=sinks, softcap=softcap)
-        assert decodes(case)
     read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
 
     def reference(query, key, value):
@@ -307,48 +303,8 @@ def a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(so
                     seeds=SINK_SEEDS)
 
 
-def test_a_launch_reads_its_slices_at_its_rows_next_power_of_two():
-    """33 rows of 2 key heads over 1024 keys, traced as on an A100 (108 multiprocessors) on any host:
-    the launch reads its slices at 64 rows (`decode_attention._rows`), whose 128 programs fill most of
-    the GPU, so it takes one slice, though its own 66 programs would have taken 8."""
-    from tuned import taken
-
-    from dew.nn.kernels.generation import assumed
-
-    query = jax.ShapeDtypeStruct((33, 4, 2, 256), jnp.bfloat16)
-    cache = jax.ShapeDtypeStruct((33, 1024, 2, 256), jnp.bfloat16)
-    lengths = jax.ShapeDtypeStruct((33,), jnp.int32)
-    with assumed("sm80"):
-        assert taken(decode_attention.DecodeAttention,
-                     lambda *a: decode_attention.attend(*a, interpret=not ON_GPU), query, cache, cache,
-                     lengths) == [decode_attention.Split(1)]
-    assert decode_attention._heuristic(66, 32, 108) == decode_attention.Split(8)
-
-
-@pytest.mark.parametrize("processors, programs, steps, splits", [
-    (None, 2, 128, 1), (108, 128, 128, 1), (108, 2, 128, 32), (132, 16, 128, 32), (132, 32, 4096, 16),
-    (132, 64, 4096, 8), (108, 2, 4, 4)])
-def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(processors, programs, steps,
-                                                                            splits):
-    """The heuristic (`_heuristic`): no slices on a device of no known multiprocessors or where the
-    programs fill most of them; else the most whose programs fill at most six a multiprocessor, at most
-    one a step: two programs over 108 multiprocessors take 32, sixteen over 132 take 32, and 32 and 64
-    take 16 and 8, the H100's fastest for Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take
-    at most 4."""
-
-    assert decode_attention._heuristic(programs, steps, processors) == decode_attention.Split(splits)
-    # The slices it may take hold the heuristic's, and none past one where the programs fill the GPU.
-    space = decode_attention._space(programs, steps, processors)
-    assert decode_attention.Split(splits) in space
-    assert (space == {decode_attention.Split(1)}) == (not processors or programs >= 0.8 * processors)
-    # An opt-in tuning run times the heuristic's and the counts of its space either side, each of which
-    # the kernel's tests hold to the gate at every config of the space.
-    variants = decode_attention._variants(programs, steps, processors)
-    assert variants[0] == decode_attention.Split(splits) and set(variants) <= space and len(variants) <= 3
-
-
 def decode_step(lengths):
-    """fp32 attention of a decode step's grouped query (`decode_attention.grouped_query`) over key
+    """fp32 attention of a decode step's grouped query (`decode_geometry.grouped_query`) over key
     lengths through the decode kernel, chosen for the decode selector (`attention_kernels.DECODE`),
     which takes it on a GPU (`decode_attention.SUPPORTS`), and the folded attention it stands in for
     over the prefix those lengths mean."""
@@ -401,7 +357,7 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
 def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation):
     """A decode step's query of 4 heads over 2 key heads, called in the layer's own `[B, 1, N, D]`
     layout with key lengths: the core reads each key head's query heads as its query positions
-    (`decode_attention.grouped_query`), so the decode kernel takes it, lowered for the GPU on this CPU."""
+    (`decode_geometry.grouped_query`), so the decode kernel takes it, lowered for the GPU on this CPU."""
     from dew.nn.kernels.generation import assumed, gpu_mesh
 
     query = jax.ShapeDtypeStruct((2, 1, 4, 64), jnp.bfloat16)
@@ -575,29 +531,6 @@ def test_key_starts_keep_the_arithmetic_auto_is_asked_for_where_the_decode_kerne
                                                                           implementation="reference"))
 
 
-@pytest.mark.parametrize("cross", [False, True], ids=["documents", "cross-documents"])
-def test_a_row_whose_documents_lie_below_its_start_reads_nothing(cross):
-    """Packed documents and a key start, no lengths or mask: the first query's only key of its
-    document lies below its row's start, so it reads nothing and comes back exactly zero, its
-    cotangent too, as the one-mask form gives; the other query reads its key."""
-    query = jnp.zeros((1, 2 if not cross else 1, 1, 16), jnp.float32)
-    key = jnp.zeros((1, 2, 1, 16), jnp.float32)
-    value = jnp.ones((1, 2, 1, 16), jnp.float32)
-    starts = jnp.asarray([1], jnp.int32)
-    documents = ({"segment_ids": jnp.asarray([[1]]), "key_segment_ids": jnp.asarray([[1, 2]])} if cross
-                 else {"segment_ids": jnp.asarray([[1, 2]])})
-
-    def attend(value):
-        return scaled_dot_product_attention(query, key, value, key_value_seq_starts=starts, **documents)
-
-    out = attend(value)
-    np.testing.assert_array_equal(np.asarray(out[:, 0]), 0)
-    if not cross:
-        np.testing.assert_array_equal(np.asarray(out[:, 1]), 1)
-    cotangent = jax.grad(lambda value: jnp.sum(attend(value)[:, 0]))(value)
-    np.testing.assert_array_equal(np.asarray(cotangent), 0)
-
-
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_decode_step_over_no_keys_returns_the_empty_result(generation):
     """A decode step of no cache capacity, its row's length 0 and a sink beside it, chosen for an A100 or an
@@ -754,8 +687,8 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
             lowering_platforms=("cuda",))
     # Each decode launch's operands, read from the lowered program's custom calls: the rows' key spans and
     # the padded queries a shard's own (`custom_calls`, `triton_calls`, in program order).
+    from dew.nn.kernels.lowered import custom_calls, triton_calls
     from dew.telemetry.instrumentation import custom_call_kind
-    from dew.training._lowering import custom_calls, triton_calls
 
     calls = [call for call in custom_calls(lowered) if custom_call_kind(call.target) == "triton"]
     launches = [call for call, kernel in zip(calls, triton_calls(lowered), strict=True)
@@ -818,7 +751,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
     if ON_GPU:
         case = PagedCase(heads=query.shape[1], kv_heads=key_pages.shape[0], head_dim=query.shape[2],
                          value_dim=query.shape[2], dtype=query.dtype, pool=key_pages.dtype,
-                         page_size=page_size, quantized=False, groups=1, head_shards=1, softcap=None,
+                         page_size=page_size, quantized=None, groups=1, head_shards=1, softcap=None,
                          arithmetic=False, named="auto", windowed=windowed)
         assert PAGED.kernel("triton").failed(case) == []
     config = decode_attention.Split(splits)

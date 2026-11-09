@@ -75,7 +75,7 @@ from dew.interop import unread
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.unread import Stored, Unread
 from dew.interop.weights import checkpoint_array, checkpoint_dtype
-from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
+from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fp8_codes
 from dew.nn.precision import correctly_rounded_divide
 
 # --------------------------------------------------------------------------
@@ -223,6 +223,66 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np
         else:
             decoded[expert] = values.view(work)
     return decoded
+
+
+E4M3_POWERS = (-9, 8)
+"""The powers of two float8_e4m3fn holds exactly, its least subnormal's to the largest below 448."""
+
+
+def _magnitudes(codes: Stored) -> Stored:
+    """Whether each group of packed E2M1 codes `[..., group, 16]` holds a code of nonzero magnitude: one
+    whose group's scale it is read under. A group of zeros, signed or not (codes 0 and 8), is its zeros
+    under any scale."""
+    return (((codes & 7) != 0) | (((codes >> 4) & 7) != 0)).any(-1)
+
+
+def mxfp4_tensor_powers(blocks: ArrayLike, scales: ArrayLike) -> np.ndarray | None:
+    """Each expert's power of two `k` (`[expert]` int32) that takes an MXFP4 bank's E8M0 group powers into
+    E4M3's (`E4M3_POWERS`), so the bank is NVFP4's parts exactly (`mxfp4_as_nvfp4`): a group's power less
+    `k`, its E4M3 block scale, twice. Every byte is its power `b - 127`, the 0x00 byte's 2**-127 among
+    them (`e8m0_scales`), but the powers bounding `k` are of the groups holding a code of nonzero
+    magnitude (`_magnitudes`): a group of zeros, signed or not, is its zeros under any block scale, an
+    all-zero group's 0x00 byte (`quantize_mxfp4`) its encoder's choice. None where an expert's bounding
+    powers spread past E4M3's 17, its `2**k` passes float32's normal range or a group's scale is the NaN
+    byte 0xff, or the load reads no values: such a bank stays dequantized (`dequantize_mxfp4`), which holds
+    every value it holds."""
+    blocks, scales = unread.held(blocks), unread.held(scales)
+    stored = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
+    if (not (unread.valued(stored) and unread.valued(blocks)) or stored.ndim != 3
+            or (stored == 255).any()):
+        return None
+    held = _magnitudes(_bytes(blocks, _CODE_DTYPES))
+    exponents = stored.astype(np.int32) - 127
+    low, high = E4M3_POWERS
+    any_held = held.any(axis=(1, 2))
+    top = np.where(any_held, np.where(held, exponents, np.iinfo(np.int32).min).max(axis=(1, 2)), high)
+    bottom = np.where(any_held, np.where(held, exponents, np.iinfo(np.int32).max).min(axis=(1, 2)), high)
+    power = top - high
+    if ((top - bottom) > high - low).any() or (power < -126).any() or (power > 127).any():
+        return None
+    return power.astype(np.int32)
+
+
+def mxfp4_as_nvfp4(blocks: ArrayLike, scales: ArrayLike, powers: np.ndarray
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Packed MXFP4 [expert, output, group, 16] blocks and their E8M0 scales, of experts whose tensor powers
+    are `powers` (`mxfp4_tensor_powers`), as NVFP4's parts, exactly and with no value decoded: each code's
+    E2M1 nibble `[expert, input, output]` uint8 (sign bit 3, as stored), each sixteen inputs' E4M3 block
+    scale `[expert, input / 16, output]` (its group's power less its expert's) and each expert's float32
+    tensor scale `2**k` `[expert]`, which `dew.nn.kernels.gemm.NvFp4.of` packs: every value its code times
+    its block's scale times its expert's, the MXFP4 value, the 0x00 byte's group's at 2**-127 as any
+    other's; a group of zeros, signed or not, under E4M3's largest power, which holds its zeros as they
+    are. A slice of a bank's experts reads its own (a placement's shard)."""
+    blocks, scales = _mxfp4_arrays(blocks, scales)
+    codes = _bytes(blocks, _CODE_DTYPES)
+    stored = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
+    experts, outputs, groups, _ = codes.shape
+    nibbles = np.stack([codes & 15, codes >> 4], axis=-1).reshape(experts, outputs, groups * GROUP)
+    local = np.where(_magnitudes(codes), stored.astype(np.int32) - 127 - powers[:, None, None],
+                     E4M3_POWERS[1])
+    block = np.ldexp(np.float32(1), local).astype(ml_dtypes.float8_e4m3fn).swapaxes(1, 2)
+    return (np.ascontiguousarray(nibbles.swapaxes(1, 2)), np.repeat(block, GROUP // 16, axis=1),
+            np.ldexp(np.float32(1), powers).astype(np.float32))
 
 
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -745,7 +805,7 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
         return np.concatenate([codes for codes, _ in parts]), np.concatenate([scale for _, scale in parts])
     rows, cols = _sides(block)
     codes, scale_inv = _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
-                                    rounded=_ue8m0 if ue8m0 else np.asarray)
+                                    rounded=_ue8m0 if ue8m0 else np.asarray, coded=np.asarray)
     # A contiguous copy: sliced off the padding, the codes are a view whose
     # buffer a writer taking it would read as the padded rows.
     return np.ascontiguousarray(codes), scale_inv
@@ -757,15 +817,19 @@ def fp8_block_cast(x: ArrayLike, block: Block) -> tuple[jax.Array, jax.Array]:
     (`dew.quantization`). No value is refused and no scale is
     rounded to ue8m0 here."""
     rows, cols = _sides(block)
-    # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do.
+    # XLA divides through a reciprocal; the cast's two divisions round as IEEE's do. The codes round to
+    # E4M3 in Dew's arithmetic (`fake_quant.fp8_codes`), which the cast then holds exactly: XLA GPU's
+    # default excess precision deletes an f32 -> E4M3 -> f32 convert pair, and XLA:CPU converts a
+    # hoisted small loop's narrow floats through float16, rounding twice.
     return _cast_blocks(jnp.asarray(x, jnp.float32), rows, cols, xp=jnp, divide=correctly_rounded_divide,
-                        rounded=jnp.asarray)
+                        rounded=jnp.asarray, coded=fp8_codes)
 
 
-def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
+def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded, coded):
     """The FP8 block cast of a float32 `values` matrix under `xp`, NumPy or
-    jax.numpy, dividing by `divide` and rounding each block's scale by
-    `rounded`: `quantize_fp8_blocks`' rule. The 1e-4 amax floor is
+    jax.numpy, dividing by `divide`, rounding each block's scale by
+    `rounded` and each value over it to E4M3 by `coded` before the cast:
+    `quantize_fp8_blocks`' rule. The 1e-4 amax floor is
     `per_block_cast_to_fp8`'s `clamp(1e-4)`."""
     height, width = values.shape
     padded = xp.pad(values, ((0, -height % rows), (0, -width % cols)))
@@ -773,7 +837,7 @@ def _cast_blocks(values, rows: int, cols: int, *, xp, divide, rounded):
     amax = xp.maximum(xp.max(xp.abs(tiles), axis=(1, 3)), xp.float32(AMAX_FLOOR))
     scale_inv = rounded(divide(amax, xp.float32(E4M3_MAX)))
     # One reciprocal per block, as the reference takes it.
-    codes = (tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
+    codes = coded(tiles * divide(xp.float32(1.0), scale_inv)[:, None, :, None]).astype(E4M3)
     return codes.reshape(padded.shape)[:height, :width], scale_inv
 
 

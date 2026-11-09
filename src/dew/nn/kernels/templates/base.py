@@ -28,14 +28,14 @@ _DERIVED_GUARD = threading.Lock()
 
 def _derived_once(derive: Callable) -> Callable:
     """A launch's `derived`, run once for what it reads: the call, the target and the configs its compiles
-    refused (`report.derivation_inputs`), and the run's numerics, its algebra pass, its derived forms and its
-    kernel choices, the contexts a derivation's forms and costs read (`dew._cache`); every eligibility check
+    refused (`report.derivation_inputs`), and the run's numerics, its algebra pass and its kernel choices,
+    the contexts a derivation's forms and costs read (`dew._cache`); every eligibility check
     and planner candidate after reads that once (row 4259: the GEMM's tile, derived at every check, took 36
     s of a Qwen3.5-4B step's compile_ahead)."""
     @functools.wraps(derive)
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget):
         key = (derive, report.derivation_inputs(self, ba, target), _cache.NUMERICS.value,
-               _cache.ALGEBRA.value, _cache.DERIVED.value, _cache.KERNEL_CHOICES.value)
+               _cache.ALGEBRA.value, _cache.KERNEL_CHOICES.value)
         with _DERIVED_GUARD:
             if key in _DERIVED:
                 return _DERIVED[key]

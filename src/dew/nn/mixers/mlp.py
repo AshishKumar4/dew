@@ -12,6 +12,7 @@ from flax import linen as nn
 from dew.nn.flops import counted_flops, parameter_flops
 from dew.nn.inputs import PLAIN_CALL, TOKENWISE, MixerCall, routing_blocks
 from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.precision import projection_role
 from dew.nn.protocols import ProjectionGroup, Routes, RoutesExperts, declared_groups
 
 if TYPE_CHECKING:
@@ -46,10 +47,12 @@ class _MLP(nn.Module):
         return isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts
 
     def __call__(self, x, call: MixerCall = PLAIN_CALL, routes: Routes | None = None):
-        if isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts:
-            blocks = routing_blocks(self.feedforward, call.metadata, x.shape)
-            return self.feedforward(x, routes=routes, **blocks)
-        return self.feedforward(x)
+        # A feed-forward in a mixer's slot plays a feed-forward's role, as a recipe takes it.
+        with projection_role("mlp"):
+            if isinstance(self.feedforward, RoutesExperts) and self.feedforward.routes_experts:
+                blocks = routing_blocks(self.feedforward, call.metadata, x.shape)
+                return self.feedforward(x, routes=routes, **blocks)
+            return self.feedforward(x)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its feed-forward declares (`ProjectionSites`), in the scope they share."""

@@ -300,6 +300,48 @@ class Decoder(nn.Module):
         return store.decode(query, lengths, None)
 
 
+
+def _decode_drawn(rows: int, capacity: int, kv_heads: int, width: int):
+    """A decode step's draws by seed: a cache's keys and values `[rows, capacity, kv_heads, width]` and a
+    query a row of twice the key heads, unit Gaussians in bf16."""
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        key, value = (jax.random.normal(stream, (rows, capacity, kv_heads, width), jnp.bfloat16)
+                      for stream in streams[:2])
+        return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
+
+    return draw
+
+
+@pytest.mark.parametrize("starts", [None, (3, 17)], ids=["whole", "window"])
+def test_a_paged_templates_gradient_lowers_in_forward_mode_for_h100(starts):
+    """The compiled paged decode's forward-over-reverse derivative lowers with traced row lengths."""
+    from jax.sharding import Mesh
+
+    from dew.nn.kernels import generation
+    from dew.nn.kv_cache import template_paged
+
+    table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
+    lengths = jnp.asarray([69, 128], jnp.int32)
+    starts = None if starts is None else jnp.asarray(starts, jnp.int32)
+    shapes = ((2, 4, 64), (2, 4, 64, 64), (2, 4, 64, 64), (4,))
+    operands = tuple(jax.ShapeDtypeStruct(shape, jnp.bfloat16 if index < 3 else jnp.float32)
+                     for index, shape in enumerate(shapes))
+
+    def loss(*arrays):
+        output = template_paged(None)(*arrays[:3], table, lengths, starts, arrays[3])
+        return jnp.sum(output.astype(jnp.float32) ** 2)
+
+    gradient = jax.grad(loss, argnums=(0, 1, 2, 3))
+
+    def differentiated(*arrays):
+        return jax.jvp(gradient, arrays, jax.tree.map(jnp.ones_like, arrays))
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices("cpu")[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(differentiated).trace(*operands).lower(lowering_platforms=("cuda",))
+
+
 @INTERPRETS
 def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_interpreted():
     """A bf16 pool split between two groups of rows (`KVCache.groups`), which the GPU's Pallas paged kernel
@@ -324,14 +366,47 @@ def test_a_grouped_pools_decode_reads_each_group_s_pages_through_the_template_in
         spans = template.spans(1, capacity, rows, lengths=lengths)
         return template.reference(query[:, None], key, value, spans)[:, 0]
 
-    def draw(seed: int):
-        streams = jax.random.split(jax.random.key(seed), 3)
-        key, value = (jax.random.normal(stream, (rows, capacity, kv_heads, width), jnp.bfloat16)
-                      for stream in streams[:2])
-        return key, value, jax.random.normal(streams[2], (rows, 2 * kv_heads, width), jnp.bfloat16)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _decode_drawn(rows, capacity, kv_heads, width),
+                    "grouped pool's template decode", seeds=8)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "grouped pool's template decode", seeds=8)
 
+
+@INTERPRETS
+@pytest.mark.parametrize("page", [16, None], ids=["paged", "dense"])
+@pytest.mark.parametrize("stored", ["int8", "float8_e4m3fn"])
+def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpreted(stored, page):
+    """An int8 or FP8 cache (`KVCache.quantized`), paged or dense, decoded on an H100 by the attention
+    template's decode (`PAGED`'s template kernel), its codes read as they lie and dequantized in the walk by
+    their scales (`template_quantized`, ledger 3624): on par with the reference path over the keys and
+    values the cache dequantizes to, an int8 cache's keys and the query in its rotation (check 1)."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention as template
+    from dew.nn.kv_cache import dequantize, quantize, rotated
+
+    rows, capacity, kv_heads, width = 4, 128, 2, 64
+    lengths = jnp.asarray([128, 70, 9, 101], jnp.int32)
+    layout = KVCache(page_size=page, quantized=stored)
+    decoder = Decoder(layout, capacity)
+    positions = jnp.broadcast_to(jnp.arange(capacity), (rows, capacity))
+    rotation = layout.key_rotation(width)
+
+    def ours(key, value, query):
+        with generation.assumed("sm90"):
+            cache = decoder.init(jax.random.key(0), key, value, positions, query, lengths)["cache"]
+            # The query in the keys' rotation, as the layer takes it into the store's (`KVStore.rotation`).
+            turned = query if rotation is None else rotated(query, rotation)
+            return decoder.apply({"cache": cache}, key, value, positions, turned, lengths,
+                                 mutable=["cache"])[0]
+
+    def reference(key, value, query):
+        if rotation is not None:
+            key, query = rotated(key, rotation), rotated(query, rotation)
+        key, value = (dequantize(*quantize(array, stored), query.dtype) for array in (key, value))
+        spans = template.spans(1, capacity, rows, lengths=lengths)
+        return template.reference(query[:, None], key, value, spans)[:, 0]
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _decode_drawn(rows, capacity, kv_heads, width),
+                    f"{stored} {page} cache's template decode", seeds=8)
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
 def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):

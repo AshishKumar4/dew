@@ -480,6 +480,14 @@ def test_a_served_prompt_carrying_its_groups_scores_what_it_scores_alone(request
                            serving=serving)
 
 
+
+@pytest.mark.parametrize("serving", [WHOLE, PIECES], ids=["whole", "in-pieces"])
+def test_a_server_over_layers_reading_their_groups_admits_in_one_mixed_forward(serving):
+    """A model whose layers read their images and blocks whole admits its prompts in the step's one mixed
+    forward beside the drawing rows, its groups carried with its tokens (ledger 1536), where it prefilled in
+    a forward of its own: the served draws above hold the mixed step to the lone task."""
+    assert Server.from_task(served_blocky(images=True), **serving).mixed_refusal is None
+
 LONG_BLOCK, SHORT_BLOCK = (-1, 0, 0, 0, 0, 0, -1, -1), (-1, 0, 0, 0, -1, -1, -1, -1)
 """Two layouts of one eight-token prompt whose block reaches a different last token."""
 REACHING = (-1, 2, -1, -1, -1, -1, -1, -1, 2, -1, -1, -1)

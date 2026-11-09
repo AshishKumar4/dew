@@ -13,6 +13,7 @@ from typing_extensions import TypeVar
 
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import GeneralizedNoiseScheduler
+from dew.nn.programs import on_host
 
 # tests/test_samplers.py checks the Diffusers-named solvers' trajectories and
 # trajectory gradients against fixtures recorded by tools/diffusers_reference.py;
@@ -95,7 +96,7 @@ def _check_endpoint_domain(process: Process, times: jax.Array, *,
     """
     if times.shape[0] < 2:
         return
-    with jax.ensure_compile_time_eval():
+    with on_host():
         alpha, sigma = process.sampler_schedule.rates(times)
         if source and bool(jnp.any(alpha[:-1] == 0)):
             raise ValueError("alpha=0 source has no finite update: " + reason)
@@ -106,7 +107,7 @@ def _check_endpoint_domain(process: Process, times: jax.Array, *,
 def _grid_levels(process: Process, times: jax.Array) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The concrete grid's alpha, sigma and lambda = log(alpha) - log(sigma) at each point, on the
     host, as the walk reads them in float32."""
-    with jax.ensure_compile_time_eval():
+    with on_host():
         alpha, sigma = process.sampler_schedule.rates(jnp.asarray(times))
         return np.asarray(alpha), np.asarray(sigma), np.asarray(_half_log_snr(alpha, sigma))
 
@@ -208,7 +209,7 @@ def _lambda_step(alpha_s, sigma_s, alpha_t, sigma_t):
 
 def _tapered_orders(order: int, steps: int, lower_order_final: bool, euler_at_final: bool) -> list[int]:
     """Every step's `_tapered_order` over a walk of `steps`, on the host."""
-    with jax.ensure_compile_time_eval():
+    with on_host():
         return [int(_tapered_order(order, taken, steps, lower_order_final, euler_at_final))
                 for taken in range(steps)]
 

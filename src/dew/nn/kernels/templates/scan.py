@@ -130,6 +130,46 @@ def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Arra
     return total(values, exchanged)
 
 
+def grouped_summed(values: jax.Array, group: int, *, interpret: bool = False) -> jax.Array:
+    """Each position's group's sum, fp32 `[T]` in `blocked(T)`'s layout: positions `group` consecutive
+    threads hold (`group` a power of two, a warp's at most) summed apart, a thread's own positions in its
+    registers and its group's by butterfly shuffles (`utils.warp_tree_reduce`), every position of a group
+    its group's sum (a short conv's heads, a vector of channels a thread)."""
+    positions = values.shape[0]
+    if interpret:
+        span = positions // THREADS * group
+        return jnp.repeat(values.reshape(-1, span).sum(axis=1), span)
+    layout = blocked(positions)
+    total: Callable[..., jax.Array] = plgpu.inline_mgpu(
+        arg_types=(layout,), return_type=plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32),
+                                                                layout=layout),
+    )(lambda ctx, x: _grouped_summed(x, group))
+    return total(values)
+
+
+def _grouped_summed(x: fa.FragmentedArray, group: int):
+    """`grouped_summed` in Mosaic GPU's terms."""
+    [vec] = x.registers.flat
+    count = ir.VectorType(vec.type).shape[0]
+    own = vector.extract(vec, [], [0])
+    for i in range(1, count):
+        own = arith.addf(own, vector.extract(vec, [], [i]))
+    total = utils.warp_tree_reduce(own, arith.addf, group)
+    spread = vector.broadcast(vec.type, total)
+    return fa.FragmentedArray(_registers=np.array([spread], dtype=object).reshape(x.registers.shape),
+                              _layout=x.layout, _is_signed=None)
+
+
+def inverse_norm(values: jax.Array, eps: float, exchanged, *, group: int | None = None,
+                 interpret: bool = False) -> jax.Array:
+    """`1 / sqrt(sum(values^2) + eps)` of a block's `values` (`summed`'s), the l2 norm's scale, its root and
+    quotient each rounded once (rsqrt's approximation is 2 ulp off): the decode step's queries and keys
+    and the short conv's heads alike; with a `group`, each group's of threads apart (`grouped_summed`)."""
+    if group is not None:
+        return 1.0 / jnp.sqrt(grouped_summed(values * values, group, interpret=interpret) + eps)
+    return 1.0 / jnp.sqrt(summed(values * values, exchanged, interpret=interpret) + eps)
+
+
 def _summed(x: fa.FragmentedArray, exchanged):
     """`summed` in Mosaic GPU's terms: the array's own reduction, its warps' aggregates through a row of
     `exchanged`."""

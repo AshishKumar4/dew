@@ -859,21 +859,21 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
 
 def bank_sites(model: BankedStacks, store: Variables) -> tuple[DecoderBank, ...]:
     """Return the model's declared stacks over `store`, the variables (or their shapes) the banks are
-    drawn from, deduplicated by canonical namespace.
+    drawn from, deduplicated by root and canonical namespace (`DecoderBank.root`).
 
     Two readers of one physical scope declare the same site, so a shared
     decoder is packed once. Conflicting views of a namespace, overlapping
     layer ownership and staged or already banked views are refused here,
     before any value is read.
     """
-    owners: dict[tuple[str, ...], DecoderBank] = {}
+    owners: dict[tuple[tuple[str, ...], tuple[str, ...]], DecoderBank] = {}
     for site in model.bank_sites(store):
         if any(not isinstance(name, str) or not name or "/" in name for name in site.namespace):
             raise ValueError("decoder namespaces must contain nonempty module names")
-        previous = owners.get(site.namespace)
+        previous = owners.get((site.root, site.namespace))
         if previous is not None and previous.view != site.view:
             raise ValueError(f"conflicting decoder views at namespace {site.namespace}")
-        owners[site.namespace] = site
+        owners[site.root, site.namespace] = site
     if not owners:
         raise ValueError("a banked store requires a declared decoder bank owner")
     paths = []
@@ -883,7 +883,8 @@ def bank_sites(model: BankedStacks, store: Variables) -> tuple[DecoderBank, ...]
         for first, count in site.view.groups:
             if first < 0 or count < 1:
                 raise ValueError("decoder bank groups require nonnegative starts and positive lengths")
-            paths.extend((*site.namespace, f"layers_{index}") for index in range(first, first + count))
+            paths.extend((*site.root, *site.namespace, f"layers_{index}")
+                         for index in range(first, first + count))
     ordered = sorted(paths)
     if any(right[:len(left)] == left for left, right in itertools.pairwise(ordered)):
         raise ValueError("declared decoder banks overlap in their canonical layer ownership")
@@ -967,7 +968,9 @@ def _bank_plan(model: BankedStacks, source: LayerBanks, mesh: MeshSpec | Mesh | 
     )
 
     shapes = source.shapes()
-    sites = bank_sites(model, shapes)
+    # A source banks the stacks of the model it places; a nested model's (`DecoderBank.root`, a
+    # distillation's frozen teacher, which training's host execution banks) it reads as entries.
+    sites = tuple(site for site in bank_sites(model, shapes) if not site.root)
     for site in sites:
         _check_shapes(shapes, site)
     device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)

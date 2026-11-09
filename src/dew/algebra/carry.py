@@ -6,14 +6,13 @@ A function of a carried state and a chunk's operands, traced at one chunk, enter
 are marked (`reads`), and the products' linear algebra saturates over them (`CARRIED`): a product of a
 transposed operand as a plain product of its transpose, a product distributed over a sum or a difference that
 reads the state, two products associated so the state is the last operand, two products of one right operand
-factored, each where the region's range facts bound the operands its new intermediates read (`rules.tame`): no
-form is infinite where the function is finite. Extraction prices the carried outputs' forms by the work that
-reads the state first and the rest second (`Priced`), so the carry reads the state through the fewest products
-its facts allow. The other outputs, emitted from each chunk's entering state once the carry has run, take the
-program's cost (`cost.model`). The forms' largest terms that read no state are the walk's prepared values,
-computed for every chunk at once (`Split.prepare`); the carry and the emitted outputs read the state and those
-alone (`Split.carry`, `Split.emit`). The association reorders rounding.
-"""
+factored, each where the region's range facts bound the operands its new intermediates read
+(`rules.reorderable`): no form is infinite where the function is finite. Extraction prices the carried
+outputs' forms by the work that reads the state first and the rest second (`Priced`), so the carry reads the
+state through the fewest products its facts allow. The other outputs, emitted from each chunk's entering state
+once the carry has run, take the program's cost (`cost.model`). The forms' largest terms that read no state
+are the walk's prepared values, computed for every chunk at once (`Split.prepare`); the carry and the emitted
+outputs read the state and those alone (`Split.carry`, `Split.emit`). The association reorders rounding."""
 
 from __future__ import annotations
 
@@ -182,9 +181,10 @@ def _carry_priced(region: terms.Region, schedule) -> DagCostModel[Priced]:
 
 
 class Split(NamedTuple):
-    """A function of a carried state split (`split`): `prepare(*operands)` the values its carry and its
-    emitted outputs read that read no state, `carry(prepared, state)` its carried outputs and
-    `emit(prepared, state)` its others, each a tuple in the function's order."""
+    """A function of a carried state split (`split`): `prepare(*operands, issue=None)` the values its carry
+    and its emitted outputs read that read no state, `carry(prepared, state, issue=None)` its carried
+    outputs and `emit(prepared, state, issue=None)` its others, each a tuple in the function's order, each
+    product a mainloop's own where it gives one (`issue(role, lhs, rhs)`, `CARRY_ROLES`, `EMIT_ROLES`)."""
 
     prepare: Callable
     carry: Callable
@@ -230,21 +230,54 @@ def split(function: Callable, state, operands: Sequence, carried: Sequence[int],
     emit_forms, _ = program.extracted(graph, others, cost.model(region, schedule), checked=checked)
     prepared = list({terms.key(term): term for form in (*carry_forms, *emit_forms)
                      for term in _free(form, reading)}.values())
+    # Each prepared value's products named by the forms that read it: an emitted output's a local readout's,
+    # a pairing of two of the chunk's operands among them its scores (`C Bᵀ`); every other the carry's write.
+    emitted = {terms.key(term) for form in emit_forms for term in _free(form, reading)}
     consts = list(closed.consts)
 
-    def prepare(*values):
-        leaves = [*consts, None, *values]
-        return tuple(forms.evaluated(region, term, leaves, {}) for term in prepared)
+    def operand(term: Term) -> bool:
+        return get_callable_args(term, Term.leaf) is not None
 
-    def reading_forms(chosen: list[Term]) -> Callable:
-        def run(given: tuple, h) -> tuple:
+    def prepare(*values, issue=None):
+        leaves = [*consts, None, *values]
+
+        def evaluated(term: Term):
+            role = EMIT_ROLES[1] if terms.key(term) in emitted else CARRY_ROLES[1]
+
+            def named(left: Term, right: Term) -> str:
+                return "scores" if role == EMIT_ROLES[1] and operand(left) and operand(right) else role
+
+            naming = None if issue is None else named
+            return forms.evaluator(region, leaves, {}, product=issue, named=naming)(term)
+
+        return tuple(evaluated(term) for term in prepared)
+
+    state = terms.key(Term.leaf(i64(first)))
+
+    def reading_forms(chosen: list[Term], roles: tuple[str, str]) -> Callable:
+        # A product of the state itself takes the side's first role, every other its second.
+        def named(left: Term, right: Term) -> str:
+            return roles[0] if state in (terms.key(left), terms.key(right)) else roles[1]
+
+        def run(given: tuple, h, issue=None) -> tuple:
             known = {terms.key(term): value for term, value in zip(prepared, given, strict=True)}
             leaves = [*([None] * first), h]
-            return tuple(forms.evaluated(region, form, leaves, known) for form in chosen)
+            value = forms.evaluator(region, leaves, known, product=issue,
+                                    named=None if issue is None else named)
+            return tuple(value(form) for form in chosen)
 
         return run
 
-    return Split(prepare, reading_forms(carry_forms), reading_forms(emit_forms))
+    return Split(prepare, reading_forms(carry_forms, CARRY_ROLES), reading_forms(emit_forms, EMIT_ROLES))
+
+
+CARRY_ROLES = ("correct", "carry")
+"""The roles of a carry's products (`Split.carry`'s `issue`): the state's own (the correction `w S`), and
+every other (the write `Kᵀ (u - w S)`)."""
+
+EMIT_ROLES = ("readout_memory", "readout_local")
+"""The roles of the emitted outputs' products (`Split.emit`'s `issue`): the state's own (`Q S`), and every
+other (the chunk's scores against its corrected values)."""
 
 
 def _products(graph: EGraph, region: terms.Region) -> None:
