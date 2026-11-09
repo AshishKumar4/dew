@@ -550,8 +550,12 @@ def clearing_selections(loaded, draw, label: str, *, stable: bool = True, tries:
     captured = selection_margins.capture(loaded.model)
     least = selection_margins.MARGIN if margin is None else margin
 
+    # A float64 model selects in float64, under x64 (outside it its float64 would be float32).
+    wide = loaded.model.dtype is not None and jnp.dtype(loaded.model.dtype) == jnp.float64
+
     def clears(inputs):
-        selections = captured(loaded.variables, jnp.asarray(inputs[0]))
+        with jax.enable_x64(new_val=wide):
+            selections = captured(loaded.variables, jnp.asarray(inputs[0]))
         return selection_margins.margin(loaded.model_config, selections, label, stable=stable) > least
 
     return selection_margins.clearing(draw, clears, tries)
