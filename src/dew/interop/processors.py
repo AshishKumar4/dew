@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import _records
-from dew._model_types import GEMMA4_TYPES, QWEN35_TYPES
+from dew._model_types import WRAPPERS, wrapper
 from dew._records import JSON
 from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD
 from dew.interop.sources import SourceReference
@@ -22,17 +22,6 @@ from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.mimo_audio import MiMoAudio
 from dew.registry import towers
-
-PACKED_MEDIA = (*QWEN35_TYPES, 'muse_glimmer', 'lfm3_vl', 'mimo_v2', 'kimi_k25', 'kimi_k3')
-"""The wrappers whose processors pack images and videos alike, as runs of patch vectors beside their
-`(t, h, w)` grids, a video's frames each a run of its own (`Processor._qwen_frames`): Qwen 3.5's, Muse
-Glimmer's, LFM3-VL's and MiMo-V2.6's, whose towers attend and convolve within a frame; and Kimi K2.5's
-and K3's, each item whole, whose tower attends over an item's frames and pools them
-(`TowerGeometry.pools_frames`)."""
-
-VIDEO_MEDIA = (*PACKED_MEDIA, *GEMMA4_TYPES)
-"""The wrappers whose processors carry videos (`pixel_values_videos`): the packed ones and Gemma 4's,
-whose video frames carry their patches' positions."""
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -559,8 +548,8 @@ class Processor:
         token_fields = {POSITIONS_FIELD: jnp.asarray(positions)}
         if not valid.all():
             token_fields[VALIDITY_FIELD] = jnp.asarray(valid)
-        gemma = self.config.get("model_type") in GEMMA4_TYPES
-        if gemma:
+        kind = wrapper(self.config.get("model_type"))
+        if kind.gemma4:
             for pixels, coordinates in (("pixel_values", "image_position_ids"),
                                          ("pixel_values_videos", "video_position_ids")):
                 if (pixels in values) != (coordinates in values):
@@ -584,12 +573,13 @@ class Processor:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
-            if "pixel_values_videos" in values and self.config.get("model_type") not in VIDEO_MEDIA:
+            if "pixel_values_videos" in values and not kind.video:
+                videos = [name for name, held in WRAPPERS.items() if held.video]
                 raise ValueError(f"video patch inputs require a visual tower that reads videos "
-                                 f"({', '.join(VIDEO_MEDIA)}), not {self.config.get('model_type')}'s")
+                                 f"({', '.join(videos)}), not {self.config.get('model_type')}'s")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
-            if self.config.get("model_type") in QWEN35_TYPES:
+            if wrapper(self.config.get("model_type")).qwen35:
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
         if ("input_features" in values) != ("input_features_mask" in values):
@@ -627,9 +617,8 @@ class Processor:
         Glimmer's packed patch runs, a per-patch position stream, and a fixed
         tokens-per-image grid.
         """
-        qwen = self.config.get("model_type") in QWEN35_TYPES
-        packed = self.config.get("model_type") in PACKED_MEDIA
-        gemma = self.config.get("model_type") in GEMMA4_TYPES
+        kind = wrapper(self.config.get("model_type"))
+        qwen, packed, gemma = kind.qwen35, kind.packed_media, kind.gemma4
         image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):

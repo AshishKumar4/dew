@@ -39,7 +39,7 @@ import numpy as np
 
 from dew import _records
 from dew._files import write_atomically
-from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew._model_types import WRAPPERS, wrapper
 from dew.batch import Variables
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
@@ -286,7 +286,7 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         # Transformers ties by the wrapper config's own field (modeling_utils' tie_weights reads
         # `getattr(config, "tie_word_embeddings", False)`), which Qwen 3.5's and Muse Glimmer's
         # configs leave unset.
-        default_tied = hf_config.get("model_type") not in (*QWEN35_TYPES, "muse_glimmer")
+        default_tied = wrapper(hf_config.get("model_type")).head_tied_by_default
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -673,7 +673,7 @@ whose release is its own code; and an audio tower."""
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
-    **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
+    **{name: _qwen35_wrapper for name, kind in WRAPPERS.items() if kind.qwen35}, "gemma3n": _gemma3n_wrapper,
     "sensenova_loop": _sensenova_loop_wrapper,
     "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper,
     **dict.fromkeys(_TEXT_VLMS, _text_vlm_wrapper)}
@@ -758,7 +758,7 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if record.get("audio") is not None and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if ((bare.startswith("mtp.") and record["text_model_type"] in QWEN35_TEXT_TYPES)
+    if ((bare.startswith("mtp.") and wrapper(record["model_type"]).qwen35)
             or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:
