@@ -50,7 +50,7 @@ from jax.typing import ArrayLike
 
 from dew._records import finite, json_value, record as section
 from dew.batch import Coordinates, Forks, Variables, coordinates
-from dew.data.forked_rows import ForkedRows
+from dew.data.forked_rows import ForkedRows, token_keys, windows_needed
 from dew.inference.rollouts import Draw, Routing, routing_rows
 from dew.nn.inputs import local_rows
 from dew.rl import group_advantage, rloo_advantage
@@ -679,14 +679,44 @@ def _chain_rows(built: Sequence[_Chain]) -> tuple[list[list[int]], dict[str, lis
     return [list(chain.tokens) for chain in built], carried
 
 
+@dataclass(frozen=True)
+class Planned:
+    """Sessions' chains as `pack` lays them, read once (`planned`): each chain's length, and where their
+    prompts are shared each chain's token keys (`forked_rows.token_keys`), which a shared prefix compares.
+    A scheduler admitting group after group plans their rows from these (`planned_rows`), never building a
+    group's chains or keys again."""
+
+    lengths: tuple[int, ...]
+    keys: tuple[list[bytes], ...] | None
+
+
+def planned(sessions: Sequence[Session], width: int, *, truncation: str, share: bool = False) -> Planned:
+    """`sessions`' chains under `truncation`, read for `planned_rows`: their keys only where `share`."""
+    built = _built(sessions, width, truncation)
+    if not built or not share:
+        return Planned(tuple(len(chain.tokens) for chain in built), None)
+    rows, carried = _chain_rows(built)
+    return Planned(tuple(len(row) for row in rows), tuple(
+        token_keys(np.asarray(row, np.int64), np.arange(len(row)),
+                   [carried[name][number] for name in carried])
+        for number, row in enumerate(rows)))
+
+
+def planned_rows(plans: Sequence[Planned], width: int) -> int:
+    """How many `width`-id rows `pack` fills with the chains of `plans` together, their groups' prompts
+    shared where they were read to be (`planned`)."""
+    lengths = [length for plan in plans for length in plan.lengths]
+    if not lengths:
+        return 0
+    shared = [plan.keys for plan in plans if plan.keys is not None]
+    keys = None if not shared else [key for held in shared for key in held]
+    return windows_needed(lengths, width, keys=keys)
+
+
 def packed_rows(sessions: Sequence[Session], width: int, *, truncation: str, share: bool = False) -> int:
     """How many `width`-id rows `pack` fills with `sessions`' chains under `truncation`, their group's
     prompts shared where `share` (`pack`)."""
-    built = _built(sessions, width, truncation)
-    if not built:
-        return 0
-    rows, carried = _chain_rows(built)
-    return ForkedRows.needed(rows, width, share=share, fields=carried)
+    return planned_rows([planned(sessions, width, truncation=truncation, share=share)], width)
 
 
 def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,

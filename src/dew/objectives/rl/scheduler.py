@@ -168,6 +168,7 @@ from .sessions import (
     RESPONSE_MASK_KEY,
     Collector,
     Moments,
+    Planned,
     Session,
     SessionSource,
     Snapshot,
@@ -180,7 +181,8 @@ from .sessions import (
     check_truncation,
     local_task_ids,
     pack,
-    packed_rows,
+    planned,
+    planned_rows,
     pooled,
     reference_penalties,
     sampled_values,
@@ -282,6 +284,9 @@ class _Entry:
     """Which of `tasks` come of real rows of the batch (`real_rows`)."""
     groups: list[_Group] = field(default_factory=list)
     complete: list[_Group] = field(default_factory=list)
+    plans: list[Planned] = field(default_factory=list)
+    """Each of `complete`'s chains as the rows lay them, read once at its admission (`RolloutScheduler._fit`),
+    which every later admission plans the rows from."""
     packs: _Entry | None = None
     """The entry whose rows this one's groups pack into: a call's first, for a batch it drew further
     (`RolloutScheduler.generation_batches`); None for its own."""
@@ -871,7 +876,9 @@ class RolloutScheduler:
         """
         home = entry.packs or entry
         width, rows = self.acquisition.width, self.acquisition.rows(len(home.tasks), self.groups)
-        alone = packed_rows(group.done, width, truncation=self.truncation, share=self.share)
+        # Read once: each admission plans the rows from the groups' plans, never their chains again.
+        plan = planned(group.done, width, truncation=self.truncation, share=self.share)
+        alone = planned_rows([plan], width)
         if alone > rows:
             raise ValueError(
                 f"one group of task {group.task.id} needs {alone} rows of {width} ids, "
@@ -881,9 +888,9 @@ class RolloutScheduler:
                                       overlong=self.overlong):
             tally.uniform += 1
             return
-        admitted = [session for complete in home.complete for session in complete.done]
-        if packed_rows([*admitted, *group.done], width, truncation=self.truncation, share=self.share) <= rows:
+        if planned_rows([*home.plans, plan], width) <= rows:
             home.complete.append(group)
+            home.plans.append(plan)
             return
         tally.cut += 1
         tally.cancelled += len(group.live)
