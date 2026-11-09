@@ -330,8 +330,8 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             # A pin of this op's where the scaled op can take it, else its own tiles
             # (`tuning.pinned_where_taken`): its registers and shared memory are not the common op's.
             with tuning.pinned_where_taken(scaled_op, scaled_op.bind(*arguments, residuals=residuals,
-                                                                     interpret=interpret)):
-                return scaled_op(*arguments, residuals=residuals, interpret=interpret)
+                                                                     interpret=interpret)) as taken:
+                return taken(*arguments, residuals=residuals, interpret=interpret)
 
         return jax.lax.cond(algebra.may_scale(value, keys_axis=1, initial=acc0), rare,
                             functools.partial(walk, scaled=False)), None
