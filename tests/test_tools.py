@@ -1423,6 +1423,26 @@ def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_no
         "        assert error.args\n"), "SLOP011", (8, 12, 13, 18, 21, 22))
 
 
+def test_a_kernel_file_read_on_a_clock_is_at_the_process_boundary_and_a_named_one_is_not(tmp_path):
+    """The kernel's accounting of a process, read from its /proc files, is outside the process, so a
+    high-water sampled on a clock reading one is at that boundary (SLOP018); a loop that only names such a
+    file, or makes a path of it it never reads, is not."""
+    assert_reported(tmp_path, "src/sparx/pages.py", ("from pathlib import Path\n"
+        "def pages():\n"
+        "    return Path('/proc/self/smaps_rollup').read_text()\n"
+        "def high_water(done):\n"
+        "    while not done.wait(0.002):\n"
+        "        pages()\n"
+        "def labelled(done):\n"
+        "    label = '/proc/self/status'\n"
+        "    while not done.wait(0.002):\n"
+        "        label.upper()\n"
+        "def named(done):\n"
+        "    status = Path('/proc/self/status')\n"
+        "    while not done.wait(0.002):\n"
+        "        status.name\n"), "SLOP018", (9, 13))
+
+
 def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
     """SLOP018: in the package's source, a sleep, a timed wait round a loop (a poll) and a retry of
     one piece of work are reported where the function deals with no subprocess, network, service or
@@ -1434,9 +1454,7 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     defined, and a nested loop's or a `match`'s exits are each read as what they are; a failure
     that falls through to the loop's exit retries nothing. A notebook's display reaches its frontend,
     another process, so its frames redrawn on a clock are at that boundary, while a representation
-    built round a loop publishes nothing; the kernel's accounting of the process, read from its /proc
-    files, is outside it too, so a high-water sampled on a clock is at that boundary, where a loop that
-    only names such a file, or makes a path of it unread, is not."""
+    built round a loop publishes nothing."""
     assert_reported(tmp_path, "src/sparx/waits.py", ("import concurrent.futures\n"
         "import subprocess\n"
         "import time\n"
@@ -1536,22 +1554,7 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "def built(done):\n"
         "    from IPython.display import HTML\n"
         "    while not done.wait(0.125):\n"
-        "        HTML('<b>waiting</b>')\n"
-        "def pages():\n"
-        "    from pathlib import Path\n"
-        "    return Path('/proc/self/smaps_rollup').read_text()\n"
-        "def high_water(done):\n"
-        "    while not done.wait(0.002):\n"
-        "        pages()\n"
-        "def labelled(done):\n"
-        "    label = '/proc/self/status'\n"
-        "    while not done.wait(0.002):\n"
-        "        label.upper()\n"
-        "def named(done):\n"
-        "    from pathlib import Path\n"
-        "    status = Path('/proc/self/status')\n"
-        "    while not done.wait(0.002):\n"
-        "        status.name\n"), "SLOP018", (5, 8, 12, 38, 44, 48, 50, 66, 86, 99, 109, 114))
+        "        HTML('<b>waiting</b>')\n"), "SLOP018", (5, 8, 12, 38, 44, 48, 50, 66, 86, 99))
 
 
 def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):
