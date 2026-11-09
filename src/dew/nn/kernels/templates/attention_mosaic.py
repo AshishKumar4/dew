@@ -108,7 +108,8 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                                                 fits: Callable[[Config], bool], *,
                                                 overlapped: bool, walks: Callable = extents,
                                                 rows: int | None = None,
-                                                least_walked: Callable[[int], int] = lambda rows: 1
+                                                least_walked: Callable[[int], int] = lambda rows: 1,
+                                                least_held: Callable[..., int] = query_rows
                                                 ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
     consumers the family's (`Family.consumers`) where its step `overlapped` (a softmax between its products,
@@ -133,8 +134,10 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     read once for twice the queries (an A100 at width 128, 128 x 32 against 64 x 64, ptxas 250 and 189
     registers spilling none; width 64, 128 x 64 against 64 x 128, two programs a multiprocessor against
     one, et-a100tile2). `tiles(rows, walked, consumers)` builds the config; `rows` a consumer's where given
-    (a backward's `fewer_rows`). None where no tile fits."""
-    unit = query_rows(family, dtype, held) if rows is None else rows
+    (a backward's `fewer_rows`), else `least_held`'s for the `held` rows: a forward's least query tile
+    (`query_rows`: the issuer's rows for a decode step's few), a backward's a role's rows (`_role_rows`).
+    None where no tile fits."""
+    unit = least_held(family, dtype, held) if rows is None else rows
     most = most_consumers(family, tiles(unit, family.rows, 1)) if overlapped else 1
     wide = rows is None and overlapped and most == 1 and family.budgets_registers
 
@@ -161,6 +164,16 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     if not found:
         return None
     return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers, config.block_q))
+
+
+def _role_rows(family: mosaic.Family, dtype, held: int) -> int:
+    """A backward launch's least held tile: a role's rows in whole swizzled rows (`extents`), however few
+    the call's keys. Its two launches transpose its tiles (`backward_family`: dQ's rows its queries, dK/dV's
+    its keys), so a side of fewer rows is both sides' (`fewer_rows`, `_sides`); the issuer's rows a forward
+    takes for a few queries (`query_rows`) gave a 16-token training step's keys 16 rows under 64 queries, and
+    neither launch lowered on mma.sync ("Cannot cast to layout" of the 16 key rows to the 64 a consumer's
+    fragments tile; at 32 tokens the one launch's "cannot relayout", et-detbwd)."""
+    return extents(family, dtype, held)[-1]
 
 
 def _least_keys(family: mosaic.Family, rows: int) -> int:
@@ -1402,6 +1415,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         def fits(config: BackwardTiles) -> bool:
             return self.legal(ba, config, target)
 
+        derive = functools.partial(_derived, least_held=_role_rows)
+
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
         fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
@@ -1415,7 +1430,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             def fused(rows: int, walked: int, consumers: int, shared=shared) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name, **shared)
 
-            if config := _derived(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
+            if config := derive(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
                                   overlapped=False):
                 found.append(config)
         # Queries first on the layout whose consumers feed their rings, each consumer its own keys over
@@ -1426,7 +1441,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
 
-            if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
+            if config := derive(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
                                   overlapped=True):
                 found.append(config)
         if found:
@@ -1444,7 +1459,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name,
                                      shared_keys=True)
 
-            if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
+            if config := derive(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
                                   overlapped=True):
                 return config
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
@@ -1471,7 +1486,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                         return BackwardTiles(walked, rows, 2, consumers, family=family.name, columns=columns,
                                              staged_logits=staged, **dkv)
 
-                    if config := _derived(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
+                    if config := derive(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
                                           overlapped=False, walks=walks, rows=rows):
                         return config
         return None
