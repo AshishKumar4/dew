@@ -19,46 +19,6 @@ type RecordValue = float | np.ndarray | None
 """A value a latent normalization's record keeps: a number, one per channel or position, or absent."""
 
 
-def check_class(config: Mapping[str, object], names: tuple[str, ...], where, *,
-                nameless: bool = False) -> None:
-    """Refuse a published autoencoder's `config` whose `_class_name` is none of `names`, naming the class it
-    holds (a Wan VAE's given to the KL loader); one that names none is taken as `names`' own where
-    `nameless` (an older AutoencoderKL's config)."""
-    named = config.get("_class_name")
-    if named not in names and not (named is None and nameless):
-        raise ValueError(f"{where} holds a {named}, not an {names[0]}")
-
-
-def published_source(name_or_dir, revision, subfolder: str, names: tuple[str, ...], *, weights: bool,
-                     nameless: bool = False):
-    """A published autoencoder's directory and config (`dew.interop.components.component_source`), its
-    config checked first (`check_class`) and its weights fetched only after, so a foreign checkpoint is
-    refused by name before any of its weights is read."""
-    from dew.interop.components import component_source
-
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=False)
-    check_class(config, names, directory, nameless=nameless)
-    if weights:
-        directory, config = component_source(name_or_dir, revision, subfolder, weights=True)
-    return directory, config
-
-
-def bound_autoencoder(directory, config, model, path_of, wrap, *, params: Variables | None, param_dtype: str,
-                      lazy: bool, shapes, inputs: tuple | None = None, tensors=None):
-    """A published autoencoder bound (`dew.interop.components.bind_component`, the `vae` component under
-    the `autoencoder` prefix): its module's parameters read from `directory` by `path_of` (or `params` as
-    given), checked against the module traced on `inputs` (one frame at its downscale factor where None),
-    and wrapped by `wrap`. Every published autoencoder's loader binds through here."""
-    from dew.interop.components import bind_component
-
-    if inputs is None:
-        inputs = (jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor,
-                                        model.image_channels), jnp.float32),)
-    return bind_component(directory, "vae", config, model, path_of, wrap, prefix=("autoencoder",),
-                          params=params, param_dtype=param_dtype, lazy=lazy, inputs=inputs, shapes=shapes,
-                          tensors=tensors)
-
-
 @dataclasses.dataclass(frozen=True, eq=False)
 class LatentNormalization:
     """A latent normalization, one description: the source values an autoencoder's record keeps

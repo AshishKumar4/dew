@@ -494,11 +494,11 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
         if not params and initial is None:
             # No hook parameter takes a gradient (a softcap's hook has none): the operands' terms alone, the
             # draw's hooks `((), None)` as they are.
-            return (*found[1:], *hooks)
+            return (*found[1:4], *hooks)
         assert traced_terms is not None, "a hooked call's parameters' terms trace its reference"
         with jax.enable_x64(new_val=True):
             _, traced = traced_terms(*widened((query, key, value, dout, *hooks)))
-        return (*found[1:], *traced[3:])
+        return (*found[1:4], *traced[3:])
 
     return terms
 
@@ -587,15 +587,18 @@ def test_the_forward_is_on_par_interpreted(call, dtype):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("form", ["fused", "fused-shared-keys"])
 @pytest.mark.parametrize("call", CALLS)
-def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call):
+def test_an_fp16_backward_in_one_launch_holds_check_1_interpreted(call, form):
     """An fp16 call's backward in the fast form's one launch (row 3886): its weights and score cotangents as
     two fp16 parts at each walk's running scale (`algebra.running_parts`), dV's and dK's accumulators taken
     to the new scale as it grows and back at the end, each tile's dQ by its own; every gradient the
-    reference's (check 1), under the interpreter, heads 64 wide, where one launch's registers hold fp16's
-    parts (at 128 the derivation takes the two launches). (A dropping fp16 call takes no Mosaic walk at
+    reference's (check 1), under the interpreter: each consumer its own keys, heads 64 wide, or two sharing
+    a key block, each its share's exponents exchanged before its parts (`attention_mosaic_coop`), heads 128
+    wide, where each launch's registers hold fp16's parts. (A dropping fp16 call takes no Mosaic walk at
     all: its dropping walk takes bf16 operands.)"""
-    _check_backward(call, SHAPES["interpreted"], form="fused", interpret=True, dtype=jnp.float16, width=64)
+    _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, dtype=jnp.float16,
+                    width=FORM_WIDTHS.get(form, 64))
 
 
 @COMPILES_ON_CPU
@@ -914,11 +917,11 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
 def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_row_interpreted():
     """A call as many queries as heads, one consumer's tile of them, whose head 0 sees two keys of equal
     logits past the fold's reach over values near bf16's largest: the call walks again unfolded, and head
-    0's rows, whose weighted values overflow, take the guarded walk in that form (`algebra.unfolded`), its
-    residuals in its units. Head 0's output is its values' mean exactly, its one value row (where the
-    reference's fp32 sums overflow); every other head's rows are the plain launch's bits, as where head 0's
-    values do not overflow; and the backward from these residuals gives head 0's values a gradient wherever
-    the reference does, finite where it is."""
+    0's rows, whose weighted values would pass fp32's largest, shift in that walk (`algebra.Argmax.shift`,
+    from the peak walk's reach), their residuals in its units. Head 0's output is its values' mean exactly,
+    its one value row (where the reference's fp32 sums overflow); every other head's rows are the bits they
+    take where head 0's values are ordinary (no row shifts for another's sake); and the backward from these
+    residuals gives head 0's values a gradient wherever the reference does, finite where it is."""
     queries, keys, width = 64, 2, 64
     spans = template.spans(queries, keys, 1)
     streams = jax.random.split(jax.random.key(0), 4)
@@ -951,6 +954,44 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
     finite = np.isfinite(reference_value)
     assert np.isfinite(found_value[finite]).all()
     assert (found_value[finite & (reference_value != 0)] != 0).all()
+
+
+@pytest.mark.parametrize("held", ["keys", "start"])
+def test_a_training_forwards_row_whose_sums_stay_in_range_takes_no_shift_whatever_its_values_reach(held):
+    """A training forward's head whose rows see 512 keys, the row's largest magnitude near fp32's largest
+    under a weight near fp32's least normal at the row's maximum (`held`: a key's value, its logit 86.5
+    below the row's peak; or a resumed state's sums, its maximum 120 binades below it), every other key
+    weighing nothing or holding zeros: its weighted values stay small, so no row shifts (`algebra.row_shift`
+    of its terms at the walk's maximum, `algebra.Reach`, `algebra.started_reach`), though its count times
+    its largest magnitude passes fp32's largest by 2^9, and its small weight is not shifted out of range.
+    Its output is exactly 2^64 times the call's over its values and sums at 2^-64, which no bound comes
+    near."""
+    queries, keys, width = 64, 512, 64
+    spans = template.spans(queries, keys, 1)
+    streams = jax.random.split(jax.random.key(1), 3)
+    query, key, value = (jax.random.normal(stream, (1, count, 2, width), jnp.float32)
+                         for stream, count in zip(streams, (queries, keys, keys), strict=True))
+    # Head 0's logits at a scale of 1/8: 128 at key 0, 41.5 at key 1, -72 at every other key.
+    query = query.at[:, :, 0].set(0.0).at[:, :, 0, 0].set(16.0)
+    key = key.at[:, :, 0].set(0.0).at[:, :, 0, 0].set(-36.0)
+    key = key.at[:, 0, 0, 0].set(64.0).at[:, 1, 0, 0].set(20.75)
+    value = value.at[:, :, 0].set(0.0)
+    if held == "keys":
+        value = value.at[:, 1, 0].set(3e38)
+    query, key, value = (array.astype(jnp.bfloat16) for array in (query, key, value))
+    # Head 0's resumed sums at 2^127 under a maximum 120 binades below its keys' (head 1's at 0, none).
+    m = jnp.zeros((1, 2, queries)).at[:, 0].set(128.0 - 120 * np.log(2.0))
+    acc = jnp.zeros((1, 2, queries, width)).at[:, 0].set(2.0 ** 127 if held == "start" else 0.0)
+    tiles = attention_mosaic.Tiles(64, 64, 2, 1, family=WGMMA)
+
+    def trained(scale):
+        hooks = template.Hooks(initial=template.Initial(m, jnp.ones((1, 2, queries)), acc * scale))
+        with _device(interpret=True), _pinned(tiles):
+            out = attention_mosaic.forward(query, key, value * jnp.bfloat16(scale), spans, hooks,
+                                           residuals=template.Kept.SPLIT, interpret=True)[0]
+        return np.asarray(out[:, :, 0], np.float32)
+
+    np.testing.assert_array_equal(trained(1.0), trained(2.0 ** -64) * np.float32(2.0 ** 64))
 
 
 UNSEEN = {
@@ -2195,10 +2236,10 @@ def _forward_kernels(op, ba, config) -> dict:
 
 DECODE_GATE = [(generation_name, width, stored) for generation_name in GATED for width in (64, 128)
                for stored in ("bfloat16", "int8", "float32")
-               if stored != "float32" or bundles.of(generation_name, jnp.bfloat16).pieces_of_views]
+               if stored != "float32" or bundles.of(generation_name, jnp.bfloat16).copies_in_pieces]
 """The decode gate's cases: each GPU whose family the mainloop qualifies, both widths, each cache; a float32
-query's parts where its family loads a block's pieces of any view (`mosaic.Transport.pieces_of_views`: not
-cp.async's, where an fp32 decode takes XLA by legality)."""
+query's parts where its family loads a block in pieces (`mosaic.Transport.copies_in_pieces`: not cp.async's,
+where an fp32 decode takes XLA by legality)."""
 
 
 @COMPILES_ON_CPU

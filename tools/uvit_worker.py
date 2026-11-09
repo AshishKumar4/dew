@@ -24,7 +24,7 @@ import sys
 import numpy as np
 import torch
 from reference_source import package, published_files
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 REPO, COMMIT = "baofff/U-ViT", "ce551708dc9cde9818d2af7d84dfadfeb7bd9034"
 FILES = {
@@ -57,23 +57,19 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     from torch_precision import float64_twin, widened
 
     t2i = uvit()
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        inputs = {key.removeprefix(f"{name}."): value for key, value in cases.items()
-                  if key.startswith(f"{name}.")}
+    def answer(inputs):
         config = {key.removeprefix("config."): value.item() for key, value in inputs.items()
                   if key.startswith("config.")}
         model = t2i.UViT(**config).eval()
         weights = {key.removeprefix("param."): torch.from_numpy(value) for key, value in inputs.items()
                    if key.startswith("param.")}
         model.load_state_dict(weights, strict=True)
-        for leaf, value in walked(model, inputs, torch.float32).items():
-            out[f"{name}.reference.{leaf}"] = value
-        wide = float64_twin(model, lambda config=config: t2i.UViT(**config))
+        reference = walked(model, inputs, torch.float32)
+        wide = float64_twin(model, lambda: t2i.UViT(**config))
         with widened():
-            for leaf, value in walked(wide, inputs, torch.float64).items():
-                out[f"{name}.truth.{leaf}"] = value
-    return out
+            return reference, walked(wide, inputs, torch.float64)
+
+    return drawn(cases, answer)
 
 
 if __name__ == "__main__":

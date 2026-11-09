@@ -67,6 +67,26 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.layouts import ConfigField, ConfigLayout
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.towers import (
+    TOWER_LAYOUTS,
+    layout_of,
+    projector_layout,
+    projector_variables,
+    tower_layout,
+    tower_variables,
+)
+from dew.interop.towers.audio import audio_config, audio_weights
+from dew.interop.towers.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
+from dew.interop.towers.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
+from dew.interop.towers.gemma4_unified import translate_gemma4_unified_vision_config
+from dew.interop.towers.lfm3 import translate_lfm3_vl_projector_config, translate_lfm3_vl_vision_config
+from dew.interop.towers.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
+from dew.interop.towers.muse_glimmer import (
+    translate_muse_glimmer_projector_config,
+    translate_muse_glimmer_vision_config,
+)
+from dew.interop.towers.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
+from dew.interop.towers.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.interop.wrappers import TextCorrection, WrapperLayout
@@ -74,17 +94,6 @@ from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.gemma3n import AltUp
-from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
-from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
-from dew.nn.vision.gemma4_unified import translate_gemma4_unified_vision_config
-from dew.nn.vision.lfm3 import translate_lfm3_vl_projector_config, translate_lfm3_vl_vision_config
-from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
-from dew.nn.vision.muse_glimmer import (
-    translate_muse_glimmer_projector_config,
-    translate_muse_glimmer_vision_config,
-)
-from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
-from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.registry import from_record, towers
 
 if TYPE_CHECKING:
@@ -131,6 +140,13 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     """Translate the wrapper's text_config as the decoder it is."""
     used.update(("text_config", "tie_word_embeddings"))
     return translate_config(_text_config(hf_config))
+
+
+_WRAPPER_TEXT_SCOPE: Mapping[str, tuple[str, tuple[str, ...]]] = {
+    "sensenova_loop": ("sensenova_loop_text", ("loop_settings", "mhc"))}
+"""A wrapper whose language model reads settings the wrapper states at its own scope: the type it reads as
+and those keys, which join its text_config (`_text_config`): SenseNova-Loop's loop and streams
+(`families.sensenova`)."""
 
 
 _TEXT_TYPES = {"lfm3_vl": "lfm3"}
@@ -255,6 +271,10 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
     text = dict(typed_part(hf_config, text, "text"))
+    scoped = _WRAPPER_TEXT_SCOPE.get(_records.text(hf_config.get("model_type"), "model_type"))
+    if scoped is not None:
+        model_type, keys = scoped
+        text = {**text, "model_type": model_type, **{key: hf_config[key] for key in keys if key in hf_config}}
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -355,7 +375,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
         frame = _records.integer(audio.get("audio_embed_dim", 640), "audio_embed_dim")
         return {"audio": None, "audio_token_id": audio_token_id, "audio_soft_tokens": None,
                 "audio_projector": translate_gemma4_projector_config(audio, text_width, frame)}
-    encoder = audio_nn.audio_config(audio)
+    encoder = audio_config(audio)
     slots = None
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
@@ -438,6 +458,18 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     if video is not None:
         video = _records.integer(video, "video_token_id")
     return _wrapper_fields(family, used, text, tower, projector, image, None, video=video)
+
+
+def _sensenova_loop_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
+    """Read SenseNova-Loop (sensenova/SenseNova-Loop-9B-Preview's remote code): Qwen 3.5's wrapper, whose
+    language model reads the loop and the mHC streams its wrapper states (`families.sensenova`,
+    `_text_config`), its tower Qwen 3.5's, a Conv3d patch embedding as `patch_conv3d` states."""
+    used.update(("loop_settings", "mhc", "model_name", "auto_map"))
+    if hf_config.get("patch_conv3d", True) is not True:
+        refuse(f"patch_conv3d {hf_config.get('patch_conv3d')!r}",
+               "Qwen 3.5's tower embeds patches by a Conv3d")
+    used.add("patch_conv3d")
+    return _qwen35_wrapper(hf_config, used)
 
 
 def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -637,6 +669,7 @@ _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
+    "sensenova_loop": _sensenova_loop_wrapper,
     "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper,
     **dict.fromkeys(_TEXT_VLMS, _text_vlm_wrapper)}
 
@@ -691,12 +724,12 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         component, owner = wrapper_route(name[:-len(sidecar)] + ".weight", record)
         return component, owner.removesuffix(".weight") + sidecar
     tower_prefix = (None if record["tower"] is None else
-                    vision_nn.tower_layout(_kind_name(record, "tower")).prefix)
+                    tower_layout(_kind_name(record, "tower")).prefix)
     projector_prefix = (None if record["projector"] is None else
-                        vision_nn.projector_layout(_kind_name(record, "projector")).prefix)
+                        projector_layout(_kind_name(record, "projector")).prefix)
     audio = record.get("audio_projector") is not None
     audio_layout = (None if record.get("audio") is None
-                    else towers[_kind_name(record, "audio")].checkpoint)
+                    else layout_of(TOWER_LAYOUTS, towers[_kind_name(record, "audio")]))
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")
     for prefix in record.get("unported", {}):
@@ -1113,23 +1146,23 @@ def read_wrapper(
     variables = {"language_model": language}
     placed = {}
     if record["tower"] is not None:
-        tower, tower_layouts = vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"],
+        tower, tower_layouts = tower_variables(_kind_name(record, "tower"), tables["tower"],
                                                          param_dtype)
-        projector, projector_layouts = vision_nn.projector_variables(
+        projector, projector_layouts = projector_variables(
             _kind_name(record, "projector"), tables["projector"], param_dtype)
         variables.update(tower=tower, projector={"params": projector})
         placed.update(tower=tower_layouts, projector=nested(projector_layouts, 0, "params"))
     audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
-        # A Gemma tower's tensors are named under its own map; any other's sit where its class says
-        # (`TowerBase.checkpoint`).
+        # A Gemma tower's tensors are named under its own map; any other's sit where its family declares
+        # (`dew.interop.towers`).
         variables["audio_tower"], placed["audio_tower"] = (
-            audio_nn.audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
+            audio_weights(tables["audio_tower"], encoder, param_dtype=param_dtype)
             if isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio))
-            else vision_nn.tower_variables(_kind_name(record, "audio"), tables["audio_tower"], param_dtype))
+            else tower_variables(_kind_name(record, "audio"), tables["audio_tower"], param_dtype))
     if record.get("audio_projector") is not None:
-        audio_projector, audio_layouts = vision_nn.projector_variables(
+        audio_projector, audio_layouts = projector_variables(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)
         variables["audio_projector"] = {"params": audio_projector}
         placed["audio_projector"] = nested(audio_layouts, 0, "params")
@@ -1312,7 +1345,7 @@ def translate_denoiser_weights(
     the family's tied-head rule. Vision and audio prefixes have no counterpart
     and raise ValueError with the tensor name.
     """
-    from dew.nn.diffusion_gemma import translate_weights as translate_sc_weights
+    from dew.interop.diffusion_gemma import translate_self_conditioning as translate_sc_weights
 
     text_names, sc_names, _ = _denoiser_sources(hf_tensors, hf_tensors.__getitem__, text_only=True,
                                                 checked=checked)

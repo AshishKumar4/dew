@@ -129,7 +129,7 @@ class _Block:
 
 # _gen_mobilenet_v5's mobilenetv5_300m_enc architecture. Repeated blocks own
 # distinct parameters; the tuples only share their immutable descriptions.
-_ARCHITECTURE = (
+MOBILENET_ARCHITECTURE = (
     (_Block("edge", 128, stride=2, expansion=4, middle_kernel=3),)
     + (_Block("edge", 128, expansion=4, middle_kernel=3),) * 2,
     (
@@ -304,9 +304,9 @@ class MobileStage(nn.Module):
 
     @nn.compact
     def __call__(self, x, train: bool = False):
-        offset = sum(len(stage) for stage in _ARCHITECTURE[:self.index])
-        count = sum(len(stage) for stage in _ARCHITECTURE)
-        for i, spec in enumerate(_ARCHITECTURE[self.index]):
+        offset = sum(len(stage) for stage in MOBILENET_ARCHITECTURE[:self.index])
+        count = sum(len(stage) for stage in MOBILENET_ARCHITECTURE)
+        for i, spec in enumerate(MOBILENET_ARCHITECTURE[self.index]):
             features = _divisible(spec.features * self.multiplier)
             drop_path = self.drop_path_rate * (offset + i) / count
             if spec.kind == "attention":

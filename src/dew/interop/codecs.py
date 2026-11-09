@@ -229,17 +229,29 @@ E4M3_POWERS = (-9, 8)
 """The powers of two float8_e4m3fn holds exactly, its least subnormal's to the largest below 448."""
 
 
-def mxfp4_tensor_powers(scales: ArrayLike) -> np.ndarray | None:
+def _magnitudes(codes: Stored) -> Stored:
+    """Whether each group of packed E2M1 codes `[..., group, 16]` holds a code of nonzero magnitude: one
+    whose group's scale it is read under. A group of zeros, signed or not (codes 0 and 8), is its zeros
+    under any scale."""
+    return (((codes & 7) != 0) | (((codes >> 4) & 7) != 0)).any(-1)
+
+
+def mxfp4_tensor_powers(blocks: ArrayLike, scales: ArrayLike) -> np.ndarray | None:
     """Each expert's power of two `k` (`[expert]` int32) that takes an MXFP4 bank's E8M0 group powers into
-    E4M3's (`E4M3_POWERS`), so the bank is NVFP4's parts exactly (`mxfp4_as_nvfp4`), read from its scales
-    alone: a group's power less `k`, its E4M3 block scale, twice. A 0x00 byte is an all-zero group's (the
-    released encoder's rule, `quantize_mxfp4`), which no power bounds. None where an expert's other powers
-    spread past E4M3's 17, its `2**k` passes float32's normal range or a group's scale is the NaN byte 0xff,
-    or the load reads no values: such a bank stays dequantized (`dequantize_mxfp4`)."""
+    E4M3's (`E4M3_POWERS`), so the bank is NVFP4's parts exactly (`mxfp4_as_nvfp4`): a group's power less
+    `k`, its E4M3 block scale, twice. Every byte is its power `b - 127`, the 0x00 byte's 2**-127 among
+    them (`e8m0_scales`), but the powers bounding `k` are of the groups holding a code of nonzero
+    magnitude (`_magnitudes`): a group of zeros, signed or not, is its zeros under any block scale, an
+    all-zero group's 0x00 byte (`quantize_mxfp4`) its encoder's choice. None where an expert's bounding
+    powers spread past E4M3's 17, its `2**k` passes float32's normal range or a group's scale is the NaN
+    byte 0xff, or the load reads no values: such a bank stays dequantized (`dequantize_mxfp4`), which holds
+    every value it holds."""
+    blocks, scales = unread.held(blocks), unread.held(scales)
     stored = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
-    if not unread.valued(stored) or stored.ndim != 3 or (stored == 255).any():
+    if (not (unread.valued(stored) and unread.valued(blocks)) or stored.ndim != 3
+            or (stored == 255).any()):
         return None
-    held = stored != 0
+    held = _magnitudes(_bytes(blocks, _CODE_DTYPES))
     exponents = stored.astype(np.int32) - 127
     low, high = E4M3_POWERS
     any_held = held.any(axis=(1, 2))
@@ -258,18 +270,16 @@ def mxfp4_as_nvfp4(blocks: ArrayLike, scales: ArrayLike, powers: np.ndarray
     E2M1 nibble `[expert, input, output]` uint8 (sign bit 3, as stored), each sixteen inputs' E4M3 block
     scale `[expert, input / 16, output]` (its group's power less its expert's) and each expert's float32
     tensor scale `2**k` `[expert]`, which `dew.nn.kernels.gemm.NvFp4.of` packs: every value its code times
-    its block's scale times its expert's, the MXFP4 value. A slice of a bank's experts reads its own (a
-    placement's shard). A group of nonzero codes under the 0x00 byte breaks the format's encoder rule,
-    refused."""
+    its block's scale times its expert's, the MXFP4 value, the 0x00 byte's group's at 2**-127 as any
+    other's; a group of zeros, signed or not, under E4M3's largest power, which holds its zeros as they
+    are. A slice of a bank's experts reads its own (a placement's shard)."""
     blocks, scales = _mxfp4_arrays(blocks, scales)
     codes = _bytes(blocks, _CODE_DTYPES)
     stored = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
     experts, outputs, groups, _ = codes.shape
-    if ((stored == 0) & (codes != 0).any(-1)).any():
-        raise ValueError("an MXFP4 group of nonzero codes under the 0x00 scale byte, which the format's "
-                         "encoder gives an all-zero group alone")
     nibbles = np.stack([codes & 15, codes >> 4], axis=-1).reshape(experts, outputs, groups * GROUP)
-    local = np.where(stored != 0, stored.astype(np.int32) - 127 - powers[:, None, None], E4M3_POWERS[1])
+    local = np.where(_magnitudes(codes), stored.astype(np.int32) - 127 - powers[:, None, None],
+                     E4M3_POWERS[1])
     block = np.ldexp(np.float32(1), local).astype(ml_dtypes.float8_e4m3fn).swapaxes(1, 2)
     return (np.ascontiguousarray(nibbles.swapaxes(1, 2)), np.repeat(block, GROUP // 16, axis=1),
             np.ldexp(np.float32(1), powers).astype(np.float32))

@@ -174,6 +174,13 @@ FOREIGN |= {"dew.lora": ("dew.nn.backbones.layer_plan", "dew.nn.mixer_base", "de
             "dew.sampling.strategies": ("dew.objectives",),
             "dew.inference.tasks": ("dew.objectives",),
             "dew.interop.sequence_causality": ("dew.training",)}
+# The one table of component kinds, typed by its members' bases under TYPE_CHECKING alone, imports no feature
+# package as it runs: a member is its import path, imported when it is read (row 4266).
+FOREIGN |= {"dew.registry": (
+    "dew.nn", "dew.data", "dew.inputs", "dew.objectives", "dew.training", "dew.inference", "dew.interop",
+    "dew.rl", "dew.decision", "dew._cli", "dew.config", "dew.checkpoints", "dew.diffusion", "dew.sampling",
+    "dew.eval", "dew.lora", "dew.quantization", "dew.telemetry", "dew.io", "dew._cleanup", "dew.figures",
+    "dew.optim")}
 
 
 @pytest.mark.parametrize("module", sorted(FOREIGN))

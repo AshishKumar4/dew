@@ -1712,6 +1712,11 @@ class Checkpoints:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
         local = self._open_local()
+        # A local step at or past this one is the one a run cut short left on this process, where the pool
+        # resumed from an earlier step because another process held none it could recover (`_local_latest`):
+        # the resumed run writes it anew, which Orbax refuses beside it (StepAlreadyExistsError).
+        for stale in [held for held in local.all_steps() if held >= step]:
+            local.delete(stale)
         self._metadata = None
         with region("checkpoint.submit_local"):
             local.save(

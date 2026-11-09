@@ -16,6 +16,17 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dreamer 4's tokenizer (`CausalTokenizer`) reads its tokens' places by two-axis rotary positions
+  (`positions="rotary"`, the default), as the paper does, and RMS-normalizes its latents before the
+  squeeze; tutorial 12's tokenizer, trained 8,000 updates, now reconstructs its balls (held-out squared
+  error 0.0067 against the mean frame's 0.14; at the 2,000 updates the tutorial as recorded trains,
+  0.12). A run saved before reads `positions="learned"`, as it
+  trained.
+- Phases (`dew.data.phases`, `dew.data.schedule`) may each read batches of their own: a phase's end on the
+  step clock is the records of the phases before it and its own steps in its own rows, each batch steps a
+  program of its own, and under accumulation a phase of another batch than the one before it begins where
+  an update does, refused where it would begin inside one. They were refused unless every phase
+  batched alike.
 - Every release Dew writes is planned once and written once (`dew.interop.releases.ReleasePlan`): `dew
   export`, `Pretrained.save`, `Decide.save_pretrained` and `SavedModel.save_pretrained` each write a plan of
   a model part, a decision head's files, the task's assets and one release record, and `export` returns the
@@ -120,7 +131,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   lower and took twice as long. A template declaration can ask for exact extraction
   (`derive.Reduction(exact=True)`), and the test suite checks every derivation's greedy choice against the exact
   optimum.
-- Dew requires its JAX build 0.12.0.1.post68: the Pallas lowering cache keys no setting a lowering never reads,
+- Dew requires its JAX build 0.12.0.1.post70: a serialized executable's output types unpickle with JAX's own
+  `AutoLayout`, so a loaded executable's outputs trace as a fresh run's do (a nested `jit` fed them traced twice,
+  and a step compiled ahead recompiled on the GPU).
+- Dew's JAX build 0.12.0.1.post69: a `cond` whose lowering drops a platform's branch still passes
+  that branch's ordered-effect tokens, and the Pallas lowering cache encodes each interned abstract value and dtype
+  once per key. Its CUDA plugins are post67's on every machine: aarch64's are built (ledger row 5211), so a GH200
+  that compiles for more than one GPU target assembles each object for its own capability too, and the `cuda12`
+  and `cuda13` extras name one plugin for x86_64 and aarch64 alike.
+- Dew's JAX build 0.12.0.1.post68: the Pallas lowering cache keys no setting a lowering never reads,
   and a process may declare packages of its own sealed by their tree's digest (`JAX_PALLAS_LOWERING_CACHE_SOURCES`),
   which Dew declares itself, so its kernels holding Dew's own code (an `inline_mgpu` body, a marked call) are
   kept and read back across processes. Its CUDA plugins are post67's, whose fixes follow.

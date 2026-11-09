@@ -24,8 +24,8 @@ from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
+from dew.interop.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.objectives.base import TEACHER, Metric
 from dew.objectives.diffusion.alignment import Alignment

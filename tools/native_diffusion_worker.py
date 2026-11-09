@@ -41,7 +41,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from reference_worker import serve
+from reference_worker import drawn, serve
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers.tar.xz"
 FLAX = ("sd", "xl", "img2img", "inpaint")
@@ -319,21 +319,17 @@ def run(site: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     `TASK-GROUP`, the group's leaves)."""
     task, group = (site, None) if site.startswith("grid-") else site.rsplit("-", 1)
     wanted = () if group is None else groups(task)[group]
-    names = sorted({key.split(".", 1)[0] for key in cases})
-    out = {}
-    for kind, wide in (("reference", False), ("truth", True)):
-        for name in names:
-            case = {key.removeprefix(f"{name}."): value for key, value in cases.items()
-                    if key.startswith(f"{name}.")}
-            if task in FLAX or task.startswith("grid-"):
-                with flax_float64() if wide else contextlib.nullcontext():
-                    answered = (grid_walk(task.removeprefix("grid-"), case, wide) if group is None
-                                else flax_call(task, case, wide, wanted))
-            else:
-                answered = torch_call(task, case, wide, wanted)
-            for leaf in answered if group is None else wanted:
-                out[f"{name}.{kind}.{leaf}"] = np.asarray(answered[leaf], np.float64 if wide else np.float32)
-    return out
+    def arm(case, wide):
+        if task in FLAX or task.startswith("grid-"):
+            with flax_float64() if wide else contextlib.nullcontext():
+                answered = (grid_walk(task.removeprefix("grid-"), case, wide) if group is None
+                            else flax_call(task, case, wide, wanted))
+        else:
+            answered = torch_call(task, case, wide, wanted)
+        return {leaf: np.asarray(answered[leaf], np.float64 if wide else np.float32)
+                for leaf in (answered if group is None else wanted)}
+
+    return drawn(cases, lambda case: (arm(case, False), arm(case, True)))
 
 
 if __name__ == "__main__":

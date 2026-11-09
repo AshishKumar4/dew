@@ -370,6 +370,9 @@ dew.config.DecoderRunConfig
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
+  loop_implicit: bool = False
+  loop_exit_gate: bool = False
+  loop_exit_threshold: float | None = None
 dew.config.MetricConfig
   name: str
   fields: JsonDict = builtins.dict()
@@ -565,6 +568,9 @@ dew.config.lm.LMRunConfig
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
+  loop_implicit: bool = False
+  loop_exit_gate: bool = False
+  loop_exit_threshold: float | None = None
   tokenizer: str = 'byte'
   prompt: str = ''
   max_new_tokens: int = 128
@@ -641,6 +647,9 @@ dew.decision.config.DecisionRunConfig
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
+  loop_implicit: bool = False
+  loop_exit_gate: bool = False
+  loop_exit_threshold: float | None = None
   pretrained: str = 'convaiinnovations/laya'
   subfolder: str | None = None
   revision: str | None = None
@@ -841,6 +850,12 @@ dew.inputs.spec.TextCondition
   unconditional: str = ''
   max_length: int | None = None
   revision: str | None = None
+dew.interop.autoencoders.pretrained.PretrainedAutoencoder
+  modelname: str = 'pcuenq/sd-vae-ft-mse-flax'
+  revision: str = 'bf16'
+  dtype: DtypeName = 'bfloat16'
+  latent_shift: float | None = None
+  latent_scale: float | None = None
 dew.lora.LoRA
   rank: int
   modules: tuple[str, ...]
@@ -849,12 +864,6 @@ dew.lora.LoRA
   dropout: float = 0.0
   source: str | None = None
   weight_name: str | None = None
-dew.nn.autoencoders.pretrained.PretrainedAutoencoder
-  modelname: str = 'pcuenq/sd-vae-ft-mse-flax'
-  revision: str = 'bf16'
-  dtype: DtypeName = 'bfloat16'
-  latent_shift: float | None = None
-  latent_scale: float | None = None
 dew.nn.dex.DifferentialExtension
   layers: tuple[tuple[int, tuple[int, ...]], ...]
   lambda_init: float | None = None

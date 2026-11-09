@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Self
 
 import jax
+import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 
 from dew import _records
 from dew.batch import Variables, part, thaw
@@ -22,7 +24,8 @@ from dew.interop.pretrained import Pretrained
 from dew.interop.releases import ReleasePlan, writable
 from dew.lora import FACTORS
 from dew.nn.attention import AttentionImpl
-from dew.registry import dtype_name, import_path
+from dew.nn.sharding import drawn_axes
+from dew.registry import dtype_name, from_record, import_path
 
 from . import joint_checkpoint
 from .calibration import Calibration
@@ -36,9 +39,21 @@ from .release import released_decision
 from .task import Decide
 
 
+def head_axes(head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+    """The axes a readout draws each of its parameters in over `backbone` (`DecisionModel.initialize_head`
+    traced for shapes alone, `drawn_axes`): the table a loaded readout is placed by. The backbone's leaves
+    enter as their shapes, a streamed load's unread ones (`SourceLeaf`) among them."""
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), backbone.variables)
+    return drawn_axes(lambda key, variables: DecisionModel(backbone.model, from_record(Head, head))
+                      .initialize_head(key, variables, jnp.zeros((1, 1), jnp.int32)), shapes)
+
+
 @dataclasses.dataclass(frozen=True)
 class DecisionHeadSource(HeadComponent):
     """The head constructor reads the native backbone's output width and compute dtype."""
+
+    def axes(self, head: nn.Module, backbone: Pretrained) -> dict[tuple[str, ...], tuple[str | None, ...]]:
+        return head_axes(head, backbone)
 
     def build(self, backbone: Pretrained | None, dtype: str, attention_impl: AttentionImpl, *,
               shapes: Mapping[str, tuple[int, ...]] | None) -> Head:
