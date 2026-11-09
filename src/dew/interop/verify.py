@@ -1174,7 +1174,7 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
         except Exception as error:
             raise _unavailable(model_type, f"{name} does not run its shrunken config "
                                f"({type(error).__name__}: {error})") from error
-        registered = _registered(model_type, source, config)
+        registered = _registered(source, config)
         with Isolated() as twin:
             probed = _Source(reference, twin)
             try:
@@ -1189,25 +1189,15 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             return _candidates(model_type, name, reasons, sized, probed, fields)
 
 
-def _registered(model_type: str, source: ModelSource, config: PretrainedConfig) -> tuple[type, object] | None:
+def _registered(source: ModelSource, config: PretrainedConfig) -> tuple[type, object] | None:
     """The config class of `config` and the causal LM transformers' auto classes register for it, the
     constructor `ModelSource.causal_lm` builds by (which may return another class, a factory's), which the
-    twin's process registers alike (`_twin_built`), so a type a script registered at runtime builds there;
-    None for a source's remote code, which its auto classes do not build. A class the running script
-    defines itself (`__main__`) has no module that process imports, so the probe is refused there, naming
-    it."""
+    twin's process registers alike (`_twin_built`), so a type a script registered at runtime builds there,
+    its classes found as `multiprocessing` finds a script's (`dew.interop.isolated`); None for a source's
+    remote code, which its auto classes do not build."""
     from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
 
-    if source.remote is not None:
-        return None
-    classes = (type(config), MODEL_FOR_CAUSAL_LM_MAPPING[type(config)])
-    scripted = [str(kind) for kind in classes if kind.__module__ == '__main__']
-    if scripted:
-        raise _unavailable(model_type, f"its classes {scripted} are defined in the running script "
-                           "(`__main__`), which the process tier 2 builds its float64 twin in "
-                           "(`dew.interop.isolated`) cannot import; define them in a module the script "
-                           "imports")
-    return classes
+    return None if source.remote is not None else (type(config), MODEL_FOR_CAUSAL_LM_MAPPING[type(config)])
 
 
 def _candidates(model_type: str, name: str, reasons: dict[str, str], sized: list, probed: _Source,
