@@ -18,17 +18,20 @@ def convert(directory):
     directory = Path(directory)
     from safetensors.numpy import load_file
 
-    from dew.interop.diffusion import flax_weights_file, weights_stem, write_flax_component
+    from dew.interop.diffusion import Declared, write_flax_component
     from dew.interop.safetensors_io import write_file
     index = json.loads((directory / "model_index.json").read_text())
-    # Each component the pipeline declares, its weight files named as the library its entry names writes them.
-    for component, declared in index.items():
+    # Each Flax component the pipeline declares (its entries' others are its own fields, `_name_or_path`),
+    # its weight files named as the library its entry names writes them.
+    for component, entry in index.items():
         folder = directory / component
-        if not (isinstance(declared, list) and len(declared) == 2 and isinstance(declared[1], str)
-                and declared[1].startswith("Flax") and folder.is_dir()):
+        if not (isinstance(entry, list) and folder.is_dir()):
             continue
-        flax_file = folder / flax_weights_file(declared)
-        filename = f"{weights_stem(declared)}.safetensors"
+        declared = Declared.of(entry, component)
+        if not declared.name.startswith("Flax"):
+            continue
+        flax_file = folder / declared.flax_file
+        filename = f"{declared.stem}.safetensors"
         if not flax_file.is_file():
             write_flax_component(directory, component, declared, load_file(folder / filename))
             continue
