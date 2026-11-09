@@ -51,8 +51,9 @@ DECODED = 4
 class Layer:
     """A matrix layer: its module at a dtype (`make`), its draw of variables, cache after a prefill and
     `DECODED` tokens by seed and held state's dtype (`drawn`), the cache's recurrent state's name, its
-    state's `[rows, Hv, Dk, Dv]` shape, whether it holds a bf16 state and whether its fused step norms a
-    head (`linear.decode_kernel`'s `normed`)."""
+    state's `[rows, Hv, Dk, Dv]` shape, whether it holds a bf16 state, whether its fused step norms a head
+    (`linear.decode_kernel`'s `normed`) and the groups its value heads read (its `groups`: key heads, or
+    Mamba-2's B and C groups)."""
 
     make: Callable
     drawn: Callable
@@ -60,6 +61,7 @@ class Layer:
     shape: tuple[int, ...]
     holds_bf16: bool
     normed: bool
+    groups: int
 
 
 def _prefilled(module, variables, seed: int, width: int):
@@ -102,11 +104,12 @@ def _drawn_of(make):
 
 LAYERS = {
     "gated delta net": Layer(lambda dtype=jnp.bfloat16: fused_case(4, 128, 3, dtype, jnp.float32)[0],
-                             _delta_net, "recurrent_state", (3, 4, 128, 128), holds_bf16=True, normed=True),
+                             _delta_net, "recurrent_state", (3, 4, 128, 128), holds_bf16=True, normed=True,
+                             groups=2),
     "kimi delta attention": Layer(_kimi, _drawn_of(_kimi), "recurrent_state", (3, 2, 128, 128),
-                                  holds_bf16=False, normed=True),
+                                  holds_bf16=False, normed=True, groups=2),
     "mamba2": Layer(_mamba2, _drawn_of(_mamba2), "ssm_state", (3, 4, 128, 64), holds_bf16=False,
-                    normed=False),
+                    normed=False, groups=1),
 }
 """Each layer the decode matrix runs, by its `layer` axis value."""
 
@@ -137,7 +140,8 @@ def _taken(case: tuple[tuple[str, str], ...]) -> bool:
     state = jax.ShapeDtypeStruct(layer.shape, jnp.dtype(named["state"]))
     with generation.assumed(named["generation"]), generation.chosen(delta_decode=named["kernel"]):
         try:
-            return decode_kernel(state, fuses=True, normed=layer.normed) == named["kernel"]
+            kernel = decode_kernel(state, groups=layer.groups, fuses=True, normed=layer.normed)
+            return kernel == named["kernel"]
         except KernelRefused:
             return False
 
