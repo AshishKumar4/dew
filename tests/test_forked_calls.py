@@ -7,6 +7,7 @@ rows whole.
 """
 
 import dataclasses
+import math
 
 import jax
 import jax.numpy as jnp
@@ -457,3 +458,74 @@ def test_two_chains_of_a_session_keep_each_sampled_id_apart():
         np.testing.assert_array_equal(np.sort(batch[BEHAVIOR_LOG_PROBS_KEY][drawn]),
                                       np.sort(np.asarray([-0.1, -0.2, -0.3, -0.4] * 2, np.float32)))
         assert sorted(batch[CALL_INDEX_KEY][drawn].tolist()) == [0] * 4 + [1] * 4
+
+
+FORKED_ROWS, FORKED_LENGTH = 8, 2048
+"""The forked recurrence's cost check's call: a decision window's rows at their length."""
+
+
+def _compiled_cost(function, *shapes) -> tuple[int, float]:
+    """The temporaries and FLOPs of the compiled gradient of `function`'s summed output in every operand."""
+    compiled = jax.jit(jax.grad(lambda *operands: function(*operands).astype(jnp.float32).sum(),
+                                argnums=tuple(range(len(shapes))))).lower(*shapes).compile()
+    cost = compiled.cost_analysis()
+    cost = cost[0] if isinstance(cost, list) else cost
+    return int(compiled.memory_analysis().temp_size_in_bytes), float(cost["flops"])
+
+
+def _recurrence_call(layer: str, length: int, documents: int):
+    """`layer`'s chunked recurrence over `FORKED_ROWS` rows of `length` tokens, three documents a row, and
+    with `documents` past zero each entering a memory of its own (`Chunk.entered`), two of them the first's
+    (a state and two questions over it): the function, its operands' shapes, its chunk and its memories'
+    elements."""
+    from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule
+    from dew.nn.mixers.mamba2 import CHUNK_SIZE as SSD_CHUNK, _chunked
+
+    def shaped(*dims):
+        return jax.ShapeDtypeStruct((FORKED_ROWS, *dims), jnp.float32)
+
+    starts = np.zeros((FORKED_ROWS, length), bool)
+    starts[:, [0, length // 13, length // 2]] = True
+    starts = jnp.asarray(starts)
+    entered = None
+    if documents:
+        held = np.zeros((FORKED_ROWS, documents), np.int32)
+        held[:, 1:3] = 1
+        entered = jnp.asarray(held)
+    if layer == "gated delta net":
+        memory = (3, 8, 8)
+        operands = [shaped(length, 1, 8), shaped(length, 1, 8), shaped(length, 3, 8), shaped(length, 3),
+                    shaped(length, 3)]
+
+        def call(query, key, value, gate, beta, *state):
+            return chunk_gated_delta_rule(query, key, value, gate, beta, *state, starts=starts,
+                                          max_segments=documents or 3, write_bound=1.0, entered=entered)[0]
+        chunk = CHUNK_SIZE
+    else:
+        memory = (4, 8, 8)
+        operands = [shaped(length, 4, 8), shaped(length, 4), shaped(length, 1, 8), shaped(length, 1, 8)]
+        rate, skip = -jnp.ones((4,)), jnp.ones((4,))
+
+        def call(x, dt, keys, queries, *state):
+            return _chunked(x, jax.nn.softplus(dt), rate, keys, queries, skip, state[0] if state else None,
+                            SSD_CHUNK, starts=starts, entered=entered)[0]
+        chunk = SSD_CHUNK
+    if documents:
+        operands.append(shaped(documents, *memory))
+    return call, operands, chunk, FORKED_ROWS * documents * math.prod(memory)
+
+
+@pytest.mark.parametrize("documents", [6, 173], ids=["the windows' own", "a loose bound"])
+@pytest.mark.parametrize("layer", ["gated delta net", "SSD"])
+def test_a_forked_recurrence_costs_its_tokens_and_a_chunk_a_document(layer, documents):
+    """A recurrence whose documents each enter a memory of their own (a call over forks) costs, in its
+    gradient's temporaries and FLOPs, what its packed row costs laid one chunk longer a document
+    (`AlignedDocuments`: each document from a chunk's edge), with each document's memory, its cotangent,
+    its final and that final's cotangent beside it, fp32, each an operation an element: a decision window's
+    rows at a documents bound of its own windows and at a loose one."""
+    call, operands, chunk, memories = _recurrence_call(layer, FORKED_LENGTH, documents)
+    temporaries, flops = _compiled_cost(call, *operands)
+    packed = _recurrence_call(layer, FORKED_LENGTH + documents * chunk, 0)
+    bound, work = _compiled_cost(packed[0], *packed[1])
+    assert temporaries <= bound + 4 * 4 * memories, (temporaries, bound, memories)
+    assert flops <= work + 4 * memories, (flops, work, memories)
