@@ -159,6 +159,33 @@ def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
         [f32(chunk, chunk)] * 4))
 
 
+def pairs_back_views(call: Call, row: int, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref) -> dict:
+    """The streams of a key pairs backward's program at chunk `row` and value head `h` (`key_pairs_own`'s,
+    `key_backward._key_pairs_back`'s): the pairs' gradients a chunk's square once, and the queries, keys and
+    the separated prefix's halves a key block a step."""
+    chunk, width = call.chunk, call.width
+    given, gates, square = call.given, call.gates, fp32_operand(call)
+    keyed = h // call.group * width
+    return {**stream_views(lambda i: (0, 0), scores=square.views(ds_ref, row, chunk, h * chunk, chunk),
+                           system=square.views(da_ref, row, chunk, h * chunk, chunk)),
+            **stream_views(lambda i: (0, i),
+                           queries=given.views(q_ref, row, chunk, keyed, width),
+                           keys=given.views(k_ref, row, chunk, keyed, width),
+                           gates=gates.views(hi_ref, row, chunk, h * width, width),
+                           lows=gates.views(lo_ref, row, chunk, h * width, width))}
+
+
+def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, operands: tuple, grads: tuple):
+    """A key block's gradients through a chunk's pairs stored at `at` (its row and column) into `refs`
+    (`dq`, `dk`, `dg`): the queries', the keys' through the gated keys (`beta k`) and their own, and the log
+    decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`."""
+    (query, key, betas), (d_query, d_keyed, d_key) = operands, grads
+    for ref, grad in zip(refs, (d_query, d_keyed * betas[:, None] + d_key,
+                                query * d_query + key * (d_keyed * betas[:, None] - d_key)), strict=True):
+        fp32_operand(call).store(ref, grad, *at[:1], call.chunk, at[1], keys, family=call.family, smem=smem)
+    return jnp.sum(d_keyed * key, axis=1)
+
+
 def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, scale: float):
     """`(dq, dk, dg [R, HV * Dk], dbeta [HV, R])` fp32: each chunk and value head's gradients through its
     sub-chunks' own pairs, each its own decay (`algebra.key_diagonal_pairs_back`), given the pairs'
@@ -180,14 +207,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
         behind, ahead = staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
-        keyed = h // call.group * width
-        views = {**stream_views(lambda i: (0, 0), scores=square.views(ds_ref, row, chunk, h * chunk, chunk),
-                                system=square.views(da_ref, row, chunk, h * chunk, chunk)),
-                 **stream_views(lambda i: (0, i),
-                                queries=given.views(q_ref, row, chunk, keyed, width),
-                                keys=given.views(k_ref, row, chunk, keyed, width),
-                                gates=gates.views(hi_ref, row, chunk, h * width, width),
-                                lows=gates.views(lo_ref, row, chunk, h * width, width))}
+        views = pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref)
 
         def step(index, slots, d_betas, accumulators):
             slots.acquire_all()
@@ -210,11 +230,9 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
                 algebra.separated(*prefix),
                 shifted_keys(call, behind, key, prefix), functools.partial(shifted_up, call, ahead),
                 (zero, zero), zero)
-            for ref, grad in ((dq_ref, d_query), (dk_ref, d_keyed * betas[:, None] + d_key),
-                              (dg_ref, query * d_query + key * (d_keyed * betas[:, None] - d_key))):
-                square.store(ref, grad, row, chunk, h * width + index * keys, keys, family=family,
-                             smem=landing["block"])
-            d_betas = d_betas + jnp.sum(d_keyed * key, axis=1)
+            d_betas = d_betas + pairs_back_stored(
+                call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
+                (query, key, betas), (d_query, d_keyed, d_key))
 
             @pl.when(index == steps - 1)
             def _():
