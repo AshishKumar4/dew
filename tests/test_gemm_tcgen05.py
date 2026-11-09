@@ -14,9 +14,8 @@ from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 def _on_tcgen05(*, interpret: bool) -> None:
     """The shared GEMM mainloop (`mosaic_gpu.gmm`) on tcgen05's bundle (`mosaic_sm100.RINGS`), over integers
-    from -1 to 1 at a depth of 256 (every sum at most 256, which a bf16 output holds exactly; an fp32 output
-    of 16-bit products is exactly summed, `templates.product.promoted`, whose step tcgen05's launch does not
-    take, its products issued by one warp): a grouped forward, a grouped
+    from -1 to 1 at a depth of 256 (every sum at most 256, which a bf16 output holds exactly): a grouped
+    forward, a grouped
     input gradient (its matrix read transposed) and a dense forward, each exactly numpy's, routed to the
     template on a 128-row tile of tcgen05's; a grouped kernel gradient, its stages rewritten by a role of
     their own, and a dense one into bf16 and into fp32, its stages read as loaded (row 5209), each routed to
