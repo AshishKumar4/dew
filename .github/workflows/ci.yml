@@ -51,8 +51,9 @@ concurrency:
 
 env:
   # The armada runner every armada job uses: one that waits out a redeploy's refusal of a new job (armada 1626e08),
-  # so a deploy's drain delays a run and never fails it (Main, 2026-11-06).
-  ARMADA: github:AshishKumar4/armada#1626e0880d02f04fd720e4c0ca452104047dbdd5
+  # so a deploy's drain delays a run and never fails it (Main, 2026-11-06), and whose judge's red row says how each
+  # failed map task ended and the tail of what it said (armada f6cc2b3; Main, 2026-11-09).
+  ARMADA: github:AshishKumar4/armada#f6cc2b362b0b39d3e298279ce3df2cce1fd0c66a
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue
