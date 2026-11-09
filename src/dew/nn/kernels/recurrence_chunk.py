@@ -176,14 +176,17 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     state, starts, firsts = operands.state, operands.starts, operands.firsts
     rows = None
     if operands.entered is not None:
-        # Each document a row of its own from its slot's memory, every kernel's call unpacked.
         rows = DocumentRows.of(starts, operands.entered, firsts)
-        query, key, value, g, beta = rows.laid(query, key, value, g, beta)
-        state, starts, firsts, max_segments = rows.entering(state), None, None, None
+    if rows is not None:
+        # Each document's own memory `[B, D, Hv, Dk, Dv]` beside the packed rows, which the template, the
+        # port and the portable walk walk (`chunk_forward.prepared`, `_blocked_rule`, `xla_mainloop`) and the
+        # rated scan's ports take as rows of their own (`_documents_apart`).
+        state = rows.entering(state).reshape(*rows.begins.shape, *state.shape[2:])
+        firsts, max_segments = rows.begins, rows.begins.shape[1]
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
-                                 work, dtype, max_segments=max_segments)
+                                 work, dtype, max_segments=max_segments, rows=rows)
     else:
         # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
         # over to the portable math there, reported as the call's route. A kernel's output unrounded, as the
@@ -201,33 +204,46 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                product=product,
                                delta=hooks.delta, decayed=hooks.decay != 'none')
 
-        def run(kernel, query, key, value, g, beta, state, starts, firsts):
+        def launched(kernel, query, key, value, g, beta, state, starts, firsts, segments):
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
-                                     max_segments=max_segments, scale=scale, delta=hooks.delta, wide=wide,
+                                     max_segments=segments, scale=scale, delta=hooks.delta, wide=wide,
                                      bound=hooks.inverse_bound, rounded=rounded)
             if kernel == 'fla':
-                return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
+                return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=segments,
                                 scale=scale, wide=wide, firsts=firsts)
             size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-            return xla_mainloop(Tiles(size), query, key, value, g, beta, state, starts, scale=scale,
+            return xla_mainloop(Tiles(size), query, key, value, g, beta, state, starts, firsts, scale=scale,
                                 delta=hooks.delta, dtype=work, bound=hooks.inverse_bound)
+
+        def run(kernel, *operands):
+            # Every kernel walks the packed rows, each document from its own memory.
+            return launched(kernel, *operands, max_segments)
 
         out, final = _per_product(product_kernel, run, query, key, value, g, beta, state, starts, firsts)
         out = recurrence.skipped(hooks, out.astype(work), value, given, work)
-    if rows is not None:
-        out, final = rows.unlaid(out), rows.leaving(final)
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
+
+
+def _documents_apart(rows: "DocumentRows", run: Callable, query, key, value, g, beta, state):
+    """`run` over a packed call's documents each a row of its own from its own memory (`state` `[B, D, Hv,
+    Dk, Dv]`, `DocumentRows`), its output back in the packed rows and each document's final `[B, D, Hv, Dk,
+    Dv]`: the kernels that walk no document from a memory of its own."""
+    out, final = run(*rows.laid(query, key, value, g, beta), state.reshape(-1, *state.shape[2:]))
+    return rows.unlaid(out), rows.leaving(final)
 
 
 @dataclasses.dataclass(frozen=True)
 class DocumentRows:
     """A packed call's documents each a row of its own, `[B * D, S]`, the row's tokens from a document's
     first, past its end written nothing (its decay one, its write gate zero), so its final memory is the
-    document's: each document enters its own memory (`Chunk.entered`) on any kernel, as a row of its own
-    enters its call's `state`. A call holds `D` rows a row of `S` tokens, its work `D` times a packed row's
-    where its documents are short."""
+    document's: each document enters its own memory (`Chunk.entered`) on a kernel that walks no document
+    from a memory of its own, as a row of its own enters its call's `state`. A call holds `D` rows a row of
+    `S` tokens, its work `D` times a packed row's where its documents are short: the template, the port and
+    the portable walk walk the packed rows instead, each document's sequence from its own memory
+    (`chunk_forward.prepared`, `_blocked_rule`, `xla_mainloop`'s aligned documents); the rated scan's ports
+    take these rows (row 5288)."""
 
     begins: jax.Array
     """Each row's documents' first slots `[B, D]` (`dew.batch.document_firsts`), `S` past its last."""
@@ -525,8 +541,8 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
     return operands
 
 
-def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, *, scale: float,
-                 delta: bool, dtype=None, bound: float | None = None):
+def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
+                 scale: float, delta: bool, dtype=None, bound: float | None = None):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -537,13 +553,22 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     returns it; a caller's epilogue passes its working dtype, unrounded) and the memory in `work`, the memory
     entering `state` (zero where None). A length off the chunk grid is padded with tokens that leave the
     memory as it was (zero keys and write gates, a unit decay). `starts` `[B, S]`, where given, marks packed
-    documents' first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`). `bound`, the
-    layer's write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is the
-    declaration's range facts (`scan.Scan.ranges`)."""
+    documents' first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`). A 5-D `state`
+    `[B, D, Hv, Dk, Dv]` is each of a row's `D` documents' own memory, the documents first at `firsts` `[B,
+    D]` (`S` for one the row holds none of): each document is laid from a chunk's edge (`_aligned`) and the
+    walk takes up its memory there (`_walk`), the final memory each document's `[B, D, Hv, Dk, Dv]`. `bound`,
+    the layer's write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is
+    the declaration's range facts (`scan.Scan.ranges`)."""
     from dew.algebra import SATURATION, scan
 
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
+    aligned = None
+    if state is not None and state.ndim == 5:
+        assert firsts is not None, "documents entering memories of their own name their first slots"
+        aligned = _Aligned.of(firsts[:, :state.shape[1]], length, config.chunk)
+        query, key, value, g, beta = aligned.laid(query, key, value, g, beta)
+        starts = None
     width = key.shape[-1]
     per_key = g.ndim == 4
 
@@ -573,12 +598,67 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
     varying = (query, key, value, g, beta, starts)
+    if aligned is not None:
+        # Each document's memory `[B, Hv, D, Dk, Dv]` and the document each chunk takes up, -1 for none.
+        entering = (varying_like(jnp.moveaxis(state.astype(work), 1, 2), *varying),
+                    jnp.broadcast_to(aligned.loads[:, None], (rows, heads, aligned.loads.shape[-1])))
+        outputs, final = _walk(forms, width, recomputed_memory())(operands, entering)
+        out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, columns), 1, 2)
+        return aligned.unlaid(out).astype(dtype), jnp.moveaxis(final, 2, 1)
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
                             else state.astype(work), *varying)
 
     outputs, final = _walk(forms, width, recomputed_memory())(operands, entering)
     out = outputs.reshape(*outputs.shape[:2], -1, columns)
     return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
+
+
+@dataclasses.dataclass(frozen=True)
+class _Aligned:
+    """A packed call's documents laid from chunks' edges (`xla_mainloop`'s documents entering memories of
+    their own): each document's tokens moved past the tokens before it to the next multiple of the chunk,
+    the slots between tokens that leave the memory as it was (zero keys, values and write gates, a unit
+    decay), so the walk takes up each document's memory at its first chunk's edge. At most `chunk - 1` slots
+    a document, against a row of the call's length a document laid apart (`DocumentRows`)."""
+
+    slots: jax.Array
+    """Each token's slot on the aligned grid `[B, S]`."""
+    loads: jax.Array
+    """The document each aligned chunk takes up `[B, chunks]`, -1 for none."""
+    length: int
+    """The aligned grid's slots, the chunks' a row."""
+
+    @classmethod
+    def of(cls, firsts, length: int, chunk: int) -> "_Aligned":
+        """`firsts` `[B, D]`' documents (`S` past a row's last) of a call of `length` tokens on `chunk`."""
+        firsts = jnp.asarray(firsts, jnp.int32)
+        documents = firsts.shape[1]
+        held = firsts < length
+        ends = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
+        sizes = jnp.where(held, jnp.minimum(ends, length) - firsts, 0)
+        # Each document's aligned first slot: the chunks every document before it fills, whole.
+        chunks = -(-sizes // chunk)
+        opened = (jnp.cumsum(chunks, axis=1) - chunks) * chunk
+        total = -(-length // chunk) + documents
+        slots = jnp.arange(length, dtype=jnp.int32)[None, :]
+        document = jnp.clip(jnp.sum(slots[:, :, None] >= firsts[:, None, :], axis=-1) - 1, 0, documents - 1)
+        aligned = (jnp.take_along_axis(opened, document, axis=1)
+                   + slots - jnp.take_along_axis(firsts, document, axis=1))
+        loads = jnp.full((firsts.shape[0], total), -1, jnp.int32).at[
+            jnp.arange(firsts.shape[0])[:, None], jnp.where(held, opened // chunk, total)].set(
+            jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape), mode="drop")
+        return cls(aligned.astype(jnp.int32), loads, total * chunk)
+
+    def laid(self, *operands):
+        """The operands `[B, S, ...]` on the aligned grid `[B, length, ...]`, zero between documents."""
+        def moved(x):
+            out = jnp.zeros((x.shape[0], self.length, *x.shape[2:]), x.dtype)
+            return jax.vmap(lambda row, at, values: row.at[at].set(values))(out, self.slots, x)
+        return tuple(moved(x) for x in operands)
+
+    def unlaid(self, out):
+        """`out` `[B, length, ...]` back at the call's slots `[B, S, ...]`."""
+        return jax.vmap(lambda row, at: row[at])(out, self.slots)
 
 
 def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *, scale: float | None = None,
@@ -666,17 +746,36 @@ def _walk(forms, width: int, recomputed: bool):
     the block's remat rung recomputes the delta rule's memory (`recomputed`, `recomputed_memory`, read as the
     call is traced: a scan differentiates its body's custom rules after the block's trace has left it), where
     the adjoint forms it again, as the port and the template drop theirs."""
+    def taken_up(h):
+        """A walk's memory entering (`h`), and the document each chunk takes up (-1 for none, `[chunks]`)
+        where it walks documents entering memories of their own (`h` `(memories [D, Dk, Dv], loads)`)."""
+        if isinstance(h, tuple):
+            return h
+        return h, None
+
     def entered(operands, h):
         prepared = jax.vmap(forms.prepare)(operands)
-
-        def one(carried, chunk):
-            return forms.step(carried, chunk), carried
-
+        memories, loads = taken_up(h)
         # The walk's decay in the forms' own carry dtype (`Derived.init`'s, the state's float32 at least).
         empty = forms.init({})[0]
         decayed = varying_like(jnp.zeros((width,), empty.dtype), *jax.tree.leaves(operands))
-        carried, entering = jax.lax.scan(one, (decayed, h), prepared)
-        return prepared, entering, carried[1]
+        if loads is None:
+            def one(carried, chunk):
+                return forms.step(carried, chunk), carried
+
+            carried, entering = jax.lax.scan(one, (decayed, memories), prepared)
+            return prepared, entering, carried[1]
+
+        def loading(carried, chunk):
+            chunk, load = chunk
+            # A chunk that takes a document up enters its memory, the walk's decay from nothing.
+            taken = (jnp.where(load >= 0, jnp.zeros_like(carried[0]), carried[0]),
+                     jnp.where(load >= 0, memories[jnp.maximum(load, 0)], carried[1]))
+            return forms.step(taken, chunk), (taken, carried[1])
+
+        carried, (entering, left) = jax.lax.scan(loading, (decayed, jnp.zeros_like(memories[0])),
+                                                 (prepared, loads))
+        return prepared, entering, _finals(memories, loads, left, carried[1])
 
     def walking_one(operands, h):
         prepared, entering, last = entered(operands, h)
@@ -684,23 +783,56 @@ def _walk(forms, width: int, recomputed: bool):
 
     def replayed_one(operands, h):
         # The walk token by token (`Derived.replay`), the derivative's arithmetic at every order.
-        def one(h, chunk):
-            outputs, h = forms.replay(chunk, h)
-            return h, outputs
+        memories, loads = taken_up(h)
+        if loads is None:
+            def one(h, chunk):
+                outputs, h = forms.replay(chunk, h)
+                return h, outputs
 
-        h, outputs = jax.lax.scan(one, h, operands)
-        return outputs, h
+            h, outputs = jax.lax.scan(one, memories, operands)
+            return outputs, h
+
+        def loading(h, chunk):
+            chunk, load = chunk
+            taken = jnp.where(load >= 0, memories[jnp.maximum(load, 0)], h)
+            outputs, after = forms.replay(chunk, taken)
+            return after, (outputs, h)
+
+        h, (outputs, left) = jax.lax.scan(loading, jnp.zeros_like(memories[0]), (operands, loads))
+        return outputs, _finals(memories, loads, left, h)
 
     def adjoint_one(operands, h, entering, d_outputs, d_final):
         if entering is None:
             entering = entered(operands, h)[1][1]
+        memories, loads = taken_up(h)
+        if loads is None:
+            def one(d_h, chunk):
+                chunk, h, d_out = chunk
+                return forms.backward(chunk, (None, h), d_h, d_out)
 
-        def one(d_h, chunk):
-            chunk, h, d_out = chunk
-            return forms.backward(chunk, (None, h), d_h, d_out)
+            d_h, d_operands = jax.lax.scan(one, d_final, (operands, entering, d_outputs), reverse=True)
+            return d_operands, d_h
 
-        d_h, d_operands = jax.lax.scan(one, d_final, (operands, entering, d_outputs), reverse=True)
-        return d_operands, d_h
+        # Back from the last document's final: at a chunk taking a document up, the cotangent of the memory
+        # it enters is that document's memory's, and the walk before it carries the previous document's
+        # final's; a document the row holds none of passes its memory through as its final.
+        last = jnp.max(loads)
+
+        def one(carried, chunk):
+            d_h, d_memories = carried
+            chunk, h, d_out, load = chunk
+            d_entering, d_chunk = forms.backward(chunk, (None, h), d_h, d_out)
+            taking = load >= 0
+            d_memories = d_memories.at[jnp.maximum(load, 0)].add(jnp.where(taking, d_entering, 0))
+            before = jnp.where(load > 0, d_final[jnp.maximum(load - 1, 0)], 0)
+            return (jnp.where(taking, before, d_entering), d_memories), d_chunk
+
+        held = jnp.arange(memories.shape[0]) <= last
+        start = (d_final[jnp.maximum(last, 0)], jnp.where(held[:, None, None], 0, d_final))
+        (_, d_memories), d_operands = jax.lax.scan(one, start, (operands, entering, d_outputs, loads),
+                                                   reverse=True)
+        # The loads' integers take no cotangent (never `live`), held in their place.
+        return d_operands, (d_memories, loads)
 
     def each(function):
         # Over every row and head at once: the derivative's rule outside the batch, which a second order
@@ -717,6 +849,17 @@ def _walk(forms, width: int, recomputed: bool):
     return contracted("test_the_chunked_delta_rule_holds_every_order")(
         generation.linear_tangent(each(walking_one), adjoint, each(replayed_one), kind=Protected(),
                                   live_cotangents=True))
+
+
+def _finals(memories, loads, left, last):
+    """Each document's final memory `[D, Dk, Dv]` of a walk taking documents up (`_walk`): the memory the
+    walk leaves before the next document's first chunk (`left`, each chunk's entering memory as the walk
+    carried it), the last document's the walk's last, and one the row holds none of its own memory."""
+    documents = memories.shape[0]
+    previous = jnp.where(loads > 0, loads - 1, documents)
+    finals = memories.at[previous].set(left, mode="drop")
+    present = jnp.max(loads)
+    return finals.at[jnp.where(present >= 0, present, documents)].set(last, mode="drop")
 
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
@@ -869,17 +1012,20 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     B, _, Hv, Dv = value.shape
     state = (jnp.zeros((B, Hv, key.shape[-1], Dv), jnp.float32) if state is None
              else state.astype(jnp.float32))
-    documents = None if starts is None else query.shape[1] if max_segments is None else max_segments
+    segments = None if starts is None else query.shape[1] if max_segments is None else max_segments
     starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
-    if documents is not None:
+    four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
+    if state.ndim == 5:
+        # Each document's own memory `[B, D, Hv, Dk, Dv]` (`chunk`'s), placed as a row's.
+        memory = jax.sharding.PartitionSpec(memory[0], None, *memory[1:])
+    elif segments is not None:
         # The kernels start each row from its memory; a first token that begins a document drops it.
         state = jnp.where(starts[:, 0, None, None, None], 0.0, state)
-    four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
     if firsts is None:
-        return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale, wide=wide),
+        return manual_map(functools.partial(_blocked_rule, segments=segments, scale=scale, wide=wide),
                           (four, four, four, decays, three, memory, resets),
                           (four, memory))(query, key, value, g, beta, state, starts)
-    return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale, wide=wide),
+    return manual_map(functools.partial(_blocked_rule, segments=segments, scale=scale, wide=wide),
                       (four, four, four, decays, three, memory, resets, resets),
                       (four, memory))(query, key, value, g, beta, state, starts, firsts)
 
@@ -907,6 +1053,9 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     from .templates.recurrence import template
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
+    if state is not None and state.ndim == 5:
+        # Each document's own memory `[B, D, H, Dk, Dv]` (`chunk_forward.prepared`), placed as a row's.
+        memory = jax.sharding.PartitionSpec(memory[0], None, *memory[1:])
     optional = [(state, memory), (starts, resets), (firsts, resets),
                 (skip, jax.sharding.PartitionSpec(four[2]))]
     operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None))
@@ -946,7 +1095,7 @@ def recomputing(names: tuple[str, ...]):
         RECOMPUTED.reset(token)
 
 
-def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, documents: int | None,
+def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, segments: int | None,
                   scale: float | None = None, wide: bool = False):
     """The port's rule on one shard, shaped to its kernels' blocks: values
     wider than the port's widest split into more value heads of their key
@@ -956,36 +1105,53 @@ def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, doc
     widths every block of the kernels' configs divides, a decay per key
     dimension with them. None of them changes a real output or gradient:
     every padded product is an exact zero. The outputs are cut back. Where
-    `documents` bounds a row's packed documents, each begun at `starts`, each
-    is a sequence of its own (fla's varlen `cu_seqlens`). The decay's shape picks
+    `segments` bounds a row's packed documents, each begun at `starts`, each
+    is a sequence of its own (fla's varlen `cu_seqlens`); where `state` is
+    each document's own memory `[B, D, Hv, Dk, Dv]` (`chunk`'s, its first
+    slots `firsts`), each of a row's `D` documents' sequence takes and gives
+    back its own (`chunked_launch.Sequences`), a document past a row's last
+    giving back what it entered. The decay's shape picks
     the port: per head fla's gated delta rule, per key dimension its Kimi
     delta attention. It keeps its memory for the backward
     but where the block's remat rung recomputes it (`RECOMPUTED`)."""
     B, S, _, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5 if scale is None else scale
+    documents = state.shape[1] if state.ndim == 5 else None
+    entering = state.reshape(-1, *state.shape[-3:])
+    memories = entering.shape[0]
+    if documents is not None:
+        # A document past its row's last enters no sequence: its memory's slots are none of the kernels'.
+        given = (firsts[:, :documents] < S).reshape(-1, 1, 1, 1)
+        entering, state = jnp.where(given, entering, 0.0), entering
     split = -(-Dv // fla_gdn.WIDEST)
     width = -(-Dv // split)
     if split > 1:
         value = _padded(value, 3, split * width).reshape(B, S, Hv * split, width)
         g, beta = (jnp.repeat(x, split, axis=2) for x in (g, beta))
-        state = jnp.moveaxis(_padded(state, 3, split * width).reshape(B, Hv, Dk, split, width), 3, 2)
-        state = state.reshape(B, Hv * split, Dk, width)
+        entering = jnp.moveaxis(_padded(entering, 3, split * width).reshape(memories, Hv, Dk, split, width),
+                                3, 2).reshape(memories, Hv * split, Dk, width)
     blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
     query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
     per_key = g.ndim == 4
     g = _padded(g, 3, blocks[0]) if per_key else g
     value = _padded(value, 3, blocks[1])
-    state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
-    # A row's padding after its documents runs as one more sequence of its own.
-    spans = None if documents is None else cu_seqlens(starts, B * (documents + 1), firsts)
+    entering = _padded(_padded(entering, 2, blocks[0]), 3, blocks[1])
+    if documents is not None:
+        spans = cu_seqlens(starts, B * documents, firsts[:, :documents])
+    else:
+        # A row's padding after its documents runs as one more sequence of its own.
+        spans = None if segments is None else cu_seqlens(starts, B * (segments + 1), firsts)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
+    out, final = port(query, key, value, g, beta, entering, spans, scale, CHUNK_SIZE,
                       not generation.triton_runs(), not recomputed_memory(), wide)
     out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width]
-    final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
-    return out, final[..., :Dv]
+    final = jnp.moveaxis(final.reshape(memories, Hv, split, Dk, width), 2, 3).reshape(
+        memories, Hv, Dk, split * width)[..., :Dv]
+    if documents is None:
+        return out, final
+    return out, jnp.where(given, final, state).reshape(B, documents, Hv, Dk, Dv)
 
 
 def _padded(x, axis: int, size: int):
@@ -1030,7 +1196,8 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 
 
 def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, state, starts, firsts,
-                chunk_size: int, work, dtype, *, max_segments: int | None = None):
+                chunk_size: int, work, dtype, *, max_segments: int | None = None,
+                rows: "DocumentRows | None" = None):
     """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
     `C` the queries, `dt` the write gate and `A` the rate) on the kernel the scan's selector gives each
     product (`SCAN`, `scan_kernel`): the recurrence template; the port of mamba_ssm's kernels, which adds
@@ -1042,7 +1209,9 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     no real output or gradient, the outputs cut back: Nemotron-H 4B's 80-wide heads took the portable math,
     6.89 ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
     rounded to no narrower than `dtype`, the caller's (unrounded where it asks it wide, Mamba-2's mixer for
-    the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`."""
+    the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`; documents entering memories of
+    their own (`rows`, `state` each one's `[B, D, Hv, Dk, Dv]`) on the template's and the portable math's
+    packed rows, on the ports each its own row (`_documents_apart`)."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
     # Under the fast forms the skip in the template's own output and walk (`mainloop._output`, `_reverse`),
@@ -1064,6 +1233,12 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
                            wide=not narrow)
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
+        if rows is not None and kernel not in ('mosaic_gpu', 'xla'):
+            return _documents_apart(rows, lambda *laid: launched(kernel, *laid[:5], rate, skip, laid[5], None,
+                                                                 None), query, key, value, g, beta, state)
+        return launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts)
+
+    def launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
         if kernel == 'mosaic_gpu':
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        skip=skip if fused else None, max_segments=max_segments, scale=1.0,
@@ -1089,8 +1264,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
                 out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
                                       starts, scan_case(x, B, chunk_size, padded=True).tpu, work)
             return out[..., :head_dim], jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
-        out, final = xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, scale=1.0,
-                                  delta=False, dtype=work)
+        out, final = xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, firsts,
+                                  scale=1.0, delta=False, dtype=work)
         return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
 
     return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts)

@@ -16,7 +16,17 @@ import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, runs
 from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import ROUTES, chunk_on, cotangents, formed, on_route, routed, token_by_token
+from test_recurrence_chunk import (
+    ROUTES,
+    chunk_on,
+    cotangents,
+    entered_draw,
+    entering_documents,
+    formed,
+    on_route,
+    routed,
+    token_by_token,
+)
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -33,7 +43,7 @@ from test_recurrence_mosaic import (
 
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
+from dew.nn.kernels.recurrence_chunk import Chunk, DocumentRows, recomputing
 from dew.nn.kernels.templates import bundles, mosaic_sm90, mosaic_sm100
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
@@ -400,6 +410,57 @@ def test_a_decay_a_key_dimensions_first_token_takes_no_gradient_where_its_sequen
     later[:, 0] = False
     dg = np.asarray(grads[1].log_decay)
     assert later.any() and np.all(dg[later] == 0.0)
+
+
+ENTERING = {'the gated delta rule': recurrence.Hooks(decay='scalar', scale=16 ** -0.5, write_bound=1.0),
+            "Kimi delta attention's": recurrence.Hooks(decay='vector', scale=16 ** -0.5, write_bound=1.0),
+            "Mamba-2's SSD": recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)}
+"""The forms whose documents enter memories of their own on the template: a decay a head and a key
+dimension under the delta rule, and the rated scan's."""
+
+
+@pytest.mark.parametrize('form', ENTERING)
+def test_documents_entering_memories_of_their_own_walk_the_packed_rows_as_each_its_own_row(form):
+    """Packed bf16 documents each entering a memory of its own (`Chunk.entered`, a request's shared prefix's
+    final memory for each of its questions) on the template: walked on the packed rows, each document's
+    sequence from its own memory (`chunk_forward.prepared`), the output, each document's final memory and the
+    gradient of each token's operands and each memory, bit for bit what each document laid out as a row of
+    its own gives (`DocumentRows`), whose launches did a row's work for each of a row's documents (row
+    5288)."""
+    hooks = ENTERING[form]
+    operands, (d_out, d_final) = entered_draw(hooks, 3)
+    # The delta rule's write gate in the operands' dtype, as its layer holds it; the SSD's `dt` its own.
+    rounded = ('query', 'key', 'value') + (('beta',) if hooks.delta else ())
+    given = entering_documents(dataclasses.replace(operands, **{
+        name: getattr(operands, name).astype(jnp.bfloat16) for name in rounded}))
+    cotangent = (d_out.astype(jnp.bfloat16), d_final)
+    # Differentiated in each token's and each memory's operands: a head's parameter's gradient (the SSD's
+    # rate and skip) sums every token's term, in the order of the layout it is summed over.
+    names = [name for name in ('query', 'key', 'value', 'log_decay', 'beta', 'state')
+             if getattr(given, name) is not None]
+
+    def walked(fields: dict):
+        return chunk_on('mosaic_gpu', hooks, dataclasses.replace(given, **fields))
+
+    def apart(fields: dict):
+        call = dataclasses.replace(given, **fields)
+        rows = DocumentRows.of(call.starts, call.entered, None)
+        # A rated decay's log decay its rate's and `dt`'s (`recurrence.log_gates`): zero past a document.
+        decay = jnp.zeros(call.beta.shape) if call.log_decay is None else call.log_decay
+        query, key, value, decay, beta = rows.laid(call.query, call.key, call.value, decay, call.beta)
+        own = dataclasses.replace(call, query=query, key=key, value=value, beta=beta,
+                                  log_decay=None if call.log_decay is None else decay,
+                                  state=rows.entering(call.state), starts=None, entered=None)
+        out, final = chunk_on('mosaic_gpu', hooks, own)
+        return rows.unlaid(out), rows.leaving(final)
+
+    fields = {name: getattr(given, name) for name in names}
+    # Under the run's fast forms, whose numbers the template's fast backward trains a 16-bit SSD by.
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
+        found, expected = (jax.device_get(with_gradients(rule)(fields, cotangent))
+                           for rule in (walked, apart))
+    for leaf, other in zip(jax.tree.leaves(found), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_array_equal(leaf, other)
 
 
 @COMPILES_ON_CPU
