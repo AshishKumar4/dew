@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
+import jax
 import numpy as np
 
 from dew._records import JSON, integer, json_value
@@ -781,6 +782,7 @@ def compile(
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
+    tokens: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
@@ -792,7 +794,9 @@ def compile(
     holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
     it reads by (`dew.data.plan.PLAN_VERSIONS`): this Dew's, or the one a resumed run saved under, which
     reads its order as it did (`dew.config.RunConfig.data_plan_version`), refused before anything is
-    provisioned where this Dew reads by none of it (`dew.data.plan.read_by`)."""
+    provisioned where this Dew reads by none of it (`dew.data.plan.read_by`). `steps` or `tokens` is the
+    run's length where it is no bound of the read's own, which automatic loading sizes its workers for
+    (`_run_batches`)."""
     read_by(plan_version)
     # The objective's data and each chain's calls as the plan's version reads them (`ObjectiveData.at`,
     # `Pipeline.at`).
@@ -820,8 +824,7 @@ def compile(
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs, version=plan_version)
-    # Automatic loading sizes its workers for the run's batches: its `steps`, else an `examples` bound's.
-    batches = steps if steps is not None or examples is None else -(-examples // staged.build.batch)
+    batches = _run_batches(staged, steps=steps, examples=examples, epochs=epochs, tokens=tokens)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
@@ -1075,6 +1078,48 @@ def _output_batch(pipeline: Pipeline) -> int:
     return next(stage.size for stage in pipeline.stages if isinstance(stage, BatchStage))
 
 
+def _shares() -> int:
+    """The shares a run's processes make each batch's rows in (`DataPartition`), as automatic loading
+    sizes each process's workers for its own (`Loading.resolved`'s `shares`): one a process, the most a
+    mesh that splits its batch over every process cuts it into, where the mesh that reads it is not built
+    yet; processes that read one share alike (`DataPartition.readers`) each make that share whole, so
+    their Python a batch is counted short and they size fewer workers, never more than they pay for."""
+    return jax.process_count()
+
+
+def _validation_build(build: _Build, validation: Pipeline, read: Read) -> _Build:
+    """The build a validation pass of `validation` reads by: training's loading as the chain states it,
+    not as training resolved it, sized for its own pass (`_Build.tuned` over `pass_batches`): a reader opens
+    each pass afresh and starts its workers again, so a pass whose Python pays for no start reads in the
+    process, where training's count started up to a worker a batch of every pass (train 746's review)."""
+    held = dataclasses.replace(build, lowering=_analyzed(validation, read, validation=True), training=False,
+                               batch=_output_batch(validation), named=_own_key(validation))
+    passed = held.pass_batches(validation) if held.loading.workers == "auto" else None
+    return held.tuned(validation, batches=passed, shares=_shares())
+
+
+def _run_batches(staged: _Staged, *, steps: int | None, examples: int | None, epochs: int | None,
+                 tokens: int | None) -> int | None:
+    """The batches a run reads, which automatic loading sizes its workers for (`Loading.resolved`): its
+    `steps`; an `examples` bound's batches; `epochs` passes over its records, or over the source examples
+    a pass holds where its read counts no records (`_Staged.passes`); a `tokens` budget over the most a
+    batch holds (its stated token batch, else its rows times the tokens a row holds, `_row_tokens`), the
+    fewest batches it may take; None where nothing states its length, which reads in the process."""
+    batch = staged.build.batch
+    if steps is not None:
+        return steps
+    if examples is not None:
+        return -(-examples // batch)
+    if epochs is not None:
+        records = staged.passes if staged.passes is not None else _epoch_records(staged.train, staged.build)
+        return None if records is None else epochs * -(-records // batch)
+    if tokens is not None:
+        row = _row_tokens(staged.train)
+        held = staged.batch_tokens or (None if row is None else batch * row)
+        return None if not held else -(-tokens // held)
+    return None
+
+
 def _compiled(
     staged: _Staged,
     packed: tuple[Coordinated, ...],
@@ -1121,7 +1166,7 @@ def _compiled(
         stores=tuple(store for source in sources for store in _token_stores(source)),
         version=build.version,
     )
-    tuned = build.tuned(train, batches=batches)
+    tuned = build.tuned(train, batches=batches, shares=_shares())
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
     build = tuned.pooled(train)
     train_host, device = _batch_steps(train)
@@ -1142,11 +1187,7 @@ def _compiled(
         else functools.partial(
             _validation_reader,
             pipeline=validation,
-            build=dataclasses.replace(
-                tuned, lowering=_analyzed(validation, read, validation=True), training=False,
-                batch=_output_batch(validation),
-                named=_own_key(validation),
-            ).tuned(validation),
+            build=_validation_build(staged.build, validation, read),
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
     )
@@ -1873,6 +1914,7 @@ def fitted[Entry](
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
+    tokens: int | None = None,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -1929,7 +1971,7 @@ def fitted[Entry](
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
                          epochs=epochs if examples is None else None, plan_version=plan_version,
-                         steps=steps)
+                         steps=steps, tokens=tokens)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

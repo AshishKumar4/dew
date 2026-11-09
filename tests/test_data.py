@@ -200,6 +200,14 @@ def _by_hand(source, *, seed, batch, count):
             for start in range(0, count * batch, batch)]
 
 
+class _Slowed(pygrain.MapTransform):
+    """A record step of 10 ms of Python a record."""
+
+    def map(self, record):
+        time.sleep(0.01)
+        return record
+
+
 @dataclasses.dataclass(frozen=True)
 class _Jittered:
     """A record step that runs Python on each record: its index scaled by a draw from its own generator."""
@@ -273,6 +281,38 @@ class _Spread:
 
     def __call__(self, record):
         return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
+
+
+def test_automatic_workers_size_for_an_epochs_run_a_validation_pass_and_a_chain_that_sets_its_threads():
+    """Automatic workers are sized for the batches a run reads however it states its length: a run of
+    epochs over indexed records reads in workers as the same run in steps does, where it read in the
+    process (the train review of row 4862's head); a validation pass is sized for its own batches, which
+    each pass starts its workers for again, so a pass of two batches reads in the process beside a training
+    read in workers, where it took training's count; a chain that sets its threads alone keeps the
+    automatic workers a chain naming no loading trains with; and each of a run's shares weighs its own
+    share of a batch's Python (`Loading.resolved`'s `shares`)."""
+    auto = Loading(workers="auto", host=TWO_CPUS)
+    rows = Pipeline(Memory(_Indexed(30))).shuffle(5).random_map(_Jittered())
+
+    def where(loader, branch) -> set[int]:
+        reader = getattr(loader, branch)(DataPartition())
+        try:
+            return {int(pid) for batch in listed(reader, 2) for pid in batch["pid"]}
+        finally:
+            reader.close()
+
+    traced = rows.map(_Where()).batch(4)
+    epochs = compile(traced, seed=5, epochs=10**5, loading=auto)
+    assert len(where(epochs, "train") - {os.getpid()}) == 2
+    held = Pipeline(Memory(_Indexed(8))).map(_Where()).batch(4)
+    validated = compile(traced.repeat(), validation=held, seed=5, steps=10**6, loading=auto)
+    assert where(validated, "val") == {os.getpid()}
+    assert len(where(validated, "train") - {os.getpid()}) == 2
+    assert traced.threads(2)._chain()._loading.workers == "auto"
+    sampled = pygrain.MapDataset.source([{"x": np.zeros(4, np.float32)}] * 16).map(_Slowed())
+    for shares, workers in ((1, 2), (10**4, 0)):
+        iterated = sampled.to_iter_dataset(pygrain.ReadOptions(num_threads=0, prefetch_buffer_size=0))
+        assert auto.resolved(iterated, reads=1, batches=10**4, shares=shares).workers == workers
 
 
 def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers():

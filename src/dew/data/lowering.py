@@ -2041,14 +2041,13 @@ class _Build:
         stream, after = self.batched(pipeline, partition, offset, fill=fill)
         return iter(self.after_batch(stream, after, pipeline, partition))
 
-    def tuned(self, pipeline: Pipeline, *, batches: int | None = None) -> _Build:
+    def tuned(self, pipeline: Pipeline, *, batches: int | None = None, shares: int = 1) -> _Build:
         """This build with automatic loading resolved on the whole order from the host's CPUs and
-        memory and, over a run of `batches`, the Python its batches take (`Loading.resolved`), its workers
-        the same rows in any count (`in_order`), and at most one worker per batch of a pass that ends where
-        its rows are indexed. A validation pass is read with training's workers, so a pass of
-        five batches had one per core, 26 on an H100 host. Each worker past the last batch reads
-        nothing, yet starts a process that imports the program and keeps about six pipes open
-        until the reader is collected."""
+        memory and, over a run of `batches`, the Python its batches take (`Loading.resolved`), each of the
+        run's `shares` making its share of every batch's rows, its workers the same rows in any count
+        (`in_order`), and at most one worker per batch of a pass that ends where its rows are indexed
+        (`pass_batches`). Each worker past the last batch reads nothing, yet starts a process that imports
+        the program and keeps about six pipes open until the reader is collected."""
         loading = self.loading
         # Read in turn, no thread reading ahead, so a batch's time is the work that makes it.
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0, threads=0,
@@ -2063,13 +2062,22 @@ class _Build:
             # group (`_InputOrder`, `_StreamOrder`); any other order by the record (`batch_order`).
             grouped = self.global_order or self.elastic
             with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
-                loading = loading.resolved(sampled, reads=1 if grouped else size, batches=batches)
-        if loading.worker_count and (not self.training or not self.lowering.endless):
-            with _closing(bare.records(pipeline, DataPartition())) as rows:
-                if isinstance(rows, pygrain.MapDataset):
-                    batches = -(-len(rows) // size)
-                    loading = dataclasses.replace(loading, workers=min(loading.worker_count, batches))
+                loading = loading.resolved(sampled, reads=1 if grouped else size, batches=batches,
+                                           shares=shares)
+        if loading.worker_count and (passed := self.pass_batches(pipeline)) is not None:
+            loading = dataclasses.replace(loading, workers=min(loading.worker_count, passed))
         return dataclasses.replace(self, loading=loading)
+
+    def pass_batches(self, pipeline: Pipeline) -> int | None:
+        """The batches one pass over `pipeline` reads, where it ends (a pass that is no endless training
+        order's) and its rows are indexed; None otherwise."""
+        if self.training and self.lowering.endless:
+            return None
+        size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
+        bare = dataclasses.replace(self, loading=dataclasses.replace(self.loading, workers=0, threads=0,
+                                                                     read_buffer=0))
+        with _closing(bare.records(pipeline, DataPartition())) as rows:
+            return -(-len(rows) // size) if isinstance(rows, pygrain.MapDataset) else None
 
     def batched(
         self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True

@@ -454,7 +454,8 @@ class Loading:
     """The host automatic workers are sized for (`resolved`): this process's (`Host.current`) where None,
     or another's, its CPUs, memory and a worker's start as it states them."""
 
-    def resolved(self, records: pygrain.IterDataset, *, reads: int, batches: int | None = None) -> Loading:
+    def resolved(self, records: pygrain.IterDataset, *, reads: int, batches: int | None = None,
+                 shares: int = 1) -> Loading:
         """These settings with automatic workers and read buffer sized for `host` (this process's
         by default) from its CPUs and its memory together. The sizing is static: it reads the batches'
         bytes, the CPUs and the memory once, as a read opens, and measures no throughput, so it never
@@ -475,7 +476,9 @@ class Loading:
         than that half holds. `records` are the batches the read makes without workers,
         `SAMPLED_BATCHES` of which are measured; `reads` is how many reads make one: one where the
         order is read by batch, its rows where it streams records. A read that makes no batch reads
-        without workers.
+        without workers. `records` are whole global batches, and a run of `shares` makes each batch's rows
+        a share in each of its processes (`DataPartition`): each process's Python and bytes a batch are
+        that share of what the sample measured.
 
         Workers take the read's Python off the training process, whose step's dispatch waits on the
         interpreter it holds (a decision run's encoding: 20.9 against 10.5 ms a step in four workers on
@@ -501,10 +504,11 @@ class Loading:
             seconds.append(time.perf_counter() - began)
         if not sampled:
             return dataclasses.replace(self, workers=0)
-        # Their mean, which a step making several batches at once is paid in, as the run pays it.
-        python = statistics.fmean(seconds[1:] or seconds)
+        # Their mean, which a step making several batches at once is paid in, as the run pays it, each
+        # process's its share of it.
+        python = statistics.fmean(seconds[1:] or seconds) / shares
         host = Host.current() if self.host is None else self.host
-        batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
+        batch = max(1, sum(batch_bytes(value) for value in sampled) // (len(sampled) * shares))
         read = max(1, batch // reads)
         budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
         cpus = host.cpus if host.cpus > 1 else 0

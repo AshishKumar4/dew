@@ -1808,14 +1808,15 @@ class RunConfig:
         stages, `data_seed` and `data_plan_version`, the training read bounded to `trainer.examples` where
         the run counts them, or to `trainer.epochs` passes over its source examples where its read has no
         record count, so its length is read off the loader this returns; its loading workers sized for
-        `trainer.steps` (`dew.data.Loading.resolved`)."""
+        the run's length, its `trainer.steps`, `epochs` or `tokens` (`dew.data.Loading.resolved`)."""
         # At the version `resumed` resolves (itself where `prepare` or `readied` resolved it; a run built
         # alone, `build_run`, resolves it here), which it always states.
         planned = self.resumed(("data_plan_version",)).data_plan_version
         assert planned is not None
         trainer = self.trainer
         return fitted(dataset, validation, objective=objective, seed=self.data_seed, plan_version=planned,
-                      examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps)
+                      examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps,
+                      tokens=trainer.tokens)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
