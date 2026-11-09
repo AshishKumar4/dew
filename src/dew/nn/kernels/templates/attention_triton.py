@@ -81,17 +81,20 @@ STAGES = 2
 """A launch's pipeline stages: one tile loading beside the one consumed (`resources.Launch.floor`)."""
 
 ROWS = 32
-"""The fewest rows, and keys, a tile takes: two mma.sync instructions' sixteen, the extents the algebra's
-laws hold at (tests/test_algebra_laws.py's `ROWS` and `KEYS`)."""
+"""A warp's rows of the block: two mma.sync instructions' sixteen."""
 
 BLOCK = WARPS * ROWS
-"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): its fewest a warp
+"""The most rows or keys a tile takes, the block a call pads to (`padded_call`): a warp's rows a warp
 (FlashAttention 2's 128 a program)."""
 
+LEAST = 16
+"""The fewest rows, and keys, a tile takes: one mma.sync instruction's sixteen, for a launch no tile of a
+warp's rows holds (a scaled fp32 training walk at width 256, its small weights fp32 and their products' sums
+beside its compensated sums: 272 registers a thread at 32 by 32, 136 at 16 by 32)."""
 
-EXTENTS = tuple(ROWS << power for power in range((BLOCK // ROWS).bit_length()))[::-1]
+EXTENTS = tuple(LEAST << power for power in range((BLOCK // LEAST).bit_length()))[::-1]
 """The extents a tile takes along its queries or its keys, largest first: powers of two from `BLOCK` down to
-`ROWS`."""
+`LEAST`, the extents the algebra's laws hold at (tests/test_algebra_laws.py's `ROWS` and `KEYS`)."""
 
 WARPGROUP_ROWS = WARPS * 16
 """The rows a warpgroup's product takes at least (PTX ISA: wgmma's and tcgen05's M of 64, four warps of 16
@@ -539,7 +542,7 @@ def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundAr
                                        held: int, walked: int) -> T | None:
     """A launch's tile from the facts (design §7, as the Mosaic mainloop's `attention_mosaic._derived`), no
     space ranked: the tile a program holds whole (a forward's queries, a backward's keys, the dK/dV launch's
-    accumulated rows) `BLOCK`, a warpgroup's four warps of `ROWS` each, FlashAttention 2's 128 a program, and
+    accumulated rows) `BLOCK`, four warps of `ROWS` each, FlashAttention 2's 128 a program, and
     the tile it walks the largest of `EXTENTS` whose program holds (`legal`: the block's shared memory
     and a thread's registers), stepping down the held tile only where no walked one does; each dividing the
     call's padded extent it lies along (`held`, `walked`; a longer tile holds padding alone). `tiles(held,

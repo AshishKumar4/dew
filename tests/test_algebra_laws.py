@@ -29,7 +29,7 @@ from dew.nn.kernels.templates import (
     bundles,
 )
 
-ROWS, KEYS, WIDTHS = (32, 64, 128), (32, 64, 128, 192, 256), (16, 32, 64, 128, 256)
+ROWS, KEYS, WIDTHS = (16, 32, 64, 128), (16, 32, 64, 128, 192, 256), (16, 32, 64, 128, 256)
 """A kernel tile's extents: its queries, its keys (the walked axis) and its head widths, each mainloop's
 (`test_every_mainloop_s_tiles_lie_in_the_kernel_extents`)."""
 
