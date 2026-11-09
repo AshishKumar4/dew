@@ -541,22 +541,6 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
     return finish(spec, finished_merged(spec, state, axis=1), initial=True, normalized=True)[0]
 
 
-def finished_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
-    """Two finished states over disjoint keys (`slice_state`'s, or merges of them) as one merge of them,
-    `first`'s keys before `second`'s: `finished_merged`'s convex combination of two, elementwise, as a
-    program's registers hold them (the in-launch merge's, `attention_mosaic_forward._Merge`)."""
-    m = jnp.maximum(first.m, second.m)
-    a, b = carried(spec, first.m, m) * first.total, carried(spec, second.m, m) * second.total
-    # Each weight over the larger, so their sum is at most two whatever the masses (an initial state's may
-    # be any finite one).
-    largest = jnp.maximum(a, b)
-    safe = jnp.where(largest > 0, largest, 1.0)
-    a, b = a / safe, b / safe
-    over = 1.0 / jnp.where(a + b > 0, a + b, 1.0)
-    out = expand(a * over, first.acc) * first.acc + expand(b * over, second.acc) * second.acc
-    return Partial(out, m, largest * (a + b))
-
-
 def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
     """Finished states over disjoint keys (`slice_state`'s, their outputs normalized, or merges of them)
     stacked on `axis` as one merge of them: their outputs' convex combination, each weighed by its mass at

@@ -574,7 +574,7 @@ def test_merging_slices_with_a_resumed_maximum_past_fp32s_largest_in_raw_units_k
 @INTERPRETS
 def test_a_split_decode_step_resumed_past_fp32s_largest_in_raw_units_keeps_its_share_interpreted():
     """An fp16 decode step on an H100 of two rows over 4096 keys, 8 query heads over 2 and 64 wide, its keys
-    cut into slices the launch merges with a resumed state whose first row's maximum is `RESUMED`
+    cut into slices merged with a resumed state whose first row's maximum is `RESUMED`
     (`Hooks.initial`): the state's maximum saturates in the raw fold's units (`algebra.initial_state`), so
     that row is the state's own sums over its denominator, on par with the reference path (check 1)."""
     keys = 4096

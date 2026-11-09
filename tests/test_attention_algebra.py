@@ -894,14 +894,13 @@ def test_power2_is_exact_under_jit_at_every_exponent():
 
 
 
-@pytest.mark.parametrize("merge", ["in-turn", "at-once"])
 @pytest.mark.parametrize(("totals", "outputs", "share"), [((1.0, 1.0, 1.0), (0.0, 0.0, 1.0), 1.0 / 3.0),
                                                           ((128.0, 64.0), (1.0, 0.0), 2.0 / 3.0)],
                          ids=["one-key-each", "denominators-128-64"])
-def test_finished_slices_merged_at_a_large_maximum_keep_each_ones_mass(merge, totals, outputs, share):
+def test_finished_slices_merged_at_a_large_maximum_keep_each_ones_mass(totals, outputs, share):
     """Finished slices at the natural maximum 2^30, their denominators `totals` and outputs `outputs`,
-    merged in turn (`algebra.finished_merge`, the in-launch merge's fold) or at once (`finished_merged`, the
-    merge after the launch): each keeps its share of the mass, so the merged output is `share`. Folding a
+    merged (`algebra.finished_merged`, the merge of a decode step's slices): each keeps its share of the
+    mass, so the merged output is `share`. Folding a
     denominator into a maximum that large rounds the fold away (2^30 + log 2 is 2^30 in fp32): folded by a
     merge, three slices of one key each left the first two one slice's mass, the output 1/2 (row 4526's
     review); folded by each slice's state, slices of 128 and 64 merged half and half (row 4646)."""
@@ -909,12 +908,9 @@ def test_finished_slices_merged_at_a_large_maximum_keep_each_ones_mass(merge, to
     states = [algebra.slice_state(spec, jnp.full((1, 1), out, jnp.float32), jnp.full((1,), 2.0 ** 30),
                                   jnp.full((1,), total, jnp.float32))
               for out, total in zip(outputs, totals, strict=True)]
-    if merge == "in-turn":
-        merged = functools.reduce(functools.partial(algebra.finished_merge, spec), states)
-    else:
-        stacked = algebra.Partial(*(jnp.stack(parts) for parts in zip(*(state[:3] for state in states),
-                                                                        strict=True)))
-        merged = algebra.finished_merged(spec, stacked, axis=0)
+    stacked = algebra.Partial(*(jnp.stack(parts) for parts in zip(*(state[:3] for state in states),
+                                                                    strict=True)))
+    merged = algebra.finished_merged(spec, stacked, axis=0)
     out = algebra.finish(spec, merged, initial=True, normalized=True)[0]
     # The heaviest slice's share of the mass rounded once: the output fp32's `share` exactly.
     assert out.item() == np.float32(share), out.item()
