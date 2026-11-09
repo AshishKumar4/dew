@@ -1882,9 +1882,11 @@ class Checkpoints:
         if target is not None:
             selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(template["variables"])[0]
                         if jnp.issubdtype(leaf.dtype, jnp.floating) and under_roots(path, parameter_roots)}
+        # Each leaf in the dtype this process holds it in: a stored float64 a float32 where x64 is off.
         typed = jax.tree_util.tree_map_with_path(
             lambda path, leaf, sharding: jax.ShapeDtypeStruct(
-                leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
+                leaf.shape, jax.dtypes.canonicalize_dtype(target if path[1:] in selected else leaf.dtype,
+                                                          allow_extended_dtype=True), sharding=sharding),
             dict(template), dict(placement))
         values, _ = self.restore(typed, step=step)
         params = values.pop("variables")

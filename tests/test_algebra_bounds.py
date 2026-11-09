@@ -160,7 +160,11 @@ def test_every_stated_bound_holds_every_output_its_operands_reach(name, dtypes, 
     operand value its declared bounds admit (the module's reading): a bound at or under the output dtype's
     reach is each finite output's; one above it claims nothing a float's rounding to infinity breaks."""
     fn = (UNARY if len(dtypes) == 1 else BINARY)[name]
-    wide = any(jnp.dtype(dtype).itemsize == 8 for dtype in dtypes)
+    with jax.enable_x64(new_val=True):
+        made = jax.eval_shape(fn, *(jax.ShapeDtypeStruct((4,), dtype) for dtype in dtypes))
+    # x64 wherever an operand or an output is 64-bit: a conversion to float64 of a 32-bit operand included.
+    outputs = [leaf.dtype for leaf in jax.tree.leaves(made)]
+    wide = any(jnp.dtype(dtype).itemsize == 8 for dtype in (*dtypes, *outputs))
     with jax.enable_x64(new_val=wide):
         columns = [_values(dtype, bound, arity=len(dtypes))
                    for dtype, bound in zip(dtypes, bounds, strict=True)]
