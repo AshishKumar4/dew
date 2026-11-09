@@ -725,6 +725,22 @@ def test_a_cpu_attention_training_steps_derived_peak_bounds_its_compile(rows, to
     assert compiled(pulled, *operands, query) <= derived + cotangent
 
 
+def test_a_tpus_derived_peak_takes_none_of_a_cpus_terms():
+    """The arrays a CPU's YNNPACK fusions read apart (`laid_inputs`, `cpu_layouts`) are a CPU's alone: a
+    TPU's derived peak is the generic one a GPU's is where no product reads, and a CPU's holds the
+    broadcast its reduction reads beside it (the promotion's review: the terms were gated on any
+    platform but a GPU)."""
+    from dew.training.footprint import peak_bytes
+
+    def spread(rows):
+        totals = jnp.sum(rows, axis=1, keepdims=True)
+        return jnp.sum(rows * jnp.broadcast_to(totals, rows.shape))
+
+    jaxpr = jax.make_jaxpr(spread)(jax.ShapeDtypeStruct((64, 64), jnp.float32)).jaxpr
+    tpu, gpu, cpu = (peak_bytes(jaxpr, platform, Workspace(0, 0)) for platform in ("tpu", "gpu", "cpu"))
+    assert tpu == gpu < cpu
+
+
 def test_a_computed_value_read_in_two_orders_is_copied_for_the_second():
     """XLA lays a computed value out once: a product returned flat both as it is and transposed holds the
     product and a reordered copy, where its transpose alone would be the product laid out for it."""
