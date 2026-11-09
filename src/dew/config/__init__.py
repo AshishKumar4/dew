@@ -1242,18 +1242,19 @@ class RunConfig:
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
-                                            "val_metrics", "val_every", "val_summaries")
+                                            "val_metrics", "val_every", "val_summaries", "kernels")
     """The fields a run resumed under its name may change: how it trains and optimizes, what it reads
-    and scores, and, in a kind of run that adds them, how it previews. Every other field says what
+    and scores, the kernels it runs (`kernels`, each on whatever hardware the resume lands on), and, in a
+    kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
-    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers", "packed_experts")
+    EXECUTED: ClassVar[tuple[str, ...]] = ("scan_layers",)
     """The model and source fields, by name, that say how a model's layers execute and not what they
     compute or store: a decoder's runs under one scan or a layer at a time hold the same layers on disk
-    (`layers_N`) and compute the same step, and a source's experts packed or decoded hold the same values
-    (its MXFP4 codes, which an export writes back alike), so a run resumes under either
-    (`check_resume`)."""
+    (`layers_N`) and compute the same step, so a run resumes under either (`check_resume`). A source's
+    experts packed or decoded (`SourceOptions.packed_experts`) are not: packed, the experts' banks are no
+    trainable parameters and hold no optimizer moments, so a resume across them is refused by name."""
 
     BUILT: ClassVar[tuple[str, ...]] = ("source.param_dtype", "source.step", "data_plan_version")
     """The fields, by their dotted paths, a run may leave None for its build or its pinning to resolve,
