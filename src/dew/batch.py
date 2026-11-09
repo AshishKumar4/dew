@@ -226,6 +226,22 @@ class Forks:
             return xp.zeros((*parents.shape, 0), np.int32)
         return xp.stack(chain, axis=-1)
 
+    def trees(self, segments, *, xp=jnp):
+        """Each token's tree `[B, S]`, from 1 in the order the trees' roots stand in the row, 0 on padding:
+        the root its document's chain of ancestors ends in. A call that reads a context a tree reads each
+        token's by it (`CrossContext.queries`): a row over one state, its questions continuing its state,
+        is one tree."""
+        segments = xp.asarray(segments, np.int32)
+        if self.depth == 0:
+            return segments
+        ancestors = self.ancestors(xp=xp)
+        levels = xp.sum(ancestors > 0, axis=-1, dtype=np.int32)
+        deepest = xp.take_along_axis(ancestors, xp.maximum(levels - 1, 0)[..., None], axis=-1)[..., 0]
+        roots = xp.where(levels > 0, deepest, xp.arange(1, self.count + 1, dtype=np.int32)[None])
+        # Each root's rank among the row's roots, read at each document's root, then at each token.
+        ranked = xp.take_along_axis(xp.cumsum(levels == 0, axis=1, dtype=np.int32), roots - 1, axis=1)
+        return xp.where(segments > 0, xp.take_along_axis(ranked, xp.maximum(segments - 1, 0), axis=1), 0)
+
     def levels(self, *, xp=jnp):
         """Each document's level `[B, D]`: how many ancestors it continues, 0 for a root."""
         return xp.sum(self.ancestors(xp=xp) > 0, axis=-1, dtype=np.int32)
