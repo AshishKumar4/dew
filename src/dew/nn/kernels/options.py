@@ -217,6 +217,66 @@ def collecting() -> Iterator[dict[str, jax.stages.Compiled]]:
         yield collected
     finally:
         _COLLECTED.reset(token)
+
+
+type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered]]
+"""The relowerings a spill made of a call (`OuterProgram.compiled`'s), each with the jit it traced by."""
+
+@dataclasses.dataclass
+class _Lowering:
+    """A call lowered within `compiled_together`: its program, the key its executable is kept by
+    (`OuterProgram._keyed`) and the compile it owns there (`OuterProgram._kept`'s future), its lowering,
+    its arguments, and the relowerings a spill made of it."""
+
+    program: OuterProgram
+    key: Hashable
+    pending: Future[jax.stages.Compiled]
+    lowered: jax.stages.Lowered
+    args: tuple
+    kwargs: dict
+    relowered: Relowered = dataclasses.field(default_factory=list)
+
+
+_TOGETHER: contextvars.ContextVar[dict[tuple[int, Hashable], _Lowering] | None] = contextvars.ContextVar(
+    "dew_programs_compiled_together", default=None)
+
+
+@contextlib.contextmanager
+def compiled_together() -> Iterator[None]:
+    """Within the block, a call of a program through Dew's compile point (`OuterProgram`) answers with its
+    results' shapes (`shapes_of`), running nothing, and one whose executable the program keeps none of is
+    traced and lowered on this thread, under its contexts, as the call would be; as the block ends,
+    every lowering is compiled at once (`report.compiled_at_once`: XLA's compiles in threads of their
+    own, a spill's refusal relowered here) and kept by its program under its call's key, so the same
+    call after the block runs it, compiling nothing: a scoring task's programs compiled before its
+    passes (`dew.decision.task.Decide.compile_scoring`). Each call's compile is its program's as `_kept`
+    reserves it, and a call of a key this block already lowered lowers it once; a block waits on no
+    compile it does not own (a key another thread reserved answers its call's traced shapes), and a block
+    within another is the outer one's, so no two blocks wait on each other. A block that raises compiles
+    nothing, and a compile that fails fails every call waiting for it, the program keeping none of them."""
+    from dew.nn.kernels.templates import report
+
+    if _TOGETHER.get() is not None:
+        yield
+        return
+    lowerings: dict[tuple[int, Hashable], _Lowering] = {}
+    token = _TOGETHER.set(lowerings)
+    try:
+        try:
+            yield
+        finally:
+            _TOGETHER.reset(token)
+        held = list(lowerings.values())
+        executables = report.compiled_at_once([
+            (call.lowered, None, functools.partial(call.program._relowered, call.args, call.kwargs,
+                                                   call.relowered))
+            for call in held])
+    except BaseException as failure:
+        for call in lowerings.values():
+            call.program._released(call.key, call.pending, failure)
+        raise
+    for call, executable in zip(held, executables, strict=True):
+        call.program._keep(call.key, call.pending, executable, call.relowered)
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
 
@@ -316,6 +376,8 @@ class OuterProgram:
         if _COLLECTED.get() is not None:
             return shapes_of(self.compiled(*args, **kwargs).out_info)
         key, dynamic, named = self._keyed(args, kwargs)
+        if (together := _TOGETHER.get()) is not None:
+            return self._together(together, key, args, kwargs)
         ready = self._ready.get(key)
         return (self._kept(key, args, kwargs) if ready is None else ready)(*dynamic, **named)
 
@@ -350,23 +412,76 @@ class OuterProgram:
                 pending.set_exception(error)
         return pending.result()
 
+    def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
+        """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
+        the thread that keeps it, each relowering with its jit kept in `relowered`."""
+        fresh = self._jitted()
+        relowering = self._traced(fresh, args, kwargs).lower()
+        relowered.append((fresh, relowering))
+        return relowering
+
+    def _together(self, together: dict[tuple[int, Hashable], _Lowering], key: Hashable, args: tuple,
+                  kwargs: dict):
+        """A call within `compiled_together`: its results' shapes, its executable reserved as `_kept`
+        reserves one and its lowering kept for the block's compile where it owns the reservation; the
+        shapes of a compile another owns, once it is done; one this block lowered, its lowering's."""
+        if (lowering := together.get((id(self), key))) is not None:
+            return shapes_of(lowering.lowered.out_info)
+        with self._compiling:
+            pending = self._executables.get(key)
+            owner = pending is None
+            if owner:
+                pending = self._executables[key] = Future()
+                if len(self._executables) > self.CACHED:
+                    self._ready.pop(self._executables.popitem(last=False)[0], None)
+            self._executables.move_to_end(key)
+        if not owner:
+            # Another's compile, done or not: its shapes as the call traces, none waited for.
+            return shapes_of(pending.result().out_info if pending.done() and pending.exception() is None
+                             else self.trace(*args, **kwargs).out_info)
+        try:
+            lowered = self.lower(*args, **kwargs)
+        except BaseException as failure:
+            self._released(key, pending, failure)
+            raise
+        # A program compiled ahead for this target runs as it was compiled (`taking`).
+        if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
+            self._keep(key, pending, ahead(), [])
+        else:
+            together[id(self), key] = _Lowering(self, key, pending, lowered, args, kwargs)
+        return shapes_of(lowered.out_info)
+
+    def _keep(self, key: Hashable, pending: Future[jax.stages.Compiled], executable: jax.stages.Compiled,
+              relowered: Relowered) -> None:
+        """Settle the compile reserved under `key` (`_together`) with `executable`, kept as `_kept` keeps
+        the one it compiles; later calls trace as its last relowering did."""
+        if relowered:
+            self.jitted = relowered[-1][0]
+        pending.set_result(executable)
+        with self._compiling:
+            if key in self._executables:
+                self._ready[key] = executable
+
+    def _released(self, key: Hashable, pending: Future[jax.stages.Compiled], failure: BaseException) -> None:
+        """Fail the compile reserved under `key` (`_together`), the program keeping none, as `_kept` fails
+        one it could not compile."""
+        with self._compiling:
+            self._executables.pop(key, None)
+        if not pending.done():
+            pending.set_exception(failure)
+
     def compiled(self, *args, **kwargs) -> jax.stages.Compiled:
         """The program over these arguments compiled through the kernel templates' reports, lowered
         afresh where a kernel spills."""
         from dew.nn.kernels.templates import report
 
-        relowered: list[tuple[jax.stages.Wrapped, jax.stages.Lowered]] = []
-
-        def relower() -> jax.stages.Lowered:
-            fresh = self._jitted()
-            lowered = self._traced(fresh, args, kwargs).lower()
-            relowered.append((fresh, lowered))
-            return lowered
+        relowered: Relowered = []
         lowered = self.lower(*args, **kwargs)
         # A program compiled ahead for this target runs as it was compiled (`taking`).
         if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
             return ahead()
-        executable = report.compiled(lowered, relower=relower)
+        executable = report.compiled(lowered,
+                                     relower=functools.partial(self._relowered, args, kwargs, relowered))
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted, lowered = relowered[-1]

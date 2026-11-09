@@ -109,16 +109,13 @@ media or multi-axis positions also keeps its own shapes.
 """
 
 
-SCORING_RUNGS = 4
-"""How many lengths a task that scores whole requests pads its passes to (`length_ladder`)."""
-
-
-def length_ladder(top: int, smallest: int, rungs: int = SCORING_RUNGS) -> tuple[int, ...]:
+def length_ladder(top: int, smallest: int, rungs: int) -> tuple[int, ...]:
     """The lengths a task that scores whole requests compiles its passes at, shortest first: `top`, the
     layout's window, so a request at the training window reads training's shape, and its halvings, `rungs`
-    of them at most and none shorter than `smallest`, the shortest row the layout lays out. Each length is
-    one program, which the task compiles once, up front, rather than one per power of two of every
-    request's length, rows and options (`dew.decision.task.Decide.pass_shapes`)."""
+    of them at most (a budget's, `dew.decision.task.Budget.lengths`) and none shorter than `smallest`, the
+    shortest row the layout lays out. Each length is one program, which the task compiles once, up front,
+    rather than one per power of two of every request's length, rows and options
+    (`dew.decision.task.Decide.pass_shapes`)."""
     return tuple(sorted({max(min(smallest, top), top >> step) for step in range(rungs)}))
 
 
