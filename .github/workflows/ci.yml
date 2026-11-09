@@ -152,14 +152,14 @@ jobs:
   # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
   # group depends on it: the whole suite, daily or dispatched, runs every file with the cache off; any other
   # run reruns what its change reaches, and the whole suite where it cannot place it: from main, and for a push to
-  # base/kernels from the last push whose run went green (the tip it moved from before any did; main where it is
-  # new).
+  # base/kernels from the last push whose run finished, green or red (the tip it moved from before any did; main
+  # where it is new).
   scope:
     # A pull request's CI is its lint and package, on hosted runners: a fork's holds no armada credentials, and its
     # suite runs when a lane's head of it reaches the land queue.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    # Reads the last green run on base/kernels, which its pushes are scoped from.
+    # Reads the last run on base/kernels that finished, green or red, which its pushes are scoped from.
     permissions:
       actions: read
       contents: read
