@@ -7,7 +7,14 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from interop_support import fixture_ids, next_token_losses, respelled, transformers_arms, transformers_model
+from interop_support import (
+    dew_next_token_loss,
+    fixture_ids,
+    next_token_losses,
+    respelled,
+    transformers_arms,
+    transformers_model,
+)
 from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
@@ -84,11 +91,8 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
     assert isinstance(loaded.model.rope_scaling, YarnScaling) and loaded.model.partial_rotary_factor == 0.5
 
     def dew(ids):
-        def loss(params):
-            logits = loaded.model.apply({**loaded.variables, 'params': params}, ids)
-            chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], -1)
-            return -jnp.mean(chosen), logits
-        (_, logits), gradient = jax.value_and_grad(loss, has_aux=True)(loaded.variables['params'])
+        (_, logits), gradient = jax.value_and_grad(dew_next_token_loss, argnums=1, has_aux=True)(
+            loaded, loaded.variables['params'], ids)
         return logits, gradient
 
     stepped = jax.jit(dew)

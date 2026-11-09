@@ -103,6 +103,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
   nonzero selection bias, grouped sigmoid routing and optional latent projections.
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -265,31 +266,64 @@ ACCURATE_SEEDS = 8
 """The accurate-policy site's declared check-1 seeds, sized by `seeds_for` paired on a GPU."""
 
 
-def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
+def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu(
+        fixture: str = "qwen3-tiny"):
     """A float32 decoder under a run's ACCURATE precision policy (`generation.run_precision`, ledger
-    2500) multiplies every product that states no precision in IEEE float32: its logits on a GPU are as
-    exact as transformers' float32 ones, both from transformers' float64 ones, JAX's own default (TF32
-    there, as JAX documents) cleared first. The policy sets the products' precision; the decoder's
-    float32 dtype keeps their operands float32. Check 1 over drawn ids of the fixture's shape."""
-    from interop_support import token_draw, torch_logits
+    2500) multiplies every product that states no precision in IEEE float32, forward and backward: on a
+    GPU its logits and its cross entropy's gradient of every parameter, one program computing both, are as
+    exact as transformers' float32 ones, all from transformers' float64 ones, JAX's own default (TF32
+    there, as JAX documents) cleared first (row 5275: no GPU check held a whole model's gradients). The
+    policy sets the products' precision; the decoder's float32 dtype keeps their operands float32. Each
+    gradient is read in the release's layout (`WeightLayout.export`). Check 1 over drawn ids of the
+    fixture's shape: Qwen3's and Llama's (`fixture`), whose gradients XLA's GEMM fusion miscompiled
+    (row 5275)."""
+    import torch
+    from interop_support import dew_next_token_loss, token_draw
     from transformers import AutoModelForCausalLM
 
     from dew.nn.kernels import generation
     from dew.nn.precision import ACCURATE
-    from tools.torch_precision import float64
+    from tools.torch_precision import float64, float64_twin
 
-    directory = FIXTURES / "qwen3-tiny"
+    directory = FIXTURES / fixture
     ids = np.load(directory / "input_ids.npy")
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
-    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
-        forward = jax.jit(loaded.model.apply).trace(loaded.variables, jnp.asarray(ids)).lower().compile()
     reference = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").eval()
-    with float64():
-        wide = AutoModelForCausalLM.from_pretrained(directory, attn_implementation="eager").double().eval()
+    wide = float64_twin(reference)
+    named = dict(reference.named_parameters())
+    layouts = {layout.name: layout for layout in loaded.weight_layouts if layout.name in named}
+
+    def loss(params, ids):
+        return dew_next_token_loss(loaded, params, ids)
+
+    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
+        both = jax.jit(jax.value_and_grad(loss, has_aux=True)).trace(
+            loaded.variables["params"], jnp.asarray(ids)).lower().compile()
+
     # Compiled once under the policy, as a run under it compiles: the gate runs it as given.
-    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64)),
-                    torch_logits(reference), token_draw(0x0A3, reference.config.vocab_size, ids.shape),
-                    "float32 logits", seeds=ACCURATE_SEEDS, truth_fn=torch_logits(wide, float64))
+    @as_given
+    def ours(ids):
+        (_, logits), grads = both(loaded.variables["params"], jnp.asarray(ids, jnp.int32))
+        return {"logits": np.asarray(logits, np.float64),
+                **{name: np.asarray(layout.export({"params": grads}), np.float64).reshape(named[name].shape)
+                   for name, layout in layouts.items()}}
+
+    def transformers(model, precision):
+        @as_given
+        def run(ids):
+            model.zero_grad(set_to_none=True)
+            tokens = torch.from_numpy(np.asarray(ids, np.int64))
+            with precision():
+                out = model(tokens, labels=tokens)
+                out.loss.backward()
+                held = dict(model.named_parameters())
+                return {"logits": out.logits.detach().double().numpy(),
+                        **{name: held[name].grad.double().numpy() for name in layouts}}
+        return run
+
+    assert_as_exact(ours, transformers(reference, contextlib.nullcontext),
+                    token_draw(0x0A3, reference.config.vocab_size, ids.shape), "float32 logits and gradients",
+                    seeds=ACCURATE_SEEDS, truth_fn=transformers(wide, float64))
 
 
 @pytest.mark.parametrize(("name", "stale"), [
