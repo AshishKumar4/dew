@@ -23,6 +23,7 @@ import pytest
 from lane_environment import without_flags
 from flax import linen as nn
 from flax.core import FrozenDict
+from interop_support import token_draw
 from model_support import parameter_loss
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
@@ -192,9 +193,7 @@ def test_a_pattern_that_matches_nothing_quantizes_nothing():
     pytest.importorskip("qwix")
     model, qmodel, variables, _ = quantized_forward(Quantization(patterns=(".*does_not_exist.*",)))
 
-    def draw(seed):
-        return (np.random.default_rng([0x5E1, seed]).integers(0, VOCAB, (BATCH, SEQ_LEN)).astype(np.int32),)
-
+    draw = token_draw(0x5E1, VOCAB, (BATCH, SEQ_LEN))
     assert_as_exact(jax.jit(lambda ids: qmodel.apply(variables, ids)),
                     jax.jit(lambda ids: model.apply(variables, ids)), draw, "a pattern that matches nothing",
                     seeds=NOTHING_SEEDS,

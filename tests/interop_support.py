@@ -660,10 +660,11 @@ def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seed
                     truth_fn=theirs(wide, float64))
 
 
-def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
-    """Check 1's draw of `shape` token ids below `vocab`, a stream of its own by `salt`."""
+def token_draw(salt: int, vocab: int, shape: tuple[int, ...], low: int = 0):
+    """Check 1's draw of `shape` token ids from `low` (1 clear of a pad id 0) below `vocab`, a stream of its
+    own by `salt`."""
     def draw(seed):
-        return (np.random.default_rng([salt, seed]).integers(0, vocab, shape).astype(np.int32),)
+        return (np.random.default_rng([salt, seed]).integers(low, vocab, shape).astype(np.int32),)
     return draw
 
 

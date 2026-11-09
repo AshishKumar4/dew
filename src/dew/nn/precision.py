@@ -710,11 +710,12 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
         inner = params.get("jaxpr")
         product = functools.partial(jax.lax.dot_general, out_sharding=params.get("out_sharding"))
         if equation.primitive is jax.lax.dot_general_p and (made := projection_product(
-                product, *given, params["dimension_numbers"], params["precision"],
+                product, given[0], given[1], params["dimension_numbers"], params["precision"],
                 params["preferred_element_type"])) is not None:
             outputs = [made]
-        elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.ClosedJaxpr):
-            outputs = _paired(inner.jaxpr, inner.consts, *given)
+        elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.Jaxpr):
+            # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
+            outputs = _paired(inner, inner.consts, *given)
         else:
             # As JAX evaluates an equation (`jax.core.eval_jaxpr`): its context, its bind's parameters.
             with equation.ctx.manager:
