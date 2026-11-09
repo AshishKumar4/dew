@@ -19,6 +19,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Theme r08 (not yet landed): training values padded to value tiles, the fast backward stepping Call.value_block. [5262]
 - Documents entering memories of their own. [5288]
 - On sm100 (tcgen05's chunks bundle) the recurrence template refuses a decay a key dimension's training. [5298]
+- Theme r08's own-pair launches (templates/recurrence/own_pairs.py. [5305]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [2077, 485, 1424, 3423, 3425, 1506]
 - Derived resources: tiles, registers, residency and issued work. [2943, 3087, 2940, 566]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 2109]
