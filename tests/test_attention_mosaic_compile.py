@@ -208,18 +208,23 @@ def _forward_kernels(op, ba, config) -> dict:
     `attention_{forward, training, peaks}`, then `_natural`, `_scaled`, `_kept`, `_columns{width}` and
     `_split` where it is so), each the op's (`MosaicForward.registers`) at its config: a scaled launch's the
     scaled op's at the config it derives (`MosaicForward.scaled`, its own registers and shared memory), a
-    peak walk's its own, a natural launch's at its own tiles (`Tiles.relaunch`), a launch over a block of the
-    values' columns at that block's width."""
-    scaled_op = dataclasses.replace(op, scaled=True)
-    scaled_config = scaled_op.derived(ba, generation.gpu_target())
+    cache's walk's its own (`MosaicForward.cached`, scaled in its kernel), a peak walk's its own, a natural
+    launch's at its own tiles (`Tiles.relaunch`), a launch over a block of the values' columns at that
+    block's width."""
+    if op.scales_in_kernel(ba):
+        # A cache's walk scales in its own kernel at its own config (`MosaicForward.cached`).
+        variants = (("_scaled", op, config),)
+    else:
+        scaled_op = dataclasses.replace(op, scaled=True)
+        variants = (("", op, config), ("_scaled", scaled_op, scaled_op.derived(ba, generation.gpu_target())))
     found = {}
-    for scaled, of, at in (("", op, config), ("_scaled", scaled_op, scaled_config)):
+    for scaled, of, at in variants:
         if at is None:
             continue
         family = attention_mosaic_program.bundle_of(at, jnp.bfloat16)
         for natural, tiles in (("", at), ("_natural", at.relaunch)):
             for kind in ("forward", "training", "peaks"):
-                for columns in (None, 64, 128, 256):
+                for columns in (None, 16, 32, 64, 128, 256):
                     registers = of.registers(ba, tiles, peaks=kind == "peaks", columns=columns)
                     model = resources.register_model(family, tiles.consumers, registers)
                     named = "" if columns is None else f"_columns{columns}"
@@ -306,7 +311,17 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
         return attention_decode.attend(query, key, value, spans, table=table)
 
     with generation.assumed(generation_name):
-        case = KernelCase("paged decode", lambda: (decode, (query, pool, pool, table)))
+        # The plan's op over the packed rows, its launches' models (`_forward_kernels`).
+        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, pool, table)]
+        rows_of, row_spans, _ = attention_decode.packed(zeros[0], spans, pool.shape[0])
+        op, args = attention_mosaic._forward_call(rows_of, zeros[1], zeros[1], row_spans, None, scale=None,
+                                                  natural=False, out_dtype=jnp.float32, masked=True,
+                                                  table=zeros[2])
+        ba = op.bind(*args, residuals=template.Kept.OUTPUT, interpret=False)
+        config = attention_decode.plan(rows_of, zeros[1], zeros[1], row_spans, None, scale=None,
+                                       target=generation.gpu_target(), table=zeros[2]).config
+        case = KernelCase("paged decode", lambda: (decode, (query, pool, pool, table)),
+                          _forward_kernels(op, ba, config))
         found = compile_mosaic_kernels([case], generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 

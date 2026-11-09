@@ -52,35 +52,21 @@ def packable(hooks: Hooks | None) -> bool:
     return hooks.score_mod is None or not _reads_places(hooks.score_mod)
 
 
-def serves(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
-           natural: bool, scale: float | None, target: generation.GpuTarget) -> bool:
+def serves(query: jax.Array, key: jax.Array, hooks: Hooks | None, *, natural: bool,
+           target: generation.GpuTarget) -> bool:
     """Whether a call's inference runs as this work list (`attend`) rather than the template's forward: its
     hooks pack (`packable`), its key heads divide its query heads, its form the fold's (the work list folds,
-    its natural rewalk its own), its packed rows a key head too few for the device's products to bound
-    its walk (`attention_mosaic.streams`): a decode step's, a speculative verify block's; and its walk, which
-    holds its rows' scale every tile, derives a config on the device (`plan`; 512-token fp32 calls on an
-    H100 at widths 64 and 128 derived none, their forward's common walk holding no scale). A verify block of
-    4 to 16 drafts a row through the forward took 1.1 to 5.9 ms where the work list took 30 us to 1.36 ms on
-    an H100, its query heads read the keys once a key head (ET-VERIFY-h100)."""
+    its natural rewalk its own), and its packed rows a key head too few for the device's products to bound
+    its walk (`attention_mosaic.streams`): a decode step's, a speculative verify block's. Its walk derives a
+    config wherever the template's forward takes the call (`plan`). A verify block of 4 to 16 drafts a row
+    through the forward took 1.1 to 5.9 ms where the work list took 30 us to 1.36 ms on an H100, its query
+    heads read the keys once a key head (ET-VERIFY-h100)."""
     heads, kv_heads = query.shape[2], key.shape[2]
     if natural or heads % kv_heads or not packable(hooks):
         return False
     batch, positions, _, width = query.shape
     rows = jax.ShapeDtypeStruct((batch, positions * (heads // kv_heads), kv_heads, width), query.dtype)
-    if not attention_mosaic.streams(rows, target):
-        return False
-    hooks = Hooks() if hooks is None else hooks
-    derived = []
-
-    def planned(query, spans):
-        packed_rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
-        derived.append(plan(packed_rows, key, value, row_spans, dataclasses.replace(hooks, initial=initial),
-                            scale=scale, target=target))
-        return query
-
-    jax.eval_shape(planned, query, spans)
-    return derived[0] is not None
-
+    return attention_mosaic.streams(rows, target)
 
 def _reads_places(score_mod) -> bool:
     """Whether `score_mod(s, q_pos, k_pos)` reads its query's place: its traced program uses the argument."""

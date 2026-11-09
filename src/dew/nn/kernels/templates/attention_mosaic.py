@@ -19,15 +19,7 @@ import tokamax
 from dew._devices import deterministic_ops_requested
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import (
-    attention_algebra as algebra,
-    attention_portable,
-    cost,
-    mosaic,
-    product,
-    resources,
-    swizzling,
-)
+from dew.nn.kernels.templates import attention_algebra as algebra, cost, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -45,7 +37,6 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     logit_scale,
-    output_split,
     power_of_two,
     prescale,
 )
@@ -96,10 +87,17 @@ from dew.nn.kernels.templates.base import Template, Unfitted
 
 def _column_blocks_of(family: mosaic.Family, dtype, value_width: int) -> list[int | None]:
     """The value columns a forward launch walks at once, widest first: the whole (None), then halved while a
-    block stays whole swizzled columns (`Family.column_unit`), each block a launch (`Tiles.columns`), for a
-    call no tile holds whole (an fp32 call's parts at width 128 on an H100: 64 x 64 staged 283,744 bytes of
-    its 232,448, one consumer, et-fp32derive)."""
-    whole, unit = _width(value_width, family, dtype), family.column_unit(dtype)
+    block stays whole swizzled columns, each block a launch (`Tiles.columns`), for a call no tile holds whole
+    (an fp32 call's parts at width 128 on an H100: 64 x 64 staged 283,744 bytes of its 232,448, one
+    consumer, et-fp32derive). A family that stages its operands swizzled takes a block at the narrowest
+    swizzle its staged dtype has (`swizzling.NARROWEST_SWIZZLE_BYTES`, `swizzling.swizzle_for`'s least: a
+    B200's scaled fp32 forward at width 128 holds 64 x 64 over 16 columns in 224 registers, where 32 spilled
+    176 bytes, et-sneedfp32c); one whose products read registers, its own unit (`Family.column_unit`)."""
+    whole = _width(value_width, family, dtype)
+    # An fp32 call's operands stage as their bf16 parts (`MosaicForward.parts`).
+    staged = jnp.bfloat16 if jnp.dtype(dtype) == jnp.dtype(jnp.float32) else dtype
+    unit = (family.column_unit(dtype) if family.operands_in_registers
+            else swizzling.swizzle_columns(staged, swizzling.NARROWEST_SWIZZLE_BYTES))
     blocks = [whole // 2 ** halved for halved in range(1, whole.bit_length())
               if whole % 2 ** halved == 0 and (whole // 2 ** halved) % unit == 0]
     return [None, *blocks]
@@ -109,7 +107,9 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                                                 tiles: Callable[[int, int, int], Config],
                                                 fits: Callable[[Config], bool], *,
                                                 overlapped: bool, walks: Callable = extents,
-                                                rows: int | None = None) -> Config | None:
+                                                rows: int | None = None,
+                                                least_walked: Callable[[int], int] = lambda rows: 1
+                                                ) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
     consumers the family's (`Family.consumers`) where its step `overlapped` (a softmax between its products,
     which runs under its partner's products as the consumers take turns, FlashAttention-3's), else one (a
@@ -119,8 +119,9 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     whole swizzled rows); the tile it walks the largest of its extents (`walks`: a backward's the family's
     unit, `extents`, its walked tiles' weights and cotangents feeding products from registers, which at fewer
     rows than the unit cross warps (fs-backward-specialized: mma.sync at 32-row shares, no relayout lowers);
-    a forward's `walked_extents`, a product's depth in whole swizzled rows) within the `walked` extent whose
-    live set a consumer's registers hold and
+    a forward's `walked_extents`, a product's depth in whole swizzled rows) within the `walked` extent (at
+    least `least_walked(rows)`, the walked tile a consumer of `rows` rows takes at least) whose live set a
+    consumer's registers hold and
     whose two stages the block holds (`fits`), two the ring's busy depth, a slot loading while one is read;
     where its family's products read operands from registers, a tile its transposed streams staged at the
     family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
@@ -147,7 +148,7 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                 # count's (a 192-row tile of three consumers over a 256-row shard pads it by half, where two
                 # consumers' 128 pad none): the call's padding is a copy and its last tile's work wasted.
                 continue
-            for extent in walks(family, dtype, walked):
+            for extent in walks(family, dtype, max(walked, least_walked(rows))):
                 for narrow in stagings(family):
                     config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
                     if fits(config):
@@ -160,6 +161,14 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     if not found:
         return None
     return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers, config.block_q))
+
+
+def _least_keys(family: mosaic.Family, rows: int) -> int:
+    """The key tile a forward consumer of `rows` rows walks at least: a tile of fewer rows than a role's lays
+    its warps along its keys, a whole 16-key product's columns each (`MosaicForward._launch_legal`), so a
+    call of fewer keys pads to them (a 3-query call's 16-row tile over its 3 keys derived only 32-key tiles,
+    each refused)."""
+    return WARPGROUP_WARPS * 16 if rows < family.role_rows else 1
 
 
 def _sides(rows: int, family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
@@ -380,25 +389,15 @@ class MosaicForward(_Mainloop[Tiles]):
                      drop, table, sources, scales)
 
         def rare():
-            # A pin of this op's where the scaled op can take it, else its own config
-            # (`tuning.pinned_where_taken`): its registers and shared memory are not the common op's. Where no
-            # config of it fits the target (an A100's training walk, its small weights' tier past a thread's
-            # registers), the template's plain-JAX walk, scaled.
+            # A pin of this op's where the scaled op can take it, else its own config, which derives wherever
+            # this op's does (`tuning.pinned_where_taken`): its registers and shared memory are not the common
+            # op's.
             scaled_op = dataclasses.replace(self, scaled=True)
             with tuning.pinned_where_taken(scaled_op, scaled_op.bind(*arguments, residuals=residuals,
                                                                      interpret=interpret)):
-                if scaled_op.fitted(arguments, residuals, interpret):
-                    return scaled_op(*arguments, residuals=residuals, interpret=interpret)
-            whole = tuple(_whole(array, self.parts) for array in (query, key, value))
-            return _portable(whole, spans, hooks, residuals, scale=self.scale, natural=self.natural,
-                             block_q=config.block_q, block_k=config.block_k)
+                return scaled_op(*arguments, residuals=residuals, interpret=interpret)
 
         return jax.lax.cond(may, rare, launched), None
-
-    def fitted(self, arguments: tuple, residuals: Kept, interpret: bool) -> bool:
-        """Whether some config of the op holds a call of `arguments` on the target, legal there (`fits`)."""
-        return bool(self.fits(self.bind(*arguments, residuals=residuals, interpret=interpret),
-                              generation.gpu_target()))
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
@@ -470,26 +469,20 @@ class MosaicForward(_Mainloop[Tiles]):
         by the share of their rows its queries fill (`layouts`: a decode step's few rows mma.sync's before
         wgmma's, row 4042), that takes the call and derives a config."""
         query = ba.arguments["query"]
-        config, chosen = None, None
         for family in layouts(target.generation, query.dtype, query.shape[1]):
             if self.refusal(ba, family) is not None:
                 continue
-
             for columns in _column_blocks_of(family, query.dtype, ba.arguments["value"].shape[3]):
                 def tiles(rows: int, walked: int, consumers: int, family=family, columns=columns) -> Tiles:
                     return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
                 config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
                                   lambda config: self._launch_legal(ba, config, target), overlapped=True,
-                                  walks=walked_extents)
-                if config is not None:
-                    break
-            if config is not None:
-                chosen = family
-                break
-        if config is None or chosen is None:
-            return None
-        return self._relaunched(ba, config, target)
+                                  walks=walked_extents, least_walked=functools.partial(_least_keys, family))
+                # With its natural rewalk's tiles, where they derive (`_relaunched`); else the next block.
+                if config is not None and (relaunched := self._relaunched(ba, config, target)) is not None:
+                    return relaunched
+        return None
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
         """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
@@ -567,15 +560,11 @@ class MosaicForward(_Mainloop[Tiles]):
             return config
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
-        # Its value columns whole first, then halved while a block of them stays a whole column unit: a
-        # launch a block (row 2526: at width 256 no tile held the anchored rewalk's whole sums).
-        whole = _width(value.shape[-1], family, query.dtype)
-        unit = family.column_unit(query.dtype)
-        widths = [whole // 2 ** halved for halved in range(whole.bit_length())
-                  if whole % 2 ** halved == 0 and (whole // 2 ** halved) % unit == 0]
+        # Its value columns whole first, then in blocks (`_column_blocks_of`): a launch a block (row 2526: at
+        # width 256 no tile held the anchored rewalk's whole sums).
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
-                                          columns=None if columns == whole else columns)
-                      for columns in widths
+                                          columns=columns)
+                      for columns in _column_blocks_of(family, query.dtype, value.shape[-1])
                       for consumers in range(config.consumers, 0, -1)
                       for block in walked_extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
@@ -707,25 +696,6 @@ class MosaicForward(_Mainloop[Tiles]):
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
 
-def _portable(operands: tuple, spans: KeySpans, hooks: Hooks, residuals: Kept, *, scale: float | None,
-              natural: bool, block_q: int, block_k: int):
-    """`MosaicForward`'s outputs on the plain-JAX mainloop at query blocks `block_q` and key tiles `block_k`
-    (`attention_portable.xla_mainloop`), its walk scaled where its rows' sums could pass fp32's largest
-    (`algebra.SCALED_WALK`): a call the scaled op fits no config for (`MosaicForward.fits`). The output, with
-    `Kept.SPLIT` the training walk's residuals and with `Kept.OUTPUT` its output's as the inference walk keeps
-    them (`output_split`, no anchor key)."""
-    config = attention_portable.Tiles(block_q, block_k, math.lcm(block_q, block_k))
-    query, key, value = operands
-    if residuals is Kept.NONE:
-        return attention_portable.xla_mainloop(config, query, key, value, spans, hooks, scale=scale,
-                                               natural=natural)
-    out, maximum, total, anchors, split = attention_portable.xla_mainloop(
-        config, query, key, value, spans, hooks, scale=scale, natural=natural, residuals=True)
-    if residuals is Kept.OUTPUT:
-        return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
-    return out, maximum, total, anchors, split
-
-
 def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple, *, grads: str | None = None,
                keys_first: bool = False) -> tuple[list, int]:
     """A step's score-hook parameters (`params`, each its `Kind` and dtype), live beside its logits: a
@@ -814,10 +784,13 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     (`algebra.at_scale`, `attention_mosaic_forward._accumulated`): priced as one fp32 tile and the
     accumulator, the H100's scaled forward at width 128 spilled 232 bytes (et-scaled-b2); its natural form's
     exponential raises the small ones within the step, beside its tiles and the weights at the scale (priced
-    apart from them, its rewalk needed 248 of the 228 priced and spilled 44 bytes, et-scaledneed); an fp32
+    apart from them, its rewalk needed 248 of the 228 priced and spilled 44 bytes, et-scaledneed; an fp32
+    call's beside its logits alone, its parts formed after it: priced beside the parts' tiles, an H100's
+    scaled fp32 forward at width 64 under a softcap priced 276 and needed 184, et-sneedfp32); an fp32
     call's parts walk its weights at the scale its own fp32 weights (priced apart, its decode step's 292
-    refused the 64 x 64 tile ptxas holds in 240, et-fp32decneed); a family whose products read registers its
-    values' fragments beside the parts' products (unpriced, an A100's at width 128 spilled 128 bytes at 255).
+    refused the 64 x 64 tile ptxas holds in 240, et-fp32decneed, and one fp32 tile fewer 212, et-parity-w); a
+    family whose products read registers its values' fragments beside the parts' products (unpriced, an
+    A100's at width 128 spilled 128 bytes at 255).
     """
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
@@ -835,22 +808,39 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
             # value blocks up front, their fragments live at once beside its logits (the liveness pass at
             # its peak, census80b), ptxas 255 registers and 48 to 56 bytes spilled where the step priced 252.
             step.append((block_k, value_width * family.rhs_copies, dtype))
-    step += _mask_places(family, block_q, block_k)
-    scaled_terms, core = [], list(step)
+    masks = _mask_places(family, block_q, block_k)
+    step += masks
+    # The step's tiles the exponential's raised small weights are formed beside: a 16-bit call's step (an
+    # inference walk's logits and weights and its masks' places; a training walk's spilled 224 to 248 bytes
+    # at 238 of 240 priced so, et-scaledneed5); an fp32 call's parts walk its logits alone, its weights'
+    # parts formed after the exponential (`_parted_products`).
+    scaled_terms = []
+    core = (list(step) if residuals else [logits, weights, *masks]) if parts == 1 else [logits]
     if scaled:
         # Its small weights raised from their exponents, fp32, and a part's product's own accumulator beside
-        # the walk's while it issues (`operands.Issuer.summed`). An fp32 call's parts walk holds its weights
-        # at the scale as the step's fp32 weights and forms the small ones' parts in turn as it forms theirs
-        # (`_parted_products`); a 16-bit call's holds its weights at the scale fp32 beside them, and the small
+        # the walk's while it issues (`operands.Issuer.summed`), and its weights at the scale fp32 beside
+        # them; an fp32 call's parts walk forms the small ones' parts in turn as it forms theirs
+        # (`_parted_products`; its weights at the scale held as the step's fp32 weights, an H100's fp32 decode
+        # step at 64 x 64 priced 212 where ptxas needed 240, et-parity-w); a 16-bit call's holds the small
         # ones' three parts (`algebra.small_parts`), a family whose products read registers its values'
         # block's fragments whole beside them, which the weights' product and each part's read.
         accumulator = (block_q, value_width, jnp.float32)
-        scaled_terms = [logits] if parts > 1 else [logits, logits]
+        # tcgen05's fp32 parts walk reads each part's product back beside them (priced below), its weights at
+        # the scale held no apart (a B200's at 64 x 64 over 16 columns needed 224).
+        scaled_terms = [logits] if parts > 1 and scopes_products(family) else [logits, logits]
         step += [*scaled_terms, accumulator]
         if parts == 1:
             step += [weights] * (3 if jnp.dtype(dtype).itemsize == 2 else 1)
             if family.operands_in_registers and not residuals:
                 step.append((block_k, value_width * family.rhs_copies, dtype))
+        if scopes_products(family) and parts > 1:
+            # An fp32 call's small part's product read back from tensor memory in its layout, converted to the
+            # walk's and taken back by its power (`algebra.restored`) beside its parts' step (tcgen05's
+            # chunks, `Tcgen05ChunksIssuer.summed`): unpriced, a B200's scaled fp32 forward at width 128
+            # priced 220 at 64 x 64 over 32 columns and spilled 176 bytes at 248, and 204 over 16 where it
+            # needed 224 (et-sneedfp32c). A 16-bit call's step holds no such tile beside its own (its scaled
+            # forward at width 64 needed 208 at 64 x 64 on one consumer, et-sneedbf16).
+            step += [accumulator] * 3
     phases = [step]
     if natural:
         # The exponential's terms (`algebra.natural_exp`); a scaled walk's raise its small weights within its
@@ -885,11 +875,18 @@ def _peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tupl
     and holds a step's logits fp32 and its score hook's parameters (`_hook_live`), its masks' places where
     the keys' indices do not fold, and its logits' product's fragments where its family reads operands from
     registers; no weighted values, weights or exponentials (FS-1971-LEAST-ATTN: the forward's walk priced it
-    238 where ptxas's least spill-free cap was 112)."""
+    238 where ptxas's least spill-free cap was 112). Where its family's products run past their step
+    (`Family.in_flight`: warpgroup MMA's), the next step's logits accumulate beside the step's it reduces;
+    tcgen05's read back beside their conversion (one priced, an H100's and a B200's at 64 x 64 width 64 37
+    registers where ptxas needed 64 to 72, et-parity-u)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits = (block_q, block_k, jnp.float32)
-    step = [logits, *_mask_places(family, block_q, block_k)]
+    # A product read back from tensor memory, converted to the walk's layout and reduced, each live at once
+    # (tcgen05's chunks: two priced, a B200's peak walk at 64 x 64, width 128, priced 69 where ptxas needed
+    # 80, et-parity-w).
+    held = 1 + family.in_flight + 2 * scopes_products(family)
+    step = [logits] * held + _mask_places(family, block_q, block_k)
     products = _products(family, dtype, (block_q, width, block_k, [logits], False, True), narrow=tiles.narrow,
                          lhs_swizzle=query_swizzle(family))
     carried = [(block_q, 1, jnp.float32)]
@@ -997,11 +994,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                              subtracted=subtracted, scales=scales)
     if scaled:
         op = dataclasses.replace(op, scaled=True)
-        if not op.fitted(args, residuals, interpret):
-            # No config of the scaled op fits the target: the template's plain-JAX walk, scaled.
-            whole = tuple(_whole(array, op.parts) for array in (query, key, value))
-            return _portable(whole, spans, hooks or Hooks(), residuals, scale=scale, natural=natural,
-                             block_q=64, block_k=64)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -1203,7 +1195,12 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                                         *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
     held, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
-    step = [(queries, block_k, jnp.float32)] * 2 + held
+    # Its two products' accumulators, and where its family's products run past their step
+    # (`Family.in_flight`: warpgroup MMA's) the next step's beside them in a launch of its own (an H100's
+    # keys-first dK/dV at 64 x 64 over two consumers' query shares priced 108 to 124 registers where ptxas
+    # needed 136 at every hook, et-parity-w); a fused launch's step waits on its dQ adds between them.
+    ahead = 0 if config.fused else family.in_flight
+    step = [(queries, block_k, jnp.float32)] * (2 * (1 + ahead)) + held
     pullback = step[1:] + [(queries, block_k, jnp.float32)] * slopes
     # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`), each read
     # where it is used, from global memory or a shared dQ's stream (`STATISTICS`), one's column vector live
