@@ -4,11 +4,9 @@ documents (check 1)."""
 
 import functools
 
-import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import hosted, marked, sigmoid
+from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid
 
 from dew.nn.kernels.path_attention import path_attention, recurrent_path_attention
 
@@ -18,6 +16,9 @@ DOCUMENTS = ((0, 13, 22), (0, 9, 33))
 """Each row's packed documents' first tokens, on and off the chunks' grid."""
 SEEDS = {False: 8, True: 16}
 """Each site's declared seeds (one sequence, packed), sized by `seeds_for` on armada."""
+
+CHUNKED = functools.partial(path_attention, chunk=CHUNK)
+"""The chunked form at the test's chunk of 16 tokens."""
 
 
 def draw(seed: int):
@@ -40,7 +41,5 @@ def test_the_chunks_are_as_exact_as_the_definition_a_lag_at_a_time(packed):
     each query back through one token's transform a step, from float64, one sequence and packed documents
     (check 1): each chunk's transforms one solve, a query chunk walking the key chunks before it, each softmax
     within its document."""
-    starts = marked(DOCUMENTS, LENGTH) if packed else None
-    dew = jax.jit(with_gradients(functools.partial(path_attention, starts=starts, chunk=CHUNK)))
-    reference = jax.jit(with_gradients(functools.partial(recurrent_path_attention, starts=starts)))
-    assert_as_exact(dew, reference, draw, f'path attention packed={packed}', seeds=SEEDS[packed])
+    assert_packed_on_par(CHUNKED, recurrent_path_attention, draw, 'path attention', packed=packed,
+                         documents=DOCUMENTS, length=LENGTH, seeds=SEEDS[packed])

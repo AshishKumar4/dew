@@ -7,8 +7,7 @@ import functools
 import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import hosted, marked, sigmoid, unit
+from test_recurrence_chunk import assert_packed_on_par, hosted, sigmoid, unit
 
 from dew.nn.kernels.recurrence_chunk import chunk_gated_oja_rule, recurrent_gated_oja_rule
 
@@ -19,6 +18,9 @@ DOCUMENTS = ((0, 23, 40), (9, 48))
 its first document, 48 a chunk's first token."""
 SEEDS = {False: 16, True: 32}
 """Each site's declared seeds (one sequence, packed), sized by `seeds_for` on armada."""
+
+CHUNKED = functools.partial(chunk_gated_oja_rule, chunk_size=CHUNK)
+"""The chunked rule at the test's chunk."""
 
 
 def draw(seed: int):
@@ -41,7 +43,5 @@ def test_the_chunked_rule_is_as_exact_as_the_rule_a_token_at_a_time(packed):
     """The chunked rule's output, final memory and every operand's gradient on par with the rule a token at a
     time from float64, one sequence and packed documents (check 1): the delta rule's derived forms on the
     transposed memory, its readout along the memory's values."""
-    starts = marked(DOCUMENTS, LENGTH) if packed else None
-    dew = jax.jit(with_gradients(functools.partial(chunk_gated_oja_rule, starts=starts, chunk_size=CHUNK)))
-    reference = jax.jit(with_gradients(functools.partial(recurrent_gated_oja_rule, starts=starts)))
-    assert_as_exact(dew, reference, draw, f'gated oja packed={packed}', seeds=SEEDS[packed])
+    assert_packed_on_par(CHUNKED, recurrent_gated_oja_rule, draw, 'gated oja', packed=packed,
+                         documents=DOCUMENTS, length=LENGTH, seeds=SEEDS[packed])
