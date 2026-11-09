@@ -67,21 +67,23 @@ def _one_head(hf_config: Mapping[str, object], used: set[str], record: DecoderFi
     return record
 
 
-def backbone_layout(*, vocab: int, hidden: int, layers: int, tied: bool) -> ConfigLayout[CausalTransformer]:
+def backbone_layout(*, vocab: int, hidden: int, layers: int, tied: bool,
+                    mlp: ConfigField | None = None) -> ConfigLayout[CausalTransformer]:
     """The decoder of a Mamba family's model, both ways, at its class's defaults: every layer its mixer
-    alone (the family's own part), `hidden_size` wide, its norms at `layer_norm_epsilon`, its residual's
-    dtype. The attention geometry the backbone validates is one head of the model width, with no
-    feed-forward and no query and key norm, none of which a layer reads; written as nothing. The mixer's
-    conv activates with SiLU whatever else `hidden_act` names."""
+    (the family's own part) and the feed-forward `mlp` reads (none where None), `hidden_size` wide, its
+    norms at `layer_norm_epsilon`, its residual's dtype. The attention geometry the backbone validates is
+    one head of the model width, with no query and key norm, none of which a layer reads; written as
+    nothing. The family's one activation is SiLU (the mixer's conv, a gated MLP's gate) whatever else
+    `hidden_act` names."""
     return ConfigLayout(
         integer('vocab_size', 'vocab_size', vocab), integer('hidden_size', 'emb_features', hidden),
         integer('num_hidden_layers', 'num_layers', layers),
         ConfigField('layer_norm_epsilon', 'norm_eps', 1e-5, parse=_records.number),
         flag('tie_word_embeddings', 'tie_embeddings', default=tied),
         flag('residual_in_fp32', 'residual_in_fp32', default=True),
-        ConfigPart(_one_head, lambda model: {}), constant('mlp_features', value=0),
+        ConfigPart(_one_head, lambda model: {}), constant('mlp_features', value=0) if mlp is None else mlp,
         constant('qk_norm', value=False),
-        expect('hidden_act', "the mixer's conv activates with silu", value='silu'))
+        expect('hidden_act', "the family's one activation is silu", value='silu'))
 
 
 def _time_step_limit(value: Configured, key: str) -> tuple[float, float]:
@@ -189,7 +191,8 @@ def is_mamba_ssm(config: Mapping[str, object]) -> bool:
 
 
 def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
-    """Return the `Mamba2Config` dict transformers' conversion writes for a mamba_ssm config.
+    """Return the `Mamba2Config` dict transformers' conversion writes for a mamba_ssm config (a Mamba3
+    layer's, the mamba3 family's record: `mamba3.config_from_mamba_ssm`).
 
     transformers' convert_mamba2_ssm_checkpoint_to_pytorch.py (mamba_ssm
     branch): the width, depth and tying carried over, the vocabulary padded
@@ -206,9 +209,13 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
         raise ValueError(f"mamba_ssm config fields {unknown} are not MambaConfig's; remove them or load a "
                          "transformers Mamba2 conversion of the checkpoint")
     ssm = _records.record(config["ssm_cfg"], "ssm_cfg")
+    if ssm.get("layer") == "Mamba3":
+        from dew.interop import mamba3
+
+        return mamba3.config_from_mamba_ssm(config, ssm)
     if ssm.get("layer") != "Mamba2":
-        raise ValueError(f"ssm_cfg layer {ssm.get('layer', 'Mamba1')!r} is not Mamba2; only mamba_ssm's "
-                         "Mamba2 checkpoints read as the mamba2 family")
+        raise ValueError(f"ssm_cfg layer {ssm.get('layer', 'Mamba1')!r} is neither Mamba2 nor Mamba3; only "
+                         "mamba_ssm's Mamba2 and Mamba3 checkpoints read (the mamba2 and mamba3 families)")
     for key, value in (("d_intermediate", 0), ("attn_layer_idx", []), ("rms_norm", True)):
         if config.get(key, value) != value:
             raise ValueError(f"{key}={config[key]!r}: transformers' Mamba2 port holds only Mamba2 layers "
