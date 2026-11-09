@@ -1717,7 +1717,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     eager memory transforms, and leaves its counters in the Grain state.
     """
     read = pipeline.mode or _preferred_read((pipeline,), provision=True)
-    loading = pipeline._loading or _DEFAULT_LOADING
+    loading = (pipeline._loading or _DEFAULT_LOADING).unsized()
     if records is not None:
         pipeline = pipeline._then(Limit(records))
         loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
@@ -1763,9 +1763,10 @@ def iterate(
     plan_version: int = PLAN_VERSIONS[-1],
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, read by data plan
-    `plan_version` (`compile`'s)."""
+    `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`)."""
     read_by(plan_version)
     pipeline = pipeline.at(plan_version)
+    loading = loading.unsized()
     if any(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
