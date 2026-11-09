@@ -4,8 +4,10 @@ and the two selectors, attention's (`ATTENTION`) and a decode step's (`DECODE`),
 `dew.nn.kernels.selection.select` evaluates while a program traces."""
 
 import dataclasses
+import functools
 import importlib
 import importlib.util
+import math
 
 import jax.numpy as jnp
 import numpy as np
@@ -179,10 +181,15 @@ class AttentionCase:
         instruction family and the kind of call, a 16-bit call's or an fp32 call's ('float32 attention'), each
         its forward and its training alike, as the kernel is chosen before the call is differentiated
         (`attention_route.attend`'s `custom_vjp`); a decode step's (`DECODE_DECLARED`, `decodes`) the
-        device's generation and 'decode' alike, as its kernels' speeds part by generation within a family."""
+        device's generation and 'decode' alike, as its kernels' speeds part by generation within a family.
+        An fp32 call longer than its receipts timed (`FP32_MEASURED`) is a cell of its own, which none
+        declares: a receipt is evidence for the shapes it measured alone, and past them the call takes the
+        template (row 5283)."""
         kind = 'attention' if self.dtype in CUDNN_DTYPES else f"{jnp.dtype(self.dtype).name} attention"
         if decodes(self):
             return device_generation(), kind.replace('attention', 'decode')
+        if self.dtype not in CUDNN_DTYPES and max(self.queries, self.keys) > FP32_MEASURED:
+            kind += f" past {FP32_MEASURED} tokens"
         return generation.family(device_generation()), kind
 
 
@@ -414,6 +421,14 @@ documents aligned to their last keys (splash's causality aligns to the first), a
 sequence axis. A call the measured ones turn down still runs when 'tpu' is named, on the pallas flash
 kernel with the call's mask, interpreted off a TPU."""
 
+_FITS = _Need('fits', lambda case: _dense_fits(case),
+              lambda case: f"jax.nn's xla attention holds the call's scores whole, {_dense_peak(case)} bytes "
+                           f"at once in a training step with its operands, past the "
+                           f"{generation.device_memory()} a device holds", row='5283')
+"""A differentiated call on jax.nn's xla attention ('xla', and 'inference''s training) fits a device's
+memory (`_dense_fits`): one that does not takes the template, its temporaries growing with the tokens, not
+their square (row 5283)."""
+
 XLA_SUPPORTS = (
     _Need('sinks', lambda case: not case.sinks, "jax.nn's attention has no sinks", row=INHERENT,
                 kind='handoff'),
@@ -445,9 +460,50 @@ XLA_SUPPORTS = (
           "XLA's CPU compiler has no float16 dot into float32 (F16_F16_F32), the algorithm jax.nn's "
           "attention names for a float16 query (`_dot_product_attention_core`), past its trace-time fallback",
           row=INHERENT, kind='handoff'),
+    _FITS,
 )
 """jax.nn's xla attention's requirements: the generic kernel, which hands what it cannot honour to
-the reference path."""
+the reference path, and refuses a call whose scores do not fit a device's memory (`_FITS`)."""
+
+
+def _dense_fits(case: AttentionCase) -> bool:
+    """Whether jax.nn's xla attention fits a device's memory for `case`: its training step's peak with its
+    operands, as Dew's footprint model derives it (`_dense_peak`), within the bytes a device holds
+    (`generation.device_memory`);
+    where the device states none (an assumed TPU), it fits. A training step's, as a call's kernel is chosen
+    before it is differentiated (`attention_route.attend`'s `custom_vjp`); the call's global shapes, a
+    device's share where no sharding splits them (a split call fits the more)."""
+    memory = generation.device_memory()
+    return memory is None or _dense_peak(case) <= memory
+
+
+def _dense_peak(case: AttentionCase) -> int:
+    """The most bytes jax.nn's xla attention holds at once in a training step of `case`: its temporaries'
+    peak beside its operands (`footprint.gradient_peak`, on the platform the call is chosen for; 12 to 13 a
+    score in fp32, its logits, weights and their cotangents), and the operands, the query, keys and values."""
+    return _dense_peak_of(case.rows, case.queries, case.heads, case.keys, case.kv_heads, case.head_dim,
+                          jnp.dtype(case.dtype).name, case.causal, generation.backend())
+
+
+@functools.cache
+def _dense_peak_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int, width: int, dtype: str,
+                   causal: bool, platform: str) -> int:
+    """`_dense_peak` of a call of these shapes, derived once a shape: the program traced over shapes alone,
+    a matrix product's workspace (MiBs) none beside its scores."""
+    import jax
+
+    from dew.training import footprint
+
+    query = jax.ShapeDtypeStruct((rows, queries, heads, width), dtype)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), dtype)
+
+    def loss(params):
+        with jax.softmax_custom_jvp(new_val=True):
+            return jax.nn.dot_product_attention(*params, is_causal=causal, implementation='xla'), ()
+
+    operands = (query, key, key)
+    peak = footprint.gradient_peak(loss, operands, (), platform=platform, workspace=footprint.Workspace(0, 0))
+    return peak.bytes + sum(math.prod(operand.shape) * jnp.dtype(dtype).itemsize for operand in operands)
 
 
 TEMPLATE_SUPPORTS = (
@@ -476,6 +532,12 @@ starts, block groups, sinks, a softcap, and probability dropout off a GPU or ove
 on a GPU or a TPU runs it by default, where its cell's declared old route does not take the call
 (`_attention_preferred`, `DECLARED`), and anywhere a call names it (`implementation='template'`, or
 `generation.chosen(attention='template')`)."""
+
+
+FP32_MEASURED = 1024
+"""The longest call DECLARED's fp32 receipts timed, its queries and its keys alike: a training step's
+attention at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100); a longer fp32 call is a cell none declares
+(`AttentionCase.cell`)."""
 
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
@@ -530,7 +592,8 @@ def _attention_preferred(case: AttentionCase) -> str:
     on every GPU, which hands a call it does not take to the next kernel by legality; splash on a TPU, until
     a receipt (CELLS-v5e) measures the template there (theme A10); xla on a CPU, which has no instruction
     family. A bias that varies by query (`AttentionCase.dense_bias`) trains on the template where it is
-    causal on warpgroup MMA alone, and elsewhere infers on it and trains on xla's attention ('inference'):
+    causal on warpgroup MMA alone, and elsewhere infers on it and trains on xla's attention ('inference')
+    where that fits a device (`_FITS`), else on the template too:
     the template's forward took 0.32 to 0.72 of xla's time on an H100 and 0.47 to 1.04 on an A100 in 22 to
     73% less memory, a table every row shares or one a row, causal and full; its training step 0.62 to 0.96
     causal on an H100, but 1.07 to 1.48 full there and 1.12 to 2.23 on an A100 (M-DD-8, W55-gh200 and
@@ -556,27 +619,16 @@ def _attention_preferred(case: AttentionCase) -> str:
         return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
             and not (case.causal and generation.gpu_target().architecture.wgmma)):
-        return 'inference'
+        # Its training xla's attention, where that fits (`_FITS`).
+        return 'inference' if _dense_fits(case) else 'template'
     if backend not in ('gpu', 'tpu'):
-        return 'xla' if _xla_scores_fit(case) else 'template'
+        # jax.nn's xla attention, the faster on a CPU (a training step's time 0.3 to 0.7 of the template's
+        # plain-JAX mainloop's at 4 x 256 x 4 x 32, 1 x 512 x 4 x 64, 2 x 1024 x 8 x 64 and 1 x 4096 x 8 x 64,
+        # 1.1 at 1 x 2048 x 3 x 32, et-cpuattn; row 4826 makes the mainloop competitive), where its scores
+        # fit (`_dense_fits`); else the template, whose temporaries grow with the tokens, not their square:
+        # the reference path after xla in the order holds them whole too.
+        return 'xla' if _dense_fits(case) else 'template'
     return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
-
-
-XLA_SCORE_BYTES = 12
-"""The temporaries jax.nn's xla attention holds a score in a CPU training step: its fp32 logits, weights and
-their cotangents, 12.5 MiB at 4 x 256 x 4 x 32 and 1544 MiB at 1 x 4096 x 8 x 64 (12.5 and 12.1 bytes a score,
-et-cpuattn at 7f128f431f), the template's plain-JAX mainloop 2.7 and 41.7 MiB."""
-
-
-def _xla_scores_fit(case: AttentionCase) -> bool:
-    """Whether a call on a CPU runs jax.nn's xla attention, the faster there (a training step's time 0.3 to
-    0.7 of the template's plain-JAX mainloop's at 4 x 256 x 4 x 32, 1 x 512 x 4 x 64, 2 x 1024 x 8 x 64 and
-    1 x 4096 x 8 x 64, 1.1 at 1 x 2048 x 3 x 32, et-cpuattn; row 4826 makes the mainloop competitive):
-    where its scores' temporaries (`XLA_SCORE_BYTES` a score) fit the device's memory, the host's physical
-    memory over its local devices, which share it; else the template, whose temporaries grow with the
-    sequence, not its square."""
-    scores = case.rows * case.heads * case.queries * case.keys
-    return scores * XLA_SCORE_BYTES <= generation.host_memory_share()
 
 
 def _hosted(kernel: str) -> str:
@@ -604,7 +656,7 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
         'spans_only', lambda case: not case.spans_only,
         "the call's visibility is spans alone, which a differentiated call's xla attention would build "
-        "densely: the template takes it", row=INHERENT))),
+        "densely: the template takes it", row=INHERENT), _FITS)),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,

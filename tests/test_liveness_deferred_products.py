@@ -260,7 +260,7 @@ where ptxas has consumed them)."""
 @pytest.mark.parametrize("launches", BACKWARD_LAUNCHES)
 def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward(launches):
     """The H100's backward of a causal attention 128 wide (the attention resource gate's case,
-    tests/test_attention_mosaic.py), whose products read each other (S, then P, then the value and key
+    tests/test_attention_mosaic_compile.py), whose products read each other (S, then P, then the value and key
     products), as one launch and as two: the pass's registers a thread (its lowered model) no more than
     ptxas's least spill-free cap for the launch checked. Holding every product of its body to its last read
     307 against ptxas's 247 (row 3154); the two-launch dQ's mask positions a register each 198 against 168
@@ -268,6 +268,7 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward(launches)
     import jax
     import jax.numpy as jnp
     import test_attention_mosaic as attention
+    import test_attention_mosaic_compile as compiled
     from fla_gdn_support import KernelCase
 
     from dew.nn.kernels import generation
@@ -285,12 +286,12 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward(launches)
         return grads.query, grads.key, grads.value
 
     accurate = False
-    op, ba, _ = attention._gated_backward("sm90", width, accurate, "none")
+    op, ba, _ = compiled._gated_backward("sm90", width, accurate, "none")
     # The pinned config of the launches asked for.
     tiles, launch = BACKWARD_LAUNCHES[launches]
     config = attention_mosaic.BackwardTiles(64, 64, 2, **tiles)
     with generation.assumed("sm90"), attention._pinned(backward=config):
-        models = attention._backward_models(op, ba, config)
+        models = compiled._backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
 
         def case(models: dict):
