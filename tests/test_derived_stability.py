@@ -50,7 +50,8 @@ FORMS = ["fast", "accurate"]
 
 ATTENTION_FAMILIES = [(name, dtype) for name in attention_suite.TEMPLATE_FAMILIES
                       for dtype in (None, "float16")]
-"""Each template family as drawn (None) and in fp16, the dtype the derived forward walks."""
+"""Each template family as drawn (None) and in fp16, the dtype the derived forward walks (`Family.retyped`:
+at fp16's own extremes where the family's values are a dtype's)."""
 
 
 @pytest.mark.parametrize("forms", FORMS)
@@ -61,7 +62,7 @@ def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name
     wherever the float64 truth rounded to their dtype is (`assert_finite`) over the family's draws (an
     anchor's, one key's and a masked query's among them), a row that sees nothing zero."""
     family = attention_suite.FAMILIES[name]
-    family = family if dtype is None else dataclasses.replace(family, dtype=dtype)
+    family = family if dtype is None else family.retyped(dtype)
     draw = attention_suite._cast(family, family.draw)
     truth = with_gradients(attention_suite._reference(family, anchored=True))
     label = f"portable derived {forms} {family.dtype} {name}"
