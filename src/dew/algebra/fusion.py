@@ -101,11 +101,10 @@ class Index:
     of the equations that read it), the values the body returns (`escaping`) and its constants' values where
     it holds them (`consts`): what the region finders read (`_regions`, `recognize.recognized`)."""
 
-    def __init__(self, jaxpr: jcore.Jaxpr | jcore.ClosedJaxpr):
+    def __init__(self, jaxpr: jcore.Jaxpr):
         self.jaxpr = jaxpr
-        values = jaxpr.consts if isinstance(jaxpr, jcore.ClosedJaxpr) else ()
-        held = len(values) == len(jaxpr.constvars)
-        self.consts = dict(zip(jaxpr.constvars, values, strict=True)) if held else {}
+        held = len(jaxpr.consts) == len(jaxpr.constvars)
+        self.consts = dict(zip(jaxpr.constvars, jaxpr.consts, strict=True)) if held else {}
         self.producer = {var: place for place, equation in enumerate(jaxpr.eqns) for var in equation.outvars}
         self.readers: dict[jcore.Var, set[int]] = collections.defaultdict(set)
         for place, equation in enumerate(jaxpr.eqns):

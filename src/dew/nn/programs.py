@@ -229,8 +229,8 @@ def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | Non
     params = {name: None if name in ("sharding", "out_sharding") else value for name, value in params.items()}
     body = params.get("call_jaxpr")
     with on_host():
-        if isinstance(body, jcore.ClosedJaxpr):
-            made = jax.core.eval_jaxpr(body.jaxpr, body.consts, *operands)
+        if isinstance(body, jcore.Jaxpr):
+            made = jcore.jaxpr_as_fun(body)(*operands)
         else:
             made = primitive.bind(*operands, **params)
     made = list(made) if primitive.multiple_results else [made]
@@ -239,7 +239,7 @@ def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | Non
 
 def _extended(value) -> bool:
     """Whether `value` is of an extended dtype (a PRNG key's)."""
-    return jax.dtypes.issubdtype(getattr(value, "dtype", None) or jnp.result_type(value), jax.dtypes.extended)
+    return jnp.issubdtype(getattr(value, "dtype", None) or jnp.result_type(value), jax.dtypes.extended)
 
 
 @contextlib.contextmanager

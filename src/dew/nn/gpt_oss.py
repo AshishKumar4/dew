@@ -3,8 +3,11 @@
 `dew.interop.codecs` reads and writes the MXFP4 checkpoints these experts ship in.
 """
 
+from __future__ import annotations
+
 import functools
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +32,9 @@ from dew.nn.moe import (
 )
 from dew.nn.precision import float32_dot_general, projection_role
 from dew.nn.sharding import declared
+
+if TYPE_CHECKING:
+    from dew.nn.kernels.gemm import NvFp4
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),
@@ -98,7 +104,7 @@ class GptOssExperts(nn.Module):
         return jnp.sum(slots * weights[..., None], axis=-2)
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
-                 parameters: tuple[jax.Array, jax.Array, jax.Array, jax.Array], *,
+                 parameters: tuple[jax.Array | NvFp4, jax.Array, jax.Array | NvFp4, jax.Array], *,
                  dtype: Dtype) -> jax.Array:
         # Each bias is added to its expert's rows' sums before their one rounding (`expert_projection`);
         # a slot of no expert, past the routed rows, comes back zero from the dispatch.
