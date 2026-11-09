@@ -321,6 +321,29 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
             assert handoffs.Schedule(WGMMA.roles(consumers).roles, floor=stated).registers() == roles
 
 
+@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budget_its_schedule_runs(
+        generation_name):
+    """A launch planned at its producer's stated registers (`resources.Launch.producer`, as the sm100 states
+    launch states 48) takes the programs a multiprocessor holds and the consumer budget its schedule runs at
+    that split (`Family.roles`), which the planner, the walk's schedule and the gate's register model all
+    read, so no decision holds a launch at the split it does not run."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    with generation.assumed(generation_name):
+        stated = 48
+        budget = WGMMA.roles(1, stated).registers()["consumer"]
+        launch = resources.Launch(lambda stages: resources.Scope(), 1, budget, floor=1, most=1,
+                                  producer=stated)
+        (plan,) = resources.plan([launch], WGMMA, generation.gpu_target(generation_name))
+        assert plan.programs == WGMMA.programs(1, budget, stated)
+        over = dataclasses.replace(launch, registers=budget + WGMMA.register_step)
+        assert resources.plan([over], WGMMA, generation.gpu_target(generation_name)) is None
+        model = resources.register_model(WGMMA, 1, budget, producer=stated)
+        assert (model.budget, model.producer) == (budget, stated)
+
+
 def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
     """A hand-off's barriers (`Schedule.scratch`) count the arrivals of the roles that fill and give it
     back: a signal two softmax warpgroups fill counts two, and an accumulator ring the product warp fills
