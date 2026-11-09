@@ -1204,6 +1204,19 @@ def _tgmm_tables_refused(tables: tuple, tiles: Tiles, family: mosaic.Family, *, 
                          f"gathered rows, rows-contiguous layout, step scales or dense call, not {tiles}'s")
 
 
+def depth_masked(prologue, tile, *sides):
+    """Dew: `prologue` of a stage `tile` and its side tiles, the last a vector over the depth of ones where
+    the call's depth runs and zeros past it (`grouped_matmul.MosaicGmm._aligned`'s, its padding), its result
+    zeroed past it: the padding's zeros go into the product as its own, where a prologue of them (a
+    reciprocal's infinities) would make NaNs of them."""
+    *own, valid = sides
+    transformed = prologue(tile, *own)
+    # The vector broadcast straight to the tile's shape, as a side vector's arithmetic broadcasts it: a
+    # `[1, depth]` reshape between took no layout Mosaic GPU infers ("Tiling rank different than broadcast
+    # result rank, (8,) vs (1, 64)", the GEMM compile gate's unaligned projection on sm90).
+    return jnp.where(valid > 0, transformed, jnp.zeros_like(transformed))
+
+
 def _gmm_refused(rhs, tiles: Tiles, extents: tuple, *, dense: bool, first, paired) -> None:
     """Dew: `gmm`'s refusal of a call its launch does not take: a dense product of several matrices, a stack
     read from its first matrix but a grouped product's of one, a paired matrix not its product's shape, or

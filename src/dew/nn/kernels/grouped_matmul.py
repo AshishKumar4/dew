@@ -1119,6 +1119,27 @@ class MosaicGmm(_Mosaic):
         # The least step its stage takes.
         return min(self.STEPS or family.depths(dtype))
 
+    def _aligned(self, ba):
+        # A prologue never sees the depth's padding: its result zeroed past the call's depth by a side vector
+        # over the depth (`mosaic_gpu.depth_masked`), bound with the padded call so its planner, its register
+        # model and its kernel stage the vector alike.
+        aligned = super()._aligned(ba)
+        hooks = aligned.arguments['hooks']
+        depth = self._padded_extents(ba).get('depth')
+        padded = self._padded_extents(aligned).get('depth')
+        if hooks.prologue is None or depth is None or depth == padded:
+            return aligned
+        abstract = isinstance(ba.arguments['tokens'], jax.ShapeDtypeStruct)
+        valid = (jax.ShapeDtypeStruct((padded,), jnp.float32) if abstract
+                 else (jnp.arange(padded) < depth).astype(jnp.float32))
+        masked = dataclasses.replace(
+            hooks, prologue=functools.partial(mosaic_gpu.depth_masked, hooks.prologue),
+            prologue_axes=(*hooks.prologue_axes, ('depth',)),
+            prologue_dtypes=(*hooks.prologue_dtypes, 'float32') if hooks.prologue_dtypes else (),
+            prologue_broadcast=(*hooks.prologue_broadcast, ()) if hooks.prologue_broadcast else ())
+        return type(aligned)(aligned.op, {**aligned.arguments, 'hooks': masked, 'prologue_operands': (
+            *aligned.arguments['prologue_operands'], valid)})
+
     def _padded_extents(self, ba) -> dict[str, int]:
         # A packed, step-scaled or block-scaled matrix's layout is its own: such a call is not padded.
         if self.STEPS is not None or self.STEP_SCALED or self.BLOCK_SCALED:
@@ -1273,7 +1294,7 @@ class MosaicGmm(_Mosaic):
                                        first, gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs,
                                        interpret=interpret, hooks=hooks, exact_sums=exact_sums,
                                        dense=dense)).arguments
-        tokens, kernel, paired = call['tokens'], call['kernel'], call.get('paired')
+        tokens, kernel, paired, hooks = call['tokens'], call['kernel'], call.get('paired'), call['hooks']
         prologue_operands, epilogue_operands = call['prologue_operands'], call.get('epilogue_operands', ())
         out, residuals = self._launched_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
                                              paired, first, gather, scatter, out_dtype=out_dtype,
