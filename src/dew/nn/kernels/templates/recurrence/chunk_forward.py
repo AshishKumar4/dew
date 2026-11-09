@@ -87,7 +87,7 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
 def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
-            family: mosaic.Family | None = None, interpret: bool = False, floor: float | None = None,
+            family: mosaic.Family | None = None, interpret: bool = False,
             rounded: bool = False, ranged: bool = False, skip=None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
@@ -100,20 +100,19 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     memory fp32. Without the `delta` rule nothing is corrected and each token writes its values gated by
     `beta` (the identity inverse: Mamba2's SSD through its rated decay's log gates, the gated linear
     attentions, GLA's with a decay a key dimension). Keys and values padded to whole blocks (`block_of`), at
-    any width whose launches the device holds (the template's legality, `template.planned`'s shared
-    memory and registers a launch). Its states and output launches take `tiles` (the template's config,
+    any width whose launches the device holds (the template's legality, `template.planned`'s shared memory and
+    registers a launch). Its states and output launches take `tiles` (the template's config,
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
-    where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
-    (`per_key_refusal`). A `rounded` call takes the run's fast forms' numbers: without the delta rule
-    (Mamba2's SSD, whose 16-bit numbers are mamba_ssm's) it passes its values between launches in the
-    operands' dtype, and an fp32 call's products take its operands as TF32 where its family's products take
-    them transposed (mma.sync's), else in `FAST_PARTS` bf16 parts (`prepared`, `_parts`). A `ranged` 16-bit
-    delta rule, whose form proves no bound on its chunk inverse, solves it at fp32's range (`_merged`). A
-    `skip` `[HV]` adds `D v` to the output of a call whose write gate takes the keys' side
+    where None), interpreted where `interpret`. A `rounded` call takes the run's fast forms' numbers: without
+    the delta rule (Mamba2's SSD, whose 16-bit numbers are mamba_ssm's) it passes its values between launches
+    in the operands' dtype, and an fp32 call's products take its operands as TF32 where its family's products
+    take them transposed (mma.sync's), else in `FAST_PARTS` bf16 parts (`prepared`, `_parts`). A `ranged`
+    16-bit delta rule, whose form proves no bound on its chunk inverse, solves it at fp32's range (`_merged`).
+    A `skip` `[HV]` adds `D v` to the output of a call whose write gate takes the keys' side
     (`Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
-                                 family=family, interpret=interpret, floor=floor, keeps=False,
+                                 family=family, interpret=interpret, keeps=False,
                                  rounded=rounded, ranged=ranged, skip=skip)
     return out, final
 
@@ -122,7 +121,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  max_segments: int | None = None,
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
-                 floor: float | None = None, keeps: bool = True,
+                 keeps: bool = True,
                  rounded: bool = False, ranged: bool = False,
                  skip=None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
@@ -142,7 +141,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     scans = (not keeps and g.ndim == 3 and jnp.dtype(dtype).itemsize == 2 and reads is not None
              and not reads.operands_in_registers)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
-                   tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps, firsts=firsts,
+                   tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, ranged=ranged, states=not scans)
     call, tiles = run.call, run.tiles
     out_dtype = jnp.float32 if wide else run.dtype
@@ -204,7 +203,7 @@ class _Run:
 
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
-             inverse=None, kept=None, floor: float | None = None, keeps: bool = True,
+             inverse=None, kept=None, keeps: bool = True,
              rounded: bool = False, ranged: bool = False, states: bool = True) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
@@ -258,8 +257,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # float64).
     held = given if delta or rounded else Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged,
-                factored=not per_key or (floor is not None and algebra.factored_range(floor)))
+                interpret, generation.gpu_target(), tiles.chunk, ranged=ranged)
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores, system = None, None, v, k, None, []

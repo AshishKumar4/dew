@@ -202,8 +202,8 @@ def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
         def rule(given):
             return template.mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta,
                                         given.state, tiles=tiles, family=family, delta=hooks.delta,
-                                        scale=given.key.shape[-1] ** -0.5, floor=hooks.floor,
-                                        bound=hooks.inverse_bound, rounded=True)
+                                        scale=given.key.shape[-1] ** -0.5, bound=hooks.inverse_bound,
+                                        rounded=True)
         return jax.jit(with_gradients(rule))
 
     assert_as_exact(on(mosaic_sm100.CHUNKS), on(mosaic_sm90.WGMMA), functools.partial(drawn, dtype,
@@ -230,7 +230,7 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
 
     def at(chunk):
         common = {'tiles': dataclasses.replace(tiles, chunk=chunk), 'family': bundle, 'interpret': True,
-                  'delta': hooks.delta, 'floor': hooks.floor, 'rounded': True}
+                  'delta': hooks.delta, 'rounded': True}
 
         def trained(given, cotangent):
             operands = (given.query, given.key, given.value, given.log_decay, given.beta, given.state)
