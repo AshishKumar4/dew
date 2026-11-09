@@ -1379,13 +1379,15 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
             "dew._cleanup.signal_group.", "dew._cleanup.exit_code.", "dew._cleanup.groups_ended.",
             "dew._cleanup.end_group.", "dew._cleanup.process_group.",
-            "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.",
-            "dew.telemetry.benchmark.resident_memory.")
+            "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
-representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals), or
-the kernel's own accounting of it (the pages it holds, `resident_memory`), which no work of the process
-orders or wakes: a region's high-water is sampled."""
+representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals)."""
+
+KERNEL_FILES = "/proc/"
+"""The kernel's own accounting of a process, read from its files (the pages it holds,
+/proc/self/smaps_rollup): outside the process as a subprocess is, no work of the process orders or wakes
+it, so a region's high-water of it is sampled."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
@@ -1708,14 +1710,16 @@ class _Calls:
 
 def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int, Mapping[str, str]],
             calls: _Calls, seen: set[int]) -> bool:
-    """Whether `function` deals with what leaves the process (`EXTERNAL`): what it runs names such
-    a module, or calls a function of the module (`_Calls`) that does."""
+    """Whether `function` deals with what leaves the process (`EXTERNAL`, `KERNEL_FILES`): what it runs
+    names such a module or reads such a file, or calls a function of the module (`_Calls`) that does."""
     seen.add(id(function))
     for node, scope in _executed_in(function.body, function):
         if isinstance(node, ast.Name | ast.Attribute):
             path = scopes.resolved(node, tables.get(id(node), {}))
             if path and f"{path}.".startswith(EXTERNAL):
                 return True
+        if isinstance(node, ast.Constant) and str(node.value).startswith(KERNEL_FILES):
+            return True
         if isinstance(node, ast.Call):
             for helper in calls.reached(scope, node):
                 if (isinstance(helper, ast.FunctionDef | ast.AsyncFunctionDef) and id(helper) not in seen
