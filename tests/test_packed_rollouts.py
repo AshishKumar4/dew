@@ -26,6 +26,8 @@ from dew.objectives.rl.sessions import (
     advantages,
     pack,
     packed_rows,
+    planned,
+    planned_rows,
     sampled_values,
     session_metrics,
 )
@@ -220,3 +222,21 @@ def test_group_advantages_match_hand_computed_values_across_uneven_groups():
     for index, value in enumerate(expected):
         mine = batch[SESSION_INDEX_KEY] == index
         np.testing.assert_allclose(batch[ADVANTAGES_KEY][mine], value, atol=1e-4)
+
+
+def test_groups_planned_apart_count_the_rows_their_batch_packs_in():
+    """Two groups planned one at a time (`planned`, as a scheduler admits them) count the rows their
+    sessions pack in together (`packed_rows`), their prompts shared: the second group's routing record lays
+    routing out for the whole batch, so its unrecorded chain's prompt id agrees with the first group's
+    unrecorded chain's, and the two share it, which planned apart under their own layouts they did not
+    (7, 6 and 6 of 10 ids need three rows, where 6 and 4 twice fill two)."""
+    def session(task, sample, prompt, tokens, routed=None):
+        call = Call(prompt, tokens, tuple(-0.1 for _ in tokens), "stop", 0, routed_experts=routed)
+        return Session(task, task, sample, 0, (call,), Status.COMPLETED, float(sample))
+
+    first = [session("t", 0, (1,), (2, 3, 4)), session("t", 1, (9,), (10, 11, 12, 13, 14))]
+    second = [session("u", 0, (1,), (5, 6, 7)),
+              session("u", 1, (20,), (21, 22, 23, 24, 25), np.ones((5, 2, 2), np.uint8))]
+    plans = [planned(first, 10, truncation="mask", share=True)]
+    plans.append(planned(second, 10, truncation="mask", share=True, first=len(plans[0].lengths)))
+    assert planned_rows(plans, 10) == packed_rows([*first, *second], 10, truncation="mask", share=True) == 3

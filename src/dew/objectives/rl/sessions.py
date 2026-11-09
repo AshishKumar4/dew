@@ -104,6 +104,10 @@ SUPPORT_COLUMNS_KEY = "support_columns"
 id whose support it belongs to; -1 on padding. A sampled id with no entry was
 drawn from the whole vocabulary."""
 
+Layout = Mapping[str, tuple[tuple[int, ...], np.dtype]]
+"""A batch's routing records laid out by their batch keys (`_layout`): each one's `[layers, top_k]`
+and dtype."""
+
 TRUNCATIONS = ("mask", "score", "zero")
 """What a `TRUNCATED` session trains on; see the module docstring."""
 ESTIMATORS = ("group", "mean", "rloo", "global")
@@ -652,17 +656,17 @@ def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Ch
     ]
 
 
-def _chain_rows(built: Sequence[_Chain]) -> tuple[list[list[int]], dict[str, list[np.ndarray]]]:
+def _chain_rows(built: Sequence[_Chain], layout: Layout | None
+                ) -> tuple[list[list[int]], dict[str, list[np.ndarray]]]:
     """Each chain's ids, and the per-token fields a shared prompt agrees on (`ForkedRows.pack`'s `fields`):
-    its sampled ids' chain, so no two chains share a sampled id, and its routing records where any call
-    recorded one, so a prompt shares only where its chains' engines routed it alike."""
+    its sampled ids' chain, so no two chains share a sampled id, and its routing records laid out by the
+    batch's `layout` (`_routed`), where any call of the batch recorded one, so a prompt shares only where
+    its chains' engines routed it alike: a chain that recorded none holds zeros, not routed."""
     # A sampled id is its chain's own: two chains of one session may sample alike after one prompt.
     sampled = [np.where(np.asarray(chain.calls) >= 0, number, -1).astype(np.int64)
                for number, chain in enumerate(built)]
     carried: dict[str, list[np.ndarray]] = {"sampled": sampled}
-    records = [chain.routing for chain in built if chain.routing is not None]
-    if records:
-        layout = _layout(records)
+    if layout is not None:
         for name in layout:
             carried[name] = []
         carried[ROUTED_KEY] = []
@@ -679,42 +683,64 @@ def _chain_rows(built: Sequence[_Chain]) -> tuple[list[list[int]], dict[str, lis
     return [list(chain.tokens) for chain in built], carried
 
 
-@dataclass(frozen=True)
+def _routed(built: Sequence[_Chain]) -> Layout | None:
+    """The routing layout of `built`'s recorded calls (`_layout`), None where no call recorded one."""
+    records = [chain.routing for chain in built if chain.routing is not None]
+    return _layout(records) if records else None
+
+
 class Planned:
     """Sessions' chains as `pack` lays them, read once (`planned`): each chain's length, and where their
-    prompts are shared each chain's token keys (`forked_rows.token_keys`), which a shared prefix compares.
-    A scheduler admitting group after group plans their rows from these (`planned_rows`), never building a
-    group's chains or keys again."""
+    prompts are shared the chains themselves, whose token keys (`forked_rows.token_keys`), which a shared
+    prefix compares, depend on the routing layout of the whole batch they are packed in (`_chain_rows`):
+    held for each layout they were planned under, so a scheduler admitting group after group builds a
+    group's keys once, and once more if a later group's records first lay routing out (`planned_rows`)."""
 
-    lengths: tuple[int, ...]
-    keys: tuple[list[bytes], ...] | None
+    def __init__(self, built: Sequence[_Chain], first: int, share: bool):
+        self.lengths = tuple(len(chain.tokens) for chain in built)
+        self.layout = _routed(built) if share else None
+        # Held for their keys alone, which a plan whose prompts are not shared never reads.
+        self._built = tuple(built) if share else ()
+        self._first, self.shared = first, share and bool(built)
+        self._keys: dict[tuple | None, tuple[list[bytes], ...]] = {}
+
+    def keys(self, layout: Layout | None) -> tuple[list[bytes], ...]:
+        """Each chain's token keys in a batch whose routing is laid out by `layout`, its sampled ids numbered
+        from the plan's `first`."""
+        held = None if layout is None else tuple(
+            (name, dims, np.dtype(dtype).str) for name, (dims, dtype) in sorted(layout.items()))
+        if held not in self._keys:
+            rows, carried = _chain_rows(self._built, layout)
+            carried["sampled"] = [np.where(chain >= 0, chain + self._first, chain)
+                                  for chain in carried["sampled"]]
+            self._keys[held] = tuple(
+                token_keys(np.asarray(row, np.int64), np.arange(len(row)),
+                           [carried[name][number] for name in carried])
+                for number, row in enumerate(rows))
+        return self._keys[held]
 
 
 def planned(sessions: Sequence[Session], width: int, *, truncation: str, share: bool = False,
             first: int = 0) -> Planned:
-    """`sessions`' chains under `truncation`, read for `planned_rows`: their keys only where `share`, each
-    chain's sampled ids its own as `pack` holds them (`_chain_rows`), numbered from `first`, so no chain of
-    another plan read with it shares one."""
-    built = _built(sessions, width, truncation)
-    if not built or not share:
-        return Planned(tuple(len(chain.tokens) for chain in built), None)
-    rows, carried = _chain_rows(built)
-    carried["sampled"] = [np.where(chain >= 0, chain + first, chain) for chain in carried["sampled"]]
-    return Planned(tuple(len(row) for row in rows), tuple(
-        token_keys(np.asarray(row, np.int64), np.arange(len(row)),
-                   [carried[name][number] for name in carried])
-        for number, row in enumerate(rows)))
+    """`sessions`' chains under `truncation`, read for `planned_rows`: their chains held for their keys only
+    where `share`, each chain's sampled ids its own as `pack` holds them (`_chain_rows`), numbered from
+    `first`, so no chain of another plan read with it shares one."""
+    return Planned(_built(sessions, width, truncation), first, share)
 
 
 def planned_rows(plans: Sequence[Planned], width: int) -> int:
     """How many `width`-id rows `pack` fills with the chains of `plans` together, their groups' prompts
-    shared where they were read to be (`planned`)."""
+    shared where they were read to be (`planned`), each group's keys under the routing layout of them all, as
+    `pack` lays them."""
     lengths = [length for plan in plans for length in plan.lengths]
     if not lengths:
         return 0
-    shared = [plan.keys for plan in plans if plan.keys is not None]
-    keys = None if not shared else [key for held in shared for key in held]
-    return windows_needed(lengths, width, keys=keys)
+    shared = [plan for plan in plans if plan.shared]
+    if not shared:
+        return windows_needed(lengths, width, keys=None)
+    layouts = [plan.layout for plan in shared if plan.layout is not None]
+    layout = _merged(layouts) if layouts else None
+    return windows_needed(lengths, width, keys=[key for plan in shared for key in plan.keys(layout)])
 
 
 def packed_rows(sessions: Sequence[Session], width: int, *, truncation: str, share: bool = False) -> int:
@@ -786,7 +812,7 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     for chain in built:
         trainable[chain.session] += sum(1 for call in chain.calls if call >= 0)
     if built:
-        chained, carried = _chain_rows(built)
+        chained, carried = _chain_rows(built, _routed(built))
         needed = ForkedRows.needed(chained, width, share=share, fields=carried)
         if rows is not None and needed > rows:
             raise ValueError(f"the chains need {needed} rows of {width} ids, more than the {rows} asked for")
@@ -883,8 +909,7 @@ def _routing_keys(record: np.ndarray | Mapping[str, np.ndarray]) -> list[tuple[s
     return [(ROUTED_EXPERTS_KEY, record)]
 
 
-def _empty_routing(shape: tuple[int, int], layout: Mapping[str, tuple[tuple[int, ...], np.dtype]]
-                   ) -> dict[str, np.ndarray]:
+def _empty_routing(shape: tuple[int, int], layout: Layout) -> dict[str, np.ndarray]:
     """The routing record's empty form over packed rows of `shape`: under each of `layout`'s keys (one
     a routed site where the records are keyed by site, `ROUTED_EXPERTS_KEY`), expert ids of zero
     `[*shape, layers, top_k]` in the engines' dtype, and `routed` false, which the trainer reads as
@@ -893,21 +918,26 @@ def _empty_routing(shape: tuple[int, int], layout: Mapping[str, tuple[tuple[int,
             ROUTED_KEY: np.zeros(shape, bool)}
 
 
-def _layout(records: Sequence[Routing]) -> dict[str, tuple[tuple[int, ...], np.dtype]]:
+def _layout(records: Sequence[Routing]) -> Layout:
     """The `[layers, top_k]` and dtype of the calls' routing records by their batch keys
-    (`_routing_keys`), which every call's must agree on: their sites, and each site's."""
-    keyed = [dict(_routing_keys(record)) for record in records]
-    names = {tuple(sorted(arrays)) for arrays in keyed}
+    (`_routing_keys`), which every call's must agree on: their sites, and each site's (`_merged`)."""
+    return _merged([{name: (array.shape[1:], array.dtype) for name, array in _routing_keys(record)}
+                    for record in records])
+
+
+def _merged(layouts: Sequence[Layout]) -> Layout:
+    """The one layout `layouts` agree on: the same sites, each of one `[layers, top_k]`, in the dtype that
+    holds them all."""
+    names = {tuple(sorted(layout)) for layout in layouts}
     if len(names) != 1:
         raise ValueError(f"routed_experts disagree on their routed sites across calls: {sorted(names)}")
 
     def held(name: str) -> tuple[tuple[int, ...], np.dtype]:
-        arrays = [arrays[name] for arrays in keyed]
-        dims = {array.shape[1:] for array in arrays}
+        dims = {layout[name][0] for layout in layouts}
         if len(dims) != 1:
             raise ValueError(f"routed_experts disagree on [layers, top_k] across calls at {name}: "
                              f"{sorted(dims)}")
-        return dims.pop(), np.result_type(*arrays)
+        return dims.pop(), np.result_type(*(layout[name][1] for layout in layouts))
 
     return {name: held(name) for name in names.pop()}
 
