@@ -18,6 +18,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
+import itertools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import NamedTuple
@@ -42,6 +43,7 @@ from dew.training.compiled_program import (
     bitcast,
     cublas_product,
     deviceless,
+    dimensions,
     lowering_platform,
     simplified,
 )
@@ -340,11 +342,19 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     value is one buffer from its initial value, where that is a buffer of the program's the loop reads
     last, to its result, its body's returned value of it among them (`carry`; `carried`, the values
     `program`, a loop's body, returns into it). With `consumed`, an output is held while the equation
-    that makes it runs, as an update that reads it there holds it (`gradient_peak`). No schedule XLA
-    picks is modelled: a compile confirms."""
+    that makes it runs, as an update that reads it there holds it (`gradient_peak`). The step's own
+    program (not a loop's body) holds besides each copy of an input its products read laid out for them
+    from the first such product to the last (`laid_copies`), and on a GPU each product the operands it
+    may be made beside (`siblings`). No schedule XLA picks is modelled: a compile confirms."""
     frontier = Frontier(program, platform, returned=True)
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
+    # The copies of the step's inputs its products read laid out for them (`laid_copies`), each held
+    # from its first reader to its last, and on a GPU the siblings a product's operands are made beside
+    # (`siblings`): the step's own program's, whose parameters' layouts are fixed, not a loop's body's.
+    entry = slicing is None and not carried
+    beside, spans, spanned = siblings(frontier, program) if entry and platform == "gpu" else ({}, [], {})
+    copies = [*laid_copies(frontier, program), *spans] if entry else []
     if consumed:
         # The program's outputs are read where they are made, by an update that writes the buffers the
         # state donates (the optimizer's, or the accumulator's): each is held while its equation runs.
@@ -356,6 +366,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     sliced = (slicing or Slicing()).within(program)
     live, held, most = 0, set(), 0
     for index, equation in enumerate(program.eqns):
+        live += sum(size for first, _, size in copies if first == index)
         made = [out for out in equation.outvars
                 if out in last and frontier.buffered(out) and out not in carried]
         made_bytes = sum(map(device_share, made))
@@ -364,8 +375,9 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
                                     returned_carry(equation, body)) for body in bodies(equation)), default=0)
-            made_for = unfused(frontier, equation)
-            operands = sum(map(device_share, made_for))
+            # An operand made beside an earlier product's is held from there (`siblings`), not made here.
+            made_for = unfused(frontier, equation) - spanned.get(index, set())
+            operands = sum(map(device_share, made_for)) + beside.get(index, 0)
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
@@ -381,7 +393,124 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
             live -= device_share(done)
+        live -= sum(size for _, ended, size in copies if ended == index)
     return most
+
+
+def input_of(frontier: Frontier, value) -> jcore.Var | None:
+    """The program input `value` is, or is a bitcast of (`bitcast`: its storage, in its memory order);
+    None for any other value."""
+    while computed(value) and value not in frontier.inputs:
+        equation = frontier.producers.get(value)
+        if equation is None or not bitcast(equation):
+            return None
+        value = equation.invars[0]
+    return value if computed(value) else None
+
+
+def product_order(operand: jcore.Var, contracting: Sequence[int],
+                  batch: Sequence[int]) -> tuple[int, ...] | None:
+    """The order of `operand`'s dimensions a product reading it with these `contracting` and `batch`
+    dimensions reads it in where its storage, row-major, is not one its GEMM takes: its batch, its free
+    and its contracting dimensions, each group as the product orders it and dimensions of one element in
+    none (XLA's dot canonicalization, `DotDecomposer`). A GEMM takes its operand's groups stored batch,
+    rows, columns; batch, columns, rows; rows, batch, columns; or columns, batch, rows (`MatrixLayout::For`,
+    xla/service/gpu/matmul_utils.cc), which layout assignment keeps (`SetDotOperandLayout`); None where it
+    is one of those."""
+    shape = dimensions(operand)
+    free = [axis for axis in range(len(shape)) if axis not in contracting and axis not in batch]
+
+    def order(*groups: Sequence[int]) -> tuple[int, ...]:
+        return tuple(axis for group in groups for axis in group if shape[axis] != 1)
+
+    taken = [order(batch, free, contracting), order(batch, contracting, free),
+             order(free, batch, contracting), order(contracting, batch, free)]
+    return None if order(range(len(shape))) in taken else taken[0]
+
+
+def laid_copies(frontier: Frontier, program: jcore.Jaxpr) -> list[tuple[int, int, int]]:
+    """The copies of `program`'s inputs its products read laid out for them, each `(first, last, bytes)`:
+    an input, or a bitcast of one, whose storage a product cannot read in the order it takes
+    (`product_order`) is copied into that order, which layout assignment fixes for a parameter as it
+    stands (xla/service/layout_assignment.cc), one copy for every product that takes it in that order,
+    made before the first of them and held to the last (two products reading one input's copy share it:
+    an attention's keys read by its scores' product and its queries' gradient, an H100's compile)."""
+    spans: dict[tuple, list[int]] = {}
+    for index, equation in enumerate(program.eqns):
+        if named(equation.primitive) != "dot_general":
+            continue
+        (contracted, batched) = equation.params["dimension_numbers"]
+        for operand, contracting, batch in zip(equation.invars[:2], contracted, batched, strict=True):
+            source = input_of(frontier, operand)
+            if source is None or not isinstance(operand, jcore.Var):
+                continue
+            taken = product_order(operand, contracting, batch)
+            if taken is not None:
+                key = (source, dimensions(operand), taken)
+                spans.setdefault(key, [index, index, device_share(operand)])[1] = index
+    return [(first, ended, size) for first, ended, size in spans.values()]
+
+
+def siblings(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int], list[tuple[int, int, int]],
+                                                                   dict[int, set]]:
+    """What XLA's GPU multi-output fusion may make together of `program`'s products' operands: two fused
+    values of one element count, each made for its own product's read (`unfused`), read from storage
+    both read (`Frontier.roots`, an input's among it) and neither computed from the other through any
+    path (`CanFuseSiblings`), are siblings XLA may fuse into one fusion writing both (`FuseSiblings`,
+    xla/backends/gpu/transforms/multi_output_fusion.cc), its cost model deciding. The fusion runs once
+    both are ready: where that is before the earlier product, the later product's operand is made there
+    and held from the earlier product to its own (a span, `(first, last, bytes)`, and that operand no
+    longer made for its read, by product); where it is not, the earlier product waits on it, and the
+    later holds the earlier's operand beside its own (bytes, by product). An attention's gradient on an
+    H100 held its probabilities in bf16, for its values' gradient, beside its scores' cotangent, both
+    made from its scores (2 x 2048 tokens, 4 heads over 1, 0.41 GB compiled against 0.34 derived without
+    it). Taken wherever the fusion is possible, so a peak it makes holds where XLA fuses them."""
+    made = {index: unfused(frontier, equation) for index, equation in enumerate(program.eqns)
+            if not frontier.fusing(equation)}
+    position = {out: index for index, equation in enumerate(program.eqns) for out in equation.outvars}
+
+    def computed_from(value, other) -> bool:
+        """Whether `value` is computed from `other` through any equation."""
+        seen, pending = set(), [value]
+        while pending:
+            equation = frontier.producers.get(pending.pop())
+            for read in [] if equation is None else equation.invars:
+                if computed(read) and read not in seen:
+                    if read is other:
+                        return True
+                    seen.add(read)
+                    pending.append(read)
+        return False
+
+    def ready(*values) -> int:
+        """The index past which every value the storage `values` read is made."""
+        return max((position.get(root, -1) for value in values for root in frontier.roots([value])),
+                   default=-1)
+
+    def sibling(left, right) -> bool:
+        common = frontier.roots([left]) & frontier.roots([right])
+        return (math.prod(dimensions(left)) == math.prod(dimensions(right))
+                and any(math.prod(dimensions(stored)) > 1 for stored in common)
+                and not computed_from(left, right) and not computed_from(right, left))
+
+    beside: dict[int, set] = {}
+    first: dict = {}
+    for later, values in made.items():
+        for earlier, others in made.items():
+            for other, value in itertools.product(others - values, values):
+                if earlier >= later or not sibling(value, other):
+                    continue
+                if ready(value, other) < earlier:
+                    # Made before the earlier product, beside its operand, and held to its own reader.
+                    first[value] = min(first.get(value, earlier), earlier)
+                else:
+                    beside.setdefault(later, set()).add(other)
+    # A product reading an operand before the fusion that makes it beside its sibling makes its own.
+    spanned = {index: kept for index, values in made.items()
+               if (kept := {value for value in values & first.keys() if index >= first[value]})}
+    last = {value: index for index, values in sorted(spanned.items()) for value in values}
+    return ({later: sum(map(device_share, others)) for later, others in beside.items()},
+            [(first[value], last[value], device_share(value)) for value in first], spanned)
 
 
 def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
