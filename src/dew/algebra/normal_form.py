@@ -17,13 +17,15 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import core as jax_core
 from jax.extend import core as jcore
 
 from dew.algebra import terms
+from dew.algebra.forms import aval
 from dew.nn.programs import host_evaluated, jax_name, on_host
 
 
-def canonical(closed: jcore.ClosedJaxpr) -> jcore.ClosedJaxpr:
+def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
     """`closed` as recognition compares it: its nested programs inlined (a jit, a closed call, a custom
     derivative's primal), each equation in its normal form (`_normal`: a square a product, a narrow float's
     arithmetic its float32 arithmetic rounded once), each value it makes from no input computed into a
@@ -32,7 +34,7 @@ def canonical(closed: jcore.ClosedJaxpr) -> jcore.ClosedJaxpr:
     the same booleans), and each equation that repeats another's primitive, parameters and operands, and
     holds no effect, read as that one."""
     flat = jax.make_jaxpr(functools.partial(_evaluated, closed.jaxpr, closed.consts))(
-        *(jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in closed.jaxpr.invars))
+        *(jax.ShapeDtypeStruct(aval(var).shape, aval(var).dtype) for var in closed.jaxpr.invars))
     jaxpr = flat.jaxpr
     local: dict[jcore.Var, jcore.Var | jcore.Literal] = {
         var: jcore.Literal(np.asarray(value), var.aval) for var, value in zip(jaxpr.constvars, flat.consts,
@@ -53,7 +55,7 @@ def canonical(closed: jcore.ClosedJaxpr) -> jcore.ClosedJaxpr:
             seen[named] = list(equation.outvars)
         equations.append(equation)
     outvars = [read(atom) for atom in jaxpr.outvars]
-    return jcore.ClosedJaxpr(jaxpr.replace(constvars=[], eqns=_live(equations, outvars), outvars=outvars), [])
+    return jcore.Jaxpr(jaxpr.replace(constvars=[], eqns=_live(equations, outvars), outvars=outvars), [])
 
 
 def _live(equations: list[jcore.JaxprEqn], outvars: list) -> list[jcore.JaxprEqn]:
@@ -126,16 +128,15 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
         operands = [read(atom) for atom in equation.invars]
         body = equation.params.get(BODY_PARAMS.get(equation.primitive.name, ""))
         if body is not None:
-            closed = body if isinstance(body, jcore.ClosedJaxpr) else jcore.ClosedJaxpr(body, ())
-            given = operands[len(operands) - len(closed.jaxpr.invars):]
-            outputs = _evaluated(closed.jaxpr, closed.consts, *given, forms=forms)
+            given = operands[len(operands) - len(body.invars):]
+            outputs = _evaluated(body, body.consts, *given, forms=forms)
         else:
             # A value of constants alone is computed where it is made, so the program and a declaration
             # hold one constant (a mean of zeros, a mask of iotas) however each built it: of the equations
             # such a constant is built from (`FOLDED`), on this host, never one that places a program on a
             # mesh, which binds as traced. An equation over a traced value stays traced; the constants its
             # normal form builds beside it (a broadcast divisor) are computed.
-            traced = any(isinstance(value, jax.core.Tracer) for value in operands)
+            traced = any(isinstance(value, jax_core.Tracer) for value in operands)
             folded = None if traced or jax_name(equation.primitive) not in FOLDED else host_evaluated(
                 equation.primitive, operands, equation.params)
             if folded is not None:
@@ -194,10 +195,10 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
     name = jax_name(equation.primitive)
     if name in VALUE_IDENTITIES:
         return list(operands)
-    if name == "sub" and _zero(operands[1]) and jnp.shape(operands[0]) == equation.outvars[0].aval.shape:
+    if name == "sub" and _zero(operands[1]) and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape:
         return [operands[0]]
     if (name in ("div", "mul") and _one(operands[1])
-            and jnp.shape(operands[0]) == equation.outvars[0].aval.shape):
+            and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape):
         return [operands[0]]
     if name in ("broadcast_in_dim", "reshape"):
         return [_laid(equation, operands[0], laid)]
@@ -217,7 +218,7 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
         if narrow is not None and jnp.result_type(operands[0]) == jnp.float32:
             return [_converted(_converted(operands[0], narrow, widened), operands[0].dtype, widened)]
     if name in ROUNDED_ONCE and len(equation.outvars) == 1 and any(map(_uniform, operands)):
-        shape = equation.outvars[0].aval.shape
+        shape = aval(equation.outvars[0]).shape
         if all(_uniform(value) or jnp.shape(value) == shape for value in operands):
             # A constant of one value throughout reads, element by element, as that value: the equation over
             # the scalar computes the same elements, so a mean's divisor held as an array is its scalar's.
@@ -226,7 +227,7 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
                 return _normal(equation, scalars, widened, laid)
     if name == "dot_general":
         return [equation.primitive.bind(*operands, **_stated(equation.params, operands))]
-    out = equation.outvars[0].aval.dtype if len(equation.outvars) == 1 else None
+    out = aval(equation.outvars[0]).dtype if len(equation.outvars) == 1 else None
     if name in ROUNDED_ONCE and out in NARROW and all(jnp.result_type(value) == out for value in operands):
         wide = [_converted(value, jnp.float32, widened) for value in operands]
         return [_converted(equation.primitive.bind(*wide, **equation.params), out, widened)]
@@ -273,7 +274,7 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
     name = jax_name(equation.primitive)
     if len(equation.outvars) != 1 or not (name in UNIT_ERASED or name in ELEMENTWISE):
         return None
-    out = equation.outvars[0].aval
+    out = aval(equation.outvars[0])
     shapes = [jnp.shape(value) for value in operands]
     if 1 not in out.shape and not any(1 in shape for shape in shapes):
         return None
@@ -348,7 +349,7 @@ def _beside(value) -> contextlib.AbstractContextManager:
     """Where an operation on `value` runs: a constant's on this host (`programs.on_host`), a constant a normal
     form builds beside a traced equation computed where nothing places it on the trace's mesh (a
     compile-only GPU's, whose devices run nothing here); a traced value's in its trace."""
-    return contextlib.nullcontext() if isinstance(value, jax.core.Tracer) else on_host()
+    return contextlib.nullcontext() if isinstance(value, jax_core.Tracer) else on_host()
 
 
 def _squeeze(value, squeezed: _Made):
@@ -360,7 +361,7 @@ def _squeeze(value, squeezed: _Made):
     if value in squeezed:
         return squeezed[value]
     target = tuple(size for size in shape if size != 1)
-    made = (np.reshape(np.asarray(value), target) if not isinstance(value, jax.core.Tracer)
+    made = (np.reshape(np.asarray(value), target) if not isinstance(value, jax_core.Tracer)
             else jax.lax.reshape(value, target))
     squeezed[value] = made
     return made
@@ -373,7 +374,7 @@ def _unit_round_trip(equation: jcore.JaxprEqn, operands: list, squeezed: _Made) 
     if jax_name(equation.primitive) != "reshape" or equation.params.get("dimensions") is not None:
         return None
     core = squeezed.get(operands[0])
-    return [core] if core is not None and jnp.shape(core) == equation.outvars[0].aval.shape else None
+    return [core] if core is not None and jnp.shape(core) == aval(equation.outvars[0]).shape else None
 
 
 def _unsqueezed(core, shape: tuple[int, ...], squeezed: _Made):
@@ -397,7 +398,7 @@ wherever a layout puts them)."""
 def _uniform(value) -> bool:
     """Whether `value` is a constant (computed, `_evaluated`) of more than one element, all one value bit for
     bit (a zero's sign among its bits)."""
-    if isinstance(value, jax.core.Tracer) or jnp.ndim(value) == 0:
+    if isinstance(value, jax_core.Tracer) or jnp.ndim(value) == 0:
         return False
     held = np.ascontiguousarray(value)
     if not held.size:
@@ -414,13 +415,13 @@ def _scalar(value) -> np.ndarray:
 def _one(value) -> bool:
     """Whether `value` is a constant (computed, `_evaluated`) of ones alone: `x / 1` and `x * 1` are `x` for
     every `x`, its sign, infinities and NaNs among them."""
-    return not isinstance(value, jax.core.Tracer) and bool(np.all(np.asarray(value) == 1))
+    return not isinstance(value, jax_core.Tracer) and bool(np.all(np.asarray(value) == 1))
 
 
 def _zero(value) -> bool:
     """Whether `value` is a constant (computed, `_evaluated`) of positive zeros alone: `x - 0` is `x` for
     every `x`, where `x - (-0)` makes a negative zero positive."""
-    if isinstance(value, jax.core.Tracer):
+    if isinstance(value, jax_core.Tracer):
         return False
     held = np.asarray(value)
     return not np.any(held) and not np.any(np.signbit(held))
@@ -429,7 +430,7 @@ def _zero(value) -> bool:
 def _laid(equation: jcore.JaxprEqn, value, laid: _Made):
     """A broadcast's or a reshape's result, a reshape that only adds unit axes written as the broadcast it
     is, recorded in `laid` by its source and layout (`_lifted`)."""
-    shape = equation.outvars[0].aval.shape
+    shape = aval(equation.outvars[0]).shape
     if jax_name(equation.primitive) == "reshape":
         ordered = equation.params.get("dimensions") is None
         dimensions = _unit_axes(jnp.shape(value), shape) if ordered else None
@@ -438,7 +439,7 @@ def _laid(equation: jcore.JaxprEqn, value, laid: _Made):
     else:
         dimensions = tuple(equation.params["broadcast_dimensions"])
     made = jax.lax.broadcast_in_dim(value, shape, dimensions)
-    if made is not value and isinstance(made, jax.core.Tracer):
+    if made is not value and isinstance(made, jax_core.Tracer):
         laid[made] = (value, (shape, dimensions))
     return made
 
