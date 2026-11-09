@@ -240,6 +240,7 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
                                   "indexer_compress_ratio": 2}, {}),
                "mamba2": ({"num_heads": 8, "head_dim": 32, "state_size": 32, "n_groups": 4,
                            "chunk_size": 64}, {}),
+               "mamba3": ({"head_dim": 16, "state_size": 16, "chunk_size": 16}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
                                     "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {}),
                "memory": ({"memory": InContextMemory(
@@ -261,7 +262,8 @@ REFUSED = {"kpool_sparse_attention"}
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
-         "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
+         "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
+         "mla": 64,
          "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
 fewest for which documents run alone compared with themselves resolve PARITY in every logit and parameter
@@ -279,7 +281,8 @@ attention runs 8 heads of 16 in 64-token chunks (`KIND_FIELDS`): at the model's 
 channels, the reference compared with itself did not resolve within 512 seeds (2048 at 8); at 8 or 16
 heads of 16, or 4 of 64, it resolves at 64. Kimi delta attention's 64 are sized paired (`seeds_for` with
 the packed row as its Dew arm, on armada, ledger 2828): compared with themselves its documents alone take
-512."""
+512. Mamba-3's 512 are sized paired too: compared with themselves its documents alone do not resolve its B
+and C biases' and norms' gradients within 512."""
 
 
 SHARDED = {"gated_delta_net", "kimi_delta_attention", "mamba2", "memory"}
@@ -460,7 +463,7 @@ KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 
 """Layer fields a kind needs to build at all, beyond the test's context."""
 
 ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "lightning_attention", "mamba", "mamba2",
-                  "memory", "short_conv"}
+                  "mamba3", "memory", "short_conv"}
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 

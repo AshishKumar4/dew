@@ -21,10 +21,10 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import pytest
 from gpu_flow import cell
+from interop_support import token_draw
 from kernel_matrix import AXES
 from reference_error import as_given, assert_as_exact
 
@@ -129,9 +129,8 @@ def _run(case: tuple[tuple[str, str], ...], copies: bool, dtype: str | None = No
     return run
 
 
-def _drawn(seed: int) -> tuple[np.ndarray]:
-    """A seed's batch of tokens, clear of the pad id."""
-    return (np.random.default_rng([2184, seed]).integers(1, VOCAB, (ROWS, LENGTH)).astype(np.int32),)
+_drawn = token_draw(2184, VOCAB, (ROWS, LENGTH), low=1)
+"""A seed's batch of tokens, clear of the pad id."""
 
 
 @cell("narrow_copies", covers=lambda case: dict(zip(AXES["narrow_copies"], case, strict=True)))

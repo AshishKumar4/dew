@@ -335,6 +335,15 @@ cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
 
 
+def unintercepted[**Arguments, Result](function: Callable[Arguments, Result]) -> Callable[Arguments, Result]:
+    """`function` run with a quantization provider's interception off, where Qwix is loaded (its
+    `disable_interceptions`, qwix/_src/interception.py): a trace of Dew's own, a derivation's declaration
+    (`dew.algebra.derive`) or a quantized attention's backward, whose products are no model's for a
+    rule to quantize. `function` itself where no provider can intercept."""
+    interception = sys.modules.get("qwix._src.interception")
+    return function if interception is None else interception.disable_interceptions(function)
+
+
 INTERCEPTED = jax.make_user_context(default_value=False)
 """Whether Dew installed a layer interceptor in this trace: adapters, input QDQ and Qwix retain
 their individual projection calls. This is independent of Qwix's arithmetic trace key above."""

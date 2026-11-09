@@ -604,7 +604,8 @@ def test_a_fetched_step_called_in_another_trace_context_runs_that_contexts_progr
     """A fetched step (`Fetched`) keeps an executable for each trace context it is called in, as the program
     compiles one for each: a step first run in float32 and then with 64-bit types on runs the program that
     context traces (its default float the wider one), not the executable it fetched first."""
-    widened = Fetched(owned_program(lambda x: jnp.asarray(x, jnp.float_) * 3.0))
+    # `float`, the default float: float32 with x64 off, float64 with it on (no float64 asked for).
+    widened = Fetched(owned_program(lambda x: jnp.asarray(x, float) * 3.0))
     narrow = jnp.ones(3, jnp.float32)
     assert widened(narrow).dtype == jnp.float32
     with jax.enable_x64(new_val=True):

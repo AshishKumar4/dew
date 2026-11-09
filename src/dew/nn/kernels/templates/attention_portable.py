@@ -34,6 +34,7 @@ from dew.nn.kernels.templates.attention import (
     by_power,
     gradients,
     interpreted_dot,
+    interpreted_rows,
     key_tiles,
     padded_call,
     prescaled,
@@ -228,13 +229,18 @@ def xla_mainloop(config: Tiles, query: jax.Array, key: jax.Array, value: jax.Arr
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
     # fold its logits' reach (`algebra.walked`).
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None, scale, hooks.score_mod,
-                           natural, algebra.headroom(value.dtype), hooks.initial is not None,
-                           compensated=algebra.compensates(value.dtype), prescale=power)
-    if not residuals:
+                           natural, hooks.rounds is None and algebra.headroom(value.dtype),
+                           hooks.initial is not None, compensated=algebra.compensates(value.dtype),
+                           prescale=power, rounds=hooks.rounds)
+    # A quantized call's weights round at each row's maximum, which its training walk finds first
+    # (`attention_program.walk`), its residuals let go where the call keeps none.
+    if not residuals and hooks.rounds is None:
         out, _ = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k, residuals=False)
         return out[:, :queries, :, :value_width]
     out, (m, denominator, anchors, split) = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k,
                                                         residuals=True)
+    if not residuals:
+        return out[:, :queries, :, :value_width]
     sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
                  split.others_total[:, :, :queries], split.shift[:, :, :queries])
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
@@ -347,7 +353,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         else:
             # The forward took the first pass (`gradient.split_delta`).
             anchor, delta, chosen = gradient.split_delta(others, own, others_total, prior, state_total,
-                                                        anchor_rows, do, chosen, shifts)
+                                                        anchor_rows, do, chosen, shifts,
+                                                        rows=interpreted_rows)
             if not split:
                 # D without the forward's split sums: the dQ launch's own pass over the keys.
                 def logits_of(j):
@@ -357,7 +364,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 walked = attention_program.off_anchor_pass(lo, hi, logits_of, before, maxima, chosen, shifts,
                                                            how, interpreted_dot)
                 first = gradient.off_anchor_delta(walked, anchor_rows, do, state_total, mean0,
-                                                 key_index[row, head, rows], shifts)
+                                                 key_index[row, head, rows], shifts, rows=interpreted_rows)
                 kept = shifts < 0
                 prior = jnp.where(kept, prior, algebra.power2(walked.total, shifts))
                 anchor, delta, chosen = (jnp.where(kept, ours, theirs)
@@ -594,7 +601,7 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
         values = jnp.swapaxes(anchor_value, 1, 2)
         anchor, delta, chosen = gradient.split_delta(others, own, others_total, forward_total, state_total,
                                                     values, jnp.swapaxes(dout, 1, 2).astype(jnp.float32),
-                                                    key_index, shift)
+                                                    key_index, shift, rows=interpreted_rows)
         dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
                                    spans, score_mod=score_mod, scale=scale, prescale=prescale,
                                    grad_scale=scale * prescale, how=how, block_q=block_q, block_k=block_k)

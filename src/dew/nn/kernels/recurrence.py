@@ -90,9 +90,7 @@ class Hooks:
     `rated`: the write gate times the head's `rate` (Mamba's discretization, `A dt` with `dt` the
     write gate), a value kind defined on a contraction, `rate <= 0` and the write gate `>= 0`, which
     its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
-    one); a skip `D v`, and the epilogue; and `floor`, the least log decay a token a layer declares
-    (Kimi delta attention's `lower_bound`, -5), which a decay a key dimension's factored chunk form reads
-    as its range's bound (`recurrence_algebra.factored_range`); and `write_bound`, the largest write gate
+    one); a skip `D v`, and the epilogue; and `write_bound`, the largest write gate
     a layer declares of l2-normalized keys (its config's: 1 for a sigmoid's, 2 for twice a sigmoid's, the
     negative-eigenvalue delta rule's), which bounds the delta rule's chunk inverse (`inverse_bound`). The
     chunked op (`recurrence_chunk.chunk`) takes the same form."""
@@ -106,7 +104,6 @@ class Hooks:
     rated: bool = False
     skip: bool = False
     output: OutputNorm | None = None
-    floor: float | None = None
     write_bound: float | None = None
 
     @property

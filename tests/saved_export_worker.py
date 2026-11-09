@@ -22,6 +22,7 @@ import ctypes
 import functools
 import gc
 import hashlib
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,25 +64,50 @@ def tensors(directory: Path) -> dict[str, tuple[str, list[int], str]]:
             for path in sorted(directory.glob("*.safetensors")) for name, array in load_file(path).items()}
 
 
+def exact_resident() -> int:
+    """This process's resident bytes as the kernel counts them page by page (/proc/self/smaps_rollup's
+    Rss, a walk of its page tables), exact where /proc/self/status's running counters lag the pages just
+    written by a batch for each CPU (`dew.telemetry.benchmark.resident_memory`), a lag that held a 31 MB
+    tree home as 9 MB on CI (train 742)."""
+    for line in Path("/proc/self/smaps_rollup").read_text().splitlines():
+        if line.startswith("Rss:"):
+            return int(line.split()[1]) * 1024
+    raise AssertionError("/proc/self/smaps_rollup states no Rss")
+
+
+SAMPLED = 0.005
+"""Seconds between the resident counts `resident_growth` takes inside its block."""
+
+
 @contextlib.contextmanager
 def resident_growth(into: list[int]) -> Iterator[None]:
     """How far this process's resident pages rise above where they start within the block, appended to
-    `into`: Linux's high-water mark (`VmHWM`) reset at the start (/proc/self/clear_refs), after a
-    collection and glibc's return of its free pages (`malloc_trim`), so pages a freed allocation left
-    resident do not hide one that reuses them. The pages XLA's buffers newly take are among them, the
-    buffers a tensor is read home into, which tracemalloc, counting Python's and NumPy's allocations
-    alone, never sees (ledger 3794); storage another allocator keeps from before the block and reuses is
-    not, which each test checks against by the same measure over the whole tree held home. The kernel's
-    counters lag the pages just written by a batch for each CPU (`resident_memory`), within the margins
-    the tests' bounds hold on armada, twice and more either side."""
-    from dew.telemetry.benchmark import resident_memory
-
+    `into`: the most of its exact counts (`exact_resident`), taken every `SAMPLED` seconds and once at
+    the end, over the count at the start, after a collection and glibc's return of its free pages
+    (`malloc_trim`), so pages a freed allocation left resident do not hide one that reuses them. The
+    pages XLA's buffers newly take are among them, the buffers a tensor is read home into, which
+    tracemalloc, counting Python's and NumPy's allocations alone, never sees (ledger 3794); storage
+    another allocator keeps from before the block and reuses is not, which each test checks against by
+    the same measure over the whole tree held home. What a block holds home past a sample's interval is
+    counted: a whole tree read home before it is written, which the export's bound is about."""
     gc.collect()
     ctypes.CDLL(None).malloc_trim(0)
-    Path("/proc/self/clear_refs").write_text("5")
-    before = resident_memory()["VmRSS"]
-    yield
-    into.append(resident_memory()["VmHWM"] - before)
+    before = exact_resident()
+    most = [before]
+    finished = threading.Event()
+
+    def sample() -> None:
+        while not finished.wait(SAMPLED):
+            most[0] = max(most[0], exact_resident())
+
+    sampler = threading.Thread(target=sample, daemon=True)
+    sampler.start()
+    try:
+        yield
+    finally:
+        finished.set()
+        sampler.join()
+        into.append(max(most[0], exact_resident()) - before)
 
 
 def exported(args) -> dict:

@@ -869,3 +869,13 @@ def test_an_fp32_delta_rules_route_computes_the_runs_declared_products():
         if kernels == {"mosaic_gpu"} and fast == {"mosaic_gpu"}:
             assert flops == [held * whole_terms / rounded_terms for held in fast_flops], matmul
     assert routed("TF32_TF32_F32") == ({"xla"}, [])
+
+
+def test_a_float64_value_asked_for_without_x64_fails_rather_than_computing_in_float32():
+    """A float64 value asked for where x64 is off fails (the suite's filter on JAX's truncation), where JAX
+    alone would hand back float32 with a warning: no float64 truth or twin computes in float32 unseen.
+    Under x64 the same request is float64."""
+    with jax.enable_x64(new_val=False), pytest.raises(UserWarning):
+        jnp.ones(3, jnp.float64)
+    with jax.enable_x64(new_val=True):
+        assert jnp.ones(3, jnp.float64).dtype == jnp.float64

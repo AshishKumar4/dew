@@ -232,10 +232,12 @@ def test_a_mixed_product_converts_its_operands_as_the_product_does():
         wide = jax.jit(lambda ints, floats: float32_einsum("i,i->", ints, floats,
                                                          preferred_element_type=jnp.float64))(ints, floats)
         assert wide.dtype == jnp.float64 and float(wide) == 1.0
-    # With x64 off a float64 result is a float32 one, whose products sum in float64.
+    # With x64 off a float64 result is a float32 one (JAX truncates it, and says so), whose products sum in
+    # float64.
     lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
-    narrowed = jax.jit(lambda lhs, rhs: float32_einsum("ik,kj->ij", lhs, rhs,
-                                                       preferred_element_type=jnp.float64))(lhs, rhs)
+    with pytest.warns(UserWarning):
+        narrowed = jax.jit(lambda lhs, rhs: float32_einsum("ik,kj->ij", lhs, rhs,
+                                                           preferred_element_type=jnp.float64))(lhs, rhs)
     assert narrowed.dtype == jnp.float32 and np.asarray(narrowed).tolist() == [[1.0]]
     assert float(accumulated(jnp.dot, 2.0, 3.0, preferred_element_type=jnp.float32)) == 6.0
 
@@ -293,9 +295,10 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
     no float64 beside a float32 computation, and no platform choice (ledger 3197: a bias's gradient
-    included); but a layer's float32 projection, which a library's CPU sums no worse than a vectorized dot
-    (`dew.nn.pairwise`, row 4863: its platform choice, and a batch's float64 sum, are the library's own).
-    Each is traced afresh, as a process with either setting traces it."""
+    included); but a float32 contraction, a layer's projection or any other, which a library's CPU sums
+    no worse than a vectorized dot (`dew.nn.pairwise`, row 4863: its platform choice, and a batch's
+    float64 sum, are the library's own). Each is traced afresh, as a process with either setting traces
+    it."""
     from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -321,11 +324,15 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     def choices(found) -> int:
         return sum(equation.primitive.name == "platform_index" for equation in found)
 
-    # The platform choices a library's layer makes of its projections alone (row 4863): those of the same
-    # layer with no bias, whose gradient sums no bias.
-    unbiased = Dense(2, use_bias=False)
-    products = choices(traced(jax.grad(lambda params: jnp.sum(unbiased.apply({"params": params}, lhs))),
-                              unbiased.init(jax.random.key(0), lhs)["params"]))
+    def contractions(found) -> int:
+        # A float32 contraction's platform choices: those a conditional reads one of whose branches is a
+        # product, each once (contractions of one trace share it; a conditional's nested in a branch read
+        # their own).
+        chosen = {equation.outvars[0] for equation in found if equation.primitive.name == "platform_index"}
+        return len({equation.invars[0] for equation in found
+                    if equation.primitive.name == "cond" and equation.invars[0] in chosen
+                    and any(inner.primitive.name == "dot_general" for branch in equation.params["branches"]
+                            for inner in equations(branch))})
 
     sites = {
         "product": traced(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))), lhs, rhs),
@@ -338,7 +345,8 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         if wide:
             assert choices(found), name
         else:
-            assert choices(found) == {"bias": products}.get(name, 0), name
+            # A library's platform choices are its float32 contractions' alone (row 4863).
+            assert choices(found) == contractions(found), name
         # Four rows of three: the product's few rows sum blocked and pairwise in float32 (`pairwise._summed`).
         assert float64(found) == wide, name
     # A float64 division is the plain division under either setting.

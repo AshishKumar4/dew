@@ -74,12 +74,14 @@ from typing import ClassVar, NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.core import ShapedArray
 from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from jax.extend import core
 
 from dew.mesh import logical_spec
-from dew.nn.derivatives import KernelGlue, contracted
+from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import launches
 
 from ..precision import (
@@ -270,50 +272,117 @@ _POSITIONAL = frozenset({'iota', 'cumsum', 'cumprod', 'cummax', 'cummin', 'cumlo
 """Primitives that keep their operand's shape but read or write by position, not value: no epilogue's."""
 
 
-def elementwise(function) -> bool:
-    """Whether `function` maps each element of an fp32 array alone, as the kernels' rows apply it to a tile
-    of a row's columns padded past its width (`_rms_forward`'s epilogue, row 821): traced at `PROBES` inputs
-    (distinct extents, so a transpose shows, and two shapes, so an array built at one input's shape fails
-    the other), every equation, nested ones too, reads and writes only the input's shape or scalars, none of
-    them positional (`_POSITIONAL`), and each one Pallas's Triton lowering takes (an exact gelu's erfc it
-    takes none of); every array it closes over a scalar. A callable that does not trace on an array
-    (TypeError, ValueError) is none."""
-    return all(_maps_alone(function, shape) for shape in PROBES)
-
-
-PROBES = ((2, 3), (5, 7))
-"""The input shapes `elementwise` traces an epilogue at."""
-
-
-def _maps_alone(function, shape: tuple[int, int]) -> bool:
-    """`elementwise`'s rule at one input `shape`."""
+def elementwise(function, shape: tuple[int, ...]) -> bool:
+    """Whether `function`, applied to an fp32 array of the call's logical `shape`, maps each element alone, as
+    the kernels' rows apply it to a tile of a row's columns padded past its width (`_rms_forward`'s
+    epilogue, row 821), read off its graph traced at that shape (`_Logical`): every equation, nested ones
+    too, reads and writes only that shape or scalars, none of them positional (`_POSITIONAL`), each one
+    Pallas's Triton lowering takes (an exact gelu's erfc it takes none of), and every array it closes over
+    a scalar. A value it derives from the shape (`y / y.shape[-1]`) is a literal of the logical shape in
+    that graph, which the tile then reads. A callable that does not trace on an array (TypeError,
+    ValueError) is none."""
     from jax._src.pallas.triton import lowering
 
     try:
-        closed = jax.make_jaxpr(function)(jax.ShapeDtypeStruct(shape, jnp.float32))
-        out = jax.eval_shape(function, jax.ShapeDtypeStruct(shape, jnp.float32))
+        closed = _traced(function, tuple(shape))
     except (TypeError, ValueError):
         return False
     lowered = set(lowering.triton_lowering_rules)
 
-    def mapped(jaxpr: jax.extend.core.Jaxpr) -> bool:
+    def mapped(jaxpr: core.Jaxpr) -> bool:
+        # An array it closes over, at any depth, is read by position: a scalar alone is every element's (a
+        # Jaxpr carries its own constants on JAX 0.12).
+        if any(np.ndim(const) != 0 for const in jaxpr.consts):
+            return False
         for equation in jaxpr.eqns:
-            shapes = [variable.aval.shape for variable in (*equation.invars, *equation.outvars)]
+            avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
+            # A custom reverse derivative has no forward one to state the tile's (`_tangents`).
             if (equation.primitive.name in _POSITIONAL or equation.primitive not in lowered
-                    or any(each not in (shape, ()) for each in shapes)):
+                    or equation.primitive.name.startswith("custom_vjp")
+                    or any(not isinstance(aval, ShapedArray) or aval.shape not in (tuple(shape), ())
+                           for aval in avals)):
                 return False
-            nested = [value for value in equation.params.values()
-                      if isinstance(value, (jax.extend.core.ClosedJaxpr, jax.extend.core.Jaxpr))]
-            if not all(closed_mapped(inner) if isinstance(inner, jax.extend.core.ClosedJaxpr)
-                       else mapped(inner) for inner in nested):
+            if not all(mapped(inner) for inner in equation.params.values() if isinstance(inner, core.Jaxpr)):
                 return False
         return True
 
-    def closed_mapped(closed: jax.extend.core.ClosedJaxpr) -> bool:
-        # An array it closes over, at any depth, is read by position: a scalar alone is every element's.
-        return all(np.ndim(const) == 0 for const in closed.consts) and mapped(closed.jaxpr)
+    outs = closed.out_avals
+    return (len(outs) == 1 and isinstance(outs[0], ShapedArray) and outs[0].shape == tuple(shape)
+            and mapped(closed))
 
-    return isinstance(out, jax.ShapeDtypeStruct) and out.shape == shape and closed_mapped(closed)
+
+@functools.lru_cache(maxsize=256)
+def _traced(function, shape: tuple[int, ...]) -> core.Jaxpr:
+    """`function`'s graph at an fp32 input of the call's logical `shape`, once a function and shape."""
+    return jax.make_jaxpr(function)(jax.ShapeDtypeStruct(shape, jnp.float32))
+
+
+@functools.lru_cache(maxsize=256)
+def _tangents(function, shape: tuple[int, ...]) -> core.Jaxpr:
+    """`function`'s forward derivative at an fp32 input of the call's logical `shape`, `(y, t) -> (out,
+    t_out)`, as JAX derives it (a custom derivative's rule applied, a relu's 0 at 0), once a function and
+    shape."""
+    aval = jax.ShapeDtypeStruct(shape, jnp.float32)
+    return jax.make_jaxpr(lambda y, t: jax.jvp(function, (y,), (t,)))(aval, aval)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Logical:
+    """An `elementwise` activation as the kernels apply it: its graph traced once at the call's logical
+    `shape` (`_traced`), evaluated on a tile of any shape (`_on_tile`). Each shape a parameter states that is
+    the logical one (a scalar broadcast to it) is the tile's, and every value the activation derived from the
+    shape a literal of the logical one, so `y / y.shape[-1]` divides a padded tile's row by the row's width.
+    Its derivative is its own, derived at the logical shape (`_tangents`, a custom rule kept) and evaluated
+    on the tile alike. Keyed by the activation and the shape, as a launch's static arguments are."""
+    function: Callable[[jax.Array], jax.Array]
+    shape: tuple[int, ...]
+
+    def __call__(self, y: jax.Array) -> jax.Array:
+        traced = _traced(self.function, self.shape)
+
+        def applied(y):
+            (out,) = _on_tile(traced, traced.consts, self.shape, y.shape, y)
+            return out
+
+        def tangent(primals, tangents):
+            derived = _tangents(self.function, self.shape)
+            out, tangent = _on_tile(derived, derived.consts, self.shape, primals[0].shape, *primals,
+                                    *tangents)
+            return out, tangent
+
+        return contracted("test_the_fused_norms_and_products_hold_every_order")(
+            declared_tangent(KernelGlue(), applied, tangent))(y)
+
+
+def _on_tile(jaxpr: core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
+    """`jaxpr`, traced at the `logical` shape, evaluated on `args` of the `tile` shape as
+    `jax.core.eval_jaxpr` evaluates it: each equation bound by its primitive (`get_bind_params`), a shape
+    parameter that is the logical shape the tile's, and a program a parameter holds (a jit's, a custom
+    derivative's primal) retraced at the tile's shapes, the equation kept. Its values alone: `_Logical`
+    states the derivative."""
+    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
+
+    def read(atom):
+        return atom.val if isinstance(atom, core.Literal) else values[atom]
+
+    def retargeted(value):
+        if isinstance(value, tuple) and tuple(value) == logical:
+            return tuple(tile)
+        if isinstance(value, core.Jaxpr):
+            avals = [jax.ShapeDtypeStruct(tile if aval.shape == logical else aval.shape, aval.dtype)
+                     for aval in value.in_avals if isinstance(aval, ShapedArray)]
+            return jax.make_jaxpr(
+                lambda *operands: _on_tile(value, value.consts, logical, tile, *operands))(*avals)
+        return value
+
+    for equation in jaxpr.eqns:
+        given = [read(atom) for atom in equation.invars]
+        params = {key: retargeted(value) for key, value in equation.params.items()}
+        with equation.ctx.manager:
+            made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
+        outputs = made if equation.primitive.multiple_results else [made]
+        values.update(zip(equation.outvars, outputs, strict=True))
+    return [read(atom) for atom in jaxpr.outvars]
 
 
 def _runs(case) -> bool:
@@ -411,7 +480,7 @@ def norm_case(x, scale, dtype, axes, *, branch=None, gate=None, epilogue=None, f
         branch_fits=branch is None or (branch.shape == x.shape and branch.dtype == x.dtype),
         gate_fits=gate is None or gate.shape == x.shape,
         placed=_placed(axes, (x, scale, branch, gate), whole_last=True),
-        activated=epilogue is not None and not elementwise(epilogue),
+        activated=epilogue is not None and not elementwise(epilogue, x.shape),
         fp32_statistics=fp32_statistics, activation=activation)
 
 
@@ -1014,9 +1083,15 @@ def _flat(value):
     return None if value is None else value.reshape(math.prod(value.shape[:-1]), value.shape[-1])
 
 
+def _logical(norm: _Norm, shape: tuple[int, ...]) -> _Norm:
+    """`norm` with its activation as the kernels apply it at the call's logical `shape` (`_Logical`)."""
+    return norm if norm.epilogue is None else norm._replace(epilogue=_Logical(norm.epilogue, tuple(shape)))
+
+
 def _rms_with_mean_square(x, branch, scale, gate, norm: _Norm):
     """`(stream, y)` and each row's mean square with epsilon, the stream `x + branch`, or `x` itself."""
-    y, stream, mean_square = _RMS_FORWARD(_flat(x), _flat(branch), scale, _flat(gate), **norm._asdict())
+    y, stream, mean_square = _RMS_FORWARD(_flat(x), _flat(branch), scale, _flat(gate),
+                                          **_logical(norm, x.shape)._asdict())
     return (x if branch is None else stream.reshape(x.shape), y.reshape(x.shape)), mean_square
 
 
@@ -1030,7 +1105,7 @@ def _rms_backward_call(stream, scale, gate, mean_square, dy, ds, norm: _Norm):
         _flat(stream), scale, _flat(gate), mean_square, _flat(dy), _flat(ds), offset=norm.offset,
         stored=norm.stored, after_cast=norm.after_cast, inverse_rounded=norm.inverse_rounded,
         activation=norm.activation, interpret=norm.interpret, weight_first=norm.weight_first,
-        epilogue=norm.epilogue)
+        epilogue=_logical(norm, stream.shape).epilogue)
     dscale = None if scale is None else _scale_sum(partial, correction)
     return dx.reshape(stream.shape), None if gate is None else dgate.reshape(gate.shape), dscale
 

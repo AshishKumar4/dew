@@ -35,7 +35,7 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Dropout, Initial, within
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Dropout, Initial, coded, within
 from dew.nn.precision import float32_einsum, two_product, two_sum
 
 
@@ -64,9 +64,11 @@ class Forward:
     power of two the queries took before their products (`prescale`, `attention.prescale`), which `scale`
     is the call's scale over, the keys a launch's walk reaches where past the call's though they are
     whole tiles (`walked_keys`: a holder of a common walk wholly past them, `seen` keeps every query from
-    it; None where none does), and whether the launch lowers its exponentials to the hardware's
+    it; None where none does), whether the launch lowers its exponentials to the hardware's
     approximations (`approximate`, `attention_mosaic_program.approximate`; false where a hook's tanh makes it
-    lower every transcendental exactly)."""
+    lower every transcendental exactly), and the bound a quantized model's weights round to (`rounds`,
+    `attention.Hooks.rounds`: each weight its code `coded(p, rounds)` at the row's known maximum in the
+    value product, the anchored walk's, `anchored_step`; None where they do not)."""
 
     form: str
     keys: int
@@ -82,6 +84,7 @@ class Forward:
     prescale: float = 1.0
     walked_keys: int | None = None
     approximate: bool = True
+    rounds: float | None = None
     subtracted: bool = False
     """Whether the fold (`base2`) takes its exponent as the accurate form's raw one does (`raw`), a difference
     of the raw products scaled after it is taken, `exp2((s - m) * scale * log2(e))`: no logit the reference
@@ -536,22 +539,6 @@ def merged_slices(spec: Forward, out: jax.Array, maximum: jax.Array, total: jax.
                          for mine, theirs in zip(state[:3], own[:3], strict=True))
         state = Partial(acc, m, total)
     return finish(spec, finished_merged(spec, state, axis=1), initial=True, normalized=True)[0]
-
-
-def finished_merge(spec: Forward, first: Partial, second: Partial) -> Partial:
-    """Two finished states over disjoint keys (`slice_state`'s, or merges of them) as one merge of them,
-    `first`'s keys before `second`'s: `finished_merged`'s convex combination of two, elementwise, as a
-    program's registers hold them (the in-launch merge's, `attention_mosaic_forward._Merge`)."""
-    m = jnp.maximum(first.m, second.m)
-    a, b = carried(spec, first.m, m) * first.total, carried(spec, second.m, m) * second.total
-    # Each weight over the larger, so their sum is at most two whatever the masses (an initial state's may
-    # be any finite one).
-    largest = jnp.maximum(a, b)
-    safe = jnp.where(largest > 0, largest, 1.0)
-    a, b = a / safe, b / safe
-    over = 1.0 / jnp.where(a + b > 0, a + b, 1.0)
-    out = expand(a * over, first.acc) * first.acc + expand(b * over, second.acc) * second.acc
-    return Partial(out, m, largest * (a + b))
 
 
 def finished_merged(spec: Forward, stacked: Partial, axis: int) -> Partial:
@@ -1524,7 +1511,10 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
         # A row's factor, one product an element (a shift is at most `HEADROOM`'s complement of the keys'
         # count and fp32's largest binade, well within `exact_power2`'s exponents).
         p = p * expand(exact_power2(-arg.shift), p)
-    parts, others, own_tile, arg = _split_tile(keys, p, value.dtype, arg,
+    # A quantized model's weights in the value product its codes at the row's maximum, each at most
+    # `rounds` and exact in the values' dtype; the denominator the weights themselves (`Forward.rounds`).
+    taken = p if spec.rounds is None else coded(p, spec.rounds)
+    parts, others, own_tile, arg = _split_tile(keys, taken, value.dtype, arg,
                                                drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos))
     if keys.accumulate is None:
         acc = state.acc + summed_products(parts, value, keys.dot)
@@ -1549,6 +1539,22 @@ def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
     state, arg, own, others_total = jax.lax.fori_loop(
         lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
         (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing))
+    return settled(state), arg, own, others_total
+
+
+def anchored_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Carry:
+    """A training forward's walk (`training_walk`'s carry) at each row's maximum and anchor found before it:
+    a walk of `argmax` over the logits alone, then `anchored_step`s from `anchored`'s carry, as the Mosaic
+    training launch walks a peak walk's anchors; a quantized call's (`Forward.rounds`), whose weights round
+    at that maximum."""
+
+    def peaked(index, arg):
+        keys = keys_at(index)
+        return argmax(arg, keys.logits, keys.coords.k_pos)
+
+    arg = jax.lax.fori_loop(lo, hi, peaked, no_argmax(start.total.shape[0]))
+    state, arg, own, others_total = jax.lax.fori_loop(
+        lo, hi, lambda index, carry: anchored_step(spec, carry, keys_at(index)), anchored(spec, start, arg))
     return settled(state), arg, own, others_total
 
 

@@ -14,9 +14,9 @@ staging tiles' swizzle is Mosaic GPU's inference.
   g_t), -1)` (`algebra.system`), inverted by doubling on the chunk's tile (`algebra.doubled`): a family's
   product is a warpgroup's 64 rows, which hold no 16-row block of their own; and in the same program the
   weighted keys and values below, the inverse applied in registers (`_solved`);
-- intra (a decay a key dimension): each chunk's scores and system, each pair's decay factored over its
-  sub-chunks on the tensor cores (`algebra.key_block_pairs`, which the call's declared floor bounds), the
-  system inverted by a launch of its own under the delta rule;
+- intra (a decay a key dimension): each chunk's scores and system, each pair of sub-chunks' decay factored
+  on the tensor cores (`algebra.key_block_pairs`), each sub-chunk's own pairs each their own decay
+  (`algebra.key_diagonal_pairs`), the system inverted by a launch of its own under the delta rule;
 - weighted: `w = A (k beta exp2(g))` and `u = A (v beta)` (`algebra.weighted`) from a stored inverse (a
   decay a key dimension's, the backward's recomputed forward), and under a decay a key dimension the keys
   decayed to their chunk's end (`algebra.key_decayed_write`);
@@ -82,7 +82,9 @@ def issued(dtype=jnp.bfloat16) -> tuple[mosaic.Family, bool]:
     family = family_of(dtype)
     if family is not None and generation.backend() == 'gpu':
         return family, False
-    return bundles.of(generation.interpreted_target().generation, bundle_dtype(dtype), scoped=True), True
+    interpreted = bundles.of(generation.interpreted_target().generation, bundle_dtype(dtype), scoped=True)
+    assert interpreted is not None, "the interpreted target's generation has a bundle for every dtype"
+    return interpreted, True
 
 def value_unit(family: mosaic.Family) -> int:
     """The values' padded width's step on `family`'s bundle: a staged operand's narrowest block of 16-bit
@@ -128,9 +130,8 @@ class Tiles:
 
 def per_key_refusal(dtype) -> str | None:
     """Why the mainloop refuses a call of `dtype` under a decay a key dimension, None where it takes it: its
-    intra launch factors each pair's decay over the chunk's sub-chunks (`algebra.key_block_pairs`), each
-    sub-chunk's own pairs too where the layer's declared floor bounds a sub-chunk's range
-    (`algebra.factored_range`), else each its own decay (`algebra.key_diagonal_pairs`), and rounds each
+    intra launch factors each pair of sub-chunks' decay (`algebra.key_block_pairs`), each sub-chunk's own
+    pairs each their own decay (`algebra.key_diagonal_pairs`), and rounds each
     side's gate once, where the fp32 recurrence rounds each pair's (1.98 times its distance from float64 in
     an fp32 call, fam-t)."""
     if jnp.dtype(dtype) == jnp.float32:
@@ -242,10 +243,6 @@ class Call:
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
     bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
     (`_merging`)."""
-    factored: bool = True
-    """Whether a decay a key dimension's pairs factor over whole sub-chunks (`algebra.factored_range` of the
-    call's declared floor): where not, each sub-chunk's own pairs are each their own decay
-    (`algebra.key_diagonal_pairs`)."""
 
     @property
     def gated_keys(self) -> bool:
@@ -705,7 +702,7 @@ def _tile_at(index, grid: tuple, grid_names: tuple) -> dict:
 def _product_widths(blocks: dict, staging: tuple, chunk: int) -> tuple[int, ...]:
     """Each width a launch's products may take: a row or column count of a tile it streams or stages (a
     product's right operand, as it is or transposed), the chunk's or a sub-chunk's (`algebra.SUB`, the
-    factored pairs' diagonal blocks), one a tensor instruction issues (16 to 256 columns, whole 16s)."""
+    factored pairs' sub-chunk blocks), one a tensor instruction issues (16 to 256 columns, whole 16s)."""
     shapes = [shape for shape, _ in blocks.values()]
     shapes += [leaf.shape for leaf in jax.tree.leaves(staging) if hasattr(leaf, "shape")]
     found = {chunk, algebra.SUB, *(extent for shape in shapes if len(shape) >= 2 for extent in shape[-2:])}
@@ -1163,14 +1160,13 @@ def _intra(q, k, g, beta, taken, call: Call, *, scale: float, solves: bool):
     head under a decay a key dimension, one launch (`_intra_walk`): the scores as `call.held`, the keys'
     system where it `solves` (`_systems`' form, the write-gated keys' pairs, strict), which `_intra_solve`
     inverts, and the decay's prefix halves (`call.gates`, `algebra.prefix`'s pair) from the laid decay `g`
-    `[R, HV * Dk]` fp32, which every later launch reads. Each pair's decay factored over the chunk's
-    sub-chunks (`algebra.key_block_pairs`, which the call's declared floor bounds), their products on the
-    tensor cores (fla_kda's intra rows); the scores and the system share every factor in one walk, their sums
-    in shared memory, one output's formed at a time (`_intra_walk`), where `_intra_merges` (wgmma's); else
-    each output walks a launch of its own, its sum in registers. Where the pairs do not factor
-    (`Call.factored`), each sub-chunk's own pairs taking their own decays besides, each output is a launch of
-    its own (no model calls one: every model's Kimi delta attention declares its floor)."""
-    if solves and not (call.factored and _intra_merges(call)):
+    `[R, HV * Dk]` fp32, which every later launch reads. Each pair of sub-chunks' decay factored
+    (`algebra.key_block_pairs`), their products on the tensor cores (fla_kda's intra rows), each sub-chunk's
+    own pairs each their own decay (`algebra.key_diagonal_pairs`, fla_kda's token-parallel diagonal); the
+    scores and the system share every factor in one walk, their sums in shared memory, one output's formed at
+    a time (`_intra_walk`), where `_intra_merges` (wgmma's); else each output walks a launch of its own, its
+    sum in registers."""
+    if solves and not _intra_merges(call):
         scores, hi, lo = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("scores",))
         (system,) = _intra_walk(q, k, g, beta, taken, call, scale=scale, products=("system",))
         return scores, system, hi, lo
@@ -1244,11 +1240,10 @@ def _rows_of(ref, keys: int) -> jax.Array:
 
 
 def _intra_masked(found: jax.Array, *, strict: bool, scale: float, diagonal) -> jax.Array:
-    """A key block's pairs `found` of an output as its sum takes them: below the diagonal where `strict` (the
-    system), else on and below it and scaled (the scores); where the pairs do not factor, each sub-chunk's own
-    pairs besides (`diagonal`, `algebra.key_diagonal_pairs` given its strictness)."""
-    if diagonal is not None:
-        found = found + diagonal(strict=strict)
+    """A key block's pairs `found` of an output (its sub-chunks' factored pairs) and each sub-chunk's own
+    (`diagonal`, `algebra.key_diagonal_pairs` given its strictness) as its sum takes them: below the diagonal
+    where `strict` (the system), else on and below it and scaled (the scores)."""
+    found = found + diagonal(strict=strict)
     lag = algebra._lags(found.shape)
     return jnp.where(lag > 0, found, 0.0) if strict else jnp.where(lag >= 0, found, 0.0) * scale
 
@@ -1286,8 +1281,8 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     padded shared tile whose rows the sub-chunks' references read), stored for the later launches, and the
     block's pairs summed into the sums the walk carries, stored at its last step: the scores (the queries'
     pairs, scaled) and, under the delta rule, the keys' system (the write-gated keys' pairs, strict), their
-    factors formed once for both (`algebra.key_block_pairs`). Where the call's pairs do not factor
-    (`Call.factored`), each sub-chunk's own pairs are each their own decay (`algebra.key_diagonal_pairs`).
+    factors formed once for both (`algebra.key_block_pairs`), and each sub-chunk's own pairs each their own
+    decay (`algebra.key_diagonal_pairs`).
     Its prefix an XLA scan of its own, thirteen launches took 0.30 ms of Kimi Linear's 1.57 ms forward on an
     H100; the scores and the system a launch each, each scanned the prefix and gated its keys again, 0.42
     and 0.40 ms of its 1.45 (kda-batch-h100-7e3a5fb48)."""
@@ -1343,11 +1338,10 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
             pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
                                             operand("keys"), prefix, at_token,
                                             Issuer(call, {"pairs": gated}).summed,
-                                            lambda up: staged_parts(family, up, keyed), chunk=chunk,
-                                            diagonal=call.factored)
+                                            lambda up: staged_parts(family, up, keyed), chunk=chunk)
             masked = []
             for name, found in zip(products, pairs, strict=True):
-                diagonal = None if call.factored else functools.partial(
+                diagonal = functools.partial(
                     algebra.key_diagonal_pairs, lambda c, name=name: rows(name), shifted, 1, lambda c: prefix,
                     chunk=chunk)
                 masked.append(_intra_masked(found, strict=name == "system", scale=scale, diagonal=diagonal))
@@ -1407,14 +1401,14 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(chunk, chunk),
                    "prefix": call.gates.landing(chunk, keys)} if "scores" in products else {}),
                **({"system": _systems(call).landing(chunk, chunk)} if "system" in products else {})}
-    # Where the call's pairs do not factor (`Call.factored`), a key block's keys and prefix halves below a
-    # sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted reads).
+    # A key block's keys and prefix halves below a sub-chunk's rows (`algebra.key_diagonal_pairs`' shifted
+    # reads).
     # Both read at row offsets no tiling divides (the scan's shifts, the sub-chunks' references), so plain.
     # Unpadded: a tile read in the accumulator's layout takes a row stride a whole number of its tiling's
     # columns (Mosaic GPU's layout inference refused 24 at a 16-column tiling and 80 at a 64-column one,
     # jsf-kdaintra5 and 9), a multiple of 32 words at 32 columns or more, so no stride it takes moves a
     # fragment store's rows off one another's banks.
-    padded = () if call.factored else (mosaic.plain((3, algebra.SUB + chunk, keys), jnp.float32),)
+    padded = (mosaic.plain((3, algebra.SUB + chunk, keys), jnp.float32),)
     scanned = mosaic.plain((2, 2 * chunk, keys), jnp.float32)
     # A merged walk's sums in shared memory, each read and written whole, so in swizzled 8-row tiles: plain,
     # rows a multiple of 32 words apart put a fragment's 8 rows in the same banks (41.3M bank conflicts in a

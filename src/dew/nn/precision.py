@@ -538,7 +538,13 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
 def accumulated(product: Callable[..., jax.Array], *operands,
                 preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
-    einsum, a matmul): the plain product, but in a process running wide CPU arithmetic
+    einsum, a matmul): where a CPU runs one of JAX's contractions (`CONTRACTIONS`) of float32 operands,
+    each of its float32 products summed as a vectorized dot sums it (`_summed_pairwise`: a layer's
+    projection's sum, `projection_product`, row 4863), the algebra's derived products and a mixer's
+    alike: sums that cancel each other (attention's dP and D on a one-key row) cancel bit for bit only
+    where both sum in one order, and XLA's one FMA chain left a Mamba layer's chunk einsums apart from
+    their sources' (Jamba's and Falcon-H1's logits and gradients). Elsewhere the plain product, but in a
+    process running wide CPU arithmetic
     (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32 (`products_dtype`) a CPU
     sums the products in float64 and rounds the sum once to the dtype the product returns.
     Each fp32 product is exact in float64, so the result is within half an fp32 ulp of the float64
@@ -566,9 +572,13 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     if not _sums_in_float64(*operands):
+        if ((key := _contraction(product, preferred_element_type)) is not None
+                and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
+                and products_dtype(*operands) == jnp.dtype(jnp.float32)):
+            return _traced_once(key, _summed_pairwise)(*operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
-        return _traced_once(key)(*operands)
+        return _traced_once(key, _summed_wide)(*operands)
     return _summed_wide(product, preferred_element_type, *operands)
 
 
@@ -580,9 +590,8 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`), a
     quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
     sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
-    product keeps the declaration), or its dtypes are others. A layer's projections alone: a product the
-    algebra derives or a mixer forms (attention's `dP` and `D`, whose sums cancel bit for bit on a one-key
-    row) keeps XLA's sum."""
+    product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
+    takes it too (`_paired`)."""
     from dew.nn import pairwise
 
     if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
@@ -621,20 +630,37 @@ derivative of its own (`_own_backward`) and depends on its operands' types and i
 _JAX_CODE = (jax.lax.dot_general.__code__, jnp.einsum.__code__)
 """The code of the contractions every other one calls through, as JAX defines it: a library that
 intercepts JAX's products in place (Qwix's `quantize_model` replaces `jax.lax.dot_general`'s and
-`jax.numpy.einsum`'s) changes it, and a trace cached before would skip the library's product."""
+`jax.numpy.einsum`'s) changes it (`_quantized`)."""
+
+_REACHED = {jnp.einsum: ("einsum", "dot_general"), jnp.dot: ("dot", "dot_general")}
+"""The ops of JAX's a contraction reaches, as Qwix names the ops it intercepts, where more than
+`dot_general` (which every other contraction calls through)."""
+
+
+def _quantized(function: Callable) -> bool:
+    """Whether Qwix quantizes the contraction `function` at the module calling it: under its interception of
+    JAX's products (`_JAX_CODE` changed), a rule of its matching an op the contraction reaches, as Qwix's own
+    query answers it (`qwix.pallas.get_current_rule`, which its providers intercept). Qwix owns the products
+    it quantizes; a contraction no rule matches stays float, and Dew's sums govern it, so a quantized model's
+    kept-in-float parts compute as the unquantized model's."""
+    if (jax.lax.dot_general.__code__, jnp.einsum.__code__) == _JAX_CODE:
+        return False
+    from qwix import pallas as qwix_pallas
+
+    return any(qwix_pallas.get_current_rule(op) is not None
+               for op in _REACHED.get(function, ("dot_general",)))
 
 
 def _contraction(product: Callable, preferred_element_type) -> tuple | None:
     """`product` as a key of one of JAX's contractions (`CONTRACTIONS`, each as JAX defines it), bound through
     plain `functools.partial`s around it (a subclass may call it otherwise) to arguments with no array among
     them, with the dtype it is asked for: the contraction, the arguments' tree and their leaves; None for any
-    other product."""
+    other product, and for one Qwix quantizes (`_quantized`), whose product is its own."""
     function, arguments, keywords = product, (), {}
     while isinstance(function, functools.partial) and type(function) is functools.partial:
         arguments, keywords = function.args + arguments, {**function.keywords, **keywords}
         function = function.func
-    intercepted = (jax.lax.dot_general.__code__, jnp.einsum.__code__) != _JAX_CODE
-    if intercepted or not any(function is contraction for contraction in CONTRACTIONS):
+    if not any(function is contraction for contraction in CONTRACTIONS) or _quantized(function):
         return None
     leaves, tree = jax.tree.flatten((arguments, keywords, preferred_element_type))
     if not all(isinstance(leaf, Hashable) and not isinstance(leaf, jax.Array | np.ndarray)
@@ -644,17 +670,59 @@ def _contraction(product: Callable, preferred_element_type) -> tuple | None:
 
 
 @functools.lru_cache(maxsize=1024)
-def _traced_once(key: tuple) -> Callable:
-    """`_summed_wide` of the contraction `key` names (`_contraction`) as one program JAX traces once for its
-    operands' types: a gated delta net layer's portable chunked math sums some 64 contractions a call,
-    each traced afresh at about 6.6 ms (the wide sum, its derivative and the narrow one each traced
-    again), 130 s of a decision witness's trace under Dew's test arithmetic (row 3142). Its arithmetic is
-    the product's own, the call a nested program XLA inlines. The most recent 1024 contractions are kept,
-    a model's working set many times over."""
+def _traced_once(key: tuple, summed: Callable) -> Callable:
+    """`summed` (`_summed_wide`, `_summed_pairwise`) of the contraction `key` names (`_contraction`) as one
+    program JAX traces once for its operands' types: a gated delta net layer's portable chunked math sums
+    some 64 contractions a call, each traced afresh at about 6.6 ms (the wide sum, its derivative and the
+    narrow one each traced again), 130 s of a decision witness's trace under Dew's test arithmetic (row
+    3142). Its arithmetic is the product's own, the call a nested program XLA inlines. The most recent 1024
+    contractions are kept, a model's working set many times over."""
     function, tree, leaves = key
     arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
     product = functools.partial(function, *arguments, **keywords)
-    return nested(functools.partial(_summed_wide, product, preferred_element_type))
+    return nested(functools.partial(summed, product, preferred_element_type))
+
+
+def _summed_pairwise(product: Callable, preferred_element_type, *operands) -> jax.Array:
+    """`accumulated`'s product of float32 operands: its trace's float32 products each summed as a layer's
+    projection's is (`_paired`); the plain product where its library states its derivative
+    (`_own_backward`)."""
+    narrow = functools.partial(product, preferred_element_type=preferred_element_type)
+    traced = jax.make_jaxpr(narrow)(*operands)
+    if _own_backward(traced.jaxpr):
+        return narrow(*operands)
+    (summed,) = _paired(traced.jaxpr, traced.consts, *operands)
+    return summed
+
+
+def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
+    """`jaxpr` evaluated on `operands`, each `dot_general` in it, a jit's program's included (`jnp.einsum`'s),
+    the product `projection_product` takes where it takes it: a CPU's vectorized-dot sum of float32
+    operands into float32."""
+    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, operands, strict=True))
+
+    def read(atom):
+        return atom.val if isinstance(atom, core.Literal) else values[atom]
+
+    for equation in jaxpr.eqns:
+        given = [read(atom) for atom in equation.invars]
+        params = equation.params
+        inner = params.get("jaxpr")
+        product = functools.partial(jax.lax.dot_general, out_sharding=params.get("out_sharding"))
+        if equation.primitive is jax.lax.dot_general_p and (made := projection_product(
+                product, given[0], given[1], params["dimension_numbers"], params["precision"],
+                params["preferred_element_type"])) is not None:
+            outputs = [made]
+        elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.Jaxpr):
+            # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
+            outputs = _paired(inner, inner.consts, *given)
+        else:
+            # As JAX evaluates an equation (`jax.core.eval_jaxpr`): its context, its bind's parameters.
+            with equation.ctx.manager:
+                made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
+            outputs = made if equation.primitive.multiple_results else [made]
+        values.update(zip(equation.outvars, outputs, strict=True))
+    return [read(atom) for atom in jaxpr.outvars]
 
 
 def _summed_wide(product: Callable, preferred_element_type, *operands) -> jax.Array:

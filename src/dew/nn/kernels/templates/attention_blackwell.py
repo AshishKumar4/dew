@@ -4,7 +4,7 @@ mainloop on tcgen05 beside it): tcgen05's products with their accumulators in te
 FlashAttention-4 and Tokamax's sm100 kernel hold them, and the template's algebra (`attention_algebra`)
 between the products.
 
-A program is a head's query block of `TCGEN05.rows` rows, in three warpgroups (`SCHEDULE`). The
+A program is a head's query block of `TCGEN05.rows` rows, in three warpgroups (`schedule`). The
 issuing one's load warp fills a ring of key stages and one of value stages (the bundle's streams,
 `mosaic_sm100.RINGS`: their slots released by the products' commit), and its
 product warp issues each step's `S = Q Kᵀ` into tensor memory and, a step behind, `P V` into the output's
@@ -49,9 +49,25 @@ from dew.nn.kernels.templates.mosaic_sm100 import ISSUING, RINGS, STORED, TCGEN0
 
 CHUNK = 32
 """The output accumulator's columns the correction rescales at a time."""
-SCHEDULE = handoffs.Schedule((handoffs.Role("softmax"), handoffs.Role("correction"), *ISSUING))
+ROLES = (handoffs.Role("softmax"), handoffs.Role("correction"), *ISSUING)
 """A program's roles: the softmax's warpgroup and the correction's, then the issuing one's load and product
 warps."""
+
+
+def schedule(rows: int, block_k: int) -> handoffs.Schedule:
+    """A program's roles (`ROLES`) and the hand-offs between them, each's barriers counting the arrivals of
+    the role that fills it and of those that give it back (`handoffs.HandOff`): `S`'s accumulator of `rows` x
+    `block_k`, which the product warp fills and the softmax gives back once read; the weights' two buffers'
+    signals, the softmax's once its tensor-memory stores are in; each `P V`'s, the product warp's commit;
+    each step's rescale in two slots, the softmax's; the rescaled accumulator's, the correction's; and the
+    softmax's final rows', the softmax's."""
+    return handoffs.Schedule(ROLES, (
+        handoffs.HandOff("scores", mosaic_sm100.Accumulators(1, rows, block_k), "mma", ("softmax",)),
+        handoffs.HandOff("p_full", mosaic_sm100.Signals(count=2), "softmax"),
+        handoffs.HandOff("o_done", mosaic_sm100.Signals(count=2), "mma"),
+        handoffs.HandOff("scaled", mosaic_sm100.Signals(count=2, tensor_core=False), "softmax"),
+        handoffs.HandOff("corrected", mosaic_sm100.Signals(), "correction"),
+        handoffs.HandOff("finished", mosaic_sm100.Signals(tensor_core=False), "softmax")))
 PART = 16
 """A step's tile's columns the softmax reads and weighs at a time: its chains over a row's whole tile spill
 (the natural relaunch's, 7.9 KB a thread at 128 columns), 80 bytes at 32 columns, none at 16 (ptxas for a
@@ -382,46 +398,43 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
         {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}, tiles.stages, 1,
         swizzles={"keys": resources.widest_swizzle(dtype, width),
                   "values": resources.widest_swizzle(dtype, value_width)})
-    scores = mosaic_sm100.Accumulators(1, rows, block_k)
+    roles = schedule(rows, block_k)
 
     def kernel(q_ref, k_ref, v_ref, out_ref, maxima_ref, over_ref, *refs):
         (q_smem, q_loaded, key_refs, value_refs, score_refs, p_even, p_odd, p_full, acc_tmem, o_done, scales,
          scaled, corrected, rows_smem, finished, o_smem, l_smem) = refs
         opened = RINGS.opened({name: dict(zip(rings[name], refs, strict=True))
                                             for name, refs in (("keys", key_refs), ("values", value_refs))})
-        scratch = _Scratch(q_smem, q_loaded, opened["keys"], opened["values"],
-                           scores.opened(*score_refs), (p_even, p_odd),
-                           paired.opened(p_full), acc_tmem, paired.opened(o_done), scales,
-                           handed.opened(scaled), signals.opened(corrected), rows_smem,
-                           loads.opened(finished), o_smem, l_smem)
+        scores, p_full, o_done, scaled, corrected, finished = roles.opened(
+            (score_refs, p_full, o_done, scaled, corrected, finished))
+        scratch = _Scratch(q_smem, q_loaded, opened["keys"], opened["values"], scores, (p_even, p_odd),
+                           p_full, acc_tmem, o_done, scales, scaled, corrected, rows_smem, finished, o_smem,
+                           l_smem)
         block = _Block(spec.form == "causal", blocks, block_k)
-        SCHEDULE.run(
+        roles.run(
             softmax=lambda _: _softmax(block, scratch, spec=spec, tiles=tiles, blocks=blocks, dtype=dtype),
             correction=lambda _: _correction(block, scratch, (out_ref, maxima_ref, over_ref), spec=spec,
                                              blocks=blocks),
             load=functools.partial(_load, block, scratch, k_ref, v_ref, group=group, tiles=tiles),
             mma=functools.partial(_products, block, scratch, q_ref))
 
-    # The softmax's final rows a role's signal; the weights', each `P V`'s and each rescale's the tensor
-    # core's; each step's factor a role's in two slots, the correction reading one while the softmax writes
-    # the next.
-    loads, signals = mosaic_sm100.Signals(tensor_core=False), mosaic_sm100.Signals()
-    handed = mosaic_sm100.Signals(count=2, tensor_core=False)
-    # The weights' two buffers' signals and each `P V`'s, a slot a buffer.
-    paired = mosaic_sm100.Signals(count=2)
+    # The hand-offs' allocations (`schedule`), each where the program's shared and tensor memory have long
+    # placed it; the rescales and the final rows staged plainly (`mosaic.plain`), stated rather than left to
+    # layout inference, which tiled a raw buffer read at row offsets in the KDA backward.
+    scores, p_full, o_done, scaled, corrected, finished = roles.scratch(target)
     scratch = (mosaic_sm100.operand((rows, width), dtype, width), RINGS.load_barriers(1),
-               tuple(rings["keys"].values()), tuple(rings["values"].values()), scores.scratch(target),
-               *(mosaic_sm100.operand_columns(rows, block_k, dtype) for _ in range(2)), paired.scratch(),
-               mosaic_sm100.accumulator_columns(rows, value_width), paired.scratch(),
-               plgpu.SMEM((2, rows), jnp.float32), handed.scratch(), signals.scratch(),
-               plgpu.SMEM((2, rows), jnp.float32), loads.scratch(),
+               tuple(rings["keys"].values()), tuple(rings["values"].values()), scores,
+               *(mosaic_sm100.operand_columns(rows, block_k, dtype) for _ in range(2)), p_full,
+               mosaic_sm100.accumulator_columns(rows, value_width), o_done,
+               mosaic.plain((2, rows), jnp.float32), scaled, corrected,
+               mosaic.plain((2, rows), jnp.float32), finished,
                mosaic_sm100.operand((rows, value_width), dtype, value_width), mosaic_sm100.vector(rows))
     rows_type = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
     out, maxima, over = TCGEN05.kernel(
         kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type,
                           rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
-        interpret=bodies.interpreted(interpret), warpgroups=SCHEDULE.warpgroups(),
+        interpret=bodies.interpreted(interpret), warpgroups=roles.warpgroups(),
         # A name a form (the default's fold and its natural rewalk compile apart).
         name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)

@@ -119,52 +119,49 @@ def _decode_spans(lengths):
     return template.spans(1, DECODE_KEYS, DECODE_ROWS, lengths=jnp.asarray(lengths, jnp.int32))
 
 
-def _slices_merged(query, key, value, spans, *, merges: bool):
-    """A folded decode step (`natural=False`) cut into 8 slices a row at the decode plan's config, merged in
-    the launch (`merges`, `MosaicForward.merges`) or after it (`algebra.merged_slices`), interpreted."""
+def _slices_merged(query, key, value, spans, *, slices: int = 8, subtracted: bool = False):
+    """A folded decode step (`natural=False`) cut into `slices` slices a row at the decode plan's config
+    (the fold's raw products where `subtracted`, as `attention_decode.attend` walks them), merged after the
+    launch (`algebra.merged_slices`), interpreted."""
     with generation.assumed("sm90"):
         rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
         config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
                                        target=generation.gpu_target()).config
         with tuning.pinned({attention_mosaic.MosaicForward: config}):
-            if merges:
-                merged = attention_mosaic.forward(
-                    rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
-                    interpret=True, out_dtype=jnp.float32, masked=True, splits=8, merges=True)
-            else:
-                out, maximum, total = attention_mosaic.forward(
-                    rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
-                    residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=8)[:3]
-                spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
-                merged = algebra.merged_slices(spec, out, maximum, total)
+            out, maximum, total = attention_mosaic.forward(
+                rows, key, value, row_spans, template.Hooks(), scale=None, natural=False,
+                residuals=Kept.OUTPUT, interpret=True, out_dtype=jnp.float32, masked=True, splits=slices,
+                subtracted=subtracted)[:3]
+            spec = attention_decode._spec(rows, row_spans, template.Hooks(), scale=None)
+            # One slice's output its rows' whole (`attention_decode.attend`'s), nothing to merge.
+            merged = out if slices == 1 else algebra.merged_slices(spec, out, maximum, total)
         return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
 
 
 @INTERPRETS
-@pytest.mark.parametrize("merges", [False, True], ids=["after", "in-launch"])
-def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted(merges):
+def test_a_far_short_rows_slices_merge_through_its_masked_rewalk_interpreted():
     """A decode step cut into 8 slices a row, its first row's query 2^16 times a drawn one (past the fold's
     reach, so the masked rewalk walks it) and 70 keys long, two key tiles: its six slices of no key store
     their empty walks' start in the rewalk for the merge to read (row 3778), the slices merged after the
-    launch or in it, each in the units of its finished rows (`algebra.finished_form`). On par with the step
-    walked whole (check 1)."""
+    launch, each in the units of its finished rows (`algebra.finished_form`). On par with the step walked
+    whole (check 1)."""
     spans = _decode_spans((70, DECODE_KEYS))
 
     def far(seed: int):
         query, key, value = _decode_draw(seed)
         return query.at[0].multiply(2.0 ** 16), key, value
 
-    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans, merges=merges)),
+    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans)),
                     jax.jit(lambda q, k, v: template.reference(q, k, v, spans)), far,
                     "a far short row's slices through its masked rewalk", seeds=SEEDS)
 
 
 @INTERPRETS
-def test_a_decode_steps_slices_merged_in_the_launch_rewalk_rows_whose_sums_pass_fp32s_largest_interpreted():
-    """A decode step cut into 8 slices a row and merged in the launch (`MosaicForward.merges`), its values
-    near bf16's largest under equal logits, so its rows' weighted values pass fp32's largest and its guarded
-    rewalk walks each row's keys whole, merging nothing (`_inference_walk`): on par with jax's own attention,
-    which normalizes its weights before their product (check 1)."""
+def test_a_decode_steps_slices_rewalk_rows_whose_sums_pass_fp32s_largest_interpreted():
+    """A decode step cut into 8 slices a row, its values near bf16's largest under equal logits, so its
+    rows' weighted values pass fp32's largest and its guarded rewalk walks their slices again, merged after
+    the launch: on par with jax's own attention, which normalizes its weights before their product
+    (check 1)."""
     lengths = (300, DECODE_KEYS)
     spans = _decode_spans(lengths)
 
@@ -178,19 +175,18 @@ def test_a_decode_steps_slices_merged_in_the_launch_rewalk_rows_whose_sums_pass_
         return jax.nn.dot_product_attention(query, key, value, implementation="xla",
                                             key_value_seq_lengths=jnp.asarray(lengths, jnp.int32))
 
-    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans, merges=True)),
+    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans)),
                     as_given(jax.jit(reference)), large,
-                    "a decode step's slices merged in the launch past fp32's largest", seeds=SEEDS)
+                    "a decode step's slices past fp32's largest", seeds=SEEDS)
 
 
 @INTERPRETS
-@pytest.mark.parametrize("merges", [False, True], ids=["after", "in-launch"])
-def test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_interpreted(merges):
+def test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_interpreted():
     """A decode step cut into 8 slices a row, each slice's 64 keys one whose logit is 30 and whose values near
     bf16's largest: no slice's sums pass fp32's largest, but their outputs, each near 3e38, sum past it, so
     their merge weighs each output by its share of the masses before its product (row 4526,
-    `algebra.finished_merged`), after the launch or in it: on par with jax's own attention, which normalizes
-    its weights before their product (check 1)."""
+    `algebra.finished_merged`): on par with jax's own attention, which normalizes its weights before their
+    product (check 1)."""
     lengths = (DECODE_KEYS, DECODE_KEYS)
     spans = _decode_spans(lengths)
     dominant = jnp.arange(DECODE_KEYS) % 64 == 0
@@ -207,7 +203,7 @@ def test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_in
         return jax.nn.dot_product_attention(query, key, value, implementation="xla",
                                             key_value_seq_lengths=jnp.asarray(lengths, jnp.int32))
 
-    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans, merges=merges)),
+    assert_as_exact(jax.jit(functools.partial(_slices_merged, spans=spans)),
                     as_given(jax.jit(reference)), outputs_near_the_largest,
                     "slices whose outputs sum past fp32's largest", seeds=SEEDS)
 
@@ -215,20 +211,9 @@ def test_slices_whose_outputs_sum_past_fp32s_largest_merge_to_their_attention_in
 @functools.partial(jax.jit, static_argnames="slices")
 def _sliced_step(query, key, value, lengths, *, slices: int):
     """A decode step of rows `lengths` long, its keys cut into `slices` slices a row at the decode plan's
-    config, merged in the launch (`MosaicForward.merges`: the last slice's program merges the others'
-    states, the interpreter's programs in turn standing in for its waits), the fold's raw products
-    (`subtracted`) as `attention_decode.attend` walks them; lengths an operand, so every drawn length
-    compiles one program."""
-    spans = _decode_spans(lengths)
-    with generation.assumed("sm90"):
-        rows, row_spans, _ = attention_decode.packed(query, spans, DECODE_KV)
-        config = attention_decode.plan(rows, key, value, row_spans, None, scale=None,
-                                       target=generation.gpu_target()).config
-        with tuning.pinned({attention_mosaic.MosaicForward: config}):
-            merged = attention_mosaic.forward(
-                rows, key, value, row_spans, template.Hooks(), scale=None, natural=False, interpret=True,
-                out_dtype=jnp.float32, masked=True, splits=slices, subtracted=True, merges=True)
-        return template.ungrouped_rows(merged, DECODE_HEADS).astype(query.dtype)
+    config and merged after the launch (`_slices_merged`), the fold's raw products (`subtracted`) as
+    `attention_decode.attend` walks them; lengths an operand, so every drawn length compiles one program."""
+    return _slices_merged(query, key, value, _decode_spans(lengths), slices=slices, subtracted=True)
 
 
 @jax.jit
@@ -251,10 +236,10 @@ def _lengths_draw(seed: int):
 @pytest.mark.parametrize("slices", [1, 2, 4, 8])
 def test_a_decode_steps_keys_cut_into_any_slice_count_merge_to_its_attention_interpreted(slices):
     """A decode step's keys cut into `slices` slices a row (`attention_mosaic.forward`'s `splits` at the
-    decode plan's config, a program a slice), the slices merged in the launch (`MosaicForward.merges`), rows
-    of their own lengths, each draw's (`_lengths_draw`): on par with the step walked whole. The lengths an
-    operand, one program judges every draw (row 4640: Hypothesis's eight lengths a case, each over eight
-    draws, took the eight-slice case 124 s)."""
+    decode plan's config, a program a slice), the slices merged after the launch, rows of their own lengths,
+    each draw's (`_lengths_draw`): on par with the step walked whole. The lengths an operand, one program
+    judges every draw (row 4640: Hypothesis's eight lengths a case, each over eight draws, took the
+    eight-slice case 124 s)."""
     assert_as_exact(functools.partial(_sliced_step, slices=slices), _whole_step, _lengths_draw,
                     f"decode step cut into {slices} slices", seeds=SEEDS)
 
