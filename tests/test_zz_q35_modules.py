@@ -20,10 +20,13 @@ def test_modules():
         identity.defvjp(fwd,bwd)
         return identity(x)
     def interceptor(next_fun,args,kwargs,context):
-        chosen=type(context.module).__name__ in ('RMSNorm','RMSNormGated','GatedDeltaNet','MultiHeadDotProductAttention') and context.method_name=='__call__'
+        cls=type(context.module).__name__
+        seam=cls=='RMSNorm' and context.method_name=='seam'
+        chosen=(cls in ('RMSNormGated','GatedDeltaNet','MultiHeadDotProductAttention') and context.method_name=='__call__') or seam
         label='/'.join(context.module.scope.path)
         if chosen:args=(tap(args[0],label+':in'),*args[1:])
         result=next_fun(*args,**kwargs)
+        if seam:return tap(result[0],label+':stream'),tap(result[1],label+':normed')
         return tap(result,label+':out') if chosen and isinstance(result,jax.Array) else result
     loaded,_,_=T._family('qwen35');inputs=T.drawing_text('qwen35')(10)
     sample=loaded.processor.from_hf(T.text_rows(inputs['ids']))
