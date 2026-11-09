@@ -195,7 +195,8 @@ def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.
     """The backward declaration's derived forms walked `along` key tiles (queries first) or query tiles (keys
     first), from the template forward's residual rows (`forward_rows`): its logits the tile's, -inf where
     unseen, and D about no anchor (its whole `delta`), each step's products the template's CPU mainloop's
-    issuer (`attention.interpreted_dot`), scheduled as a mainloop tiles the walk: keys first, a key tile's dK
+    issuer (`attention.interpreted_dot`), its outputs along the walk the step's own, scheduled as a mainloop
+    tiles the walk: keys first, a key tile's dK
     and dV the walk's over the query tiles; queries first, each query tile walking the key tiles, its dQ the
     walk's and each key tile's dK and dV its share, summed over the query tiles in order (row 3310: one
     contraction over a key tile's every query at once, no mainloop's schedule, erred 1.63 times the
@@ -223,11 +224,17 @@ def derived_backward(form: str, along: str, accurate: bool = False, how=algebra.
 
         return {name: part_of(name, value) for name, value in values.items()}
 
+    # Each tile's outputs along the walk (dQ keys first, dK and dV queries first), the step's own, its
+    # products the issuer's too, as a mainloop forms them (`derive.Derived.step`'s `outputs`).
+    indices = (0,) if along == "rows" else (1, 2)
+
     def walk(values: dict):
         parts = [tile(values, index) for index in range(tiles)]
-        mapped = [forms.mapped(part) for part in parts]
-        return forms.finish(walked(forms, parts, template.interpreted_dot), values,
-                            shapes=shaped(parts[0])), mapped
+        state, mapped = forms.init(shaped(parts[0])), []
+        for part in parts:
+            state, outputs = forms.step(state, part, product=template.interpreted_dot, outputs=indices)
+            mapped.append(dict(zip(indices, outputs, strict=True)))
+        return forms.finish(state, values, shapes=shaped(parts[0])), mapped
 
     def run(q, k, v, d):
         _, peak, total, delta = rows_of(q, k, v, d)
