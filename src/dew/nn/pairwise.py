@@ -201,8 +201,14 @@ def _rows_blocked(rows: jax.Array, matrices: jax.Array, group_sizes: jax.Array, 
     block = contraction_block(depth)
 
     def plain(rows, matrices):
+        # Placed as XLA's ragged product places it on a mesh with Explicit axes, where JAX infers no
+        # placement for a ragged dot (`grouped_matmul.ragged_placement`): this branch is traced on every
+        # platform (`precision.projection_product`'s `platform_dependent`).
+        from dew.nn.kernels.grouped_matmul import ragged_placement
+
         return jax.lax.ragged_dot(rows, matrices, group_sizes, precision=precision,
-                                  preferred_element_type=jnp.float32)
+                                  preferred_element_type=jnp.float32,
+                                  out_sharding=ragged_placement(((rows, 0), (matrices, matrices.ndim - 1))))
 
     if block >= depth or 0 in rows.shape + matrices.shape:
         return plain(rows, matrices)
@@ -232,6 +238,9 @@ def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Arra
     each (a group of no rows zero). The steps walk to the most blocks any group may hold, a static count
     reverse mode differentiates, each past the largest group's blocks skipped (`lax.cond`): adding a zero
     block to the counter changes no sum."""
+    # Each group's rows gathered from the whole rows: a gather along a dimension a mesh's Explicit axis splits
+    # takes no placement JAX infers, so the rows are first made whole on the device (`_whole_rows`).
+    rows, cotangent = _whole_rows(rows), _whole_rows(cotangent)
     total, depth, width = rows.shape[0], rows.shape[1], cotangent.shape[1]
     groups = group_sizes.shape[0]
     block = contraction_block(total)
@@ -272,6 +281,16 @@ def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Arra
     return summed
 
 
+def _whole_rows(operand: jax.Array) -> jax.Array:
+    """`operand` with its first dimension placed whole where a mesh's Explicit axis splits it (its other
+    dimensions placed as they are); `operand` itself elsewhere."""
+    sharding = jax.typeof(operand).sharding
+    if not (isinstance(sharding, jax.sharding.NamedSharding) and sharding.mesh.explicit_axes
+            and len(sharding.spec) and sharding.spec[0] is not None):
+        return operand
+    return jax.sharding.reshard(operand, jax.sharding.PartitionSpec(None, *sharding.spec[1:]))
+
+
 def ragged_form(lhs, rhs, ragged_dot_dimension_numbers) -> str | None:
     """Which of a grouped GEMM's ragged products `jax.lax.ragged_dot_general` of `lhs` and `rhs` is
     (`pairwise_ragged_dot_general` sums these): 'rows', rows grouped and their depth contracted, `[rows,
@@ -292,12 +311,12 @@ def ragged_form(lhs, rhs, ragged_dot_dimension_numbers) -> str | None:
 
 
 def pairwise_ragged_dot_general(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array,
-                                ragged_dot_dimension_numbers, precision=None) -> jax.Array:
+                                ragged_dot_dimension_numbers, precision=None, out_sharding=None) -> jax.Array:
     """`jax.lax.ragged_dot_general` of float32 `lhs` and `rhs` into float32 in a form `ragged_form` names,
     summed blocked and pairwise as `pairwise_dot_general` sums a dense one: rows grouped and their depth
     contracted by `_rows_blocked`, each group's rows contracted by `_groups_blocked`. Its reverse pass is the
     plain product's, each cotangent a product of its own summed so over its own contraction (Protected, as
-    the dense form's)."""
+    the dense form's). Its result placed at `out_sharding` where given, the ragged product's own."""
     from dew.nn.kernels.generation import linear_tangent
 
     form = ragged_form(lhs, rhs, ragged_dot_dimension_numbers)
@@ -308,7 +327,8 @@ def pairwise_ragged_dot_general(lhs: jax.Array, rhs: jax.Array, group_sizes: jax
     product = contracted("test_a_cpu_pairwise_grouped_product_holds_every_order")(
         linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
                        kind=Protected()))
-    return product(lhs, rhs, group_sizes)
+    out = product(lhs, rhs, group_sizes)
+    return out if out_sharding is None else jax.sharding.reshard(out, out_sharding)
 
 
 def _ragged_rows(transposed: bool, precision) -> tuple[Callable, Callable]:

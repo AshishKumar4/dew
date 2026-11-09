@@ -630,9 +630,11 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
             return product(lhs, rhs, sizes, dimension_numbers, precision=precision,
                            preferred_element_type=preferred_element_type)
 
+        # Placed where the ragged product is (its `out_sharding`, a mesh with Explicit axes stating it).
+        placement = product.keywords.get('out_sharding') if isinstance(product, functools.partial) else None
         blocked_grouped = functools.partial(pairwise.pairwise_ragged_dot_general,
                                             ragged_dot_dimension_numbers=dimension_numbers,
-                                            precision=precision)
+                                            precision=precision, out_sharding=placement)
         return jax.lax.platform_dependent(lhs, rhs, group_sizes, cpu=blocked_grouped, default=plain_grouped)
 
     def plain(lhs, rhs):
