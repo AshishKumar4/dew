@@ -771,6 +771,8 @@ def compile(
     reads its order as it did (`dew.config.RunConfig.data_plan_version`), refused before anything is
     provisioned where this Dew reads by none of it (`dew.data.plan.read_by`)."""
     read_by(plan_version)
+    # The objective's data as the plan's version reads it (`ObjectiveData.at`).
+    objective = None if objective is None else objective.at(plan_version)
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING
@@ -1811,6 +1813,7 @@ def fitted[Entry](
     record count, but states the source examples a pass holds
     (`Loader.pass_examples`), reads it bounded to that many passes, as
     `examples` bounds it (`Loader.epochs`), in the one compile (`_staged`)."""
+    objective = None if objective is None else objective.at(plan_version)
     if not isinstance(dataset, (Dataset, Loader)):
         if examples is not None:
             raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
@@ -1894,6 +1897,8 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
     filled out with copies its `VALID_ROWS` marks, where a training read would drop them. `measured`
     is the chain as its run's widths measured it (`_held_measure`), which it reads as it stands."""
+    # The objective's data as the plan's version reads it, before it is measured (`ObjectiveData.at`).
+    objective = None if objective is None else objective.at(plan_version)
     chain = _held_batched(dataset._chain(), batch)
     if measured is None:
         measured = _held_measure(chain, objective)
@@ -1958,6 +1963,7 @@ def validation(
     widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched; it
     reads by data plan version `plan_version`, its run's (`compile`)."""
     read_by(plan_version)
+    objective = None if objective is None else objective.at(plan_version)
     read = read or _preferred_read((pipeline,), provision=provision)
 
     # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).

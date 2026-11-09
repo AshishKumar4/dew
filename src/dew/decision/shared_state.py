@@ -102,7 +102,12 @@ def shared_for(layout: QuestionLayout, backbone: nn.Module | TokenModel, head: H
     """`layout` as `head` reads rows over `backbone`: its questions over one state where the backbone
     computes each question's documents as its own row does (`ForkedCalls`, in a training step where
     `train`, no dropout drawing) and the head reads each question apart from the others
-    (`Head.reads_apart`, one question a row not asked); a row a question otherwise."""
+    (`Head.reads_apart`, one question a row not asked), as many as a row holds where the layout states
+    none (`QuestionLayout.shared_state`); a row a question otherwise."""
     reads = (head.reads_apart and not head.one_question and isinstance(backbone, ForkedCalls)
              and backbone.fork_refusal(train) is None)
-    return layout if reads or not layout.shares else dataclasses.replace(layout, shared_state=1)
+    if not reads:
+        return dataclasses.replace(layout, shared_state=1) if layout.shares else layout
+    if layout.shared_state is None and forkable(layout):
+        return dataclasses.replace(layout, shared_state=layout.max_len)
+    return layout

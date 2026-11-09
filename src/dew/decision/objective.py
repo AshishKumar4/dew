@@ -277,7 +277,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 self.image_processor = backbone.processor
                 head = head or model.head
                 context_encoder = context_encoder or model.context_encoder
-                layout = layout or backbone.layout
+                # The layout as the task was given it, which a plan before rows shared a state reads.
+                layout = layout or backbone.declared
                 tokenizer = tokenizer or backbone.tokenizer
                 specials = specials or backbone.specials
                 module = model.backbone
@@ -329,6 +330,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             layout = default_layout(module.causal, head.one_question)
         # A request's questions train over one copy of its state where the backbone and head read each
         # question as its own row (`QuestionLayout.shared_for`), in a training step's form.
+        # The layout as stated, which a run under a data plan before rows shared a state reads (`data`).
+        self.stated = layout
         self.layout = (shared_for(layout, module, head, train=True) if isinstance(layout, QuestionLayout)
                        else layout)
         self.tokenizer = tokenizer
@@ -503,29 +506,42 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
         """Fit rows before mixing, augment training layouts, and pack training
         and evaluation rows alike, by the objective's own tokenizer, which its
-        `bounds` count in."""
+        `bounds` count in: a request's questions over one copy of its state where its layout shares
+        (`shared_for`), and as its layout is stated where a run's data plan predates that
+        (`ObjectiveData.earlier`, `dew.data.plan.SHARED_STATE`), so a run saved before resumes reading as
+        it was written."""
         if tokenizer not in (None, self.tokenizer):
             raise ValueError("a decision objective lays its rows out with its own tokenizer; "
                              "pass tokenizer= when building it")
+        shared = self._data(self.layout, self.bounds)
+        stated = self.stated
+        if stated is self.layout or not isinstance(stated, QuestionLayout):
+            return shared
+        earlier = self._data(stated, stated.bounds(self.tokenizer, self.specials, self.context_length,
+                                                   self.segments, self.context_window))
+        return dataclasses.replace(shared, earlier=earlier)
+
+    def _data(self, layout: Layout, bounds: Bounds) -> ObjectiveData:
+        """`data` as `layout` lays rows out within `bounds`."""
         grouped = bool(self.consistency)
-        training = ConfigureLayout(self.layout, self.tokenizer, self.specials, self.shuffle_options,
+        training = ConfigureLayout(layout, self.tokenizer, self.specials, self.shuffle_options,
                                    self.none_of_the_above, train=True, context_length=self.context_length,
                                    grouped=grouped, none_of_the_above_options=self.none_of_the_above_options)
         evaluating = dataclasses.replace(training, train=False)
-        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
-                  self.bounds, self.none_of_the_above, self.context_window,
+        fit = Fit(layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
+                  bounds, self.none_of_the_above, self.context_window,
                   none_of_the_above_options=self.none_of_the_above_options)
         held = dataclasses.replace(fit, none_of_the_above=0.0, scored=True)
         # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
         expand = (QuestionRows(),)
-        options = self.bounds.options if self.layout.joint else None
+        options = bounds.options if layout.joint else None
         compact = None if options is None else -(-options // OPTION_TILE) * OPTION_TILE
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
-            pack=packing(self.layout, self.bounds, self.context_window, grouped),
-            packed=(PackedRows(self.layout.max_len, compact, self.spans_in_context,
-                               documents=forked_documents(self.layout, self.bounds)),),
+            pack=packing(layout, bounds, self.context_window, grouped),
+            packed=(PackedRows(layout.max_len, compact, self.spans_in_context,
+                               documents=forked_documents(layout, bounds)),),
         )
 
     def bind_widths(self, widths: Mapping[str, object]) -> None:

@@ -1510,6 +1510,16 @@ class ObjectiveData:
     """The rows the objective reads where a chain lays out none of its own, after its other record
     steps; rows a chain packs or cuts into windows (`Pack`, `Windows`) keep the length it gives them, as
     a schedule's stages each give theirs (`dew.data.compile.objective_steps`)."""
+    earlier: ObjectiveData | None = None
+    """The objective's data as a plan before `dew.data.plan.SHARED_STATE` reads it, where it reads
+    otherwise since (a decision request's questions over one copy of their state), so a run saved under
+    such a plan resumes reading as it was written (`at`); None where it reads alike."""
+
+    def at(self, version: int) -> ObjectiveData:
+        """This data as plan `version` reads it: `earlier` before `SHARED_STATE`, itself otherwise."""
+        from dew.data.plan import SHARED_STATE
+
+        return self.earlier if self.earlier is not None and version < SHARED_STATE else self
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep
