@@ -1832,7 +1832,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                     return
                 place = _tgmm_place(m, depth.start + wg * depth_half, columns.start, tiles)
                 out_gmem = o_gmem.at[g_i]
-                if tail is None:
+                if workspace is None:  # no tail
                     _stored_chunks(family, summed, lambda value, at: store(0, value, out_gmem, at), place)
                     return
                 first, gathered = gathered
@@ -2055,7 +2055,7 @@ def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_su
     return summed
 
 
-def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, steps, block_k: int, *,
+def _zero_neighbours_of(family: mosaic.Issuer, refs: list, step, start, end, steps, block_k: int, *,
                         aligned_skip: bool = False):
     """Dew: in a group's first and last row blocks, zero each of `refs` (`[block_k, columns]` stages, each
     one swizzled row wide, so one holds a thread's few registers whatever the tile's width; each with
