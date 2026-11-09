@@ -4,13 +4,16 @@ own sampling task, at the step its selection pins, which its record names."""
 
 import dataclasses
 import json
+import shutil
 from pathlib import Path
 
 import jax
 import numpy as np
 import pytest
 from process_support import run_pool
-from run_kinds import decision, diffusion, lm, trained
+from run_kinds import SEQ, decision, diffusion, lm, trained
+from saved_run_kinds import over, windows
+from token_support import write_token_corpus
 
 from dew.batch import FROZEN
 from dew.config import ObjectiveConfig, SourceOptions
@@ -269,6 +272,35 @@ def test_a_run_resumes_whether_its_decoder_scans_its_layers_or_not(tmp_path):
             **deeper.model.fields, "scan_layers": scanned}))
         trained(run, tmp_path, "run", trainer={"name": "run", "steps": steps, "checkpoint_final": True})
         assert str(steps) in {path.name for path in (tmp_path / "runs" / "run").iterdir()}
+
+
+def test_a_run_resumes_under_another_kernel_choice_and_refuses_its_experts_packed_otherwise(tmp_path):
+    """A run over an MXFP4 GPT-OSS source, its experts decoded, resumes on another kernel for its attention
+    (`RunConfig.kernels`, overridable on whatever hardware the resume lands on, training.md) and trains a
+    step past its saved one (`RESUMABLE`); a resume asking its experts packed, whose banks are no trainable
+    parameters and hold no optimizer moments, is refused before it restores or writes its record
+    (`check_resume`; the promotion's review: it passed the check and failed at restore)."""
+    from test_hf_decoder_moe import _mxfp4_gpt_oss
+
+    source = _mxfp4_gpt_oss(tmp_path / "source")
+    # A tokenizer whose ids fit the source's 96, which its fixture carries none of, as its own, and windows
+    # of ids it holds.
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(Path(__file__).parent / "fixtures" / "hf" / "dory-tiny" / name, source / name)
+    ids = np.random.default_rng(0).integers(1, 56, (2, 40 * SEQ))
+    corpus = write_token_corpus(tmp_path / "held-tokens", ids[0], ids[1, :8 * SEQ], tokenizer=str(source),
+                                vocab_size=96)
+    first = dataclasses.replace(over(str(source), tmp_path, drawn=False), data=windows(corpus.train),
+                                validation=windows(corpus.val), kernels={"attention": "reference"})
+    trained(first, tmp_path, "run", trainer={"name": "run", "checkpoint_final": True})
+    again, _ = trained(dataclasses.replace(first, kernels={"attention": "xla"}), tmp_path, "run",
+                       trainer={"name": "run", "steps": 2, "checkpoint_final": True})
+    assert int(again.step) == 2
+    record = (tmp_path / "runs" / "run" / "run.json").read_text()
+    packed = dataclasses.replace(first, source=dataclasses.replace(first.source, packed_experts=True))
+    with pytest.raises(ValueError):
+        trained(packed, tmp_path, "run", trainer={"name": "run", "steps": 3, "checkpoint_final": True})
+    assert (tmp_path / "runs" / "run" / "run.json").read_text() == record
 
 
 @pytest.mark.mesh(devices=8)
