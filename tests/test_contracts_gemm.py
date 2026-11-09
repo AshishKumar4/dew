@@ -140,7 +140,7 @@ def test_a_cpu_pairwise_grouped_product_holds_every_order(edge, form):
                 return masked(rows, cotangent)
             starts, numbers = np.cumsum([0, *np.asarray(sizes)]), (((1,), (0,)), ((), ()))
             return jnp.stack([pairwise.pairwise_dot_general(rows[a:b].T, cotangent[a:b], numbers)
-                              for a, b in zip(starts[:-1], starts[1:], strict=True)])
+                              for a, b in itertools.pairwise(starts)])
 
     primals = normal_draw(4866, *shapes, scale=EDGES[edge])
     direction = normal_draw(4867, *shapes, scale=EDGES[edge])

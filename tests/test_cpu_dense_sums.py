@@ -4,6 +4,7 @@ and pairwise, or in float64), the products a dense layer forms taking it in fixe
 error against float64, forward and both gradients, on par with a vectorized dot's."""
 
 import functools
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -223,11 +224,11 @@ def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_
         group_sizes = jnp.asarray(sizes, jnp.int32)
         whole = jnp.asarray([sum(sizes)], jnp.int32)
         with jax.default_matmul_precision(precision.FP32_SUMS):
-            out = jax.jit(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32))(x, w)
-            dx = jax.jit(lambda dy, w: gemm.gemm(dy, w, group_sizes, transpose_rhs=True,
-                                                 out_dtype=jnp.float32))(dy, w)
-            dw = jax.jit(lambda x, dy: gemm.gemm_t(x, dy, whole, out_dtype=jnp.float32))(x, dy)
-        for g, (start, end) in enumerate(zip(starts[:-1], starts[1:], strict=True)):
+            out = jax.jit(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.float32))(x, w, group_sizes)
+            dx = jax.jit(lambda dy, w, s: gemm.gemm(dy, w, s, transpose_rhs=True,
+                                                    out_dtype=jnp.float32))(dy, w, group_sizes)
+            dw = jax.jit(lambda x, dy, s: gemm.gemm_t(x, dy, s, out_dtype=jnp.float32))(x, dy, whole)
+        for g, (start, end) in enumerate(itertools.pairwise(starts)):
             rows, cotangent = x[start:end], dy[start:end]
             np.testing.assert_array_equal(np.asarray(out[start:end]),
                                           np.asarray(pairwise.pairwise_dot_general(rows, w[g], numbers)))
