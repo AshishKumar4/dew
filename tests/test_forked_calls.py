@@ -34,15 +34,17 @@ ROWS = [[3, 4, 5, 6, 7, 8, 9, 10, 11], [3, 4, 5, 6, 7, 8, 9, 12], [3, 4, 5, 6, 7
         [3, 4, 5, 6, 7, 8, 9, 10, 16], [20, 21, 22, 23, 24]]
 """Four rows over one prompt of seven tokens, two of them sharing an eighth, and a row of its own."""
 
-FORK_SEEDS = 48
-"""Check 1's declared seeds for rows over forks against the rows laid out whole."""
+FORK_SEEDS = 64
+"""Check 1's declared seeds for rows over forks against the rows laid out whole: `seeds_for`, paired, sized
+the Mamba-2 hybrid's site, its A_log gradient a sum over every token of each head's, at 64 with sixteen
+heads (at four it resolves within no count up to MOST_SEEDS, at thirty-two at 256; armada, 11-09)."""
 
 RECURRENT = {
     "gated_delta_net": {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
                         "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4},
     "kimi_delta_attention": {"linear_num_heads": 2, "linear_head_dim": 8, "linear_conv_kernel_dim": 4},
     "mamba": {"intermediate_size": 32, "state_size": 4, "time_step_rank": 2},
-    "mamba2": {"num_heads": 4, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4},
+    "mamba2": {"num_heads": 16, "head_dim": 8, "state_size": 8, "n_groups": 1, "chunk_size": 4},
     "short_conv": {"conv_L_cache": 3},
     "lightning_attention": {"block_size": 4}}
 """The mixers holding row state that read forks, at toy size: Qwen3.5's gated delta net, Kimi's delta
