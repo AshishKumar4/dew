@@ -14,7 +14,6 @@ import copy
 import dataclasses
 import functools
 import json
-import logging
 import os
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -122,8 +121,6 @@ if TYPE_CHECKING:
     from dew.nn.dex import DifferentialExtension
     from dew.sampling.guidance import Guidance
     from dew.sampling.solvers.common import Solver
-
-_log = logging.getLogger(__name__)
 
 
 def _refined(layout: Layout | None, model: RefinesLayout | None) -> Layout | None:
