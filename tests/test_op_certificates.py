@@ -81,7 +81,7 @@ def test_ties_round_to_even_and_a_low_part_breaks_them(fmt):
 @pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
 def test_subnormal_cells_overflow_and_signed_zero(fmt):
     least = 2.0 ** (fmt.emin - fmt.precision + 1)
-    edge = fmt.largest + 2.0 ** (fmt.emax - fmt.precision)
+    edge = fmt.overflow
     cases = [(least / 2, least * 2.0 ** -40), (-least / 2, 0.0), (3 * least / 2, 0.0), (least / 4, 0.0),
              (-least / 4, 0.0), (2.0 ** fmt.emin * 0.75, 0.0), (edge, 0.0), (-edge, 0.0),
              (edge, -edge * 2.0 ** -60), (np.nextafter(edge, 0), 0.0), (fmt.largest, 0.0)]

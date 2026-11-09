@@ -20,6 +20,7 @@ from op_certificates import (
     interval_ends,
     interval_precision,
     magnitude_sum,
+    nearest,
     rounded,
     stepped as oc_stepped,
     two_sum,
@@ -104,6 +105,9 @@ def _bits(value) -> np.ndarray:
     value = np.asarray(value)
     if value.dtype == bool:
         return value.astype(np.uint8)
+    if value.dtype.itemsize == 0:
+        # float0, a symbolic zero's type (an integer input's tangent), holds no bits.
+        return np.zeros(value.shape, np.uint8)
     return value.view(np.dtype(f"u{value.dtype.itemsize}"))
 
 
@@ -302,6 +306,18 @@ def _erfinv_special(value):
     return expected, ~(np.abs(value) < 1) | (value == 0)
 
 
+def _sin_special(value):
+    """sin's exact values at ±0 (sin(±0) = ±0), and its NaN at the infinities, named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.where(value == 0, value, np.nan), named
+
+
+def _cos_special(value):
+    """cos's one exact value, cos(±0) = 1, and its NaN at the infinities, named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.where(value == 0, 1.0, np.nan), named
+
+
 def _logistic_interval(values, bits):
     """logistic's outward enclosure, 1 / (1 + exp(-x)), at each finite value, taken at EXP_RANGE's nearer
     end beyond it: below it every logistic is under exp(-110), between +0 and the least subnormal of a
@@ -353,7 +369,7 @@ def _transcendental(enclose, special):
     return levels
 
 
-def _terms_hold(native, terms, fmt: Format, flushes: bool) -> np.ndarray:
+def _terms_hold(native, terms, fmt: Format, flushes: bool, counts=None) -> np.ndarray:
     """Whether each native sum of `terms` (exact float64 values, summed along the last axis) is within
     the bound of any order of summing them in `fmt`, fused multiply-adds included: γ_n Σ|terms| (Higham,
     Accuracy and Stability of Numerical Algorithms, 2002, §3.1: n terms, at most n - 1 roundings on any
@@ -361,14 +377,15 @@ def _terms_hold(native, terms, fmt: Format, flushes: bool) -> np.ndarray:
     Σ|terms|, in the allowance), plus what underflow loses past that relative bound at each rounding:
     where the lane flushes, a flushed partial's least normal; where it keeps subnormals, half their
     spacing (a product, or a sum carried wider and rounded into `fmt`). An empty sum is the additive
-    identity, +0."""
+    identity, +0. `counts`, where given, is each sum's own count of terms, its padding zeros left out (a
+    scatter's, whose elements take different numbers of updates)."""
     native = np.asarray(native, np.float64)
     count = terms.shape[-1]
     if count == 0:
         return _same(native, np.zeros_like(native))
     underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
     error = np.abs(native - exact_sum(terms, -1))
-    slack = allowance(magnitude_sum(terms, -1), count, fmt, underflow)
+    slack = allowance(magnitude_sum(terms, -1), count if counts is None else counts, fmt, underflow)
     return np.isfinite(error) & (error <= np.nextafter(slack, np.inf))
 
 
@@ -588,10 +605,295 @@ def _dot(params, operands, result, fmt):
     return _terms_hold(native, products, fmt, flushes).reshape(result.shape)
 
 
+def _scatter_targets(params, operand, indices, updates):
+    """Where each element of a lax.scatter's `updates` lands in `operand`, by XLA's semantics: an
+    `[updates.size, operand.ndim]` array of operand indices, -1 rows for an update its window drops. Each
+    update's scatter coordinates pick a start vector from `indices` (its last axis the index vector),
+    placed on `scatter_dims_to_operand_dims` and the operand's batching axes, clamped so the window fits
+    (the clip mode) or dropped whole where it does not (every other mode), then offset by the update's
+    window coordinates on the operand's axes a window keeps."""
+    import jax
+
+    numbers = params["dimension_numbers"]
+    clip = params["mode"] == jax.lax.GatherScatterMode.CLIP
+    window_axes = [axis for axis in range(operand.ndim)
+                   if axis not in numbers.inserted_window_dims and axis not in numbers.operand_batching_dims]
+    scatter_dims = [dim for dim in range(updates.ndim) if dim not in numbers.update_window_dims]
+    window = [1] * operand.ndim
+    for dim, axis in zip(numbers.update_window_dims, window_axes, strict=True):
+        window[axis] = updates.shape[dim]
+    targets = np.full((updates.size, operand.ndim), -1, np.int64)
+    for flat, at in enumerate(np.ndindex(*updates.shape)):
+        batch = tuple(at[dim] for dim in scatter_dims)
+        vector = indices[batch]
+        start = [0] * operand.ndim
+        for position, axis in enumerate(numbers.scatter_dims_to_operand_dims):
+            start[axis] = int(vector[position])
+        for axis, batch_axis in zip(numbers.operand_batching_dims, numbers.scatter_indices_batching_dims,
+                                    strict=True):
+            start[axis] = batch[batch_axis]
+        if clip:
+            start = [min(max(begin, 0), operand.shape[axis] - window[axis])
+                     for axis, begin in enumerate(start)]
+        elif any(start[axis] < 0 or start[axis] + window[axis] > operand.shape[axis]
+                 for axis in range(operand.ndim)):
+            continue
+        for dim, axis in zip(numbers.update_window_dims, window_axes, strict=True):
+            start[axis] += at[dim]
+        targets[flat] = start
+    return targets
+
+
+def _scattered(params, operand, indices, updates):
+    """lax.scatter's result: `operand` with each update written where it lands (`_scatter_targets`), in
+    their order, so of two updates of one element the later stands."""
+    result = np.array(operand)
+    targets = _scatter_targets(params, operand, indices, updates)
+    for update, target in zip(np.asarray(updates).ravel(), targets, strict=True):
+        if target[0] >= 0:
+            result[tuple(target)] = update
+    return result
+
+
+def _scatter_added(params, operands, result, fmt):
+    """A scatter-add's result: each operand element plus every update that lands on it (`_scatter_targets`),
+    summed within its bound in any order (`_terms_hold`, each element's own count of terms); for integers,
+    wrapped to the result's width."""
+    operand, indices, updates = (np.asarray(value) for value in operands)
+    targets = _scatter_targets(params, operand, indices, updates)
+    landed = targets[:, 0] >= 0
+    places = np.ravel_multi_index(targets[landed].T, operand.shape) if operand.ndim else np.zeros(
+        int(landed.sum()), np.int64)
+    values = updates.ravel()[landed]
+    if fmt is None:
+        summed = operand.astype(np.uint64).ravel()
+        with np.errstate(over="ignore"):
+            np.add.at(summed, places, values.astype(np.uint64))
+        return _bits(result) == _bits(summed.astype(result.dtype).reshape(operand.shape))
+    flushes = lane().flushes
+    counts = np.bincount(places, minlength=operand.size)
+    width = int(counts.max(initial=0)) + 1
+    terms = np.zeros((operand.size, width))
+    terms[:, 0] = _read(operand, flushes).ravel()
+    slot = np.zeros(operand.size, np.int64)
+    for place, value in zip(places, _read(values, flushes), strict=True):
+        slot[place] += 1
+        terms[place, slot[place]] = value
+    native = np.asarray(result, np.float64).ravel()
+    return _terms_hold(native, terms, fmt, flushes, counts=counts + 1).reshape(operand.shape)
+
+
+def _ragged_dot(params, operands, result, fmt):
+    """A ragged_dot_general's products, exact in float64, summed within their bound in any order
+    (`_terms_hold`): the lhs's rows split into consecutive groups of `group_sizes`, either each row times
+    its group's rhs over the contracting axis (a ragged row axis, the rhs grouped) or each group's rows
+    alone summed (a ragged contracting axis, the result grouped), as the product's dimensions state it
+    (`dew.nn.programs.ragged_layout`); a row past every group a zero. Other forms have no contract here."""
+    from dew.nn.programs import RaggedLayout, ragged_layout
+
+    lhs, rhs, sizes = (np.asarray(value) for value in operands)
+    layout = ragged_layout(lhs.ndim, rhs.ndim, params["ragged_dot_dimension_numbers"])
+    if layout not in (RaggedLayout.ROWS, RaggedLayout.GROUPS):
+        raise TypeError("a ragged_dot_general of this form")
+    group = np.repeat(np.arange(sizes.size), sizes)
+    group = np.concatenate([group, np.full(lhs.shape[0] - group.size, -1)])
+    flushes = lane().flushes
+    left, right = _read(lhs, flushes), _read(rhs, flushes)
+    if layout is RaggedLayout.ROWS:
+        # [rows, columns, terms]: each row times its group's rhs, a row of no group times zeros.
+        weights = np.where(group[:, None, None] >= 0, np.moveaxis(right, 1, 2)[np.maximum(group, 0)], 0.0)
+        products = left[:, None, :] * weights
+    else:
+        # [groups, lhs columns, rhs columns, rows]: each group's rows' products, every other row a zero.
+        member = group[None, :] == np.arange(sizes.size)[:, None]
+        products = np.where(member[:, None, None, :],
+                            left.T[None, :, None, :] * right.T[None, None, :, :], 0.0)
+    native = np.asarray(result, np.float64).reshape(products.shape[:-1])
+    return _terms_hold(native, products, fmt, flushes).reshape(np.shape(result))
+
+
+def _integer_power(params, operands, result, fmt):
+    """An integer_pow's result: x^y by repeated multiplications (a square and multiply per bit of |y|), and
+    a reciprocal of them where y is negative, each a rounding, so within γ_r of the exact power relative to
+    it (Higham, Accuracy and Stability of Numerical Algorithms, 2002, §3.1: r roundings of relative error at
+    most the unit roundoff), plus what underflow loses at each rounding; an exactly infinite or undefined
+    power the lane's same, and one past the format's range infinite. Integers wrap to the result's width."""
+    import fractions
+
+    (value,) = operands
+    power = params["y"]
+    if fmt is None:
+        powered = _wrapping(lambda a: a ** abs(power))
+        return _bits(result) == _bits(powered(result, value))
+    flushes = lane().flushes
+    read = _read(value, flushes)
+    magnitude = abs(power)
+    roundings = max(magnitude.bit_length() - 1 + bin(magnitude).count("1") - 1, 0) + (power < 0)
+    exact = np.empty(read.shape)
+    for index, element in enumerate(read.flat):
+        # A zero's or a non-finite value's power is exact in float64 (a pole of the zero's sign where the
+        # power is odd); every other one a fraction's, rounded once.
+        if np.isfinite(element) and element != 0:
+            exact.flat[index] = float(fractions.Fraction(float(element)) ** power)
+        else:
+            with np.errstate(divide="ignore"):
+                exact.flat[index] = np.float64(element) ** power
+    native = np.asarray(result, np.float64)
+    underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
+    slack = allowance(np.abs(exact), roundings, fmt, underflow)
+    finite = np.isfinite(exact) & (np.abs(exact) <= fmt.largest)
+    # A power's sign is exact, a zero's among them.
+    held = (finite & np.isfinite(native) & (np.abs(native - exact) <= np.nextafter(slack, np.inf))
+            & (np.signbit(native) == np.signbit(exact)))
+    beyond = ~finite & ~np.isnan(exact) & (native == np.copysign(np.inf, exact))
+    return held | beyond | (np.isnan(exact) & np.isnan(native))
+
+
+def _keyed(value) -> bool:
+    import jax
+
+    dtype = getattr(value, "dtype", None)
+    return dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
+
+
+@functools.cache
+def _combiner(which: str, dtype: str) -> str:
+    """The combine jaxpr, as printed, of one of Dew's variadic reductions over `dtype` operands: a
+    compensated sum's (`dew.nn.precision.compensated_add`), or a row's online softmax's with or without
+    its maximum's column (`dew.objectives.lm.chunked._row_terms`, `"softmax"` and `"softmax predicted"`):
+    what a `reduce` equation is recognized as by its own combine."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.nn import programs
+    from dew.nn.precision import compensated_add
+    from dew.objectives.lm.chunked import _row_terms
+
+    scalar = jax.ShapeDtypeStruct((), dtype)
+    if which == "compensated":
+        return str(jax.make_jaxpr(lambda a, b, c, d: compensated_add((a, b), (c, d)))(*[scalar] * 4))
+    traced = jax.make_jaxpr(lambda x, labels: _row_terms(x, which == "softmax predicted", labels))(
+        jax.ShapeDtypeStruct((1, 3), dtype), jax.ShapeDtypeStruct((1,), jnp.int32))
+    reduces = [eqn for eqn in programs.equations(traced.jaxpr) if eqn.primitive.name == "reduce"]
+    return str(reduces[0].params["jaxpr"])
+
+
+def _underflow(fmt: Format) -> float:
+    """What one rounding loses below `fmt`'s normal range: its least normal where the lane flushes, else
+    half its least subnormal."""
+    return 2.0 ** fmt.emin if lane().flushes else 2.0 ** (fmt.emin - fmt.precision)
+
+
+def _pair_held(params, operands, results, fmt) -> list[np.ndarray]:
+    """A compensated sum's `(hi, lo)` pairs (`compensated_add`'s reduction of `(values, residuals)`): `hi +
+    lo` within 5u²·n·Σ|terms| of the terms' exact sum, plus what underflow loses (8n of `_underflow`), and
+    `lo` within a rounding of `hi`. Each combine's TwoSums are exact and its residuals' two additions
+    round (Ogita, Rump and Oishi, Accurate Sum and Dot Product, 2005, §4: an error of at most
+    2.01u(|d| + |l1| + |l2|) ≤ 4.03u²(|h1| + |h2|) a combine), at most n combines on a term's path. A
+    TwoSum overflows only where its rounded sum does (Boldo, Graillat and Muller, On the robustness of
+    the 2Sum and Fast2Sum algorithms, 2017, §5), and a TwoSum of an infinite sum takes inf - inf for its
+    residual, so a combine reaching a non-finite value makes both halves NaN, and every combine after it:
+    a sum of a non-finite term, or one some order of whose combines certainly overflows (its positive or
+    negative terms, summed first, past the format's overflow threshold by γ_2n), may also be a NaN pair;
+    any other sum's pair is finite and held, a NaN one a finding where no order is proven to make it."""
+    flushes = lane().flushes
+    axes = tuple(params["dimensions"])
+    # A reduce's operands are its arrays, then each one's initial value, every output's first term.
+    arrays, initial = operands[:len(operands) // 2], operands[len(operands) // 2:]
+    terms = [np.moveaxis(_read(value, flushes), axes, range(-len(axes), 0)) for value in arrays]
+    terms = np.concatenate([value.reshape(*value.shape[:value.ndim - len(axes)], -1) for value in terms], -1)
+    starts = np.broadcast_to(np.stack([_read(value, flushes) for value in initial]), (*terms.shape[:-1], 2))
+    terms = np.concatenate([starts, terms], -1)
+    count = terms.shape[-1] // 2
+    high, low = (np.asarray(value, np.float64) for value in results)
+    exact, magnitude = exact_sum(terms, -1), magnitude_sum(terms, -1)
+    u, lost = fmt.unit_roundoff, _underflow(fmt)
+    bound = 5 * u * u * count * magnitude + 8 * count * lost + 2.0 ** -52 * (np.abs(high) + np.abs(exact))
+    one_signed = np.maximum(exact_sum(np.maximum(terms, 0), -1), exact_sum(np.maximum(-terms, 0), -1))
+    overflows = ~np.all(np.isfinite(terms), -1) | (one_signed * (1 - gamma(2 * count, fmt)) >= fmt.overflow)
+    near = np.abs(high + low - exact) <= bound
+    renormalized = np.abs(low) <= u * np.abs(high) + lost
+    pair = np.isfinite(high) & np.isfinite(low) & near & renormalized
+    held = pair | (overflows & np.isnan(high) & np.isnan(low))
+    return [held, held]
+
+
+def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
+    """A row's online softmax (`chunked._row_terms`' reduction of `(logits, ones, rest[, columns])`): its
+    maximum exact, its maximum's first column exact, and each sum of exponentials scaled to the maximum
+    within its bound of the exact Σ s_j e^(x_j - M): a term's path through at most n combines, each a
+    subtraction of maxima (its error in the exponent, u|m - M|, summing along the path to at most
+    u(M - x_j)), an exponential (the lane's reach for it, `lane`, relative r), a product and a sum, so the
+    term within e^(u(M - x_j) + n(r + 3u)) - 1 of itself, plus what underflow loses (4n of `_underflow`).
+    A row of a NaN may hold any sums; a row whose maximum is -inf keeps its sums as they are, summed
+    (γ_n). Its initial values are one more term of every row, its maximum's column the least of the
+    columns holding the maximum, as the combine keeps the lesser on a tie."""
+    flushes = lane().flushes
+    (axis,) = params["dimensions"]
+    arrays, initial = operands[:len(operands) // 2], operands[len(operands) // 2:]
+    values = []
+    for value, start in zip(arrays, initial, strict=True):
+        laid = np.moveaxis(_read(value, flushes), axis, -1)
+        start = np.broadcast_to(_read(start, flushes), (*laid.shape[:-1], 1))
+        values.append(np.concatenate([start, laid], -1))
+    logits, scales = values[0], values[1:3]
+    count = logits.shape[-1]
+    peak = np.max(logits, -1)
+    held = [_same(np.asarray(results[0], np.float64), peak)]
+    nan = np.any(np.isnan(logits), -1)
+    u, lost = fmt.unit_roundoff, _underflow(fmt)
+    reach = 2 * u * lane().reach["exp", fmt.name]
+    empty = peak == -np.inf
+    with np.errstate(invalid="ignore", over="ignore"):
+        shifted = np.where(empty[..., None], 0.0, logits - peak[..., None])
+        terms = np.exp(shifted)
+        spread = np.exp(np.minimum(-u * shifted + count * (reach + 3 * u), 700.0)) - 1
+    for scale, result in zip(scales, results[1:3], strict=True):
+        weighted = scale * terms
+        exact, magnitude = exact_sum(weighted, -1), magnitude_sum(weighted, -1)
+        bound = (np.sum(np.abs(weighted) * spread, -1) + 4 * count * lost
+                 + gamma(count, fmt) * magnitude * empty + 2.0 ** -50 * magnitude)
+        native = np.asarray(result, np.float64)
+        held.append(nan | (np.isfinite(native) & (np.abs(native - exact) <= bound)))
+    if len(results) == 4:
+        least = np.min(np.where(logits == peak[..., None], values[3], np.iinfo(values[3].dtype).max), -1)
+        held.append(nan | (np.asarray(results[3]) == least))
+    return held
+
+
+REDUCTIONS = {"compensated": _pair_held, "softmax": _softmax_held, "softmax predicted": _softmax_held}
+"""Dew's variadic reductions check 2 holds, each recognized by its combine (`_combiner`), and its contract
+over all its results together."""
+
+
+def _reduced(eqn, operands, results) -> list[np.ndarray]:
+    """A variadic `reduce`'s held results, by the contract of the reduction its combine is (`REDUCTIONS`);
+    a TypeError for one it is none of."""
+    dtype = str(np.asarray(operands[0]).dtype)
+    combine = str(eqn.params["jaxpr"])
+    for which, contract in REDUCTIONS.items():
+        if np.issubdtype(np.dtype(dtype), np.floating) and combine == _combiner(which, dtype):
+            return contract(eqn.params, operands, results, _format(np.asarray(results[0]).dtype))
+    raise TypeError("a reduction of none of Dew's combines")
+
+
 def _moved(oracle):
     """A move of data or a sign operation: the result is `oracle(params, *operands)` in storage bits,
-    subnormals and NaN payloads kept."""
+    subnormals and NaN payloads kept. A move of PRNG keys moves their data: each word of a key's data moved
+    as its keys are (`oracle` over that word of every keyed operand), so its every word is held."""
     def contract(params, operands, result, fmt):
+        import jax
+
+        if _keyed(result):
+            words = np.asarray(jax.random.key_data(result))
+            data = [np.asarray(jax.random.key_data(value)) if _keyed(value) else None for value in operands]
+
+            def word(at):
+                parts = (np.asarray(value) if part is None else part[..., at]
+                         for value, part in zip(operands, data, strict=True))
+                return np.asarray(oracle(params, *parts))
+            expected = np.stack([word(at) for at in range(words.shape[-1])], axis=-1)
+            return np.all(_bits(words) == _bits(expected.astype(words.dtype)), axis=-1)
         expected = np.asarray(oracle(params, *(np.asarray(value) for value in operands)))
         result = np.asarray(result)
         return np.broadcast_to(_bits(result) == _bits(expected.astype(result.dtype)), result.shape)
@@ -663,6 +965,16 @@ def _integral_extremum(reduce, extreme: str):
 
 def _selected(params, which, *cases):
     return np.choose(np.asarray(which).astype(np.int64), cases)
+
+
+def _dynamic_sliced(params, operand, *starts):
+    """lax.dynamic_slice's result: the window of `slice_sizes` at `starts`, each start clamped so the window
+    fits in the operand, as XLA clamps it."""
+    sizes = params["slice_sizes"]
+    at = [min(max(int(start), 0), extent - size)
+          for start, extent, size in zip(starts, np.shape(operand), sizes, strict=True)]
+    window = tuple(slice(begin, begin + size) for begin, size in zip(at, sizes, strict=True))
+    return np.asarray(operand)[window]
 
 
 def _broadcast(params, value):
@@ -761,6 +1073,85 @@ def _gathered(params, operand, indices):
     return result
 
 
+def _ordered(value) -> np.ndarray:
+    """Each value's place in the lane's total order of its type, as int64: a float's sign and magnitude
+    bits, so -NaN < -inf < ... < -0 < +0 < ... < +inf < NaN as XLA's sort and top_k order them; an
+    integer or a boolean its own value."""
+    value = np.asarray(value)
+    if value.dtype == np.bool_ or np.issubdtype(value.dtype, np.integer):
+        return value.astype(np.int64)
+    bits = _bits(value).astype(np.int64)
+    width = 8 * value.dtype.itemsize
+    magnitude = bits & ((1 << (width - 1)) - 1)
+    return np.where(bits >> (width - 1) & 1, -magnitude - 1, magnitude)
+
+
+def _sort_key(value) -> np.ndarray:
+    """A sort key as lax.sort compares it: a float's zeros one +0 and its NaNs one +NaN, after every other
+    value (`_canonicalize_float_for_sort`, jax/_src/lax/lax.py); any other value as it is."""
+    value = np.asarray(value)
+    if _format(value.dtype) is None:
+        return value
+    zeroed = np.where(value == 0, value.dtype.type(0), value)
+    return np.where(np.isnan(value), np.array(np.nan, value.dtype), zeroed)
+
+
+def _sorted(params, operands) -> list[np.ndarray]:
+    """lax.sort's results: every operand reordered along `dimension` by its first `num_keys` operands'
+    total order (`_ordered`) of their canonical keys (`_sort_key`), the first key most significant,
+    stably (ties in their places' order, as the lane's sort keeps them whether or not it is asked to)."""
+    axis = params["dimension"]
+    keys = [np.moveaxis(_ordered(_sort_key(value)), axis, -1) for value in operands[:params["num_keys"]]]
+    order = np.lexsort(keys[::-1], axis=-1)
+    return [np.moveaxis(np.take_along_axis(np.moveaxis(np.asarray(value), axis, -1), order, -1), -1, axis)
+            for value in operands]
+
+
+def _top(params, operand) -> list[np.ndarray]:
+    """lax.top_k's results: along `axis`, its `k` greatest values in the total order (`_ordered`), the
+    greatest first and of equal ones the earlier first, and their indices, int32."""
+    axis = params.get("axis", -1)
+    moved = np.moveaxis(np.asarray(operand), axis, -1)
+    order = np.argsort(-_ordered(moved), axis=-1, kind="stable")[..., :params["k"]]
+    return [np.moveaxis(np.take_along_axis(moved, order, -1), -1, axis),
+            np.moveaxis(order.astype(np.int32), -1, axis)]
+
+
+def _rounded_to(params, value) -> np.ndarray:
+    """lax.reduce_precision's result, as XLA computes it: `value`'s significand rounded to nearest even at
+    `mantissa_bits`, in its own binade; where `exponent_bits` narrows its type's exponent, then past the
+    narrow format's largest value infinite and below its least normal value a zero of the value's sign (the
+    narrow format's subnormals flushed); NaN kept; in `value`'s own type."""
+    import ml_dtypes
+
+    value = np.asarray(value)
+    exponent, mantissa = params["exponent_bits"], params["mantissa_bits"]
+    own = ml_dtypes.finfo(value.dtype)
+    wide = value.astype(np.float64)
+    if exponent >= own.nexp:
+        kept = Format("significand", mantissa + 1, own.minexp, own.maxexp - 1)
+        return nearest(wide, kept).astype(value.dtype)
+    largest = 2 ** (exponent - 1) - 1
+    # No least exponent: the significand rounds in the value's own binade, the narrow range applied after.
+    rounded = nearest(wide, Format(f"e{exponent}m{mantissa}", mantissa + 1, -(2 ** 20), largest))
+    flushed = np.abs(rounded) < 2.0 ** (1 - largest)
+    return np.where(flushed, np.copysign(0.0, wide), rounded).astype(value.dtype)
+
+
+def _rounded_integral(params, value) -> np.ndarray:
+    """lax.round's result: each value's nearest integer, a tie away from zero or to even
+    (`rounding_method`), in the value's type, its sign kept."""
+    import jax
+
+    value = np.asarray(value)
+    wide = value.astype(np.float64)
+    if params["rounding_method"] == jax.lax.RoundingMethod.TO_NEAREST_EVEN:
+        found = np.rint(wide)
+    else:
+        found = np.copysign(np.floor(np.abs(wide) + 0.5), wide)
+    return found.astype(value.dtype)
+
+
 def _bitcast(params, value):
     """lax.bitcast_convert_type's shapes: a narrower type adds a trailing axis of the width ratio, a
     wider one takes the trailing axis away."""
@@ -817,6 +1208,25 @@ def _unwrapped(params, operands, result, fmt):
     return _bits(result) == _bits(np.asarray(jax.random.key_data(operands[0])))
 
 
+def _seeded(params, operands, result, fmt):
+    """A key made from a seed is integers: its data is a separate `jax.random.key` of the seed's, of the
+    equation's own implementation, bit for bit."""
+    import jax
+
+    expected = jax.random.key_data(jax.random.key(operands[0], impl=params["impl"]))
+    return _bits(np.asarray(jax.random.key_data(result))) == _bits(np.asarray(expected))
+
+
+def _folded(params, operands, result, fmt):
+    """A key folded with data is integers: its data is a separate `jax.random.fold_in` of the same key and
+    data's, bit for bit."""
+    import jax
+
+    key, data = operands
+    expected = jax.jit(jax.random.fold_in)(key, data)
+    return _bits(np.asarray(jax.random.key_data(result))) == _bits(np.asarray(jax.random.key_data(expected)))
+
+
 LEVELS = {
     "add": _arithmetic(two_sum),
     "sub": _arithmetic(lambda a, b: two_sum(a, -b)),
@@ -831,6 +1241,10 @@ LEVELS = {
     "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
     "rsqrt": _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
     "logistic": _transcendental(_logistic_interval, _logistic_special),
+    # mpmath's interval sine and cosine reduce their argument at the enclosure's own precision, rigorously:
+    # an argument too large for it leaves the enclosure wide, undecided, and its precision is raised.
+    "sin": _transcendental(_interval(lambda iv, x: iv.sin(x)), _sin_special),
+    "cos": _transcendental(_interval(lambda iv, x: iv.cos(x)), _cos_special),
 }
 """Each rounding primitive's measure, `levels(operands, result, fmt, flushes) -> level`, element by
 element, on a lane that flushes or not: 0 where the result is its exact value rounded to nearest (an
@@ -849,13 +1263,15 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     """PROBES operands of the rounding primitive `name` in `fmt`, over its domain at every scale its
     results reach: sums of every alignment, a quarter of them nearly cancelling; products and quotients
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
-    subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
+    subnormals included; logarithms of every binade, a quarter near one, a quarter in [1, 4) and the
+    witness a site found past the reach; exponentials across fp32's
     range and a quarter near zero; log1p and expm1 at every normal binade near zero and across their
     domains; inverse error functions across (-1, 1) and a quarter near its poles;
     reciprocal roots of every binade, a quarter at the powers of four where they are exact; logistics
-    across fp32's range and a quarter near zero; and each transcendental at its exact value (exp(0),
-    log(1), erf_inv(0), logistic(0)), which a lane must return exactly. One fixed draw per primitive and
-    format."""
+    across fp32's range and a quarter near zero; sines and cosines of every binade a rotary table reaches
+    and a quarter across a few periods; and each transcendental at its exact value (exp(0), log(1),
+    erf_inv(0), logistic(0), sin(0), cos(0)), which a lane must return exactly. One fixed draw per primitive
+    and format."""
     rng = np.random.default_rng([*name.encode(), fmt.precision])
     quarter = PROBES // 4
 
@@ -877,6 +1293,11 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     elif name == "log":
         value = np.abs(scaled(-126, 127))
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        # A quarter where a logsumexp's sums of exponentials sit, and XLA:CPU's float32 log a step past
+        # faithful at 2.6954336 (0x402c81fc: 0.99155915 against 0.991559088..., a quantization-aware
+        # step's chunked cross entropy, check 2), which the probes grew by.
+        value[quarter:2 * quarter] = rng.uniform(1, 4, quarter)
+        value[1] = np.float32(np.uint32(0x402C81FC).view(np.float32))
         value[0] = 1.0
         drawn = [value]
     elif name in ("exp", "logistic"):
@@ -902,6 +1323,13 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value = np.abs(scaled(-149, 127))
         value[:quarter] = 4.0 ** rng.integers(-74, 64, quarter)
         drawn = [value]
+    elif name in ("sin", "cos"):
+        # Every binade from 2^-30 to 2^20, the angles a rotary table reaches, and a quarter across a few
+        # periods, where the functions turn.
+        value = scaled(-30, 21)
+        value[:quarter] = rng.uniform(-8, 8, quarter)
+        value[0] = 0.0
+        drawn = [value]
     else:
         value = rng.uniform(-1, 1, PROBES)
         poles = 1 - 2.0 ** -rng.uniform(1, fmt.precision, quarter)
@@ -916,11 +1344,11 @@ SUBNORMAL_OPERANDS = {
     "mul": lambda tiny: (tiny, 2.0 ** 100), "div": lambda tiny: (tiny, 2.0 ** -100),
     "sqrt": lambda tiny: (tiny,), "rsqrt": lambda tiny: (tiny,),
     "log": lambda tiny: (tiny,), "log1p": lambda tiny: (tiny,), "expm1": lambda tiny: (-tiny,),
-    "erf_inv": lambda tiny: (tiny,),
+    "erf_inv": lambda tiny: (tiny,), "sin": lambda tiny: (tiny,),
 }
 """Each rounding primitive's operands at a subnormal `tiny` whose result tells a subnormal read as it is from
-one read as zero (`lane`'s `kept`); exp, logistic and square return the same result either way, so a lane's
-flushing holds them as it holds every other operation."""
+one read as zero (`lane`'s `kept`); exp, logistic, square and cos return the same result either way, so a
+lane's flushing holds them as it holds every other operation."""
 
 
 def _keeps_subnormals(name: str, fmt: Format) -> bool:
@@ -1003,6 +1431,8 @@ CONTRACTS = {
     "erf_inv": _rounding("erf_inv", None),
     "rsqrt": _rounding("rsqrt", None),
     "logistic": _rounding("logistic", None),
+    "sin": _rounding("sin", None),
+    "cos": _rounding("cos", None),
     "reduce_sum": _reduced_sum,
     "cumsum": _cumulative,
     "dot_general": _dot,
@@ -1041,6 +1471,29 @@ CONTRACTS = {
     "iota": _moved(_iota),
     "gather": _moved(_gathered),
     "stack": _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
+    "dynamic_slice": _moved(_dynamic_sliced),
+    # Exact functions of a value as the lane's arithmetic reads it (a flushed subnormal a zero).
+    "floor": _moved(lambda params, a: np.floor(_read(a, lane().flushes)).astype(a.dtype)),
+    "nextafter": _moved(lambda params, a, b: np.nextafter(a, b)),
+    "scatter": _moved(_scattered),
+    "scatter-add": _scatter_added,
+    "ragged_dot_general": _ragged_dot,
+    "integer_pow": _integer_power,
+    "sort": _moved(lambda params, part: part),
+    "top_k": _moved(lambda params, part: part),
+    "unstack": _moved(lambda params, part: part),
+    "tile": _moved(lambda params, a: np.tile(a, params["reps"])),
+    "stop_gradient": _moved(lambda params, a: a),
+    "xor": _moved(lambda params, a, b: np.bitwise_xor(a, b)),
+    # A shift by the operand's width or more (an amount read unsigned) leaves its sign in every bit.
+    "shift_right_arithmetic": _moved(lambda params, a, b: np.right_shift(a, np.minimum(
+        b.astype(a.dtype).view(f"u{a.dtype.itemsize}").astype(np.uint64), 8 * a.dtype.itemsize - 1)
+        .astype(a.dtype))),
+    "round": _moved(_rounded_integral),
+    "reduce_precision": _moved(_rounded_to),
+    "is_finite": _compared(lambda params, a: np.isfinite(a)),
+    "random_seed": _seeded,
+    "random_fold_in": _folded,
     "random_bits": _random_bits,
     "empty2": _unset,
     "random_wrap": _wrapped,
@@ -1064,10 +1517,14 @@ def _piece(params, value, index):
 RESULT_OPERANDS = {
     "optimization_barrier": lambda params, operands, index: [operands[index]],
     "split": lambda params, operands, index: [_piece(params, operands[0], index)],
+    "unstack": lambda params, operands, index: [np.take(operands[0], index, axis=params["axis"])],
+    "sort": lambda params, operands, index: [_sorted(params, operands)[index]],
+    "top_k": lambda params, operands, index: [_top(params, operands[0])[index]],
 }
-"""The primitives of several results whose each result is a move of a part of their operands of its own
-position, `parts(params, operands, index)`, which its contract reads alone (`_held`): an optimization
-barrier's i-th operand, a split's i-th piece."""
+"""The primitives of several results whose each result is a move of its operands of its own position,
+`parts(params, operands, index)`, which its contract reads alone (`_held`): an optimization barrier's i-th
+operand, a split's i-th piece, an unstack's i-th slice, a sort's i-th operand reordered (`_sorted`), a
+top_k's values or their indices (`_top`)."""
 
 
 def certified(fn, *arguments) -> tuple:
@@ -1077,12 +1534,14 @@ def certified(fn, *arguments) -> tuple:
     them, and every equation whose result breaks its contract or that has none, by its path, with its
     first element that breaks. The program is walked as the gate walks every program
     (`float64_terms.walked`, by `Certifying`): its calls, branches and scans inside, a scan a step at a
-    time, each step's equations by the step's path. This certifies the op-by-op program; a fused
-    program's internals are check 1's."""
+    time, each step's equations by the step's path, and a call of one of JAX's high-level primitives as the
+    program JAX lowers it to (`float64_terms.lowered`), so no equation is held as a call it cannot open.
+    This certifies the op-by-op program; a fused program's internals are check 1's."""
     import jax
-    from float64_terms import evaluated_on, walked
+    from float64_terms import evaluated_on, lowered, walked
 
     closed, shape = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+    closed = lowered(closed)
     findings: list[str] = []
     leaves = jax.tree.leaves(arguments)
     with evaluated_on(leaves):
@@ -1136,7 +1595,7 @@ def _held(eqn, operands, results, findings, at) -> None:
     name = eqn.primitive.name
     for seen in _OBSERVING:
         seen.append((name, eqn.params, list(operands), list(results)))
-    if name not in CONTRACTS:
+    if name not in CONTRACTS and name != "reduce":
         findings.append(f"{at}: uncertifiable, no contract for {name}")
         return
     hosted = [_host(value) for value in operands]
@@ -1146,6 +1605,17 @@ def _held(eqn, operands, results, findings, at) -> None:
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")
             return
+    if name == "reduce":
+        # A variadic reduction's results are held together, by the reduction its combine is.
+        try:
+            held = _reduced(eqn, hosted, [_host(result) for result in results])
+        except TypeError:
+            findings.append(f"{at}: uncertifiable, no contract for this reduce's combine")
+            return
+        for ok in held:
+            if not np.all(ok):
+                findings.append(f"{at}: {int(ok.size - ok.sum())} of {ok.size} elements break the contract")
+        return
     for index, result in enumerate(results):
         fmt = _format(getattr(_host(result), "dtype", np.float32))
         # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
