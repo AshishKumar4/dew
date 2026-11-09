@@ -405,10 +405,10 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
          scaled, corrected, rows_smem, finished, o_smem, l_smem) = refs
         opened = RINGS.opened({name: dict(zip(rings[name], refs, strict=True))
                                             for name, refs in (("keys", key_refs), ("values", value_refs))})
-        handed = roles.opened((score_refs, p_full, o_done, scaled, corrected, finished))
-        scratch = _Scratch(q_smem, q_loaded, opened["keys"], opened["values"], handed["scores"],
-                           (p_even, p_odd), handed["p_full"], acc_tmem, handed["o_done"], scales,
-                           handed["scaled"], handed["corrected"], rows_smem, handed["finished"], o_smem,
+        scores, p_full, o_done, scaled, corrected, finished = roles.opened(
+            (score_refs, p_full, o_done, scaled, corrected, finished))
+        scratch = _Scratch(q_smem, q_loaded, opened["keys"], opened["values"], scores, (p_even, p_odd),
+                           p_full, acc_tmem, o_done, scales, scaled, corrected, rows_smem, finished, o_smem,
                            l_smem)
         block = _Block(spec.form == "causal", blocks, block_k)
         roles.run(
