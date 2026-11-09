@@ -1717,17 +1717,17 @@ class Transport[Allocated, Opened](abc.ABC):
         self.passed(streams, hi, streamed[1], first=streamed[0], between=between)
         return walked
 
-    def run(self, allocated: Allocated, walk: Walk, interpret: bool) -> None:
+    def run(self, allocated: Allocated, walk: Walk, interpret: bool, *, floor: int | None = None) -> None:
         """`walk` on a program's roles: the producer's loads of its views into `allocated`'s streams (opened
-        here) where the family has one, and its consumer's walk of them, fed by the producer or by its own
-        loads (`fed`)."""
+        here) where the family has one, lowered to `floor` (`roles`), and its consumer's walk of them, fed by
+        the producer or by its own loads (`fed`)."""
         streams = self.opened(allocated, walk.views)
 
         def consumer(wg):
             self.walk(self.fed(streams, walk.views, 0, walk.steps, wg), walk.stepped(), walk.carry, (),
                       interpret)
 
-        self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps))
+        self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps), floor=floor)
 
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:

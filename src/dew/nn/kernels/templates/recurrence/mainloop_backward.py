@@ -700,8 +700,12 @@ def _query_key_held(call: Call) -> Held:
     block = (memories, call.block, vb)
     summed = ([f32(call.block, call.block), *masks(call.block, call.block), *fragments(call, block, block)]
               if call.family.operands_in_registers else [f32(call.block, vb)] * 2)
+    # An fp32 call's products overlapping (warpgroup MMA's) keep its row results `after` and `leaving`
+    # beside them: unstated, Qwen3.5's fp32 training claimed 3 programs an H100 at 136 registers, whose cap
+    # spilled 36 bytes (jsf-owncap).
+    rows = [f32(chunk, 4)] * 2 if call.family.products_overlap and held.parts > 1 else []
     return Held(phases=(
-        [f32(chunk, call.block)] * 4
+        [f32(chunk, call.block)] * 4 + rows
         + fragments(call, (given, chunk, vb), (held, chunk, vb), (memories, call.block, vb)),
         summed))
 
@@ -1119,9 +1123,14 @@ def _values_back(a, v, du, beta, taken, call: Call):
     out_type = (held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((call.heads, call.rows), jnp.float32))
     work = Work(flops=2 * chunk * chunk * value_width, span=1)
-    # A value block's gradient in fp32 and narrow, its product through the inverse, and the values in fp32.
+    # A value block's gradient in fp32 and narrow, its product through the inverse, and the values in fp32;
+    # where products overlap (warpgroup MMA's), the write gates' and their gradient's rows, and past two value
+    # blocks the next block's values loaded beside them (unstated, 192-wide values claimed 3 programs an H100
+    # at 120 registers, whose cap spilled 32 bytes, jsf-owncap).
+    overlapping = ((held_tile(call.given, chunk, vb) if value_width // vb > 2 else []) + [f32(chunk, 4)] * 2
+                   if call.family.products_overlap else [])
     held_tiles = Held(phases=(
-        [f32(chunk, vb)] * 3 + held_tile(held, chunk, vb)
+        [f32(chunk, vb)] * 3 + held_tile(held, chunk, vb) + overlapping
         + fragments(call, (held, chunk, chunk), (held, chunk, vb)),))
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(4),

@@ -106,8 +106,9 @@ def _key_scores_back(scores, do, corrected, taken, call: Call):
                           corrected=((chunk, value_width), held))
     # The scores' gradient summed over the value blocks, then held beside each block's local product.
     # The local products' results beside the scores' sum: three `[C, C]` warpgroup accumulators live at once
-    # (jsf-three-back: 90 registers against an H100's need of 112), a tensor memory read's beside them.
-    accumulators = {"fragments": 1, "registers": 2, "tensor": 3}[product_results(call)]
+    # (jsf-three-back: 90 registers against an H100's need of 112), a tensor memory read's beside them, and
+    # mma.sync's two (one stated, an A100 claimed 3 programs at 152 registers, whose cap spilled, jsf-owncap).
+    accumulators = {"fragments": 2, "registers": 2, "tensor": 3}[product_results(call)]
     held_tiles = Held(carried=[f32(chunk, chunk)], phases=(
         masks(chunk, chunk) + fragments(call, (given, chunk, vb), (held, chunk, vb)),
         [f32(chunk, vb)] * accumulators + held_tile(grads, chunk, vb)
