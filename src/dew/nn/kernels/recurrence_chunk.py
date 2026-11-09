@@ -114,7 +114,8 @@ class Chunk(recurrence.Gated):
     documents' first tokens, each from a zero memory, `firsts` their rows' documents' first slots as the
     batch built them (`dew.batch.Coordinates.firsts`; the kernels sort them from `starts` where None).
 
-    Where `entered` `[B, D]` int is given (`dew.batch.Entered`'s), each packed document enters a memory of
+    Where `entered` `[B, D]` int is given (a call over `dew.batch.Forks`, `dew.nn.linear.forked_scan`), each
+    packed document enters a memory of
     its own: `state` is `[B, D, Hv, Dk, Dv]`, a memory a slot, and a row's `d`-th document enters its
     `entered[d]`-th slot (one-based; zero, a zero memory); the final memory is each document's own, `[B, D,
     Hv, Dk, Dv]` (`DocumentRows`)."""
@@ -245,27 +246,27 @@ class DocumentRows:
         slots = self.begins[..., None] + offsets
         return jnp.minimum(slots, length - 1), slots < self.ends[..., None]
 
-    def laid(self, query, key, value, g, beta):
-        """The operands `[B, S, ...]` as the documents' rows `[B * D, S, ...]`: past a document's end its
-        decay one (`g` zero) and its write gate zero, its queries, keys and values zero."""
-        slots, own = self._index(beta.shape[1])
+    def laid(self, *operands):
+        """The operands `[B, S, ...]` as the documents' rows `[B * D, S, ...]`, zero past a document's end:
+        a decay one (`g` zero, a step zero), a write gate zero, its queries, keys and values zero."""
+        slots, own = self._index(operands[0].shape[1])
 
-        def taken(x, fill):
+        def taken(x):
             picked = jax.vmap(lambda row, at: row[at])(x, slots)
             kept = own.reshape(*own.shape, *(1,) * (picked.ndim - own.ndim))
-            picked = jnp.where(kept, picked, jnp.asarray(fill, x.dtype))
+            picked = jnp.where(kept, picked, jnp.zeros((), x.dtype))
             return picked.reshape(-1, *picked.shape[2:])
 
-        return (taken(query, 0), taken(key, 0), taken(value, 0), taken(g, 0), taken(beta, 0))
+        return tuple(taken(x) for x in operands)
 
     def entering(self, state):
-        """Each document row's memory `[B * D, Hv, Dk, Dv]`: its slot's of `state` `[B, D, Hv, Dk, Dv]`, zero
-        for slot zero."""
+        """Each document row's memory `[B * D, ...]`: its slot's of `state` `[B, D, ...]` (`[B, D, Hv, Dk,
+        Dv]`, a selective scan's `[B, D, C, N]`), zero for slot zero."""
         if state is None:
             raise ValueError("documents entering memories of their own (`Chunk.entered`) read the slots' "
                              "memories, `state` `[B, D, Hv, Dk, Dv]`")
         picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(state, self.entered)
-        kept = (self.entered > 0).reshape(*self.entered.shape, 1, 1, 1)
+        kept = (self.entered > 0).reshape(*self.entered.shape, *(1,) * (state.ndim - 2))
         return jnp.where(kept, picked, 0.0).reshape(-1, *state.shape[2:])
 
     def unlaid(self, out):
@@ -281,8 +282,7 @@ class DocumentRows:
         return jax.vmap(lambda row, d, t: row[d, t])(out, document, jnp.clip(at, 0, length - 1))
 
     def leaving(self, final):
-        """The documents' rows' final memories `[B * D, Hv, Dk, Dv]` as each document's, `[B, D, Hv, Dk,
-        Dv]`."""
+        """The documents' rows' final memories `[B * D, ...]` as each document's, `[B, D, ...]`."""
         return final.reshape(*self.begins.shape, *final.shape[1:])
 
 
@@ -1402,12 +1402,20 @@ def selective_kernel(x, A, B, C) -> str:
     return select(SELECTIVE, case).kernel
 
 
-def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
+def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, entered=None):
     """Mamba's selective scan (`dew.nn.mixers.mamba.selective_scan`'s operands, `state` `[B, D, N]` or None)
     on the kernel its selector gives each product (`SELECTIVE`, `_per_product`): the recurrence template's
     scan, interpreted off a GPU (where a call names it), per shard of rows on a mesh (`manual_map`: B and C
     serve every channel, so the channels stay whole); or `portable(x, dt, A, B, C, D, state, starts)`,
-    the portable math."""
+    the portable math. Where `entered` `[B, Dc]` is given, each of `starts`' documents enters its own
+    state, `state` `[B, Dc, D, N]` a state a slot, as `Chunk.entered` takes them, and the final state is
+    each document's (`DocumentRows`)."""
+    if entered is not None:
+        rows = DocumentRows.of(starts, entered)
+        x_rows, dt_rows, b_rows, c_rows = rows.laid(x, dt, B, C)
+        out, final = selective_scan(x_rows, dt_rows, A, b_rows, c_rows, D, rows.entering(state), None,
+                                    portable=portable)
+        return rows.unlaid(out), rows.leaving(final)
     from .templates.recurrence import selective
 
     def template(x, dt, A, B, C, D, state, *starts):

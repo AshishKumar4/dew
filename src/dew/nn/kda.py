@@ -47,15 +47,15 @@ from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel
 from .linear import (
     DepthwiseConv1d,
     RMSNormGated,
-    call_tree,
     decode_delta_rule,
     decode_kernel,
-    entered_scan,
+    fork_cache,
+    forked_conv,
+    forked_scan,
     fused_token,
     held_scan,
     over_sequence,
     split_delta_rule,
-    tree_scan,
 )
 from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
@@ -94,12 +94,11 @@ class KimiDeltaAttention(nn.Module):
     `chunk_kda`, fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
     """
 
-    reads: ClassVar[frozenset[str]] = frozenset({"entered", "tree_parents", "key_runs", "key_positions"})
-    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that enter another, each read
-    from the memory and the conv history the one it enters ends with (`dew.nn.linear.entered_scan`), and a
-    tree's, with the key runs and positions of its attention beside it (`dew.nn.linear.call_tree`): on a tree
-    each token's path (`tree_scan`); no mask or bias, which a recurrence reading every earlier token of its
-    document has no way to narrow."""
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
+    """Of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`), the documents that continue another
+    (`dew.batch.Forks`), each read from the memory and the conv history its parent leaves
+    (`dew.nn.linear.forked_conv`, `forked_scan`); no mask, runs or bias, which a recurrence reading every
+    earlier token of its document has no way to narrow."""
 
     emb_features: int
     num_heads: int
@@ -199,7 +198,8 @@ class KimiDeltaAttention(nn.Module):
         gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))
         gate = gate.reshape(B, S, self.num_heads, self.head_dim)
         token = None
-        if decode and S == 1 and decode_kernel(
+        forked = tokens.forks is not None
+        if decode and S == 1 and not forked and decode_kernel(
                 jax.ShapeDtypeStruct((B, self.num_heads, self.head_dim, self.head_dim), wide),
                 fuses=True) == 'fused':
             token = self._fused_token(taps, g, beta, gate, valid, tokens.starts)
@@ -229,21 +229,12 @@ class KimiDeltaAttention(nn.Module):
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         shards = sequence_shards()
-        given = attention_metadata  # A tree call's parents, and its attention's runs and places beside them.
-        tree = None if given is None else call_tree(given.tree_parents, given.key_runs, given.key_positions)
-        if tree is not None:
-            def along(convolved, g, beta, held):
-                query, key, value = (part.reshape(B, 1, self.num_heads, self.head_dim) for part in convolved)
-                return decode_delta_rule(query, key, value, g, beta, held)
+        if forked:
+            if shards > 1:
+                raise LayoutRefused("documents that continue another are read whole in their rows; a "
+                                    "sequence axis splits them")
 
-            out = tree_scan(self, projected, taps, None, tree, along, (g, beta), valid=valid,
-                            state='recurrent_state', state_dtype=wide, parts=heads, dtype=wide)
-        elif tokens.entered is not None:
-            if decode or shards > 1:
-                raise LayoutRefused("documents that enter another are read whole in their rows by a training "
-                                    "or scoring call; a decode step or a sequence axis splits them")
-
-            def entered_rule(convolved, *, valid, starts, state, entered):
+            def forked_rule(convolved, *, valid, starts, state, entered):
                 query, key, value = (split(part) for part in convolved)
                 # A call's other tokens keep its memory, as padding does (exp(0) = 1, beta = 0).
                 kept_g = jnp.where(valid[:, :, None, None], g, 0.0)
@@ -252,9 +243,11 @@ class KimiDeltaAttention(nn.Module):
                                               starts=starts, max_segments=tokens.max_segments,
                                               write_bound=1.0, entered=entered)
 
-            out = entered_scan(projected, taps, None, entered_rule, tokens,
-                               (self.num_heads, self.head_dim, self.head_dim), parts=heads,
-                               dtype=projected.dtype if ported else wide, state_dtype=wide)
+            history, held = fork_cache(self, 'recurrent_state') if decode else (None, None)
+            convolved = forked_conv(projected, taps, tokens, history=history, parts=heads,
+                                    dtype=projected.dtype if ported else wide)
+            out = forked_scan(convolved, forked_rule, tokens, (self.num_heads, self.head_dim, self.head_dim),
+                              held=held, state_dtype=wide)
         elif shards > 1:
             if decode:
                 raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
@@ -304,6 +297,8 @@ class KimiDeltaAttentionMixer(MixerBase):
     and Kimi K3's `use_full_rank_gate` output gate."""
 
     residuals = DELTA_RULE_RESIDUALS
+    # Each document from the state and conv history its parent leaves (`dew.nn.linear.forked_scan`).
+    reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).
     packed_cache = True
 

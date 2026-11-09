@@ -309,6 +309,21 @@ class Mixture:
         rather than in its place: Gemma 4's parallel branch (`build`)."""
         return self.parallel
 
+    def fork_refusal(self) -> str | None:
+        """Why the layers this mixture builds would not compute a document over its ancestors
+        (`dew.batch.Forks`) as its own row does, or None. Two of its settings read tokens beyond the one
+        routed, in the row's order: block routing chooses a block's experts from every token in it, and a
+        fork puts a block's earlier tokens in the prefix and its later ones in each branch; a capacity
+        bounds each expert's slots by the tokens of the row routed before (`moe.capacity_positions`), and a
+        window of forks holds other rows' tokens before a branch's and its prefix once for every branch.
+        Each token's own routing reads nothing else, so every other mixture computes forks exactly."""
+        if self.routing_block is not None:
+            return "block routing chooses a block's experts from every token in it, which a fork splits"
+        if self.capacity_factor is not None:
+            return ("a capacity counts the row's tokens routed before each, which a window of forks "
+                    "counts otherwise")
+        return None
+
     def generation_refusal(self) -> str | None:
         """Why a generation loop cannot run the layers this mixture builds, or None.
 

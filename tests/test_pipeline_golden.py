@@ -35,12 +35,13 @@ from dew.data.steps.generic import Formatting
 
 GOLD = Path(__file__).parent / "fixtures/golden/loaders-7ad0d4079.json.gz"
 ORACLE = Path(__file__).parents[1] / "tools/measurements/data-pipeline/data_oracle_legacy.py"
-CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "preferences", "images_memory",
+CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "images_memory",
          "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records")
-"""The corpora the old loaders read alike. Decision rows are not among them: they pack into windows,
-which no old loader did (tests/test_decision_packing.py); nor is video, whose record the media
-stages changed on purpose (a waveform and its validity in place of per-frame rows and features):
-tests/test_data.py holds a video listing to itself across workers and a resume."""
+"""The corpora the old loaders read alike. Decision rows and preference pairs are not among them: they
+pack into windows, which no old loader did (tests/test_decision_packing.py, tests/test_dpo.py); nor is
+video, whose record the media stages changed on purpose (a waveform and its validity in place of
+per-frame rows and features): tests/test_data.py holds a video listing to itself across workers and a
+resume."""
 
 
 @functools.cache
@@ -85,9 +86,6 @@ def chains(tmp_path_factory):
                             for index in range(40)])
     prompts = Memory([{"prompt": list(range(1, 3 + index % 6)), "data_source": "rule",
                        "ground_truth": str(index % 3), "extra_info": ""} for index in range(40)])
-    pairs = Memory([{"chosen": list(range(1, 3 + index % 4)), "rejected": [2, 3, 4],
-                     "chosen_mask": [0] + [1] * (1 + index % 4), "rejected_mask": [0, 1, 1]}
-                    for index in range(40)])
     pixels = tuple({"image": ((np.arange(16 * 16 * 3).reshape(16, 16, 3) + index * 7) % 256).astype(np.uint8),
                     "label": index % 3, "caption": f"picture {index}"} for index in range(40))
     image_root, image_file = _image_sources(root, pixels)
@@ -128,8 +126,6 @@ def chains(tmp_path_factory):
         "chat": (chat().shuffle(7).repeat().batch(4), chat(4, 16)),
         "prompts": (prompts.pipe(presets.prompts, "byte", max_prompt_len=16, batch=None).shuffle(7).repeat()
                     .batch(4), None),
-        "preferences": (pairs.pipe(presets.preferences, seq_len=16, batch=None).shuffle(7).repeat().batch(4),
-                        None),
         "images_memory": pictures(Memory(pixels)),
         "images_arrayrecord": pictures(Files(image_root, format="array_record")),
         "images_hf": pictures(Files(image_file)),

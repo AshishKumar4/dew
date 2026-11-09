@@ -156,7 +156,8 @@ def test_prompt_encoding_passes_unread_catalog_fields_through(read):
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_preference_pair_passes_unread_catalog_fields_through(read):
-    """Pair padding consumes only the completion ids and their masks."""
+    """The pair step consumes only the completion ids and their masks, laying the pair out as one document:
+    the prompt its halves share once, then each half's rest."""
     originals = [{"id": index, "chosen": [1, 2, index + 3], "rejected": [1, index + 4],
                   "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1],
                   "catalog": {"tags": [str(index)]}} for index in range(3)]
@@ -165,9 +166,8 @@ def test_preference_pair_passes_unread_catalog_fields_through(read):
     for row, original in zip(rows, originals, strict=True):
         assert row["id"] == original["id"] and row["catalog"] == original["catalog"]
         assert not {"chosen", "rejected", "chosen_mask", "rejected_mask"} & row.keys()
-        np.testing.assert_array_equal(row["input_ids"],
-                                      [[*original["chosen"], 0], [*original["rejected"], 0, 0]])
-        np.testing.assert_array_equal(row["completion_mask"], [[0, 1, 1, 0], [0, 1, 0, 0]])
+        np.testing.assert_array_equal(row["text"], [1, *original["chosen"][1:], *original["rejected"][1:]])
+        np.testing.assert_array_equal(row["completion_mask"], [0, 1, 1, 1])
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
@@ -185,7 +185,7 @@ def test_prompt_and_preference_encodings_read_token_arrays_as_they_read_lists(re
         return next(iter(iterate(chain, read=read, loading=READ)))
 
     encoded = [first(rows) for rows in (lists, native)]
-    for name in ("prompt", "prompt_length", "input_ids", "completion_mask"):
+    for name in ("prompt", "prompt_length", "text", "completion_mask"):
         np.testing.assert_array_equal(encoded[1][name], encoded[0][name])
 
 

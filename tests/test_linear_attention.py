@@ -36,8 +36,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import fused_step, recurrence, through
-from entered_support import LAYOUTS, assert_entered_as_own_rows
 from flax import linen as nn
+from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
 from reference_error import as_given, assert_as_exact, widened, without_ynn
 
@@ -1129,12 +1129,12 @@ def test_the_fused_step_compiles_within_each_gpus_resources(target):
 
 
 @pytest.mark.parametrize("layout", list(LAYOUTS))
-def test_documents_that_enter_another_read_its_memory_and_history_as_their_own_rows_do(reference, geometry,
-                                                                                        layout):
-    """A row of shared parts and the documents that enter them (`dew.batch.Entered`, the questions of rows
-    over one state) gives each document's tokens, and the gradients through them, what its own row of the
-    part it enters and itself gives, over drawn inputs (check 1): the conv reads the entered part's last
-    tokens and the recurrence starts from its final memory (`entered_scan`), documents numbered out of
-    their order in the row and one token each among them (row 1506)."""
-    assert_entered_as_own_rows(layer(geometry), layer_params(reference), geometry["hidden_size"], layout,
+def test_documents_that_continue_another_read_its_memory_and_history_as_their_own_rows_do(reference,
+                                                                                           geometry, layout):
+    """A row of documents that continue another (`dew.batch.Forks`: the questions of rows over one state, a
+    tree's candidates) gives each document's tokens, and the gradients through them, what its own row of its
+    ancestors and itself gives, over drawn inputs (check 1): the conv reads its chain's last tokens
+    (`forked_conv`) and the recurrence starts from its parent's final memory (`forked_scan`), documents
+    numbered out of their order in the row, one token each among them, and a chain three deep."""
+    assert_forks_as_own_rows(layer(geometry), layer_params(reference), geometry["hidden_size"], layout,
                                "gated delta net")

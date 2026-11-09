@@ -780,7 +780,8 @@ def test_a_released_checkpoint_states_the_layout_its_task_was_trained_with(decid
     framed = Framing(system="Answer from the state.", prefill="", thinking=False)
     for number, chosen in enumerate(({"order": "state_first"}, {"order": "re_read"}, {"blocks": True},
                                      {"framing": framed, "order": "question_first"})):
-        layout = replace(decide.layout, **chosen)
+        # The layout as the task reads it, a row a question for Laya's head (`QuestionLayout.shared_for`).
+        layout = replace(decide, layout=replace(decide.layout, **chosen)).layout
         replace(decide, layout=layout).save_pretrained(tmp_path / str(number))
         again = Decide.from_pretrained(tmp_path / str(number), attention_impl="xla")
         assert again.layout == layout, chosen

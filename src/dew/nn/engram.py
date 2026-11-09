@@ -197,6 +197,14 @@ class Engram:
         ids = jnp.concatenate(hashes, axis=-1).astype(jnp.int32)
         return ids + jnp.asarray(offsets, jnp.int32)
 
+    @staticmethod
+    def fork_refusal() -> str:
+        """Why engram's lookups would not compute a document over its ancestors (`dew.batch.Forks`) as
+        its own row does: each token's n-gram hashes the ids before it in the row's order
+        (`EngramHashes`), and a branch's first tokens stand after another document's in a window of
+        forks, where its own row holds its parent's last tokens."""
+        return "engram's n-gram hashes read the ids before each token in the row's order"
+
 
 _MASK64 = (1 << 64) - 1
 _GAMMA = 0x9E3779B97F4A7C15

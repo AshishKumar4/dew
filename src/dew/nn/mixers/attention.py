@@ -49,6 +49,8 @@ from dew.nn.inputs import (
     coordinates_of,
     counted_places,
     document_reach,
+    fork_runs,
+    intersected_runs,
 )
 from dew.nn.kernels.selection import select, selected
 from dew.nn.kernels.templates import attention as template
@@ -171,18 +173,21 @@ class CallVisibility(NamedTuple):
 
 
 def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int, queries: int, keys: int,
-                    key_places, sliding_window: int | None, cached: bool = False) -> CallVisibility | None:
+                    key_places, sliding_window: int | None, cached: bool = False,
+                    anchor: tuple[jax.Array, jax.Array] | None = None) -> CallVisibility | None:
     """A call's own visibility, None where it states none: its pairwise mask
     (`AttentionMetadata.pairwise_mask`), a windowed layer keeping each query to the keys within its
-    window of the query's rotary position where the call gives the keys' positions; else its key runs
+    window of the query's rotary position where the call gives the keys' positions; its key runs
     (`AttentionMetadata.key_runs`), a windowed layer windowing each run over the key positions the call
     gives, its queries read at them too where they are its own tokens, or a cached call's at its rotary
-    positions through a mask; a tree call's runs (`AttentionMetadata.tree_parents`), which it must carry.
-    `key_places` are where the keys are read otherwise."""
-    if metadata.tree_parents is not None and metadata.key_runs is None:
-        raise ValueError("a tree call's attention is masked by its key runs, each token's cache and "
-                         "ancestors (attention_key_runs)")
-    if metadata.pairwise_mask is None and metadata.key_runs is None:
+    positions through a mask; and its forks' runs (`dew.nn.inputs.fork_runs`): each token its ancestors'
+    keys and its own, a cached call's after the row's cache at `anchor` (`fork_anchor`). A query reads a
+    key where every one of them it states lets it. An uncached call's forks window their runs over the
+    tokens' places, which their positions give; a cached call's over the key positions it gives, which a
+    windowed layer's cached keys need, held at their slots. `key_places` are where the keys are read
+    otherwise."""
+    forked = fork_runs(metadata, batch, queries, anchor if cached else None)
+    if metadata.pairwise_mask is None and metadata.key_runs is None and forked is None:
         # A validity alone hides its keys from the layer's own visibility (`_masking`), no call's.
         return None
     key_positions, valid = metadata.key_positions, metadata.key_valid
@@ -190,8 +195,23 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
         raise ValueError("attention_key_positions must be [B, keys]")
     if valid is not None and (jnp.shape(valid) != (batch, keys) or jnp.asarray(valid).dtype != jnp.bool_):
         raise ValueError("attention_key_valid must be boolean [B, keys]")
+    if forked is not None and cached and sliding_window is not None and key_positions is None:
+        # A windowed layer reads its cached keys at their places, which forks derive (`fork_key_places`).
+        assert anchor is not None, "a cached call over forks follows its row's cache"
+        key_positions = fork_key_places(metadata, rotary_positions, anchor[0], batch, queries, keys)
     # A cached call's queries are not its keys: they are read at their rotary positions.
     query_places = jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries)) if cached else None
+    runs = None
+    if metadata.key_runs is not None:
+        runs = jnp.asarray(metadata.key_runs)
+        if runs.ndim != 4 or runs.shape[:2] != (batch, queries) or runs.shape[-1] != 2:
+            raise ValueError("attention_key_runs must be [B, queries, R, 2]")
+    if forked is not None:
+        runs = forked if runs is None else intersected_runs(forked, runs)
+        if not cached and metadata.valid is not None:
+            # An uncached call's keys are its tokens: its forks read its real ones alone.
+            real = jnp.asarray(metadata.valid, bool)
+            valid = real if valid is None else real & jnp.asarray(valid, bool)
     if metadata.pairwise_mask is not None:
         pairwise = jnp.asarray(metadata.pairwise_mask)
         if pairwise.shape != (batch, queries, keys) or pairwise.dtype != jnp.bool_:
@@ -201,14 +221,55 @@ def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int
             query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries))
             mask = mask & windowed(query_positions[:, :, None], key_positions[:, None, :], sliding_window,
                                    causal=False)[:, None]
+        if forked is not None:
+            # The forks' runs narrow the mask: a key is read where both let it, an uncached windowed
+            # layer's within the window of the tokens' places.
+            mask = mask & visibility_mask(queries, keys, causal=False, sliding_window=None, key_runs=runs)
+            if key_positions is None and not cached and sliding_window is not None:
+                query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (batch, queries))
+                places = jnp.broadcast_to(jnp.asarray(key_places), (batch, keys))
+                mask = mask & windowed(query_positions[:, :, None], places[:, None, :], sliding_window,
+                                       causal=False)[:, None]
         return CallVisibility(mask, None, None, key_places if key_positions is None else key_positions,
                               query_places)
-    runs = jnp.asarray(metadata.key_runs)
-    if runs.ndim != 4 or runs.shape[:2] != (batch, queries) or runs.shape[-1] != 2:
-        raise ValueError("attention_key_runs must be [B, queries, R, 2]")
-    window = None if key_positions is None else sliding_window
+    window = sliding_window if key_positions is not None or (forked is not None and not cached) else None
     key_places = key_places if key_positions is None else key_positions
     return CallVisibility(None, runs, window, key_places, query_places, valid)
+
+
+def fork_key_places(metadata: AttentionMetadata, rotary_positions, first: jax.Array, batch: int,
+                    queries: int, keys: int) -> jax.Array:
+    """Each cache slot's place `[B, keys]` in a cached call over forks, as a windowed layer reads its keys:
+    the call's real tokens at the slots the cache stores them from `first` (`fork_anchor`), each at its
+    rotary position, and the row's cached tokens before them counted back from the place of the call's
+    roots, the least of its tokens' (the cache's last document continuing into them, one token a place)."""
+    positions = jnp.broadcast_to(jnp.asarray(rotary_positions, jnp.int32), (batch, queries))
+    real = jnp.asarray(coordinates_of(metadata, batch, queries).valid, bool)
+    slots = jnp.arange(keys, dtype=jnp.int32)[None, :]
+    root = jnp.min(jnp.where(real, positions, jnp.iinfo(jnp.int32).max), axis=-1, keepdims=True)
+    written = first[:, None] + jnp.cumsum(real, axis=-1, dtype=jnp.int32) - 1
+    rows = jnp.arange(batch)[:, None]
+    cached = root - first[:, None] + slots
+    held = cached.at[rows, jnp.where(real, written, keys)].set(positions, mode="drop")
+    return held.astype(jnp.int32)
+
+
+def fork_anchor(written: jax.Array, documents: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Where a cached call's forks follow its row's cache (`fork_runs`'s `anchor`), `(first, start)` `[B]`
+    each: the slot its first token is stored at (`written` `[B, S]`, each token's slot, -1 for padding),
+    and the first slot of the row's cached document that the call continues, by the cache's numbering
+    (`documents` `[B, keys]`, `dew.nn.kv_cache.DOCUMENTS`), so a packed prompt's earlier documents stay
+    unread, as a cached call reads its own document alone (`_cached_call`)."""
+    keys = documents.shape[-1]
+    written = jnp.asarray(written, jnp.int32)
+    first = jnp.min(jnp.where(written >= 0, written, keys), axis=-1)
+    slots = jnp.arange(keys, dtype=jnp.int32)[None, :]
+    before = slots < first[:, None]
+    # The row's last cached document, which the call's first continues (`Append.documents`).
+    continued = jnp.max(jnp.where(before, documents, 0), axis=-1, keepdims=True)
+    start = jnp.min(jnp.where(before & (documents == continued) & (continued > 0), slots, first[:, None]),
+                    axis=-1)
+    return first, start
 
 
 def dense_visibility(mask, documents, causal: bool, window: int | None, valid, runs, places, key_places,
@@ -305,10 +366,10 @@ class CausalSelfAttention(nn.Module):
     `kv_store`, post rope and norm, and keeps no cache.
     """
     reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs", "key_valid",
-                                                 "position_bias", "admitted", "tree_parents"})
+                                                 "position_bias", "admitted", "forks"})
     """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask or key
-    runs, places keys, adds a position bias and runs a server's mixed step; a tree call masks it by its
-    key runs (`call_visibility`)."""
+    runs, places keys, adds a position bias and runs a server's mixed step; forks it reads as each
+    token's ancestors' keys and its own (`call_visibility`)."""
 
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves
@@ -1208,8 +1269,15 @@ class CausalSelfAttention(nn.Module):
             if decode or self.ctx.attention_impl != 'auto':
                 implementation = masked()
         runs = query_places = None
+        # A cached call's forks follow its row's cache, from the document it continues (`fork_anchor`).
+        anchor = None
+        if decode and attention_metadata is not None and attention_metadata.forks is not None:
+            if DOCUMENTS not in history:
+                raise ValueError(f"{self.name}: a cached call over forks continues its row's cache, which "
+                                 "this call reads none of")
+            anchor = fork_anchor(jnp.asarray(positions).reshape(B, S), history[DOCUMENTS])
         own, implementation = self._overridden(attention_metadata, rotary_positions, B, S, key.shape[-3],
-                                               key_places, implementation, masked, decode)
+                                               key_places, implementation, masked, decode, anchor)
         if own is not None:
             mask, runs, window, key_places, query_places, valid = own
             causal, documents, groups, places = False, None, _Groups(), (
@@ -1325,13 +1393,13 @@ class CausalSelfAttention(nn.Module):
 
     def _overridden(self, metadata: AttentionMetadata | None, rotary_positions, B: int, S: int, keys: int,
                     key_places, implementation: AttentionImpl, masked: Callable[[], AttentionImpl],
-                    decode: bool):
+                    decode: bool, anchor: tuple[jax.Array, jax.Array] | None = None):
         """A call's own visibility (`call_visibility`), None where it states none, and the kernel it takes:
         a mask's the masked one (`masked()`), as a cached call's or a named kernel's runs do; an uncached
         call's runs the one the layer chooses ('auto')."""
         own = None if metadata is None else call_visibility(
             metadata, rotary_positions, batch=B, queries=S, keys=keys, key_places=key_places,
-            sliding_window=self.ctx.sliding_window, cached=decode)
+            sliding_window=self.ctx.sliding_window, cached=decode, anchor=anchor)
         if own is not None and (own.mask is not None or decode or self.ctx.attention_impl != 'auto'):
             implementation = masked()
         return own, implementation
@@ -1671,6 +1739,7 @@ class CausalSelfAttention(nn.Module):
             return False
         return metadata is None or (
             metadata.pairwise_mask is None and metadata.key_runs is None and metadata.position_bias is None
+            and metadata.forks is None
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
     def _output(self, attention, gate, batch: int, length: int, own_value, progress):
@@ -1718,6 +1787,8 @@ class AttentionMixer(MixerBase):
     """
 
     residuals = (*QKV_RESIDUALS, 'output_gate', 'o_proj', 'context')
+    # Each token reads its ancestors' keys and its own (`call_visibility`).
+    reads_forks = True
     draws_init_std = True
     drops_attention = True
 

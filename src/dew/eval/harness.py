@@ -39,11 +39,12 @@ from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
-from dew.batch import BLOCKS_FIELD
+from dew.batch import BLOCKS_FIELD, COORDINATES_FIELD
+from dew.data.forked_rows import ForkedRows
 from dew.distributed.placement import Layout, MeshSpec
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.interop.generation_config import source_cache, source_decoding
-from dew.nn.inputs import ModelInputs, pad_token_rows
+from dew.nn.inputs import ModelInputs
 from dew.nn.kernels.options import program
 from dew.nn.visibility import served_blocks
 from dew.objectives.lm.objective import LMObjective, TokenScorer
@@ -66,28 +67,33 @@ def _scored(model: nn.Module, variables, rows: ModelInputs) -> tuple[jax.Array, 
     whichever harness asks: the model is its static argument, hashed by its fields, as a decode step
     takes it (`dew.inference.serving_kernel`), so harnesses over a run's checkpoints share it.
 
-    `rows` is `[B, T]` of token ids, with their fields (`_scoring_inputs`); both results are
-    `[B, T - 1]`, entry `i` belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
-    a causal model cannot read backwards, so a short row's own slots hold what they would hold alone.
+    `rows` is `[B, T]` of token ids, the windows `_scoring_inputs` packs, with their fields; both results
+    are `[B, T - 1]`, entry `i` belonging to `rows[:, i + 1]`, each token's scored from its predecessor's
+    state (`TokenScorer.token_scores` over forks).
     """
     scorer: TokenScorer = LMObjective(model, rows.tokens.shape[1] - 1, head_tile="tiled")
     scores = scorer.token_scores(variables, rows, predict=True)
     return -scores.losses, scores.correct == 1
 
 
-def _scoring_inputs(rows: list[list[int]], contexts: list[int],
-                    prefix: int | Literal["prompt"] | None) -> ModelInputs:
-    """`rows`, each its context's first `contexts` ids and its continuation after, right-padded, as the
-    scorer reads them: under a prefix run, each context's blocks a server makes of a prompt
-    (`served_blocks`, the context whole under "prompt"), each continuation token and padding slot in
-    no block (-1), and the padding marked, so a continuation is scored as its generation reads it."""
-    tokens, fields = pad_token_rows(rows, padding_side="right")
-    token_fields = {name: jnp.asarray(value) for name, value in fields.items()}
+def _scoring_inputs(rows: list[list[int]], contexts: list[int], prefix: int | Literal["prompt"] | None,
+                    share: bool) -> tuple[ModelInputs, ForkedRows]:
+    """`rows`, each its context's first `contexts` ids and its continuation after, packed into windows as
+    the scorer reads them (`ForkedRows`): with `share`, a context its continuations share computed once for
+    them all, else each row in a window of its own. Under a prefix run, each context's blocks a server
+    makes of a prompt (`served_blocks`, the context whole under "prompt"), each continuation token in no
+    block (-1), so a continuation is scored as its generation reads it."""
+    fields = None
     if prefix is not None:
-        context = np.arange(tokens.shape[1])[None, :] < np.asarray(contexts)[:, None]
-        blocks = np.where(context, served_blocks(context, prefix), -1).astype(np.int32)
-        token_fields[BLOCKS_FIELD] = jnp.asarray(blocks)
-    return ModelInputs(jnp.asarray(tokens), token_fields=token_fields)
+        fields = {BLOCKS_FIELD: [np.where(np.arange(len(row)) < context,
+                                          served_blocks(np.arange(len(row))[None] < context, prefix)[0],
+                                          -1).astype(np.int32) for row, context in zip(rows, contexts,
+                                                                                         strict=True)]}
+    width = max(len(row) for row in rows)
+    forks = ForkedRows.pack(rows, width, share=share, fields=fields, documents=None if share else 1)
+    return ModelInputs(jnp.asarray(forks.tokens), token_fields={
+        COORDINATES_FIELD: forks.coordinates, **{name: jnp.asarray(value) for name, value in
+                                                 forks.fields.items()}}), forks
 
 
 def _batches(count: int, size: int) -> list[range]:
@@ -293,15 +299,21 @@ class DewLM(TemplateLM):
                     f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
             rows.append([*context, *continuation][-(self.max_length + 1):])
         answers: list[tuple[float, bool]] = []
+        # A request's options share its context, computed once for them all where the model computes a
+        # shared prefix as each row's own; a prefix run's blocks read a row's context whole, which forks
+        # do not lay out.
+        share = self.task.prefix is None and LMObjective(self.task.model, 1).shares_prefixes()
         for batch in _batches(len(rows), self.batch_size):
-            inputs = _scoring_inputs([rows[index] for index in batch],
-                                     [len(rows[index]) - len(requests[index][2]) for index in batch],
-                                     self.task.prefix)
+            inputs, forks = _scoring_inputs(
+                [rows[index] for index in batch],
+                [len(rows[index]) - len(requests[index][2]) for index in batch], self.task.prefix, share)
             scoring = program(_scored, self.task.model, static_argnums=(0,))
             # Scored in the attention form the run trained in, as its generation is (`SavedRunTask.traced`).
             with self.task.traced():
                 probabilities, argmax = scoring(self.task.model, self.task.variables, inputs)
-            values, matched = np.asarray(probabilities), np.asarray(argmax)
+            # Each row's targets read from the windows' (`ForkedRows.targets`).
+            values = np.asarray(forks.targets(probabilities))
+            matched = np.asarray(forks.targets(argmax.astype(jnp.int32))) == 1
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1
                 start = end - len(requests[index][2])

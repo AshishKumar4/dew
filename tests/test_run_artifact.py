@@ -138,8 +138,10 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
     count = max(2, jax.device_count())
     if kind == "dpo":
         objective = DPOObjective(adapter.model, seq_len=2, variables=adapter.variables)
+        from dew.data.preferences import pair_windows
+
         pairs = np.tile(np.asarray([[[1, 2, 3], [1, 2, 4]]], np.int32), (count, 1, 1))
-        batch = {"input_ids": pairs, "completion_mask": np.ones_like(pairs, np.float32)}
+        batch = pair_windows(pairs, np.ones_like(pairs), count=count)
     else:
         objective = PPOObjective(adapter.model, seq_len=2, critic=ValueHead(base.clone()), beta=0.1,
                                  variables=adapter.variables)

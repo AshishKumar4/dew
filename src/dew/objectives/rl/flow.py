@@ -338,6 +338,15 @@ class GroupedRollout:
         """`value`'s rows each repeated into its group of samples, in the array namespace `xp`."""
         return xp.repeat(value, self.groups, axis=0)
 
+    def encoded_conditions(self, params: Variables, batch: Batch) -> dict:
+        """The conditions of an expanded `batch` (`_expanded`), each source row's encoded once by the
+        objective's frozen towers (`encoded_conditions`) and repeated into its group, as its group's
+        samples read it: the towers see every prompt once, not once a sample."""
+        source = {condition.field: jax.tree.map(lambda leaf: leaf[::self.groups], batch[condition.field])
+                  for condition in self.objective.inputs.conditions.values()}
+        encoded = self.objective.encoded_conditions(params, source)
+        return jax.tree.map(lambda leaf: leaf if jnp.ndim(leaf) == 0 else self._grouped(leaf), encoded)
+
 
     def _expanded(self, batch: Batch) -> tuple[Batch, slice | np.ndarray, int]:
         """Repeat every source row into its group of samples.
@@ -469,7 +478,7 @@ class FlowRollout(GroupedRollout):
         """Sample one SDE trajectory per row, decode its final samples, and return the masked-image
         inputs an inpainting model read, which its rescoring reads again."""
         objective = self.objective
-        given = objective.encoded_conditions(params, batch)
+        given = self.encoded_conditions(params, batch)
         spatial = objective._spatial(params, batch, key)
         denoise = objective.denoiser(params, {**given, **spatial},
                                      {**objective.blank_conditions(params, given), **spatial})

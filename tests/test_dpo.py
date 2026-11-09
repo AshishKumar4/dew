@@ -5,8 +5,8 @@ must match TRL 1.12's DPO path with the defaults (`sigmoid` loss,
 `reverse_kl`): the reference is tests/fixtures/rl/dpo.npz, which
 tools/parity_dpo.py writes by running TRL's own `DPOTrainer._compute_loss`
 on fixed logits. `DPOObjective` composes that term with the
-chunked head's per-token log-probabilities, reading the reference from the
-frozen `step.ema`, and `Preferences` stacks the batches it trains on.
+chunked head's per-token log-probabilities over windows of packed pairs, reading the reference from the
+frozen `step.ema`, and `presets.preferences` packs the windows it trains on, a pair's shared prompt once.
 """
 
 import json
@@ -24,7 +24,7 @@ from tool_support import load
 from dew.data import Files, Loading, Memory, presets
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
-from dew.data.preferences import IDS_KEY, MASK_KEY
+from dew.data.preferences import HALVES_KEY, IDS_KEY, MASK_KEY, REAL_KEY, PairIds, pair_windows, windows
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 
@@ -81,23 +81,28 @@ def test_dpo_loss_rewards_and_gradient_match_trl(reference):
 
 # --- the objective -------------------------------------------------------------
 
-def pair_batch(seed=0):
-    """Two pairs of full-length rows, `[PAIRS, 2, WIDTH]`, with prompt
-    prefixes under the mask."""
+def pairs(seed=0):
+    """Two pairs of full-length rows, `[PAIRS, 2, WIDTH]`, ids and completion masks, a shared prompt of two
+    ids under the mask."""
     rng = np.random.RandomState(seed)
     ids = rng.randint(0, VOCAB, (PAIRS, 2, WIDTH)).astype(np.int32)
+    ids[:, 1, :2] = ids[:, 0, :2]
     mask = np.ones((PAIRS, 2, WIDTH), np.int32)
     mask[:, :, :2] = 0
     mask[0, 1, 4:] = 0
-    return {IDS_KEY: jnp.asarray(ids), MASK_KEY: jnp.asarray(mask)}
+    return ids, mask
 
 
-def flat(batch):
-    """A `[B, 2, S]` pair batch as TRL's `[2B, S]` stack with the shifted
-    mask, indexed pair by pair, the layout both implementations share below
-    the objective."""
-    ids = np.asarray(batch[IDS_KEY])
-    mask = np.asarray(batch[MASK_KEY])[:, :, 1:]
+def pair_batch(seed=0):
+    """`pairs(seed)` as the windows a DPO run trains on."""
+    return pair_windows(*pairs(seed))
+
+
+def flat(held):
+    """`[B, 2, S]` pairs as TRL's `[2B, S]` stack with the shifted mask, indexed pair by pair, the layout
+    both implementations share below the objective."""
+    ids, mask = held
+    mask = mask[:, :, 1:]
     return (ids[:, 0], ids[:, 1], mask[:, 0], mask[:, 1])
 
 
@@ -108,7 +113,7 @@ def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
     params = jax.tree.map(lambda x: x + .1, reference)
     batch = pair_batch()
     loss, aux = objective.scalar_loss(params, batch, Step(jnp.array(0), jax.random.key(1), reference))
-    chosen, rejected, chosen_mask, rejected_mask = flat(batch)
+    chosen, rejected, chosen_mask, rejected_mask = flat(pairs())
     def score(variables, ids, mask):
         logits = model.apply(variables, jnp.asarray(ids[:, :-1]))
         log_probs = jax.nn.log_softmax(logits)
@@ -159,9 +164,8 @@ def test_swapped_halves_change_the_loss():
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
 
     loss, _ = objective.scalar_loss(moved, batch, step)
-    swapped = {IDS_KEY: batch[IDS_KEY][:, ::-1, :],
-               MASK_KEY: batch[MASK_KEY][:, ::-1, :]}
-    flipped, _ = objective.scalar_loss(moved, swapped, step)
+    ids, mask = pairs()
+    flipped, _ = objective.scalar_loss(moved, pair_windows(ids[:, ::-1], mask[:, ::-1]), step)
 
     assert abs(float(flipped) - float(loss)) > 1e-4
 
@@ -178,13 +182,15 @@ def test_evaluation_scores_chosen_perplexity():
     with steady_state(allow=("host_to_device",)):
         objective.evaluate(params, batch, step)
 
-    chosen_ids, _, chosen_mask, _ = flat(batch)
+    # Each chosen completion token's score, pair by pair in the windows' order, as its own row scores it.
+    chosen_ids, _, chosen_mask, _ = flat(pairs())
     expected = np.asarray(objective.per_token_log_probs(params, chosen_ids))
-    np.testing.assert_allclose(np.asarray(scores.losses), -expected, rtol=1e-5)
-    np.testing.assert_array_equal(np.asarray(scores.weights), chosen_mask)
+    counted = np.asarray(scores.weights) > 0
+    assert counted.sum() == chosen_mask.sum()
+    np.testing.assert_allclose(np.asarray(scores.losses)[counted], -expected[chosen_mask > 0], rtol=1e-5)
     logits = objective.model.apply(params, chosen_ids[:, :-1], train=False)
-    np.testing.assert_array_equal(np.asarray(scores.correct),
-                                  np.asarray(jnp.argmax(logits, axis=-1) == chosen_ids[:, 1:]))
+    right = np.asarray(jnp.argmax(logits, axis=-1) == chosen_ids[:, 1:])
+    np.testing.assert_array_equal(np.asarray(scores.correct)[counted], right[chosen_mask > 0])
 
 
 def test_a_misbuilt_objective_is_refused():
@@ -198,16 +204,16 @@ def test_a_misshapen_batch_is_refused():
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=params)
     batch = pair_batch()
 
-    flat_batch = {IDS_KEY: batch[IDS_KEY].reshape(-1, WIDTH),
-                  MASK_KEY: batch[MASK_KEY].reshape(-1, WIDTH)}
+    ids, mask = pairs()
     with pytest.raises(ValueError):
-        objective.scalar_loss(params, flat_batch, step)
+        objective.scalar_loss(params, {IDS_KEY: ids, MASK_KEY: mask}, step)
 
-    short = {IDS_KEY: batch[IDS_KEY][:, :, :4], MASK_KEY: batch[MASK_KEY][:, :, :4]}
+    short = {key: value[:, :4] if np.ndim(value) == 2 and key != "fork_parents" else value
+             for key, value in batch.items()}
     with pytest.raises(ValueError):
         objective.scalar_loss(params, short, step)
 
-    wide = {IDS_KEY: batch[IDS_KEY], MASK_KEY: batch[MASK_KEY][:, :, :4]}
+    wide = {**batch, MASK_KEY: batch[MASK_KEY][:, :4]}
     with pytest.raises(ValueError):
         objective.scalar_loss(params, wide, step)
 
@@ -222,10 +228,9 @@ def records(*rows):
     return tuple(json.dumps(row) for row in rows)
 
 
-def preference_rows(rows, pad_id, width):
-    pairs = Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=width, batch=None,
-                                                           pad_id=pad_id)
-    return list(iterate(pairs, read="memory", loading=Loading(workers=0)))
+def preference_rows(rows, width):
+    laid = Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=width, batch=None)
+    return list(iterate(laid, read="memory", loading=Loading(workers=0)))
 
 
 PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
@@ -234,53 +239,59 @@ PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
 
 def test_a_preference_dataset_trains_as_the_preference_config_does():
     """`Trainer.fit` compiles a Dataset with the objective's own stages.
-    DPO adds none, so one step over `preferences.PreferencePair` rows moves the policy
+    DPO adds none, so one step over the windows `preferences.windows` packs of the pairs moves the policy
     exactly as one step over the same pairs through the preferences preset."""
     import optax
     from bank_support import identical
 
-    from dew.data import preferences
     from dew.training import Layout, Trainer
 
-    pairs = [PAIR] * 8
+    held = [PAIR] * 8
 
     def trained(data):
         trainer = Trainer(DPOObjective(TinyHead(vocab_size=8), 3), optax.sgd(0.1), key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0))
         return trainer.fit(data, steps=1).variables
 
-    identical(trained(Memory(pairs).map(preferences.PreferencePair(4)).batch(8)),
-              trained(compile(Memory(pairs).pipe(presets.preferences, seq_len=4, batch=8),
+    laid = windows(held, 4)
+    rows = [{key: value[at] for key, value in laid.items()} for at in range(len(laid[IDS_KEY]))]
+    identical(trained(Memory(rows).batch(len(rows))),
+              trained(compile(Memory(held).pipe(presets.preferences, seq_len=4, batch=len(rows)),
                               read="memory", loading=Loading(workers=0))))
 
 
 def test_a_ragged_pair_is_refused():
     row = dict(PAIR, chosen_mask=[0, 1, 1])
     with pytest.raises(ValueError):
-        preference_rows(records(row), 0, 4)[0]
+        preference_rows(records(row), 4)[0]
     row = dict(PAIR, chosen=[1, "x"])
     with pytest.raises(ValueError):
-        preference_rows(records(row), 0, 4)[0]
+        preference_rows(records(row), 4)[0]
     row = dict(PAIR, rejected_mask=[0, 0, 2])
     with pytest.raises(ValueError):
-        preference_rows(records(row), 0, 4)[0]
+        preference_rows(records(row), 4)[0]
 
 
 def test_an_incomplete_row_is_refused():
     with pytest.raises(ValueError):
-        preference_rows(records({"chosen": [1]}), 0, 4)
+        preference_rows(records({"chosen": [1]}), 4)
     with pytest.raises(ValueError):
-        preference_rows(records([1, 2]), 0, 4)[0]
+        preference_rows(records([1, 2]), 4)[0]
     with pytest.raises(ValueError):
         compile(Memory([]).pipe(presets.preferences, seq_len=4, batch=1), read="memory",
                 loading=Loading(workers=0))
 
 
-def test_unread_preference_fields_pass_through():
-    row = preference_rows(records(dict(PAIR, reward=1.0)), 0, 4)[0]
+def test_unread_preference_fields_pass_through_the_pair_step():
+    """The pair step keeps a record's fields it does not read beside the pair's document: its shared prompt
+    once, then each half's rest."""
+    from dew.data.preferences import PreferencePair
+
+    row = PreferencePair(4).map(dict(PAIR, reward=1.0))
     assert row["reward"] == 1.0
-    np.testing.assert_array_equal(row[IDS_KEY], [[1, 2, 3, 4], [1, 2, 5, 0]])
-    np.testing.assert_array_equal(row[MASK_KEY], [[0, 0, 1, 1], [0, 0, 1, 0]])
+    np.testing.assert_array_equal(row["text"], [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(row[MASK_KEY], [0, 0, 1, 1, 1])
+    np.testing.assert_array_equal(row[HALVES_KEY], [0, 0, 1, 1, 2])
 
 
 def test_parquet_pairs_batch_in_pairs(tmp_path):
@@ -298,50 +309,46 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
 
     assert data.records == 1
     batch = next(data.train(DataPartition()))
-    np.testing.assert_array_equal(
-        np.asarray(batch[IDS_KEY]), [[[1, 2, 3, 4], [1, 2, 5, 0]]])
-    np.testing.assert_array_equal(
-        np.asarray(batch[MASK_KEY]), [[[0, 0, 1, 1], [0, 0, 1, 0]]])
+    np.testing.assert_array_equal(np.asarray(batch[IDS_KEY]), [[1, 2, 3, 4, 5, 0, 0, 0]])
+    np.testing.assert_array_equal(np.asarray(batch[MASK_KEY]), [[0, 0, 1, 1, 1, 0, 0, 0]])
 
-@pytest.mark.parametrize("mask_case", ["varied", "explicit", "default"])
-def test_varied_rows_pad_to_one_window(mask_case):
-    """Two pairs of different lengths batch without ragged edges: the
-    grain batcher stacks static shapes, so every row is already `[2,
-    seq_len]`."""
-    rows = records(
-        {"chosen": [1, 2, 3, 4], "rejected": [5]},
-        {"chosen": [6], "rejected": [7, 8]})
-    if mask_case == "explicit":
-        rows = records(PAIR)
-    elif mask_case == "default":
-        rows = records({"chosen": [1, 2], "rejected": [3]})
-    batch_size = 2 if mask_case == "varied" else 1
-    data = compile(Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=4,
-                                                                  batch=batch_size),
-                   read="memory", loading=Loading(workers=0))
+@pytest.mark.parametrize("share", [True, False], ids=["shared", "whole"])
+def test_pairs_pack_into_windows_each_half_at_its_own_places(share):
+    """Pairs of different lengths pack first-fit into windows of two halves' tokens, several a window: each
+    pair's halves read back, token for token and place for place, as their own rows lay them, its prompt
+    once where the halves share it and twice where they are laid whole; a default mask marks every token a
+    completion's, so nothing is shared."""
+    from dew.data.preferences import PAIRS_KEY, POSITIONS_KEY
 
-    batch = next(data.train(DataPartition()))
+    rows = [{"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5], "chosen_mask": [0, 0, 1, 1],
+             "rejected_mask": [0, 0, 1]},
+            {"chosen": [6], "rejected": [7, 8]}, {"chosen": [1, 2], "rejected": [3]}]
+    laid = list(iterate(Memory(rows).pipe(presets.preferences, seq_len=4, batch=None, share=share),
+                        read="memory", loading=Loading(workers=0)))
+    found = {}
+    for batch in laid:
+        ids, pair, half = (np.asarray(batch[key]) for key in (IDS_KEY, PAIRS_KEY, HALVES_KEY))
+        places = np.asarray(batch[POSITIONS_KEY])
+        for number in range(1, int(pair.max()) + 1):
+            held = pair == number
+            for side in (1, 2):
+                own = held & ((half == side) | (half == 0))
+                found.setdefault(tuple(ids[held]), []).append(
+                    (list(ids[own][np.argsort(places[own], kind="stable")]), list(np.sort(places[own]))))
+    halves = sorted((tuple(row["chosen"]), tuple(row["rejected"])) for row in rows)
+    read = sorted(tuple(tuple(tokens) for tokens, _ in found[key]) for key in found)
+    assert read == halves
+    assert all(places == list(range(len(tokens))) for each in found.values() for tokens, places in each)
+    shared = sum(int(np.sum(np.asarray(batch[REAL_KEY]))) for batch in laid)
+    assert shared == sum(len(row["chosen"]) + len(row["rejected"]) for row in rows) - (2 if share else 0)
 
-    ids = np.asarray(batch[IDS_KEY])
-    if mask_case == "explicit":
-        np.testing.assert_array_equal(ids[0], [[1, 2, 3, 4], [1, 2, 5, 0]])
-        np.testing.assert_array_equal(batch[MASK_KEY][0], [[0, 0, 1, 1], [0, 0, 1, 0]])
-        return
-    if mask_case == "default":
-        np.testing.assert_array_equal(batch[MASK_KEY][0], [[1, 1, 0, 0], [1, 0, 0, 0]])
-        return
-    assert ids.shape == (2, 2, 4)
-    order = np.argsort(-ids[:, 0, :].sum(-1))
-    np.testing.assert_array_equal(ids[order][:, 0, :], [[1, 2, 3, 4], [6, 0, 0, 0]])
-    np.testing.assert_array_equal(np.asarray(batch[MASK_KEY])[order][:, 1, :],
-                                  [[1, 0, 0, 0], [1, 1, 0, 0]])
 
 def test_an_overlong_row_is_refused():
     row = {"chosen": [1, 2, 3, 4, 5], "rejected": [1]}
     with pytest.raises(ValueError):
-        preference_rows(records(row), 0, 4)
+        preference_rows(records(row), 4)
     with pytest.raises(ValueError):
-        preference_rows(records(PAIR), 0, 0)
+        preference_rows(records(PAIR), 0)
 
 
 def test_parquet_without_sides_is_refused(tmp_path):
@@ -356,11 +363,219 @@ def test_parquet_without_sides_is_refused(tmp_path):
 
 
 def test_a_preference_pair_marks_each_halfs_real_tokens():
-    """A preference pair's layout marks each half's ids as real (`REAL_KEY`) and its padding as not,
-    whatever its completion marks: a chosen half ending in an unmarked token, a rejected half of no
-    completion."""
-    from dew.data.preferences import REAL_KEY, PreferencePair
+    """A window marks its pairs' ids as real (`REAL_KEY`) and its padding as not, whatever their completion
+    marks: a chosen half ending in an unmarked token, a rejected half of no completion."""
+    laid = windows([{"chosen": [1, 2, 3, 4], "rejected": [1, 2], "chosen_mask": [0, 0, 1, 0],
+                     "rejected_mask": [0, 0]}], 5)
+    assert laid[REAL_KEY].tolist() == [[1, 1, 1, 1, 0, 0, 0, 0, 0, 0]]
 
-    row = PreferencePair(5, pad_id=7).map(
-        {"chosen": [1, 2, 3, 4], "rejected": [1, 2], "chosen_mask": [0, 0, 1, 0], "rejected_mask": [0, 0]})
-    assert row[REAL_KEY].tolist() == [[1, 1, 1, 1, 0], [1, 1, 0, 0, 0]]
+
+@pytest.mark.parametrize("share", [True, False], ids=["shared", "whole"])
+@pytest.mark.parametrize("kind", ["attention", "gated delta net hybrid", "one document a row"])
+def test_packed_pairs_train_as_each_pair_a_row(kind, share):
+    """Pairs packed into windows (`preferences.windows`: several pairs a window, a pair's shared prompt once
+    where `share`; a user's model that reads one document a row one half a window, `segments=1`) give the
+    DPO loss, its rewards and the gradient in every parameter that each pair laid out a row, its halves
+    scored apart, gives (check 1, over drawn weights and references, float64 truth): each half's completion
+    scored from its own predecessors, a half's first token from the shared prompt's last, each pair's sums
+    reduced by its number across the batch (`pair_numbers`)."""
+    from model_support import TINY_DECODER, float64_truth, float64_twin
+
+    from dew.batch import coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm.objective import LMObjective
+    from dew.rl.surrogate import preference_logsigmoid_terms
+
+    half = 7
+    segments = 1 if kind == "one document a row" else None
+    if kind == "one document a row":
+        from capability_modules import TokenModel as UserTokens
+
+        model = UserTokens(vocab_size=VOCAB)
+    elif kind == "attention":
+        model = CausalTransformer(vocab_size=VOCAB, **{**TINY_DECODER, "max_seq_len": 2 * half},
+                                  dtype="float32")
+    else:
+        model = CausalTransformer(
+            vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8, mlp_features=32,
+            max_seq_len=2 * half, dtype="float32", layer_types=("linear_attention", "full_attention"),
+            kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+                "linear_num_key_heads": 2, "linear_num_value_heads": 2, "linear_key_head_dim": 8,
+                "linear_value_head_dim": 8}}}})
+    rng = np.random.default_rng(5)
+    rows = []
+    for index in range(5):
+        prompt = rng.integers(1, VOCAB, 2 + index % 3).tolist()
+        chosen = prompt + rng.integers(1, VOCAB, 1 + index % 2).tolist()
+        rejected = prompt + rng.integers(1, VOCAB, 2).tolist()
+        rows.append({"chosen": chosen, "rejected": rejected,
+                     "chosen_mask": [0] * len(prompt) + [1] * (len(chosen) - len(prompt)),
+                     "rejected_mask": [0] * len(prompt) + [1] * (len(rejected) - len(prompt))})
+    # A pair of default masks, every token a completion's: no prompt shared, each half's first token
+    # scored from nothing and so counted in neither arm.
+    rows.append({"chosen": rng.integers(1, VOCAB, 4).tolist(),
+                 "rejected": rng.integers(1, VOCAB, 3).tolist()})
+    rows[-1].update({"chosen_mask": [1] * 4, "rejected_mask": [1] * 3})
+    laid = windows(rows, half, share=share, segments=segments)
+    assert laid[IDS_KEY].shape[0] < len(rows) or not share or segments == 1
+    objective = DPOObjective(model, half - 1, beta=0.5, segments=segments)
+    ids = np.zeros((2 * len(rows), half), np.int32)
+    marks = np.zeros((2 * len(rows), half), np.float32)
+    for index, row in enumerate(rows):
+        for side, name in enumerate(("chosen", "rejected")):
+            ids[side * len(rows) + index, :len(row[name])] = row[name]
+            marks[side * len(rows) + index, :len(row[name])] = row[f"{name}_mask"]
+    held = coordinates(valid=jnp.asarray(ids > 0), right_padded=True)
+
+    def packed(objective):
+        def run(params, reference):
+            step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=reference)
+            (loss, aux), grads = jax.value_and_grad(objective.scalar_loss, has_aux=True)(params, laid, step)
+            return {"loss": loss, "chosen": aux.metrics["rewards/chosen"], "grads": grads}
+        return jax.jit(run)
+
+    def each_row(model):
+        scorer = LMObjective(model, half - 1)
+
+        def run(params, reference):
+            def loss(params):
+                policy, frozen = (-scorer.token_scores(tree, ids, coordinates=held).losses
+                                  for tree in (params, reference))
+                shifted = jnp.asarray(marks[:, 1:])
+                halves = [jnp.split(values, 2) for values in (policy, frozen)]
+                terms, (chosen, _) = preference_logsigmoid_terms(
+                    halves[0][0], halves[0][1], halves[1][0], halves[1][1], *jnp.split(shifted, 2), 0.5)
+                return jnp.mean(terms), jnp.mean(chosen)
+            (value, chosen), grads = jax.value_and_grad(loss, has_aux=True)(params)
+            return {"loss": value, "chosen": chosen, "grads": grads}
+        return jax.jit(run)
+
+    # A user's module states no dtype of its own: the gate's float64 run of the reference arm is its truth.
+    truth_fn = None if segments == 1 else float64_truth(each_row(float64_twin(model)))
+
+    initialized = jax.jit(objective.init)
+
+    def draw(seed):
+        # The reference another draw of the same model's weights.
+        return initialized(jax.random.key(seed)), initialized(jax.random.fold_in(jax.random.key(seed), 1))
+
+    assert_as_exact(packed(objective), each_row(model), draw, f"DPO over packed pairs, {kind}",
+                    seeds=48, truth_fn=truth_fn)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("segments", [None, 1], ids=["packed", "a half a window"])
+def test_a_step_split_over_parts_and_shards_trains_as_each_pair_a_row(segments):
+    """A trainer's step over windows of pairs, read in two microbatches over two data shards (`split=2`
+    on a two-device data mesh), moves the policy as one SGD step on the loss of each pair laid out a row
+    (check 1, over drawn weights, float64 truth): the trainer lays a batch of windows of one half, a
+    pair's two in turn, so each pair's two stand in one part and shard (`UNIT_ROWS`,
+    `dew.training.planning.unit_order`), and a pair's halves reduce by its number however the windows hold
+    them. A split no order keeps the pairs whole in is refused."""
+    import optax
+    from flax import linen as nn
+    from model_support import TINY_DECODER, float64_truth, float64_twin
+
+    from dew.batch import coordinates
+    from dew.mesh import LayoutRefused
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm.objective import LMObjective
+    from dew.rl.surrogate import preference_logsigmoid_terms
+    from dew.training import MeshSpec, Trainer
+
+    half, rate = 8, 0.5
+    model = CausalTransformer(vocab_size=VOCAB, **{**TINY_DECODER, "max_seq_len": 2 * half}, dtype="float32")
+    rng = np.random.default_rng(9)
+    rows = []
+    # Eight windows either way: two pairs of at most seven tokens a window of sixteen, or a half each.
+    for index in range(4 if segments == 1 else 16):
+        prompt = rng.integers(1, VOCAB, 2 + index % 2).tolist()
+        chosen, rejected = (prompt + rng.integers(1, VOCAB, 2).tolist() for _ in range(2))
+        rows.append({"chosen": chosen, "rejected": rejected,
+                     "chosen_mask": [0] * len(prompt) + [1, 1], "rejected_mask": [0] * len(prompt) + [1, 1]})
+    laid = windows(rows, half, segments=segments)
+    assert laid[IDS_KEY].shape[0] == 8
+    ids = np.zeros((2 * len(rows), half), np.int32)
+    marks = np.zeros((2 * len(rows), half), np.float32)
+    for index, row in enumerate(rows):
+        for side, name in enumerate(("chosen", "rejected")):
+            ids[side * len(rows) + index, :len(row[name])] = row[name]
+            marks[side * len(rows) + index, :len(row[name])] = row[f"{name}_mask"]
+    held = coordinates(valid=jnp.asarray(ids > 0), right_padded=True)
+
+    def trainer_for(seed, split=2):
+        objective = DPOObjective(model, half - 1, beta=0.5, segments=segments)
+        trainer = Trainer(objective, optax.sgd(rate),
+                          key=jax.random.key(seed), split=split, checkpoints=None, tracker=None)
+        # Two devices, the data axis taking both: two data shards.
+        trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+        return trainer
+
+    trainer = trainer_for(0)
+    start = trainer.initial_state()
+    step = trainer.compile(start, laid)
+
+    def stepped(params):
+        # The trainer's step from the drawn weights, its reference the same weights frozen (`step.ema`), run
+        # on the host: the gate compiles its arms, and a step is a program of its own.
+        # A state of its own buffers each call: the step donates the state it reads.
+        state = jax.tree.map(jnp.copy, start.replace(variables={**start.variables, "params": params},
+                                                      ema={**start.ema, "params": params}))
+        state, *_ = step(state, laid)
+        return state.variables["params"]
+
+    def each_row(model):
+        scorer = LMObjective(model, half - 1)
+
+        def run(params):
+            def loss(params):
+                policy, frozen = (-scorer.token_scores({"params": tree}, ids, coordinates=held).losses
+                                  for tree in (params, jax.lax.stop_gradient(params)))
+                halves = [jnp.split(values, 2) for values in (policy, frozen)]
+                terms, _ = preference_logsigmoid_terms(halves[0][0], halves[0][1], halves[1][0], halves[1][1],
+                                                       *jnp.split(jnp.asarray(marks[:, 1:]), 2), 0.5)
+                return jnp.mean(terms)
+            return jax.tree.map(lambda leaf, grad: leaf - rate * grad, params, jax.grad(loss)(params))
+        return jax.jit(run)
+
+    initialized = jax.jit(DPOObjective(model, half - 1).init)
+
+    def draw(seed):
+        params = nn.unbox(initialized(jax.random.key(seed)))["params"]
+        return params, stepped(params)
+
+    plain, wide = each_row(model), each_row(float64_twin(model))
+    assert_as_exact(lambda _, moved: moved, lambda params, _: plain(params), draw,
+                    f"a split step over pairs, segments={segments}", seeds=8,
+                    truth_fn=float64_truth(lambda params, _: wide(params)))
+    if segments == 1:
+        with pytest.raises(LayoutRefused):
+            trainer = trainer_for(0, split=8)
+            state = trainer.initial_state()
+            trainer.compile(state, laid)
+
+
+def test_pairs_of_one_half_a_window_are_numbered_across_the_batch_and_kept_whole_in_a_steps_parts():
+    """`PairIds` numbers each pair across its batch, a pair's two windows of one half the same pair and
+    unit; `unit_order` lays the rows so a step reading every `split`th row over its shards keeps each pair
+    whole, the rows as they stand where they already do, and none where no order does (a part of one
+    row). A batch opening on a pair's second window is refused."""
+    from dew.batch import UNIT_ROWS
+    from dew.data.preferences import PAIRS_KEY
+    from dew.training.planning import keeps_units, unit_order
+
+    rows = [{"chosen": [1, 2, 3], "rejected": [1, 2, 4], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1, 1]}
+            for _ in range(4)]
+    laid = windows(rows, 3, segments=1)
+    assert laid[PAIRS_KEY].max(axis=1).tolist() == [1, 1, 2, 2, 3, 3, 4, 4]
+    assert laid[UNIT_ROWS].tolist() == [1, 1, 2, 2, 3, 3, 4, 4]
+    assert unit_order(laid, 1, 2).tolist() == list(range(8))
+    order = unit_order(laid, 2, 2)
+    units = laid[UNIT_ROWS][order]
+    for row in range(8):
+        part = (row // 4, row % 2)
+        assert all((other // 4, other % 2) == part for other in range(8) if units[other] == units[row])
+    assert unit_order(laid, 8, 1) is None and not keeps_units(laid, 8, 1)
+    assert keeps_units({"x": np.zeros(3)}, 2, 1)
+    with pytest.raises(ValueError):
+        PairIds()({key: value[1:] for key, value in laid.items()})

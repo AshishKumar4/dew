@@ -1,8 +1,8 @@
 """A row of a request's questions over one copy of its state (`QuestionLayout.shared_state`): what each
-question's own row writes before its question, written once, and each question's own part after it, each at
-the positions its own row lays it at; each question reads that shared part and itself (and, with
-`siblings`, the questions before it), so it decides as its own row does, its request's tokens the state's
-once and each question's."""
+question's own row writes before its question, written once, and each question's own part after it as a
+document continuing it (`dew.batch.Forks`), each at the positions its own row lays it at; each question
+reads that shared part and itself, so it decides as its own row does, its request's tokens the state's once
+and each question's."""
 
 import copy
 import dataclasses
@@ -26,6 +26,7 @@ from dew.decision.layout import (
     DecisionInputs,
     Instructions,
     OptionLines,
+    QuestionLayout,
     State,
     StateFirstLayout,
     Text,
@@ -44,6 +45,7 @@ OWN = StateFirstLayout(
                           noul_first="false"),
               AnswerCue(template="\nAnswer:", many="\nAnswer:")))
 """A lettered row of a question of its own, its state first."""
+OWN = dataclasses.replace(OWN, shared_state=1)
 SHARED = dataclasses.replace(OWN, shared_state=3)
 QUESTIONS = {"team": Choice("Which team handles it?", ["cards", "loans", "fraud", "none"]),
              "way": Choice("Which way is it?", ["up", "down", "left", "right"]),
@@ -61,16 +63,16 @@ def own_and_shared(layout=SHARED, state: str = STATES[2]):
 
 
 def test_a_row_over_one_state_holds_it_once_and_each_question_as_its_own_row_lays_it():
-    """The row holds what the questions' own rows write before their question once, stream 0, and each
-    question's own part after it, its stream its place: each token, its position, the question's spans and
-    its readout, the ones its own row holds, moved along the row."""
+    """The row holds what the questions' own rows write before their question once, its document 1, and
+    each question's own part after it, a document continuing it in their order: each token, its position,
+    the question's spans and its readout, the ones its own row holds, moved along the row."""
     own, [row] = own_and_shared()
     shared = own[0].questions[0].span[0]
-    tokens, positions, streams = (np.asarray(field) for field in (row.tokens, row.positions, row.streams))
-    assert list(tokens[streams == 0]) == list(own[0].tokens[:shared])
+    tokens, positions, documents = (np.asarray(field) for field in (row.tokens, row.positions, row.forked))
+    assert list(tokens[documents == 1]) == list(own[0].tokens[:shared])
     assert len(tokens) == shared + sum(len(each.tokens) - shared for each in own)
-    for stream, (alone, laid) in enumerate(zip(own, row.questions, strict=True), start=1):
-        part = streams == stream
+    for document, (alone, laid) in enumerate(zip(own, row.questions, strict=True), start=2):
+        part = documents == document
         assert list(tokens[part]) == list(alone.tokens[shared:])
         assert list(positions[part]) == list(range(shared, len(alone.tokens)))
         [mine] = alone.questions
@@ -96,29 +98,23 @@ def test_questions_that_outgrow_a_row_take_several_each_repeating_the_state():
             assert row.tokens[:shared] == own[0].tokens[:shared] and len(row.tokens) <= layout.max_len
 
 
-def test_each_question_reads_the_shared_part_and_itself_and_with_siblings_those_before_it():
-    """The model's runs of a row over one state, its layout's streams (`stream_runs`), siblings or not: a
-    token of the shared part reads it up to itself; a question's token reads the shared part whole and its
-    own part up to itself, and with `siblings` each question before it whole; no question reads one after
-    it."""
-    for siblings in (False, True):
-        layout = dataclasses.replace(SHARED, siblings=siblings)
-        _, [row] = own_and_shared(layout)
-        inputs = DecisionInputs.collate([row], SPECIALS.pad, attention=layout.attention)
-        assert inputs.reads is not None
-        runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
-        length = inputs.tokens.shape[1]
-        seen = np.asarray(visibility_mask(length, length, causal=False, sliding_window=None,
-                                          key_runs=runs))[0, 0]
-        streams = np.asarray(row.streams)
-        index = np.arange(len(streams))
-        for query, stream in enumerate(streams):
-            read = (streams == 0) & ((index <= query) if stream == 0 else True)
-            read |= (streams == stream) & (index <= query)
-            if siblings and stream > 0:
-                read |= (streams > 0) & (streams < stream)
-            assert list(seen[query, :len(streams)]) == list(read), (siblings, query)
-
+def test_each_question_reads_the_shared_part_and_itself():
+    """The forks a row over one state lays out (`DecisionInputs.coordinates`): a token of the shared part
+    reads it up to itself; a question's token reads the shared part whole and its own part up to itself,
+    and no other question's."""
+    _, [row] = own_and_shared()
+    inputs = DecisionInputs.collate([row], SPECIALS.pad)
+    laid = inputs.coordinates()
+    assert laid.forks is not None and laid.segments is not None
+    runs = laid.forks.runs(laid.segments)
+    length = inputs.tokens.shape[1]
+    seen = np.asarray(visibility_mask(length, length, causal=False, sliding_window=None, key_runs=runs))[0, 0]
+    documents = np.asarray(row.forked)
+    index = np.arange(len(documents))
+    for query, document in enumerate(documents):
+        read = (documents == 1) & ((index <= query) if document == 1 else True)
+        read |= (documents == document) & (index <= query)
+        assert list(seen[query, :len(documents)]) == list(read), query
 
 
 def test_a_layout_of_its_own_reads_that_writes_a_stream_twice_reads_by_its_streams():
@@ -138,7 +134,7 @@ def examples() -> list[Example]:
 
 def scored(objective, windows, variables) -> dict[str, np.ndarray]:
     """Each question's real options' logits, keyed by its request's shared part's tokens and its own
-    part's: a row of its own is both, a row over one state its stream 0 and the question's stream."""
+    part's: a row of its own is both, a row over one state its shared document and the question's."""
     forward = without_ynn(lambda variables, inputs: objective.model.logits(variables, inputs))
     logits = {}
     for batch in windows:
@@ -146,24 +142,26 @@ def scored(objective, windows, variables) -> dict[str, np.ndarray]:
         held = np.asarray(forward(variables, inputs))
         options, owners = np.asarray(batch["options"]), np.asarray(batch["question_rows"])
         tokens, segments = np.asarray(batch["tokens"]), np.asarray(batch["segments"])
-        streams = np.asarray(batch["streams"]) if "streams" in batch else np.zeros_like(tokens)
+        forked = "documents" in batch
+        documents = np.asarray(batch["documents"]) if forked else np.zeros_like(tokens)
         for window, owner in enumerate(owners):
             for row in range(1, int(segments[window].max()) + 1):
                 own = segments[window] == row
-                for stream, slot in enumerate(np.flatnonzero(owner == row), start=1):
-                    part = own & ((streams[window] == 0) | (streams[window] == stream)
-                                  if "streams" in batch else True)
+                held_documents = np.unique(documents[window][own])
+                for number, slot in enumerate(np.flatnonzero(owner == row), start=1):
+                    part = own & (np.isin(documents[window], held_documents[[0, number]])
+                                  if forked else True)
                     key = bytes(tokens[window][part].astype(np.uint8)).decode(errors="replace")
                     logits[key] = held[window][slot][options[window][slot]]
     return dict(sorted(logits.items()))
 
 
-@pytest.mark.parametrize("siblings", [False], ids=["apart"])
-def test_a_row_over_one_state_decides_each_question_as_its_own_row_does(siblings):
+def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
     """Rows of a request's questions over one state, two requests a window, decide each question's options as
     its own row does in a window of its own, through the unmodified objective (check 1, over drawn
     parameters, float64 truth)."""
-    shared = in_streams(dataclasses.replace(SHARED, siblings=siblings), segments=2)
+    shared = in_streams(SHARED, segments=2)
+    assert isinstance(shared.layout, QuestionLayout) and shared.layout.shares
     alone = in_streams(OWN, segments=1)
     rows = examples()
     windows = {"shared": windows_of(shared, rows, count=8), "alone": windows_of(alone, rows, count=24)}
@@ -187,11 +185,11 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does(siblings
 
 
 def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_one_row(tmp_path):
-    """A decision run of a letter readout over a causal source whose every layer reads key runs, its rows
-    asking a request's questions over one state (`shared_state`), trains a step; the task loaded from its run
-    lays a request's three questions in one row and answers each with one of its options. Over a source whose
-    recurrent layers read no key runs (Qwen3.5's gated delta net), the run is refused, as its rows' streams
-    would be read as one sequence (until a document enters from a given memory, row 1506)."""
+    """A decision run of a letter readout, its rows asking a request's questions over one state
+    (`shared_state`), trains a step over a hybrid source (Qwen3.5's gated delta net beside attention, each
+    question's documents from the state the shared part leaves) and over an attention source; the task
+    loaded from its run lays a request's three questions in one row and answers each with one of its
+    options."""
     from run_kinds import QWEN_TINY, lettered, shared, trained
     from test_decision_streams import GEMMA
 
@@ -201,8 +199,7 @@ def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_o
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
     run = dataclasses.replace(lettered(tmp_path, drawn=False), data=rows, validation=None, shared_state=3)
     assert run.pretrained == str(QWEN_TINY)
-    with pytest.raises(ValueError):
-        trained(run, tmp_path, "hybrid")
+    trained(run, tmp_path, "hybrid")
     # Over a vocabulary that spells A to D as one unknown token, labels it spells apart (`run_kinds.shared`).
     run = dataclasses.replace(shared(tmp_path, drawn=False), data=rows, validation=None)
     assert run.pretrained == str(GEMMA)
@@ -280,7 +277,7 @@ def test_a_head_that_reads_across_its_rows_questions_refuses_a_row_over_one_stat
 def test_a_row_over_one_state_writes_its_state_before_its_question_and_its_instructions_first():
     """A layout whose rows write the state after the question (a question-first or a re-reading order), or
     the options before the instructions, shares no part of the state its questions read alike: it is refused
-    with shared_state set (review of state-once)."""
+    with several questions a row asked, and lays a question a row by default (review of state-once)."""
     from dew.decision.layout import MarkerLayout
 
     first, state, instructions, options, cue = OWN.segments
@@ -290,3 +287,5 @@ def test_a_row_over_one_state_writes_its_state_before_its_question_and_its_instr
         MarkerLayout(shared_state=2)
     with pytest.raises(ValueError):
         dataclasses.replace(OWN, shared_state=2, segments=None, order="re_read")
+    assert not MarkerLayout().shares and dataclasses.replace(OWN, shared_state=None).shares
+
