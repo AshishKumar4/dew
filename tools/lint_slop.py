@@ -1805,7 +1805,7 @@ GATE = frozenset({"tests/reference_error.py", "src/dew/parity.py", "tests/op_cer
                   "tests/test_gate_calibration.py", "tests/test_float64_terms.py",
                   "tests/sampling_gate.py", "tests/test_sampling_gate.py",
                   "tests/learning_gate.py", "tests/test_learning_gate.py", "tests/one_draw.py",
-                  "tests/float64_terms.py", "tests/conditioning.py",
+                  "tests/float64_terms.py",
                   "tests/rounding_bound.py", "tests/test_weighed_check.py", "tests/arm_arithmetic.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
 bound: every other comparison goes through its assertion; the sampling gate (tests/sampling_gate.py)

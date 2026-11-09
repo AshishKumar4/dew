@@ -87,7 +87,6 @@ from arm_forms import (
     windows as windows,
 )
 from check1_wire import CENSUS, DRAWS, STAGES
-from conditioning import Conditioning, conditioned
 from float64_terms import float64_terms
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
@@ -104,6 +103,7 @@ from dew.parity import (
     ROW_FACTOR,
     SIZING_FROM,
     UPPER_TAIL,
+    Conditioning,
     Finding,
     GateFailure,
     Inconclusive,
@@ -124,6 +124,7 @@ from dew.parity import (
     _staged,
     _term_leaves,
     _verdict,
+    heavy_masks,
 )
 from dew.parity_stages import REDRAW, staged_units
 
@@ -641,8 +642,8 @@ def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
 
 
 def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, program=None) -> Conditioning:
-    """Check 1's conditioning of `reference_fn` (tests/conditioning.py): its rounding scale at a draw as its
-    arm runs (`summed_as_run`, a window loop's by window), read from `program` where the reference is
+    """Check 1's conditioning of `reference_fn` (dew.parity's `Conditioning`): its rounding scale at a draw as
+    its arm runs (`summed_as_run`, a window loop's by window), read from `program` where the reference is
     recorded (`assert_as_exact`'s `conditioning_program`), its heavy elements over `seeds` as `ran`, its
     compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run."""
     from rounding_bound import rounding_scale
@@ -658,7 +659,18 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, program=None) -
             return jax.tree.map(lambda *scale: None if scale[0] is None else np.stack(scale), *each,
                                 is_leaf=lambda leaf: leaf is None)
 
-    return conditioned(unrewritten(ran or reference_fn), unrewritten(truth_fn), draw, seeds, scale_of)
+    # Its heavy elements over `seeds`' draws, each run as its arm runs (`summed_as_run`) beside its float64
+    # truth, `truth_fn`'s or its own, classed alike in every process that runs them.
+    ran_fn, true_fn = unrewritten(ran or reference_fn), unrewritten(truth_fn)
+
+    def ran_and_true(seed):
+        inputs = draw(seed)
+        with summed_as_run():
+            ran_here = jax.device_get(ran_fn(*inputs))
+        with jax.enable_x64(new_val=True):
+            return ran_here, jax.device_get((true_fn or ran_fn)(*widened(inputs)))
+
+    return Conditioning(scale_of, heavy_masks(map(ran_and_true, seeds)))
 
 
 def _truth_and_terms(truth_fn, terms_fn, inputs):
@@ -694,7 +706,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     `terms_fn`, the truth is that program's with each output's terms (`float64_terms`),
     every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
     terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
-    widened inputs. With `conditioning` (`conditioning.Conditioning`), every arm's leaves are read as
+    widened inputs. With `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as
     residuals in units of the reference's rounding at its truth's inputs (`Weighed.weighed`)."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
@@ -1011,7 +1023,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     is as without, so it may run as given.
 
     `conditioning`, the weighed check's own declared seeds (`seeds_for(..., conditioning=True)`), judges
-    the site weighed where it stays undecided with its budget spent (tests/conditioning.py, ledger 1714),
+    the site weighed where it stays undecided with its budget spent (dew.parity's conditioning, ledger 1714),
     each verdict logged under the check that decided it, the weighed one's ", conditioned". Its scale is
     the reference program's rounding; a recorded reference, which has no program here, names one
     (`conditioning_program`): a transcription of the reference's own computation in JAX, op for op and cast
@@ -1036,9 +1048,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
 def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditioning: int, truth_fn, orders,
               library_fn, library_row, library_leaves, also, terms, examples: bool, program=None) -> None:
-    """`assert_as_exact`'s site with `conditioning` (tests/conditioning.py): the unweighted check over its
-    own `seeds`, whole, and where it stays undecided the weighed check over `conditioning` seeds, its heavy
-    elements classed over the draws it takes, alike in every process that runs it. A sharded site's map
+    """`assert_as_exact`'s site with `conditioning` (dew.parity's `Conditioning`): the unweighted check over
+    its own `seeds`, whole, and where it stays undecided the weighed check over `conditioning` seeds, its
+    heavy elements classed over the draws it takes, alike in every process that runs it. A sharded site's map
     tasks draw each check's units apart, the weighed check's past the unweighted one's in the plan's units
     (tools/armada/ci.py `draws_of`), and its judge pools the weighed check's where it defers."""
     plain, span = staged_units(seeds), staged_units(conditioning)
@@ -1065,8 +1077,8 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None,
                  offset: int = 0) -> None:
-    """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (tests/
-    conditioning.py: built of the site's compiled reference and truth where it draws, never in its judge),
+    """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (dew.parity's
+    `Conditioning`: built of the site's compiled reference and truth where it draws, never in its judge),
     a map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
     given = reference_fn
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
