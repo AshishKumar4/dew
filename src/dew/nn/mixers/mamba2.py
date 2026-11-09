@@ -422,7 +422,8 @@ class Mamba2(nn.Module):
             return self.out_proj(self._gated(out, gate))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
-        if decode and length == 1 and decode_kernel(jax.ShapeDtypeStruct((batch, *state), wide), fuses=True,
+        if decode and length == 1 and decode_kernel(jax.ShapeDtypeStruct((batch, *state), wide),
+                                                    groups=self.n_groups, fuses=True,
                                                     normed=False) == 'fused':
             token = self._fused_token(taps, bias, dt, valid, tokens.starts)
         out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads), state,
