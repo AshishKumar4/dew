@@ -132,14 +132,6 @@ def _registry() -> _Registry:
     return _SCOPE.get() or _PROCESS
 
 
-def refused() -> Hashable:
-    """Each config the compiles in scope refused (`compiled`, `_proposing`'s replacement among them): what
-    a lowering's derivation reads beside its arguments, which a trace kept outside the compile point is
-    kept by (`dew.training._candidates.candidate_for`)."""
-    with _GUARD:
-        return frozenset(_registry().refused.items())
-
-
 class Exhausted(ValueError):
     """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
     that ends so keeps the first program (`compiled`)."""

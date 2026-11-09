@@ -151,7 +151,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     key = None if stated is None else (
         stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow, launches,
         lowering, mesh, platforms, capacity, _footprinted(footprint), derived, stepping.rows, stepping.split,
-        stepping.prefetch, stepping.examples, report.refused(), trace_context())
+        stepping.prefetch, stepping.examples, report.refused_launches(), trace_context())
     if key is not None:
         with _KEEPING:
             if (kept := _CANDIDATES.get(key)) is not None:
