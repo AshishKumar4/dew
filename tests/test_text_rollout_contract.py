@@ -424,6 +424,19 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
         np.testing.assert_array_equal(first, second)
 
 
+def session_chain(result, key: str, session: int) -> np.ndarray:
+    """`result[key]` along session `session`'s chain as its packed row holds it: the documents its last
+    token's document continues (`fork_parents`, a prompt its group shares), then that document."""
+    rows, columns = np.nonzero(result["session_index"] == session)
+    row, documents = rows[0], result["text_segment_ids"][rows[0]]
+    parents = result.get("fork_parents")
+    chain, document = [], documents[columns[-1]]
+    while document:
+        chain.insert(0, np.asarray(result[key][row])[documents == document])
+        document = 0 if parents is None else parents[row][document - 1]
+    return np.concatenate(chain)
+
+
 def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     model = decoder()
     objective = GRPOObjective(model, seq_len=7)
@@ -443,9 +456,8 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     result = rollout(SimpleNamespace(variables=params, step=0, updates=0), batch, jax.random.key(1))
     assert seen[:2] == [("a", "", "1", "")] * 2
     for index, (_, text, _, _) in enumerate(seen):
-        where = result["session_index"] == index
-        chain = result["input_ids"][where]
-        mask = result["response_mask"][where] != 0
+        chain = session_chain(result, "input_ids", index)
+        mask = session_chain(result, "response_mask", index) != 0
         width = int(batch["prompt_length"][index // 2])
         np.testing.assert_array_equal(chain[:width], batch["prompt"][index // 2, 4 - width:])
         assert not mask[:width].any() and mask[width:].all()
@@ -453,8 +465,8 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
         actions = chain[width:]
         count = len(actions) - int(actions[-1] == eos)
         assert text == " ".join(str(token) for token in actions[:count])
-        np.testing.assert_array_equal(result["behavior_log_probs"][where], 0)
-        old = result["old_log_probs"][where]
+        np.testing.assert_array_equal(session_chain(result, "behavior_log_probs", index), 0)
+        old = session_chain(result, "old_log_probs", index)
         assert np.all(old[~mask] == 0) and np.all(old[mask] < 0)
     for index in (0, 1):
         actions = result["input_ids"][(result["session_index"] == index) & (result["response_mask"] != 0)]
