@@ -48,7 +48,7 @@ from ..precision import at_least_fp32, rounded_operand
 from ..programs import equations
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, mosaic, report, resources
+from .templates import across, base, bundles, mosaic, report, resources
 from .templates.axes import GROUPS, held as held_axes
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import EIGHT, Product
@@ -657,7 +657,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             staged = max(0, words - family.held_registers) + rewritten
         prologue = self._prologue_registers(ba, config)
         prologue += rewritten if prologue else 0
-        phases = [staged, prologue, self._epilogue_registers(ba, config, stored)]
+        # A dense call's last wave balanced over the programs merges a slice of another program's partial at a
+        # time beside its own (`mosaic.Family.fixed_up`, `across.merge_slices`).
+        merged = (min(accumulator, across.MERGED_REGISTERS)
+                  if ba.arguments.get('dense') and mosaic_gpu.fixes_up(config, dtype) else 0)
+        phases = [staged, prologue, merged, self._epilogue_registers(ba, config, stored)]
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`).
         plain += accumulator if ba.arguments.get('paired') is not None else 0
         if ba.arguments.get('exact_sums'):

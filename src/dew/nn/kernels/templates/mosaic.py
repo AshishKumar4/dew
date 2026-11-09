@@ -1615,13 +1615,6 @@ class Issuer[Accumulator](abc.ABC):
         return plgpu.layout_cast(value, self.layout)
 
 
-MERGED_REGISTERS = 64
-"""The registers a thread of a merging role holds the partials it reads ahead of combining them in
-(`Family.fixed_up`): as many partials as fit, at least one (an H100's 16-row decode's at 64 columns 10, its
-tile's 8 and its two statistics' 1 each; a GEMM's 128 x 128 fp32 tile 128). One partial read at a time
-waited each read behind the last one's combine, 0.49 us a slice (a 16-row decode's 49, M-DD-12)."""
-
-
 def _selected(predicate, taken, other):
     """`taken` where `predicate` holds, else `other`, leaf by leaf: a splat predicate's select, which keeps
     each leaf in its own layout (an implicit broadcast lowers in no warpgroup semantics)."""
@@ -2114,11 +2107,13 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
         balanced tail's program first in one tile having left its partial of the tile before in its own
         slot), and the program that arrives last at the tile's counter (`arrived`, on `ready`'s semaphore
         of its last program, `partials_ready`) combines every partial in the programs' order, the same sum
-        whichever arrives last, and stores it (`store`), reading as many partials as `MERGED_REGISTERS` holds
-        before combining them, so their reads wait together. No program waits on another, which the GPU may
-        never have scheduled (row 4732). `combine(running, partial)` is the algebra's merge of two partials
-        of one tile (a sum's addition by default; a split walk's softmax merge, a scan's composition), which
-        the work's declaration supplies. `summed` may be a pytree (a merge's partial of several leaves):
+        whichever arrives last, and stores it (`store`), reading as many partials as
+        `across.MERGED_REGISTERS` holds before combining them, so their reads wait together, and a partial
+        past it a slice of its widest leaf's columns at a time (`across.merge_slices`). No program waits on
+        another, which the GPU may never have scheduled (row 4732). `combine(running, partial)` is the
+        algebra's merge of two partials of one tile (a sum's addition by default; a split walk's softmax
+        merge, a scan's composition), separable over the widest leaf's columns, which the work's declaration
+        supplies. `summed` may be a pytree (a merge's partial of several leaves):
         `partials` is then a ref a leaf, in its structure. Interpreted (`ready` None), the tile's first
         program combines, which the interpreter walks after every other (`tail.ordered`). `partials` and
         `firsts` are a workspace, a slot written only where programs share a tile (none where one program
@@ -2132,54 +2127,63 @@ class Family[Allocated, Opened, Accumulator](Issuer[Accumulator], Transport[Allo
             # 64 bytes), which an optimized global transfer refuses.
             jax.tree.map(lambda leaf, ref: plgpu.store(ref.at[program], leaf, optimized=False), summed, refs)
 
-        def read(refs, other):
-            # The partials' structure read off the running value's: a ref may itself be a tree.
-            return jax.tree.map(lambda _, ref: plgpu.load(ref.at[other], optimized=False), summed, refs)
+        def read(refs, other, column=0, width=None):
+            # The partials' structure read off the running value's: a ref may itself be a tree; the widest
+            # leaf's slice of `width` columns from `column` alone where the merge is sliced.
+            leaves, tree = jax.tree.flatten(summed)
+            loaded = [plgpu.load(ref.at[other] if place != widest or width is None
+                                 else ref.at[other, :, pl.ds(column, width)], optimized=False)
+                      for place, ref in enumerate(tree.flatten_up_to(refs))]
+            return jax.tree.unflatten(tree, loaded)
 
         # A partial's registers a thread: a tile's words over the role's threads, a row vector's in the
         # accumulator's row layout (`row_registers`), as the statistics of a split decode's merge.
         held = sum(self.row_registers(leaf.shape[0], leaf.dtype) if leaf.ndim == 1
                    else -(-leaf.size * leaf.dtype.itemsize // (4 * resources.THREADS))
                    for leaf in jax.tree.leaves(summed))
-        ahead = max(1, MERGED_REGISTERS // held)
+        ahead = max(1, across.MERGED_REGISTERS // held)
+        # A partial past what a merge reads ahead (a GEMM tile's) is merged a slice of its widest leaf's columns
+        # at a time, its other leaves (a softmax merge's row statistics) read whole each slice, so the running
+        # value and one slice are live, not two whole tiles (`across.merge_slices`).
+        widest, slices = across.merge_slices(summed, held)
 
-        # A partial past the registers a merge reads ahead (a GEMM tile's) is added into the running value
-        # a slice of columns at a time, so the running value and one slice are live, not two whole tiles: read
-        # whole beside the running sum, a dense kernel gradient's balanced tail held 267 registers live at its
-        # 128 x 256 and 128 x 128 tiles (the GEMM compile gate's liveness pass, EM-probe2), which ptxas
-        # interleaved into 240 and 255.
-        leaves = jax.tree.leaves(summed)
-        sliced = (combine is operator.add and len(leaves) == 1 and leaves[0].ndim == 2
-                  and held > MERGED_REGISTERS)
-        if sliced:
-            columns = leaves[0].shape[1]
-            width = max(8, columns * MERGED_REGISTERS // held)
-            while columns % width:
-                width //= 2
+        def sliced(value, start, width):
+            leaves, tree = jax.tree.flatten(value)
+            return jax.tree.unflatten(tree, [leaf[:, start:start + width] if place == widest else leaf
+                                             for place, leaf in enumerate(leaves)])
 
-            def merged(chunk, running):
-                other = first + 1 + chunk
-                (ref,) = jax.tree.leaves(partials)
-                return jnp.concatenate(
-                    [running[:, start:start + width]
-                     + plgpu.load(ref.at[other, :, pl.ds(start, width)], optimized=False)
-                     for start in range(0, columns, width)], axis=1)
+        def joined(parts):
+            # Each slice's widest leaf side by side; a merge separable over the columns leaves every slice's
+            # other leaves alike, the last's kept.
+            flat = [jax.tree.flatten(part)[0] for part in parts]
+            tree = jax.tree.structure(parts[0])
+            return jax.tree.unflatten(tree, [jnp.concatenate([each[place] for each in flat], axis=1)
+                                             if place == widest else flat[-1][place]
+                                             for place in range(len(flat[0]))])
 
-            def combined(running) -> None:
-                store(lax.fori_loop(0, gathered - first - 1, merged, running))
-        else:
+        columns = jax.tree.leaves(summed)[widest].shape[1] if widest is not None else 0
+        spans = ([(0, None)] if widest is None
+                 else [(column, columns // slices) for column in range(0, columns, columns // slices)])
+
+        def combined(running) -> None:
             def merged(chunk, running):
                 # A chunk's partials read before any is combined, a read past the last partial reading the
-                # last again, left out of the sum: the order stays the programs'.
+                # last again, left out of the sum: the order stays the programs'. Each slice of the widest
+                # leaf merged apart; a merge is separable over its columns, so every slice's other leaves are
+                # the same and the last's are kept.
                 start = first + 1 + chunk * ahead
-                reads = [read(partials, jnp.minimum(start + i, gathered - 1)) for i in range(ahead)]
-                running = combine(running, reads[0])
-                for i, partial in enumerate(reads[1:], 1):
-                    running = _selected(start + i < gathered, combine(running, partial), running)
-                return running
+                others = [jnp.minimum(start + i, gathered - 1) for i in range(ahead)]
+                parts = []
+                for column, width in spans:
+                    value = running if width is None else sliced(running, column, width)
+                    reads = [read(partials, other, column, width) for other in others]
+                    value = combine(value, reads[0])
+                    for i, partial in enumerate(reads[1:], 1):
+                        value = _selected(start + i < gathered, combine(value, partial), value)
+                    parts.append(value)
+                return parts[0] if len(parts) == 1 else joined(parts)
 
-            def combined(running) -> None:
-                store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
+            store(lax.fori_loop(0, (gathered - first - 1 + ahead - 1) // ahead, merged, running))
 
         if ready is None:
             pl.when(program != first)(lambda: left(partials))
