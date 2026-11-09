@@ -382,9 +382,12 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, klein_pipeline
 
     encoder = klein.inputs.conditions["conditioning"].encoder
     params = klein.variables["encoders"]["conditioning"]
+    # Compiled as a training step and a sampling task run it (`encode_conditions`), the prompt's tokens
+    # read on the host.
+    encode = jax.jit(lambda tokens: encoder.encode(params, tokens).context)
 
     def encoded(*rows):
-        return encoder.encode(params, encoder.tokenize([*words(*rows), ""])).context
+        return encode(encoder.tokenize([*words(*rows), ""]))
 
     def encode_prompt(pipe, dtype, *rows):
         return torch.cat([pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))[0]
