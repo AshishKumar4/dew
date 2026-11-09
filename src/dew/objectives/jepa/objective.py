@@ -173,6 +173,7 @@ class JepaObjective(ReleasesModel, Objective[Ratio]):
                                         1 if momentum_steps is None else momentum_steps),
             select=under("params", CONTEXT_ENCODER),
             progressed=momentum_steps is None,
+            stated=("linear", tuple(momentum), momentum_steps, f"params/{CONTEXT_ENCODER}"),
         )
 
     _model_part = CONTEXT_ENCODER
@@ -245,6 +246,9 @@ class JepaObjective(ReleasesModel, Objective[Ratio]):
         if step.ema is None:
             raise ValueError("the JEPA target branch needs the trainer's EMA variables")
         return part(step.ema, CONTEXT_ENCODER)
+
+    traced = ("encoder", "predictor", "mask", "sample", "is_video")
+    """Its encoder, predictor, masks and what it reads."""
 
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.sample.key])

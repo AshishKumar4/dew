@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import enum
 import functools
@@ -21,7 +22,7 @@ import weakref
 import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import (
     TYPE_CHECKING,
     ClassVar,
@@ -628,11 +629,16 @@ class EMASpec:
     decay: optax.Schedule
     select: PathFilter = everything
     progressed: bool = False
+    stated: Hashable = None
+    """A value of its decay and selection where one states them (`constant`'s), which a trace of the
+    step that keeps the EMA is kept by (`Objective.traced_by`); None for a schedule or a selection given
+    as a function alone."""
 
     @classmethod
     def constant(cls, decay: float | None) -> EMASpec | None:
         """Follow what moves at a constant `decay`, never the frozen collection; None keeps no EMA."""
-        return None if decay is None else cls(optax.constant_schedule(decay), lambda path: path[0] != FROZEN)
+        return None if decay is None else cls(optax.constant_schedule(decay), lambda path: path[0] != FROZEN,
+                                              stated=("constant", decay, "moving"))
 
 
 class SavedTask(Protocol):
@@ -773,6 +779,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     any the data would give, or declares none."""
 
     ema: EMASpec | None = None
+    traced: ClassVar[tuple[str, ...] | None] = None
+    """The attributes beside its modules, held tree and EMA that its loss, draw and optimizer read, by
+    name, which its trace is kept by (`trace_key`); None where no value states them. A class states its
+    own: a subclass, whose loss may read more, inherits none (`stated_trace`)."""
     saved_task: ClassVar[type[SavedTask] | None] = None
     settings: ClassVar[type[DataclassInstance] | None] = None
     """The dataclass of what a saved run records beside its objective and model
@@ -952,6 +962,28 @@ class Objective(ABC, Generic[Loss, Effects]):
         adapter by name rather than reporting a full-FT MFU for PEFT.
         """
         return 3 * self.model_flops(model, batch)
+
+    def trace_key(self) -> Hashable | None:
+        """A value of everything this objective's loss and its draw read beside their arguments, equal for
+        two objectives whose losses trace alike, so a trace of one serves the other's equal fit, a refit or
+        a resume in the same process building it anew (`traced_update_flops`; row 3873): its `traced`
+        settings' values beside its modules, held tree and EMA (`traced_by`). None where its class states
+        none, or a value none of them (a closure, a constant a trace bakes in). A key reads the objective
+        as it is now, its modules and head as a fit's rung set them."""
+        names = vars(type(self)).get("traced")
+        return None if names is None else self.traced_by(*(getattr(self, name) for name in names))
+
+    def traced_by(self, *settings: TracedSetting) -> Hashable | None:
+        """A trace key (`trace_key`) of the objective's `settings` (`frozen_value`) beside what every
+        objective's trace reads: the modules its programs execute as they stand (`program_key`: after a
+        rung's substitute, at its head's policy), its held tree's shapes (`held_shapes`), whose arrays pass
+        as arguments, and the EMA its step keeps (`EMASpec.stated`); None where its EMA or a setting
+        states no value."""
+        stated = frozen_value(settings)
+        if stated is UNKEYED or (self.ema is not None and self.ema.stated is None):
+            return None
+        return (tuple(self.program_key()), held_shapes(self.held_variables()),
+                None if self.ema is None else (self.ema.stated, self.ema.progressed), stated)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
@@ -1781,8 +1813,80 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     return accumulated[0] / accumulated[1]
 
 
+def traced_shapes(tree):
+    """`tree` with each leaf the shape, dtype and weak type of its abstract value (`jax.typeof`): what a
+    trace reads of arrays that pass to it as arguments, as `jax.eval_shape` would give them (a key's dtype,
+    a weak type), tracing nothing and converting no array."""
+    def shaped(leaf) -> jax.ShapeDtypeStruct:
+        aval = jax.typeof(leaf)
+        return jax.ShapeDtypeStruct(aval.shape, aval.dtype, weak_type=aval.weak_type)
+
+    return jax.tree.map(shaped, tree)
+
+
+def shapes_key(shapes) -> Hashable:
+    """A tree of shapes (`traced_shapes`) as a value: its structure and its leaves."""
+    return jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes))
+
+
+def held_shapes(tree) -> Hashable:
+    """`tree`'s structure and each leaf's shape, dtype and weak type (`traced_shapes`), what a trace reads
+    of a tree its arrays pass to as arguments; None for none."""
+    return None if tree is None else shapes_key(traced_shapes(tree))
+
+
+def stated_trace[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> Hashable | None:
+    """`objective.trace_key()` where its own class states its settings (`Objective.traced`) or its key,
+    else None: a subclass reads what its own loss adds (a counter, a term), which a key it inherited does
+    not state."""
+    own = vars(type(objective))
+    return objective.trace_key() if "trace_key" in own or "traced" in own else None
+
+
+class _Unkeyed:
+    """A part of a trace's settings that states no value (a function, an object compared by identity)."""
+
+
+UNKEYED = _Unkeyed()
+
+type TracedSetting = (Hashable | Mapping[str, TracedSetting] | Sequence[TracedSetting] | DataclassInstance
+                      | None)
+"""A setting an objective's trace reads (`Objective.traced`): a hashable value (a number, a string, a Flax
+module, a frozen dataclass), a mapping or sequence of such, or a dataclass of them, which `frozen_value`
+reads as a value, or refuses as none where any part is a function or an object compared by identity."""
+
+
+def frozen_value(value: TracedSetting) -> Hashable:
+    """`value` as a value a trace can be kept by: a mapping as its sorted entries, a sequence as a tuple, a
+    dataclass as its type and fields, recursively, a number, string or other hashable value as itself (a
+    Flax module by its fields); `UNKEYED` where any part is a function, or an object of no value (one
+    hashed by its identity, or not at all)."""
+    from flax import linen as nn
+
+    if isinstance(value, Mapping):
+        entries = tuple(sorted((name, frozen_value(field)) for name, field in value.items()))
+        return UNKEYED if any(field is UNKEYED for _, field in entries) else entries
+    if isinstance(value, list | tuple):
+        parts = tuple(map(frozen_value, value))
+        return UNKEYED if any(part is UNKEYED for part in parts) else (type(value), parts)
+    if is_dataclass(value) and not isinstance(value, type | nn.Module):
+        stated = tuple((declared.name, frozen_value(getattr(value, declared.name)))
+                       for declared in fields(value))
+        return UNKEYED if any(part is UNKEYED for _, part in stated) else (type(value), stated)
+    if ((callable(value) and not isinstance(value, nn.Module))
+            or type(value).__hash__ in (None, object.__hash__)):
+        return UNKEYED
+    return value
+
+
 _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (
     weakref.WeakKeyDictionary())
+
+_KEYED_FLOPS: collections.OrderedDict[Hashable, tuple[float, float]] = collections.OrderedDict()
+"""`traced_update_flops`' counts of objectives that state their trace (`Objective.trace_key`), by that key
+and the batch's shapes, the `KEYED_FLOPS` latest: a refit's objective, built anew, reads its equal's."""
+
+KEYED_FLOPS = 256
 
 
 def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tuple[float, float]:
@@ -1793,9 +1897,13 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     batches keep theirs traces once."""
     from dew.nn.flops import traced_flops
 
-    shapes = jax.eval_shape(lambda batch: batch, batch)
-    signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
+    shapes = traced_shapes(batch)
+    signature = shapes_key(shapes)
     kept = _TRACED.setdefault(objective, {})
+    if (key := stated_trace(objective)) is not None and signature not in kept:
+        counted = _KEYED_FLOPS.get((type(objective), key, signature))
+        if counted is not None:
+            kept[signature] = counted
     if signature not in kept:
         variables = unboxed(abstract(objective.init, jax.random.key(0)))
         step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
@@ -1809,6 +1917,10 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
 
         kept[signature] = (traced_flops(forward, variables, shapes),
                            traced_flops(gradient, variables["params"], rest, shapes))
+        if key is not None:
+            _KEYED_FLOPS[type(objective), key, signature] = kept[signature]
+            while len(_KEYED_FLOPS) > KEYED_FLOPS:
+                _KEYED_FLOPS.popitem(last=False)
     return kept[signature]
 
 __all__ = [

@@ -222,6 +222,9 @@ class TokenizerObjective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return None
 
+    traced = ("max_mask",)
+    """Its masking."""
+
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         video = unit_frames(batch["video"])
         rows, frames = video.shape[:2]
@@ -417,6 +420,9 @@ class WorldModelObjective(Objective[Ratio]):
     def latents(self, variables: Variables, video: jax.Array) -> jax.Array:
         """`video`'s latents, each frame encoded by the tokenizer `variables` hold (`TOKENIZER`)."""
         return jax.lax.stop_gradient(self.tokenizer.bind(variables[TOKENIZER]).encode(video))
+
+    traced = ("tokenizer", "shortcut")
+    """Its tokenizer and its forcing; both trees pass as arguments."""
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         clean = self.latents(variables, unit_frames(batch["video"]))

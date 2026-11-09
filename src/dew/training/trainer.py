@@ -19,7 +19,7 @@ import os
 import sys
 import time
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Generic, Protocol
 
@@ -294,6 +294,9 @@ class Trainer(Generic[Loss, Effects]):
         self.split = split
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
+        # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
+        self._scaled = dynamic_scale if isinstance(dynamic_scale, bool) else None
+        self._updates: int | None = None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
         if record and step is not None:
@@ -485,6 +488,29 @@ class Trainer(Generic[Loss, Effects]):
             return self.device_mesh
         from dew.distributed.host import companion_mesh
         return companion_mesh(self.device_mesh)
+
+    def _step_key(self) -> Hashable | None:
+        """A value of everything this trainer's step traces from beside its arguments, equal for two trainers
+        whose steps trace alike, so a refit or a resume in the same process that builds its trainer and
+        objective anew reads the step its equal traced (`dew.training._candidates.candidate_for`; row
+        3873): the objective's own (`Objective.trace_key`, its EMA among it) at its current rung, the
+        optimizer's config and the updates or examples it was built for, the reader's device steps, and
+        every setting the step reads. None where a value states none of it: an objective that states no
+        trace, an optimizer given built, a custom step, a device step or a setting compared by identity
+        (`frozen_value`), a loss scale given built, links, or a run that measures its kernels' configs as
+        it lowers."""
+        from dew.objectives.base import UNKEYED, frozen_value, stated_trace
+
+        objective = stated_trace(self.objective)
+        if (objective is None or self._config is None or self.step is not None or self._scaled is None
+                or self.links or self._stated_links or self.tune_kernels):
+            return None
+        settings = frozen_value((self._config, self._device, self.mesh, self.layout, self.inspection,
+                                 self.param_dtype, self.diloco))
+        if settings is UNKEYED:
+            return None
+        return (type(self.objective), objective, settings, self._updates, self._examples, self._microbatches,
+                self.accumulation, self.split, self._scaled, self.lower_for, self._narrow, self.record)
 
     def _stepping(self) -> Stepping[Loss, Effects]:
         """What a fit search's candidates read of this trainer beside its public fields, as it stands
@@ -1355,6 +1381,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is None:
             return
         built = self._config.build(updates, clocked=self._examples is not None)
+        self._updates = updates
         self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
 
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,

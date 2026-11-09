@@ -1531,6 +1531,11 @@ class LMObjective(TokenScorer):
         scored = self._scored_loss(variables, batch, step, train=step.training)
         return scored.statistics, scored.units * self.row_weights(batch, scored.units.shape[0])[:, None]
 
+    traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "pad_id", "token_accuracy",
+              "prefix", "exit_entropy", "mtp_weight", "z_loss", "loss_role", "indexer", "adaptation")
+    """Its window, balance, head policy and every setting its loss reads; its indexer phase is its
+    indexer's."""
+
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | RoutedStatistics, Aux[Variables]]:
         if self._warmup:
             return self._warmup_loss(variables, batch, step)
