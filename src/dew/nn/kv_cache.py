@@ -507,7 +507,9 @@ def cache_leaf(module: nn.Module, name: str) -> jax.Array:
     """`module`'s cache leaf `name`, its own, or read at its layer where its run's bank holds it
     (`Banked.read`), on the device (`host_memory.fetched`)."""
     held = module.get_variable("cache", name)
-    return held.read() if isinstance(held, Banked) else fetched(held)
+    if isinstance(held, Banked):
+        return held.read()
+    return fetched(held) if on_host(held) else held
 
 
 @dataclasses.dataclass(frozen=True)
@@ -611,7 +613,7 @@ class KVStore:
         elif isinstance(held, Banked):
             self._put(name, held.replace(bank=write(held.bank, held.layer)))
         else:
-            self._put(name, placed_like(held, write(fetched(held), None)))
+            self._put(name, placed_like(held, write(fetched(held) if on_host(held) else held, None)))
 
     def write(self, key: jax.Array, value: jax.Array, positions: jax.Array) -> None:
         """Store `key` and `value` at `positions`, `value` once where it is the keys (`payloads`)."""
