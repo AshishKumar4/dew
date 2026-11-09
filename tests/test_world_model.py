@@ -11,11 +11,12 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 from dew.objectives.world_model import Dynamics, shortcut_forcing_loss
 
 
-def test_shortcut_forcing_is_the_papers_bootstrap():
-    """Each frame's loss is its x-prediction's squared error where d is the smallest step, and else
+def test_shortcut_forcing_is_the_papers_bootstrap_beside_the_x_prediction_at_every_step():
+    """Each frame's loss is its x-prediction's squared error, and where d is past the smallest step
     (1 - tau)^2 times the squared error of its velocity against the mean of the two half-step
     velocities the predictor takes itself, every frame times 0.9 tau + 0.1, within float64 rounding
-    of Eq. 7 run in NumPy over a predictor with a closed form."""
+    of Eq. 7 run in NumPy over a predictor with a closed form, its x-prediction's error taken at every
+    step where Eq. 7 takes it at the smallest alone (`shortcut_forcing_loss`, row 4802)."""
     rng = np.random.default_rng(0)
     clean, noise = rng.normal(size=(3, 5, 4, 2)), rng.normal(size=(3, 5, 4, 2))
     d = 1 / 2.0 ** rng.integers(0, 4, (3, 5))
@@ -40,18 +41,42 @@ def test_shortcut_forcing_is_the_papers_bootstrap():
             noisy = (1 - level) * z0 + level * z1
             one = np.asarray([[level]]), np.asarray([[step]])
             predicted = f(noisy[None, None], *one)[0, 0]
-            if step <= 1 / 8:
-                loss = np.sum((predicted - z1) ** 2)
-            else:
+            loss = np.sum((predicted - z1) ** 2)
+            if step > 1 / 8:
                 half = np.asarray([[step / 2]])
                 first = (f(noisy[None, None], one[0], half)[0, 0] - noisy) / (1 - level)
                 between = noisy + first * step / 2
                 later = f(between[None, None], one[0] + step / 2, half)[0, 0]
                 second = (later - between) / (1 - level - step / 2)
                 velocity = (predicted - noisy) / (1 - level)
-                loss = (1 - level) ** 2 * np.sum((velocity - (first + second) / 2) ** 2)
+                loss += (1 - level) ** 2 * np.sum((velocity - (first + second) / 2) ** 2)
             expected[b, t] = (0.9 * level + 0.1) * loss
     assert_computes_the_oracle(found, expected, "shortcut forcing", roundings=roundings)
+
+
+def test_a_predictor_that_ignores_its_data_is_charged_at_every_step_size():
+    """A predictor that ignores its data, one constant, is consistent across its own half steps, so
+    shortcut forcing's bootstrap charges it nothing past the smallest step: each frame's loss is still its
+    x-prediction's error under the ramp, at every step size, so no step trains toward it (row 4802: the
+    dynamics trained on still clips forecast with 4.6 times diffusion forcing's error where Eq. 7 charged
+    the x-prediction at the smallest step alone)."""
+    rng = np.random.default_rng(1)
+    clean, noise = rng.normal(size=(2, 7, 4, 2)), rng.normal(size=(2, 7, 4, 2))
+    d = np.broadcast_to(1 / 2.0 ** np.arange(7), (2, 7))
+    tau = np.floor(rng.uniform(size=(2, 7)) / d) * d
+    constant = rng.normal(size=(4, 2))
+
+    def ignoring(noisy, tau, d):
+        return jnp.broadcast_to(constant, noisy.shape)
+
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(shortcut_forcing_loss(ignoring, clean, noise, tau, d, 1 / 64))
+        roundings = chain_roundings(jax.make_jaxpr(
+            lambda *a: shortcut_forcing_loss(ignoring, *a, 1 / 64))(clean, noise, tau, d))
+    charged = (0.9 * tau + 0.1) * np.sum((constant - clean) ** 2, axis=(-2, -1))
+    assert_computes_the_oracle(found, charged, "an ignoring predictor's shortcut forcing",
+                               roundings=roundings)
+    assert (charged > 0).all()
 
 
 def test_step_sizes_are_powers_of_two_and_levels_lie_on_their_grid():
