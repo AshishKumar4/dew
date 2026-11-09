@@ -959,8 +959,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         two objectives whose losses trace alike, so a trace of one serves the other's equal fit, a refit or
         a resume in the same process building it anew (`traced_update_flops`; row 3873); None, the
         default, where no value states them (a closure, a constant a trace bakes in), and none is shared.
-        A key reads the objective as it is now, its modules and head as a fit's rung set them."""
+        A key reads the objective as it is now, its modules and head as a fit's rung set them. A class
+        states its own (`stated_trace`): a subclass that inherits one, whose loss may read more, has none."""
         return None
+
+    def traced_by(self, *settings: Hashable) -> Hashable:
+        """A trace key (`trace_key`) of the objective's `settings` beside what every objective's trace
+        reads: the modules its programs execute as they stand (`program_key`: after a rung's substitute,
+        at its head's policy) and its held tree's shapes (`held_shapes`), whose arrays pass as arguments."""
+        return (tuple(self.program_key()), held_shapes(self.held_variables()), *settings)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
@@ -1790,6 +1797,21 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     return accumulated[0] / accumulated[1]
 
 
+def held_shapes(tree) -> Hashable:
+    """`tree`'s structure and each leaf's shape and dtype, what a trace reads of a tree its arrays pass to
+    as arguments; None for none."""
+    if tree is None:
+        return None
+    shapes = jax.tree.map(lambda leaf: (np.shape(leaf), np.result_type(leaf)), tree)
+    return jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes))
+
+
+def stated_trace(objective: Objective) -> Hashable | None:
+    """`objective.trace_key()` where its own class states one, else None: a subclass reads what its own
+    loss adds (a counter, a term), which a key it inherited does not state."""
+    return objective.trace_key() if "trace_key" in vars(type(objective)) else None
+
+
 _TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (
     weakref.WeakKeyDictionary())
 
@@ -1817,7 +1839,7 @@ def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tu
     shapes = jax.tree.map(shaped, batch)
     signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
     kept = _TRACED.setdefault(objective, {})
-    if (key := objective.trace_key()) is not None and signature not in kept:
+    if (key := stated_trace(objective)) is not None and signature not in kept:
         counted = _KEYED_FLOPS.get((type(objective), key, signature))
         if counted is not None:
             kept[signature] = counted

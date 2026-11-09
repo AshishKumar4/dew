@@ -15,7 +15,7 @@ perplexity, since a validation pass never samples.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from typing import NamedTuple
 
 import jax
@@ -326,6 +326,15 @@ class GRPOObjective(TokenScorer):
                       jnp.asarray(batch[ADVANTAGES_KEY], dtype), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
                       None if weights is None else jnp.asarray(weights, dtype), proximal, qk, sown, inspected)
+
+    def trace_key(self) -> Hashable | None:
+        """Its window, balance, head policy and every setting its policy loss reads
+        (`Objective.traced_by`); its reference is the step's EMA, an argument."""
+        return self.traced_by(self.seq_len, self.balance, self.head_chunks, self.head_tile, self.head_fused,
+                              self.aggregation_tokens, self.kl_term, self.reward_kl, self.beta,
+                              self.epsilon_low, self.epsilon_high, self.dual_clip, self.behavior_importance,
+                              self.sequence_mask, self.geometric_mask, self.policy_loss, self.aggregation,
+                              self.sampling_temperature)
 
     def loss(self, variables, batch, step):
         """Compute the policy surrogate over the trainable tokens, plus the KL to the reference.

@@ -24,7 +24,7 @@ compilation rather than a constant embedded in the executable.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -178,6 +178,12 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
     def row_tokens(self, batch: Batch) -> int | None:
         """The tokens of each row, every one of them a slot the corruption may mask."""
         return self.inputs.sample.held(batch)[-1] if self.inputs is not None else None
+
+    def trace_key(self) -> Hashable | None:
+        """Its window, balance, process, its sampler's steps and solver, its blocks and end tokens
+        (`Objective.traced_by`)."""
+        return self.traced_by(self.seq_len, self.balance, self.process, self.steps, self.solver, self.block,
+                              self.eos_token_ids)
 
     def loss(self, variables, batch, step: Step):
         nelbo, aux, _ = self._scored(variables, batch, step, train=step.training)

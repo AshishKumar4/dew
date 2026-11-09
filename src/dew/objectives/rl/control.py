@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, NotRequired, TypedDict
 
@@ -203,6 +203,11 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio]):
     def training_flops(self, model, batch: Batch) -> float:
         """One update's work on `batch`, its loss's gradient's traced program's (`traced_update_flops`)."""
         return traced_update_flops(self, batch)[1]
+
+    def trace_key(self) -> Hashable | None:
+        """Its actor-critic, what it reads and its return and loss settings (`Objective.traced_by`)."""
+        return self.traced_by(self.observation_size, self.discount, self.lam, self.clip, self.reward_scaling,
+                              self.value_cost, self.entropy_cost, self.reads)
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         observation, following = self.seen(batch["observation"]), self.seen(batch["following"])

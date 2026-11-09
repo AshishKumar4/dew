@@ -572,12 +572,9 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
     def trace_key(self) -> Hashable | None:
         """Its world model, its settings and the shapes of the tree it starts from: its loss and its draw
         read nothing else (its return bins are its model's, its slow targets' decay a state's EMA)."""
-        held = None if self.variables is None else jax.tree.map(
-            lambda leaf: (np.shape(leaf), np.result_type(leaf)), self.variables)
-        shapes = None if held is None else (jax.tree.structure(held), tuple(jax.tree.leaves(held)))
-        return (self.model, self.horizon, self.imagination, self.lam, self.entropy, self.free_nats,
-                self.return_rate, tuple(sorted(self.scales.items())), self.imitates, self.slow_targets,
-                self.smoothness, shapes)
+        return self.traced_by(self.horizon, self.imagination, self.lam, self.entropy, self.free_nats,
+                              self.return_rate, tuple(sorted(self.scales.items())), self.imitates,
+                              self.slow_targets, self.smoothness)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         params_key, latent = jax.random.split(key)

@@ -497,7 +497,9 @@ class Trainer(Generic[Loss, Effects]):
         the updates it was built for, and every setting the step reads. None where a value states none of
         it: an objective that states no trace, an optimizer given built or a custom step (functions), a
         loss scale given built, links, or a run that measures its kernels' configs as it lowers."""
-        objective = self.objective.trace_key()
+        from dew.objectives.base import stated_trace
+
+        objective = stated_trace(self.objective)
         if (objective is None or self._config is None or self.step is not None or self._scaled is None
                 or self.links or self._stated_links or self.tune_kernels):
             return None

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import Literal
 
 import jax
@@ -220,6 +220,10 @@ class TokenizerObjective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return None
 
+    def trace_key(self) -> Hashable | None:
+        """Its tokenizer and its masking (`Objective.traced_by`)."""
+        return self.traced_by(self.max_mask)
+
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         video = unit_frames(batch["video"])
         rows, frames = video.shape[:2]
@@ -386,6 +390,11 @@ class WorldModelObjective(Objective[Ratio]):
     def latents(self, variables: Variables, video: jax.Array) -> jax.Array:
         """`video`'s latents, each frame encoded by the tokenizer `variables` hold (`TOKENIZER`)."""
         return jax.lax.stop_gradient(self.tokenizer.bind(variables[TOKENIZER]).encode(video))
+
+    def trace_key(self) -> Hashable | None:
+        """Its dynamics, its tokenizer and its forcing (`Objective.traced_by`); both trees pass as
+        arguments."""
+        return self.traced_by(self.tokenizer, self.shortcut)
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         clean = self.latents(variables, unit_frames(batch["video"]))
