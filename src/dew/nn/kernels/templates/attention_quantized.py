@@ -44,15 +44,21 @@ def whole(rule) -> bool:
 
 def takes(rule) -> bool:
     """Whether this module computes `rule`'s attention: activations quantized to int8 by Qwix's dynamic
-    absmax per channel (no static scale, no tile of the contraction, no channel's axis disabled), its
-    gradients unquantized, so its backward is the straight-through one over the original residuals
-    (`use_original_residuals`), and no configuration of Qwix's own over it (`additional_qt_config`, which
-    may replace any of these: qwix/_src/providers/qt.py's `_create_dot_general_qt_config`)."""
-    return (jnp.dtype(rule.act_qtype) == jnp.dtype(jnp.int8)
-            and rule.act_calibration_method in (None, "absmax") and not rule.act_static_scale
-            and rule.tile_size is None and getattr(rule, "bwd_qtype", None) is None
-            and not getattr(rule, "disable_channelwise_axes", False)
-            and not getattr(rule, "additional_qt_config", None))
+    absmax per channel (no static scale, no tile of the contraction), as Dew's serving rule
+    (`qwix.QuantizationRule`) and its training rule (`qwix.QtRule`, `dew.quantization`'s) state it; a training
+    rule's gradients unquantized too, so its backward is the straight-through one over the original residuals
+    (`use_original_residuals`), no channel's axis disabled and no configuration of Qwix's own over it
+    (`additional_qt_config`, which may replace any of these: qwix/_src/providers/qt.py's
+    `_create_dot_general_qt_config`)."""
+    from qwix import QtRule
+
+    forward = (jnp.dtype(rule.act_qtype) == jnp.dtype(jnp.int8)
+               and rule.act_calibration_method in (None, "absmax") and not rule.act_static_scale
+               and rule.tile_size is None)
+    if not isinstance(rule, QtRule):
+        return forward
+    return (forward and rule.bwd_qtype is None and not rule.disable_channelwise_axes
+            and not rule.additional_qt_config)
 
 
 BOUND = 127.5
