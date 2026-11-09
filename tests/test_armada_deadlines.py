@@ -154,12 +154,12 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     assert "unobserved" not in first and "unobserved" not in stuck
 
 
-def test_a_task_whose_pytest_never_began_is_run_again_and_one_a_signal_ended_is_red_with_its_signal(ci, tmp_path):
-    """A task whose pytest never began (its interpreter would not start: the environment, the launch, an install
-    before pytest) has no verdict of any test: its row is said stale and run again, never a red of its tests. One
-    whose pytest began and a signal ended, its report never written, is its file's red whole, the signal kept on
-    its row for whoever it routes to (Main, 2026-11-09: a write the runner could not make before pytest began
-    filed 43 GPU tier parts' files as reds)."""
+def test_a_pytest_that_never_began_runs_again_and_one_a_signal_ended_is_red_with_its_signal(ci, tmp_path):
+    """A task whose pytest never began (its interpreter would not start: the environment, the launch, an
+    install before pytest) has no verdict of any test: its row is said stale and run again, never a red of
+    its tests. One whose pytest began and a signal ended, its report never written, is its file's red whole,
+    the signal kept on its row for whoever it routes to (Main, 2026-11-09: a write the runner could not make
+    before pytest began filed 43 GPU tier parts' files as reds)."""
     interpreter(tmp_path, "3.12")
     python = tmp_path / ".venv-3.12/bin/python"
     kept = python.read_text()
