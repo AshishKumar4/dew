@@ -2345,9 +2345,10 @@ class DecoderRunConfig(RunConfig):
 
         if not self.loop_exit_gate:
             return {}
-        if "exit_entropy" not in self.objective.fields:
+        stated = {} if self.objective is None else self.objective.fields
+        if "exit_entropy" not in stated:
             return {"exit_entropy": EXIT_ENTROPY}
-        if self.objective.fields["exit_entropy"] is None:
+        if stated["exit_entropy"] is None:
             raise ValueError("--loop-exit-gate draws a gate the objective's exit_entropy trains, and the run "
                              "sets it to None, which trains nothing: state a weight, or leave it out for "
                              f"{EXIT_ENTROPY}")
