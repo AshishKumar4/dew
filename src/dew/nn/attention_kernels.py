@@ -174,6 +174,9 @@ class AttentionCase:
     template does not take it."""
     rows: int = 1
     """The call's rows, every leading axis of the query's `[B, T, N, D]` (a batch, its chunks)."""
+    drop_placed: bool = False
+    """Whether its dropout draws at a sequence slice's global queries or keys (`template.DropPlaces`), which
+    the Mosaic dropping walk does not read (`attention_route.drops`)."""
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -520,7 +523,8 @@ TEMPLATE_SUPPORTS = (
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
-    _Need('dropout', lambda case: not case.dropout or attention_route.drops(case.dtype),
+    _Need('dropout',
+          lambda case: not case.dropout or attention_route.drops(case.dtype, placed=case.drop_placed),
           attention_route.DROPS_NOT, row='1521'),
     _ARITHMETIC,
 )

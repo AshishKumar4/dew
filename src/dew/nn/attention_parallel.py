@@ -285,8 +285,8 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
         arguments = dict(zip(extras, arrays, strict=True))
         if dropout_seed is not None:
             rows, heads = arguments.pop('dropout_rows'), arguments.pop('dropout_heads')
-            arguments.update(dropout_rate=dropout_rate, dropout_places=template.DropPlaces(
-                rows, heads, jnp.arange(query.shape[1]), jnp.arange(key.shape[1])))
+            # Every device holds every query and key: their places are global.
+            arguments.update(dropout_rate=dropout_rate, dropout_places=template.DropPlaces(rows, heads))
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window, **arguments)
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
@@ -370,8 +370,9 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
         if dropout_seed is not None:
             rows, heads, queries = (arguments.pop(name) for name in
                                     ('dropout_rows', 'dropout_heads', 'dropout_queries'))
+            # Every device holds every key: their places are global.
             arguments.update(dropout_rate=dropout_rate, dropout_places=template.DropPlaces(
-                rows, heads, queries, jnp.arange(key.shape[1])))
+                rows, heads, queries))
         return kernel(query, key, value, causal=False, sliding_window=None, **arguments)
 
     attended = manual_map(
