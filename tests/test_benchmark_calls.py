@@ -246,12 +246,13 @@ held = np.ones(64 * 2**20, np.uint8)
 guard = np.ones(2**20, np.uint8)
 del held
 # A new private mapping is pages no allocator held: the kernel hands each in as it is written.
-with mmap.mmap(-1, 64 * 2**20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages, resident_peak() as peak:
+size = 64 * 2**20
+with mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages, resident_peak() as peak:
     before = resident_memory()
-    for offset in range(0, len(pages), mmap.PAGESIZE):
+    for offset in range(0, size, mmap.PAGESIZE):
         pages[offset] = 1
     after = resident_memory()
-print(json.dumps({"before": before, "after": after, "size": len(pages), "rise": peak.rise("Anonymous"),
+print(json.dumps({"before": before, "after": after, "size": size, "rise": peak.rise("Anonymous"),
                   "ended": resident_memory()["Anonymous"] - peak.before["Anonymous"]}))
 """
 

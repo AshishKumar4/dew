@@ -858,7 +858,7 @@ def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
                                      "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1",
-                                     "--loop-exit-gate", "True"),
+                                     "--loop-exit-gate"),
                          default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
     objective = config.prepare().train("gated")
     gate = ("early_exit_gate/bias", "early_exit_gate/kernel")
