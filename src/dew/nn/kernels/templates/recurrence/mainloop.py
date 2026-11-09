@@ -549,6 +549,9 @@ class Launch:
     resident: int = 1
     consumers: int = 1
     family: mosaic.Family | None = None
+    producer: int | None = None
+    """The registers its producer role is lowered to (`resources.Launch.producer`), which its register model
+    reads (the gate holds the split its schedule runs)."""
 
 
 PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
@@ -671,19 +674,20 @@ def _landed(landing: dict, family: mosaic.Family) -> dict:
 
 
 def _planned_launch(call: Call, scope: Callable[[int], resources.Scope], registers: int, *, floor: int,
-                    most: int, consumers: int = 1) -> resources.LaunchPlan | None:
+                    most: int, consumers: int = 1,
+                    producer: int | None = None) -> resources.LaunchPlan | None:
     """A launch's ring depth and the programs a multiprocessor holds of it (`resources.plan`, at its stated
     `registers` and its streams `scope`d at each depth from `floor` to `most`), None where it holds at none: a
     config past the device, whose record says so (`Launch.resident` zero) and `template.Mosaic.legal`
     refuses."""
-    found = resources.plan([resources.Launch(scope, consumers, registers, floor=floor, most=most)],
-                           call.family, call.target)
+    found = resources.plan([resources.Launch(scope, consumers, registers, floor=floor, most=most,
+                                             producer=producer)], call.family, call.target)
     return found[0] if found else None
 
 
 def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | tuple[int, int] | None,
-          consumers: int = 1) -> tuple[resources.LaunchPlan | None, int]:
+          stages: int | tuple[int, int] | None, consumers: int = 1,
+          producer: int | None = None) -> tuple[resources.LaunchPlan | None, int]:
     """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
     holds at once, at most its `tiles`, its rings up to two deep where they run on across its tiles (a
     family's whose walks do not scope their streams apart, `Family.walks_scoped`), at the plan that hides the
@@ -693,13 +697,14 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
     any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
     most)` pair's; None where no multiprocessor holds it (`_planned_launch`), a persistent launch then a
-    program a multiprocessor."""
+    program a multiprocessor; its producer lowered to `producer` (`resources.Launch.producer`)."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
-        found = _planned_launch(call, scope, registers, floor=1, most=most)
+        found = _planned_launch(call, scope, registers, floor=1, most=most, producer=producer)
         return found, min(tiles, (call.target.multiprocessors or 1) * (found.programs if found else 1))
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
-    return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers), tiles
+    return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers,
+                           producer=producer), tiles
 
 
 def _stated(work: Work, tiles: int, hardware: float, arrays, out_type) -> pl.CostEstimate:
@@ -734,7 +739,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   work: Work, held: Held, staging: tuple = (), once: dict | None = None,
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
-                  name: str | None = None, hardware: float | None = None, issues: bool = True):
+                  name: str | None = None, hardware: float | None = None, issues: bool = True,
+                  producer: int | None = None):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -766,7 +772,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     threads = 128 * family.warpgroups(consumers)
 
     found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
-                            consumers=consumers)
+                            consumers=consumers, producer=producer)
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.
@@ -786,7 +792,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     registers, work.span * each, stages, stepped, flops,
                                     work.exponentials * each, moved, found.programs if found else 0,
-                                    consumers, family))
+                                    consumers, family, producer))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
         return recorded
@@ -807,7 +813,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                 return
             walked = given({axis: lax.axis_index(axis) for axis in grid_names})
             if walked is not None:
-                family.run(streams["walked"], walked, call.interpret)
+                family.run(streams["walked"], walked, call.interpret, floor=producer)
 
         # The products' own memory where the family's issuer keeps each (`Family.scoped`'s `products`): a
         # product's width is one of its tiles' (its streams', its staging's) or the chunk's.
@@ -2036,7 +2042,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                              consumers=walkers, held=_states_held(call, values, keys, bv), staging=staging,
                              once=initials, landing=landing, after=after,
                              # Its last write's column sums an fp32 call's alone (`column_sums`).
-                             reduces=held.parts > 1)(
+                             reduces=held.parts > 1, producer=_states_producer(call))(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
     if stores_corrected:
         return launched
@@ -2070,6 +2076,14 @@ def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values:
     steps = call.chunks / sequences
     return (out_type, blocks, initials, staging, landing, after,
             Work(flops=4 * chunk * width * walked_width * steps, span=steps))
+
+
+def _states_producer(call: Call) -> int | None:
+    """The registers `_states`' producer role is lowered to: 48 where the family keeps its products in tensor
+    memory (tcgen05's), whose producer's loads spilled at `resources.producer_floor`'s 24 (60 bytes on
+    Nemotron-H 4B's fp32 states, 52 on GDN's and 44 on KDA's bf16; none at 48 or 40, jsf-states-held), else
+    the floor."""
+    return 48 if product_results(call) == "tensor" else None
 
 
 def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
@@ -2329,6 +2343,11 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
                   *products]
         return Held(phases=(values, [f32(chunk, call.block)] * 4))
     values = [f32(chunk, bv)] * (2 if family.products_overlap else 1) + held_tile(held, chunk, bv)
+    # An fp32 call's prologue's high and low prefixes, a row's and a column's, held across the first step's
+    # envelope where products overlap: unstated, Qwen3.5's fp32 forward claimed 2 programs an H100 at 204
+    # registers, whose cap spilled 16 bytes (jsf-owncap).
+    split = family.products_overlap and held.parts > 1
+    prefixes = [f32(chunk, 4)] * 2 + [f32(32, chunk)] * 2 if split else []
     # A write gate on the keys' side scales the scores' columns (`chunk_scores`' `column_scale`): its vector
     # across a thread's columns, 16 fragments on a 64-wide tile (the lowered liveness of Nemotron-H 4B's SSD
     # output, ssd-evidence5 at 97a10a66b; row 2943).
@@ -2341,11 +2360,11 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     scored = _product(call, (given, chunk, call.block), (given, call.block, chunk), rhs_transposed=True,
                       rhs_swizzle=swizzle)
     if call.value_width // bv == 1:
-        return Held(phases=(values + products, scores + scored))
+        return Held(carried=prefixes, phases=(values + products, scores + scored))
     # One product's fragments at a time where both phases hold at once, the products issuing in turn: each
     # phase's own beside the other stated an A100's fp32 call at 288 registers a 16-wide output block, where
     # ptxas needed 248 (tf32-fp32c at 9f82d62c4).
-    return Held(phases=(values + scores + _widest(products, scored),))
+    return Held(carried=prefixes, phases=(values + scores + _widest(products, scored),))
 
 
 @lowered_once

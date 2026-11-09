@@ -973,8 +973,10 @@ def _model(launch: mainloop.Launch, family: mosaic.Family) -> resources.Register
     """A launch's register model as the compile gate decides on it (`resources.register_model`,
     `kernel_compile.decisions`): its stated registers (`Launch.registers`) at its consumer roles
     (`Launch.consumers`, a walk's `Tiles.walkers`), by the bundle it issues by (`Launch.family`; the solve
-    launch's warpgroup MMA layout without a producer), `family` where it names none."""
-    return resources.register_model(launch.family or family, launch.consumers, launch.registers)
+    launch's warpgroup MMA layout without a producer), `family` where it names none; its producer lowered as
+    its schedule lowers it (`Launch.producer`)."""
+    return resources.register_model(launch.family or family, launch.consumers, launch.registers,
+                                     producer=launch.producer)
 
 
 class Unbudgeted(template.Mosaic):

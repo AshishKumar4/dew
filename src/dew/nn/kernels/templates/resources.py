@@ -384,6 +384,9 @@ class Launch:
     most: int = MOST_STAGES
     tile: object = None
     """The template's tile the launch is at, which a plan's evidence names (`recording`)."""
+    producer: int | None = None
+    """The registers its producer role is lowered to where its issue loop holds more than the family's
+    least (`Family.roles`; None: `producer_floor`), as its schedule runs it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -578,9 +581,9 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
     plans = []
     for launch in launches:
         if (family.budgets_registers and launch.registers is not None
-                and launch.registers > family.registers(launch.consumers)):
+                and launch.registers > family.registers(launch.consumers, producer=launch.producer)):
             return None
-        most = family.programs(launch.consumers, launch.registers)
+        most = family.programs(launch.consumers, launch.registers, launch.producer)
         residencies = range(most, 0, -1) if programs is None else (programs,) if programs <= most else ()
         order = hidden(family, launch.consumers)
         found = None
