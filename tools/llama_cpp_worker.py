@@ -39,8 +39,8 @@ def prepared() -> tuple[Path, Path, torch.nn.Module]:
 
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's logits from libllama, and transformers' float64 truth."""
-    from tools.llama_cpp_reference import llama_logits
     from _dew_torch.precision import float64
+    from tools.llama_cpp_reference import llama_logits
 
     program, gguf, model = prepared()
     out = {}
