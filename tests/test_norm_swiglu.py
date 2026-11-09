@@ -63,6 +63,17 @@ def fused_seam(epsilon: float, dtype, offset: bool, after_cast: bool, *, axes=No
                                                                after_cast, portable, axes=axes)
 
 
+def fused_activated(epsilon: float, activation):
+    """The fused RMS norm with `activation` after it (`norm_swiglu.rms_norm`'s epilogue), as `fused_seam`
+    is."""
+    def portable(x, scale):
+        return stream_rms_normalized(x, None, scale, epsilon, x.dtype, False, False, True,
+                                     implementation="xla", activation=activation)[1]
+
+    return lambda x, scale: norm_swiglu.rms_norm(x, scale, epsilon, x.dtype, offset=False, after_cast=False,
+                                                 portable=portable, epilogue=activation)
+
+
 def fused_gated(epsilon: float, dtype, activation: str):
     """The fused gated norm called itself (`norm_swiglu.gated_rms_norm`), as `fused_seam` is."""
     def portable(x, gate, scale):

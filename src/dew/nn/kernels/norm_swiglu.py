@@ -349,7 +349,8 @@ class _Logical:
                                     *tangents)
             return out, tangent
 
-        return declared_tangent(KernelGlue(), applied, tangent)(y)
+        return contracted("test_the_fused_norms_and_products_hold_every_order")(
+            declared_tangent(KernelGlue(), applied, tangent))(y)
 
 
 def _on_tile(jaxpr: jax.extend.core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> list:
