@@ -915,3 +915,29 @@ def test_a_norm_whose_epsilon_an_enclosing_trace_closes_over_compiles_through_de
     with generation.assumed("sm90"):
         through.trace(epsilon)
     np.testing.assert_array_equal(np.asarray(through(epsilon)), np.asarray(written(epsilon)))
+
+
+def test_a_gated_product_whose_activation_has_its_own_batching_rule_is_never_fused():
+    """A SwiGLU whose SiLU carries a custom batching rule of its own (`jax.custom_batching.custom_vmap`, one a
+    fused call written in its place would not keep) runs as written through `dew.jit` on an H100, where the
+    same product without the rule runs Dew's fused kernel."""
+    from jax.custom_batching import custom_vmap
+
+    import dew
+
+    silu = custom_vmap(jax.nn.silu)
+    silu.def_vmap(lambda size, batched, x: (jax.nn.silu(x) + 1, batched[0]))
+
+    def batched_by_its_rule(a, b):
+        return silu(a.astype(jnp.float32)).astype(a.dtype) * b
+
+    shapes = [jax.ShapeDtypeStruct(ROWS, jnp.bfloat16)] * 2
+
+    def fused(program) -> bool:
+        with generation.routes() as found:
+            dew.jit(program).trace(*shapes)
+        return any(route.choice == "swiglu" and route.kernel != "xla" for route in found)
+
+    with generation.assumed("sm90"):
+        assert fused(gated_product_of)
+        assert not fused(batched_by_its_rule)

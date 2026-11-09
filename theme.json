@@ -1,0 +1,105 @@
+{
+ "sha": "d586ec74f5fa846ccfb8936a3eb36e40eb93cc4c",
+ "items": [
+  {
+   "item": "tests/test_check2.py",
+   "green": true,
+   "why": "2 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_check2.py": "passed"
+   },
+   "tail": ".......................................................................  [100%]\n=============================== warnings summary ===============================\ntests/test_check2.py::test_the_lane_flushes_operands_and_results_alike_however_it_compiles[float32-7.174648137343064e-43-8.470329472543003e-22]\ntests/test_check2.py::test_extrema_order_zeros_and_propagate_nan_as_the_lane_does\ntests/test_check2.py::test_an_exp_past_its_range_is_held_at_its_neighbours_however_far\n  /home/ci/work/dew/dew/tests/op_certificates.py:195: RuntimeWarning: overflow encountered in nextafter\n    return np.nextafter(x, np.full(x.shape, direction, dtype)).astype(np.float64)\n\ntests/test_check2.py: 544 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 8543 programs fetched (177.4 MB read), 1 bundles uploaded (79.1 MB)\n71 passed, 5 deselected, 547 warnings in 350.72s (0:05:50)\nrun_tests: {\"tests\": 71, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 71, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_algebra.py",
+   "green": true,
+   "why": "30 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra.py": "passed"
+   },
+   "tail": "..............................                                           [100%]\n=============================== warnings summary ===============================\ntests/test_algebra.py: 25 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\ntests/test_algebra.py::test_each_rewrites_right_side_holds_check_2\n  /home/ci/work/dew/dew/tests/op_certificates.py:195: RuntimeWarning: overflow encountered in nextafter\n    return np.nextafter(x, np.full(x.shape, direction, dtype)).astype(np.float64)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 6623 programs fetched (27.2 MB read), 0 bundles uploaded (0.0 MB)\n30 passed, 26 warnings in 26.34s\nrun_tests: {\"tests\": 30, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 30, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_algebra_fusion.py",
+   "green": true,
+   "why": "3 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra_fusion.py": "passed"
+   },
+   "tail": ".................................                                        [100%]\n=============================== warnings summary ===============================\ntests/test_algebra_fusion.py: 418 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 470 programs fetched (5.9 MB read), 0 bundles uploaded (0.0 MB)\n33 passed, 65 deselected, 418 warnings in 51.07s\nrun_tests: {\"tests\": 33, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 33, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_algebra_bits.py",
+   "green": true,
+   "why": "26 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_algebra_bits.py": "passed"
+   },
+   "tail": ".                                                                        [100%]\nshared XLA cache: 2602 programs fetched (10.4 MB read), 0 bundles uploaded (0.0 MB)\n1 passed in 280.42s (0:04:40)\nrun_tests: {\"tests\": 1, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 1, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_marked_calls.py",
+   "green": true,
+   "why": "17 passed in a green run of exactly these inputs, reused from the test cache",
+   "finished": true,
+   "cases": {
+    "tests/test_marked_calls.py": "passed"
+   },
+   "tail": "1 files ran green on these inputs on AuthenticAMD-25-17, AuthenticAMD-26-17; their rows are reused\nrun_tests: {\"tests\": 17, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 17, \"cases\": {}, \"reused\": true}\n"
+  },
+  {
+   "item": "tests/test_footprint_compiled_program.py",
+   "green": true,
+   "why": "31 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_footprint_compiled_program.py": "passed"
+   },
+   "tail": "ithub.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\ntests/test_footprint_compiled_program.py::test_a_pallas_kernel_holds_what_its_lowering_holds\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/compiler.py:826: UserWarning: Error reading persistent compilation cache entry for 'jit_wrapped': JaxRuntimeError: INVALID_ARGUMENT: PjRtCompiler must be constructed with a Client to call DeserializeLoadedExecutable.\n    warnings.warn(\n\ntests/test_footprint_compiled_program.py: 14 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/compiler.py:826: UserWarning: Error reading persistent compilation cache entry for 'jit__lambda': JaxRuntimeError: INVALID_ARGUMENT: PjRtCompiler must be constructed with a Client to call DeserializeLoadedExecutable.\n    warnings.warn(\n\ntests/test_footprint_compiled_program.py::test_a_loops_carry_is_one_buffer_from_its_start_to_its_result[discarded]\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/compiler.py:826: UserWarning: Error reading persistent compilation cache entry for 'jit_discarded_carry': JaxRuntimeError: INVALID_ARGUMENT: PjRtCompiler must be constructed with a Client to call DeserializeLoadedExecutable.\n    warnings.warn(\n\ntests/test_footprint_compiled_program.py::test_a_loops_carry_is_one_buffer_from_its_start_to_its_result[nested]\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/compiler.py:826: UserWarning: Error reading persistent compilation cache entry for 'jit_nested_carry': JaxRuntimeError: INVALID_ARGUMENT: PjRtCompiler must be constructed with a Client to call DeserializeLoadedExecutable.\n    warnings.warn(\n\ntests/test_footprint_compiled_program.py::test_a_loops_carry_is_one_buffer_from_its_start_to_its_result[one-start-twice]\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/compiler.py:826: UserWarning: Error reading persistent compilation cache entry for 'jit_one_start_twice': JaxRuntimeError: INVALID_ARGUMENT: PjRtCompiler must be constructed with a Client to call DeserializeLoadedExecutable.\n    warnings.warn(\n\ntests/test_footprint_compiled_program.py::test_a_loops_carry_is_one_buffer_from_its_start_to_its_result[scan]\ntests/test_footprint_compiled_program.py::test_a_loops_carry_is_one_buffer_from_its_start_to_its_result[while]\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/compiler.py:826: UserWarning: Error reading persistent compilation cache entry for 'jit_program': JaxRuntimeError: INVALID_ARGUMENT: PjRtCompiler must be constructed with a Client to call DeserializeLoadedExecutable.\n    warnings.warn(\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 757 programs fetched (9.5 MB read), 0 bundles uploaded (0.0 MB)\n31 passed, 264 warnings in 17.86s\nrun_tests: {\"tests\": 31, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 31, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_sequence_causality.py",
+   "green": true,
+   "why": "39 passed in a green run of exactly these inputs, reused from the test cache",
+   "finished": true,
+   "cases": {
+    "tests/test_sequence_causality.py": "passed"
+   },
+   "tail": "1 files ran green on these inputs on AuthenticAMD-25-17, AuthenticAMD-26-17; their rows are reused\nrun_tests: {\"tests\": 39, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 39, \"cases\": {}, \"reused\": true}\n"
+  },
+  {
+   "item": "tests/test_float64_replay.py",
+   "green": true,
+   "why": "20 passed in a green run of exactly these inputs, reused from the test cache",
+   "finished": true,
+   "cases": {
+    "tests/test_float64_replay.py": "passed"
+   },
+   "tail": "1 files ran green on these inputs on AuthenticAMD-25-17, AuthenticAMD-26-17; their rows are reused\nrun_tests: {\"tests\": 20, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 20, \"cases\": {}, \"reused\": true}\n"
+  },
+  {
+   "item": "tests/test_kernel_outputs_written.py",
+   "green": true,
+   "why": "23 passed, 0 skipped",
+   "finished": true,
+   "cases": {
+    "tests/test_kernel_outputs_written.py": "passed"
+   },
+   "tail": ".......................                                                  [100%]\n=============================== warnings summary ===============================\ntests/test_kernel_outputs_written.py: 70 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 5877 programs fetched (45.6 MB read), 0 bundles uploaded (0.0 MB)\n23 passed, 70 warnings in 32.42s\nrun_tests: {\"tests\": 23, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 23, \"cases\": {}}\n"
+  },
+  {
+   "item": "tests/test_deepseek_v41.py",
+   "green": true,
+   "why": "14 groups green",
+   "finished": true,
+   "cases": {
+    "tests/test_deepseek_v41.py": "passed"
+   },
+   "tail": "..                                                                       [100%]\n=============================== warnings summary ===============================\ntests/test_deepseek_v41.py: 16220 warnings\n  /home/ci/work/dew/dew/.venv-3.12/lib/python3.12/site-packages/jax/_src/core.py:222: DeprecationWarning: core.Jaxpr is missing a DebugInfo object. This behavior is deprecated, use api_util.debug_info() to construct a proper DebugInfo object and propagate it to this function. See https://github.com/jax-ml/jax/issues/26480 for more details.\n    debug_info = debug_info or lu._missing_debug_info(\"core.Jaxpr\")\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\nshared XLA cache: 5119 programs fetched (65.2 MB read), 0 bundles uploaded (0.0 MB)\n2 passed, 30 deselected, 16220 warnings in 108.84s (0:01:48)\nrun_tests: {\"tests\": 2, \"failures\": 0, \"errors\": 0, \"skipped\": 0, \"passed\": 2, \"cases\": {}}\n"
+  }
+ ]
+}
