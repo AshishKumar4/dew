@@ -155,6 +155,9 @@ def run_of(cell: Cell, backbone: Path, root: Path) -> DecisionRunConfig:
     return DecisionRunConfig(
         pretrained=str(backbone), model=ModelConfig("causal_transformer", {"dtype": "float32"}),
         head=HEADS[cell.head], max_len=MAX_LEN[cell.head],
+        # A question head's rows a question each, as Laya's release lays them; a letter readout's as its
+        # layout derives them, a request's questions over one copy of its state.
+        shared_state=1 if cell.head == "question" else None,
         option_tokens=None if cell.joint else OPTION_TOKENS,
         objective=ObjectiveConfig("decision", {"consistency": cell.consistency}), calibrate=False,
         data=read(TRAIN[0], "train"), validation=read(HELD[0], "held"))
@@ -206,11 +209,13 @@ def test_a_cell_of_the_workflow_holds_the_conservation_contract(cell, backbone, 
     planted = {state: reason for split in (TRAIN, HELD) for state, reason in split[1].items()
                if reason != "options_alike" or not cell.joint}
     assert {state: reason for state, reason in refusal.items() if reason} == planted
-    # Its question layouts lay an example out as two rows or more, its joint one as one: a bound counting
-    # rows would end the run at half the examples it is given or sooner.
+    # Every layout asks each of an example's questions once. A question head's lays them a row each, two
+    # rows an example: a bound counting rows would end the run at half the examples it is given or sooner.
+    # A joint row holds both, and a letter readout's row asks both over one copy of the state.
     first = example(0)
-    assert len(task.layout.rows(task.tokenizer, task.specials, first.state, first.questions)) == (
-        1 if cell.joint else 2)
+    rows = task.layout.rows(task.tokenizer, task.specials, first.state, first.questions)
+    assert sorted(laid.name for row in rows for laid in row.questions) == sorted(first.questions)
+    assert len(rows) == (2 if cell.head == "question" else 1)
     # The bound counts source examples, the ones the layout keeps, which it fits before the bound reads them:
     # all of them, one pass, or the first step's batch to reach the share's.
     if cell.bound == "examples":
