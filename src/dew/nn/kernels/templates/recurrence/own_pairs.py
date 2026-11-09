@@ -179,10 +179,10 @@ def pairs_back_stored(call: Call, refs: tuple, at: tuple, keys: int, smem, opera
     """A key block's gradients through a chunk's pairs stored at `at` (its row and column) into `refs`
     (`dq`, `dk`, `dg`): the queries', the keys' through the gated keys (`beta k`) and their own, and the log
     decay's (`q dq + k (beta dk' - dk)`); returns the write gates' terms, each row's `sum(dk' k)`."""
-    (query, key, betas), (d_query, d_keyed, d_key) = operands, grads
+    (query, key, betas), (d_query, d_keyed, d_key), (row, column) = operands, grads, at
     for ref, grad in zip(refs, (d_query, d_keyed * betas[:, None] + d_key,
                                 query * d_query + key * (d_keyed * betas[:, None] - d_key)), strict=True):
-        fp32_operand(call).store(ref, grad, *at[:1], call.chunk, at[1], keys, family=call.family, smem=smem)
+        fp32_operand(call).store(ref, grad, row, call.chunk, column, keys, family=call.family, smem=smem)
     return jnp.sum(d_keyed * key, axis=1)
 
 
