@@ -31,7 +31,7 @@ from dew.nn.scatter import DROPPED, gather_positions
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
 from dew.sampling.guided import Grammar
-from dew.sampling.trees import DraftTree, TreeBlock, TreeShape
+from dew.sampling.trees import DraftTree, TreeBlock, TreeDraft, TreeShape
 
 
 @struct.dataclass
@@ -127,7 +127,9 @@ class DecodeOps:
     positions to the drafter's windows, and `draft` drafts the next block from
     each row's first token, handing each position's logits to a `choose`.
     `draft_tree` drafts a tree of candidates after each row's root token
-    (`dew.sampling.trees.DraftTree`), which `TreeSpeculative` verifies.
+    (`dew.sampling.trees.DraftTree`), which `TreeSpeculative` verifies: the
+    picks of the model's own chain drafter (`chain_tree`), None where it
+    drafts none.
     `crosses` says which rows a call taking them from `lengths` tokens to
     `following` carries past the position where the model's cached keys go
     stale (`text.rebuild_position`), each such row rebuilding every cache in
@@ -814,20 +816,98 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
             raise ValueError(f"the model's block drafter proposes {len(candidates) - 1} tokens a "
                              f"pass, fewer than a block of {block_size} candidates needs")
     else:
-        propose = ops.propose
-        assert propose is not None and state.hidden is not None, \
-            "a drafting pass reads the last hidden state"
+        assert state.hidden is not None, "a drafting pass reads the last hidden state"
         hidden = state.hidden
         for depth in range(1, block_size):
-            drafting, logits, produced = propose(
-                drafting, hidden[:, None], candidates[depth - 1][:, None], None, reached(depth)[:, None],
-                base[:, depth - 1][:, None], (depth - 1) % ops.depths, "draft")
-            hidden = produced[:, 0]
-            drawn_at(depth, logits[:, 0])
+            drafting, logits, hidden = _proposed(ops, drafting, hidden, candidates[depth - 1],
+                                                 reached(depth), base[:, depth - 1], depth)
+            drawn_at(depth, logits)
     # Every candidate gets the real criterion, the last one included: a
     # block accepted whole must not draw its bonus behind a stop.
     ending.append(stopping(states[block_size], candidates[block_size - 1]).done)
     return _Drafted(drafting, candidates, scores, states, offered, ending)
+
+
+def _proposed(ops: DecodeOps, drafting: DecoderState, hidden: jax.Array, token: jax.Array, live: jax.Array,
+              place: jax.Array, depth: int) -> tuple[DecoderState, jax.Array, jax.Array]:
+    """One candidate drafted through the model's prediction depths (`DecodeOps.propose`): candidate
+    `depth`'s (from 1, the first after the target's own draw) logits `[rows, V]`, after `token` `[rows]` at
+    its coordinate `place` `[rows]` on the `live` rows, from the state `hidden` `[rows, F]` the target or
+    the candidate before it left, with the drafting state and the hidden state it leaves the next: the
+    depths in turn, as a chain's block (`_drafted`) and a tree's paths (`chain_tree`) both draft."""
+    propose = ops.propose
+    assert propose is not None, "a model without prediction depths proposes nothing"
+    drafting, logits, produced = propose(drafting, hidden[:, None], token[:, None], None, live[:, None],
+                                         place[:, None], (depth - 1) % ops.depths, "draft")
+    return drafting, logits[:, 0], produced[:, 0]
+
+
+def chain_tree(ops: DecodeOps) -> DraftTree | None:
+    """The tree drafter of a model that drafts chains (its prediction depths or its block drafter, as
+    `refuse_undrafted` reads them), None for a model that drafts none. Every child is a pick: a node's
+    `j`-th child is the `j`-th most probable token of the draft's logits after the node's path from the
+    root, so a tree of one child a node is the chain a greedy draft proposes, and each child's `q` is
+    its point mass (`TreeDraft.log_q` None), which the walk's recursive rejection takes one after another
+    (`TreeSpeculative`). Every draft reads the state before the block and leaves it as it was.
+
+    The prediction depths draft each node's children in one step from the state its own path left
+    (`_proposed`), a node's children sharing their parent's step. A block drafter drafts a pass a chain,
+    each candidate drawn as the pass reaches it, so each leaf's path is a pass of its own, picking its
+    nodes' ranks; a node several leaves share is drafted alike on each, a pass reading nothing but its
+    own picks."""
+    depths = ops.propose is not None and ops.embed is not None and ops.depths
+    if not (depths or ops.draft is not None):
+        return None
+    passes = ops.draft
+
+    def draft(state: DecoderState, root: jax.Array, shape: TreeShape, keys: jax.Array,
+              base: jax.Array) -> TreeDraft:
+        # Every child is a pick, which draws nothing.
+        del keys
+        every = jnp.ones(root.shape[0], bool)
+        tokens: dict[int, jax.Array] = {}
+
+        def picked(logits: jax.Array, kids: Sequence[int]) -> None:
+            """`kids`, a fed token's children in their order, each the pick of its rank in `logits`."""
+            ranked = lax.top_k(logits, len(kids))[1].astype(jnp.int32)
+            for rank, kid in enumerate(kids):
+                tokens.setdefault(kid, ranked[:, rank])
+
+        if passes is not None:
+            for leaf in (node for node in range(shape.nodes) if not shape.children[node + 1]):
+                path = shape.ancestry(leaf)
+
+                def choose(index: int, logits: jax.Array, path: tuple[int, ...] = path) -> jax.Array:
+                    if index >= len(path):
+                        return jnp.argmax(logits, axis=-1)
+                    # The fed token whose children these logits rank: the root's, then each path node's.
+                    picked(logits, shape.children[0 if index == 0 else path[index - 1] + 1])
+                    return tokens[path[index]]
+
+                passes(state, root, choose)
+                if path[-1] not in tokens:
+                    raise ValueError(f"the model's block drafter proposes fewer tokens a pass than a tree "
+                                     f"{len(path)} deep needs")
+        else:
+            assert state.hidden is not None, "a drafting pass reads the last hidden state"
+
+            def descend(fed: int, drafting: DecoderState, hidden: jax.Array, token: jax.Array) -> None:
+                """Draft fed token `fed`'s children (the root's 0, node `j`'s `1 + j`) after `token`, from
+                the drafting state and hidden state its path left, then theirs."""
+                kids = shape.children[fed]
+                if not kids:
+                    return
+                depth = 1 if fed == 0 else int(shape.depths[fed - 1]) + 1
+                drafting, logits, hidden = _proposed(ops, drafting, hidden, token, every,
+                                                     base + (depth - 1), depth)
+                picked(logits, kids)
+                for kid in kids:
+                    descend(kid + 1, drafting, hidden, tokens[kid])
+
+            descend(0, state, state.hidden, root)
+        return TreeDraft(jnp.stack([tokens[node] for node in range(shape.nodes)], axis=1), None)
+
+    return draft
 
 
 def _taken(key: jax.Array, log_ratio: jax.Array) -> jax.Array:
@@ -1071,9 +1151,10 @@ def _settled(state: DecoderState, step: StepState, terminated: jax.Array, ops: D
 
 @struct.dataclass
 class TreeSpeculative(_Speculating):
-    """Drafts a tree of candidates with the model's tree drafter (`DecodeOps.draft_tree`) and verifies the
-    whole tree with the model itself in one pass (`dew.sampling.trees.TreeBlock`), keeping the longest
-    path the target accepts (ledger 4527).
+    """Drafts a tree of candidates with the model's tree drafter (`DecodeOps.draft_tree`: its prediction
+    depths' or its block drafter's picks, `chain_tree`) and verifies the whole tree with the model itself
+    in one pass (`dew.sampling.trees.TreeBlock`), keeping the longest path the target accepts (ledger
+    4527).
 
     The root, the block's first token, is an ordinary target draw. From it the walk descends: at each node
     its children are tested in their order by recursive rejection, each accepted with probability
@@ -1099,11 +1180,13 @@ class TreeSpeculative(_Speculating):
         return int(self.shape.depths.max()) + 2
 
     def walks(self, ops: DecodeOps, budget: int) -> int:
-        """The most blocks a row walks a token in: across the model's cache rebuild until its tree is past
-        it, and every one where its cache holds no room for the tree (`tree_step`)."""
-        if ops.capacity is not None:
-            return budget
-        return 0 if ops.crosses is None else min(self.shape.nodes + 1, budget)
+        """The most blocks a row walks a token in (`tree_step`): across the model's cache rebuild until
+        its tree is past it, a block for each of the tree's fed tokens, and through the last slots of
+        its cache, where the whole tree has no room, a block for each of the tree's nodes; no further, as
+        a prompt and its draws fit a row's cache (`text.check_inputs`)."""
+        crossing = 0 if ops.crosses is None else self.shape.nodes + 1
+        filling = 0 if ops.capacity is None else self.shape.nodes
+        return min(crossing + filling, budget)
 
     def stepped(self, state: DecoderState, step: StepState, terminated: jax.Array, ops: DecodeOps,
                 transform, stopping, budget: int | jax.Array) -> Block:
@@ -1114,8 +1197,9 @@ class TreeSpeculative(_Speculating):
 def refuse_untreed(ops: DecodeOps) -> None:
     """Refuse a tree decode that has no tree drafter or no verify (`TreeSpeculative`)."""
     if ops.verify is None or ops.draft_tree is None:
-        raise ValueError("tree speculative decoding drafts with the model's tree drafter, and this model "
-                         "has none; choose Speculative or another strategy")
+        raise ValueError("tree speculative decoding drafts its tree with the model's prediction depths or "
+                         "its block drafter, and this model has neither; load a checkpoint with MTP or "
+                         "DSpark weights or choose another strategy")
 
 
 def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan: TreeSpeculative,
@@ -1142,9 +1226,10 @@ def tree_step(state: DecoderState, step: StepState, terminated: jax.Array, plan:
     opening = dataclasses.replace(step, active=active & (step.step < budget))
     first = transform(opening, state.logits.astype(jnp.float32))
     root = select(keys[:, 0], first, opening.active)
-    drafted = draft_tree(state, root, shape, keys[:, 1])
+    base = _coordinates(state, step, jnp.zeros((1, 1), jnp.int32))[:, 0]
+    drafted = draft_tree(state, root, shape, keys[:, 1], base)
     fed = jnp.concatenate([root[:, None], drafted.tokens], axis=1)
-    block = TreeBlock(shape, cursor, _coordinates(state, step, jnp.zeros((1, 1), jnp.int32))[:, 0])
+    block = TreeBlock(shape, cursor, base)
     _, verified, _ = verify(state, fed, jnp.broadcast_to((active & ~walking)[:, None], fed.shape),
                             rebuilds=False, tree=block)
     raw = verified.astype(jnp.float32)
