@@ -105,8 +105,9 @@ class Schedule:
         """Each hand-off's allocations (`stated`), in turn."""
         return tuple(shape.scratch(target) for shape in self.stated())
 
-    def opened(self, refs: Sequence) -> Mapping[str, object]:
-        """Each hand-off opened by name over its scoped `refs` (`scratch`'s, in turn)."""
+    def opened(self, refs: Sequence) -> Mapping[str, Any]:
+        """Each hand-off opened by name over its scoped `refs` (`scratch`'s, in turn): each its shape's own
+        opened type (a tensor-core `Signal`, a `Tensor` of accumulators)."""
         return {handoff.name: shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
                 for handoff, shape, ref in zip(self.handoffs, self.stated(), refs, strict=True)}
 
