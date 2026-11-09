@@ -278,7 +278,7 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     fixture's shape: Qwen3's and Llama's (`fixture`), whose gradients XLA's GEMM fusion miscompiled
     (row 5275)."""
     import torch
-    from interop_support import token_draw
+    from interop_support import dew_next_token_loss, token_draw
     from transformers import AutoModelForCausalLM
 
     from dew.nn.kernels import generation
@@ -294,9 +294,7 @@ def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a
     layouts = {layout.name: layout for layout in loaded.weight_layouts if layout.name in named}
 
     def loss(params, ids):
-        logits = loaded.model.apply({**loaded.variables, "params": params}, ids)
-        chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], -1)
-        return -jnp.mean(chosen), logits
+        return dew_next_token_loss(loaded, params, ids)
 
     with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
         both = jax.jit(jax.value_and_grad(loss, has_aux=True)).trace(
