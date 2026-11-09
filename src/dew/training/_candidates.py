@@ -174,8 +174,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
 def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Candidate, batch: Batch,
                               placement, replicated, split: int, platforms: tuple[str, ...] | None
                               ) -> Callable[[], jax.stages.Lowered] | None:
-    """The sampled step a kept candidate's reader lowers (`Candidate.sampled`), its own trainer's: as
-    `_candidate` builds it, over the candidate's shapes and the batch's."""
+    """The sampled step `candidate`'s reader lowers (`Candidate.sampled`), its own trainer's, as the step
+    lowers, over the same arguments, for the same platforms: none without an inspection."""
     if stepping.trainer.inspection is None:
         return None
     watched = step_program(stepping, candidate.shapes, candidate.copies, candidate.shardings, placement,
@@ -249,14 +249,10 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
             (local_devices(trainer.device_mesh) or [*trainer.device_mesh.devices.flat])[0], split,
             functools.partial(consumes_where_made, stepping, prepared, micro, window, shapes),
             max(cuts, default=0), capacity)
-    # The sampled step lowers as the step does, over the same arguments, for the same platforms.
-    watched = None if trainer.inspection is None else step_program(
-        stepping, shapes, copies, shardings, placement, replicated, split, sampled=True)
-    sampled = None if watched is None else functools.partial(
-        lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
-        *apart(prepared), given, part)
-    return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                     lower.report() if lowering else KernelReport((), ()), footprint, sampled)
+    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
+                          lower.report() if lowering else KernelReport((), ()), footprint)
+    return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
+                                                           split, platforms))
 
 
 def consumes_where_made[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], prepared: TrainState,

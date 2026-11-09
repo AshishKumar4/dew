@@ -180,10 +180,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         return self.inputs.sample.held(batch)[-1] if self.inputs is not None else None
 
     def trace_key(self) -> Hashable | None:
-        """Its window, balance, process, its sampler's steps and solver, its blocks and end tokens
-        (`Objective.traced_by`)."""
-        return self.traced_by(self.seq_len, self.balance, self.process, self.steps, self.solver, self.block,
-                              self.eos_token_ids)
+        """Its window, balance, head chunks, process, its sampler's steps and solver, its blocks and end
+        tokens (`Objective.traced_by`)."""
+        return self.traced_by(self.seq_len, self.balance, self.head_chunks, self.process, self.steps,
+                              self.solver, self.block, self.eos_token_ids)
 
     def loss(self, variables, batch, step: Step):
         nelbo, aux, _ = self._scored(variables, batch, step, train=step.training)

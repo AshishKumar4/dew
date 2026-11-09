@@ -25,6 +25,8 @@ BUILT = {
     "grpo": (lambda **settings: GRPOObjective(tiny(), 8, **settings), {"beta": 0.5}),
     "masked": (lambda **settings: MaskedDiffusionObjective(tiny(causal=False), MDLM(mask_id=7)(), 8,
                                                            **settings), {"steps": 3}),
+    "masked chunks": (lambda **settings: MaskedDiffusionObjective(tiny(causal=False), MDLM(mask_id=7)(), 8,
+                                                                  **settings), {"head_chunks": 2}),
 }
 
 
