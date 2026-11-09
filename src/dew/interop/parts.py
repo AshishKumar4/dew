@@ -1142,7 +1142,7 @@ class Assembly:
     """A stored tensor's name as the source's load names it, and for one expert's own tensor, which the
     load stacks into its experts module's fused one, the expert's index and canonical projection
     (`_load_names`). It reads stored names alone: a name the model holds (a gradient's) is stored first
-    as `save_pretrained` stores it (`dew.interop.verify.gradient_parity`)."""
+    as `save_pretrained` stores it (`dew.interop.verify.gradients_mapped`)."""
     flat: frozenset[str] = frozenset()
     """The canonical names of the parameters the source stores with leading unit axes that their leaves
     hold flat (`KnownPart.flat`), which the family's `prepare` reads flat."""
