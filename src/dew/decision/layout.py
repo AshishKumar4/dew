@@ -718,8 +718,10 @@ class QuestionLayout(Layout):
     option (`option_0`) writes nothing the row reads. An option with no description is its key."""
 
     shared_state: int | None = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
-    """The most questions a row asks over one copy of their request's state (as many as it holds where
-    None, one at 1), each continuing it as its own row does (`dew.decision.shared_state`)."""
+    """The most questions a row asks over one copy of their request's state, each continuing it as its own
+    row does (`dew.decision.shared_state`): one at 1, and where None, unstated, one too, as the layout read
+    before rows shared a state, until what reads the rows states it (`shared_for`, as many as a row holds
+    where the backbone and head read each question as its own row does)."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -802,16 +804,17 @@ class QuestionLayout(Layout):
 
     def row_questions(self, questions: int) -> int:
         """As many of them as one row asks over one state (`shares`, `shared_state`), else one."""
-        if not self.shares:
+        if not self.shares or self.shared_state is None:
             return 1
-        return questions if self.shared_state is None else min(questions, self.shared_state)
+        return min(questions, self.shared_state)
 
     @property
     def shares(self) -> bool:
-        """Whether a request's questions share one copy of its state in their rows (`shared_state`)."""
+        """Whether a request's questions share one copy of its state in their rows (`shared_state`, stated
+        past one)."""
         from dew.decision.shared_state import forkable
 
-        return self.shared_state != 1 and forkable(self)
+        return self.shared_state is not None and self.shared_state > 1 and forkable(self)
 
     @property
     def spans_in_context(self) -> bool:
@@ -837,11 +840,11 @@ class QuestionLayout(Layout):
                              tokens=tokens, conversation=_conversation(state),
                              request=questions if request is None else request)
                for name, question in questions.items()]
-        if not self.shares:
+        if not self.shares or self.shared_state is None:
             return own
         from dew.decision.shared_state import over_one_state
 
-        return over_one_state(own, self.max_len, self.shared_state or len(own))
+        return over_one_state(own, self.max_len, self.shared_state)
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
                state: Sequence[int], *, conversation: bool = False,

@@ -287,5 +287,8 @@ def test_a_row_over_one_state_writes_its_state_before_its_question_and_its_instr
         MarkerLayout(shared_state=2)
     with pytest.raises(ValueError):
         dataclasses.replace(OWN, shared_state=2, segments=None, order="re_read")
-    assert not MarkerLayout().shares and dataclasses.replace(OWN, shared_state=None).shares
+    # A layout that states no sharing asks a question a row, as before rows shared a state, until what
+    # reads its rows states it (`shared_for`); one that states it shares.
+    assert not MarkerLayout().shares and not dataclasses.replace(OWN, shared_state=None).shares
+    assert dataclasses.replace(OWN, shared_state=2).shares
 

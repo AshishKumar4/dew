@@ -949,13 +949,19 @@ consecutive inputs by index and hand them on in turn (`dew.data.elastic_order._I
 are those it reads in none and its position names no count of them. 10's workers each read every W-th input
 and batched its own, so its batches and its position were its count's (row 4862). A stream reads alike."""
 
-PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER)
+SHARED_STATE = 12
+"""The plan version from which a decision run's requests ask their questions over one copy of their state,
+where its backbone and head read each question as its own row does (`dew.decision.shared_state.shared_for`):
+11's runs asked a row a question, and resume so (row 14d24faa6's forks)."""
+
+PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
 in the mixture that reads it or a named chain's own, into each shuffle of its own, so corpora of one length
 shuffled by one seed read in orders of their own and a named corpus reads one order mixed or alone (row
 3840), where 8 read them in one permutation; 10 streams a Parquet store by its files (`FILE_SHARDS`); 11
-reads a per-share read's inputs in their order in its workers (`IN_ORDER`). A run saved under an earlier
-version reads by it (carried to 1.0, ledger 1552)."""
+reads a per-share read's inputs in their order in its workers (`IN_ORDER`); 12 asks a decision request's
+questions over one copy of its state (`SHARED_STATE`). A run saved under an earlier version reads by it
+(carried to 1.0, ledger 1552)."""
 
 
 def read_by(version: int) -> int:
