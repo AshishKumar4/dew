@@ -227,8 +227,9 @@ def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
     rows = every_case_row(task)
     plan = task.planned()
     assert all(plan.add(row) for row in rows) and len(set(plan.windows())) < len(rows)
-    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
-                   layout=task.layout)
+    with jax.enable_x64(new_val=True):
+        wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64",
+                                              attention_impl="xla"), layout=task.layout)
 
     draw = drawn_about(decide.variables)
 
@@ -857,8 +858,9 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     examples = answered()
     mesh = MeshSpec().build(jax.devices())
     task = replace(decide, budget=Budget(rows=3))
-    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
-                   budget=task.budget)
+    with jax.enable_x64(new_val=True):
+        wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64",
+                                              attention_impl="xla"), budget=task.budget)
 
     def evaluated(on: Decide) -> np.ndarray:
         found: list = []

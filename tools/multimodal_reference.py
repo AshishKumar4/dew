@@ -138,14 +138,16 @@ def _encode(processor, images: np.ndarray, prompts: list[str], audio: list[np.nd
 def _sgd_step(model, singles: list[dict], valid: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """The summed next-token loss over every row, its backward, and one SGD
     step of learning rate LEARNING_RATE on every parameter, in place; returns
-    the loss and the pixel inputs, which hold their gradients."""
+    the loss and the pixel inputs, which hold their gradients (none for text alone)."""
     targets = int((valid[:, :-1] & valid[:, 1:]).sum())
     loss = torch.zeros((), device=model.device)
     pixel_inputs = []
     for single in singles:
-        pixels = single["pixel_values"].clone().requires_grad_(requires_grad=True)
-        pixel_inputs.append(pixels)
-        predictions = model(**{**single, "pixel_values": pixels}, use_cache=False).logits[0, :-1]
+        if "pixel_values" in single:
+            pixels = single["pixel_values"].clone().requires_grad_(requires_grad=True)
+            pixel_inputs.append(pixels)
+            single = {**single, "pixel_values": pixels}
+        predictions = model(**single, use_cache=False).logits[0, :-1]
         loss = loss + torch.nn.functional.cross_entropy(
             predictions, single["input_ids"][0, 1:], reduction="sum") / targets
     loss.backward()
@@ -158,9 +160,9 @@ def _sgd_step(model, singles: list[dict], valid: torch.Tensor) -> tuple[torch.Te
 
 def numerics(model, encoded: dict) -> dict[str, np.ndarray]:
     """`model`'s logits over the batch `encoded` a row at a time (zero at every padded position), then its
-    summed next-token `loss`, its `pixel_gradient` and the `updated_logits` after one SGD step
-    (`_sgd_step`, in place), in the model's dtype: the references the source draw's files hold
-    (`_write_numerics`) and a drawn site's (tools/multimodal_worker.py)."""
+    summed next-token `loss`, its `pixel_gradient` (where it reads pixels) and the `updated_logits` after
+    one SGD step (`_sgd_step`, in place), in the model's dtype: the references the source draw's files
+    hold (`_write_numerics`) and a drawn site's (tools/multimodal_worker.py)."""
     valid = encoded["attention_mask"].bool()
     dtype = next(model.parameters()).dtype
     shape = (*encoded["input_ids"].shape, model.config.get_text_config().vocab_size)
@@ -173,8 +175,10 @@ def numerics(model, encoded: dict) -> dict[str, np.ndarray]:
     with torch.no_grad():
         for row, single in enumerate(singles):
             updated[row, valid[row]] = model(**single, use_cache=False).logits[0]
-    return {"logits": logits.numpy(), "loss": loss.detach().numpy(), "updated_logits": updated.numpy(),
-            "pixel_gradient": torch.cat([pixels.grad for pixels in pixel_inputs]).numpy()}
+    found = {"logits": logits.numpy(), "loss": loss.detach().numpy(), "updated_logits": updated.numpy()}
+    if pixel_inputs:
+        found["pixel_gradient"] = torch.cat([pixels.grad for pixels in pixel_inputs]).numpy()
+    return found
 
 
 def _write_numerics(found: dict[str, np.ndarray], destination: Path, suffix: str = "") -> None:

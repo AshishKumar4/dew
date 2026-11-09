@@ -12,6 +12,7 @@ import atexit
 import dataclasses
 import itertools
 import json
+import os
 import subprocess
 import time
 
@@ -31,6 +32,7 @@ from dew.data.compile import compile, held, validation
 from dew.data.dataset import (
     Checkpointable,
     DataPartition,
+    Host,
     Records as IndexedRows,
     describe,
     take_batch,
@@ -196,6 +198,230 @@ def _by_hand(source, *, seed, batch, count):
     return [{field: [row[field] for row in rows[start:start + batch]]
              for field in rows[start]}
             for start in range(0, count * batch, batch)]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Jittered:
+    """A record step that runs Python on each record: its index scaled by a draw from its own generator."""
+
+    identity = "jittered@1"
+
+    def __call__(self, record, rng):
+        return {"index": record["index"], "drawn": float(record["index"]) * rng.uniform()}
+
+
+TWO_CPUS = Host(2, 2**34, worker_start=1.0)
+"""A host of two CPUs whose loading worker starts in a second, which automatic loading sizes for
+(`Loading.host`)."""
+
+
+def test_a_training_read_in_automatic_workers_reads_in_them_where_they_pay_for_themselves():
+    """A training read in automatic workers (`Loading(workers="auto")`, which a chain that names no loading
+    trains with) reads in them where the Python its batches take over the batches the run reads is more
+    than a worker's start (`Loading.resolved`), here in two for two CPUs over a run of a million steps, and
+    in the training process over a run of two. In workers its batches are those it reads in the process,
+    in their order, and a position either saved resumes in the other on the batches the uninterrupted read
+    goes on to (row 4862)."""
+    auto = Loading(workers="auto", host=TWO_CPUS)
+    rows = Pipeline(Memory(_Indexed(30))).shuffle(5).repeat().random_map(_Jittered())
+    chain = rows.batch(4)
+
+    def processes(steps: int, loading: Loading | None = auto) -> set[int]:
+        # The processes that ran the read's steps: the training process's, or its workers'.
+        where = rows.map(_Where()).batch(4)
+        reader = compile(where, seed=5, steps=steps, loading=loading).train(DataPartition())
+        try:
+            return {int(pid) for batch in listed(reader, 8) for pid in batch["pid"]}
+        finally:
+            reader.close()
+
+    assert processes(2) == {os.getpid()}
+    workers = processes(10**6)
+    assert len(workers) == 2 and os.getpid() not in workers
+    # A chain that names no loading reads in as many processes as automatic loading sized for this host.
+    assert len(processes(10**6, None)) == len(processes(10**6, Loading(workers="auto")))
+    short = compile(chain, seed=5, steps=2, loading=auto)
+    automatic = compile(chain, seed=5, steps=10**6, loading=auto)
+    inline = compile(chain, seed=5, loading=Loading(workers=0))
+    reader, whole = automatic.train(DataPartition()), inline.train(DataPartition())
+    try:
+        read = listed(reader, 12)
+        assert read == listed(whole, 12)
+    finally:
+        reader.close()
+        whole.close()
+    for saved_by, resumed_by in ((automatic, inline), (inline, automatic), (short, automatic)):
+        before = saved_by.train(DataPartition())
+        try:
+            head = listed(before, 5)
+            saved = before.get_state()
+        finally:
+            before.close()
+        resumed = resumed_by.train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            assert head + listed(resumed, 7) == read
+        finally:
+            resumed.close()
+
+
+@dataclasses.dataclass(frozen=True)
+class _Spread:
+    """An expansion of each record into as many rows as its index modulo three, none for every third."""
+
+    identity = "spread@1"
+
+    def __call__(self, record):
+        return [{"index": record["index"], "part": part} for part in range(record["index"] % 3)]
+
+
+def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers():
+    """A training read cut per share, its steps run in its loading workers before an expansion that makes
+    its rows a stream, reads the batches it reads in no workers in one, two, four and the count automatic
+    loading resolves to (`IN_ORDER`, `_Build.in_order`): each worker reads whole groups of consecutive inputs
+    by index and they are handed on in turn. A position saved in any count resumes in any other on the
+    batches the uninterrupted read goes on to (row 4862)."""
+    chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
+             .flat_map(_Spread()).batch(4))
+
+    def loader(workers):
+        return compile(chain, seed=5, loading=Loading(workers=workers, host=TWO_CPUS))
+
+    def read(workers, count: int, state=None) -> tuple[list, object]:
+        reader = loader(workers).train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            read = listed(reader, count)
+            return read, reader.get_state()
+        finally:
+            reader.close()
+
+    whole, _ = read(0, 12)
+    assert loader(0).plan.lowering == "per-share"
+    for workers in (1, 2, 4, "auto"):
+        assert read(workers, 12)[0] == whole
+    for saved_in, resumed_in in ((2, 4), (4, 0), (0, "auto")):
+        head, saved = read(saved_in, 5)
+        assert head + read(resumed_in, 7, saved)[0] == whole
+
+
+@dataclasses.dataclass(frozen=True)
+class _Where:
+    """A record step noting the process that ran it."""
+
+    identity = "where@1"
+
+    def __call__(self, record):
+        return {**record, "pid": os.getpid()}
+
+
+def test_a_read_cut_per_share_expands_and_draws_in_its_workers_alike_in_any_count():
+    """A training read cut per share whose expansion and the random steps after it run in its loading
+    workers (`_PerInput`), each input spread there whole and each draw keyed by its input and its row in it:
+    its batches are those it reads in no workers in one, two, four and the count automatic loading resolves
+    to, a position saved in any count resumes in any other, and the expansion runs in the workers, not the
+    reading process (row 4862: a decision run's expansion and layout held the reading process's
+    interpreter)."""
+    expanded = Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().flat_map(_Spread())
+
+    def read(chain, workers, count: int, state=None) -> tuple[list, object]:
+        reader = compile(chain, seed=5, steps=10**6, loading=Loading(workers=workers, host=TWO_CPUS)).train(
+            DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            read = listed(reader, count)
+            return read, reader.get_state()
+        finally:
+            reader.close()
+
+    chain = expanded.random_map(_Jittered()).batch(4)
+    whole, _ = read(chain, 0, 12)
+    for workers in (1, 2, 4, "auto"):
+        assert read(chain, workers, 12)[0] == whole
+    for saved_in, resumed_in in ((2, 4), (4, 0), (0, 2)):
+        head, saved = read(chain, saved_in, 5)
+        assert head + read(chain, resumed_in, 7, saved)[0] == whole
+    pids = {int(pid) for batch in read(expanded.map(_Where()).batch(4), 2, 3)[0] for pid in batch["pid"]}
+    assert pids and os.getpid() not in pids
+
+
+@dataclasses.dataclass(frozen=True)
+class _Tokens:
+    """A record's index beside a document of `index % 5 + 1` tokens."""
+
+    identity = "tokens@1"
+
+    def __call__(self, record):
+        return {"index": record["index"], "tokens": np.arange(record["index"] % 5 + 1, dtype=np.int32)}
+
+
+@pytest.mark.parametrize("chain", ["chunked", "expanded twice"])
+def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain):
+    """A read cut per share in its inputs' order (`IN_ORDER`), in no workers and in two, counts what a
+    version 10 read counts of the same batches: a cut into chunks its records' chunks
+    (`data/chunks_per_record`), which the reading process keeps, and an objective's expansion after
+    another the source examples it makes rows of (`FlatMap.examples`), each where it stands (review of
+    row 4862)."""
+    from dew.data.pipeline import FlatMap
+    from dew.data.plan import FILE_SHARDS
+    from dew.data.text import Chunks
+
+    source = Pipeline(Memory(_Indexed(30)), name="docs").shuffle(5).repeat()
+    if chain == "chunked":
+        built = source.map(_Tokens()).flat_map(Chunks(2, fields=("tokens",))).random_map(_Jittered()).batch(4)
+    else:
+        built = source.flat_map(_Spread())._then(FlatMap(_Spread(), examples=True)).batch(4)
+
+    def counted(workers, version):
+        pinned = {} if version is None else {"plan_version": version}
+        loading = Loading(workers=workers, host=TWO_CPUS)
+        loader = compile(built, seed=5, steps=10**6, loading=loading, **pinned)
+        reader = loader.train(DataPartition())
+        try:
+            listed(reader, 6)
+            return {name: value for name, value in loader.statistics().items()
+                    if name.startswith(("data/chunks", "data/rows", "data/examples", "data/consumed"))}
+        finally:
+            reader.close()
+
+    earlier = counted(0, FILE_SHARDS)
+    assert earlier
+    for workers in (0, 2):
+        assert counted(workers, None) == earlier
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_a_position_saved_under_plan_version_10_resumes_as_10_read_it(workers):
+    """A per-share read saved under plan version 10, in no workers or in two, which each read every
+    second input, resumes under this Dew's version (`IN_ORDER`) as 10 read it, in the workers its position
+    names (`_PerShare.resumed_at`): on the batches 10's read goes on to, bit for bit, and its positions name
+    10 still."""
+    from dew.data.plan import FILE_SHARDS, IN_ORDER
+
+    chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
+             .flat_map(_Spread()).batch(4))
+    earlier = compile(chain, seed=5, loading=Loading(workers=workers), plan_version=FILE_SHARDS)
+    now = compile(chain, seed=5)
+    assert earlier.plan.version == FILE_SHARDS and now.plan.version == IN_ORDER
+    reader = earlier.train(DataPartition())
+    try:
+        whole = listed(reader, 12)
+    finally:
+        reader.close()
+    reader = earlier.train(DataPartition())
+    try:
+        head, saved = listed(reader, 5), reader.get_state()
+    finally:
+        reader.close()
+    resumed = now.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert head + listed(resumed, 7) == whole
+        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == FILE_SHARDS
+    finally:
+        resumed.close()
 
 
 @pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),

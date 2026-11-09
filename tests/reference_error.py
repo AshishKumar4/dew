@@ -555,10 +555,13 @@ def dot_precisions(function, *arguments) -> list:
     sums (`dew.nn.precision.accumulated`) are tests/test_cpu_accumulation.py's."""
     with jax.default_matmul_precision(None):
         graph = jax.make_jaxpr(function)(*arguments)
-    return [(equation.params["precision"],
-             jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
-             tuple(variable.aval.shape for variable in equation.invars))
-            for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
+    # The types the program states, a float64 sum's traced under x64 (`dew.nn.precision.float64_sum`) among
+    # them, read as they are.
+    with jax.enable_x64(new_val=True):
+        return [(equation.params["precision"],
+                 jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
+                 tuple(variable.aval.shape for variable in equation.invars))
+                for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
 
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
