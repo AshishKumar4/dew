@@ -55,7 +55,7 @@ A preset is a plain function from a dataset and its settings to a dataset, appli
 | `sft` | Packed `text`, `text_coordinates` and aligned `text_roles` |
 | `canvas` | One row per assistant turn: `text`, int32 `[B, prompt_length + canvases * canvas_size]`, and `canvas_mask` |
 | `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
-| `preferences` | `input_ids` and `completion_mask`, `[B, 2, seq_len]` |
+| `preferences` | Windows of packed pairs: `input_ids`, `completion_mask` and each token's pair and half, `[B, 2 * seq_len - 1]` |
 | `images` | RGB uint8 `image`, `[B, size, size, 3]`, and the source's other fields, such as `label` |
 | `clips` | Uint8 `video`, `[B, frames, size, size, 3]`, and audio features |
 | `Decisions` | The objective's encoded question rows |
