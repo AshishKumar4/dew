@@ -407,8 +407,8 @@ class MosaicForward(_Mainloop[Tiles]):
             # op's.
             scaled_op = dataclasses.replace(self, scaled=True)
             with tuning.pinned_where_taken(scaled_op, scaled_op.bind(*arguments, residuals=residuals,
-                                                                     interpret=interpret)):
-                return scaled_op(*arguments, residuals=residuals, interpret=interpret)
+                                                                     interpret=interpret)) as taken:
+                return taken(*arguments, residuals=residuals, interpret=interpret)
 
         return jax.lax.cond(may, rare, launched), None
 

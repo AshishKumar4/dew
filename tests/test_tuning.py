@@ -158,6 +158,11 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
               tuning.pinned_where_taken(rms.op, rms)):
             taken = launches(step(), *operands(15))
         assert taken["rms_norm_forward"] == rows and taken["swiglu_forward"] == ((1,), 8)
+    # The op's own config (a measured candidate's) likewise: kept where it can take it, else its own.
+    for own, kept in ((norm_swiglu.BlockConfig(1024, 4), None), (norm_swiglu.RowsConfig(1, 1),
+                                                                 norm_swiglu.RowsConfig(1, 1))):
+        with tuning.pinned_where_taken(rms.op.replace(config=own), rms) as taken_op:
+            assert taken_op.config == kept
 
     # The picks a GPU measured, stored for this device, as a fresh process finds them: each launch's
     # variant beside its heuristic (16 rows and 4 warps a norm program, a step's 1024 elements a SwiGLU's).

@@ -1230,17 +1230,21 @@ def pinned(configs: Mapping[type[KernelOp], Hashable]) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def pinned_where_taken(op: KernelOp, ba: tokamax.BoundArguments) -> Iterator[None]:
-    """A launch of `op` over `ba` traced within takes an enclosing pin of its
-    kind (`pinned`) where it can take it (`KernelOp.pinnable`), else its own
-    config, that pin set aside and every other kind's kept: a launch a pinned
-    one makes of another of its kind, whose resources the pin was not chosen
-    for (a scaled attention forward, `attention_mosaic.MosaicForward.scaled`)."""
+def pinned_where_taken[Op: KernelOp](op: Op, ba: tokamax.BoundArguments) -> Iterator[Op]:
+    """`op` to launch over `ba` within, taking its own config (`op.config`, a measured candidate's) and an
+    enclosing pin of its kind (`pinned`) where it can take them (`KernelOp.pinnable`), else its own derived
+    config, the pin set aside and every other kind's kept: a launch a configured one makes of another of its
+    kind, whose resources the config was not chosen for (a scaled attention forward,
+    `attention_mosaic.MosaicForward.scaled`). Its own config carried into the scaled op raised `Unpinnable`
+    where a measured run timed the common op's 128 x 128 Triton tile, 320 registers a thread scaled (row
+    5326)."""
+    if op.config is not None and not op.pinnable(ba, op.completed(ba, op.config)):
+        op = op.replace(config=None)
     kind = type(op)
     pins = dict(_cache.KERNEL_PINS.value)
     if kind not in pins or op.pinnable(ba, op.completed(ba, pins[kind])):
-        yield
+        yield op
         return
     with _cache.KERNEL_PINS(tuple((pinned_kind, config) for pinned_kind, config in _cache.KERNEL_PINS.value
                                   if pinned_kind is not kind)):
-        yield
+        yield op
