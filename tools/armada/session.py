@@ -48,8 +48,8 @@ def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
     No timed dump of every thread's stack runs beside the tests, as walking threads that run killed the
     process mid-dump (exit 245, a SIGSEGV, in 3 of 5 runs of a multithreaded interpreted kernel's test,
     2026-10-25): a caller's deadline ends a hang (ci.py's `tested`: SIGINT, whose report pytest prints where
-    it can handle it, then the group killed past the grace), its stacks written once as it passes
-    (executed.py), and a fatal signal still prints the stacks (pytest's faulthandler)."""
+    it can handle it, then the group killed past the grace), its stacks read from outside it once as it passes
+    (ci.py's `dumped`), and a fatal signal still prints the stacks (pytest's faulthandler)."""
     runner = [*measured, "-m", "pytest"] if measured else ["pytest"]
     return [f".venv-{python}/bin/python", "-S", "-u", "-c", BOOT, *runner, "-q", *SELECTION, "-rfE",
             "--tb=short", "--continue-on-collection-errors", "-p", "no:cacheprovider", f"--junitxml={report}"]

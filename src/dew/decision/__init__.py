@@ -71,6 +71,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     )
     from dew.decision.rows import NONE_OF_THE_ABOVE, Encoding
     from dew.decision.scoring import Brier, Combined, LogLoss, RankedProbability, ScoringRule, Spherical
+    from dew.decision.sources import PretrainedDecision
     from dew.decision.task import TASK_FILE, Budget, Decide, Finalists, Knockout, Usage, Weights
 
 _EXPORTS = {
@@ -123,6 +124,7 @@ _EXPORTS = {
     "Noul": "dew.decision.questions",
     "NoulAnswer": "dew.decision.questions",
     "OptionLines": "dew.decision.layout",
+    "PretrainedDecision": "dew.decision.sources",
     "Question": "dew.decision.questions",
     "QuestionLayout": "dew.decision.layout",
     "QuestionSegment": "dew.decision.layout",
@@ -212,6 +214,7 @@ __all__ = [
     "Noul",
     "NoulAnswer",
     "OptionLines",
+    "PretrainedDecision",
     "Question",
     "QuestionLayout",
     "QuestionSegment",

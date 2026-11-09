@@ -77,6 +77,8 @@ EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
 """The worker of the pools that run on the examples clock."""
 READ_ROUNDS = Path(__file__).with_name("read_rounds_worker.py")
 """The worker of the pool that counts the rounds a fit agrees its reads in."""
+REPLICA_KEY = Path(__file__).with_name("replica_key_worker.py")
+"""The worker of the pool that recovers a lost key from a replica."""
 CLOCKED = 17
 """The examples a pool's run bounded in examples is bounded to: of ten records, seven read twice, and in
 one global order a last global batch of one row, which one share holds and the other does not."""
@@ -1423,6 +1425,63 @@ def test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica(tmp_path,
         assert report["dataset_state"] == whole[index]["dataset_state"]
         assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.fixture(scope="module")
+def killed_split_pool(tmp_path_factory):
+    """The killed pool run of `killed_local_pool` with fsdp over every device of the pool, so each
+    process holds half of each sharded variable, and its local step half the state, of which the other
+    holds no copy."""
+    directory = tmp_path_factory.mktemp("killed-split")
+    channels = [channel(directory / f"blocked{index}") for index in range(2)]
+    coordinator = f"127.0.0.1:{free_port()}"
+    (directory / "killed").mkdir()
+    pool = [spawn("fit", directory / "killed" / f"process{index}.json", processes=2,
+                  process_id=index, coordinator=coordinator,
+                  **local_flags(directory, fsdp_size=MESH_DEVICES, block_after=LOCAL_KILL_AFTER, notify=path))
+            for index, path in enumerate(channels)]
+    handed = told(list(zip(pool, channels, strict=True)))
+    assert all(process.returncode == -signal.SIGKILL for process in pool)
+    assert handed == [LOCAL_KILL_AFTER] * 2
+    assert all(local_committed(directory, index, LOCAL_KILL_AFTER).exists() for index in range(2))
+    return directory
+
+
+@pytest.mark.distributed
+def test_a_survivors_newer_local_step_gives_way_to_the_one_its_resumed_pool_writes(tmp_path,
+                                                                                   killed_split_pool):
+    """Where each process holds half the state, no survivor holds a lost process's shards, so a pool
+    missing one process's local step resumes, every process, from persistent step six. Process 0's
+    local step eight, from the run the kill cut short, gives way to the one the resumed run writes,
+    which Orbax refuses to write beside it, and the pool lands on the data position and parameters of
+    the run nobody killed (row 5219)."""
+    directory = tmp_path / "killed"
+    shutil.copytree(killed_split_pool, directory)
+    shutil.rmtree(directory / "local" / "process1")
+    flags = {"fsdp_size": MESH_DEVICES}
+    whole, resumed = run_pools(("fit", tmp_path / "whole", 2, local_flags(tmp_path / "whole-run", **flags)),
+                               ("fit", tmp_path / "resumed", 2, local_flags(directory, **flags)))
+
+    for index, report in enumerate(resumed):
+        assert report["split_between_processes"]
+        assert report["restored_step"] == 2 * SAVE_EVERY
+        assert report["step"] == STEPS
+        assert report["local_steps"] == [LAST_LOCAL_STEP]
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                                    dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_process_that_lost_its_copy_of_a_key_of_another_implementation_recovers_it(tmp_path):
+    """A key whose implementation is not the default (`rbg`, four words where threefry's has two) is
+    recovered from a replica as every other leaf is: the process that lost it holds zeros in its own
+    implementation's words, from a concrete key's template and from a shape's (`_zeros`), and receives
+    the holder's words, which draw what the key draws."""
+    for report in run_pool("replica_key", tmp_path / "pool", 2, script=REPLICA_KEY):
+        assert report["zeros"] == [[4], [4]]
+        for name in ("key", "shape"):
+            assert report[name] == report["expected"]
 
 
 # --------------------------------------------------------------------------

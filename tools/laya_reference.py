@@ -12,8 +12,9 @@ fp32 and again in float64, and writes
 
 - layouts.json: each question's token ids and option markers, which Dew's
   layout must reproduce exactly;
-- logits.npz: each question's option logits, fp32 under `<layout>/<case>/<id>`
-  and float64 under `<layout>/<case>/<id>/f64`;
+- logits.npz, for the released checkpoint alone (the tiny one's layouts and
+  answers are what its tests read): each question's option logits, fp32
+  under `<layout>/<case>/<id>` and float64 under `<layout>/<case>/<id>/f64`;
 - answers.json: `Agent.system_one` on each request, the published wire
   answers, in fp32 on the CPU;
 
@@ -176,8 +177,9 @@ def laid_logits(agent, model, exact) -> tuple[dict, dict]:
     return layouts, logits
 
 
-def references(directory: Path, out: Path) -> None:
-    """Laya's layouts, logits in fp32 and float64, and agent answers for `directory`."""
+def references(directory: Path, out: Path) -> dict[str, np.ndarray]:
+    """Laya's layouts and agent answers for `directory`, written to `out`, and its logits in fp32 and
+    float64, returned."""
     agent_module, _ = _laya()
     agent = agent_module.Agent(str(directory), device="cpu")
     layouts, logits = laid_logits(agent, *twins(agent, directory))
@@ -185,8 +187,8 @@ def references(directory: Path, out: Path) -> None:
                for case, request in CASES.items()}
     out.mkdir(parents=True, exist_ok=True)
     (out / "layouts.json").write_text(json.dumps(layouts) + "\n")
-    np.savez(out / "logits.npz", **logits)
     (out / "answers.json").write_text(json.dumps(answers, indent=1) + "\n")
+    return logits
 
 
 def main() -> None:
@@ -203,7 +205,7 @@ def main() -> None:
 
         directory = Path(snapshot_download(LAYA_REPO, revision=LAYA_REVISION, allow_patterns=[
             "model.safetensors", "encoder/*", "tokenizer/*", "rl_agent_config.json"]))
-        references(directory, FIXTURES / "real")
+        np.savez(FIXTURES / "real" / "logits.npz", **references(directory, FIXTURES / "real"))
         (FIXTURES / "real" / "source.json").write_text(
             json.dumps({"repo": LAYA_REPO, "revision": LAYA_REVISION}) + "\n")
     print(sorted(path.name for path in FIXTURES.rglob("*") if path.is_file()), file=sys.stderr)

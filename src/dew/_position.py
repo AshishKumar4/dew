@@ -22,7 +22,7 @@ import dataclasses
 import json
 from collections.abc import Mapping
 
-from dew._records import record
+from dew._records import integer, record
 
 ENVELOPE = "dew_global_position"
 """The key a global position is written under.
@@ -124,6 +124,39 @@ def replicated(position: bytes) -> Mapping[str, object] | None:
     return _enveloped(position, REPLICATED)
 
 
+RAMPED = "dew_ramped_position"
+"""The key a batch ramp over an elastic read writes its position under (`dew.data.dataset.RampedStream`):
+the read's own position where the ramp last read (`source`, an elastic read's, `REPLICATED`), the
+records of that read its steps had handed over (`skip`), and every record they had (`records`), all
+counted over the one order every reader reads, so every process writes the same one and any process
+count reads it back."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Ramped:
+    """A batch ramp's place over an elastic read (`RAMPED`): its read restored at `source`, and its next
+    read's first `skip` records skipped, it has handed over `records`."""
+
+    source: bytes
+    skip: int
+    records: int
+
+
+def encode_ramped(place: Ramped) -> bytes:
+    """`place` as the bytes a checkpoint stores for it."""
+    return json.dumps({RAMPED: {"source": json.loads(place.source), "skip": place.skip,
+                                "records": place.records}}).encode()
+
+
+def ramped(position: bytes) -> Ramped | None:
+    """The ramp's place `position` holds (`RAMPED`), or None for any other kind."""
+    held = _enveloped(position, RAMPED)
+    if held is None:
+        return None
+    return Ramped(json.dumps(record(held["source"], "ramped read's position")).encode(),
+                  integer(held["skip"], "records skipped"), integer(held["records"], "records handed over"))
+
+
 def _enveloped(position: bytes, key: str) -> dict | None:
     """The object `position` holds under dew's `key`, None where it is not JSON or holds no object
     there."""
@@ -139,6 +172,6 @@ def _enveloped(position: bytes, key: str) -> dict | None:
 
 def translates(position: bytes) -> bool:
     """Whether a process count other than the one that wrote `position` can
-    read it: true for a global position and an elastic read's, false for one
-    shard's own offset."""
-    return decode(position) is not None or replicated(position) is not None
+    read it: true for a global position, an elastic read's and a ramp's over
+    one, false for one shard's own offset."""
+    return decode(position) is not None or replicated(position) is not None or ramped(position) is not None

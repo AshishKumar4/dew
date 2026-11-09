@@ -11,8 +11,8 @@ import pytest
 
 @pytest.fixture(scope="module")
 def vae():
-    from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
-    return StableDiffusionVAE(dtype=jnp.float32)
+    from dew.interop.autoencoders.pretrained import load_kl_vae
+    return load_kl_vae("CompVis/stable-diffusion-v1-4", jnp.float32, revision="bf16", subfolder=None)[0]
 
 
 @pytest.mark.network

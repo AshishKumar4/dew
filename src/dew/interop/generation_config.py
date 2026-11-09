@@ -17,7 +17,7 @@ from __future__ import annotations
 import functools
 import json
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -28,7 +28,7 @@ from dew import _records
 from dew._coordination import agreed
 from dew._records import JSON
 from dew.batch import token_id, token_ids
-from dew.nn.protocols import Bounded, Predicting
+from dew.nn.protocols import Bounded, Layered, Predicting
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling, ordered_transforms, with_ids_of
@@ -134,8 +134,9 @@ _CONTROLS = {
     "cache_config": _Control("unsupported", refusal="quantized and offloaded caches are not implemented"),
     "cache_implementation": _Control(
         "unsupported",
-        neutral=("static",),
-        refusal="the native cache is the fixed-capacity static one",
+        neutral=("static", "offloaded", "offloaded_static"),
+        refusal="the native cache is the fixed-capacity static one, in device memory or, offloaded, in "
+                "host memory (`source_cache`)",
         masked_neutral=(),
     ),
     "compile_config": _Control("unsupported", refusal="the native decoder owns its compilation"),
@@ -586,6 +587,24 @@ def eos_field(eos_token_ids: Sequence[int]) -> dict[str, JSON]:
     ids: list[JSON] = [int(token) for token in eos_token_ids]
     named: dict[str, JSON] = {} if not ids else {"eos_token_id": ids[0] if len(ids) == 1 else ids}
     return named
+
+
+OFFLOADED = ("offloaded", "offloaded_static")
+"""Hugging Face's offloaded caches (`cache_implementation`), which keep the keys and values in host
+memory and bring each layer's to the device as it runs: Dew's offloaded cache (`KVCache.offloaded`)."""
+
+
+def source_cache(config: Mapping[str, object], generation_config: Mapping[str, object],
+                 model: nn.Module) -> nn.Module:
+    """The model over the cache the source's generation asks for: its layout offloaded where
+    `cache_implementation` names one of Hugging Face's offloaded caches (`OFFLOADED`), as it is
+    otherwise; a model that declares no layout (`Layered`) has none to offload."""
+    if _generation_value(config, generation_config, "cache_implementation") not in OFFLOADED:
+        return model
+    if not isinstance(model, Layered):
+        raise ValueError(f"cache_implementation offloads the keys and values to the host, and "
+                         f"{type(model).__name__} declares no cache layout (dew.nn.protocols.Layered)")
+    return model.with_kv_cache(replace(model.kv_cache, offloaded=True))
 
 
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],

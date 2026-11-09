@@ -33,8 +33,8 @@ from interop_support import (
 )
 from tool_support import load
 
+from dew.interop.autoencoders.rae import UNREAD, load_dinov2, load_rae
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders.rae import UNREAD, load_dinov2, load_rae
 
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5

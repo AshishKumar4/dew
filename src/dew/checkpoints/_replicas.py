@@ -134,14 +134,15 @@ def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
 def _zeros(leaf):
     """Zeros where a placed template leaf lies, each process's shards its own: the shards a process
     that lost its local copy holds until its replicas give it theirs (`_from_replicas`). A key is
-    read as its key data, as a restore reads it (`_placed`); a leaf nothing places is kept."""
+    read as its key data, as a restore reads it (`_placed`), in the words its own implementation holds
+    (an rbg key's four, threefry's two), a concrete key's or a shape's; a leaf nothing places is kept."""
     sharding = getattr(leaf, "sharding", None)
     if not isinstance(sharding, jax.sharding.NamedSharding):
         return leaf
     shape, dtype = tuple(leaf.shape), leaf.dtype
     if jnp.issubdtype(dtype, jax.dtypes.prng_key):
-        key_words = jax.eval_shape(lambda: jax.random.key_data(jax.random.key(0)))
-        shape, dtype = (*shape, *key_words.shape), key_words.dtype
+        key_words = jax.eval_shape(jax.random.key_data, jax.ShapeDtypeStruct(shape, dtype))
+        shape, dtype = tuple(key_words.shape), key_words.dtype
     # Every shard of a placement by name is one shape.
     shard = sharding.shard_shape(shape)
     return jax.make_array_from_callback(shape, sharding, lambda _: np.zeros(shard, dtype))
