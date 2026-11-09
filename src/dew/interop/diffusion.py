@@ -887,15 +887,30 @@ def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray])
     return parameters
 
 
-def write_flax_component(directory: Path, component: str, tensors: Mapping[str, np.ndarray]) -> None:
-    """Write `tensors` as the msgpack file a Flax component of `component` ships.
+def weights_stem(declared: object) -> str:
+    """The stem a pipeline component's weight files are named by, as the library its `model_index.json` entry
+    (`[library, class]`) names writes them: Diffusers' `diffusion_pytorch_model` and
+    `diffusion_flax_model`, transformers' (a text encoder, a safety checker) `model` and `flax_model`."""
+    library = declared[0] if isinstance(declared, (list, tuple)) and declared else None
+    return "diffusion_pytorch_model" if library == "diffusers" else "model"
+
+
+def flax_weights_file(declared: object) -> str:
+    """The msgpack a Flax pipeline component of `model_index.json` entry `declared` ships (`weights_stem`)."""
+    return "diffusion_flax_model.msgpack" if weights_stem(declared) != "model" else "flax_model.msgpack"
+
+
+def write_flax_component(directory: Path, component: str, declared: object,
+                         tensors: Mapping[str, np.ndarray]) -> None:
+    """Write `tensors` as the msgpack file a Flax component of `component`, `model_index.json` entry
+    `declared`, ships (`flax_weights_file`).
 
     A source that declares a Flax class keeps that format beside the
     safetensors, so a reader of either one finds what it expects.
     """
     from flax.serialization import to_bytes
-    filename = "diffusion_flax_model.msgpack" if component in ("unet", "vae") else "flax_model.msgpack"
-    (directory / component / filename).write_bytes(to_bytes(flax_component_parameters(component, tensors)))
+    (directory / component / flax_weights_file(declared)).write_bytes(
+        to_bytes(flax_component_parameters(component, tensors)))
 
 
 def save_source(source, values, destination: Path, max_shard_size: int | str) -> None:
@@ -954,9 +969,8 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
         carried = LazyTensors({name: specifications[original] for name, original in names.items()},
                               lambda name, names=names: source.retained_tensors[names[name]])
         tensors = layout_tensors(layouts.get(component, {}), values, retained=carried)
-        weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
-        save_sharded(tensors, destination / component, max_shard_size, stem=weights)
         declared = index.get(component)
+        save_sharded(tensors, destination / component, max_shard_size, stem=weights_stem(declared))
         if (
             isinstance(declared, (list, tuple))
             and len(declared) == 2
@@ -964,5 +978,5 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
             and declared[1].startswith("Flax")
         ):
             # Diffusers' Flax classes read one whole msgpack, so it is built whole.
-            write_flax_component(destination, component, dict(tensors))
+            write_flax_component(destination, component, declared, dict(tensors))
     source.inputs.conditions["conditioning"].encoder.save_assets(destination)
