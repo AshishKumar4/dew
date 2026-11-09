@@ -27,6 +27,7 @@ from reference_error import (
 )
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
+from test_recurrence_chunk import formed
 from tool_support import load
 
 from dew.batch import coordinates
@@ -45,6 +46,12 @@ SHARDED_SEEDS = 256
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`) at `SHARDED`, sized
 by `seeds_for` on the port (2026-10-21, on armada): the fewest for which one device compared with itself
 resolves the factor, its final state's leaf the last to."""
+
+SKIPPED = (1, 64, 4, 16, 2, 16)
+"""The packed skip site's rows, tokens, heads, head width, groups and state width: a row of documents whose
+laid chunks, as many as its worst case, are more than its sequences take."""
+SKIPPED_SEEDS = 8
+"""The packed skip site's declared draws, sized by `seeds_for` on armada, paired."""
 
 SHARDED = (4, 80, 8, 16, 2, 16)
 """The per-shard site's rows, tokens, heads, head width, groups and state width: the final state needs the
@@ -205,6 +212,26 @@ def the_template_is_as_exact_as_mamba_ssm():
 
     assert_as_exact(jax.jit(run), as_given(reference), draw, f"the template against mamba_ssm, {case}",
                     seeds=seeds, truth_fn=as_given(truth))
+
+
+def test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ssms_port():
+    """A bf16 SSD over packed documents on the recurrence template under the fast forms, its skip in the
+    template's own walk (`recurrence_chunk._rated_scan`'s `fused`), interpreted at the interpreter's route:
+    the skip's gradient on par with the port of mamba_ssm's kernels' (check 1; the portable math's sums it
+    exactly). Summed over every laid row, it read the rows of chunks no sequence takes, which the walk never
+    writes: not finite on every draw, natively on an H100 and interpreted (M-JS-63, jsf-ssdfin)."""
+    def skip_gradient(kernel):
+        def run(arrays):
+            with generation.chosen(ssd=kernel):
+                return mamba_ssd_xla(arrays, 16, jnp.bfloat16)["D"]
+
+        return formed("fast", run)
+
+    def draw(seed):
+        return (mamba_ssd_draw(seed, SKIPPED, jnp.bfloat16, documents=True),)
+
+    assert_as_exact(jax.jit(skip_gradient("mosaic_gpu")), jax.jit(skip_gradient("pallas")), draw,
+                    "the packed skip's gradient on the template", seeds=SKIPPED_SEEDS)
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():
