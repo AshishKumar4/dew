@@ -188,8 +188,12 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
         # over to the portable math there, reported as the call's route. A kernel's output unrounded, as the
         # portable math's, where an epilogue reads it or the caller's dtype is not the operands' (Mamba-3's
-        # fp32 rank terms cancel against it, `chunk_mamba3`), so the output is rounded once.
+        # fp32 rank terms cancel against it, `chunk_mamba3`), so the output is rounded once. The template's
+        # numbers are read once, as the selector reads them: a remat's pullback runs the launch later, under
+        # whatever precision its caller set then (a saved fp32 gradient under 'highest' took the accurate
+        # forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it).
         wide = hooks.skip or hooks.output is not None or dtype != jnp.result_type(query, key, value)
+        rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value))
 
         def product_kernel(product: str) -> str:
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
@@ -201,8 +205,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=wide,
-                                     bound=hooks.inverse_bound,
-                                     rounded=chunk_rounding(hooks.delta, jnp.result_type(query, key, value)))
+                                     bound=hooks.inverse_bound, rounded=rounded)
             if kernel == 'fla':
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                 scale=scale, wide=wide, firsts=firsts)
