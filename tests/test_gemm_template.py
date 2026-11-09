@@ -500,17 +500,21 @@ def test_the_prologues_rounding_is_in_its_derivative():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(jax.jit(jax.grad(plain))(scale)))
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80"))
+@pytest.mark.parametrize("generation_name", generations("sm90"))
 @pytest.mark.parametrize("sizes", [[3], None], ids=["ragged", "dense"])
 def test_a_prologue_never_sees_the_depths_padding(generation_name, sizes):
-    """A depth no tile divides is padded with zeros, which `reciprocal` turns to infinities: the kernel,
-    ragged or dense, zeroes them again before the product, so every output is the sum of 17 ones."""
-    x, w = jnp.ones((3, 17), jnp.bfloat16), jnp.ones((1, 17, 16))
+    """A depth no tile divides is padded with zeros, which `reciprocal` turns to infinities: the template's
+    launch, named, ragged or dense, zeroes them again before the product (`mosaic_gpu.depth_masked`), so
+    every output is the sum of 17 ones (NaN where the launch padded the depth before its prologue,
+    ff76ff7f19f)."""
+    x, w = jnp.ones((3, 17), jnp.bfloat16), jnp.ones((1, 17, 16), jnp.bfloat16)
     w = w if sizes else w[0]
-    with generation.assumed(generation_name):
+    with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
+          generation.routes() as routes):
         out = jax.jit(lambda x, w: gemm.gemm(x, w, None if sizes is None else jnp.asarray(sizes),
-                                                 prologue=reciprocal, out_dtype=jnp.float32,
-                                                 interpret_on_cpu=True))(x, w)
+                                             prologue=reciprocal, out_dtype=jnp.float32,
+                                             interpret_on_cpu=True))(x, w)
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}
     np.testing.assert_array_equal(np.asarray(out), np.full((3, 16), 17.0))
 
 
