@@ -326,7 +326,7 @@ class _Probe:
         # A probe traced over abstract weights (`qualified`) reads the keys each query sees off the mask
         # alone, whose values its trace holds; a mask it does not hold is no visibility it can verify.
         seen = (_masked(module, query, key, attention_mask, scaling, kwargs) if self.abstract
-                else _seen(module, query, key, attention_mask, scaling, kwargs))
+                else _seen(module, query.shape, key.shape, query.dtype, attention_mask, scaling, kwargs))
         if seen is None or not _visible(seen, kwargs.get("sliding_window")):
             self.unmatched += 1
 
@@ -345,16 +345,20 @@ class _Probe:
         return ""
 
 
-def _seen(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray:
-    """Which keys each query of a call reads in transformers' SDPA attention as the probe runs it,
-    `[B, Q, H, K]`: its attention weights over one-hot values, nonzero where a key is read. Read from
-    the attention itself, so a mask transformers builds or one it leaves to the attention's causal
-    flag (None) alike."""
+def _seen(module, queries, keys, dtype, attention_mask, scaling, kwargs) -> np.ndarray:
+    """Which keys each query of a call of `queries` and `keys` (their shapes) reads in transformers'
+    SDPA attention, `[B, Q, H, K]`: its attention weights over one-hot values, nonzero where a key is
+    read. Read from the attention itself, so a mask transformers builds or one it leaves to the
+    attention's causal flag (None) alike, over zero queries and keys of `dtype`, whose logits are all
+    zero: every key the mask keeps takes an equal weight. The call's own logits would not do: a probe's
+    random weights put a row's logits 120 apart, where the softmax weight of a key the mask keeps
+    rounds to zero in float32."""
     import torch
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    batch, heads, keys, _ = key.shape
-    identity = torch.eye(keys, dtype=query.dtype).expand(batch, heads, keys, keys)
+    batch, heads, length, _ = keys
+    identity = torch.eye(length, dtype=dtype).expand(batch, heads, length, length)
+    query, key = (torch.zeros(tuple(shape), dtype=dtype) for shape in (queries, keys))
     weights, _ = ALL_ATTENTION_FUNCTIONS["sdpa"](module, query, key, identity, attention_mask,
                                                scaling=scaling, dropout=0.0, **kwargs)
     return weights.detach().cpu().numpy() > 0
@@ -362,9 +366,8 @@ def _seen(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray:
 
 def _masked(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray | None:
     """Which keys each query of a call traced over abstract weights reads (`_seen`'s), `[B, Q, H, K]`:
-    transformers' SDPA over zero queries and keys of the call's shapes, its mask's values held as the
-    trace evaluated them, and its other arguments the call's own that are no tensors; None where the
-    mask's values are traced, not held."""
+    its mask's values held as the trace evaluated them, and its other arguments the call's own that are
+    no tensors; None where the mask's values are traced, not held."""
     import torch
     from jax.core import Tracer
     from torchax.interop import jax_view
@@ -376,7 +379,7 @@ def _masked(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray |
             return None
         mask = torch.from_numpy(np.array(held))
     plain = {name: value for name, value in kwargs.items() if not isinstance(value, torch.Tensor)}
-    return _seen(module, torch.zeros(tuple(query.shape)), torch.zeros(tuple(key.shape)), mask, scaling, plain)
+    return _seen(module, query.shape, key.shape, torch.float32, mask, scaling, plain)
 
 
 def _visible(seen: np.ndarray, window: int | None) -> bool:
