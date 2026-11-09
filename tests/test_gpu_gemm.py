@@ -21,7 +21,7 @@ one process (`gpu_flow`), each cell its own file's property:
   and on a B200 tcgen05's load warp gathers by TMA's four-row gathers, bitwise the rows gathered first
   (test_gemm_gather).
 - The template's grouped product of 16-bit operands sums into fp32 as exactly as XLA's at depths 128 and
-  512, its sums promoted a step at a time (test_grouped_gemm; row 4331).
+  512, its sums the tensor cores' own at the default precision (test_grouped_gemm; M-EM-3).
 - The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
   the one before it, as float64 does (test_warpgroup_scan).
 - GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the reference

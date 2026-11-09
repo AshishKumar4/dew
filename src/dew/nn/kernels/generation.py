@@ -377,6 +377,9 @@ class GpuTarget:
     multiprocessors: int | None = None
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
+    memory: int | None = None
+    """The named device's memory in bytes, its datasheet's, which a call's footprint is held to where the
+    device is assumed and absent (`device_memory`; an attached device states its allocator's own limit)."""
     l2_bytes: int | None = None
     """The L2 cache's bytes, which a launch whose operands are re-read across its programs (a split
     contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
@@ -564,12 +567,13 @@ class GpuTarget:
 TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
-              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
+              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9,
+              memory=16 * 10 ** 9),
     # A dependent step on XLA's path: an A100-SXM4-40GB's loop iteration, 5.96 us (FS-STEP-SECONDS1-a100,
     # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
-              memory_bandwidth=2039e9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              memory_bandwidth=2039e9, memory=80 * 10 ** 9, triton_gemm_fusions=False, step_seconds=5.96e-6,
               # The Ampere Tuning Guide's "Increased L2 Capacity": A100's 40 MB.
               l2_bytes=40 * 2 ** 20,
               # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
@@ -583,11 +587,11 @@ TARGETS = {target.generation: target for target in (
               # architecture whitepaper's Table 4), a real one's other facts its driver's (`runtime_facts`).
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12},
                'NVIDIA RTX A6000': {'bf16': 154.8e12}}, multiprocessors=72,
-              clock_hz=1695e6, memory_bandwidth=600e9),
+              clock_hz=1695e6, memory_bandwidth=600e9, memory=24 * 10 ** 9),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), multiprocessors=58,
-              clock_hz=2040e6, memory_bandwidth=300e9, triton_gemm_fusions=False),
+              clock_hz=2040e6, memory_bandwidth=300e9, memory=24 * 10 ** 9, triton_gemm_fusions=False),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024, {
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
@@ -597,7 +601,8 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA GH200': {'bf16': 989e12, 'fp8': 1979e12}}, multiprocessors=132,
               # A loop iteration on XLA's path, 4.93 us (FS-STEP-SECONDS1-h100's second round, 0.3% from the
               # line; its first's 4.80 us lay 17% from it).
-              clock_hz=1830e6, memory_bandwidth=3350e9, triton_gemm_fusions=False, step_seconds=4.93e-6,
+              clock_hz=1830e6, memory_bandwidth=3350e9, memory=80 * 10 ** 9, triton_gemm_fusions=False,
+              step_seconds=4.93e-6,
               # The Hopper Tuning Guide's "Increased L2 Capacity": H100's 50 MB.
               l2_bytes=50 * 2 ** 20,
               # A step whose head takes its gradient in the backward a tile at a time, unfused, compiled for
@@ -625,7 +630,8 @@ TARGETS = {target.generation: target for target in (
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
-              clock_hz=1965e6, memory_bandwidth=8e12,
+              # HGX B200's 1,440 GB of HBM3e over its 8 GPUs.
+              clock_hz=1965e6, memory_bandwidth=8e12, memory=180 * 10 ** 9,
               # The Blackwell Tuning Guide's "Increased L2 Capacity" (1.4.2.2): GB200's GPU, 126 MB.
               l2_bytes=126 * 2 ** 20,
               # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
@@ -640,7 +646,8 @@ TARGETS = {target.generation: target for target in (
     # only XLA's own fusions in a compile-only target; a B300 run reads its own (`runtime_facts`).
     GpuTarget('sm103', 'NVIDIA B300', 227 * 1024,
               dense_peaks={'NVIDIA B300': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=160,
-              clock_hz=1965e6, memory_bandwidth=8e12,
+              # HGX B300's 2.3 TB of HBM3e over its 8 GPUs, 288 GB each (NVIDIA's HGX table).
+              clock_hz=1965e6, memory_bandwidth=8e12, memory=288 * 10 ** 9,
               # The B200's step above compiled for a B300 holds 13.9 GiB, 5.6 with the head fused: some
               # weight gradients late, bounded from above as on a B200 (row 3341's calibration).
               late_weight_gradients=True),
@@ -650,6 +657,8 @@ TARGETS = {target.generation: target for target in (
               # datasheet); 1.792 TB/s is the Workstation part's (the RTX PRO Blackwell architecture
               # whitepaper, p.12).
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1597e9,
+              # Its 96 GB of GDDR7 (the Server Edition's datasheet).
+              memory=96 * 10 ** 9,
               # In-kernel: a dependent lane reduction's 137.7 ns (FS-STEP-SECONDS1-g4, its two rounds 137.68
               # and 137.66).
               step_seconds=3.68e-6, kernel_step_seconds=137.7e-9),
@@ -1283,6 +1292,22 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
+LAUNCHED_TRIPS = ('cuda', 'rocm')
+"""The lowering platforms whose XLA loops run each trip's kernels as launches of their own (a GPU's: a binary
+search's log2(K) trips cost a speculative verify 284 us beside its 22 us attention, M-DD-10), so a loop
+unrolled into one program saves a launch a trip; a CPU's and a TPU's loop runs within its one program."""
+
+
+def by_trips[T](branch: Callable[..., Callable[[], T]]) -> T:
+    """`branch(launched=...)()` for the platform a program lowers for (`jax.lax.platform_dependent`),
+    `launched` whether that platform's loop trips are launches of their own (`LAUNCHED_TRIPS`): a loop's
+    choice to unroll where that saves the launches, and to stay a loop elsewhere."""
+    import jax
+
+    return jax.lax.platform_dependent(**{platform: branch(launched=True) for platform in LAUNCHED_TRIPS},
+                                      default=branch(launched=False))
+
+
 def placed_platform() -> str:
     """The platform of the devices the context places a call on: the set mesh's, else the default
     device's (`jax.default_device`), else `jax.default_backend()`, 'gpu' for CUDA's and ROCm's. A
@@ -1306,11 +1331,76 @@ def gpu_placed() -> bool:
 
 
 def host_memory_share() -> int:
-    """A CPU device's share of its host's physical memory, in bytes: the host's over the process's local
-    devices, which share it (a forced count of CPU devices among them)."""
+    """A CPU device's share of the memory this process can hold, in bytes: the least of its host's physical
+    memory, its control groups' limits (`cgroup_memory_limits`: a container's, a service's) and its address
+    space's (`RLIMIT_AS`), over the process's CPU devices, which share it (a forced count of them)."""
+    import resource
+
     import jax
 
-    return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // max(1, jax.local_device_count())
+    limits = [os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"), *cgroup_memory_limits()]
+    address, _ = resource.getrlimit(resource.RLIMIT_AS)
+    if address != resource.RLIM_INFINITY:
+        limits.append(address)
+    return min(limits) // max(1, jax.local_device_count('cpu'))
+
+
+CGROUP_MEMORY = {2: ("sys/fs/cgroup", "memory.max"), 1: ("sys/fs/cgroup/memory", "memory.limit_in_bytes")}
+"""Each cgroup version's memory hierarchy, its mount under the root, and the file a group states its limit in
+(the kernel's cgroup-v2 and cgroup-v1 memory documentation)."""
+
+
+def cgroup_memory_limits(root: str = "/") -> list[int]:
+    """The memory limits on the control groups this process runs in (`/proc/self/cgroup`: v2's unified
+    group, v1's memory controller's), each group's own and every ancestor's up to its hierarchy's mount
+    (`CGROUP_MEMORY`), any of which bounds it; a group its mount does not show (a container's, whose own group
+    is its mount's root) states its limit at that root. `root` is the filesystem's, which a test builds."""
+    limits = []
+    with contextlib.suppress(OSError):
+        with open(os.path.join(root, "proc/self/cgroup")) as groups:
+            listed = groups.read().splitlines()
+        for line in listed:
+            _, controllers, group = line.split(":", 2)
+            version = 2 if not controllers else 1 if "memory" in controllers.split(",") else None
+            if version is None:
+                continue
+            mount, name = CGROUP_MEMORY[version]
+            parts = [part for part in group.split("/") if part]
+            for depth in range(len(parts), -1, -1):
+                # 'max' (v2's none) reads as no number.
+                with (contextlib.suppress(OSError, ValueError),
+                      open(os.path.join(root, mount, *parts[:depth], name)) as limit):
+                    limits.append(int(limit.read().strip()))
+    return limits
+
+
+def device_memory() -> int | None:
+    """The bytes one device a call is chosen for holds: the least allocator limit of the devices this
+    process places it on (`placed_devices`; `Device.memory_stats`' `bytes_limit`, what an allocation fails
+    against, under the process's memory fraction); an assumed and absent GPU's datasheet's
+    (`GpuTarget.memory`); a CPU's share of the process's (`host_memory_share`); None where none is known (an
+    assumed TPU, a device that states none)."""
+    platform = backend()
+    if platform == 'cpu':
+        return host_memory_share()
+    if assumption() is None:
+        limits = [stats['bytes_limit'] for device in placed_devices()
+                  if 'bytes_limit' in (stats := device.memory_stats() or {})]
+        return min(limits, default=None)
+    return gpu_target().memory if platform == 'gpu' else None
+
+
+def placed_devices() -> list:
+    """This process's devices the context places a call on, as `placed_platform` reads the context: the
+    default device where no mesh is set and one is (`jax.default_device`), else the local devices of the
+    placed platform."""
+    import jax
+
+    device = jax.config.jax_default_device
+    if (jax.sharding.get_abstract_mesh().abstract_device is None and device is not None
+            and not isinstance(device, str)):
+        return [device]
+    return jax.local_devices(backend=placed_platform())
 
 
 def backend() -> str:

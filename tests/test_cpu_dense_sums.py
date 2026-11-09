@@ -4,6 +4,7 @@ and pairwise, or in float64), the products a dense layer forms taking it in fixe
 error against float64, forward and both gradients, on par with a vectorized dot's."""
 
 import functools
+import itertools
 
 import jax
 import jax.numpy as jnp
@@ -203,3 +204,35 @@ def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share():
     for got, want in zip(summed, plain, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
         assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
+
+
+def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_product():
+    """The grouped GEMM's portable products on a CPU in fixed float32 sums (`gemm.gemm` and `gemm.gemm_t`,
+    their ragged dots through `precision.accumulated`, row 4863's GEMM remainder): each group's rows' product
+    and its input gradient's bitwise `pairwise_dot_general`'s of that group's rows alone, the depth blocked
+    and summed as a tree as a dense product's is, over groups of rows no block divides, one empty and one of a
+    single row, at 96 and 1024 deep; and the kernel gradient of one group of every row bitwise the dense
+    one's, its rows blocked from the group's first and the blocks' sums added as `_tree` adds them."""
+    sizes = [70, 0, 1, 129, 37]
+    starts = np.cumsum([0, *sizes])
+    rng = np.random.default_rng(4863)
+    numbers = (((1,), (0,)), ((), ()))
+    for depth in (96, 1024):
+        x = jnp.asarray(rng.standard_normal((sum(sizes), depth)), jnp.float32)
+        w = jnp.asarray(rng.standard_normal((len(sizes), depth, 40)), jnp.float32)
+        dy = jnp.asarray(rng.standard_normal((sum(sizes), 40)), jnp.float32)
+        group_sizes = jnp.asarray(sizes, jnp.int32)
+        whole = jnp.asarray([sum(sizes)], jnp.int32)
+        with jax.default_matmul_precision(precision.FP32_SUMS):
+            out = jax.jit(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.float32))(x, w, group_sizes)
+            dx = jax.jit(lambda dy, w, s: gemm.gemm(dy, w, s, transpose_rhs=True,
+                                                    out_dtype=jnp.float32))(dy, w, group_sizes)
+            dw = jax.jit(lambda x, dy, s: gemm.gemm_t(x, dy, s, out_dtype=jnp.float32))(x, dy, whole)
+        for g, (start, end) in enumerate(itertools.pairwise(starts)):
+            rows, cotangent = x[start:end], dy[start:end]
+            np.testing.assert_array_equal(np.asarray(out[start:end]),
+                                          np.asarray(pairwise.pairwise_dot_general(rows, w[g], numbers)))
+            np.testing.assert_array_equal(np.asarray(dx[start:end]), np.asarray(
+                pairwise.pairwise_dot_general(cotangent, jnp.swapaxes(w[g], 0, 1), numbers)))
+        np.testing.assert_array_equal(np.asarray(dw[0]),
+                                      np.asarray(pairwise.pairwise_dot_general(x.T, dy, numbers)))

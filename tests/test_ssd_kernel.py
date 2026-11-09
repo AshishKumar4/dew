@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
-from ssd_support import ssd_orbit, stepwise_scan
+from ssd_support import segment_sum, ssd_orbit, stepwise_scan
 
 from dew.algebra.scan import RESET_DECAY
 from dew.nn.kernels.recurrence_chunk import ssd_operands
@@ -72,19 +72,6 @@ def mixer_operands(shape, seed: int = 0):
             jax.random.normal(keys[4], (batch, steps, groups, state_size), jnp.float32),
             jax.random.normal(keys[5], (heads,), jnp.float32),
             jax.random.normal(keys[6], (batch, heads, head_dim, state_size), jnp.float32))
-
-
-def segment_sum(x):
-    """`segment_sum` (modeling_mamba2.py:73-90): over the last axis of `x`,
-    `out[..., i, j] = sum_{j < k <= i} x[..., k]` on and below the diagonal,
-    `-inf` above, as the reference's masked cumulative sum rather than a
-    difference of cumulative sums, so exp of it is the same numbers."""
-    size = x.shape[-1]
-    strict = jnp.tril(jnp.ones((size, size), jnp.bool_), -1)
-    expanded = jnp.where(strict, jnp.broadcast_to(x[..., :, None], (*x.shape, size)), 0.0)
-    summed = jnp.cumsum(expanded, axis=-2)
-    inclusive = jnp.tril(jnp.ones((size, size), jnp.bool_))
-    return jnp.where(inclusive, summed, -jnp.inf)
 
 
 def _chunk_writes(x_c, B_c, a_c):

@@ -61,13 +61,16 @@ def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
 def promoted(*, above: bool, outputs: tuple, compute: Dtype | None = None) -> bool:
     """Whether a product promotes each depth step's partial apart (`exact_sums`): where an output is fp32,
     whose sums a 16-bit output's one rounding hides, and the product is asked above the default precision
-    (`above`) or multiplies 16-bit operands (`compute`). A tensor core adds each instruction's products
-    into one fp32 accumulator in order, and its error grows with the depth: every Dew launch's fp32 sum of
-    bf16 products, Triton's and the template's at four tiles alike, was 1.661x XLA's RMS error from
-    float64 at a depth of 128 and 3.88x at 512 on an A100 (M-NS-1, NS4331-VALUE4-a100; row 4331)."""
-    if jnp.dtype(jnp.float32) not in {jnp.dtype(dtype) for dtype in outputs}:
-        return False
-    return above or (compute is not None and jnp.dtype(compute) in HALF)
+    (`above`). At the default precision a 16-bit product's fp32 sums are the tensor cores' own, as cuBLAS's
+    are: a dense kernel gradient's tensor-core sums were 0.98-1.00 of XLA's (cuBLAS's) RMS error from
+    float64 at 8192 tokens and at depths of 128 to 2048 on an A100 and an H100 (M-EM-3), where its exact
+    sums, 40 to 60 times closer to float64 than the reference, cost an H100 1.10-2.06x their time (W124) and
+    an A100 the 128 x 128 tile; row 4331's premise (M-NS-1: 1.661x XLA's error at depth 128, 3.88x at 512)
+    did not reproduce. An underfilled wave's split of the contraction (`gemm.mosaic_gpu.split_count`)
+    shortens each sum as cuBLAS's split-K does. `compute`, the operands' dtype, no longer decides it (an
+    FP8 product promotes apart, `declared`)."""
+    del compute
+    return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}
 
 
 def _refusal(compute: jnp.dtype, operands: tuple, above: bool, precision: PrecisionLike = None
