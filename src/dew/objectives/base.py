@@ -765,6 +765,8 @@ class Objective(ABC, Generic[Loss, Effects]):
     split), or None to draw one (`init`)."""
     processor: Processor | None = None
     """What turns text into ids and back for the objective's task, or None."""
+    _fresh: tuple[str, ...] = ()
+    """What the source `bind_model` bound drew fresh beside its loaded weights (`fresh_modules`)."""
 
     @property
     def inputs(self) -> InputSpec | None:
@@ -876,6 +878,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         from dew.inference.projections import unpacked
 
+        # What the source drew fresh beside the weights it loaded, none where other variables replace them.
+        self._fresh = tuple(source.fresh) if isinstance(source, Extended) and variables is OMITTED else ()
         if _loaded(source):
             variables = source.variables if variables is OMITTED else variables
             processor = source.text_processor if processor is OMITTED else processor
@@ -1176,10 +1180,11 @@ class Objective(ABC, Generic[Loss, Effects]):
     def fresh_modules(self) -> tuple[str, ...]:
         """The modules this objective trains that are drawn fresh beside a loaded base, by their paths
         under `params` (`backbone/layers_1/cross_attention`, `head`), which a run trains in a fresh group
-        (`dew.optim.OptimConfig.fresh_groups`): none by default, an objective declaring what it draws beside
-        the base it holds and what its source drew (`Pretrained.fresh`). One drawn with no parameter, a
-        tied readout, the group leaves out (`dew.config.trained_modules`)."""
-        return ()
+        (`dew.optim.OptimConfig.fresh_groups`): what the source it trains drew (`Pretrained.fresh`, held
+        where `bind_model` holds its tree as the objective's), an objective declaring besides what it
+        draws beside the base it holds. One drawn with no parameter, a tied readout, the group leaves out
+        (`dew.config.trained_modules`)."""
+        return self._fresh
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules
@@ -1771,6 +1776,15 @@ class Source(Protocol[M]):
 
     @property
     def text_processor(self) -> Processor | None: ...
+
+
+@runtime_checkable
+class Extended(Protocol):
+    """A loaded source that names what of its model it drew fresh beside the weights it loaded, by each
+    parameter's or module's path under `params`, as `dew.interop.Pretrained` does (`fresh`)."""
+
+    @property
+    def fresh(self) -> tuple[str, ...]: ...
 
 
 @runtime_checkable
