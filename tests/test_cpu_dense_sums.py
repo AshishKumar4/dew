@@ -236,3 +236,48 @@ def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_
                 pairwise.pairwise_dot_general(cotangent, jnp.swapaxes(w[g], 0, 1), numbers)))
         np.testing.assert_array_equal(np.asarray(dw[0]),
                                       np.asarray(pairwise.pairwise_dot_general(x.T, dy, numbers)))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_grouped_float32_projection_on_an_explicit_data_split_traces_and_places_as_xlas():
+    """A float32 grouped projection, its input gradient and its kernel gradient (`gemm.gemm`, `gemm.gemm_t`,
+    their CPU branch `pairwise.pairwise_ragged_dot_general`, which a platform choice traces on every platform)
+    of rows an Explicit data axis splits over two devices: each traced and run (JAX infers no placement for a
+    ragged dot, so each block's states its own, `grouped_matmul.ragged_placement`, and a kernel gradient's
+    gathers read whole rows), each value XLA's ragged products' bit for bit over small integers, and placed as
+    `ragged_placement` places them."""
+    from dew.nn.kernels.grouped_matmul import ragged_placement
+
+    rng = np.random.default_rng(4864)
+    tokens, cotangent = (jnp.asarray(rng.integers(-3, 4, size=shape), jnp.float32)
+                         for shape in ((64, 40), (64, 16)))
+    kernel = jnp.asarray(rng.integers(-3, 4, size=(2, 40, 16)), jnp.float32)
+    sizes = jnp.asarray([40, 24], jnp.int32)
+    rows = jax.lax.RaggedDotDimensionNumbers((((1,), (1,)), ((), ())), (0,), (0,))
+    groups = jax.lax.RaggedDotDimensionNumbers((((0,), (0,)), ((), ())), (0,), ())
+
+    def summed(tokens, cotangent):
+        out, pull = jax.vjp(lambda t, k: gemm.gemm(t, k, sizes, out_dtype=jnp.float32), tokens, kernel)
+        return out, *pull(cotangent), gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32)
+
+    def plain(tokens, cotangent):
+        def ragged(lhs, rhs, numbers, sources):
+            return jax.lax.ragged_dot_general(lhs, rhs, sizes, numbers, preferred_element_type=jnp.float32,
+                                              out_sharding=ragged_placement(sources))
+
+        transposed = jnp.swapaxes(kernel, 1, 2)
+        gradient = ragged(tokens, cotangent, groups, (None, (tokens, 1), (cotangent, 1)))
+        return (ragged(tokens, kernel, rows, ((tokens, 0), (kernel, 2))),
+                ragged(cotangent, transposed, rows, ((cotangent, 0), (transposed, 2))), gradient, gradient)
+
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with pytest.MonkeyPatch.context() as patched, jax.set_mesh(mesh):
+        patched.setattr(pairwise, "contraction_block", lambda depth, lanes=None: min(depth, 8))
+        split = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        placed = (jax.device_put(tokens, split), jax.device_put(cotangent, split))
+        with jax.default_matmul_precision(precision.FP32_SUMS):
+            got_all = jax.jit(summed)(*placed)
+        want_all = jax.jit(plain)(*placed)
+    for got, want in zip(got_all, want_all, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
