@@ -299,9 +299,16 @@ def input_bias(q, k):
     return jnp.broadcast_to(rows, (q.shape[0], q.shape[2], q.shape[1], k.shape[1])).astype(q.dtype)
 
 
+def _wide(x):
+    """The dtype a plain program computes `x`'s logits or statistics in: float32 over bfloat16 or float32
+    operands, as its author writes it, and the operands' own where they are wider, so the program run on
+    float64 operands is its float64 truth and no second fp32 run."""
+    return jnp.promote_types(x.dtype, jnp.float32)
+
+
 def softcapped_attention(q, k, v):
     """Gemma 2's attention as a plain program writes it: scaled logits softcapped at 50, causal."""
-    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=_wide(q)) * q.shape[-1] ** -0.5
     logits = 50.0 * jnp.tanh(logits / 50.0)
     causal = jnp.tril(jnp.ones((q.shape[1], k.shape[1]), bool))
     weights = jax.nn.softmax(jnp.where(causal, logits, -jnp.inf), axis=-1).astype(v.dtype)
@@ -321,7 +328,7 @@ def masked_attention(mask):
     """Attention written out over `mask(q, k)`, its masked logits -inf: a row the mask leaves no key is
     NaN."""
     def attend(q, k, v):
-        logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+        logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=_wide(q)) * q.shape[-1] ** -0.5
         weights = jax.nn.softmax(jnp.where(mask(q, k), logits, -jnp.inf), axis=-1).astype(v.dtype)
         return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
     return attend
@@ -399,11 +406,11 @@ def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows
             # it, the logits in the operands' dtype masked there with its least value, then widened.
             s = jnp.einsum("bthd,bshd->bhts", q / jnp.float32(root).astype(q.dtype), k)
             s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, jnp.finfo(s.dtype).min)
-            s = s.astype(jnp.float32)
+            s = s.astype(_wide(s))
         else:
-            s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+            s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=_wide(q)) * q.shape[-1] ** -0.5
             if logits_cast is not None:
-                s = s.astype(logits_cast).astype(jnp.float32)
+                s = s.astype(logits_cast).astype(_wide(q))
             s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, fill)
         e = jnp.exp(s - jax.lax.stop_gradient(jnp.max(s, -1, keepdims=True, initial=initial)))
         total = jnp.sum(e, -1)
@@ -426,7 +433,7 @@ def test_a_programs_own_choice_by_the_platform_stays_as_written():
 
     def attend(doubled):
         def run(q, k, v):
-            s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=jnp.float32) * q.shape[-1] ** -0.5
+            s = jnp.einsum("bthd,bshd->bhts", q, k, preferred_element_type=_wide(q)) * q.shape[-1] ** -0.5
             s = jnp.where(jnp.tril(jnp.ones(s.shape[-2:], bool)), s, -jnp.inf)
             weights = jax.nn.softmax(s, axis=-1)
             if doubled:
@@ -519,14 +526,14 @@ def flax_rms(x, w):
 
 def widened_rms(x, w):
     """An RMSNorm as a plain program writes it: float32 statistics, the weight before the cast."""
-    widened = x.astype(jnp.float32)
+    widened = x.astype(_wide(x))
     inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
     return (widened * inverse * w).astype(x.dtype)
 
 
 def offset_rms(x, w):
     """Gemma's RMSNorm: the normalized row cast first, then times one more than its weight."""
-    widened = x.astype(jnp.float32)
+    widened = x.astype(_wide(x))
     normed = widened * jax.lax.rsqrt(jnp.mean(jnp.square(widened), axis=-1, keepdims=True) + 1e-6)
     return normed.astype(x.dtype) * (1 + w.astype(x.dtype))
 
@@ -534,7 +541,7 @@ def offset_rms(x, w):
 def gated_product_of(a, b):
     """A gated MLP's product as a plain program writes Dew's (torch's) math: the activation in float32,
     rounded once to the gate's dtype, then times the up projection."""
-    return jax.nn.silu(a.astype(jnp.float32)).astype(a.dtype) * b
+    return jax.nn.silu(a.astype(_wide(a))).astype(a.dtype) * b
 
 
 def _norms_written(fn, *shapes):
@@ -561,16 +568,16 @@ def residual_rms(x, branch, w):
 def gated_rms(x, gate, w):
     """Qwen3-Next's gated RMSNorm as a plain program writes it: fp32 statistics, the weight, then the gate's
     SiLU, cast once."""
-    widened = x.astype(jnp.float32)
+    widened = x.astype(_wide(x))
     inverse = jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
-    return (widened * inverse * w.astype(jnp.float32) * jax.nn.silu(gate.astype(jnp.float32))).astype(x.dtype)
+    return (widened * inverse * w.astype(_wide(w)) * jax.nn.silu(gate.astype(_wide(gate)))).astype(x.dtype)
 
 
 def packed_swiglu(gate_up):
     """A packed gate|up projection's SwiGLU as a plain program writes Dew's math (`gated_product_of`): its
     two halves sliced out."""
     gate = gate_up[..., 0, :]
-    return jax.nn.silu(gate.astype(jnp.float32)).astype(gate.dtype) * gate_up[..., 1, :]
+    return jax.nn.silu(gate.astype(_wide(gate))).astype(gate.dtype) * gate_up[..., 1, :]
 
 
 def _own_norm(*, offset: bool, after_cast: bool):
@@ -655,7 +662,7 @@ def test_a_plain_programs_norms_run_the_kernel_dews_own_call_takes(form):
 
 def _rows_inverse(x):
     """Each row's inverse root mean square, fp32 `[rows]`, the feature axis reduced."""
-    widened = x.astype(jnp.float32)
+    widened = x.astype(_wide(x))
     return jax.lax.rsqrt(jnp.sum(widened * widened, axis=-1) / x.shape[-1] + 1e-6)
 
 
@@ -670,21 +677,21 @@ NEAR_NORMS = {
     "statistics in bfloat16, the widening dropped": lambda x, w: (
         x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6) * w.astype(x.dtype)),
     "the weight applied before the statistic": lambda x, w: (
-        _rows_inverse(x * w.astype(x.dtype))[:, None] * x.astype(jnp.float32)).astype(x.dtype),
+        _rows_inverse(x * w.astype(x.dtype))[:, None] * x.astype(_wide(x))).astype(x.dtype),
     "a SwiGLU whose sigmoid rounds to bfloat16": lambda x, w: jax.nn.silu(x) * (x * w.astype(x.dtype)),
     "columns scaled by the rows' statistics":
-        lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[None, :]).astype(x.dtype),
+        lambda x, w: (x.astype(_wide(x)) * _rows_inverse(x)[None, :]).astype(x.dtype),
     "a weight along the rows":
-        lambda x, w: (x.astype(jnp.float32) * _rows_inverse(x)[:, None] * w[:, None]).astype(x.dtype),
+        lambda x, w: (x.astype(_wide(x)) * _rows_inverse(x)[:, None] * w[:, None]).astype(x.dtype),
     "a jit named silu that is tanh": lambda x, w: jax.jit(_named_silu)(x) * w.astype(x.dtype),
-    "a zero mean multiplier": lambda x, w: (x.astype(jnp.float32) * jax.lax.rsqrt(
-        jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True) * 0.0 + 1e-6)).astype(x.dtype),
+    "a zero mean multiplier": lambda x, w: (x.astype(_wide(x)) * jax.lax.rsqrt(
+        jnp.sum(jnp.square(x.astype(_wide(x))), axis=-1, keepdims=True) * 0.0 + 1e-6)).astype(x.dtype),
     "its own sum as the weight": lambda x, w: (
-        x.astype(jnp.float32) * _rows_inverse(x)[:, None]
-        * jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1)[None, :]).astype(x.dtype),
+        x.astype(_wide(x)) * _rows_inverse(x)[:, None]
+        * jnp.sum(jnp.square(x.astype(_wide(x))), axis=-1)[None, :]).astype(x.dtype),
     "a weight rounded to bf16 before it weighs": lambda x, w: (
-        x.astype(jnp.float32) * _rows_inverse(x)[:, None]
-        * (w.astype(jnp.float32) * 1.001).astype(jnp.bfloat16).astype(jnp.float32)).astype(x.dtype),
+        x.astype(_wide(x)) * _rows_inverse(x)[:, None]
+        * (w.astype(_wide(w)) * 1.001).astype(jnp.bfloat16).astype(_wide(w))).astype(x.dtype),
 }
 """Programs a norm's recogniser reads almost as an RMSNorm or SwiGLU and computes otherwise (a square row,
 so every axis has the feature axis's extent)."""
@@ -696,9 +703,9 @@ def test_a_norm_is_its_mean_over_the_rows_width_alone(width):
     a divisor near the width, closer than any output of the row's dtype shows, it is no norm, and the
     compile point writes none."""
     def program(x, w):
-        widened = x.astype(jnp.float32)
+        widened = x.astype(_wide(x))
         inverse = jax.lax.rsqrt(jnp.sum(jnp.square(widened), axis=-1, keepdims=True) / width + 1e-6)
-        return (widened * inverse * w.astype(jnp.float32)).astype(x.dtype)
+        return (widened * inverse * w.astype(_wide(w))).astype(x.dtype)
 
     _, found = _norms_written(program, jax.ShapeDtypeStruct((256, 256), jnp.bfloat16),
                               jax.ShapeDtypeStruct((256,), jnp.bfloat16))
@@ -711,9 +718,9 @@ def _two_results(x):
 
 
 def _norm_of(rows, w):
-    widened = rows.astype(jnp.float32)
+    widened = rows.astype(_wide(rows))
     return (widened * jax.lax.rsqrt(jnp.mean(widened * widened, axis=-1, keepdims=True) + 1e-6)
-            * w.astype(jnp.float32)).astype(rows.dtype)
+            * w.astype(_wide(w))).astype(rows.dtype)
 
 
 def _first_normed(x, w):
@@ -731,18 +738,18 @@ def _divided_by(divisor):
     held = jnp.asarray([divisor], jnp.float32)
 
     def program(x, w):
-        widened = x.astype(jnp.float32)
+        widened = x.astype(_wide(x))
         mean = jnp.sum(widened * widened, axis=-1, keepdims=True) / held
-        return (widened * jax.lax.rsqrt(mean + 1e-6) * w.astype(jnp.float32)).astype(x.dtype)
+        return (widened * jax.lax.rsqrt(mean + 1e-6) * w.astype(_wide(w))).astype(x.dtype)
     return program
 
 
 def _permuted_statistic(x, w):
     """A row normalized by the statistic of its elements read in another order."""
     swapped = jax.lax.reshape(x, x.shape, dimensions=(1, 0))
-    widened, other = x.astype(jnp.float32), swapped.astype(jnp.float32)
+    widened, other = x.astype(_wide(x)), swapped.astype(_wide(swapped))
     inverse = jax.lax.rsqrt(jnp.mean(other * other, axis=-1, keepdims=True) + 1e-6)
-    return (widened * inverse * w.astype(jnp.float32)).astype(x.dtype)
+    return (widened * inverse * w.astype(_wide(w))).astype(x.dtype)
 
 
 def _stream_read_early(x, branch, w):
