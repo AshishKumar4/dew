@@ -289,11 +289,28 @@ def step_calibrations(directory: str, step: int) -> tuple[epath.Path, ...]:
                  if path.exists())
 
 
-def _calibrated(directory: str, weights: Weights | None = None
-                ) -> tuple[Mapping[str, object], Weights] | None:
-    """The calibration `Decide.save` wrote into the run in `directory` and the weights it was fitted on:
-    the one fitted on `weights` where it kept one (`CALIBRATIONS`), else its latest (`TASK_FILE`); None
-    where it wrote none."""
+@dataclass(frozen=True)
+class _SavedTask:
+    """A calibrated task as `Decide.save` writes it (`TASK_FILE`): the weights it was fitted on, its
+    calibration, its budget and its name, written and read by these fields alone
+    (`dew.registry.to_record`, `from_record`)."""
+
+    weights: Weights
+    calibration: Calibration
+    budget: Budget
+    name: str
+
+    def written(self) -> str:
+        """The file as a save writes it."""
+        from dew.registry import to_record
+
+        return json.dumps(to_record(self, _SavedTask), indent=1) + "\n"
+
+
+def _calibrated(directory: str, weights: Weights | None = None) -> _SavedTask | None:
+    """The calibration `Decide.save` wrote into the run in `directory`: the one fitted on `weights` where
+    it kept one (`CALIBRATIONS`), else its latest (`TASK_FILE`), read in the shapes a save writes now
+    (`_earlier_settings`); None where it wrote none."""
     from dew.registry import from_record
 
     kept = None if weights is None else _fitted_file(directory, weights)
@@ -301,7 +318,7 @@ def _calibrated(directory: str, weights: Weights | None = None
     if not saved.exists():
         return None
     settings = _earlier_settings(_records.record(json.loads(saved.read_text()), TASK_FILE))
-    return settings, from_record(Weights, _records.json_value(settings["weights"], "weights"))
+    return from_record(_SavedTask, _records.json_value(settings, TASK_FILE))
 
 
 def _earlier_settings(settings: Mapping[str, object]) -> Mapping[str, object]:
@@ -468,7 +485,7 @@ class Decide(SavedRunTask, InItsForm):
             return None
         with Checkpoints(directory) as checkpoints:
             best = checkpoints.best
-        return saved[1].step if saved[1].step == best else None
+        return saved.weights.step if saved.weights.step == best else None
 
     @classmethod
     def step_records(cls, directory: str, step: int) -> tuple[epath.Path, ...]:
@@ -516,7 +533,6 @@ class Decide(SavedRunTask, InItsForm):
         from its recorded source independently of the tokenizer that lays out the task's text.
         """
         from dew.inference.tasks import saved_model
-        from dew.registry import from_record
 
         directory, record, step = run.directory, run.record, run.step
         variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
@@ -527,21 +543,18 @@ class Decide(SavedRunTask, InItsForm):
         saved = _calibrated(directory, Weights(step, averaged))
         if saved is None:
             return task
-        settings, fitted = saved
+        fitted = saved.weights
         # An average's own directory names the runs it averages beside the step it holds (`save`).
         if (fitted.step, fitted.ema) != (step, averaged):
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
-        budget = from_record(Budget, _records.json_value(settings["budget"], "budget"))
+        budget = saved.budget
         # An options width the saved budget leaves None is the run's recorded one (`DecideSettings.options`).
         if budget.options is None:
             budget = replace(budget, options=task.budget.options)
-        return replace(task, weights=fitted,
-                       calibration=from_record(Calibration, _records.json_value(settings["calibration"],
-                                                                               "calibration")),
-                       budget=budget, name=_records.text(settings["name"], "name"))
+        return replace(task, weights=fitted, calibration=saved.calibration, budget=budget, name=saved.name)
 
     @classmethod
     def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
@@ -626,7 +639,6 @@ class Decide(SavedRunTask, InItsForm):
         any run's, whatever its layout; a directory holding another run's
         checkpoints is refused (ValueError).
         """
-        from dew.registry import to_record
 
         if self.weights is None:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
@@ -635,18 +647,15 @@ class Decide(SavedRunTask, InItsForm):
             self._claimed(directory)
             # A directory of its own, made before its calibration file is written into it.
             epath.Path(directory).mkdir(parents=True, exist_ok=True)
-        written = json.dumps({
-            "weights": to_record(self.weights, Weights),
-            "calibration": to_record(self.calibration, Calibration),
-            "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n"
+        written = _SavedTask(self.weights, self.calibration, self.budget, self.name).written()
         # The weights' own file first, kept when a later step is fitted, then the run's latest. A latest a
         # Dew that kept no file by step wrote is kept by its own weights before it is replaced.
         kept = _fitted_file(directory, self.weights)
         kept.parent.mkdir(parents=True, exist_ok=True)
         write_atomically(kept, written)
         latest = _calibrated(directory)
-        if latest is not None and not (held := _fitted_file(directory, latest[1])).exists():
-            write_atomically(held, json.dumps(latest[0], indent=1) + "\n")
+        if latest is not None and not (held := _fitted_file(directory, latest.weights)).exists():
+            write_atomically(held, latest.written())
         write_atomically(epath.Path(directory) / TASK_FILE, written)
         if self.weights.averaged:
             # The calibration file first: a save stopped before its checkpoint lands leaves a directory
@@ -656,18 +665,13 @@ class Decide(SavedRunTask, InItsForm):
     def _claimed(self, directory: str) -> None:
         """Refuse `directory` for this average (`save`) where it holds a run's checkpoints its own
         calibration file does not name as this average's: another run's weights."""
-        from dew.registry import from_record
 
         assert self.weights is not None
         with Checkpoints(directory) as checkpoints:
             if not checkpoints.committed():
                 return
-        saved = epath.Path(directory) / TASK_FILE
-        held = None
-        if saved.exists():
-            fitted = _records.record(json.loads(saved.read_text()), TASK_FILE)["weights"]
-            held = from_record(Weights, _records.json_value(fitted, "weights"))
-        if held is None or held.averaged != self.weights.averaged:
+        saved = _calibrated(directory)
+        if saved is None or saved.weights.averaged != self.weights.averaged:
             raise ValueError(f"{directory} holds a run's checkpoints other than this average, which its "
                              "calibration does not describe; save the average to a directory of its own")
 
