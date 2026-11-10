@@ -77,8 +77,9 @@ from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
     from dew.checkpoints import Resume
-    from dew.data.dataset import DataPartition, Loader
-    from dew.training._fit import Start
+    from dew.data.compile import Handed
+    from dew.data.dataset import DataPartition, Dataset, Loader
+    from dew.training._fit import FitArguments, FitPlan, Start
     from dew.training.planning import Planned
     from dew.training.trainer import Trainer
 
@@ -682,16 +683,17 @@ class AheadTarget:
 
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None, examples: int | None = None,
-                                  resume: Resume = "auto") -> CompiledAhead:
+                                  resume: Resume = "auto", plan: FitPlan | None = None) -> CompiledAhead:
         """`trainer`, built over this target's devices (`compile_only`), its first step compiled ahead
         (`compile_ahead`) and saved, as what ends the run, over the batch `fit` would start it on
-        (`first_step_batch`), at the rung the checkpoint a run resumes under `resume` left it. A run whose
+        (`first_step_batch`), at the rung the checkpoint a run resumes under `resume` left it, with its
+        evaluations' programs where `plan` is what its `fit` is asked for (`Trainer._fit_plan`). A run whose
         step reads a rollout's batches, which it makes as it trains, is refused."""
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
-        ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples, resume),
-                              self.capacity, frontier=self.frontier)
+        ahead = _compiled_ahead(trainer, first_step_batch(trainer, loader, steps, examples, resume),
+                                self.capacity, frontier=self.frontier, plan=plan)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -763,7 +765,8 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
-                                   capacity: int | None = None, *, frontier: bool = False) -> AheadOfTime:
+                                   capacity: int | None = None, *, frontier: bool = False,
+                                   fit: FitArguments | None = None) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
     mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
     (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
@@ -772,11 +775,26 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
     time the search took, and with `frontier` each rung above it that fits at fewer microbatches than
     every plan before it (`FitSearch.above`), compiled and not saved: the plans a run's speed is chosen
-    among (the module's docstring). `capacity` states bytes per GPU; absent it, memory fit is unknown rather
-    than measured. The GPU it compiles for is the one the mesh's compile-only GPUs state, as XLA compiles
-    over them: their generation and multiprocessors (`compile_only_gpus`' `multiprocessors`, `built_target`),
-    which the step's launches derive for and it records. Profiling, tuning and rollout require execution and
-    are refused."""
+    among (the module's docstring). With `fit`, what the run's `Trainer.fit` over `batch` is asked for, its
+    evaluations' programs compile with its start's (`started`). `capacity` states bytes per GPU;
+    absent it, memory fit is unknown rather than measured. The GPU it compiles for is the one the mesh's
+    compile-only GPUs state, as XLA compiles over them: their generation and multiprocessors
+    (`compile_only_gpus`' `multiprocessors`, `built_target`), which the step's launches derive for and it
+    records. Profiling, tuning and rollout require execution and are refused."""
+    return _compiled_ahead(trainer, batch, capacity, frontier=frontier,
+                           plan=None if fit is None else fit_plan(trainer, batch, fit))
+
+
+def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Dataset | Loader | Handed,
+                              fit: FitArguments) -> FitPlan:
+    """What `trainer.fit(dataset, **fit)` runs (`Trainer._fit_plan`, which states `fit`'s defaults)."""
+    return trainer._fit_plan(dataset, **fit)
+
+
+def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, capacity: int | None,
+                                     *, frontier: bool, plan: FitPlan | None) -> AheadOfTime:
+    """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
+    (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`)."""
     if capacity is not None and capacity <= 0:
         raise ValueError("compile-ahead capacity must be positive bytes per GPU")
     if trainer.host_master or trainer.rollout is not None or trainer.lower_for is not None:
@@ -819,7 +837,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     with assumed(on), uncached() if on_tpus else contextlib.nullcontext(), routes() as taken:
         target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier)
-        starts = started(trainer, start, planned)
+        starts = started(trainer, start, planned, plan)
     if missing := substituted(taken):
         _log.warning("the step compiled ahead for %s holds kernels this host cannot lower: %s", generation,
                      "; ".join(missing))
@@ -841,17 +859,18 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing), starts=starts)
 
 
-def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
-                             ) -> dict[str, Executable]:
+def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
+                             plan: FitPlan | None = None) -> dict[str, Executable]:
     """The programs a run of `trainer` compiles besides its step, compiled for the target over their
     arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_lowered`), for
     a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
     (`narrowed`), and what its steps run on their results, each called as the run calls it, over the
     step's results' shapes (`collecting`): an accumulating window's first allocation (`Trainer._window_of`),
     a split step's whole (`whole_step`), its counters (`bookkeep`), a sampled step's latest sample
-    (`latest`), its log's copies (`copied`) and its logged tokens' sum (`added_tokens`). Each by its
-    program's digest, through the kernel templates' reports as every compile is. Its evaluations compile
-    on its devices still (row 4752)."""
+    (`latest`), its log's copies (`copied`) and its logged tokens' sum (`added_tokens`), and with the plan
+    of its `fit` (`plan`), what its evaluations' warming pass compiles before they run
+    (`Trainer._warmed_ahead`; row 4752). Each by its program's digest, through the kernel templates'
+    reports as every compile is."""
     from dew.training.distributed import start_lowered
     from dew.training.narrow import narrowed
 
@@ -880,15 +899,16 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
             return lowered[-1]
         executable = report.compiled(lowered[0], relower=relower)
         return program_digest(lowered[-1]), Executable.of(executable)
-    collected = _results_programs(trainer, start, planned)
+    collected = _results_programs(trainer, start, planned, plan)
     return {**dict(map(kept, lowerings)), **{digest: Executable.of(executable)
                                              for digest, executable in collected.items()}}
 
 
-def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned
-                                       ) -> dict[str, jax.stages.Compiled]:
-    """The programs a run's steps run on their results and its state, compiled where the run's own code
-    calls them over shapes (`collecting`), by digest: `started`'s last part."""
+def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
+                                       plan: FitPlan | None) -> dict[str, jax.stages.Compiled]:
+    """The programs a run's steps run on their results and its state, and with its `fit`'s `plan` its
+    evaluations' warming pass over its first state, compiled where the run's own code calls them over
+    shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
@@ -914,4 +934,6 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
                 latest((committed.count, committed.inspected), (committed.count, committed.inspected))
             added_tokens(counted.tokens, counted.tokens)
             copied(together(moving, frozen))
+        if plan is not None:
+            trainer._warmed_ahead(plan, placed, start.shardings)
     return collected

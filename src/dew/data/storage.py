@@ -105,13 +105,6 @@ def commit_export(
     return manifest
 
 
-class TransportStats(TypedDict):
-    hits: int
-    misses: int
-    downloaded_bytes: int
-    wait_seconds: float
-
-
 def _byte_size(value: int | str) -> int:
     if isinstance(value, int):
         return value
@@ -170,7 +163,7 @@ class _PinnedReader(io.BufferedReader):
 
 
 _MIRRORS: weakref.WeakSet = weakref.WeakSet()
-"""Every mirror this process opened and still holds (`mirror_metrics`)."""
+"""Every mirror this process opened and still holds (`Mirrored`)."""
 
 
 class BoundedFileCache(WholeFileCacheFileSystem):
@@ -343,7 +336,9 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 raise TypeError("dewcache binary read returned non-bytes")
             return payload
 
-    def metrics(self) -> TransportStats:
+    def metrics(self) -> dict[str, float]:
+        """Its counters by name: the reads it served from its files and those it downloaded, the bytes it
+        downloaded and the seconds its readers waited on downloads."""
         return {
             "hits": self._dew_hits,
             "misses": self._dew_misses,
@@ -352,18 +347,38 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         }
 
 
-def mirror_metrics() -> dict[str, float]:
-    """What this process's mirrors (`dewcache::`) did, summed over every one it opened, as a run logs it
-    beside its data metrics (`data/mirror/...`, row 4299): none where it opened none."""
-    held = [mirror.metrics() for mirror in _MIRRORS]
-    if not held:
-        return {}
-    return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}
+class Mirrored:
+    """What this process's mirrors (`dewcache::`) did from a moment on (`now`), or since the process began:
+    each mirror's counters less what it held at that moment, one opened since counted whole. A run's
+    statistics count from where its reader began and a loading worker's from where its iterator began, so a
+    run logs the mirror reads it made beside its data metrics (`data/mirror/...`, row 4299), never those an
+    earlier reader of its process made (rows 5220, 5221: a run that opened no mirror logged one a test
+    before it in its process had)."""
+
+    def __init__(self, held: Mapping[BoundedFileCache, Mapping[str, float]] | None = None):
+        self._held: weakref.WeakKeyDictionary[BoundedFileCache, Mapping[str, float]] = (
+            weakref.WeakKeyDictionary(held or {}))
+
+    @classmethod
+    def now(cls) -> Mirrored:
+        """The counters from this moment on."""
+        return cls({mirror: mirror.metrics() for mirror in _MIRRORS})
+
+    def metrics(self) -> dict[str, float]:
+        """Each counter's change since the moment, summed over this process's mirrors; none where none
+        moved."""
+        moved: dict[str, float] = {}
+        for mirror in _MIRRORS:
+            held = self._held.get(mirror, {})
+            for name, value in mirror.metrics().items():
+                key = f"data/mirror/{name}"
+                moved[key] = moved.get(key, 0.0) + value - held.get(name, 0.0)
+        return moved if any(moved.values()) else {}
 
 
 MIRRORED = "dew_mirror"
 """The key under which a loading worker's position carries its process's mirror counters
-(`dew.data.readers.WorkerMirrors`): `{"process": <its process>, "counts": mirror_metrics()}`."""
+(`dew.data.readers.WorkerMirrors`): `{"process": <its process>, "counts": <its Mirrored's metrics>}`."""
 
 MIRRORS = "dew_mirrors"
 """The key under which a position that reads its loading workers' positions without keeping them (an
@@ -392,7 +407,7 @@ def carried_mirrors(state: Mapping[str, object] | Sequence[object] | None) -> di
 
 
 def _counted(counts: object) -> dict[str, float]:
-    """Mirror counters as a position carries them (`mirror_metrics`), by name."""
+    """Mirror counters as a position carries them (`Mirrored`), by name."""
     if not isinstance(counts, Mapping):
         raise ValueError(f"a position's mirror counters are a mapping, not {counts!r}")
     return {str(name): float(value) for name, value in counts.items()}

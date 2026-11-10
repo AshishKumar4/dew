@@ -287,14 +287,16 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15
 # compiler the GPU runs, XLA's CUDA backend of Dew's PJRT plugin (jax-cuda12-pjrt) for a compile-only
 # device (the Triton it builds, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels
 # compile through too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no
-# accelerator: locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
-# (tools/lock_environment.sh).
+# accelerator, with Dew's kernel wheels, whose FFI targets a GPU program's lowering reads (dew-cutlass's .so
+# links the CUDA runtime alone, so it loads with no GPU): locks/cpu.txt takes this extra, and a GPU host's lock
+# has its own CUDA plugin already (tools/lock_environment.sh).
 kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post73; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "jax-cuda12-pjrt==0.12.0.1.post73; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "dew-flash-attn-cu12~=0.3.8; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "dew-cutlass-cu12~=0.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-runtime-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install

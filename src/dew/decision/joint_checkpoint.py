@@ -24,8 +24,9 @@ from dew._files import write_atomically
 from dew.batch import unboxed
 from dew.decision.calibration import Calibration
 from dew.decision.formats import beyond_default
+from dew.decision.inputs import DecisionInputs
 from dew.decision.laya import IN_PROJ
-from dew.decision.layout import DecisionInputs, Layout
+from dew.decision.layout import Layout
 from dew.interop.releases import HeadFiles
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.sharding import abstract

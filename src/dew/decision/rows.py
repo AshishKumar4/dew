@@ -19,6 +19,7 @@ from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
 from dew.decision.data import Example, GroupedExamples
 from dew.decision.head import Head
+from dew.decision.inputs import compacted, labelled_rows, question_owners
 from dew.decision.layout import (
     OPTIONS,
     QUESTION_FIELDS,
@@ -28,11 +29,8 @@ from dew.decision.layout import (
     QuestionField,
     QuestionLayout,
     Specials,
-    compacted,
     context_tokens,
-    labelled_rows,
     question_fields,
-    question_owners,
     with_context,
 )
 from dew.decision.questions import Choice, Question

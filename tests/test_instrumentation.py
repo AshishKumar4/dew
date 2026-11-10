@@ -222,32 +222,85 @@ def a_fused_attention_counts_the_pairs_its_mask_computes(window):
     assert both is not None and (both.model, both.hardware) == ((2 + 4) * product, (2 + 4 + 1) * product)
 
 
-def test_a_fused_attention_counts_its_value_product_at_the_values_width():
-    """`Q K^T` and its two backward products run at the query's width, `P V` and its two at the
-    value's, which a model may set apart (MiMo's 192 and 128): FlashAttention-3's forward and
-    backward calls, as the wheel issues them, count each product at its own width, and the
-    backward's recomputed `Q K^T` in the hardware's count alone."""
-    batch, length, heads, query_width, value_width = 1, 64, 2, 192, 128
-    module = f"""HloModule step
+def _flash_module(target, stated, *, length=64, heads=2, query_width=192, value_width=128) -> str:
+    """A module of one call to FlashAttention's `target` as the wheel states its operands (`stated`,
+    `dew_flash_attn.TARGETS`): what comes before its query (a backward's output gradient), then the
+    query, key and value, batched `[1, length, heads, width]`, or packed `[length, heads, width]`
+    between two arrays of cumulative offsets."""
+    batched = "" if stated.packed else "1,"
+    layout = "{2,1,0}" if stated.packed else "{3,2,1,0}"
+    widths = [value_width] * stated.query + [query_width, query_width, value_width]
+    arrays = [f"bf16[{batched}{length},{heads},{width}]{layout}" for width in widths]
+    offsets = ["s32[2]{0}", "s32[2]{0}"] if stated.packed else []
+    parameters = "\n".join(f"  %a{index} = {array} parameter({index})"
+                           for index, array in enumerate(arrays + offsets))
+    operands = ", ".join(f"%a{index}" for index in range(len(arrays) + len(offsets)))
+    return f"""HloModule step
 
-ENTRY %main (q: bf16[1,64,2,192], k: bf16[1,64,2,192], v: bf16[1,64,2,128], g: bf16[1,64,2,128]) -> f32[] {{
-  %q = bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}} parameter(0)
-  %k = bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}} parameter(1)
-  %v = bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}} parameter(2)
-  %g = bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}} parameter(3)
-  %fwd = (bf16[{batch},{length},{heads},{value_width}]{{3,2,1,0}}) custom-call(%q, %k, %v), \
-custom_call_target="dew_flash3_mha_fwd", api_version=API_VERSION_TYPED_FFI
-  %bwd = (bf16[{batch},{length},{heads},{query_width}]{{3,2,1,0}}) custom-call(%g, %q, %k, %v), \
-custom_call_target="dew_flash3_mha_bwd", api_version=API_VERSION_TYPED_FFI
+ENTRY %main () -> f32[] {{
+{parameters}
+  %call = ({arrays[stated.query]}) custom-call({operands}), custom_call_target="{target}", \
+api_version=API_VERSION_TYPED_FFI
   ROOT %zero = f32[] constant(0)
 }}
 """
+
+
+def test_a_fused_attention_counts_its_value_product_at_the_values_width():
+    """`Q K^T` and its two backward products run at the query's width, `P V` and its two at the
+    value's, which a model may set apart (MiMo's 192 and 128): each of FlashAttention's batched
+    calls, as the wheel states its operands, counts each product at its own width, and a backward's
+    recomputed `Q K^T` in the hardware's count alone."""
+    flash = pytest.importorskip("dew_flash_attn")
+    length, heads, query_width, value_width = 64, 2, 192, 128
+    product = 2 * heads * length * length
+    batched = {target: stated for target, stated in flash.TARGETS.items() if not stated.packed}
+    assert {stated.backward for stated in batched.values()} == {False, True}
+    for target, stated in batched.items():
+        counted = hlo_flops(_flash_module(target, stated))
+        assert counted is not None and counted.unsized == 0, target
+        assert counted.model == (2 if stated.backward else 1) * product * (query_width + value_width), target
+        # The backward recomputes its scores, `Q K^T` at the query's width, the hardware's work alone.
+        assert counted.hardware == counted.model + stated.backward * product * query_width, target
+
+
+def test_a_packed_attention_is_counted_as_unsized_work_never_as_zero():
+    """A FlashAttention call over packed sequences reads their lengths from cumulative offsets at run
+    time, so no shape in the module states its pairs: each such call the wheel states is an unsized
+    launch, and the utilizations it leaves are lower bounds, never a count of zero work for it."""
+    flash = pytest.importorskip("dew_flash_attn")
+    packed = {target: stated for target, stated in flash.TARGETS.items() if stated.packed}
+    assert {stated.backward for stated in packed.values()} == {False, True}
+    for target, stated in packed.items():
+        counted = hlo_flops(_flash_module(target, stated))
+        assert counted is not None and (counted.model, counted.hardware, counted.unsized) == (0, 0, 1), target
+        assert set(counted.utilizations(1, 1.0, peak=1.0)) == {"train/unsized_kernels"}, target
+
+
+def test_a_library_call_is_counted_by_what_its_target_computes():
+    """XLA's library calls are counted by what each target computes: cuDNN's F8 attention backward as a
+    backward, its four products and the recomputed one; a CUB sort as no matmul, sized at zero; and a
+    cuBLAS triangular solve, which is no GEMM, as unsized rather than as a product of its shapes."""
+    module = """HloModule step
+
+ENTRY %main () -> f32[] {
+  %q = f8e4m3fn[1,64,2,128]{3,2,1,0} parameter(0)
+  %k = f8e4m3fn[1,64,2,128]{3,2,1,0} parameter(1)
+  %v = f8e4m3fn[1,64,2,128]{3,2,1,0} parameter(2)
+  %a = f32[32,32]{1,0} parameter(3)
+  %b = f32[32,8]{1,0} parameter(4)
+  %keys = u32[1024]{0} parameter(5)
+  %backward = (bf16[1,64,2,128]{3,2,1,0}) custom-call(%q, %k, %v), \
+custom_call_target="__cudnn$fmhaSoftmaxBackwardF8"
+  %sorted = (u32[1024]{0}, u8[4096]{0}) custom-call(%keys), custom_call_target="xla.gpu.ext.cub_sort_keys"
+  %solved = (f32[32,8]{1,0}, s8[1024]{0}) custom-call(%a, %b), custom_call_target="__cublas$triangularSolve"
+  ROOT %zero = f32[] constant(0)
+}
+"""
     counted = hlo_flops(module)
+    product = 2 * 2 * 64 * 64 * 128
     assert counted is not None
-    product = 2 * batch * heads * length * length
-    assert counted.model == (1 + 2) * product * (query_width + value_width)
-    # The backward recomputes its scores, `Q K^T` at the query's width, the hardware's work alone.
-    assert counted.hardware == counted.model + product * query_width
+    assert (counted.model, counted.hardware, counted.unsized) == (4 * product, 5 * product, 1)
 
 
 UNSIZED = """HloModule step
@@ -545,7 +598,8 @@ def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
 def test_a_collectives_device_groups_are_read_in_every_form_xla_prints():
     """Each form a CPU step's compiled HLO prints a collective's groups in, read as the positions
     in the device assignment that take part together: listed, an iota laid out and transposed,
-    over a mesh's named axes, a permute's pairs, and every device at once."""
+    over a mesh's named axes, a permute's pairs, and every device at once; a collective-reduce's
+    as any collective's."""
     from dew.telemetry.instrumentation import hlo_instructions
 
     module = """ENTRY %main (p: f32[8]) -> f32[8] {
@@ -554,10 +608,12 @@ def test_a_collectives_device_groups_are_read_in_every_form_xla_prints():
   %named = f32[8]{0} all-gather(f32[2]{0} %p), replica_groups=mesh['fsdp'=4,'sequence'=2] {'fsdp'}
   %pairs = f32[8]{0} collective-permute(f32[8]{0} %p), source_target_pairs={{1,0},{3,2},{5,4},{7,6}}
   %every = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups={}
+  %reduced = f32[8]{0} collective-reduce(f32[8]{0} %p), replica_groups={{0,1,2,3},{4,5,6,7}}
 }"""
     assert {name: instruction.groups for name, instruction in hlo_instructions(module).items()} == {
         "listed": ((0, 1), (4, 5), (2, 3), (6, 7)),
         "iota": ((0, 4), (2, 6), (1, 5), (3, 7)),
         "named": ((0, 2, 4, 6), (1, 3, 5, 7)),
         "pairs": ((1, 0), (3, 2), (5, 4), (7, 6)),
-        "every": ()}
+        "every": (),
+        "reduced": ((0, 1, 2, 3), (4, 5, 6, 7))}

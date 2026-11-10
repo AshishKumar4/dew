@@ -19,15 +19,8 @@ from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
-from dew.decision.layout import (
-    OPTION_TILE,
-    Bounds,
-    DecisionInputs,
-    Layout,
-    QuestionLayout,
-    Specials,
-    default_layout,
-)
+from dew.decision.inputs import OPTION_TILE, DecisionInputs
+from dew.decision.layout import Bounds, Layout, QuestionLayout, Specials, default_layout
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import (

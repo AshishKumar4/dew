@@ -1561,6 +1561,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None
 
+    def _reports_by_program(self, *, loss: bool, evaluate: bool) -> bool:
+        """Whether `_validation_report` with these flags runs the objective's programs alone (`program`):
+        its loss, or its loss and scores together (`_validation_scores`), which a run compiled ahead
+        compiles over shapes (`dew.training.evaluation.warmed_ahead`); an `evaluate` of its own may read
+        the batch on the host."""
+        return not evaluate or (loss and self._validation_scores is not None)
+
     @property
     def _compiled_scores(self) -> Callable[..., TokenScores]:
         """`_evaluation_scores` compiled for the current modules. Run op by op, the

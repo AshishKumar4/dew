@@ -396,8 +396,8 @@ def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the
     """A JEPA run whose encoder record states no dtype computes in the dtype its numerics derive
     (`numerics_fields`: bfloat16 for bf16-mixed, float16 for 16-mixed), and its predictor computes in that
     dtype and with that attention kernel too, as its configuration promises: read off the built encoder,
-    where its record states none (row 3027, a predictor left at float32 beside a bfloat16 encoder). Its
-    own width and depth stay the predictor's."""
+    where its record states none (row 3027, a predictor left at float32 beside a bfloat16 encoder). It
+    takes its encoder's width, heads and MLP ratio; its own width and depth stay the predictor's."""
     import jax.numpy as jnp
 
     from dew.config import TrainerConfig
@@ -419,6 +419,8 @@ def test_a_jepa_runs_predictor_computes_as_its_encoder_where_the_run_derives_the
     assert objective.predictor.attention_impl == objective.encoder.attention_impl == "xla"
     assert (objective.predictor.num_layers, objective.predictor.predictor_features) == (1, 8)
     assert objective.predictor.emb_features == objective.encoder.emb_features == 16
+    # The options its encoder marks as shared (`FROM_ENCODER`), each set off its class's default here.
+    assert (objective.predictor.num_heads, objective.predictor.mlp_ratio) == (2, 2)
 
 
 def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_updates(tmp_path):

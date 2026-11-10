@@ -8,7 +8,7 @@ import jax.numpy as jnp
 
 from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head
-from dew.decision.layout import DecisionInputs
+from dew.decision.inputs import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.progress import END, Progress, ReadsProgress, progressed

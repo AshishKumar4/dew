@@ -33,7 +33,7 @@ from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import COUNTERS, FILE_SHARDS, IN_ORDER, Plan, earlier_position, read_otherwise_at_11
 from dew.data.shared import SharedMapping
-from dew.data.storage import MIRRORED, PositionText, carried_mirrors, mirror_metrics
+from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
 """A batch's fields its reader owns, which a host step after the batch neither reads nor writes
@@ -141,10 +141,10 @@ class _Published:
 
 
 class WorkerMirrors(pygrain.IterDataset[Batch]):
-    """A loading worker's rows as they are, its position carrying what its own process's mirrors did
-    (`mirror_metrics`): Grain's worker queue hands the reading process each row's position, and the
-    reading process sees no worker's mirror itself, so a run's statistics count a worker's mirror reads
-    from the position its reader last published (`_Statistics`, row 4339)."""
+    """A loading worker's rows as they are, its position carrying what its own process's mirrors did since
+    its iterator began (`Mirrored`): Grain's worker queue hands the reading process each row's position,
+    and the reading process sees no worker's mirror itself, so a run's statistics count a worker's mirror
+    reads from the position its reader last published (`_Statistics`, row 4339)."""
 
     def __init__(self, parent: pygrain.IterDataset[Batch]):
         super().__init__(parent)
@@ -160,13 +160,15 @@ class _WorkerMirrorsIterator(pygrain.DatasetIterator[Batch]):
         self._read = parent
         # This process's one iterator, named apart from every other worker's and a later one's.
         self._process = f"{os.getpid()}:{uuid.uuid4().hex}"
+        # Its own reads alone: a worker forked from a process that read through a mirror holds its counts.
+        self._mirrored = Mirrored.now()
 
     def __next__(self) -> Batch:
         return next(self._read)
 
     def get_state(self) -> Mapping[str, object]:
         return {"parent": self._read.get_state(),
-                MIRRORED: {"process": self._process, "counts": mirror_metrics()}}
+                MIRRORED: {"process": self._process, "counts": self._mirrored.metrics()}}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         # A position a worker saved before it carried its mirrors' counters is its rows' alone (row 4339).
@@ -353,6 +355,8 @@ class _Statistics:
         self._published: list[_PublishedCounts] = []
         # A global-order read's positions, read for its loading workers' mirrors alone (`mirrored`).
         self._mirrored: list[_PublishedCounts] = []
+        # What this process's mirrors do from the run's start, not an earlier reader's (rows 5220, 5221).
+        self._own = Mirrored.now()
 
     def observe(self, stream: _PerShare) -> None:
         self._published.append(stream._statistics)
@@ -371,9 +375,9 @@ class _Statistics:
         read = {name: counts for published in self._published for name, counts in published.counts.items()}
         merged = {name: counts.followed(read.pop(name)) if name in read else counts
                   for name, counts in self._counts.items()}
-        # What this process's mirrors did beside them (`mirror_metrics`, row 4299), and each loading
-        # worker's, which its readers' positions carried (`WorkerMirrors`, row 4339).
-        mirrored = [mirror_metrics(), *(counts for published in (*self._published, *self._mirrored)
+        # What this process's mirrors did since the run began beside them (`Mirrored`, row 4299), and each
+        # loading worker's, which its readers' positions carried (`WorkerMirrors`, row 4339).
+        mirrored = [self._own.metrics(), *(counts for published in (*self._published, *self._mirrored)
                                         for process, counts in published.mirrors.items()
                                         if not process.startswith(f"{os.getpid()}:"))]
         summed: dict[str, float] = {}

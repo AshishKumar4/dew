@@ -90,7 +90,8 @@ from dew.registry import (
 from dew.state import TrainState
 from dew.telemetry.profile import CaptureOptions
 from dew.telemetry.records import RunRecord, TrialFinished, packages_installed, tracker_json
-from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
+from dew.training._fit import FitArguments
+from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead, fit_plan
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
 from dew.training.cadence import Counted
 from dew.training.cooldown import Cooldowns
@@ -1976,8 +1977,20 @@ class RunConfig:
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
+        # What `fit` is asked for but its resume, which a run compiled ahead compiles its evaluations from.
+        fitted = FitArguments(
+            # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
+            steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
+            examples=dataset.examples if steps is None else None,
+            eval_every=trainer.eval_interval(dataset), checkpoint_every=trainer.checkpoint_interval(dataset),
+            checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
+            metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+            best=trainer.best_policies(), stop=trainer.stop, restore_best=trainer.restore_best,
+            cooldowns=trainer.cooldowns,
+            # A run that names no metrics and validates no split has no suite to score.
+            validation=validation if suites is None else suites or None, summaries=self.val_summaries)
         if trainer.compile_ahead is not None:
-            raise self.compiled_ahead(objective, dataset, steps, rollout, name)
+            raise self.compiled_ahead(objective, dataset, steps, rollout, name, fitted)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -2014,19 +2027,7 @@ class RunConfig:
             self._agree_resume(checkpoints, built, dataset, steps)
             agreed("run metadata", record_run)
             with self.traced():
-                state = built.fit(
-                    # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
-                    dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
-                    examples=dataset.examples if steps is None else None,
-                    eval_every=trainer.eval_interval(dataset),
-                    checkpoint_every=trainer.checkpoint_interval(dataset),
-                    checkpoint_final=trainer.checkpoint_final, scored_to=trainer.scored_to,
-                    metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
-                    best=trainer.best_policies(), stop=trainer.stop, restore_best=trainer.restore_best,
-                    cooldowns=trainer.cooldowns, resume=trainer.resume,
-                    # A run that names no metrics and validates no split has no suite to score.
-                    validation=validation if suites is None else suites or None,
-                    summaries=self.val_summaries)
+                state = built.fit(dataset, resume=trainer.resume, **fitted)
                 if after is not None:
                     after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
@@ -2054,23 +2055,25 @@ class RunConfig:
             yield
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
-                                         steps: int | None, rollout: Rollout | None,
-                                         name: str) -> CompiledAhead:
+                                         steps: int | None, rollout: Rollout | None, name: str,
+                                         fitted: FitArguments | None = None) -> CompiledAhead:
         """The run's first step compiled for its `compile_ahead` target and saved
         (`AheadTarget.compiled`), its trainer built as `train` builds it, its links the run's own, over
         that target's compile-only devices (`AheadTarget.compile_only`), with no tracker: what ends a run
-        that compiles ahead. A run `name` whose directory holds its checkpoints reads them, and compiles the
-        step its resume takes; one that has none writes none."""
+        that compiles ahead, with its evaluations' programs where `fitted` is what `train` hands `fit`.
+        Its checkpointer is the run `name`'s own, as its fit is planned with one (a `Pause` its
+        checkpoints resume, a validation loss that ranks them): a directory that holds checkpoints is
+        read, the step its resume takes compiled, and one that holds none is asked and not created
+        (`Checkpoints.latest`)."""
         target = self.trainer.compile_ahead
         assert target is not None
         mesh = self.trainer.mesh.build(target.compile_only())
-        held = epath.Path(self.trainer.directory(name)).is_dir()
-        trainer = self.built(objective, mesh, rollout,
-                             checkpoints=self.trainer.checkpoints(name) if held else None)
+        trainer = self.built(objective, mesh, rollout, checkpoints=self.trainer.checkpoints(name))
         with self.traced():
+            plan = None if fitted is None else fit_plan(trainer, dataset, fitted)
             # The run's bound in examples as its data was compiled to it (`viewed`).
             return target.compiled(trainer, dataset, steps, dataset.examples if steps is None else None,
-                                   self.trainer.resume)
+                                   self.trainer.resume, plan)
 
     def viewed(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
                rollout: Rollout | None = None,

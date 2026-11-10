@@ -18,17 +18,21 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-# NCCL names its kernels after the collective it runs:
-# `ncclDevKernel_AllGather_RING_LL`, `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`,
-# `ncclDevKernel_SendRecv` (collective-permute and all-to-all), and the same
-# with `ncclKernel_` before NCCL 2.19.
-NCCL_COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
+NCCL_COLLECTIVES = (
+    "Broadcast", "Reduce", "AllGather", "AllGatherV", "ReduceScatter", "AllReduce", "SendRecv")
+"""The collectives NCCL names its kernels after (`ncclDevKernel_AllGather_RING_LL`,
+`ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`, `ncclDevKernel_SendRecv` for a collective-permute and an
+all-to-all; `ncclKernel_` before NCCL 2.19). NCCL states them in its build alone, so they are read from its
+source at v2.32.3-1, the release the GPU locks install: src/device/generate.py's `all_colls`."""
 
 COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "ragged-all-to-all",
-               "collective-broadcast", "collective-permute", "send", "recv")
-"""The HLO ops that move data between devices. XLA runs some as an async
-pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
-computation that holds the op itself."""
+               "collective-broadcast", "collective-permute", "collective-reduce", "send", "recv")
+"""The HLO ops that move data between devices, as XLA prints them. XLA runs some as an async pair,
+`<op>-start` and `<op>-done`, and wraps others in `async-start` over a computation that holds the op
+itself. jaxlib states an op's opcode (`HloOpcode`) but neither its printed name nor which ones communicate,
+so they are read from XLA's source at d867969800d4 (the revision jaxlib 0.12.0.1 builds):
+xla/hlo/utils/hlo_query.cc's `IsCollectiveCommunicationOp` and the send and recv its async
+collectives take (`IsAsyncCollectiveStartOp`), each spelled as xla/hlo/ir/hlo_opcode.h prints it."""
 
 
 def collective(op: str) -> str | None:

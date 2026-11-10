@@ -35,7 +35,8 @@ from dew.decision import (
     StateFirstLayout,
 )
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
-from dew.decision.layout import OPTION_TILE, QUESTION_FIELDS, DecisionInputs, Labels, compacted
+from dew.decision.inputs import OPTION_TILE, DecisionInputs, compacted
+from dew.decision.layout import QUESTION_FIELDS, Labels
 from dew.decision.rows import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained

@@ -42,12 +42,11 @@ from dew.decision.calibration import (
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
+from dew.decision.inputs import OPTION_TILE, DecisionInputs
 from dew.decision.laya import LAYA
 from dew.decision.layout import (
-    OPTION_TILE,
     QUESTION_FIELDS,
     Bounds,
-    DecisionInputs,
     Encoded,
     Laid,
     Layout,
@@ -421,7 +420,7 @@ class Decide(SavedRunTask, InItsForm):
     def released(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
         """The declared decision task over the bundle's own tree, its projections as the model holds
         them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
-        model = DecisionModel(bundle.model, bundle.head)
+        model = DecisionModel(bundle.model, bundle.head, bundle.context_encoder)
         variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
         # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,

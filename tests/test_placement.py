@@ -198,3 +198,30 @@ def test_a_pipelines_state_and_load_are_placed_by_their_declared_axes_and_load_a
         key = jax.tree_util.keystr(path)
         assert leaf.sharding.spec == trained[key].spec and leaf.sharding.memory_kind == "device", key
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(whole), err_msg=key)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_pipelines_frozen_language_tower_is_split_as_its_draw_declares(tmp_path):
+    """Qwen-Image's frozen language tower, held under its encoder's `text_encoder`, is placed by the axes
+    its draw declares, its heads and MLP split over the tensor axis, as the layout's invariants hold them,
+    not by the shape heuristic, which splits nothing over tensor (row 4407: the tower's table named its
+    parameters by paths its held tree lays out otherwise, so none of them was found)."""
+    from pathlib import Path
+
+    from diffusion_support import source_objective
+    from interop_support import extract_fixture
+
+    from dew.mesh import TENSOR_AXIS
+
+    source = extract_fixture(Path(__file__).with_name("fixtures") / "qwen_image_source.tar.xz", tmp_path)
+    _, objective = source_objective(source)
+    mesh = LAYOUT.build(jax.devices()[:8])
+    trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
+                      layout=Layout(min_shard=MIN_SHARD), tracker=None)
+    trainer.device_mesh = mesh
+    state = jax.eval_shape(trainer.initial_state)
+    placed = trainer.shardings(state)
+    assert_placed("qwen-image", state.variables, placed.variables, mesh, objective.parameter_axes)
+    tower = [sharding for path, sharding in jax.tree_util.tree_leaves_with_path(placed.variables)
+             if "text_encoder" in jax.tree_util.keystr(path)]
+    assert tower and any(TENSOR_AXIS in mesh_axes(entry) for sharding in tower for entry in sharding.spec)

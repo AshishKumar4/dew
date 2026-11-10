@@ -13,6 +13,8 @@ matmul (docs/research/benchmark-parity.md:5-9,93-102).
 """
 
 import functools
+import importlib
+import importlib.util
 import json
 import math
 import re
@@ -21,7 +23,7 @@ import threading
 import weakref
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import jax
 import numpy as np
@@ -139,18 +141,106 @@ def _buffers(shape: str) -> tuple[int, ...]:
     return tuple(found)
 
 
-_CUSTOM_CALLS = (
-    ("gemm", re.compile(r'^__cublas')),
-    ("convolution", re.compile(r'^__cudnn\$conv')),
-    ("attention", re.compile(r'^__cudnn\$fmha|^dew_flash3?_mha')),
-    ("grouped_gemm", re.compile(r'^dew_cutlass_grouped_gemm')),
-    ("triton", re.compile(r'^__gpu\$xla\.gpu\.triton$')),
-    ("mosaic_gpu", re.compile(r'^mosaic_gpu(_v\d+)?$')),
-    ("mosaic_tpu", re.compile(r'^tpu_custom_call$')),
-    ("no_matmul", re.compile(r'^(Sharding|SPMD(FullToShard|ShardToFull)Shape|annotate_device_placement'
-                             r'|MoveTo(Device|Host)|xla\.sdy\.|GetRngSeed|cu_threefry2x32|TopK|__cub\$'
-                             r'|xla_(ffi_)?python_)')),
-)
+class Attention(Protocol):
+    """What a fused attention's call states of its operands, as a FlashAttention wheel's targets state it
+    (`dew_flash_attn.TARGETS`): where its query sits among them (a backward's first is the output's
+    gradient), whether it runs the backward, and whether its sequences lie between cumulative offsets
+    given at run time (`packed`), whose pairs no shape states."""
+
+    @property
+    def query(self) -> int: ...
+
+    @property
+    def backward(self) -> bool: ...
+
+    @property
+    def packed(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class _Fused:
+    """cuDNN's fused attention, as XLA calls it: its query, key and value first, batched `[B, S, H, D]`."""
+
+    backward: bool
+    query: int = 0
+    packed: bool = False
+
+
+@dataclass(frozen=True)
+class _Call:
+    """What one custom-call target computes (`custom_call_kind`), with the facts its reader needs: a fused
+    attention's operands, a cuDNN convolution's direction (`forward`, `input`, `filter`: which gradient,
+    if any, it computes)."""
+
+    kind: str
+    attention: Attention | None = None
+    direction: str = "forward"
+
+
+_XLA_CALLS: dict[str, _Call] = {
+    **{target: _Call("gemm") for target in (
+        "__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f8", "__cublas$lt$matmul$mx")},
+    **{target: _Call("convolution", direction=direction) for target, direction in (
+        ("__cudnn$convForward", "forward"), ("__cudnn$convBiasActivationForward", "forward"),
+        ("__cudnn$convForwardGraph", "forward"), ("__cudnn$convBackwardInput", "input"),
+        ("__cudnn$convBackwardFilter", "filter"))},
+    **{target: _Call("attention", _Fused(backward)) for target, backward in (
+        ("__cudnn$fmhaSoftmax", False), ("__cudnn$fmhaSoftmaxF8", False),
+        ("__cudnn$fmhaSoftmaxDropout", False),
+        ("__cudnn$fmhaScaleBiasSoftmax", False), ("__cudnn$fmhaScaleBiasSoftmaxDropout", False),
+        ("__cudnn$fmhaSoftmaxBackward", True), ("__cudnn$fmhaSoftmaxBackwardF8", True),
+        ("__cudnn$fmhaSoftmaxDropoutBackward", True), ("__cudnn$fmhaScaleBiasSoftmaxBackward", True),
+        ("__cudnn$fmhaScaleBiasSoftmaxDropoutBackward", True))},
+    **{target: _Call("no_matmul") for target in (
+        "__cudnn$norm", "__cudnn$convReorderFilter", "__cudnn$convReorderFilterAndBias",
+        "xla.gpu.ext.cub_sort_unassigned_scratch_size", "xla.gpu.ext.cub_sort_pairs",
+        "xla.gpu.ext.cub_sort_keys", "xla.gpu.ext.cub_scan_unassigned_scratch_size", "xla.gpu.ext.cub_scan",
+        "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape", "annotate_device_placement",
+        "MoveToHost", "MoveToDevice", "PinToDevice", "TopK",
+        "xla.sdy.FuncResultSharding", "xla.sdy.ShardingGroup", "xla.sdy.PropagationBarrier",
+        "xla.sdy.GlobalToLocalShape", "xla.sdy.LocalToGlobalShape",
+        "xla_python_cpu_callback", "xla_ffi_python_cpu_callback", "xla_python_gpu_callback",
+        "xla_ffi_python_gpu_callback")},
+}
+"""The custom-call targets XLA states, each by what it computes. XLA names them in C++ alone, so they are
+read from its source at d867969800d4 (the revision jaxlib 0.12.0.1 builds): xla/service/gpu/cublas_cudnn.h's
+cuBLAS, cuDNN and CUB targets, xla/service/memory_annotations.h's placements,
+xla/service/spmd/shardy/constants.h's sharding marks, Shardy's round trip and the Python callbacks,
+xla/service/topk_rewriter.cc's "TopK". A target this table and its owners' (`_calls`) do not hold, a
+cuBLAS triangular solve or grouped matmul and cuDNN's block-scaled dot among them, is one nothing here
+sizes. A fused attention's backward reads its query first; an F8 attention's form is its own target."""
+
+_JAX_CALLS: dict[str, _Call] = {
+    "mosaic_gpu_v2": _Call("mosaic_gpu"),
+    "tpu_custom_call": _Call("mosaic_tpu"),
+    **{target: _Call("no_matmul") for target in (
+        "cu_threefry2x32_ffi", "hip_threefry2x32_ffi", "xla_buffer_python_cpu_callback",
+        "xla_buffer_python_gpu_callback", "AllocateBuffer")},
+}
+"""The custom-call targets JAX's lowerings write as literals, no constant of JAX's stating them (Dew's fork
+of JAX 0.12.0.1): jax/experimental/mosaic/gpu/core.py's Mosaic GPU kernel, jax/_src/tpu_custom_call.py's
+Mosaic TPU kernel, jax/_src/random/threefry2x32.py's random bits, jax/_src/buffer_callback.py's callbacks and
+jax/_src/lax/lax.py's `lax.empty`. Triton's target JAX states, and `_calls` reads it."""
+
+
+@functools.cache
+def _calls() -> dict[str, _Call]:
+    """Every custom-call target this count knows, by what it computes: XLA's (`_XLA_CALLS`), JAX's
+    (`_JAX_CALLS`, Triton's from JAX's own constant) and those of Dew's kernel wheels where installed,
+    each stating its own (`dew_cutlass.TARGETS`, `dew_flash_attn.TARGETS`); a wheel this process lacks
+    states none, and its calls go unsized."""
+    from jax.experimental.pallas.triton import CUSTOM_CALL_TARGET_NAME
+
+    calls = {**_XLA_CALLS, **_JAX_CALLS, CUSTOM_CALL_TARGET_NAME: _Call("triton")}
+    if importlib.util.find_spec("dew_cutlass") is not None:
+        cutlass = importlib.import_module("dew_cutlass")
+        calls.update({target: _Call("grouped_gemm") for target in cutlass.TARGETS})
+    if importlib.util.find_spec("dew_flash_attn") is not None:
+        targets: Mapping[str, Attention] = importlib.import_module("dew_flash_attn").TARGETS
+        calls.update({target: _Call("packed_attention" if stated.packed else "attention", stated)
+                      for target, stated in targets.items()})
+    return calls
+
 
 PALLAS = ("triton", "mosaic_gpu", "mosaic_tpu")
 """The kinds of custom call a Pallas kernel lowers to, whose work is the cost the kernel states."""
@@ -329,18 +419,20 @@ def _window(attributes: str) -> dict[str, list[int]]:
 
 
 def _dot_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]],
-               contracting: tuple[int, ...]) -> float:
-    """Every output element costs one multiply-add per contracted element."""
+               contracting: tuple[int, ...]) -> float | None:
+    """Every output element costs one multiply-add per contracted element; None where the module states
+    no shape for its first operand."""
     lhs = shapes.get(instruction.operands[0]) if instruction.operands else None
     if lhs is None:
-        return 0.0
+        return None
     contracted = math.prod(lhs[axis] for axis in contracting if axis < len(lhs))
     return _MAC * math.prod(instruction.dims) * contracted
 
 
 def _convolution_flops(instruction: _Instruction,
-                       shapes: dict[str, tuple[int, ...]]) -> float:
-    """Output elements times the kernel window times the input features.
+                       shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """Output elements times the kernel window times the input features; None where the module states
+    no shape for its input or no dim_labels.
 
     Dividing by the input dilation counts a strided convolution's gradient at
     the multiply-adds its forward pass costs: the dilated positions are zeros,
@@ -349,7 +441,7 @@ def _convolution_flops(instruction: _Instruction,
     lhs = shapes.get(instruction.operands[0]) if instruction.operands else None
     labels = _LABELS.search(instruction.attributes)
     if lhs is None or labels is None:
-        return 0.0
+        return None
     features = lhs[labels.group(1).split('_')[0].index('f')]
     window = _window(instruction.attributes)
     groups = _GROUPS.search(instruction.attributes)
@@ -359,17 +451,18 @@ def _convolution_flops(instruction: _Instruction,
     return _MAC * macs
 
 
-def _grouped_gemm_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float:
+def _grouped_gemm_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float | None:
     """A CUTLASS grouped GEMM's call (`dew_cutlass_grouped_gemm`, and `_k`'s weight gradient): each row of
     its first operand, the tokens, multiplies its features into the result's last axis once, whichever
-    group holds it."""
+    group holds it; None where the module states no shape for the tokens."""
     tokens = shapes.get(instruction.operands[0]) if instruction.operands else None
-    return 0.0 if tokens is None else _MAC * math.prod(tokens) * instruction.dims[-1]
+    return None if tokens is None else _MAC * math.prod(tokens) * instruction.dims[-1]
 
 
-def _cudnn_convolution_flops(target: str, instruction: _Instruction,
-                             shapes: dict[str, tuple[int, ...]]) -> float:
-    """A cuDNN convolution call, at the multiply-adds of its forward shape.
+def _cudnn_convolution_flops(direction: str, instruction: _Instruction,
+                             shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """A cuDNN convolution call computing `direction` (`_Call.direction`), at the multiply-adds of its
+    forward shape; None where the module states no shape for an operand it reads or no dim_labels.
 
     XLA keeps the forward convolution's window and dim_labels on all three
     kinds, so each reduces to the same product `B Ho Wo O Kh Kw I / groups`
@@ -381,26 +474,19 @@ def _cudnn_convolution_flops(target: str, instruction: _Instruction,
     rhs = shapes.get(instruction.operands[1]) if len(instruction.operands) > 1 else None
     labels = _LABELS.search(instruction.attributes)
     if lhs is None or rhs is None or labels is None:
-        return 0.0
+        return None
     lhs_labels, output_labels = labels.group(1).split('_')[0], labels.group(1).split('->')[1]
     kernel = math.prod(_window(instruction.attributes)['size'])
     groups = _GROUPS.search(instruction.attributes)
     dims = instruction.dims
-    if 'BackwardInput' in target:
+    if direction == 'input':
         macs = math.prod(lhs) * kernel * dims[lhs_labels.index('f')]
-    elif 'BackwardFilter' in target:
+    elif direction == 'filter':
         outputs = rhs[output_labels.index('f')]
         macs = math.prod(dims) * math.prod(rhs) / outputs
     else:
         macs = math.prod(dims) * kernel * lhs[lhs_labels.index('f')]
     return _MAC * macs / (int(groups.group(1)) if groups else 1)
-
-
-_FLASH = {'dew_flash_mha_fwd': (0, False), 'dew_flash_mha_bwd': (1, True),
-          'dew_flash3_mha_fwd': (0, False), 'dew_flash3_mha_bwd': (1, True)}
-"""FlashAttention-2's and FlashAttention-3's calls (dew_flash_attn): where
-the query sits among each one's operands (the backward's first is the
-output's gradient), and whether it is the backward."""
 
 
 _CAUSAL = re.compile(r'is_causal = true|"mask_type":"(?:PADDING_)?CAUSAL"')
@@ -428,11 +514,12 @@ def _reached(queries: int, keys: int, attributes: str) -> int:
     return int(np.clip(high - low + 1, 0, None).sum())
 
 
-def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
-                           query: int, backward: bool) -> tuple[float, float]:
-    """A fused-attention call (cuDNN's or dew_flash_attn's), from the query,
-    key and value it is given, the operands at `query` and the two after it,
-    and the pairs of them its mask computes (`_reached`).
+def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]],
+                           attention: Attention) -> tuple[float, float] | None:
+    """A fused-attention call (cuDNN's or dew_flash_attn's) as its target states its operands
+    (`Attention`), from the query, key and value it is given, the operands at its `query` and the two
+    after it, and the pairs of them its mask computes (`_reached`); None where they are not batched
+    `[batch, sequence, heads, width]` arrays the module states.
 
     The kernel keeps the scores off memory, so nothing in the module states
     its arithmetic; the operands do. They are `[batch, sequence, heads, width]`
@@ -450,29 +537,31 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
     it kept off memory, one `Q K^T` more at the query's width, the hardware's
     alone.
     """
+    query = attention.query
     if len(instruction.operands) < query + 3:
-        return 0.0, 0.0
+        return None
     queries, key, value = (shapes.get(instruction.operands[query + offset]) for offset in range(3))
-    if any(operand is None or len(operand) != 4 for operand in (queries, key, value)):
-        return 0.0, 0.0
-    assert queries is not None and key is not None and value is not None
+    if queries is None or key is None or value is None:
+        return None
+    if any(len(each) != 4 for each in (queries, key, value)):
+        return None
     batch, length, heads, width = queries
     pairs = _MAC * batch * heads * _reached(length, key[1], instruction.attributes)
-    model = (2 if backward else 1) * pairs * (width + value[3])
-    return model, model + (pairs * width if backward else 0.0)
+    model = (2 if attention.backward else 1) * pairs * (width + value[3])
+    return model, model + (pairs * width if attention.backward else 0.0)
 
 
 def custom_call_kind(target: str) -> str | None:
-    """What a custom call computes, by its target: cuBLAS's GEMMs ('gemm'),
-    cuDNN's convolutions ('convolution'), the fused attentions of cuDNN and
-    dew_flash_attn ('attention'), dew_cutlass's grouped GEMMs ('grouped_gemm'),
-    the kernels Pallas lowers to (`PALLAS`), and
-    the calls that run no matmul (sharding and placement marks, host copies and
-    callbacks, random bits, sorts and top-k: 'no_matmul'); None for any other,
-    whose work nothing here sizes (`sizes`). The FLOP count, the kernel report
-    (`dew.training._lowering`) and tools/attribute_step.py read custom calls
-    through this one table."""
-    return next((kind for kind, pattern in _CUSTOM_CALLS if pattern.search(target)), None)
+    """What a custom call computes, by its target (`_calls`, each name read from the owner that states
+    it): cuBLAS's GEMMs ('gemm'), cuDNN's convolutions ('convolution'), the fused attentions of cuDNN and
+    dew_flash_attn ('attention', and 'packed_attention' for a call over sequences between offsets given
+    at run time, whose work no shape states), dew_cutlass's grouped GEMMs ('grouped_gemm'), the kernels
+    Pallas lowers to (`PALLAS`), and the calls that run no matmul (sharding and placement marks, host
+    copies and callbacks, random bits, sorts, scans and top-k: 'no_matmul'); None for any other, whose
+    work nothing here sizes (`sizes`). The FLOP count, the kernel report (`dew.training._lowering`) and
+    tools/attribute_step.py read custom calls through this one table."""
+    call = _calls().get(target)
+    return None if call is None else call.kind
 
 
 @dataclass(frozen=True)
@@ -495,9 +584,10 @@ class HloInstruction:
     """The traced names of the parameters it reads, through bitcasts, copies
     and tuple elements: a jitted step's own are its arguments' paths, such
     as `current.opt_state[0].mu['head']`."""
-    flops: float
+    flops: float | None
     """The matmul and convolution work of one call, a fusion's included, as
-    the step's count (`hlo_flops`) counts it."""
+    the step's count (`hlo_flops`) counts it; None where any of it is unsized
+    (`StepFlops.unsized`)."""
     runs: float
     """Its calls per call of the module, as `hlo_flops` weighs them: a loop
     body's trip count, every branch of a conditional once."""
@@ -531,9 +621,10 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     gathered once, so the fusions that call one share its sets."""
     computations, entry = _parse(text)
     weights = {} if entry is None else _weights(computations, entry)
-    bodies: dict[str, tuple[frozenset[str], frozenset[str], float]] = {}
+    bodies: dict[str, tuple[frozenset[str], frozenset[str], float | None]] = {}
 
-    def fused(name: str, seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str], float]:
+    def fused(name: str,
+              seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str], float | None]:
         if name in bodies:
             return bodies[name]
         computation = computations.get(name)
@@ -541,14 +632,14 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             return frozenset(), frozenset(), 0.0
         ops = {instruction.op for instruction in computation.instructions.values()}
         names = {each for instruction in computation.instructions.values() for each in instruction.traced}
-        flops = sum(_instruction_flops(instruction, computation.shapes)[1]
-                    for instruction in computation.instructions.values())
+        flops = _summed(_hardware(_instruction_flops(instruction, computation.shapes))
+                        for instruction in computation.instructions.values())
         for instruction in computation.instructions.values():
             for called in _CALLS.findall(instruction.attributes):
                 inner_ops, inner_names, inner_flops = fused(called, seen | {name})
                 ops |= inner_ops
                 names |= inner_names
-                flops += inner_flops
+                flops = _summed((flops, inner_flops))
         bodies[name] = frozenset(ops), frozenset(names), flops
         return bodies[name]
 
@@ -571,8 +662,8 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _, _ in called))
             names = frozenset(instruction.traced).union(*(each for _, each, _ in called))
             reads = frozenset().union(*(parameters(computation, each) for each in instruction.operands))
-            flops = (_instruction_flops(instruction, computation.shapes)[1]
-                     + sum(each for _, _, each in called))
+            flops = _summed([_hardware(_instruction_flops(instruction, computation.shapes)),
+                             *(each for _, _, each in called)])
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
                                          reads, flops, weights.get(called_as, 0.0), instruction.buffers,
@@ -582,9 +673,24 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     return found
 
 
-def _instruction_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> tuple[float, float]:
+def _hardware(flops: tuple[float, float] | None) -> float | None:
+    """The hardware's share of an instruction's work (`_instruction_flops`), None where it is unsized."""
+    return None if flops is None else flops[1]
+
+
+def _summed(parts: Iterable[float | None]) -> float | None:
+    """The sum of `parts`, None where any is: work one part leaves unsized leaves the whole unsized."""
+    parts = list(parts)
+    return None if any(part is None for part in parts) else sum(part for part in parts if part is not None)
+
+
+def _instruction_flops(instruction: _Instruction,
+                       shapes: dict[str, tuple[int, ...]]) -> tuple[float, float] | None:
     """The multiply-add work of one instruction, the model's and the hardware's (a kernel's recomputed
-    products the hardware's alone), and zero for anything else.
+    products the hardware's alone), zero for anything that runs no matmul, and None for one whose work the
+    count cannot size (`sizes`): a custom call nothing here knows (`custom_call_kind`), a Pallas kernel that
+    states no cost, an attention over sequences its shapes do not state, or a matmul whose operands the
+    module states no shape for. Missing work stays missing, never counted as zero.
 
     Only the matmuls and convolutions count. Everything the compiler leaves
     elementwise (the optimizer, the EMA, normalization, the softmax, the loss
@@ -592,18 +698,26 @@ def _instruction_flops(instruction: _Instruction, shapes: dict[str, tuple[int, .
     about, which is the convention this repo's benchmarks state
     (docs/research/benchmark-parity.md:44-48).
     """
-    target = target_of(instruction)
-    if custom_call_kind(target) == 'attention':
-        query, backward = _FLASH.get(target, (0, target.endswith('Backward')))
-        return _fused_attention_flops(instruction, shapes, query=query, backward=backward)
-    if custom_call_kind(target) in PALLAS:
+    if instruction.op != 'custom-call':
+        flops = _matmul_flops(instruction, shapes)
+        return None if flops is None else (flops, flops)
+    call = _calls().get(target_of(instruction))
+    if call is None:
+        return None
+    if call.kind in PALLAS:
         # A Pallas kernel's work is the hardware's it states, the model's share where it declares one
-        # (`MODEL_FLOPS`); `_unsized` counts a kernel that states none.
-        hardware = _stated_flops(instruction.attributes) or 0.0
+        # (`MODEL_FLOPS`).
+        hardware = _stated_flops(instruction.attributes)
+        if hardware is None:
+            return None
         declared = _MODEL_FLOPS.search(instruction.attributes)
         return (hardware if declared is None else float(declared.group(1))), hardware
-    flops = _matmul_flops(instruction, shapes)
-    return flops, flops
+    if call.kind == 'no_matmul':
+        return 0.0, 0.0
+    if call.kind == 'attention' and call.attention is not None:
+        return _fused_attention_flops(instruction, shapes, call.attention)
+    flops = _library_flops(call, instruction, shapes)
+    return None if flops is None else (flops, flops)
 
 
 def target_of(instruction: _Instruction) -> str:
@@ -619,9 +733,9 @@ the rest its own recomputation (attention's scores, `attention_mosaic_program.st
 _MODEL_FLOPS = re.compile(MODEL_FLOPS + r'="(\d+)"')
 
 
-def _matmul_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float:
-    """A matmul's or a convolution's multiply-add work, a GEMM library call's among them; zero for any other
-    instruction."""
+def _matmul_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """A `dot`'s or a `convolution`'s multiply-add work, None where the module states too little to size
+    it; zero for any other instruction but a custom call (`_instruction_flops`)."""
     if instruction.op == 'dot':
         contracting = _CONTRACTING.search(instruction.attributes)
         axes = () if contracting is None else tuple(
@@ -629,19 +743,24 @@ def _matmul_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]])
         return _dot_flops(instruction, shapes, axes)
     if instruction.op == 'convolution':
         return _convolution_flops(instruction, shapes)
-    target = target_of(instruction)
-    kind = custom_call_kind(target)
-    if kind == 'gemm':
+    return 0.0
+
+
+def _library_flops(call: _Call, instruction: _Instruction,
+                   shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """A GEMM library call's multiply-add work, a cuBLAS GEMM's, a cuDNN convolution's or a grouped GEMM's;
+    None for any other call, and where the module states too little to size it."""
+    if call.kind == 'gemm':
         contracting = _GEMM_CONTRACTING.search(instruction.attributes)
         axes = () if contracting is None else tuple(
             int(axis.strip(' "')) for axis in contracting.group(1).split(',')
             if axis.strip(' "'))
         return _dot_flops(instruction, shapes, axes)
-    if kind == 'convolution':
-        return _cudnn_convolution_flops(target, instruction, shapes)
-    if kind == 'grouped_gemm':
+    if call.kind == 'convolution':
+        return _cudnn_convolution_flops(call.direction, instruction, shapes)
+    if call.kind == 'grouped_gemm':
         return _grouped_gemm_flops(instruction, shapes)
-    return 0.0
+    return None
 
 
 def _stated_flops(attributes: str) -> float | None:
@@ -658,8 +777,9 @@ def _stated_flops(attributes: str) -> float | None:
 
 def sizes(kind: str | None, stated: float | None) -> bool:
     """Whether the FLOP count sizes the work of a custom call of `kind` (`custom_call_kind`) whose kernel
-    states `stated` FLOPs: a library's GEMM, convolution or attention by its shapes, a Pallas kernel by
-    the cost it states, a call that runs no matmul as none; never a call nothing here knows."""
+    states `stated` FLOPs: a library's GEMM, convolution or batched attention by its shapes, a Pallas
+    kernel by the cost it states, a call that runs no matmul as none; never a packed attention, whose
+    sequences its shapes do not state, nor a call nothing here knows."""
     return (kind in ("gemm", "convolution", "attention", "grouped_gemm", "no_matmul")
             or (kind in PALLAS and stated is not None))
 
@@ -879,10 +999,11 @@ class StepFlops:
     """One step's FLOPs: the `model`'s, the forward a remat recomputes counted
     once, and the `hardware`'s, every matmul the device runs. MFU is read off
     the first and HFU off the second (PaLM's distinction). `unsized` counts
-    the custom calls the step runs whose work neither holds (`sizes`): a
-    Pallas kernel that states no cost (JAX's Triton lowering drops the
-    kernel's `CostEstimate`; Mosaic's keep theirs) or a call nothing here
-    knows, so where any runs both are lower bounds."""
+    the instructions the step runs whose work neither holds (`_instruction_flops`):
+    a Pallas kernel that states no cost (JAX's Triton lowering drops the
+    kernel's `CostEstimate`; Mosaic's keep theirs), an attention over
+    sequences its shapes do not state (`packed_attention`), or a call nothing
+    here knows, so where any runs both are lower bounds."""
 
     model: float
     hardware: float
@@ -989,11 +1110,11 @@ def _inclusive(name: str, computations: dict[str, _Computation], memo: dict[str,
     if name in memo:
         return memo[name]
     computation = computations[name]
-    counted = [(*_instruction_flops(instruction, computation.shapes), instruction.recomputed)
+    counted = [(_instruction_flops(instruction, computation.shapes), instruction.recomputed)
                for instruction in computation.instructions.values()]
-    launches = sum(_unsized(instruction) for instruction in computation.instructions.values())
-    total = StepFlops(sum(flops for flops, _, recomputed in counted if not recomputed),
-                      sum(flops for _, flops, _ in counted), float(launches))
+    sized = [(*flops, recomputed) for flops, recomputed in counted if flops is not None]
+    total = StepFlops(sum(flops for flops, _, recomputed in sized if not recomputed),
+                      sum(flops for _, flops, _ in sized), float(len(counted) - len(sized)))
     for instruction in computation.instructions.values():
         branches = _branches(instruction)
         for callee, times in _call_counts(instruction, computation, computations).items():
@@ -1007,14 +1128,6 @@ def _inclusive(name: str, computations: dict[str, _Computation], memo: dict[str,
             total = total + max(ran, key=lambda flops: (flops.hardware, flops.model, flops.unsized))
     memo[name] = total
     return total
-
-
-def _unsized(instruction: _Instruction) -> bool:
-    """Whether `instruction` is a custom call whose work the count cannot size (`sizes`): a Pallas
-    kernel's that states no cost of its own (`_stated_flops`), or one nothing here knows."""
-    target = _TARGET.search(instruction.attributes) if instruction.op == 'custom-call' else None
-    return target is not None and not sizes(custom_call_kind(target.group(1)),
-                                            _stated_flops(instruction.attributes))
 
 
 def model_flops_utilization(

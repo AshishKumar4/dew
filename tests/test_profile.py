@@ -191,6 +191,27 @@ def test_manual_stop_inside_context_does_not_stop_another_owner(tmp_path, native
     assert "second_survived" in event_names(captures(tmp_path / "second")[0])
 
 
+def test_a_capture_another_owner_stopped_leaves_that_owners_next_trace_running(tmp_path, native_reports):
+    """A Dew capture whose trace another owner stopped and replaced with its own stops only the trace it
+    started, JAX's session it holds: its stop fails, its manifest saying why, and the other owner's trace
+    runs on and keeps what it traced (row 3455: Dew stopped the process's trace, whichever it was)."""
+    profiler = dew.Profiler(tmp_path / "dew")
+    profiler.start()
+    jax.profiler.stop_trace()
+    native = jax.profiler.start_trace(tmp_path / "native")
+    try:
+        with pytest.raises(BaseExceptionGroup):
+            profiler.stop()
+        assert native.is_running
+        with jax.profiler.TraceAnnotation("native_survived"):
+            work().block_until_ready()
+    finally:
+        native.stop()
+    assert "native_survived" in event_names(tmp_path / "native")
+    (manifest,) = (tmp_path / "dew").rglob("manifest.json")
+    assert json.loads(manifest.read_text())["capture_status"] == "failed"
+
+
 def test_capture_drains_async_arrays_and_effects_without_host_copies(tmp_path, native_reports):
     observed = []
 

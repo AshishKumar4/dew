@@ -174,7 +174,7 @@ def bare_search(objective):
     the test's to set (`judged_at`), and a compile it asks raises `Asked` naming the rung it asked at."""
     from dew.training.planning import FitSearch
 
-    def asked(split, narrow, footprint=None, derived=True):
+    def asked(split, narrow, footprint=None, *, derived=True, lowering=True):
         raise Asked(search.remat_rung())
 
     search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective,
@@ -183,20 +183,52 @@ def bare_search(objective):
     return search
 
 
-def test_a_step_lowered_afresh_past_a_spilled_kernel_traces_its_footprint_again():
-    """The search's first lowering of a candidate the derivation read keeps the footprint it traced; one
-    lowered afresh past a kernel that spilled traces its own (`FitSearch.relowering`), as the kernel's next
-    config can change the buffers its first held (review of row 4261)."""
+def test_a_step_lowered_afresh_past_spilled_kernels_traces_the_footprint_of_the_one_it_keeps():
+    """The search's first lowering of a candidate the derivation read keeps the footprint it traced. A
+    step lowered afresh past a kernel that spilled is lowered with none and derives none
+    (`FitSearch.relowering`): a compile lowers one for each config it refuses and judges only the step it
+    keeps, whose footprint is then traced once, not lowered, at the configs its launches settled on
+    (`FitSearch.footprinted`), as a kernel's next config can change the buffers its first held (review of
+    row 4261; row 5361: twelve step-downs each traced a footprint to judge one)."""
+    from dew.training._lowering import KernelReport
     from dew.training.footprint import Footprint
+    from dew.training.planning import Candidate
 
-    handed = []
+    asked = []
+    kept = Footprint(residuals=4, gradients=5, held=6)
+
+    def lower(split, narrow, footprint=None, *, derived=True, lowering=True):
+        asked.append({"footprint": footprint, "derived": derived, "lowering": lowering})
+        traced = kept if derived and footprint is None else footprint
+        return Candidate({}, None, {}, None, None, 0, 0, None, "[]", KernelReport((), ()), traced)
+
     search = bare_search(deep(split=None).objective)
-    search.lower = lambda split, narrow, footprint, derived: handed.append(footprint)
-    derived = Footprint(residuals=1, gradients=2, held=3)
-    search.footprints[search.candidate_key(1, narrow=False)] = derived
-    search.lowering(1)
-    search.relowering(1)
-    assert handed == [derived, None]
+    search.lower = lower
+    first = Footprint(residuals=1, gradients=2, held=3)
+    search.footprints[search.candidate_key(1, narrow=False)] = first
+    assert search.lowering(1).footprint == first
+    relowered = [search.relowering(1) for _ in range(3)]
+    assert [candidate.footprint for candidate in relowered] == [None, None, None]
+    assert search.footprinted(1, relowered[-1]).footprint == kept
+    assert asked == [{"footprint": first, "derived": True, "lowering": True},
+                     *[{"footprint": None, "derived": False, "lowering": True}] * 3,
+                     {"footprint": None, "derived": True, "lowering": False}]
+
+
+def test_a_step_that_fits_at_its_fewest_microbatches_reads_one_derivation(monkeypatch, tmp_path):
+    """A run whose plan finds its split, with room for its step whole: the derivation reads the step at its
+    fewest microbatches, which fits, and nothing else, no rung walked and no other split read, and the
+    one compile is there (`FitSearch.fits_at_fewest`: the rung it stands on is the least-recompute one
+    and the fewest its fewest; the walk at its most microbatches and the halving read two derivations to
+    say so, row 5361)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, LIMIT)
+    trainer = deep(split=None)
+    with Compiles("step") as compiles:
+        compiled(trainer)
+    [read] = trainer.plan["derived"]
+    assert read["label"] == "fits" and read["split"] == trainer.plan["split"] == 1
+    assert compiles.count == 1 and trainer.plan["probes"][0]["fits"]
 
 
 class Asked(Exception):

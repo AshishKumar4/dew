@@ -10,9 +10,11 @@ import datetime
 import functools
 import logging
 import math
+import os
 import time
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import TypedDict
 
 import grain.python as pygrain
 import jax
@@ -48,7 +50,7 @@ from dew.state import TrainState
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
-from dew.training.cooldown import Branch
+from dew.training.cooldown import Branch, Cooldowns
 from dew.training.diloco import regrouped
 from dew.training.evaluation import EvalSuite, Evaluation, Split, Summary, episodic
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
@@ -131,6 +133,8 @@ class FitPlan:
     """The step, the real tokens and the consumed examples a `Pause` ends the run at (`Pause.at`)."""
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
+    restore_best: bool = False
+    """Whether the run returns the model it ranked best (`Trainer.fit`'s `restore_best`)."""
     """Every validation split by name, its metrics and cadence resolved."""
     summaries: tuple[Summary, ...] = ()
     """The scalars each step whose evaluations score every split they weigh forms (`Summary`)."""
@@ -195,6 +199,12 @@ class FitPlan:
     def cadenced(self) -> bool:
         """Whether any evaluation runs before the end."""
         return bool(self.eval_every or any(suite.every for suite in self.suites.values()))
+
+    @property
+    def evaluates(self) -> bool:
+        """Whether the run evaluates at all: midway (`evaluates_midway`) or at its end, which validates
+        where it names a split, a cadence, a ranking or a stop."""
+        return bool(self.validation or self.eval_every or self.best or self.stop or self.held_best)
 
     @property
     def evaluates_midway(self) -> bool:
@@ -933,6 +943,35 @@ type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset
                      | Mapping[str, Dataset | Handed | Split | EvalSuite])
 """`fit`'s validation: a chain or a Grain dataset, the split `val`, or splits by name, each a chain, a
 Grain dataset, NumPy arrays, a reader or an evaluation suite."""
+
+
+class FitArguments(TypedDict, total=False):
+    """`Trainer.fit`'s keywords for what a run is asked for beside its data, its starting state and its
+    resume, which select where it starts rather than what it plans: its length, cadences, scores, policies
+    and reading, every keyword `Trainer._fit_plan` takes, which states their defaults. `fit` hands them to
+    it as asked, and so does a run compiled ahead, which plans its evaluations from them
+    (`dew.training.ahead.compile_ahead`'s `fit`, `fit_plan`), as a configured run hands them to `fit`
+    (`dew.config.RunConfig.train`)."""
+
+    steps: int | None
+    epochs: int | None
+    tokens: int | None
+    examples: int | None
+    log_every: int | str | Counted
+    eval_every: int | str | Counted | None
+    checkpoint_every: int | str | Counted | datetime.timedelta | None
+    checkpoint_final: bool
+    scored_to: str | os.PathLike[str] | None
+    metrics: Sequence[Metric]
+    preview: bool
+    best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None
+    stop: Plateau | Pause | None
+    restore_best: bool
+    cooldowns: Cooldowns | None
+    validation: HandedSplits | None
+    summaries: Sequence[Summary]
+    observe: Observe | None
+    device_prefetch: int
 
 
 def handed_splits(

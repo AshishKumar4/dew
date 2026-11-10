@@ -1,9 +1,5 @@
 {
  "references": {
-  "joint_checkpoint/tiny/images.npz": {
-   "tool": "tools/joint_checkpoint_reference.py",
-   "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
-  },
   "joint_checkpoint/tiny/logits.npz": {
    "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]

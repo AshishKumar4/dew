@@ -1225,7 +1225,9 @@ class Checkpoints:
         """
         if self.local_directory is None:
             return None
-        steps = from_every_process(self._open_local().latest_step())
+        # A process that holds no local directory holds no local step, and asking makes none (`_newest`).
+        unopened = self._local_manager is None and not epath.Path(self.local_path).is_dir()
+        steps = from_every_process(None if unopened else self._open_local().latest_step())
         self._recovery = None
         if None not in steps and len(set(steps)) == 1:
             return steps[0]

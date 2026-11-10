@@ -23,7 +23,8 @@ from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
 from dew.decision.images import Images
-from dew.decision.layout import DecisionInputs, Specials
+from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import Specials
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
@@ -492,9 +493,10 @@ def test_a_request_with_images_reads_its_context_beside_them():
 def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_to_export(tmp_path):
     """A task whose backbone reads its decision context through cross-attention is a bundle a run starts
     from (`PretrainedDecision.of`), its backbone its source family's carrying the cross-attention, so the
-    task it declares again (`Decide.released`) is the task, model and every weight; its release, which no
-    family writes, is refused as it is written (row 4776's review: the bundle was refused as it was made,
-    and a run from such a run's native release could not start)."""
+    task it declares again (`Decide.released`) is the task, model and every weight, its context encoded
+    as the task encodes it (row 4797: a backbone-encoded context came back read through the token table);
+    its release, which no family writes, is refused as it is written (row 4776's review: the bundle was
+    refused as it was made, and a run from such a run's native release could not start)."""
     from dew.data.text import HFTokenizer
     from dew.decision import JointLayout
     from dew.decision.sources import PretrainedDecision
@@ -504,7 +506,7 @@ def test_a_context_reading_tasks_bundle_carries_its_cross_attention_and_refuses_
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
     layout = JointLayout(max_len=1024)
     objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
-                                  tokenizer=tokenizer, layout=layout)
+                                  tokenizer=tokenizer, layout=layout, context_encoder="backbone")
     task = Decide(objective.model, opened(objective.init(jax.random.key(0))), layout, tokenizer,
                   objective.specials, processor=source.processor)
     bundle = PretrainedDecision.of(task)

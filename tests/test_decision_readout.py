@@ -22,7 +22,8 @@ from test_decision_objective import SPECIALS, TOKENIZER
 from dew.batch import part, thaw
 from dew.decision import Choice
 from dew.decision.head import LabelReadout, SlotReadout
-from dew.decision.layout import DecisionInputs, Labels, StateFirstLayout
+from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import Labels, StateFirstLayout
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.interop import Pretrained

@@ -84,7 +84,8 @@ PARTS = (
     ("embedding", r"[Ee]mbed|table_rows|wte|tok_emb"),
 )
 CALL_KINDS = {"gemm": "gemm", "convolution": "gemm", "grouped_gemm": "gemm", "attention": "attention",
-              "triton": "pallas", "mosaic_gpu": "pallas", "mosaic_tpu": "pallas"}
+              "packed_attention": "attention", "triton": "pallas", "mosaic_gpu": "pallas",
+              "mosaic_tpu": "pallas"}
 """A custom call's kind here, from `custom_call_kind`'s: Pallas lowers to Triton and Mosaic calls."""
 FUSED_KINDS = (
     ("gemm", {"dot", "convolution"}),
@@ -249,6 +250,9 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     by_part_kind: dict = defaultdict(lambda: defaultdict(float))
     gemms, layouts, everything = [], [], []
     fp8_gflop = 0.0
+    # The step's ops whose work the FLOP count leaves unsized (`HloInstruction.flops` None, or no op of the
+    # module named), by kind, so a total that skips them (the GEMMs') says how many of its kind it skipped.
+    unsized: dict[str, int] = defaultdict(int)
     for row in (row for row in rows if str(row.get("program_id")) == step):
         name = str(row.get("tf_op_name") or "")
         us = float(row["total_self_time"]) / steps
@@ -267,26 +271,31 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         by_kind[kind] += us
         by_part_kind[part][kind] += us
         # The compiled FLOPs over the measured time: the work done, counted from the op itself as the
-        # step's FLOP count counts it. XProf's own rates are no measure of it: its model rate put a
-        # cuBLAS weight-gradient GEMM of C6's Qwen3.5-0.8B at 550 TFLOP/s on an A100 (4x its work), and its
-        # normalized rate guesses each op's precision (the later Qwen3.5-0.8B step's GEMMs at 1.127 of the peak).
-        calls = runs * known.runs if known is not None else 0.0
-        gflops = known.flops * calls / (us * 1e-6) / 1e9 if known is not None and us else 0.0
+        # step's FLOP count counts it, None where that count leaves it unsized. XProf's own rates are no
+        # measure of it: its model rate put a cuBLAS weight-gradient GEMM of C6's Qwen3.5-0.8B at 550
+        # TFLOP/s on an A100 (4x its work), and its normalized rate guesses each op's precision (the later
+        # Qwen3.5-0.8B step's GEMMs at 1.127 of the peak).
+        flops, calls = (None, 0.0) if known is None else (known.flops, runs * known.runs)
+        if flops is None:
+            unsized[kind] += 1
+        gflops = flops * calls / (us * 1e-6) / 1e9 if flops is not None and us else None
         # XProf's HBM bandwidth is GiB/s over the op's own time, so the op moves that much a step.
         hbm_mib = float(row.get("hbm_bw") or 0) * us * 1e-6 * 1024
         record = {"us": round(us, 1), "part": part, "direction": direction, "kind": kind,
                   "hlo": row.get("hlo_op_name"), "framework": name[:200], "count": row.get("occurrences"),
-                  "gflops": round(gflops, 1), "hbm_mib": round(hbm_mib, 1), "bound_by": row.get("bound_by"),
+                  "gflops": None if gflops is None else round(gflops, 1), "hbm_mib": round(hbm_mib, 1),
+                  "bound_by": row.get("bound_by"),
                   "source": source}
         everything.append(record)
         if kind == "gemm":
             record["precision"] = gemm_precision(row, known)
             # Model FLOPs exclude remat's recompute, so an FP8 GEMM's recomputed copy is not charged.
-            if record["precision"] == "fp8" and not (known is not None and known.recomputed):
+            charged = record["precision"] == "fp8" and not (known is not None and known.recomputed)
+            if gflops is not None and charged:
                 fp8_gflop += gflops * us * 1e-6
             # Each GEMM against its own precision's peak, as mfu_mixed counts it.
             limit = fp8_peak if record["precision"] == "fp8" else peak
-            if limit:
+            if limit and gflops is not None:
                 record["fraction_of_peak"] = round(gflops / limit, 3)
                 record["lost_us"] = round(us * max(0.0, 1 - gflops / limit), 1)
                 gemms.append(record)
@@ -312,6 +321,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                        for part, directions in heaviest(by_part)},
         "by_kind_ms": ms(by_kind),
         "by_part_kind_ms": {part: ms(kinds) for part, kinds in heaviest(by_part_kind)},
+        "unsized_by_kind": dict(unsized),
         "gemm_fraction_of_peak": round(judged / judged_us, 3) if judged_us else None,
         "gemm_lost_ms": round(sum(record["lost_us"] for record in gemms) / 1e3, 3) if peak else None,
         "gemms_by_lost_time": sorted(gemms, key=lambda record: -record["lost_us"])[:25],
