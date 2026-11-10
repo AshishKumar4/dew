@@ -12,8 +12,8 @@ across chunks, each chunk's `C B^T`, then the output), the same nine backward on
 each kernel's grid, and the numerics mamba_ssm runs: operands in their own dtype into fp32 accumulation,
 the states the chunks enter stored in the operands' dtype, the decay between two steps of a chunk
 `exp(min(acs_i - acs_j, 0))` of the log decay `acs` cumulated within the chunk, and each gradient of the
-decay summed from its products as mamba_ssm's stable kernels sum it. Products of fp32 operands take
-BF16x6 (`fla_gdn._dot`) where mamba_ssm's take one TF32, and the output is stored in fp32 where
+decay summed from its products as mamba_ssm's stable kernels sum it. Products of fp32 operands take one
+TF32 (`fla_gdn._dot`), as mamba_ssm's do, and the output is stored in fp32 where
 mamba_ssm rounds it to the operands' dtype: a sequence-sharded scan adds the earlier shards' state to it
 before any rounding (`dew.nn.mixers.mamba2._ssd`), and the gated norm after it reads fp32 anyway.
 mamba_ssm's deterministic mode is the only one: a sum over a kernel's blocks lands in a workspace that

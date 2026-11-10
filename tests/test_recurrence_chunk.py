@@ -19,6 +19,7 @@ from reference_error import (
     FEWEST_SEEDS,
     assert_as_exact,
     assert_fp32_reduction_bound,
+    assert_rounds_where_the_reference_does,
     chain_roundings,
     widened,
     with_gradients,
@@ -599,6 +600,32 @@ def test_a_rated_decay_is_its_log_decay():
     assert_as_exact(functools.partial(decayed, RATED), functools.partial(decayed, WHOLE), rated_draw,
                     'a rated decay against its log decay', seeds=RATED_SEEDS,
                     truth_fn=functools.partial(decayed, WHOLE, launch=recurrence.step_reference))
+
+
+def test_a_value_read_by_the_write_and_the_skip_rounds_its_gradient_once():
+    """A 16-bit value both the recurrence writes and the skip adds (`D v`), their value gradients nearly
+    cancelling (`D` near -1 against a write gate near 1): its gradient sums both in the working precision and
+    rounds once, as the recurrence a token at a time does (`recurrence_chunk._read_once`). Rounded to bf16
+    apart and added in it, the sum kept neither's low bits: a write gate's value gradient's worst row 11.6
+    times the token recurrence's (row 5447)."""
+    hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True)
+    operands = Chunk(query=jnp.full((1, 1, 1, 1), 1.0078125, jnp.bfloat16),
+                     key=jnp.ones((1, 1, 1, 1), jnp.bfloat16), value=jnp.ones((1, 1, 1, 8), jnp.bfloat16),
+                     beta=jnp.full((1, 1, 1), 0.99609375, jnp.bfloat16), skip=jnp.array([-0.9999], jnp.float32),
+                     state=jnp.zeros((1, 1, 1, 8), jnp.float32))
+
+    def gradient(run, operands):
+        def loss(value):
+            out, _ = run(hooks, dataclasses.replace(operands, value=value))
+            return jnp.sum(out.astype(jnp.promote_types(out.dtype, jnp.float32)))
+
+        return jax.grad(loss)(operands.value)
+
+    dew = jax.jit(lambda x: gradient(lambda hooks, x: chunk_on('xla', hooks, x), x))(operands)
+    reference = jax.jit(lambda x: gradient(token_by_token, x))
+    with jax.enable_x64(new_val=True):
+        truth = reference(widened((operands,))[0])
+    assert_rounds_where_the_reference_does(dew, reference(operands), truth, 'a write and a skip of one value')
 
 
 def test_the_operands_are_checked_as_the_decode_steps():

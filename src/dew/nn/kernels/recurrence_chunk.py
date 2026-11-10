@@ -207,32 +207,37 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # numbers are read once, as the selector reads them: a remat's pullback runs the launch later, under
         # whatever precision its caller set then (a saved fp32 gradient under 'highest' took the accurate
         # forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it).
-        wide = hooks.skip or hooks.output is not None or dtype != jnp.result_type(query, key, value)
+        wide_out = hooks.skip or hooks.output is not None or dtype != jnp.result_type(query, key, value)
         rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value))
 
         def product_kernel(product: str) -> str:
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                               scale=scale, wide=wide, bound=hooks.inverse_bound,
+                               scale=scale, wide=wide_out, bound=hooks.inverse_bound,
                                product=product, forked=forked, delta=hooks.delta,
                                decayed=hooks.decay != 'none')
 
-        def run(kernel, query, key, value, g, beta, state, starts, firsts, *walked):
-            # Every kernel walks the packed rows, each document from its own memory.
+        def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
+            # Every kernel walks the packed rows, each document from its own memory, its values read once
+            # with the skip's (`_read_once`).
             carried = None if forked is None else forked.carrying(*walked)
+            wide, own = _read_once(value, work)
             if kernel == 'mosaic_gpu':
-                return template_rule(query, key, value, g, beta, state, starts, firsts, forked=carried,
-                                     max_segments=max_segments, scale=scale, delta=hooks.delta, wide=wide,
-                                     bound=hooks.inverse_bound, rounded=rounded)
-            if kernel == 'fla':
-                return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, wide=wide, firsts=firsts)
-            size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-            return xla_mainloop(Tiles(size), query, key, value, g, beta, state, starts, firsts, scale=scale,
-                                delta=hooks.delta, dtype=work, bound=hooks.inverse_bound, forked=carried)
+                out, final = template_rule(query, key, own, g, beta, state, starts, firsts, forked=carried,
+                                           max_segments=max_segments, scale=scale, delta=hooks.delta,
+                                           wide=wide_out, bound=hooks.inverse_bound, rounded=rounded)
+            elif kernel == 'fla':
+                out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
+                                      max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
+            else:
+                size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
+                out, final = xla_mainloop(Tiles(size), query, key, wide, g, beta, state, starts, firsts,
+                                          scale=scale, delta=hooks.delta, dtype=work,
+                                          bound=hooks.inverse_bound, forked=carried)
+            return recurrence.skipped(hooks, out.astype(work), wide, {'skip': skip}, work), final
 
-        out, final = _per_product(product_kernel, run, query, key, value, g, beta, state, starts, firsts,
+        out, final = _per_product(product_kernel, run, query, key, value, g, beta,
+                                  given['skip'] if hooks.skip else None, state, starts, firsts,
                                   *(() if forked is None else forked.walked))
-        out = recurrence.skipped(hooks, out.astype(work), value, given, work)
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
@@ -847,6 +852,17 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
+def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
+    """`value` read once in the working precision `work` and in its own dtype from that one read: where a
+    call reads its values twice, its recurrence's kernel and the skip's `D v` (`recurrence.skipped`), their
+    gradients sum in `work` and round to the values' dtype once. Each widening a 16-bit value apart, the two
+    rounded apart and added in it: a write gate's value gradient's worst row was 11.6 times the token
+    recurrence's on an A100 and a CPU alike, equal to it read once, its forward bitwise the same (row 5447,
+    M-MC-6-base-a100)."""
+    wide = value.astype(work)
+    return wide, wide.astype(value.dtype)
+
+
 def _per_product(kernel_of: Callable[[str], str], run, *operands):
     """`run(kernel, *operands)` on the kernel a selector gives each product (`kernel_of('forward')`,
     `kernel_of('training')`), differentiated at every order through the portable math (`run('xla', ...)`,
@@ -1189,13 +1205,15 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
         return launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, carried)
 
     def launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, forked):
+        # The values read once with the skip's where it is added here (`_read_once`), the ports' own.
+        wide, own = _read_once(value, work)
         if kernel == 'mosaic_gpu':
-            out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
+            out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
                                        skip=skip if fused else None, forked=forked,
                                        max_segments=max_segments, scale=1.0, delta=False, wide=not narrow,
                                        rounded=fast)
             out = out.astype(work)
-            return (out if fused else recurrence.skipped(hooks, out, value, {'skip': skip}, work)), final
+            return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
         batch, _, heads, head_dim = x.shape
@@ -1228,9 +1246,9 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             if aligned is not None:
                 out = aligned.unlaid(out)
             return out, jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
-        out, final = xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, firsts,
+        out, final = xla_mainloop(Tiles(chunk_size), query, key, wide, g, beta, state, starts, firsts,
                                   scale=1.0, delta=False, dtype=work, forked=forked)
-        return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
+        return recurrence.skipped(hooks, out, wide, {'skip': skip}, work), final
 
     return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts,
                         *(() if forked is None else forked.walked))
