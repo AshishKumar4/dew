@@ -198,15 +198,16 @@ def solved(system: Iv, lane: Lane) -> Iv:
 
 def weighted(lower, tile, beta, decay: Iv | None, lane: Lane) -> tuple[Iv, Iv]:
     """`algebra.weighted` from the stored inverse `lower` (the operand its product stages): `(fp32 value,
-    stored)`, the scaled tile `tile beta [decay]` (each multiply rounded) on the diagonal outside the
-    product."""
-    scaled = fp32(mul(point(tile), point(np.asarray(beta)[:, None])), lane)
+    stored)`, the scaled tile `tile beta [decay]` rounded for the product; its diagonal's last multiply
+    may contract into the final add."""
+    diagonal = mul(point(tile), point(np.asarray(beta)[:, None]))
+    scaled = fp32(diagonal, lane)
     if decay is not None:
         # A head's decay a row's, `[C]`; a key dimension's its own entry's, `[C, Dk]`.
-        scaled = fp32(mul(scaled, decay if decay.lo.ndim == 2 else Iv(decay.lo[:, None], decay.hi[:, None])),
-                      lane)
+        diagonal = mul(scaled, decay if decay.lo.ndim == 2 else Iv(decay.lo[:, None], decay.hi[:, None]))
+        scaled = fp32(diagonal, lane)
     held = (lane.held, lane.held)
-    value = fp32(add(scaled, dot(point(lower), staged(scaled, lane), lane, parts=held)), lane)
+    value = fp32(add(fused(diagonal, lane), dot(point(lower), staged(scaled, lane), lane, parts=held)), lane)
     return value, staged(value, lane)
 
 
