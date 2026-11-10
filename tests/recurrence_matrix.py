@@ -135,10 +135,11 @@ def _drawn(case: dict[str, str], seed: int):
 
 
 def _inputs(case: dict[str, str], seed: int) -> dict[str, np.ndarray]:
-    """`case`'s draw at `seed` (`_drawn`) as a recording reads it: its operands by name and its cotangents
-    (`d_out`, `d_final`), host arrays."""
+    """`case`'s draw at `seed` (`_drawn`) as a recording reads it: its operands' arrays by name (a static
+    field, `Chunk.held`, no operand) and its cotangents (`d_out`, `d_final`), host arrays."""
     operands, (d_out, d_final) = _drawn(case, seed)
-    return {**{name: np.asarray(value) for name, value in vars(operands).items() if value is not None},
+    arrays = jax.tree_util.tree_leaves_with_path(operands)
+    return {**{path[0].name: np.asarray(value) for path, value in arrays},
             "d_out": np.asarray(d_out), "d_final": np.asarray(d_final)}
 
 
@@ -153,8 +154,8 @@ def _leaves(results) -> dict:
     """A step's results (`_step`'s output, final memory and operand gradients) by the names a recording keeps
     them under: `out`, `final` and `d_<operand>`."""
     (out, final), grads = results
-    return {"out": out, "final": final, **{f"d_{name}": value for name, value in vars(grads).items()
-                                            if value is not None}}
+    return {"out": out, "final": final, **{f"d_{path[0].name}": value for path, value in
+                                            jax.tree_util.tree_leaves_with_path(grads)}}
 
 
 def _starts(case: dict[str, str]):
