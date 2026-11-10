@@ -576,9 +576,6 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         # The walk's release of a step's slots is its products' commit (`CommittedRing`): nothing to await.
         del pending
 
-    def held(self, ref):
-        return ref
-
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return plgpu.layout_cast(jnp.zeros(shape, jnp.float32), STORED)
 

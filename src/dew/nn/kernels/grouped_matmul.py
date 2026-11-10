@@ -810,7 +810,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and (not tabled or (family.gathers_rows and family.gathers_alone))
                 and (not gathered or ba.arguments['hooks'].prologue is None)
                 and (family.issues_in_consumers or not prepared)
-                and (family.counts_hooks or not hooked) and (family.counts_sums or not summed))
+                and (family.counts_hooks or not hooked))
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
