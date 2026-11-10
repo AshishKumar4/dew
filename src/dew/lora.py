@@ -45,7 +45,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path as FilePath
-from typing import ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -118,6 +118,22 @@ DIFFUSERS_WEIGHTS = "pytorch_lora_weights.safetensors"
 DIFFUSERS_METADATA = "lora_adapter_metadata"
 
 FACTORS = LOW_RANK_FACTORS
+
+
+def stored_name(module: str, factor: str) -> str:
+    """A factor's (`FACTORS`) stored tensor name under its module's: `<module>.<factor>.weight`, PEFT's
+    and Diffusers' `lora_A.weight` and `lora_B.weight`."""
+    return f"{module}.{factor}.weight"
+
+
+def stored_factor(name: str) -> tuple[str, str] | None:
+    """The module and the factor (`FACTORS`) a stored tensor name holds (`stored_name`), None where it
+    holds no factor."""
+    for factor in FACTORS:
+        suffix = stored_name("", factor)
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[:-len(suffix)], factor
+    return None
 # PEFT's init: A as torch's Linear default, kaiming-uniform with a=sqrt(5),
 # which is uniform on +-1/sqrt(fan_in); B zero, so a fresh adapter is the
 # identity.
@@ -900,10 +916,10 @@ class _Branch:
             # them (`nn.get_partition_spec`, empty for a kernel that names none).
             kernel = module.get_variable("params", "kernel")
             names, shape = tuple(nn.get_partition_spec(kernel)), meta.unbox(kernel).shape
-            sides = {"lora_A": (*shape[:len(axes)], target.rank), "lora_B": (target.rank, *shape[len(axes):])}
-            a, b = (module.param(factor, declared(init, factor_axes(names, factor, len(sides[factor]))),
-                                 sides[factor], FACTOR_DTYPE)
-                    for factor, init in zip(LOW_RANK_FACTORS, (INIT_A, INIT_B), strict=True))
+            a, b = (module.param(factor, declared(init, factor_axes(names, factor, len(side))), side,
+                                 FACTOR_DTYPE)
+                    for factor, init, side in zip(LOW_RANK_FACTORS, (INIT_A, INIT_B),
+                                                  factor_shapes(shape, len(axes), target.rank), strict=True))
         # The branch drops out its input when the forward carries the
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
@@ -1268,8 +1284,15 @@ class _Factors:
     b: WeightLayout
 
     def shapes(self, rank: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Return the tree's `lora_A` and `lora_B` shapes at `rank`."""
-        return (*self.kernel_shape[:self.contracted], rank), (rank, *self.kernel_shape[self.contracted:])
+        """Return the tree's `lora_A` and `lora_B` shapes at `rank` (`factor_shapes`)."""
+        return factor_shapes(self.kernel_shape, self.contracted, rank)
+
+
+def factor_shapes(kernel_shape: Sequence[int], contracted: int,
+                  rank: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """A kernel's `lora_A` and `lora_B` shapes at `rank`: its `contracted` leading (input) axes, then the
+    rank; the rank, then its output axes."""
+    return (*kernel_shape[:contracted], rank), (rank, *kernel_shape[contracted:])
 
 
 def _insert_factors(leaves: dict, module: Path, a, b) -> None:
@@ -1302,11 +1325,12 @@ def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -
             f"transposed {transpose}, whose input axes do not lead the kernel")
     module = layout.paths[0][:-1]
     prefix = name.removesuffix(".weight")
+    a, b = FACTORS
     return _Factors(
         module, kernel_shape, contracted,
-        WeightLayout(f"{prefix}.lora_A.weight", ((*module, "lora_A"),), (rank, inner),
+        WeightLayout(stored_name(prefix, a), ((*module, a),), (rank, inner),
                      (contracted, *transpose[split:])),
-        WeightLayout(f"{prefix}.lora_B.weight", ((*module, "lora_B"),), (out, rank),
+        WeightLayout(stored_name(prefix, b), ((*module, b),), (out, rank),
                      (*(1 + axis - contracted for axis in transpose[:split]), 0)))
 
 
@@ -1391,9 +1415,26 @@ loader does not carry: an activated LoRA's invocation tokens, QA-LoRA, DoRA, a l
 or KaSA's routing, saved modules, trainable tokens or parameters, and any PEFT adds."""
 
 
+_PEFT_FIELDS: Mapping[str, tuple[str, object]] = {
+    "rank": ("r", None), "alpha": ("lora_alpha", None), "rank_pattern": ("rank_pattern", {}),
+    "alpha_pattern": ("alpha_pattern", {}), "rslora": ("use_rslora", False), "dropout": ("lora_dropout", 0.0)}
+"""Each number of an adapter's `_Config` by its PEFT `LoraConfig` field, which `_Config.read` reads and
+`_Config.written` writes, with what a config leaving the field out means (None: a config must state it)."""
+
+_PEFT_BASE = ("base_model_name_or_path", "revision")
+"""The `LoraConfig` fields of an `AdapterBase`'s name and revision, each absent where it is None."""
+
+_PEFT_FIXED: Mapping[str, object] = {"peft_type": "LORA", "bias": "none", "fan_in_fan_out": False,
+                                     "init_lora_weights": True, "inference_mode": True}
+"""The `LoraConfig` fields Dew builds its adapters one way by: a LoRA, its kernels' biases untrained, its
+factors stored `[out, in]`, initialized as PEFT's and saved for inference. They are written so that a PEFT
+reader finds the keys it expects; a config read back holds each Dew's way unless it is inert
+(`_INERT_FIELDS`)."""
+
+
 @dataclass(frozen=True)
 class _Config:
-    """Holds the fields of a PEFT `LoraConfig` an adapter's numerics depend on."""
+    """Holds the fields of a PEFT `LoraConfig` an adapter's numerics depend on (`_PEFT_FIELDS`)."""
 
     rank: int
     alpha: float
@@ -1407,33 +1448,39 @@ class _Config:
     def read(cls, config: Mapping[str, object], where: str) -> _Config:
         # Each field read is taken from what is left, so what remains is every field it does not read.
         left = dict(config)
-        peft_type = left.pop("peft_type", "LORA")
-        if peft_type != "LORA":
-            raise ValueError(f"{where} is a {peft_type} adapter, not LoRA")
-        bias = left.pop("bias", "none")
-        rank, alpha = left.pop("r", None), left.pop("lora_alpha", None)
-        rank_pattern, alpha_pattern = left.pop("rank_pattern", {}), left.pop("alpha_pattern", {})
-        rslora, dropout = left.pop("use_rslora", False), left.pop("lora_dropout", 0.0)
-        name, revision = left.pop("base_model_name_or_path", None), left.pop("revision", None)
+        fixed = {field: left.pop(field, value) for field, value in _PEFT_FIXED.items()}
+        if fixed["peft_type"] != _PEFT_FIXED["peft_type"]:
+            raise ValueError(f"{where} is a {fixed['peft_type']} adapter, not LoRA")
+        read = {field: left.pop(name, absent) for field, (name, absent) in _PEFT_FIELDS.items()}
+        name, revision = (left.pop(field, None) for field in _PEFT_BASE)
         # A field unset is absent, null, false, zero or empty, as PEFT writes every field it leaves at rest.
         unset = (None, False, 0, "", [], {})
         refused = sorted(field for field, value in left.items()
                          if field not in _INERT_FIELDS and value not in unset)
-        if bias != "none":
-            refused.append("bias")
+        refused += [field for field, value in fixed.items()
+                    if field not in _INERT_FIELDS and value != _PEFT_FIXED[field]]
         if refused:
             raise ValueError(f"{where} sets {', '.join(refused)}, which this loader does not carry")
+        rank_pattern, alpha_pattern, rslora = read["rank_pattern"], read["alpha_pattern"], read["rslora"]
         if (not isinstance(rank_pattern, Mapping) or not isinstance(alpha_pattern, Mapping)
                 or not isinstance(rslora, bool)):
-            raise ValueError(f"{where} needs per-module patterns and a boolean use_rslora")
+            raise ValueError(f"{where} needs per-module patterns and a boolean {_PEFT_FIELDS['rslora'][0]}")
         if not isinstance(name, str | None) or not isinstance(revision, str | None):
             raise ValueError(f"{where} names its base model and revision as strings or not at all")
-        return cls(_rank(where, rank), finite(alpha, f"{where}: alpha"),
+        return cls(_rank(where, read["rank"]), finite(read["alpha"], f"{where}: alpha"),
                    {module: _rank(f"{where} rank_pattern {module}", value)
                     for module, value in rank_pattern.items()},
                    {module: finite(value, f"{where} alpha_pattern {module}: alpha")
                     for module, value in alpha_pattern.items()},
-                   rslora, _dropout(where, dropout), None if name is None else AdapterBase(name, revision))
+                   rslora, _dropout(where, read["dropout"]),
+                   None if name is None else AdapterBase(name, revision))
+
+    def written(self, targets: Sequence[str]) -> Mapping[str, object]:
+        """The `LoraConfig` of this config over the `targets` modules, as PEFT writes it (`read`'s)."""
+        base = () if self.base is None else zip(_PEFT_BASE, (self.base.name, self.base.revision), strict=True)
+        return {**_PEFT_FIXED, **{name: getattr(self, field) for field, (name, _) in _PEFT_FIELDS.items()},
+                "target_modules": list(targets),
+                **{field: value for field, value in base if value is not None}}
 
     def rank_of(self, relative: str) -> int:
         return self.rank_pattern.get(_pattern(self.rank_pattern, relative), self.rank)
@@ -1448,35 +1495,7 @@ def _pattern(patterns: Mapping[str, object], relative: str) -> str:
     return next((key for key in patterns if re.match(rf"(.*\.)?({key})$", relative)), relative)
 
 
-class PeftConfig(TypedDict):
-    """The contents of `adapter_config.json`, as PEFT writes and reads it.
-
-    It holds the defaults every target uses and the per-module exceptions.
-    `fan_in_fan_out`, `bias`, `init_lora_weights` and `inference_mode` are fixed
-    because Dew builds its adapters one way. Nothing here reads those four back;
-    they are written so that a PEFT reader finds the keys it expects. An adapter
-    bound to a Hub model names it and its commit (`AdapterBase`), which PEFT
-    loads the base from; one bound to a local directory or a model built from
-    its class names none, since no other machine resolves it.
-    """
-
-    peft_type: str
-    r: int
-    lora_alpha: float
-    rank_pattern: dict[str, int]
-    alpha_pattern: dict[str, float]
-    target_modules: list[str]
-    use_rslora: bool
-    lora_dropout: float
-    fan_in_fan_out: bool
-    bias: str
-    init_lora_weights: bool
-    inference_mode: bool
-    base_model_name_or_path: NotRequired[str]
-    revision: NotRequired[str]
-
-
-def _config(lora: Adapter, named: Mapping[str, Target], base: AdapterBase | None) -> PeftConfig:
+def _config(lora: Adapter, named: Mapping[str, Target], base: AdapterBase | None) -> Mapping[str, object]:
     """Build the PEFT config of `named` targets, keyed by the relative module name.
 
     The commonest rank and alpha become the defaults and the rest the patterns.
@@ -1485,25 +1504,9 @@ def _config(lora: Adapter, named: Mapping[str, Target], base: AdapterBase | None
     alphas = [target.alpha for target in named.values()]
     rank = max(set(ranks), key=ranks.count)
     alpha = max(set(alphas), key=alphas.count)
-    config: PeftConfig = {
-        "peft_type": "LORA",
-        "r": rank,
-        "lora_alpha": alpha,
-        "rank_pattern": {name: target.rank for name, target in named.items() if target.rank != rank},
-        "alpha_pattern": {name: target.alpha for name, target in named.items() if target.alpha != alpha},
-        "target_modules": sorted(named),
-        "use_rslora": lora.rslora,
-        "lora_dropout": lora.dropout,
-        "fan_in_fan_out": False,
-        "bias": "none",
-        "init_lora_weights": True,
-        "inference_mode": True,
-    }
-    if base is not None:
-        config["base_model_name_or_path"] = base.name
-        if base.revision is not None:
-            config["revision"] = base.revision
-    return config
+    return _Config(rank, alpha, {name: target.rank for name, target in named.items() if target.rank != rank},
+                   {name: target.alpha for name, target in named.items() if target.alpha != alpha},
+                   lora.rslora, lora.dropout, base).written(sorted(named))
 
 
 # --------------------------------------------------------------------------
@@ -1526,20 +1529,22 @@ def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
     """Return every module's factor pair. `configs` is keyed by component."""
     factors: dict[str, dict[str, np.ndarray]] = {}
     for key, tensor in tensors.items():
-        module, _, factor = key.removeprefix(prefix).rpartition(".lora_")
-        if not key.startswith(prefix) or not module or factor not in ("A.weight", "B.weight"):
-            raise ValueError(
-                f"{key} is not a LoRA tensor ({prefix}<module>.lora_A.weight or lora_B.weight); "
-                "kohya/sgm keys and embedding adapters are not accepted")
-        factors.setdefault(module, {})[factor[0]] = tensor
+        held = stored_factor(key.removeprefix(prefix)) if key.startswith(prefix) else None
+        if held is None:
+            named = " or ".join(stored_name(f"{prefix}<module>", factor) for factor in FACTORS)
+            raise ValueError(f"{key} is not a LoRA tensor ({named}); kohya/sgm keys and embedding adapters "
+                             "are not accepted")
+        module, factor = held
+        factors.setdefault(module, {})[factor] = tensor
     entries = []
     for module, pair in factors.items():
-        if pair.keys() != {"A", "B"}:
-            raise ValueError(f"{module} has lora_{next(iter(pair))} without its partner")
+        if pair.keys() != set(FACTORS):
+            raise ValueError(f"{module} has {next(iter(pair))} without its partner")
         component = _component(components, module)[0]
         if component not in configs:
             raise ValueError(f"the file carries no config for {module}'s component {component!r}")
-        entries.append(_Entry(module, pair["A"], pair["B"], configs[component]))
+        a, b = (pair[factor] for factor in FACTORS)
+        entries.append(_Entry(module, a, b, configs[component]))
     return entries
 
 
@@ -1608,8 +1613,10 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
     ranks: dict[str, dict[str, int]] = {}
     for key, tensor in tensors.items():
         component, _, rest = key.partition(".")
-        module, _, factor = rest.rpartition(".lora_")
-        if factor == "B.weight":
+        held = stored_factor(rest)
+        # The rank leads a stored `lora_B`, `[out, rank]` (`_factors`).
+        if held is not None and held[1] == FACTORS[1]:
+            module = held[0]
             ranks.setdefault(component, {})[module] = _rank(f"{where} {component}.{module}", tensor.shape[1])
     return {component: _Config(next(iter(found.values())), float(next(iter(found.values()))),
                                found, {}, rslora=False, dropout=0.0, base=None)
@@ -1661,5 +1668,5 @@ class AdaptedClass(Protocol):
     _dew_lora_bound: ClassVar[_Bound]
 
 
-__all__ = ["Adapter", "AdapterRecord", "AdapterSet", "LoRA", "PeftConfig", "Target", "adapter_names",
+__all__ = ["Adapter", "AdapterRecord", "AdapterSet", "LoRA", "Target", "adapter_names",
            "unadapted"]
