@@ -1170,14 +1170,14 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     (`_ported_documents`), their table's given memories `state` `[B, S', Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
-    # Under the fast forms the skip in the template's own output and walk (`mainloop._output`, `_reverse`),
-    # as mamba_ssm's kernels add it, the output in the operands' dtype where the caller asks it so and no
-    # epilogue reads it after (`hooks.output`'s norm), else wide: added after, its fp32 output's skip and cast
-    # took 0.045 ms past an H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
-    # window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values ungated
-    # (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast forms),
-    # the skip is added after. Decided once: the selector judges the call the run makes (its skip's reverse
-    # tile).
+    # Under the fast forms the skip in the template's own output and walk (`output.output_launch`,
+    # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where the caller asks it
+    # so and no epilogue reads it after (`hooks.output`'s norm), else wide: added after, its fp32 output's
+    # skip and cast took 0.045 ms past an H100's launches, and its gradient's 0.094
+    # (ssd-rounded-h100-fdab2424c, window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values
+    # ungated (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast
+    # forms), the skip is added after. Decided once: the selector judges the call the run makes (its skip's
+    # reverse tile).
     operand = jnp.dtype(jnp.result_type(query, key, value))
     fast = fast_rounding(operand)
     fused = fast and hooks.skip and operand.itemsize == 2

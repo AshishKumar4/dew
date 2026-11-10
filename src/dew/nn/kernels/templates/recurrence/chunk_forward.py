@@ -22,11 +22,9 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Between,
     Call,
     Operand,
-    Table,
     Tiles,
     _intra,
     _intra_solve,
-    _output,
     _parts,
     _scan,
     _solved,
@@ -39,6 +37,8 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     per_key_refusal,
     values_unit,
 )
+from dew.nn.kernels.templates.recurrence.output import output_launch
+from dew.nn.kernels.templates.recurrence.table import Table
 
 
 def zero_padded(x, axis: int, size: int):
@@ -96,7 +96,7 @@ class ForkedTable(NamedTuple):
     """A forked call's table as the template takes it, its documents laid from chunks' edges
     (`chunked_launch.AlignedDocuments`): each row's given memories `given` `[B, S', HV, Dk, Dv]`, the slot
     each aligned chunk takes up and stores its memory in, `loads` and `stores` `[B, NC]`
-    (`mainloop.Table`), its entry write `entries` `[B, NC, HV, Dk, Dv]` where the call gives one, and the
+    (`table.Table`), its entry write `entries` `[B, NC, HV, Dk, Dv]` where the call gives one, and the
     stored slots a row holds, `held`."""
 
     given: jax.Array
@@ -107,7 +107,7 @@ class ForkedTable(NamedTuple):
 
 
 def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
-    """`forked` as the walks take it (`mainloop.Table`): its memories padded to the call's key and value
+    """`forked` as the walks take it (`table.Table`): its memories padded to the call's key and value
     widths and laid as the memories are, its slots a chunk's."""
     def laid(x):
         return zero_padded(zero_padded(x.astype(jnp.float32), 3, width), 4, columns).reshape(-1, columns)
@@ -186,8 +186,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                          table=run.table)
         final = run.shaped(final)
     else:
-        o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, run.beta, call, tiles,
-                    scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=skip)
+        o = output_launch(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, run.beta, call,
+                          tiles, scale=run.scale, out_dtype=out_dtype, scores=run.scores, skip=skip)
         final = run.final
     o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
     assert final is not None, "a forward runs its states launch"
@@ -260,7 +260,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     states launch's where not `states` (a walk forming the output too, `_scan`, runs it; its memories,
     corrected values and final memory then None). The solve stores its inverse where the call `keeps` it
     (`_solved`). A forked call's documents laid from chunks' edges (`chunked_launch.AlignedDocuments`) give
-    `forked` (`tabled`): its walks take up each document's memory from its table (`mainloop.Table`)."""
+    `forked` (`tabled`): its walks take up each document's memory from its table (`table.Table`)."""
     family = family_of(jnp.result_type(q, k, v)) if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "

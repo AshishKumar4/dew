@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 
 from dew.batch import document_firsts
 from dew.nn.kernels import generation, tuning
+from dew.nn.scatter import gather_positions
 
 
 @dataclasses.dataclass(frozen=True)
@@ -418,11 +419,7 @@ class AlignedDocuments:
             return None
         key, value, weight = forked.entry
         taken = jnp.maximum(self.takes, 0)
-
-        def per_chunk(x):
-            return jnp.take_along_axis(x, taken.reshape(*taken.shape, *(1,) * (x.ndim - 2)), axis=1)
-
-        key, value, weight = per_chunk(key), per_chunk(value), per_chunk(weight)
+        key, value, weight = (gather_positions(x, taken) for x in (key, value, weight))
         group = value.shape[-2] // key.shape[-2]
         if group > 1:
             key = jnp.repeat(key, group, axis=-2)

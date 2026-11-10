@@ -509,7 +509,7 @@ def _first_decays(dg, run, dh0, taken=None):
     starts from no memory. Cumulated from its chunk's end, that token's gradient is every term of its chunk,
     which cancel to fp32's residue where the memory is zero: rows of float64 zero 1.5e-7 from it against fla's
     3.3e-9 (row 5194, M-JS-26-a100). A forked call's documents each take theirs up at a chunk's first token
-    (`mainloop.Table.loads`): `<h, taken>` there, the memory the chunk entered and its gradient (`taken`,
+    (`table.Table.loads`): `<h, taken>` there, the memory the chunk entered and its gradient (`taken`,
     the reverse walk's)."""
     call = run.call
     shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.batch, -1)

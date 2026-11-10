@@ -24,9 +24,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
     Operand,
-    Returning,
-    Slots,
-    Table,
     Tiles,
     block_stored,
     chunk_liveness,
@@ -54,13 +51,12 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     summed_issuer,
     summing_staging,
     table_held,
-    table_landing,
-    table_returned,
     vector_blocks,
     vector_views,
     walk_stores,
     whole_blocks,
 )
+from dew.nn.kernels.templates.recurrence.table import Table, returned_by, table_landing, table_returned
 from dew.nn.precision import compensated_sum
 
 
@@ -452,12 +448,15 @@ def _reverse_keyed(call: Call, h) -> tuple[Operand, object]:
     return call.given, h // call.group * call.width
 
 
-def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gates: bool,
-                      skips: bool = False) -> tuple:
-    """`_reverse`'s outputs' types, its walked streams and its final memories' streams, a program walking
-    `walked_width` value columns; where the walk `gates` the values, their stream and beta's sums, where it
-    `skips`, the skip's sums, and under a decay a key dimension the memory decay's."""
-    chunk = call.chunk
+def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: int, *, gates: bool,
+                      skips: bool, table: Table | None, producer: int | None):
+    """`_reverse`'s `program` launched (`launch_kernel`): its outputs, its walked streams and its final
+    memories' streams, a program walking `tiles.walkers` value blocks; where the walk `gates` the values,
+    their stream and beta's sums, where it `skips`, the skip's sums, under a decay a key dimension the
+    memory decay's, and a forked call's `table`'s (`table_returned`); its staging and landing tiles, its
+    `Work` over the laid sequences' mean of chunks and its register model (`_reverse_held`, `table_held`)."""
+    chunk, bv = call.chunk, tiles.block_v
+    walked_width = bv * tiles.walkers
     width, value_width, given = call.width, call.value_width, call.given
     final = Operand(batch * call.heads * width, 1, jnp.dtype(jnp.float32))
     values = _reverse_values(call, gates=gates)
@@ -476,7 +475,27 @@ def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gat
                            **({"values": ((chunk, walked_width), given)} if gates else {}))
     finals = stream_blocks(**{f"final{i}": ((call.block, walked_width), final)
                               for i in range(width // call.block)})
-    return out_type, blocks, finals
+    out_type = (*out_type, *(() if table is None else table_returned(call, table, batch)))
+    # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
+    steps = call.chunks / sequences
+    held = dataclasses.replace(call.held, rows=call.rows)
+    final_landing, after = final_memory_landing(call, bv)
+    return launch_kernel(program, call, out_type=out_type, grid=(value_width // walked_width, sequences,
+                                                                 call.heads),
+                         # Two deep where the block holds both, else one: fp32's two parts and 256-wide keys
+                         # took 237920 and 282848 bytes, past an H100's 232448 (fp32-plan-sm90, cdcd620ef).
+                         grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2),
+                         work=Work(flops=2 * (2 + call.delta) * chunk * width * walked_width * steps,
+                                   span=steps),
+                         held=table_held(_reverse_held(call, bv, gates=gates, skips=skips), call, table, bv),
+                         consumers=tiles.walkers, producer=producer,
+                         live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
+                         staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
+                                  (plgpu.SMEM((chunk, bv), held.stored),)),
+                         once=finals,
+                         landing={**memory_landing(call, bv), "corrected": values.landing(chunk, bv),
+                                  **final_landing, **table_landing(call, table is not None, bv)},
+                         after=after)
 
 
 def _reverse_producer(call: Call) -> int | None:
@@ -513,7 +532,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     grads = _reverse_values(call, gates=gates)
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
-    held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
+    memories, given = call.memories, call.given
     batch, chunks = dht.shape[0] // (call.heads * width), call.chunks
     final = Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
     assert gates or not skips, "the walk adds a skip where it gates the values"
@@ -582,48 +601,22 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                         smem=lands["corrected"], wait=False)
             return grad, accumulators
 
-        def returning(table: Table, role):
-            taken_ref, *returned = returned_refs
-            return Returning(Slots(call, h, walked + role * bv, bv), table_refs[0], table_refs[1], taken_ref,
-                             returned[0] if returned else None, row, table.count, table.held, chunks,
-                             roled(role)[1]["table"])
-
         sequence_walk(call, final, "final", (leaving, final_views), (walked_streams, views), step,
                       chunks - first - count, count, ends, begins,
                       lambda role, i: dh0_ref.at[pl.ds(memory(row, i), call.block),
                                                  pl.ds(walked + role * bv, bv)], bv,
                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer,
-                      table=None if table is None else functools.partial(returning, table))
+                      table=returned_by(table, table_refs, returned_refs, call, h,
+                                        lambda role: walked + role * bv, bv, row,
+                                        lambda role: roled(role)[1]["table"]))
 
-    out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates, skips=skips)
-    out_type = (*out_type, *(() if table is None else table_returned(call, table, batch)))
-    # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
-    steps = chunks / sequences.shape[0]
-    work = Work(flops=2 * (2 + call.delta) * chunk * width * walked_width * steps, span=steps)
-    final_landing, after = final_memory_landing(call, bv)
-    launched = launch_kernel(program, call, out_type=out_type,
-                             grid=(value_width // walked_width, sequences.shape[0], call.heads),
-                             # Two deep where the block holds both, else one: fp32's two parts and 256-wide
-                             # keys took 237920 and 282848 bytes, past an H100's 232448 (fp32-plan-sm90,
-                             # cdcd620ef).
-                             grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2),
-                             work=work,
-                             held=table_held(_reverse_held(call, bv, gates=gates, skips=skips), call, table,
-                                             bv),
-                             consumers=walkers, producer=producer,
-                             live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
-                             staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
-                                      (plgpu.SMEM((chunk, bv), held.stored),)),
-                             once=finals,
-                             landing={**memory_landing(call, bv), "corrected": grads.landing(chunk, bv),
-                                      **final_landing, **table_landing(call, table is not None, bv)},
-                             # The keys take the place of weights without the delta rule, and the keys and
-                             # the prefix that of values a walk gates none of: operands no step reads.
-                             after=after)(q, k, k if w is None else w, do, local, hi, lo, dht, sequences,
-                                          k if v is None else v, hi if beta is None else beta,
-                                          *(() if skip is None else (skip.astype(jnp.float32),)),
-                                          *(() if memory is None else (memory,)),
-                                          *(() if table is None else (table.loads, table.stores)))
+    # The keys take the place of weights without the delta rule, and the keys and the prefix that of values
+    # a walk gates none of: operands no step reads.
+    launched = _reverse_launched(program, call, tiles, batch, sequences.shape[0], gates=gates, skips=skips,
+                                 table=table, producer=producer)(
+        q, k, k if w is None else w, do, local, hi, lo, dht, sequences, k if v is None else v,
+        hi if beta is None else beta, *(() if skip is None else (skip.astype(jnp.float32),)),
+        *(() if memory is None else (memory,)), *(() if table is None else (table.loads, table.stores)))
     # A forked call's stored slots' gathered gradients the walk alone reads.
     return launched[:-1] if returns == 2 else launched
 

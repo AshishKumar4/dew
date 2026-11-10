@@ -361,25 +361,6 @@ def document_by_document(hooks, operands, run=None):
     return jnp.stack(outs), jnp.stack(lasts)
 
 
-def assert_entering_on_par(kernel: str, hooks) -> None:
-    """A forked call's packed documents (`Chunk.loads`: a request's questions entering its shared part's
-    final memory, a chain's each its predecessor's) on `kernel`, in one walk: its output, its row's last
-    memory and every operand's gradient, the given memories' included (a slot entered twice summing both
-    documents'), against each document a sequence of its own from its table slot's memory in the row's
-    order, the recurrence a token at a time from float64 (check 1)."""
-    def ours(operands):
-        out, final = chunk_on(kernel, hooks, entering_documents(operands), chunk_size=CHUNK)
-        return out.astype(jnp.float32), final.astype(jnp.float32)
-
-    def theirs(operands):
-        out, final = document_by_document(hooks, operands)
-        return out.astype(jnp.promote_types(out.dtype, jnp.float32)), final
-
-    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)),
-                    functools.partial(entered_draw, hooks),
-                    f'{kernel} {hooks} a forked call\'s documents', seeds=80)
-
-
 @pytest.mark.check1_shards(seeds=80, per_task=8)
 @pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
 def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
@@ -388,9 +369,11 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
     float64 terms of the walk and its table, 6.4 GB at 8 draws on armada (11-10), so 16 a task passed a
     task's 12 GB.
     The portable math's walk over a forked call, each document laid from a chunk's edge and its table slot's
-    memory taken up there, the stored finals kept in the walk's table (`xla_mainloop`, `_walk`;
-    `assert_entering_on_par`)."""
-    assert_entering_on_par('xla', hooks)
+    memory taken up there, the stored finals kept in the walk's table (`xla_mainloop`, `_walk`), against
+    each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`): a slot
+    entered twice sums both documents' gradients."""
+    assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
+                         f'xla {hooks} a forked call\'s documents', seeds=80)
 
 
 def test_fla_refuses_a_forked_call_named_or_handed_to_it():
@@ -411,20 +394,22 @@ def test_fla_refuses_a_forked_call_named_or_handed_to_it():
     assert handed.value.refusals == [recurrence_chunk.PORT_FORKED]
 
 
-def assert_forked_as_each_alone(kernel: str, hooks, draw, site: str, seeds: int) -> None:
-    """A forked call on `kernel` (`entering_documents` of `draw`'s operands): its output, the row's last
-    memory and every operand's gradient, the given memories' included, as `kernel`'s call over each document
-    alone from its table slot's memory in the row's order (`document_by_document`), the recurrence a token
-    at a time in float64 their truth (check 1)."""
+def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alone: bool = False) -> None:
+    """A forked call on `kernel` (`entering_documents` of `draw`'s operands; `Chunk.loads`: a request's
+    questions entering its shared part's final memory, a chain's each its predecessor's): its output, the
+    row's last memory and every operand's gradient, the given memories' included, against each document a
+    sequence of its own from its table slot's memory in the row's order (`document_by_document`), through
+    `kernel`'s call where `alone`, else the recurrence a token at a time, which in float64 is their truth
+    (check 1)."""
     def ours(operands):
         out, final = chunk_on(kernel, hooks, entering_documents(operands), chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
-    def alone(hooks, piece):
+    def own(hooks, piece):
         return chunk_on(kernel, hooks, piece, chunk_size=CHUNK)
 
     def theirs(operands):
-        out, final = document_by_document(hooks, operands, alone)
+        out, final = document_by_document(hooks, operands, own if alone else None)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
     wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands)))
@@ -447,10 +432,11 @@ def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_
     """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
     state passing taking up its table slot's memory there with its entry write added (`Chunk.entry_key`),
     keeping the finals its documents store (`_ported_documents`), as the port's call over each document
-    alone from its slot's memory and entry write (`assert_forked_as_each_alone`). The port's own numbers
+    alone from its slot's memory and entry write (`assert_forked_on_par`). The port's own numbers
     (mamba_ssm's) are tests/test_mamba_ssd.py's."""
-    assert_forked_as_each_alone('pallas', hooks, functools.partial(entered_draw, hooks, entries=True),
-                                f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80)
+    assert_forked_on_par('pallas', hooks, functools.partial(entered_draw, hooks, entries=True),
+                         f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80,
+                         alone=True)
 
 
 def narrowed_draw(hooks, seed: int):
@@ -467,12 +453,12 @@ def narrowed_draw(hooks, seed: int):
 def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(hooks):
     """The recurrence template interpreted over a forked call in 16 bits, the gated delta rule, Kimi delta
     attention and Mamba2's SSD: its walks take each document's memory up from the call's table and keep
-    the finals its documents store (`mainloop.Taking`, `mainloop.Returning`; ledger 5376), as its call over
-    each document alone (`assert_forked_as_each_alone`), the same launches' arithmetic. A draw a task: four
+    the finals its documents store (`table.Taking`, `table.Returning`; ledger 5376), as its call over
+    each document alone (`assert_forked_on_par`), the same launches' arithmetic. A draw a task: four
     took 287 to 381 s a task (jsf-table-phase at 693aa1c1c)."""
-    assert_forked_as_each_alone('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
-                                f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
-                                seeds=8)
+    assert_forked_on_par('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
+                         f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
+                         seeds=8, alone=True)
 
 
 def edge_draw(hooks, seed: int):

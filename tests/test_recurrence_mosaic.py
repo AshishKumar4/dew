@@ -1388,8 +1388,8 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
 @pytest.mark.parametrize(('target', 'name', 'training'), FORKED_GATE)
 def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, training):
     """A forked call's launches (`forked_case`) compiled by Mosaic on this CPU for `target`: its walks taking
-    each document's memory up from the call's table and keeping its stored finals (`mainloop.Taking`,
-    `mainloop.Returning`; ledger 5376) lower, every kernel spilling none and every report read
+    each document's memory up from the call's table and keeping its stored finals (`table.Taking`,
+    `table.Returning`; ledger 5376) lower, every kernel spilling none and every report read
     (`kernel_compile.mosaic_failures`), at the tiles a run settles on: a launch spilling at its derived tiles
     refused and the call derived again, as a run's compile steps it down (`report.refuse_launch`,
     `stepped_down`; such a spill the register model's miss, row 5357)."""
