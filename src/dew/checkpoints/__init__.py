@@ -108,7 +108,7 @@ from dew.checkpoints._payloads import (
     _refuse_profiles_alone,
     _StepFacts,
 )
-from dew.checkpoints._replicas import _covered, _from_replicas, _grid, _zeros
+from dew.checkpoints._replicas import Grid, _covered, _from_replicas, _zeros
 from dew.checkpoints._state_trees import (
     TreePath,
     _at,
@@ -921,7 +921,7 @@ class Checkpoints:
         self._metadata: tuple[bool, int, _StepFacts] | None = None
         # The newest local step, the processes holding it and where its arrays lie, where some process
         # lost its copy and recovers it from them (`_local_latest`); None where every process holds it.
-        self._recovery: tuple[int, frozenset[int], Mapping[str, object]] | None = None
+        self._recovery: tuple[int, frozenset[int], Grid] | None = None
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -1239,7 +1239,7 @@ class Checkpoints:
         holders = frozenset(index for index, step in enumerate(steps) if step == newest)
         recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
                                                        or {}).get("grid"))
-        grid = None if recorded is None else record(recorded, "grid")
+        grid = None if recorded is None else Grid.read(recorded)
         if grid is None or not _covered(grid, holders):
             return None
         self._recovery = newest, holders, grid
@@ -1748,7 +1748,7 @@ class Checkpoints:
         """
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
-        grid = _grid({name: leaf for name, leaf in state_tree.items() if name != 'position'})
+        grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
         coded, deltas = _with_ema_deltas(state_tree)
         state_tree = dict(coded)
         if saved is not None:
@@ -1770,7 +1770,7 @@ class Checkpoints:
                     **step_record(deltas, control, rung, artifact, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
-                    "grid": grid,
+                    "grid": None if grid is None else grid.record(),
                 },
             )
         if _written_in_place(state_tree):
@@ -2250,7 +2250,7 @@ class Checkpoints:
         recovery = self._recovery
         written = (self._step_metadata(step, local=True).custom_metadata or {})
         if recovery is not None and written.get('processes') == jax.process_count() and (
-                _grid(state_tree) == recovery[2]):
+                Grid.of(state_tree) == recovery[2]):
             return
         raise ValueError(
             f"This process lost its copy of local step {step}, which the processes "

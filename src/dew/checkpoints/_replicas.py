@@ -1,10 +1,11 @@
 """A local step another process lost, read from the processes that hold its replicas: each array's grid of
-shards by process (`_grid`), which holder sends which shard (`_sources`), whether the holders cover every
+shards by process (`Grid`), which holder sends which shard (`_sources`), whether the holders cover every
 shard (`_covered`), and the arrays rebuilt from them (`_from_replicas`). `dew.checkpoints` recovers a lost
 local step through them."""
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
@@ -28,41 +29,65 @@ def _split_axes(spec: jax.sharding.PartitionSpec) -> list[str]:
     return sorted(axis for entry in spec for axis in mesh_axes(entry))
 
 
-def _grid(tree: Mapping[str, StateLeaf]) -> JSON:
-    """What a local save records of where `tree`'s arrays lie, for a process that lost its copy to
-    find each shard it held on a replica (`_covered`): the mesh's axes and its devices' ids in grid
-    order, and, by path, the axes each array splits over. None where an array lies elsewhere than on
-    one mesh by name (a host-owned state's), which no replica recovers."""
-    meshes, split = set(), {}
-    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
-        if not isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)):
-            continue
-        if not isinstance(leaf.sharding, jax.sharding.NamedSharding):
+@dataclasses.dataclass(frozen=True)
+class Grid:
+    """Where a local save's arrays lie, for a process that lost its copy to find each shard it held on a
+    replica (`_covered`): the mesh's axes, its shape and its devices' ids in grid order, and, by path,
+    the axes each array splits over. A save writes it (`of`, `record`) and a recovery reads it back
+    (`read`): one schema both ways."""
+
+    axes: tuple[str, ...]
+    shape: tuple[int, ...]
+    devices: tuple[int, ...]
+    split: Mapping[str, tuple[str, ...]]
+
+    @classmethod
+    def of(cls, tree: Mapping[str, StateLeaf]) -> Grid | None:
+        """The grid `tree`'s arrays lie on; None where an array lies elsewhere than on one mesh by name
+        (a host-owned state's), which no replica recovers."""
+        meshes, split = set(), {}
+        for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+            if not isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)):
+                continue
+            if not isinstance(leaf.sharding, jax.sharding.NamedSharding):
+                return None
+            mesh = leaf.sharding.mesh
+            if not isinstance(mesh, jax.sharding.Mesh):
+                return None
+            grid = mesh.devices
+            meshes.add((tuple(mesh.axis_names), tuple(device.id for device in grid.flat), grid.shape))
+            split[jax.tree_util.keystr(path)] = tuple(_split_axes(leaf.sharding.spec))
+        if len(meshes) != 1:
             return None
-        mesh = leaf.sharding.mesh
-        if not isinstance(mesh, jax.sharding.Mesh):
-            return None
-        grid = mesh.devices
-        meshes.add((tuple(mesh.axis_names), tuple(device.id for device in grid.flat), grid.shape))
-        split[jax.tree_util.keystr(path)] = _split_axes(leaf.sharding.spec)
-    if len(meshes) != 1:
-        return None
-    ((axes, devices, shape),) = meshes
-    return {"axes": list(axes), "shape": list(shape), "devices": list(devices), "split": split}
+        ((axes, devices, shape),) = meshes
+        return cls(axes, tuple(shape), devices, split)
+
+    def record(self) -> JSON:
+        """The grid as a local save's metadata holds it (`read`)."""
+        return {"axes": list(self.axes), "shape": list(self.shape), "devices": list(self.devices),
+                "split": {path: list(axes) for path, axes in self.split.items()}}
+
+    @classmethod
+    def read(cls, recorded: JSON) -> Grid:
+        """The grid a local save recorded (`record`)."""
+        fields = record(recorded, "grid")
+        return cls(tuple(_records.strings(fields["axes"], "grid axes")),
+                   tuple(_records.integers(fields["shape"], "grid shape")),
+                   tuple(_records.integers(fields["devices"], "grid devices")),
+                   {path: tuple(_records.strings(axes, "split axes"))
+                    for path, axes in record(fields["split"], "grid split").items()})
 
 
-def _sources(grid: Mapping[str, object], split: Sequence[str], holders: frozenset[int],
+def _sources(grid: Grid, split: Sequence[str], holders: frozenset[int],
              process: Mapping[int, int] | None = None) -> np.ndarray | None:
     """Which device, in `grid`'s order, gives its shard of an array split over the axes `split` to the
     devices that share it (the same coordinates on those axes): the first, by grid order, on a process
     of `holders`, each device's process by its id (`process`, the pool's own by default). None where
     some shard has no copy on any holder."""
-    shape = tuple(_records.integers(grid["shape"], "grid shape"))
-    axes = _records.strings(grid["axes"], "grid axes")
+    shape, axes = grid.shape, grid.axes
     if process is None:
         process = {device.id: device.process_index for device in jax.devices()}
-    devices = _records.integers(grid["devices"], "grid devices")
-    held = np.asarray([process[device] in holders for device in devices], bool).reshape(shape)
+    held = np.asarray([process[device] in holders for device in grid.devices], bool).reshape(shape)
     # The axes a shard's copies differ along come first, then each group's devices along the rest.
     shared = [axis for axis, name in enumerate(axes) if name not in split]
     order = [*[axis for axis in range(len(axes)) if axis not in shared], *shared]
@@ -74,19 +99,17 @@ def _sources(grid: Mapping[str, object], split: Sequence[str], holders: frozense
     return np.transpose(first.reshape([shape[axis] for axis in order]), np.argsort(order))
 
 
-def _covered(grid: Mapping[str, object] | None, holders: frozenset[int],
+def _covered(grid: Grid | None, holders: frozenset[int],
              process: Mapping[int, int] | None = None) -> bool:
     """Whether the processes of `holders` hold a copy of every shard of every array a local save
-    placed over `grid` (`_grid`), so a process that lost its copy recovers it from them; each
+    placed over `grid` (`Grid`), so a process that lost its copy recovers it from them; each
     device's process by its id (`process`, the pool's own by default)."""
     if grid is None:
         return False
-    split = record(grid["split"], "grid split")
-    return all(_sources(grid, _records.strings(axes, "split axes"), holders, process) is not None
-               for axes in {tuple(_records.strings(axes, "split axes")) for axes in split.values()})
+    return all(_sources(grid, axes, holders, process) is not None for axes in set(grid.split.values()))
 
 
-def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
+def _from_replicas(tree, grid: Grid, holders: frozenset[int]):
     """`tree`'s arrays, each shard on every device that holds it the bytes its first copy on a
     process of `holders` holds (`_sources`): a process that lost its local copy holds zeros there,
     and receives each shard as the sum, over the axes its copies lie along, of the source's bits and
@@ -97,7 +120,7 @@ def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
         if not isinstance(leaf, jax.Array):
             return leaf
         placed = leaf.sharding
-        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`_grid`)"
+        assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`Grid.of`)"
         mesh, split = placed.mesh, tuple(_split_axes(placed.spec))
         # Every axis the copies lie along, those of one device too, so the sum is replicated as its
         # placement says.
