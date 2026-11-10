@@ -277,8 +277,8 @@ def _upstream(named: dict[str, str], block: int, *, first: int = 0):
     run, starts = UPSTREAMS[_port(named).upstream], _starts(named)
 
     def run_block(drawn):
-        names = [field.name for field in dataclasses.fields(drawn[0][0])
-                 if getattr(drawn[0][0], field.name) is not None]
+        # The draw's arrays alone: a static field (`Chunk.held`) is no operand of the upstream's.
+        names = [path[0].name for path, _ in jax.tree_util.tree_leaves_with_path(drawn[0][0])]
         found = run(named, {name: np.stack([getattr(operands, name) for operands, _ in drawn])
                             for name in names},
                     tuple(np.stack(parts) for parts in zip(*(c for _, c in drawn), strict=True)), starts)
