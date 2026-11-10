@@ -112,24 +112,32 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     # A write gate on the keys' side scales the scores' columns (`chunk_scores`' `column_scale`): its vector
     # across a thread's columns, 16 fragments on a 64-wide tile (the lowered liveness of Nemotron-H 4B's SSD
     # output, ssd-evidence5 at 97a10a66b; row 2943).
-    # Accurate three-part products use `Issuer.apart`: a register family can overlap every term's fresh
-    # sum. Pricing one accepted an unrounded fp32 write gate whose output ptxas serialized (C7512).
-    sums = (len(product.terms(given.parts, given.parts))
-            if family.products_overlap and given.parts > 2 else 1)
-    scores = ([f32(chunk, chunk)] * (2 + sums) + masks(chunk, chunk)
-              + (held_tile(held, chunk, chunk) if held.parts > 1 else [])
-              + ([f32(chunk, chunk // 2)] if call.gated_keys else []))
+    gated = [f32(chunk, chunk // 2)] if call.gated_keys else []
+    parts = held_tile(held, chunk, chunk) if held.parts > 1 else []
+    if family.products_overlap and given.parts > 2:
+        # Accurate three-part products (`Issuer.apart`) overlap every term's fresh sum, then the decay and
+        # mask apply, then the scores split into parts (`algebra.chunk_scores`), each stage's tiles dead
+        # before the next's: one stage at a time. One sum priced accepted an unrounded fp32 write gate whose
+        # output ptxas serialized (C7512); every stage at once stated 384 registers where ptxas held an fp32
+        # rated scan's output at 248 spilling none, least 240 (the six sums alone; armada
+        # recurrence-disjoint-score-proof).
+        sums = len(product.terms(given.parts, given.parts))
+        stages = ([f32(chunk, chunk)] * sums + gated, [f32(chunk, chunk)] * 3 + masks(chunk, chunk) + gated,
+                  [f32(chunk, chunk)] * 2 + parts + gated)
+    else:
+        stages = ([f32(chunk, chunk)] * 3 + masks(chunk, chunk) + parts + gated,)
     # The keys staged as they arrive, a token a row: `Kᵀ`'s depth its stage's columns, a whole swizzle of it
     # a load (`swizzle`, `_output_swizzle`'s; a 128-byte one's 64 bf16 columns held Nemotron-H 4B's SSD
     # output 48 registers past a model of 16, 255 and a spill on an A100, where it stated 216; row 2943).
     scored = product_fragments(call, (given, chunk, call.block), (given, call.block, chunk),
                                rhs_transposed=True, rhs_swizzle=swizzle)
     if call.value_width // bv == 1:
-        return Held(carried=prefixes, phases=(values + products, scores + scored))
+        return Held(carried=prefixes, phases=(values + products, *(stage + scored for stage in stages)))
     # One product's fragments at a time where both phases hold at once, the products issuing in turn: each
     # phase's own beside the other stated an A100's fp32 call at 288 registers a 16-wide output block, where
     # ptxas needed 248 (tf32-fp32c at 9f82d62c4).
-    return Held(carried=prefixes, phases=(values + scores + largest_live_set(products, scored),))
+    return Held(carried=prefixes,
+                phases=tuple(values + stage + largest_live_set(products, scored) for stage in stages))
 
 
 @lowered_once

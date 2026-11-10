@@ -1131,7 +1131,10 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     (`algebra.key_block_pairs`), a pair's decay's two terms (`between`), a sub-chunk's middle factor and the
     laid references being rolled, an output's gated rows, their masks, one product's result `[C, right]`
     (`_pairs_right`) and its operands: its references read where they are needed and its products rolled, a
-    product's columns put into a tile read whole once (`_placed`)."""
+    product's columns put into a tile read whole once (`_placed`). The pairs read their rows' grid alone
+    (`algebra.key_block_pairs`), one int32 tile: its columns' too stated 256 and 254 registers for an sm100's
+    two intra launches, where ptxas held each at 248 spilling none, least 232 (armada
+    recurrence-unused-grid-proof)."""
     chunk = call.chunk
     pairing = _pairing_operand(call)
     # A gated row block against the keys gated up, read transposed (`algebra.key_block_pairs`' 'pairs').
@@ -1142,8 +1145,7 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
         # walks merged (M-JS-17's A100 parent), beside one gated output's factors.
         return Held(carried=[f32(chunk, chunk)], phases=(
             [f32(chunk, block)] * 5,
-            [f32(chunk, block)] * 9 + [f32(chunk, _pairs_right(call))] + masks(chunk, block) * 2
-            + paired))
+            [f32(chunk, block)] * 9 + [f32(chunk, _pairs_right(call))] + masks(chunk, block) + paired))
     # Live at once: the prefix halves and their separated pair, the rows' grid, the keys and the queries as
     # read, one output's rows and their gated form, the keys gated up, the gate down, a sub-chunk's middle
     # factor and the masked keys; the output's pairs and its sum read back. Its sums held in registers across
@@ -1152,7 +1154,7 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     return Held(carried=[], phases=(
         [f32(chunk, block)] * 5,
         [f32(chunk, block)] * 9 + [f32(chunk, _pairs_right(call))] + [f32(chunk, chunk)] * 2
-        + masks(chunk, block) * 2 + paired))
+        + masks(chunk, block) + paired))
 
 
 def _doubling_held(call: Call) -> list:
