@@ -115,11 +115,11 @@ def test_a_worker_ends_with_its_owner_however_the_owner_dies(tmp_path):
     owner = (
         "import sys, time\n"
         f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
-        "from process_support import start_process\n"
+        "from process_support import drained, start_process\n"
         "code = ('import os, time\\npid = os.fork()\\n'\n"
         "        'if pid:\\n    print(os.getpid(), pid, flush=True)\\ntime.sleep(600)\\n')\n"
         "worker = start_process([sys.executable, '-c', code], devices=1)\n"
-        "print(worker.stdout.readline().strip(), flush=True)\n"
+        "print(drained(worker).line(0, timeout=60).strip(), flush=True)\n"
         "time.sleep(600)\n"
     )
     for signal_number in (9, 15):
