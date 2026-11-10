@@ -63,6 +63,8 @@ class Question(ABC):
         kind of one of `KINDS`."""
         kind = request.get("type")
         unknown = set(request) - {"type", "instructions", "criteria"}
+        if not isinstance(kind, str):
+            raise ValueError(f"a question's type is its name, got {kind!r}")
         if unknown:
             raise ValueError(f"a question has a type, instructions and criteria, not {sorted(unknown)}")
         kinds = {question.kind: question for question in KINDS}

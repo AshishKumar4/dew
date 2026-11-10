@@ -187,18 +187,10 @@ class Slurm:
 
 def _tpu_chips() -> int:
     """How many TPU chips this host's PCI bus holds, as JAX's startup counts them
-    (`jax._src.hardware_utils.num_available_tpu_chips_and_device_id`): JAX's own module, read from its file
-    without importing `jax`, so the launcher imports nothing beyond the standard library before the
-    process is prepared. That module imports the standard library alone."""
-    found = importlib.util.find_spec("jax")
-    if found is None or found.submodule_search_locations is None:
-        return 0
-    path = Path(next(iter(found.submodule_search_locations))) / "_src" / "hardware_utils.py"
-    spec = importlib.util.spec_from_file_location("dew_jax_hardware_utils", path)
-    assert spec is not None and spec.loader is not None, f"no module at {path}"
-    hardware = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(hardware)
-    chips, _ = hardware.num_available_tpu_chips_and_device_id()
+    (`jax._src.hardware_utils.num_available_tpu_chips_and_device_id`: one per PCI function 0)."""
+    from jax._src import hardware_utils
+
+    chips, _ = hardware_utils.num_available_tpu_chips_and_device_id()
     return chips
 
 

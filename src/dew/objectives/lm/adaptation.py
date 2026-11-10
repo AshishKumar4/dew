@@ -298,7 +298,7 @@ def _slot_terms(read: list, spread: jax.Array, weights: jax.Array) -> list:
     for level in reversed(read):
         lengths, fed = jnp.sqrt(level.squares), jnp.sqrt(level.inputs)
         named = {"squares": weights * level.squares, "inputs": weights * level.inputs,
-                 "crossed": weights * fed * lengths, "lengths": weights * lengths,
+                 "crossed": weights * (fed * lengths), "lengths": weights * lengths,
                  "least": jnp.where(counted, spread, jnp.inf),
                  **{name: jnp.where(counted, term, 0) for name, term in (
                      ("fed", fed), ("longest", lengths), ("norm", jnp.broadcast_to(level.up, spread.shape)),

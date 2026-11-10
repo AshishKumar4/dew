@@ -1195,7 +1195,8 @@ def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
             return column
         return take_rows(column, indices) if isinstance(indices, np.ndarray) else column[indices]
 
-    return jax.tree.map(taken, batch, is_leaf=lambda column: isinstance(column, list))
+    # A plain list or tuple is a column of per-row records, as `take_rows` takes it; a NamedTuple a structure.
+    return jax.tree.map(taken, batch, is_leaf=lambda column: type(column) in (list, tuple))
 
 
 def row_field(column, rows: int) -> bool:
