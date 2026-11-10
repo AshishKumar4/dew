@@ -1796,13 +1796,13 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
             state, accumulators = stepped(n, slots, state, accumulators, *loaded)
             return (state if tabled is None else tabled.after(n, state)), accumulators
 
-        if (fetch := prefetch) is None:
-            def walked_step(n, slots, state, accumulators):
-                return role_step(n, slots, taken_up(n, state), accumulators)
-        else:
+        def walked_step(n, slots, state, accumulators):
+            return role_step(n, slots, taken_up(n, state), accumulators)
+
+        if (fetch := prefetch) is not None:
             last = start + count - 1
 
-            def walked_step(n, slots, carry, accumulators):
+            def fetched_step(n, slots, carry, accumulators):
                 state, loaded = carry
                 # The memory a chunk takes up from its table before the next chunk's prefix is fetched, so
                 # the fetched vectors live across the step alone: fetched first, they lived across the
@@ -1812,6 +1812,8 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
                 ahead = fetch(jnp.minimum(n + 1, last))
                 state, accumulators = role_step(n, slots, state, accumulators, loaded)
                 return (state, ahead), accumulators
+
+            walked_step = fetched_step
 
         def taken(index, slots, carry, accumulators):
             del index, carry
