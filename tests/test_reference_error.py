@@ -1384,6 +1384,28 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
                     seeds=seeds, truth_fn=truth)
 
 
+def test_a_recording_asked_ahead_is_the_recording_asked_in_turn():
+    """A reference asked several seeds at a time on threads of their own (`record_case`'s `ahead`, an
+    `evaluate` that holds its own arithmetic) records what it records asked one seed at a time: the same
+    declared count, evidence and sketches, its sizing's pilots included."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    _, live = _tiny_row(4)
+    draw, evaluate = _tiny_row_recording(live)
+
+    def own(inputs):
+        with jax.enable_x64(new_val=True):
+            return evaluate(inputs)
+
+    with jax.enable_x64(new_val=True):
+        in_turn = recorder.record_case("site", draw, own, summary=True)
+        ahead = recorder.record_case("site", draw, own, summary=True, ahead=4)
+    assert ahead.keys() == in_turn.keys()
+    for key, value in in_turn.items():
+        np.testing.assert_array_equal(ahead[key], value, err_msg=key)
+
+
 def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
     """A summarized recording made in shards of seeds (`record_shard`), each drawn as one run draws it,
     and joined (`merge_shards`) is the recording `record_case`'s summary makes of the same reference:

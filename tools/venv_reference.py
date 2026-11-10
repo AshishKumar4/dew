@@ -13,8 +13,11 @@ repository rather than a distribution.
 
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
 import importlib
 import os
+import queue
 import subprocess
 import sys
 from pathlib import Path
@@ -96,7 +99,8 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
          **{f"multimodal-{family}-text": {
              "test": "test_multimodal_model", "arms": f"{family}/text", "worker": "multimodal_worker.py",
              "reference": "huggingface/transformers 5.16.1", "license": "Apache-2.0",
-             "distribution": ("transformers", "5.16.1")}
+             "distribution": ("transformers", "5.16.1"),
+             "weighed": f"{family}/text" in importlib.import_module("multimodal_families").WEIGHED}
             for family in importlib.import_module("multimodal_families").TEXT_DRAWN},
          **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
                                        "worker": "codec_worker.py",
@@ -136,8 +140,10 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
 `pipeline_arms(arms)`, which gives the four), worker and reference, the distribution and version its
 environment must hold, where the reference is one, and the device its worker's float32 run takes, the CPU
 unless named; `narrow` the precision the reference's narrow run and Dew's take where not float32; `host`
-where its `dew` runs on the host as given (a pipeline's walk, its own programs inside), and `outputs` where
-the recording keeps the outputs whole."""
+where its `dew` runs on the host as given (a pipeline's walk, its own programs inside), `outputs` where
+the recording keeps the outputs whole, and `weighed` where its test declares check 1's weighed check: the
+recording keeps the outputs whole and each draw's rounding scale, the reference's own computation's, which
+its worker reads from its float64 twin with every operation tapped (`<draw>.scale_seed`)."""
 
 
 def site_arms(site: str):
@@ -169,20 +175,54 @@ def recording(site: str, python: str, source: str | None, given=None) -> dict[st
             raise SystemExit(f"the recording is of {name} {wanted}; {python} holds {held}")
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     environment |= {"JAX_PLATFORMS": "cpu", **({} if source is None else {"PYTHONPATH": source})}
-    with session([python, str(ROOT / "tools" / known["worker"]), site], env=environment) as worker:
+    command = [python, str(ROOT / "tools" / known["worker"]), site]
+    weighed = known.get("weighed", False)
+    with session(command, env=environment) as worker, contextlib.ExitStack() as workers:
+        # A weighed site's draws are many, its unweighted sizing declaring the cap where it never resolves,
+        # and each draw's rounding scale is its twin's step run nine times over, every operation tapped:
+        # each of the host's cores runs a worker of its own, which every draw and every scale is asked of,
+        # as many at once (`record_case`'s `ahead`).
+        pool = [worker, *(workers.enter_context(session(command, env=environment))
+                          for _ in range(len(os.sched_getaffinity(0)) - 1 if weighed else 0))]
+        free = queue.Queue()
+        for each in pool:
+            free.put(each)
+
+        def asked_of(question: dict) -> dict:
+            held = free.get()
+            try:
+                return held.ask(question)
+            finally:
+                free.put(held)
+
         def evaluate(inputs):
-            answer = worker.ask({f"case.{key}": value for key, value in inputs.items()})
+            answer = asked_of({f"case.{key}": value for key, value in inputs.items()})
             reference, truth = arms(answer, "case.")
             # The leaves the reference made that Dew replays (`record_case`), where the worker gives any.
             replayed = {leaf.removeprefix("case.replayed."): value for leaf, value in answer.items()
                         if leaf.startswith("case.replayed.")}
             return (*({leaf: arm[leaf] for leaf in outputs} for arm in (reference, truth)), replayed)
 
+        asking = workers.enter_context(concurrent.futures.ThreadPoolExecutor(len(pool)))
+        asked: dict[int, concurrent.futures.Future] = {}
+
+        def scaled(seed: int):
+            answer = asked_of({**{f"case.{key}": value for key, value in draw(seed).items()},
+                               "case.scale_seed": np.int64(seed)})
+            return {leaf: answer[f"case.scale.{leaf}"] for leaf in outputs}
+
+        def scale(inputs, seed):
+            for ahead in range(seed, seed + len(pool)):
+                if ahead not in asked:
+                    asked[ahead] = asking.submit(scaled, ahead)
+            return asked.pop(seed).result()
+
         narrow = getattr(jnp, known.get("narrow", "float32"))
         dew = ((lambda inputs: run(narrow, inputs)) if known.get("host")
                else jax.jit(lambda inputs: run(narrow, inputs)))
-        return record_case(site, draw, evaluate, store_inputs=False, summary=not known.get("outputs"),
-                           dew=dew)
+        return record_case(site, draw, evaluate, store_inputs=False,
+                           summary=not (known.get("outputs") or weighed), dew=dew,
+                           scale=scale if weighed else None, ahead=len(pool))
 
 
 def main() -> None:

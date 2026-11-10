@@ -30,6 +30,7 @@ from multimodal_families import (
     TEXT_IDS,
     TEXT_LENGTHS,
     TEXT_OUTPUTS,
+    WEIGHED,
     text_rows,
 )
 from one_draw import assert_as_exact_as_the_reference
@@ -713,6 +714,7 @@ DRAWN_SITES = [*sorted(DRAWN), *(f"{family}/text" for family in sorted(TEXT_DRAW
 over token rows alone."""
 
 
+
 @pytest.mark.parametrize("arms", DRAWN_SITES)
 def test_a_drawn_site_is_on_par_with_its_reference(arms):
     """A drawn site's leaves, on par with the reference's (check 1), the truth the reference's float64 twin
@@ -723,14 +725,15 @@ def test_a_drawn_site_is_on_par_with_its_reference(arms):
     family, _, kind = arms.partition("/")
     site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
     recording, draw, dew, leaves = pipeline_arms(arms)
-    assert_arms_as_recorded((recording, draw, dew, leaves), site, SEEDS[arms], arms)
+    weighed = arms in WEIGHED
+    assert_arms_as_recorded((recording, draw, dew, leaves), site, SEEDS[arms], arms, weighed=weighed)
     for slipped in ("inputs", "gradient"):
         slip = computing(family, slipped=slipped, text=kind == "text")
         with pytest.raises(GateFailure):
             # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
             assert_arms_as_recorded(
                 (recording, draw, lambda dtype, inputs, slip=slip: (dew if dtype == jnp.float64 else slip)(
-                    dtype, inputs), leaves), site, SEEDS[arms], f"{arms} slipped {slipped}")
+                    dtype, inputs), leaves), site, SEEDS[arms], f"{arms} slipped {slipped}", weighed=weighed)
 
 
 def _float32_values_in_float64(loaded, inputs) -> int:
