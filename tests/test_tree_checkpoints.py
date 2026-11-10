@@ -132,7 +132,7 @@ def test_a_leaf_marks_the_same_from_the_host_as_on_the_devices(dtype):
     """A frozen digest marks a host leaf on the host and a device leaf on the devices: the two give
     one leaf's stored bytes the same marks, at any chunk the host reads them in, where JAX holds the
     leaf as stored (a float64 leaf with x64 on)."""
-    from dew.checkpoints import _host_marks, _marks
+    from dew.checkpoints._integrity import _host_marks, _marks
 
     values = np.abs(np.random.default_rng(0).normal(size=(3, 5, 7))) * 40
     leaf = (values > 30) if dtype is np.bool_ else values.astype(dtype)

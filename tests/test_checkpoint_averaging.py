@@ -120,7 +120,7 @@ def test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read
 @as_given
 def running(*leaves) -> np.ndarray:
     """The leaves' running mean as `averaged` takes it, one run after another."""
-    from dew.checkpoints import _taken
+    from dew.checkpoints.averaging import _taken
 
     mean = np.asarray(leaves[0], np.float32)
     for count, leaf in enumerate(leaves[1:], start=2):
@@ -174,7 +174,7 @@ def test_one_run_or_runs_of_other_models_do_not_average(tmp_path):
 def test_a_narrow_floating_leaf_averages_in_fp32(dtype):
     """A leaf a run keeps in bf16 or float8, as a collection beside the parameters may, is floating
     and averages in fp32, as the parameters do."""
-    from dew.checkpoints import _on_host, _taken
+    from dew.checkpoints.averaging import _on_host, _taken
 
     one, other = (_on_host(jnp.asarray(values, dtype)) for values in ([1, 3], [3, 6]))
     assert one.dtype == np.float32
@@ -185,7 +185,7 @@ def test_a_complex_leaf_averages_each_component_and_stays_complex():
     """A complex leaf, as a model of complex parameters keeps, averages its real and imaginary parts
     each as a real leaf does, and stays complex: two runs holding 1+2j average to 1+2j, not 1, and
     1+2j with 3-4j to 2-1j (row 1870, AT-02)."""
-    from dew.checkpoints import _on_host, _taken
+    from dew.checkpoints.averaging import _on_host, _taken
 
     one, other = (_on_host(np.asarray(values, np.complex64))
                   for values in ([1 + 2j, 1 + 2j], [1 + 2j, 3 - 4j]))
