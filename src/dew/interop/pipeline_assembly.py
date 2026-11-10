@@ -970,10 +970,9 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
         raise ValueError(f"The {pipeline} text encoder is one of {sorted(known)}, not {kind!r}")
     template, layers = known[kind]
     multimodal = kind == "mistral3"
-    text = dict(_records.record(config["text_config"], "text_config")) if multimodal else config
-    if multimodal:
-        text["tie_word_embeddings"] = _records.boolean(config.get("tie_word_embeddings", False),
-                                                      "tie_word_embeddings")
+    # A Mistral-3's language model as a wrapper's reads (`hf_decoders.language_model_config`): its
+    # text_config under the wrapper's head policy, Mistral3Config's tied head where the file states none.
+    text = decoders.language_model_config(config) if multimodal else config
     record = decoders.translate_config(text)
     named = dtype_name(compute)
     if named is None:
