@@ -645,8 +645,9 @@ class _Measured:
 class _TrainingMeasured(_Measured):
     """A training read measured (`_training_measure`), with the mirror counters its statistics count from:
     taken before it read anything, as a memory read downloads its corpus as it is measured, before any
-    reader is built (rows 5220, 5258). A phase's read is measured as its phase is staged, and counts from
-    there; a held split's reads are its own read's, not the training read's."""
+    reader is built (rows 5220, 5258). A phased run's statistics are its first phase's (`_compile_phases`),
+    counting from that phase's measure: what this process's mirrors do from there on, its later phases'
+    reads among them, and none an earlier reader made."""
 
     mirrored: Mirrored = dataclasses.field(kw_only=True)
 
