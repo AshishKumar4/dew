@@ -204,6 +204,23 @@ def between(later, earlier):
     return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
 
 
+def first_decays(dg, entered, d_entered, first, memory, takes, live):
+    """`dg` `[N, ...]`, a decay a key dimension's gradient summed back over each chunk (a token or a laid
+    row a row), with each sequence's first token's taken from the memory its decay scales: the memory it
+    enters (`entered` `[M, ..., Dv]`, its index `memory` among them) against that memory's gradient
+    (`d_entered`), summed over the values, where the sequence takes a memory (`takes`), exactly zero where it
+    enters none; a sequence's first token at row `first`, one with no tokens (not `live`) dropped. Summed
+    back, that token's gradient is every term of its chunk, which cancel to fp32's residue where the memory
+    is zero: rows of float64 zero 1.5e-7 from it against fla's 3.3e-9 (row 5194, M-JS-26-a100), 2.7e-11 on a
+    zero initial memory, as a float64 recurrence holds it exactly. fla_kda's port and the template read
+    it alike."""
+    shared = jnp.sum(entered.astype(jnp.float32) * d_entered, axis=-1).reshape(-1, *dg.shape[1:])
+    taking = takes.reshape(-1, *(1,) * (dg.ndim - 1))
+    value = jnp.where(taking, shared[memory], 0.0)
+    index = jnp.where(live, first, dg.shape[0])
+    return dg.at[index].set(value.astype(dg.dtype), mode="drop")
+
+
 def _remembered(decayed, entered, issue: Issue = portable, name: str = "memory"):
     """A chunk's tokens reading through their decays, `decayed @ entered` (the product `name`): the memory the
     chunk entered read through its decayed queries ('memory'), or its corrected values through its scores

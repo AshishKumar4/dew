@@ -504,27 +504,21 @@ class KeyKept(NamedTuple):
 
 
 def _first_decays(dg, run, dh0, taken=None):
-    """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales, as
-    fla_kda's port takes it (`fla_kda.first_decay_grad`): `<h0, dh0>` over the values for a sequence that
-    takes its memory (begins its row), exactly zero for any other, which
-    starts from no memory. Cumulated from its chunk's end, that token's gradient is every term of its chunk,
-    which cancel to fp32's residue where the memory is zero: rows of float64 zero 1.5e-7 from it against fla's
-    3.3e-9 (row 5194, M-JS-26-a100). A forked call's documents each take theirs up at a chunk's first token
-    (`table.Table.loads`): `<h, taken>` there, the memory the chunk took up in fp32 (`_taken_memories`, as
-    the walk took it, not its 16-bit copy the states launch stored) and its gradient (`taken`, the reverse
-    walk's)."""
+    """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales
+    (`algebra.first_decays`, as fla_kda's port takes it): `<h0, dh0>` for a sequence that takes its memory
+    (begins its row), at its first chunk's first row. A forked call's documents each take theirs up at a
+    chunk's first token (`table.Table.loads`): `<h, taken>` there, the memory the chunk took up in fp32
+    (`_taken_memories`, as the walk took it, not its 16-bit copy the states launch stored) and its gradient
+    (`taken`, the reverse walk's)."""
     call = run.call
-    shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.batch, -1)
     walked = chunked_launch.unpacked(Walked, lambda i: run.sequences[:, i])
-    first, sizes, row, begins = walked.first, walked.count, walked.row, walked.takes
-    value = jnp.where((begins == 1)[:, None], shared[row], 0.0)
-    index = jnp.where(sizes > 0, first * call.chunk, call.rows)
-    dg = dg.at[index].set(value.astype(dg.dtype), mode="drop")
+    dg = algebra.first_decays(dg, run.h0, dh0, walked.first * call.chunk, walked.row, walked.takes == 1,
+                              walked.count > 0)
     if taken is None:
         return dg
-    entered = jnp.sum(_taken_memories(run) * taken, axis=-1).reshape(call.chunks, -1)
-    index = jnp.where(run.table.loads >= 0, jnp.arange(call.chunks) * call.chunk, call.rows)
-    return dg.at[index].set(entered.astype(dg.dtype), mode="drop")
+    chunks = jnp.arange(call.chunks)
+    took = run.table.loads >= 0
+    return algebra.first_decays(dg, _taken_memories(run), taken, chunks * call.chunk, chunks, took, took)
 
 
 def _taken_memories(run) -> jax.Array:

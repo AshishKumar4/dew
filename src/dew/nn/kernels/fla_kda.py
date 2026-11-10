@@ -946,21 +946,15 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
 
 def first_decay_grad(dg, h0, dh0, spans: Sequences):
     """`dg` `[B, T, HV, K]`, the decay's gradient summed back over each chunk, with each sequence's
-    first token's taken from the memory its decay scales: `<h0, dh0>` over the values for a sequence
-    that takes a memory (a row's first, or a document entering its own, `Sequences`), and exactly zero
-    for any other, which starts from no memory. Summed back, that
-    token's gradient is every term of its chunk, which cancel to fp32's residue where the memory is
-    zero (2.7e-11 on a zero initial memory, as a float64 recurrence and the portable math hold
-    exactly). The gated delta rule's port sums each token's own terms instead
-    (`fla_gdn._summed_back`), which give it exactly."""
+    first token's taken from the memory its decay scales (`algebra.first_decays`): `<h0, dh0>` over the
+    values for a sequence that takes a memory (a row's first, or a document entering its own,
+    `Sequences`), exactly zero for any other. The gated delta rule's port sums each token's own terms
+    instead (`fla_gdn._summed_back`), which give it exactly."""
     batch, length = dg.shape[:2]
     span = unpacked(Span, lambda i: spans.spans[:, i])
-    first, count, memory, takes = span.first, span.count, span.memory, span.takes
-    shared = jnp.sum(h0.astype(jnp.float32) * dh0, axis=-1)
-    value = jnp.where((takes == 1)[:, None, None], shared[memory], 0.0)
     flat = dg.reshape(batch * length, *dg.shape[2:])
-    index = jnp.where(count > 0, first, batch * length)
-    return flat.at[index].set(value.astype(dg.dtype), mode='drop').reshape(dg.shape)
+    return algebra.first_decays(flat, h0, dh0, span.first, span.memory, span.takes == 1,
+                                span.count > 0).reshape(dg.shape)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool, residual, cotangent):
