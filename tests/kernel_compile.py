@@ -391,8 +391,10 @@ def write_modules(printed: str, directory: str) -> None:
 
 def _route(lowered, executable, mesh: Mesh) -> dict:
     """What a compiled route shows (`Expected`): its launches by name, the operands each of their calls
-    reads, and its collectives over `mesh`, JSON's types (a record a process of its own writes back)."""
-    calls = kernel_calls(lowered, unrun=True)
+    reads, and its collectives over `mesh`, JSON's types (a record a process of its own writes back). Its
+    launches are those a run of it reaches (`kernel_calls`), not a loop's of no trips, which the resource
+    compile reads all the same (`unrun`): a route whose launch never runs does not take it."""
+    calls = kernel_calls(lowered)
     shards: dict[str, list] = {}
     for call in calls:
         shards.setdefault(call.name, []).append([list(shape) for shape in call.operands])
@@ -758,6 +760,10 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
                 if (model := lowered_models.get(name, _declared(kernel, models))) is not None:
                     modelled[name] = model
+            record["stated_models"] = {
+                report.launch_name(kernel["kernel"], kernel["launch"]): stated.record() for kernel in kernels
+                if kernel["launch"] is not None and (launch := report.traced(kernel["launch"])) is not None
+                and (stated := launch.kernels.get(kernel["kernel"])) is not None}
             needs = _needs(directory, generation, modelled)
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited(kernel, compiled), needs) for kernel in kernels]
@@ -883,15 +889,17 @@ def _report(kernel: dict) -> Report:
 
 
 def _register_evidence(record: dict) -> list[dict]:
-    """Each modelled kernel's evidence: its decision under the model that decided its launch, the one its
-    launch lowered (`lowered_models`, whose residency its need was searched at, `_needs`), else the case's
-    declared one for its name; and its spills and unmodelled launches."""
+    """Each modelled kernel's evidence, one row a model it has: the one its launch stated as it traced
+    (`stated_models`, the derivation's own prediction, which admitted its tile and chose its residency), the
+    case's declared one for its name (`models`), and the one its launch lowered (`lowered_models`, whose
+    residency its need was searched at, `_needs`), each judged against ptxas; and its spills and unmodelled
+    launches."""
     rows = []
     for kernel in record.get("kernels", ()):
         found = _report(kernel)
-        lowered = found.traced in record.get("lowered_models", {})
-        for source, key in (("models", found.kernel), ("lowered_models", found.traced)):
-            if (stated := record.get(source, {}).get(key)) is None or (source == "models" and lowered):
+        for source, key in (("stated_models", found.traced), ("models", found.kernel),
+                            ("lowered_models", found.traced)):
+            if (stated := record.get(source, {}).get(key)) is None:
                 continue
             model = resources.RegisterModel(**stated)
             need = kernel.get("need")
