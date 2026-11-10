@@ -9,7 +9,7 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import resources
 from dew.nn.kernels.templates.handoffs import Role, Schedule
-from dew.nn.kernels.templates.mosaic import Ring, RingFamily
+from dew.nn.kernels.templates.mosaic import Ring, RingFamily, drain
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,12 +56,9 @@ class Feed:
         pl.when(self.loads & (ahead < self.hi))(lambda: self.load(ahead))
 
     def drained(self) -> None:
-        """The loading consumer's wait for the release of each slot the walk filled last (`Ring.drain`), so
-        no slot is reused or freed while another consumer reads it."""
-        @pl.when(self.loads)
-        def _():
-            for ring in self.rings.values():
-                ring.drain(self.hi - self.first)
+        """The loading consumer's wait for the release of each slot the walk filled last (`drain`), so no
+        slot is reused or freed while another consumer reads it."""
+        pl.when(self.loads)(lambda: drain(self.rings.values(), self.hi - self.first))
 
 
 class ConsumerFed[Accumulator](RingFamily[Accumulator]):
@@ -138,7 +135,4 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def _ended(self, rings: dict[str, Ring], end, wg) -> None:
         # The loading consumer has seen every release but the last ring's worth: it waits for those too, so
         # no slot is reused or freed while another consumer reads it, and every release is seen.
-        @pl.when(wg == self.loader)
-        def _():
-            for ring in rings.values():
-                ring.drain(end)
+        pl.when(wg == self.loader)(lambda: drain(rings.values(), end))

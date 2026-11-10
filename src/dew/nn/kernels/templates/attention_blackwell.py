@@ -221,9 +221,8 @@ def _load(block: _Block, scratch: _Scratch, k_ref, v_ref, *, group: int, tiles: 
             scratch.keys.load(scratch.keys.turn(index), k_ref.at[tile])
             scratch.values.load(scratch.values.turn(index), v_ref.at[tile])
 
-    # Each slot's last releases, observed so its barriers end where they began (`Ring.drain`).
-    scratch.keys.drain(block.steps)
-    scratch.values.drain(block.steps)
+    # Each slot's last releases, observed so its barriers end where they began (`mosaic.drain`).
+    mosaic.drain((scratch.keys, scratch.values), block.steps)
 
 
 def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
