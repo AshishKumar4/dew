@@ -1263,8 +1263,8 @@ CODES = (64, 64)
 
 
 def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = True):
-    """`codes` (int8 or e4m3) converted into a bf16 tile through a family's `converted`, each row scaled by
-    `scale`, and copied out: on an A100's mma.sync and an H100's fed warpgroup MMA."""
+    """`codes` (int8 or e4m3) converted into a bf16 tile through the generation's family's `converted`, each
+    row scaled by `scale`, and copied out."""
     from dew.nn.kernels.templates import bundles, resources
 
     family = bundles.of(generation_name, jnp.bfloat16)
@@ -1280,10 +1280,10 @@ def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = 
             mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0],
                               copy=swizzling.coalesced, widest=resources.copied_rows(CODES[1], jnp.bfloat16))
 
-        # A fed family's kernel runs on a thread axis, which its scoped allocations name.
-        threaded = {"collective_axes": "wg"} if generation_name == "sm90" else {}
-        pl.run_scoped(scoped, swizzling.plain(CODES, codes.dtype), swizzling.plain(CODES, jnp.bfloat16),
-                      **threaded)
+        # Scoped as the family scopes a program's allocations (`Family.program_scoped`: across its thread
+        # axis where its kernel runs on one).
+        family.program_scoped(lambda *refs, streams: scoped(*refs), swizzling.plain(CODES, codes.dtype),
+                              swizzling.plain(CODES, jnp.bfloat16), streams={})
 
     out = jax.ShapeDtypeStruct(CODES, jnp.bfloat16)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,
