@@ -219,7 +219,7 @@ class DPOObjective(TokenScorer):
         laid = window_coordinates(batch, self.finals)
         # The policy and its reference score the windows in one forward each, through the same function,
         # so a policy equal to its reference earns zero rewards wherever the two compile alike.
-        real = jnp.asarray(batch[REAL_KEY])[:, :-1] > 0
+        real = jnp.asarray(batch[REAL_KEY])[:, :-self.finals] > 0
         with watched_positions(real if step.watched is not None else None):
             policy = self.token_scores(variables, ids, coordinates=laid, qk_stats=step.qk_stats,
                                        predict=predict, progress=self.progress(step),
