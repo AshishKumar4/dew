@@ -65,7 +65,10 @@ IDLE_SECONDS = 60
 store that is gone produces, so a close that waits out its transfers ends (`dew.data.cache`). It is the
 bound botocore already holds every S3 transfer to (its connect and read timeouts, 60 s each, botocore's
 `Config`), so every store fails a silent peer alike: gcsfs, which bounds no request of its own
-(`requests_timeout=None`), is opened with it (`Store.resolve`)."""
+(`requests_timeout=None`), is opened with it (`Store.resolve`). The Hub is a boundary of its library
+(row 5402): huggingface_hub's JSON calls go through one process-wide client with no timeout, which no call
+or client of it bounds, and hf_xet, which carries the bytes, bounds its transfers (60 s connect, 300 s idle
+read) but not its shard upload's read."""
 
 STORED = {"s3": "etag", "gs": "generation", "gcs": "generation"}
 """The version each remote store names an object it holds by and changes as it is replaced
