@@ -1319,7 +1319,8 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     if target == 'sm100':
-        failed += [f"{case}: no tiles derived" for case in refused if case.startswith("a write gate bfloat16")]
+        failed += [f"{case}: no tiles derived" for case in refused
+                   if case.startswith("a write gate bfloat16")]
     assert not failed, "\n".join(failed)
 
 
