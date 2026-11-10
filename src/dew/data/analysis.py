@@ -525,6 +525,26 @@ def _member_keys(members: Sequence[str]) -> list[str]:
     return keys
 
 
+def same_stage(made: Stage, held: Stage) -> bool:
+    """Whether two stages are one: the same kind, running the same step, and equal in every other field
+    (a map's `rejects`, a filter's reason, a batch's size). Their steps are the same where a plan's
+    identity states them wholly and alike (`StepIdentity.exact`: a function a module names, a frozen
+    step by its fields), or they are equal as values; a step a plan names by its kind alone (a partial,
+    a closure) is the same only as the same object. A plan's identity names what a stage runs, and two
+    kinds of stage may run one step (a map and a filter over one function), so it alone does not say a
+    stage is the one a call made (`Pipeline._remade`)."""
+    stated = _identity(made)
+    if type(made) is not type(held) or stated != _identity(held):
+        return False
+    ran_made, ran_held = runs(made), runs(held)
+    if ran_made is None or ran_held is None or not dataclasses.is_dataclass(made):
+        return made == held
+    return all((stated.exact and getattr(made, field.name) is ran_made.step
+                and getattr(held, field.name) is ran_held.step)
+               or getattr(made, field.name) == getattr(held, field.name)
+               for field in dataclasses.fields(made))
+
+
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     """What a stage runs, as the plan's manifest and a cache's key record it,
     refused for a cache's key where none can key it (`StepIdentity.of`). A

@@ -726,7 +726,9 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     forked = isinstance(layout, QuestionLayout) and layout.shares
     # With siblings, each question's document continuing the one before it (`Encoded.forked_parents`).
     chained = forked and isinstance(layout, QuestionLayout) and layout.siblings
-    positioned = parallel or forked
+    # Rows in streams over one state lay each question at its own row's positions too
+    # (`QuestionLayout.streamed`).
+    positioned = parallel or forked or (isinstance(layout, QuestionLayout) and layout.streamed)
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
     streamed = layout.attention is not None
     along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))

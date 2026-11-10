@@ -768,8 +768,9 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     if (saved.get("version") == FILE_SHARDS and plan.version >= IN_ORDER
             and read_otherwise_at_11(saved) is None):
         saved = {**saved, "version": IN_ORDER}
-    # 12 reads every plan as 11 does: what it changed is the steps a decision objective hands a plan
-    # (`SHARED_STATE`), and a plan of other steps is another plan, refused by its steps (`Plan.check`).
+    # 12 reads every plan as 11 does: what it changed is the steps a decision objective and the
+    # preference preset hand a plan (`SHARED_STATE`, `PAIR_WINDOWS`), and a plan of other steps is another
+    # plan, refused by its steps (`Plan.check`).
     if saved.get("version") == IN_ORDER and plan.version >= SHARED_STATE:
         saved = {**saved, "version": SHARED_STATE}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
@@ -961,6 +962,12 @@ where its backbone and head read each question as its own row does (`dew.decisio
 objective hands its plan and no reading of a plan: a position 11 saved of any other chain goes on under 12
 (`earlier_plan`), and one of a decision chain whose steps 12 lays out otherwise is another plan's
 (`Plan.check`), which a run config's resume reads by 11."""
+PAIR_WINDOWS = 12
+"""The plan version from which the preference preset packs its pairs into windows
+(`dew.data.presets.preferences`): 11's laid a pair a row, which a chain compiled under it lays again
+(the preset's `dew.data.pipeline.earlier`, `Pipeline.at`) and its objective scores
+(`dew.objectives.base.Objective.bind_plan`). The same version as `SHARED_STATE`, each naming what it
+changed: no Dew published one without the other."""
 
 PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
