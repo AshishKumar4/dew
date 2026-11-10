@@ -51,6 +51,7 @@ from dew.newton_schulz import (
     orthogonalized,
     polar_express,
 )
+from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import boxed, declared_axes, layer_norms, layers_of, parameter_path
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
@@ -563,7 +564,7 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     if logged is None:
         raise ValueError(
             f"QK-Clip reaches {'.'.join(names)} but its layer sowed no max "
-            "logits; the model has to sow them under the 'qk' collection "
+            f"logits; the model has to sow them under the {QK!r} collection "
             "for the clip to know what fires")
     # Float32 or wider, the leaf's: a float32 or bf16 run's clip is float32 as ever, and a float64
     # read of it computes it in float64.

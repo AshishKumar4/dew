@@ -74,7 +74,7 @@ from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
-from dew.nn.inspection import INSPECTED, current_positions, watched_positions
+from dew.nn.inspection import INSPECTED, QK, current_positions, watched_positions
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
@@ -951,7 +951,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             replay["routed_experts"] = jax.tree.map(lambda record: jnp.asarray(record)[:, :-finals], routed)
             if covered is not None:
                 replay["routed"] = jnp.asarray(covered, bool)[:, :-finals]
-        collections = (([ROUTER_COLLECTION] if routing else []) + (["qk"] if qk_stats else [])
+        collections = (([ROUTER_COLLECTION] if routing else []) + ([QK] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
@@ -971,7 +971,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             # Each target's state its predecessor's, a document's first token's its parent's last.
             hidden = _predicted(hidden, before)
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
-        qk = gathered.get("qk", {}) if qk_stats else None
+        qk = gathered.get(QK, {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         inspected = gathered.get(INSPECTED, {}) if watched else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
@@ -1002,7 +1002,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                                   mutable=collections or False, **packing)
         if collections:
             states, depth_sown = states
-            names = (ROUTER_COLLECTION, "qk", INDEXER_COLLECTION)
+            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION)
             records = tuple({**(held or {}), **depth_sown.get(name, {})} if wanted else held
                             for held, name, wanted in zip(records, names, asked, strict=True))
         return self._depth_scores(params, states, targets, prepared, roles, dtype, table, rows), records

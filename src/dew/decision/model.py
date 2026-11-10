@@ -11,6 +11,7 @@ from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
+from dew.nn.inspection import QK
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
@@ -181,8 +182,8 @@ class DecisionModel(HeadedModel):
                                            progress=progress, opened=opened)
         logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
                                              opened=opened)
-        if "qk" in opened:
-            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
+        if QK in opened:
+            sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head_sown.get(QK, {})}}
         return logits, sown
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
@@ -194,13 +195,13 @@ class DecisionModel(HeadedModel):
         which reads its questions' spans from `spanned`, the pass that holds them, where the head pools
         them."""
         head = thaw(part(variables, "head"))
-        clipped = "qk" in opened
+        clipped = QK in opened
         head_sown: dict = {}
 
         def applied(*args, **kwargs) -> jax.Array:
             if not clipped:
                 return _array(self.head.apply(head, *args, **kwargs))
-            out, held = self.head.apply(head, *args, mutable=["qk"], **kwargs)
+            out, held = self.head.apply(head, *args, mutable=[QK], **kwargs)
             head_sown.update(held)
             return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds

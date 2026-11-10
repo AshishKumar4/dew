@@ -29,6 +29,11 @@ from dew.nn.sharding import in_pipeline_stage
 INSPECTED = "inspected"
 """The collection watched modules sow their outputs' summaries into."""
 
+QK = "qk"
+"""The collection a model's attention sows its logit maxima in where a step opens it (`Step.qk_stats`): what
+a QK-Clip reads (`dew.optim`), the observation contract's beside `INSPECTED`, its producers' and readers'
+one name."""
+
 HISTOGRAM_EDGES = tuple(float(edge) for edge in range(-8, 5))
 """The base-10 exponents bounding an opt-in histogram's bins of magnitudes: a value below 1e-8 in the
 first, above 1e4 in the last, one bin a decade between."""

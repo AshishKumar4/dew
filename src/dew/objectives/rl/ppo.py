@@ -18,6 +18,7 @@ from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import HiddenStates
@@ -256,11 +257,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         # groups' shared prompts among them (`packed_coordinates`).
         laid = packed_coordinates(batch, -1)
         values = self.critic.apply(part(variables, "critic"), ids[:, :-1], coordinates=laid,
-                                   mutable=["qk"] if qk_stats else False, **progressed(self.critic, progress))
+                                   mutable=[QK] if qk_stats else False, **progressed(self.critic, progress))
         qk = None
         if qk_stats:
             values, gathered = values
-            qk = gathered.get("qk", {})
+            qk = gathered.get(QK, {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
         # Each action's value its prefix's, read at its predecessor's slot as a token's score is

@@ -61,7 +61,7 @@ from dew.batch import (
 )
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.inspection import INSPECTED, Watched, watching
+from dew.nn.inspection import INSPECTED, QK, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
 from dew.nn.precision import (
     ROUNDING_STREAM,
@@ -286,9 +286,6 @@ def stream(name: str) -> int:
         raise ValueError(f"the draws {name!r} and {_STREAMS[fold]!r} fold alike; rename one")
     return fold
 
-
-QK = "qk"
-"""The collection a model's attention sows its logit maxima in, where a step opens it (`Step.qk_stats`)."""
 
 OBSERVED = (QK, INSPECTED)
 """The collections a model call sows what a step observes in (`Step.observed`): its attention logit maxima
