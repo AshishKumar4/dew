@@ -35,24 +35,6 @@ _GRID_NAMES: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("t
 """The launch grid's axis names while its entry traces (`VmemRings.kernel`), which `program_index` reads."""
 
 
-class Slots:
-    """A step's operand slots by stream name (`mosaic.Slots`'s interface): the walk awaits a step's blocks
-    before the step and refills a slot only after the step that read it, so releasing one early is
-    nothing."""
-
-    def __init__(self, refs: dict):
-        self._refs = refs
-
-    def __getitem__(self, name: str):
-        return self._refs[name]
-
-    def release(self, name: str) -> None:
-        del name
-
-    def acquire_all(self) -> None:
-        """Every slot acquired: the walk awaits a step's blocks whole before the step."""
-
-
 @dataclasses.dataclass(frozen=True)
 class Streams:
     """A program's operand streams opened (`VmemRings.opened`): each stream's ring (its `slots`, `(STAGES,
@@ -417,7 +399,7 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
                 for name in names:
                     streams.copy(name, index, slot).wait()
-                slots = Slots({name: streams.rings[name]['slots'].at[slot] for name in names})
+                slots = mosaic.WholeSlots({name: streams.rings[name]['slots'].at[slot] for name in names})
                 return step(index, slots, *carry)
 
             carry = lax.fori_loop(lo, hi, body, carry)
