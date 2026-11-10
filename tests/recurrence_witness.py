@@ -103,8 +103,8 @@ class Exponents:
 
     def raised(self, lane: Lane) -> Iv:
         """`algebra.raised(hi, lo)` at each position: the decay from the chunk's start."""
-        return raised_exponent(outward(self.exact - self.bound - FRACTION, self.exact + self.bound + FRACTION),
-                               lane)
+        spread = self.bound + FRACTION
+        return raised_exponent(outward(self.exact - spread, self.exact + spread), lane)
 
     def gated(self, lane: Lane) -> Iv:
         """`algebra.scalar_write`'s gate at each position, `raised(last - hi, last_lo - lo)`: the
