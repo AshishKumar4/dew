@@ -347,7 +347,7 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         else:
             # A library's platform choices are its float32 contractions' alone (row 4863).
             assert choices(found) == contractions(found), name
-        # Four rows of three: the product's few rows sum blocked and pairwise in float32 (`pairwise._summed`).
+        # Four rows of three: the product's few rows sum blocked and pairwise (`pairwise._blocked`).
         assert float64(found) == wide, name
     # A float64 division is the plain division under either setting.
     with jax.enable_x64(new_val=True):

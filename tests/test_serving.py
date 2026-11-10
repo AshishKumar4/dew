@@ -466,6 +466,30 @@ def test_a_sampled_request_keeps_its_own_draws():
         np.testing.assert_array_equal(mine.lengths[0], rows.lengths[index])
 
 
+def test_a_request_of_several_continuations_draws_each_as_the_task_does():
+    """A task drawing `n` continuations of a prompt serves each prompt as `n` rows (`Server.n`),
+    continuation `c` past the first its key folded by `c` as a task call's is (`continuation_keys`): a
+    prompt's ticket gathers its continuations in order, each the tokens the task's `n`-continuation call
+    draws for it, and the first continuation the draw a one-continuation request makes."""
+    from dataclasses import replace
+
+    bound = replace(task(Sampling(temperature=1.0, top_k=5, eos_token_ids=EOS)), n=3)
+    server = Server.from_task(bound, slots=4, capacity=128)
+    served = server(PROMPTS, 6, key=3)
+    called = bound(PROMPTS, 6, key=3).host()
+    assert len(served) == len(PROMPTS)
+    for index, generation in enumerate(served):
+        mine = generation.host()
+        assert mine.tokens.shape[0] == 3
+        rows = slice(3 * index, 3 * index + 3)
+        np.testing.assert_array_equal(mine.tokens[:, generation.prompt_width:],
+                                      called.tokens[rows, called.prompt_width:])
+        np.testing.assert_array_equal(mine.lengths, called.lengths[rows])
+    single = Server.from_task(replace(bound, n=1), slots=4, capacity=128)(PROMPTS, 6, key=3)
+    for gathered, alone in zip(served, single, strict=True):
+        np.testing.assert_array_equal(gathered.host().tokens[:1], alone.host().tokens)
+
+
 def test_submission_keeps_device_keys_on_device_until_admission():
     """A request can queue its key without waiting for a copy to the host.
 
@@ -1042,6 +1066,22 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
         assert_same_generation(ticket.result(), lone)
     # "1234567" keeps its last token to prefill: one full page of four is shared.
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+
+
+@pytest.mark.parametrize("fields", [{"mixture": Mixture(experts=4, top_k=2, hash_layers=(0,))}],
+                         ids=["hash-routing"])
+def test_a_decoder_reading_each_tokens_id_serves_in_the_mixed_step(fields):
+    """Hash routing reads each token's id, which the mixed admitting step's one row of every slot's tokens
+    carries per token: the server takes that step (`mixed_refusal` None) and each request draws what the
+    lone task draws, its likelihoods on par with a full forward's from the float64 twin (check 1)."""
+    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
+                              max_seq_len=64, dtype="float32", **fields)
+    bound = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
+                           sampling=Sampling(temperature=0, pad_token_id=0))
+    serving = {"slots": 3, "capacity": 64}
+    assert Server.from_task(bound, **serving).mixed_refusal is None
+    assert_served_as_exact(bound, (Served(7), Served(5), Served(9)), f"mixed step over {fields}",
+                           serving=serving)
 
 
 def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_pages():

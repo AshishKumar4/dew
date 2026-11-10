@@ -561,16 +561,29 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind, tmp_path):
 
 def test_a_tower_layer_asking_wide_logits_attends_with_them():
     """`clip_layer`'s `wide_logits` reaches its attention (`MixerContext.wide_logits`): from the same
-    weights and bf16 inputs, a layer asking them answers otherwise than the layer that does not, which is
-    CLIP's own (row 4149's review, train 608: the world model's blocks build on `clip_layer`, attending
-    so)."""
+    weights and bf16 inputs, the program of a layer asking them takes its attention logits (the product
+    over the head width whose result is `[batch, heads, queries, keys]`) in at least 32 bits, and the program
+    of the layer that does not, which is CLIP's own, takes none so (row 4149's review, train 608: the
+    world model's blocks build on `clip_layer`, attending so). Read from the program, as no output shows
+    it on a CPU, whose compiler may keep a bf16 result wider than bf16 (row 5429)."""
     import jax.numpy as jnp
 
+    from dew.nn.programs import equations
     from dew.nn.text_encoders import clip_layer
 
     x = jnp.asarray(np.random.default_rng(23).normal(scale=4.0, size=(2, 8, 32)), jnp.bfloat16)
     wide, narrow = (clip_layer(32, 2, 64, 8, norm_type="rms", qk_norm=True, wide_logits=flag,
                                dtype=jnp.bfloat16) for flag in (True, False))
     variables = narrow.init(jax.random.key(24), x)
-    assert not np.array_equal(np.asarray(wide.apply(variables, x), np.float32),
-                              np.asarray(narrow.apply(variables, x), np.float32))
+
+    def logits_dtypes(layer):
+        # Every product's result whose last two axes are the queries' and the keys'.
+        program = jax.make_jaxpr(layer.apply)(variables, x)
+        return {str(variable.aval.dtype) for equation in equations(program.jaxpr)
+                if equation.primitive is jax.lax.dot_general_p for variable in equation.outvars
+                if variable.aval.shape[-2:] == (8, 8)}
+
+    # At least 32 bits where asked (float64 under Dew's wide CPU test arithmetic, `float64_sum`), none narrow.
+    taken = logits_dtypes(wide)
+    assert taken and all(np.dtype(dtype).itemsize >= 4 for dtype in taken)
+    assert all(np.dtype(dtype).itemsize < 4 for dtype in logits_dtypes(narrow))

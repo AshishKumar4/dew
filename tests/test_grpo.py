@@ -275,19 +275,45 @@ def test_a_small_log_ratios_k3_estimate_keeps_its_leading_term():
                                   np.asarray(k3_kl(jnp.zeros_like(log_ratio), jnp.asarray(log_ratio))))
 
 
-def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():
-    """A synchronous collection's proximal likelihoods are the sampler's raw ones, the policy at
-    temperature 1 (`Synchronous.rescore`): a GRPO objective reading its ratio at another
-    `sampling_temperature` is refused, where its unchanged weights would not give a ratio of 1; one at
-    1.0 is taken, whatever temperature and truncation the sampler draws at."""
-    def collected(objective):
-        return RolloutScheduler.sampled(objective, lambda *args: 1.0, groups=2, max_new_tokens=RESPONSE_WIDTH,
-                                        sampling=Sampling(temperature=1.3, top_k=5))
+def test_a_synchronous_collection_rescores_a_ratio_read_at_another_temperature():
+    """A synchronous collection's raw likelihoods are the sampler's, the policy at temperature 1: a GRPO
+    objective reading its ratio at another `sampling_temperature` has its packed rows rescored under the
+    step's weights at the progress its loss reads (`Synchronous`'s `rescoring`), so each step's proximal
+    column is the policy its loss scores, a ratio of 1 over unchanged weights; one at 1.0 keeps the raw
+    likelihoods and runs no rescoring forward."""
+    import optax
 
-    with pytest.raises(ValueError):
-        collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1,
-                                sampling_temperature=0.7))
-    collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1))
+    from dew.data import Memory, prompts
+    from dew.data.text import tokenizer_for
+    from dew.nn.progress import Progress
+    from dew.objectives.rl.scheduler import scored_rows
+    from dew.training import Layout, Trainer
+
+    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
+    vocab = tokenizer_for(tokenizer).vocab_size
+
+    def collected(objective):
+        return RolloutScheduler.sampled(objective, lambda text, record: float(len(text)), groups=2,
+                                        max_new_tokens=4, sampling=Sampling(temperature=1.3, top_k=5))
+
+    assert collected(GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)).acquisition.rescore is None
+    tempered = GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1, sampling_temperature=0.7)
+    scheduler = collected(tempered)
+    seen = []
+
+    def rollout(state, batch, key):
+        packed = scheduler(state, batch, key)
+        seen.append((np.asarray(packed[OLD_LOG_PROBS_KEY]),
+                     scored_rows(tempered, state.variables, packed, Progress(state.updates))))
+        return packed
+
+    rows = [{"prompt": "hi", "data_source": "rule", "ground_truth": "a"}] * 8
+    data = Memory(rows).filter_map(prompts.encode(tokenizer, max_prompt_len=8)).batch(8)
+    Trainer(tempered, optax.sgd(0.0), key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+            rollout=rollout).fit(data, steps=2)
+    assert len(seen) == 2
+    for proximal, scored in seen:
+        np.testing.assert_array_equal(proximal, scored)
 
 
 def annealing(**fields) -> GRPOObjective:
