@@ -42,6 +42,7 @@ from dew.nn.protocols import Lacks
 from dew.nn.sharding import rows_taken
 from dew.objectives.base import TEACHER, Aux, Objective, Step
 
+from .end_to_end import hinge_charges
 from .objective import DISCRIMINATOR, SPECTRAL, FlowDistillationObjective
 
 
@@ -160,7 +161,8 @@ class Heads(nn.Module):
 def hinge_discriminator(real: Sequence[jax.Array], fake: Sequence[jax.Array]) -> jax.Array:
     """Each row's hinge loss, relu(1 - D(real)) + relu(1 + D(fake)), meaned
     over every head's every logit as StyleGAN-T's concatenated logits are."""
-    return (jnp.mean(nn.relu(1 - _logits(real)), axis=-1) + jnp.mean(nn.relu(1 + _logits(fake)), axis=-1))
+    charged_real, charged_fake = hinge_charges(_logits(real), _logits(fake))
+    return jnp.mean(charged_real, axis=-1) + jnp.mean(charged_fake, axis=-1)
 
 
 def hinge_generator(fake: Sequence[jax.Array]) -> jax.Array:

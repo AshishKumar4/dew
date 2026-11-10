@@ -202,6 +202,13 @@ def _applied(module: nn.Module, variables: Variables, *inputs: jax.Array | Batch
     return output
 
 
+def hinge_charges(real: jax.Array, fake: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A discriminator's hinge charge on each of its logits, unreduced: `relu(1 - D(real))` for the real
+    and `relu(1 + D(fake))` for the fake, the law LADD's discriminator (`adversarial.hinge_discriminator`)
+    and REPA-E's (`EndToEnd.regularizer`) both reduce, each its own way."""
+    return nn.relu(1.0 - real), nn.relu(1.0 + fake)
+
+
 @dataclass(frozen=True)
 class EndToEnd:
     """REPA-E's end-to-end tuning of the autoencoder.
@@ -321,7 +328,8 @@ class EndToEnd:
             total = total + self.discriminator_weight * started * terms["generator"]
             real, fake = (_applied(network, discriminator, jax.lax.stop_gradient(pixels), batch)
                           for pixels in (images, reconstruction))
-            hinge = started * 0.5 * (mean_of(nn.relu(1.0 - real)) + mean_of(nn.relu(1.0 + fake)))
+            charged_real, charged_fake = hinge_charges(real, fake)
+            hinge = started * 0.5 * (mean_of(charged_real) + mean_of(charged_fake))
             terms["discriminator"] = hinge
         return total, hinge, terms
 
