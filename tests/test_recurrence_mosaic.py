@@ -1474,12 +1474,19 @@ def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, trainin
     refused and the call derived again, as a run's compile steps it down (`report.refuse_launch`,
     `stepped_down`; such a spill the register model's miss, row 5357). A call whose table walk the template
     derives no tiles for is one it derives none for unforked, the template ineligible for it alike: the
-    table's slice a step holds no call out the walk takes otherwise."""
+    table's slice a step holds no call out the walk takes otherwise; and a training pass whose gradient the
+    fast backward takes for neither (`Mosaic.trains`: a write gate without the delta rule, unrounded) is
+    one it trains for neither."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     facts, stepped = generation.gpu_target(target), set()
     while True:
         case, bound, tiles, unforked = forked_case(target, name, training)
+        if case is not None and training:
+            with generation.assumed(facts):
+                if not template.MOSAIC.trains(bound, facts):
+                    assert not template.MOSAIC.trains(unforked, facts), name
+                    return
         if case is None:
             with generation.assumed(facts):
                 assert template.MOSAIC.derived(unforked, facts) is None, f"{name}: forked alone derives none"
