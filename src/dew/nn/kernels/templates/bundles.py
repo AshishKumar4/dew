@@ -6,8 +6,9 @@ execution (mma.sync's warps into registers, `mosaic_sm80.MmaIssuer`; wgmma's war
 producer fills, `mosaic.RingFamily`, multicast across a cluster; TMA rings their consumers fill,
 `fed.ConsumerFed`; a TPU core's VMEM rings). Each composition reuses its components and overrides only what
 differs: `mosaic_sm80.Mma` (mma.sync on cp.async), `MmaFed` (mma.sync on consumer-fed TMA rings),
-`mosaic_sm90.WGMMA` and `FED` (wgmma on producer- and consumer-fed rings), `mosaic_sm100.RINGS` and `CHUNKS`
-(tcgen05 on producer rings, its accumulators persisted or a product's in registers), `mosaic_tpu.MXU`. A
+`mosaic_sm90.WGMMA` and `FED` (wgmma on producer- and consumer-fed rings), `mosaic_sm100.RINGS`, `PAIR` and
+`CHUNKS` (tcgen05 on producer rings, its accumulators persisted on one CTA or a pair's, or a product's in
+registers), `mosaic_tpu.MXU`. A
 device takes the most capable legal component of each kind its facts state (`compositions`: its issuers and
 loaders, stated per device in `generation.Architecture`, never implied by a generation's number), each
 composition as the device runs it (`Family.on`: its cluster and block scales the device's), and a launch the
@@ -71,8 +72,11 @@ COMPOSITIONS: dict[str, tuple[Composition, ...]] = {
     # and read out in chunks for a launch that states its tiles' accumulators; scoped a product in half-lane
     # tensor memory and read back into registers in the WGMMA layout (row 4747) for a launch holding its
     # 64-row tiles in registers between products whose program scopes the issuer's product scratch. A
-    # launch stating neither takes the next issuer.
+    # launch stating neither takes the next issuer. A launch stating its accumulators takes the pair too
+    # (`mosaic_sm100.PAIR`, CUTLASS's 2-SM UMMA, a cluster of two each product spans), by its tile's config,
+    # after the one CTA's.
     mosaic_sm100.RINGS.name: (Composition(lambda dtype: mosaic_sm100.RINGS, lambda launch: launch.stated),
+                              Composition(lambda dtype: mosaic_sm100.PAIR, lambda launch: launch.stated),
                               Composition(lambda dtype: mosaic_sm100.CHUNKS,
                                           lambda launch: launch.scoped and not launch.stated)),
     # wgmma: TMA rings a producer fills, then rings its consumers fill.
