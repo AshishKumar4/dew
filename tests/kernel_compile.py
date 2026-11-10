@@ -889,17 +889,18 @@ def _report(kernel: dict) -> Report:
 
 
 def _register_evidence(record: dict) -> list[dict]:
-    """Each modelled kernel's evidence, one row a model it has: the one its launch stated as it traced
-    (`stated_models`, the derivation's own prediction, which admitted its tile and chose its residency), the
-    case's declared one for its name (`models`), and the one its launch lowered (`lowered_models`, whose
-    residency its need was searched at, `_needs`), each judged against ptxas; and its spills and unmodelled
-    launches."""
+    """Each modelled kernel's evidence, one row a model that decided it, judged against ptxas: the one its
+    launch stated as it traced (`stated_models`, the derivation's own prediction, which admitted its tile and
+    chose its residency) and the one its launch lowered (`lowered_models`, whose residency its need was
+    searched at, `_needs`); where its launch has neither, the case's declared one for its name (`models`), a
+    fallback no launch of a model of its own reads; and its spills and unmodelled launches."""
     rows = []
     for kernel in record.get("kernels", ()):
         found = _report(kernel)
+        own = any(found.traced in record.get(source, {}) for source in ("stated_models", "lowered_models"))
         for source, key in (("stated_models", found.traced), ("models", found.kernel),
                             ("lowered_models", found.traced)):
-            if (stated := record.get(source, {}).get(key)) is None:
+            if (stated := record.get(source, {}).get(key)) is None or (source == "models" and own):
                 continue
             model = resources.RegisterModel(**stated)
             need = kernel.get("need")
