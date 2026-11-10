@@ -106,15 +106,6 @@ class Refused(ValueError):
     """A declaration the derivation cannot express as monoids along its walked axis, and why."""
 
 
-def read_by(jaxpr: jcore.Jaxpr, sinks: set) -> set:
-    """The values `sinks` read, themselves included."""
-    read = set(sinks)
-    for equation in reversed(jaxpr.eqns):
-        if any(var in read for var in equation.outvars):
-            read.update(var for var in equation.invars if isinstance(var, jcore.Var))
-    return read
-
-
 def evaluate(closed, env: dict, needed: set) -> None:
     """Each equation an output of which is `needed` and not yet in `env`, evaluated into it in order."""
     def read(atom):

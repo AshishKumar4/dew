@@ -24,7 +24,7 @@ from jax.extend.core import primitives
 from dew.algebra import terms
 from dew.algebra.forms import aval
 from dew.nn.derivatives import marked_call_p
-from dew.nn.programs import called, entrywise, host_evaluated, on_host
+from dew.nn.programs import called, entrywise, host_evaluated, live, on_host
 
 
 def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -57,19 +57,9 @@ def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
             seen[named] = list(equation.outvars)
         equations.append(equation)
     outvars = [read(atom) for atom in jaxpr.outvars]
-    return jcore.Jaxpr(jaxpr.replace(constvars=[], eqns=_live(equations, outvars), outvars=outvars), [])
-
-
-def _live(equations: list[jcore.JaxprEqn], outvars: list) -> list[jcore.JaxprEqn]:
-    """The equations an output reads, in order: a layout the normal form left unread (a value's form before
-    its unit axes were erased) is no part of what the program computes. An effect is read by definition."""
-    wanted = {atom for atom in outvars if isinstance(atom, jcore.Var)}
-    kept = []
-    for equation in reversed(equations):
-        if equation.effects or wanted & set(equation.outvars):
-            kept.append(equation)
-            wanted.update(atom for atom in equation.invars if isinstance(atom, jcore.Var))
-    return kept[::-1]
+    # A layout the normal form left unread (a value's form before its unit axes were erased) is no part of
+    # what the program computes.
+    return jcore.Jaxpr(jaxpr.replace(constvars=[], eqns=live(equations, outvars), outvars=outvars), [])
 
 
 class _Made:

@@ -275,7 +275,7 @@ def evaluate(jaxpr: jcore.Jaxpr, consts, arguments) -> list:
         return _constant(atom.val) if isinstance(atom, jcore.Literal) else env[atom]
 
     # Only the equations the outputs read: an inlined platform choice leaves its index unread.
-    needed = forms.read_by(jaxpr, {atom for atom in jaxpr.outvars if isinstance(atom, jcore.Var)})
+    needed = programs.read_by(jaxpr, jaxpr.outvars)
     for equation in jaxpr.eqns:
         if not any(out in needed for out in equation.outvars):
             continue

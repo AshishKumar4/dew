@@ -548,8 +548,7 @@ def equations(graph, *, platform: str | None = None):
             if chosen is None:
                 yield from equations(equation.params, platform=platform)
                 continue
-            taken = next(index for index, platforms in enumerate(chosen)
-                         if platforms is None or platform in platforms)
+            taken = programs.platform_branch(chosen, platform)
             yield from equations(programs.branches(equation)[taken], platform=platform)
     elif hasattr(graph, "jaxpr"):
         yield from equations(graph.jaxpr, platform=platform)
@@ -659,33 +658,23 @@ def _below_float64(dtype) -> bool:
     return dtype is not None and jnp.issubdtype(dtype, jnp.inexact) and jnp.finfo(dtype).bits < 64
 
 
-def _programs_within(equation, lowering: str) -> list:
-    """The programs `equation` runs within it (`programs.bodies`), of a platform's choice the branch alone
-    that a program lowered for `lowering` keeps (`programs.platform_branch`)."""
-    chosen = equation.params.get("branches_platforms")
-    if chosen is not None:
-        return [programs.branches(equation)[programs.platform_branch(chosen, lowering)]]
-    return programs.bodies(equation)
-
-
 def _narrow_values(program, lowering: str) -> Iterator[str]:
     """Each result of `program`, a float64 truth's traced program with what no output reads removed, that an
-    operation rounds narrower than float64, in the program or in one within it (`_programs_within`). A
+    operation rounds narrower than float64, in the program or in one within it (`equations`: of a platform's
+    choice, the branch a program lowered for `lowering` keeps). A
     narrow result is a format's own, and kept, where its operation rounds to a stated format (a cast,
     FORMATTED) or rounds nothing (`arm_arithmetic.rounds_nothing`: a move of entries, a selection, a
     negation): a truth that states a rounding (a quantized weight, a bf16 output) keeps it and what it
     selects of it, and one that computes in fp32 does not. A constant or a literal is its exact value
     whatever its format, as JAX promotes it where a float64 operation reads it: a parameter left float32
     under a float64 run is no rounding."""
-    for equation in getattr(program, "jaxpr", program).eqns:
+    for equation in equations(program, platform=lowering):
         primitive = equation.primitive
-        within = _programs_within(equation, lowering)
-        for inner in within:
-            yield from _narrow_values(inner, lowering)
         made = [var.aval for var in equation.outvars if _below_float64(getattr(var.aval, "dtype", None))]
         formats = (primitive is jax.lax.convert_element_type_p or primitive in FORMATTED
                    or rounds_nothing(primitive))
-        if made and not within and not formats:
+        # A call's results are its body's, read there.
+        if made and not formats and not programs.bodies(equation):
             yield (f"`{primitive.name}` computed in {made[0].str_short()} in "
                    f"{equation.source_info.name_stack or 'the truth itself'}")
 

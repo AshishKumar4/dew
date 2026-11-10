@@ -10,7 +10,7 @@ which branch a platform runs and which bodies XLA sees.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TypeGuard
 
 import jax
@@ -93,6 +93,29 @@ def equations(jaxpr: jcore.Jaxpr) -> Iterator[jcore.JaxprEqn]:
 def computed(value) -> TypeGuard[jcore.Var]:
     """Whether `value` is a program's variable, not a literal it reads."""
     return isinstance(value, jcore.Var) and not isinstance(value, jcore.Literal)
+
+
+def read_by(jaxpr: jcore.Jaxpr, sinks: Iterable) -> set[jcore.Var]:
+    """The variables of `jaxpr` that `sinks` read, themselves included: each sink's own, and every operand of
+    an equation one of whose results is read. A literal among `sinks` reads nothing. Effects are not
+    followed: what a value depends on, not what a program must still run (`live`)."""
+    read = {value for value in sinks if computed(value)}
+    for equation in reversed(jaxpr.eqns):
+        if any(var in read for var in equation.outvars):
+            read.update(value for value in equation.invars if computed(value))
+    return read
+
+
+def live(equations: Sequence[jcore.JaxprEqn], outvars: Sequence) -> list[jcore.JaxprEqn]:
+    """`equations`, in order, without those nothing reads: the ones `outvars` read (`read_by`'s walk) and
+    every equation with an effect, kept whatever reads it."""
+    wanted = {value for value in outvars if computed(value)}
+    kept: list[jcore.JaxprEqn] = []
+    for equation in reversed(equations):
+        if equation.effects or any(var in wanted for var in equation.outvars):
+            kept.append(equation)
+            wanted.update(value for value in equation.invars if computed(value))
+    return kept[::-1]
 
 
 def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],

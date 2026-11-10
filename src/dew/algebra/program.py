@@ -32,7 +32,7 @@ from dew.algebra.extract import Linear
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
-from dew.nn.programs import called, control_flow, inlined, with_bodies
+from dew.nn.programs import called, control_flow, inlined, live, with_bodies
 
 
 @dataclasses.dataclass(frozen=True)
@@ -236,8 +236,9 @@ def _windowed(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation) -> jco
                                                          reused=reused))
     if not spliced:
         return jaxpr
-    return _live(jaxpr.replace(eqns=[kept for equation in jaxpr.eqns
-                                     for kept in spliced.get(id(equation), [equation])]))
+    # Without the equations a spliced form left behind, which nothing reads.
+    landed = [kept for equation in jaxpr.eqns for kept in spliced.get(id(equation), [equation])]
+    return jaxpr.replace(eqns=live(landed, jaxpr.outvars))
 
 
 WINDOWS_HELD = 4096
@@ -339,18 +340,6 @@ def _splices(window: jcore.Jaxpr, yielded: list[jcore.Var], done: Rewrite,
                                              outvars=[renaming(var) for var in equation.outvars])
                             for equation in traced.jaxpr.eqns]
     return spliced
-
-
-def _live(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`jaxpr` without the equations nothing reads: those a spliced form left behind, an equation with an
-    effect kept whatever reads it."""
-    wanted = {atom for atom in jaxpr.outvars if not isinstance(atom, jcore.Literal)}
-    kept: list[jcore.JaxprEqn] = []
-    for equation in reversed(jaxpr.eqns):
-        if equation.effects or any(var in wanted for var in equation.outvars):
-            kept.append(equation)
-            wanted.update(atom for atom in equation.invars if not isinstance(atom, jcore.Literal))
-    return jaxpr.replace(eqns=kept[::-1])
 
 
 def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
