@@ -41,16 +41,13 @@ class HybridSSMAttentionDiT(SimpleDiT):
         policy, and the name a checkpoint stores them under.
         """
         def build(block_cls, policy: str | None, **fields) -> ModulatedBlock:
+            # The stack's block options (`_block_options`), an SSM block's attention ones unread.
             make = functools.partial(
                 block_cls if counted else remat_block(block_cls, self.remat, policy=policy),
                 features=self.emb_features,
                 num_heads=self.num_heads,
-                mlp_ratio=self.mlp_ratio,
-                dropout_rate=self.dropout_rate,
-                dtype=self.dtype,
-                precision=self.precision,
-                norm_epsilon=self.norm_epsilon,
                 adaln_silu=self.adaln_silu,
+                **self._block_options(),
                 **fields,
             )
             return make(parent=None) if counted else make()
@@ -65,14 +62,7 @@ class HybridSSMAttentionDiT(SimpleDiT):
                 scan_order=self.scan_order,
                 name=f"ssm_block_{index}",
             )
-        return build(
-            ModulatedBlock, 'dots',
-            mixer='attention',
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            qk_norm=self.qk_norm,
-            attention_impl=self.attention_impl,
-            name=f"dit_block_{index}",
-        )
+        return build(ModulatedBlock, 'dots', mixer='attention', name=f"dit_block_{index}")
 
     def stack(self, *, counted: bool = False) -> list[ModulatedBlock]:
         """Return the layers' blocks, each the block that `ssm_attention_ratio` or `block_pattern` names;
