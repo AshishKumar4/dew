@@ -130,10 +130,12 @@ def opened(variables, value: float = 1.0):
     return {**tree, "params": jax.tree_util.tree_map_with_path(gate, tree["params"])}
 
 
-def windows_of(objective: DecisionObjective, rows, count: int = 6) -> list[dict]:
+def windows_of(objective: DecisionObjective, rows, count: int = 6,
+               plan_version: int | None = None) -> list[dict]:
     """The first `count` windows `objective`'s data packs of `rows` as its evaluation reads them, in
-    order, each window as many rows as its bounds allow."""
-    reader = decision_rows(rows, None, rows, objective=objective.data(), tokens=objective.layout.max_len)
+    order, each window as many rows as its bounds allow, read by data plan `plan_version` where given."""
+    reader = decision_rows(rows, None, rows, objective=objective.data(), tokens=objective.layout.max_len,
+                           plan_version=plan_version)
     return list(itertools.islice(reader.val(DataPartition()), count))
 
 
