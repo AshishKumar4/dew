@@ -813,10 +813,13 @@ def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
 
 def _row_starts(along: np.ndarray, owners: np.ndarray) -> np.ndarray:
     """Where the row each question of `owners` belongs to starts along a stream whose rows `along`
-    numbers (0 for padding): the row's first slot (`document_spans`), each padding question's 0."""
+    numbers in the order they stand (0 for padding): past the slots of the rows before it, as
+    `document_spans` extends each (a row with none of the stream's slots, an empty context, starts where
+    the next does), each padding question's 0."""
     rows = int(max(along.max(initial=0), owners.max(initial=0)))
-    first, _ = document_spans(along[None], rows, xp=np)
-    return np.concatenate([[0], first[0]]).astype(np.int32)[owners]
+    first, end = document_spans(along[None], rows, xp=np)
+    before = np.concatenate([[0], np.cumsum(end[0] - first[0])])
+    return np.concatenate([[0], before]).astype(np.int32)[owners]
 
 
 def forked_documents(layout: Layout, bounds: Bounds) -> int | None:

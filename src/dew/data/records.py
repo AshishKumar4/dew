@@ -392,13 +392,12 @@ class _MixRecord:
 
 @dataclasses.dataclass(frozen=True)
 class _PhasesRecord:
-    """Phases' record: their chains and the steps or tokens each ends at, under the one clock they keep."""
+    """Phases' record: their chains and the steps or tokens each ends at, under the one clock they keep,
+    read where the record names it (`_read_source`)."""
 
     phases: Sequence[JSON] = dataclasses.field(metadata=_reads(_entries))
-    until_steps: Sequence[JSON] | None = dataclasses.field(default=None,
-                                                           metadata=_reads(_entries, omitted=True))
-    until_tokens: Sequence[JSON] | None = dataclasses.field(default=None,
-                                                            metadata=_reads(_entries, omitted=True))
+    until_steps: JSON = dataclasses.field(default=None, metadata=_reads(_kept, omitted=True))
+    until_tokens: JSON = dataclasses.field(default=None, metadata=_reads(_kept, omitted=True))
 
 
 def _laid_out(laid: _ChainRecord | _MixRecord | _PhasesRecord) -> dict[str, JSON]:
@@ -663,12 +662,12 @@ def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
                        mix.seed)
     if "phases" in written:
         phases = _read_laid(_PhasesRecord, written, "phases")
-        clock, until = (("tokens", phases.until_tokens) if phases.until_tokens is not None
+        # The one clock the record names: its tokens' where it names them, its steps' otherwise.
+        clock, until = (("tokens", phases.until_tokens) if "until_tokens" in written
                         else ("steps", phases.until_steps))
-        if until is None:
-            raise ValueError("a phases record names the steps or tokens each phase ends at")
+        ends = _entries(until, f"until_{clock}")
         return Phases(tuple(_read_chain(record(child, "phase")) for child in phases.phases),
-                      tuple(None if end is None else integer(end, f"until_{clock}") for end in until), clock)
+                      tuple(None if end is None else integer(end, f"until_{clock}") for end in ends), clock)
     return from_record(Source, written)
 
 
