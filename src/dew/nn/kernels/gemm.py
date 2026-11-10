@@ -45,7 +45,7 @@ from dew import _cache
 from dew.algebra import bits
 from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
-from dew.nn.kernels.templates import axes as side_axes_of, product as formats_of, swizzling
+from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100, product as formats_of, swizzling
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
@@ -1031,14 +1031,14 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     the operands' block-scaled values (`decoded`: each exact in bfloat16 and in TF32, so DEFAULT's products
     are exact) summed as XLA sums fp32 products. Gathered rows (`gather`) are the template's gather
     (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
-    as every call's scales are laid out anew for the products (`_scales_tiled`), a sixteenth or a
+    as every call's scales are laid out anew for the products (`mosaic_sm100.scales_tiled`), a sixteenth or a
     thirty-second of the rows' bytes (row 4851)."""
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
     # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products.
-    scales = (_scales_tiled(lhs.scales if gather is None else lhs.scales[gather]),
-              _scales_tiled(matrices.scales))
+    scales = (mosaic_sm100.scales_tiled(lhs.scales if gather is None else lhs.scales[gather]),
+              mosaic_sm100.scales_tiled(matrices.scales))
     call = functools.partial(launch, lhs.codes, matrices.codes, sizes, (), (), None, None, *tables,
                              out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales)
     tile = _planned(launch, launch.bind(*_abstract(*call.args[:3]), (), (), None, None,
@@ -1104,17 +1104,6 @@ def _mx_backward(out_dtype, interpret, residuals, cotangent):
 # The MXFP8 recipe's gradient (`mxfp8_projection`): a derivative of Dew's choosing (`Surrogate`).
 _mx_projection = contracted("test_an_mxfp8_projection_holds_every_reverse_order")(
     declared_derivative(Surrogate(), _mx_value, _mx_forward, _mx_backward, nondiff_argnums=(3, 4)))
-
-
-def _scales_tiled(scales: jax.Array) -> jax.Array:
-    """MX scales `[..., rows, depth / 32]` tiled as `tcgen05.scales_layout` lays them out in shared memory,
-    `[..., rows / 128, depth / 128, 32, 16]`: row `i` and scale `j` at `[i // 128, j // 4, i % 32,
-    (i // 32) % 4 * 4 + j % 4]` (`mosaic_gpu.gmm`'s `mx_scales`)."""
-    *lead, rows, columns = scales.shape
-    tiled = scales.reshape(*lead, rows // 128, 4, 32, columns // 4, 4)
-    order = tuple(range(len(lead)))
-    tiled = jnp.transpose(tiled, (*order, *(len(lead) + axis for axis in (0, 3, 2, 1, 4))))
-    return tiled.reshape(*lead, rows // 128, columns // 4, 32, 16)
 
 
 @dataclasses.dataclass(frozen=True)

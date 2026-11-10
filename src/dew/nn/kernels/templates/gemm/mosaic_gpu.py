@@ -64,6 +64,7 @@ from dew.nn.kernels.templates import (
     bundles,
     cost as unit_cost,
     mosaic,
+    mosaic_sm100,
     product as product_formats,
     resources,
     rings,
@@ -537,13 +538,11 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
 
 def _scale_tiles(block_m: int, block_n: int, block_k: int, dtype) -> dict:
     """Dew: a block-scaled step's scale streams (`gmm_allocations`'): its rows' and its matrix's columns'
-    scales in `tcgen05.scales_layout`'s tiles, `[128-row tiles, scale tiles, 32, 16]`, a tile four scales of
-    each of 128 rows, so a step of `block_k` depths takes `block_k` over four blocks' depths of them
-    (`product.block_format`)."""
+    scales of its `block_k` depths, one a block (`product.block_format`), in their tiles
+    (`mosaic_sm100.scale_tiles`)."""
     scale, per = block_format(dtype)
-    depth_tiles = block_k // (4 * per)
-    return {'a_scales': ((block_m // 128, depth_tiles, 32, 16), scale),
-            'b_scales': ((block_n // 128, depth_tiles, 32, 16), scale)}
+    return {'a_scales': (mosaic_sm100.scale_tiles(block_m, block_k // per), scale),
+            'b_scales': (mosaic_sm100.scale_tiles(block_n, block_k // per), scale)}
 
 
 def _scale_blocks(block_m: int, block_n: int) -> dict:
