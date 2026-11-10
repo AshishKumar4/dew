@@ -960,12 +960,6 @@ def record_float(record: Mapping[str, object], field: str, default: float | None
     return _recorded(record, field, default, used, _records.number)
 
 
-def record_bool(record: Mapping[str, object], field: str, default: bool | None = None, *,
-                used: set[str] | None = None) -> bool:
-    """Read a boolean field out of a record by name (`_recorded`)."""
-    return _recorded(record, field, default, used, _records.boolean)
-
-
 # Where a layer's norms sit in the two trees: without the sandwich the names
 # are the same, and with it they move (`SANDWICH_NORMS`).
 _PRE_NORMS = {
@@ -1065,10 +1059,6 @@ _V4_HEAD = ('hc_fn', 'hc_base', 'hc_scale')
 # the frozen table a hash router selects by; none is a parameter, so each
 # lands where `Router` keeps it (modeling_deepseek_v4.py:1033, :1062).
 _MOE_STATE = ('e_score_correction_bias', 'media_bias', 'tid2eid')
-
-
-def _norm_names(sandwich: bool) -> dict[str, str]:
-    return SANDWICH_NORMS if sandwich else _PRE_NORMS
 
 
 # The decoder's tensors outside its layers, read one way on load and the

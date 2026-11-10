@@ -232,17 +232,6 @@ def _side(value: object, field: str) -> int:
     return _records.integer(value, field)
 
 
-def trunk_geometry(vision: Mapping[str, object]) -> dict[str, int]:
-    """The width, MLP width, depth and head count a ViT config states, under
-    the trunk fields of the families that share the reference's names."""
-    return {
-        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": _records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": _records.integer(vision["num_attention_heads"], "num_attention_heads"),
-    }
-
-
 def activation_name(config: Mapping[str, object], runs: Collection[str], default: str,
                     fields: tuple[str, ...] = ("hidden_act",)) -> str:
     """The activation the first of `fields` that `config` states names, else
@@ -324,5 +313,5 @@ TRUNK_FIELDS = (integer_field("hidden_size", required=True),
                 integer_field("intermediate_size", required=True),
                 integer_field("num_hidden_layers", "num_layers", required=True),
                 integer_field("num_attention_heads", "num_heads", required=True))
-"""The width, MLP width, depth and head count a ViT config states (`trunk_geometry`), both ways."""
+"""The width, MLP width, depth and head count a ViT config states, both ways."""
 

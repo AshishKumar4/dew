@@ -90,18 +90,6 @@ def _shared_unused() -> Route:
                     _kv_shared)
 
 
-def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
-                       last_full: bool = False) -> tuple[str, ...]:
-    period = 6
-    if not last_full and hf_config.get('layer_types') is None:
-        used.add('sliding_window_pattern')
-        period = _records.integer(hf_config.get("sliding_window_pattern", 6), "sliding_window_pattern")
-    types = specified_layer_types(hf_config, used,
-                                  ('sliding_attention',) * (period - 1) + ('full_attention',))
-    # Gemma4TextConfig rewrites the final layer before building the model.
-    return (*types[:-1], 'full_attention') if last_full and types else types
-
-
 GEMMA4_ROPE = {'sliding_attention': {'rope_type': 'default', 'rope_theta': 10000.0},
                'full_attention': {'rope_type': 'proportional', 'partial_rotary_factor': 0.25,
                                   'rope_theta': 1000000.0}}
