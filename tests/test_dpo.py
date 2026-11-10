@@ -634,3 +634,30 @@ def test_a_windows_padding_holds_the_pad_id(segments):
     (batch,) = list(chain)
     held = np.asarray(batch[REAL_KEY]) > 0
     assert np.all(np.asarray(batch[IDS_KEY])[~held] == 7)
+
+
+def test_a_run_from_before_pair_windows_reads_a_pair_a_row():
+    """A DPO objective that states no `segments`, bound to a data plan from before preference pairs packed
+    into windows (`bind_plan`, `dew.data.plan.PAIR_WINDOWS`), reads a pair a row as `segments=1` does: its
+    batch, its loss and gradient on such a batch, and its trace key; bound to a later plan it reads windows;
+    one that states `segments` reads as stated whatever the plan."""
+    from dew.data.plan import PAIR_WINDOWS
+
+    model = TinyHead(vocab_size=VOCAB)
+    earlier, stated = DPOObjective(model, 3), DPOObjective(model, 3, segments=1)
+    earlier.bind_plan(PAIR_WINDOWS - 1)
+    stated.bind_plan(PAIR_WINDOWS)
+    assert earlier.inputs == stated.inputs and earlier.trace_key() == stated.trace_key()
+    batch = windows([PAIR, PAIR], 4, segments=1)
+    params = stated.init(jax.random.key(0))
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=stated.init(jax.random.key(2)))
+
+    def scored(objective):
+        return jax.value_and_grad(lambda tree: objective.scalar_loss(tree, batch, step)[0])(params)
+
+    found, expected = (jax.tree.leaves(scored(objective)) for objective in (earlier, stated))
+    for one, other in zip(found, expected, strict=True):
+        np.testing.assert_array_equal(one, other)
+    later = DPOObjective(model, 3)
+    later.bind_plan(PAIR_WINDOWS)
+    assert later.segments is None and later.trace_key() != stated.trace_key()

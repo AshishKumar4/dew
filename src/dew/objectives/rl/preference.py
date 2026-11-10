@@ -20,6 +20,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.batch import COORDINATES_FIELD, VALID_ROWS, Coordinates, Forks, Variables, coordinates
+from dew.data.plan import PAIR_WINDOWS
 from dew.data.preferences import (
     DOCUMENTS_KEY,
     HALVES_KEY,
@@ -154,19 +155,32 @@ class DPOObjective(TokenScorer):
             raise ValueError(f"a window holds at least one pair; got pairs={pairs}")
         # A token's place is its own half's, at most `seq_len`, which the model's positions cover.
         super().__init__(model, seq_len, balance=balance, **options)
-        inputs, self.finals = window_shape(seq_len + 1, pairs=pairs, segments=segments)
+        self.ema = EMASpec.constant(1.0)
+        self.beta = beta
+        self.pairs = pairs
+        self._stated = segments
+        self._lay(segments)
+
+    def _lay(self, segments: int | None) -> None:
+        """Read batches laid out with `segments` (`segments=1` a pair a row, else windows of packed pairs):
+        the window's inputs (`context`) and finals, and the batch it takes."""
+        inputs, self.finals = window_shape(self.seq_len + 1, pairs=self.pairs, segments=segments)
         # A window reads its inputs, its finals a tail of targets no input reads (`Coordinates.finals`).
         self.context = inputs
         width = inputs + self.finals
-        self.ema = EMASpec.constant(1.0)
         # The batch is windows of packed pairs, two halves' tokens a window, or a pair a row, its halves
         # a window each (`segments=1`); windows of pairs a caller holds are as wide as their pairs read
         # (`preferences.windows`), at most this.
         self.inputs = InputSpec(sample=Field(IDS_KEY, (2, width)) if segments == 1
                                 else Field(IDS_KEY, (width,), variable_axes=(0,)))
-        self.beta = beta
         self.segments = segments
-        self.pairs = pairs
+
+    def bind_plan(self, version: int) -> None:
+        """Read its batches as data plan `version` lays them out: a plan from before preference pairs packed
+        into windows (`dew.data.plan.PAIR_WINDOWS`) lays a pair a row where the run states no `segments`,
+        so the objective reads a pair a row (`segments=1`, which `traced` reads), as the run it resumes
+        did; a later plan, as stated."""
+        self._lay(1 if version < PAIR_WINDOWS and self._stated is None else self._stated)
 
     @property
     def halved(self) -> bool:
