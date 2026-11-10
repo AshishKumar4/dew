@@ -3,6 +3,7 @@
 // kernel from the group sizes on the device (CUTLASS's example 57, its shapes device-side alone), so a call
 // never reads the group sizes on the host.
 #include "grouped.h"
+#include "groups.cuh"
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -65,20 +66,6 @@ struct Kernel {
   };
 };
 
-// The groups' first rows, a serial scan in shared memory by one thread: a call's groups are few (a model's
-// experts), and the prepare kernel runs once a call.
-__device__ void scanned(const int32_t* group_sizes, int groups, int64_t* starts) {
-  if (threadIdx.x == 0) {
-    int64_t start = 0;
-    for (int i = 0; i < groups; ++i) {
-      starts[i] = start;
-      start += group_sizes[i];
-    }
-    starts[groups] = start;
-  }
-  __syncthreads();
-}
-
 // The forward's (and dx's) groups: group i is rows starts[i] to starts[i + 1] of x and out, times w[i].
 template <class K>
 __global__ void prepare_grouped(typename K::Arrays arrays, const typename K::A* x, const typename K::B* w,
@@ -123,14 +110,6 @@ __global__ void prepare_grouped_k(typename K::Arrays arrays, const typename K::A
   }
 }
 
-template <class T>
-T* carved(char*& cursor, int count) {
-  // Each array 128-byte aligned, as CUTLASS's TMA descriptors and vectorized loads want.
-  T* array = reinterpret_cast<T*>(cursor);
-  cursor += (sizeof(T) * count + 127) / 128 * 128;
-  return array;
-}
-
 // One call of kernel K: the group arrays carved from scratch, written by `prepare` on the stream, then the
 // GEMM. `extents` are CUTLASS's (m, n, k) of the packed strides, which no group's rows change.
 template <class K, class Prepare>
@@ -143,9 +122,11 @@ const char* run(Prepare prepare, const void* lhs, const void* rhs, void* out, co
   const auto stride_c = cutlass::make_cute_packed_stride(typename K::StrideC{}, make_shape(m_extent, n_extent, 1));
   const auto stride_d = cutlass::make_cute_packed_stride(typename K::StrideD{}, make_shape(m_extent, n_extent, 1));
   const std::size_t bytes =
-      8 * 128 + groups * (sizeof(typename ProblemShape::UnderlyingProblemShape) + 3 * sizeof(void*) +
-                          sizeof(typename K::StrideA) + sizeof(typename K::StrideB) +
-                          sizeof(typename K::StrideC) + sizeof(typename K::StrideD));
+      carved_bytes<typename ProblemShape::UnderlyingProblemShape>(groups) +
+      carved_bytes<const typename K::A*>(groups) + carved_bytes<const typename K::B*>(groups) +
+      carved_bytes<typename K::D*>(groups) + carved_bytes<typename K::StrideA>(groups) +
+      carved_bytes<typename K::StrideB>(groups) + carved_bytes<typename K::StrideC>(groups) +
+      carved_bytes<typename K::StrideD>(groups);
   char* cursor = static_cast<char*>(allocate(bytes));
   if (cursor == nullptr) return "the scratch allocator has no room for the groups' arrays";
   typename K::Arrays arrays{carved<typename ProblemShape::UnderlyingProblemShape>(cursor, groups),
@@ -212,7 +193,25 @@ const char* grouped_k_typed(const GroupedK& call, cudaStream_t stream, const All
                 Shape<int, int, int>{k, n, static_cast<int>(call.m)}, stream, allocate, device, multiprocessors);
 }
 
+// Its instantiation's geometry (`Instantiated`): its tile, the stages CUTLASS's builder fitted beside its
+// epilogue's shared memory, the threads of its tiled MMA (two consumer warpgroups) and its cluster's rows.
+template <class K>
+Instantiated instantiated() {
+  using Mainloop = typename K::Mainloop;
+  return {size<0>(typename K::Tile{}), size<1>(typename K::Tile{}), size<2>(typename K::Tile{}),
+          Mainloop::DispatchPolicy::Stages, static_cast<int>(size(typename Mainloop::TiledMma{})),
+          size<0>(typename K::Cluster{}), "wgmma"};
+}
+
 }  // namespace
+
+Instantiated sm90_kernel(Dtype result) {
+  // Every layout of a result's kernel instantiates the same tile, stages and threads; its result's epilogue
+  // storage sets its stages.
+  using BF16 = cutlass::bfloat16_t;
+  return result == Dtype::kF32 ? instantiated<Kernel<BF16, float, RowMajor, RowMajor>>()
+                               : instantiated<Kernel<BF16, BF16, RowMajor, RowMajor>>();
+}
 
 const char* sm90_grouped(const Grouped& call, cudaStream_t stream, const Allocate& allocate, int device,
                          int multiprocessors) {
