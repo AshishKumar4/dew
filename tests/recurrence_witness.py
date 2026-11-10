@@ -63,6 +63,7 @@ from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 
 from dew.nn.kernels import recurrence_algebra
+from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
 
 LOG2E = recurrence_algebra.LOG2_E
@@ -640,8 +641,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     # 16-bit value; an fp32 one's three, or under the fast forms its family's (`mainloop._fast_parts`).
     wide = jnp.dtype(dtype) == jnp.float32
     fast = 1 if family.takes_tf32 and family.transposes_tf32 else mainloop.FAST_PARTS
-    given = (fast if rounded else mainloop.PARTS) if wide else 1
-    held = given if delta or rounded else mainloop.PARTS
+    given = (fast if rounded else product.EXACT_PARTS) if wide else 1
+    held = given if delta or rounded else product.EXACT_PARTS
     write = "delta" if delta else ("keys" if held == 1 else "values")
 
     def route(*x):

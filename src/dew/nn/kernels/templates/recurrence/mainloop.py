@@ -119,9 +119,6 @@ def block_of(family: mosaic.Family) -> int:
     call's products take too."""
     return family.depths(jnp.bfloat16)[0]
 
-PARTS = -(-(jnp.finfo(jnp.float32).nmant + 1) // (jnp.finfo(jnp.bfloat16).nmant + 1))
-"""The bf16 parts of an fp32 operand: its significand's 24 bits (23 stored and the implicit one) a bf16
-part's 8 at a time, each part the rounding error of those before it, three."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,7 +176,7 @@ def _parts(dtype, family: mosaic.Family, fast: bool = False) -> int:
     `_fast_parts` under the run's fast forms (`fast`), else three."""
     if jnp.dtype(dtype) != jnp.float32:
         return 1
-    return _fast_parts(family) if fast else PARTS
+    return _fast_parts(family) if fast else product.EXACT_PARTS
 
 
 def diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -424,7 +421,7 @@ def summing_staging(call: Call) -> tuple:
     wide-bwd at b3de8f293)."""
     chunk = call.chunk
     staged = (() if call.family.operands_in_registers
-              else staging_tiles(Operand(chunk, PARTS, jnp.dtype(jnp.float32)), (chunk, chunk)))
+              else staging_tiles(Operand(chunk, product.EXACT_PARTS, jnp.dtype(jnp.float32)), (chunk, chunk)))
     return (*staged, (plgpu.SMEM((chunk, chunk), jnp.bfloat16),), column_sums_scratch(call))
 
 
@@ -445,7 +442,7 @@ def summed_issuer(staging: tuple, call: Call) -> tuple:
     """`algebra.summed_pairs`' issuer and column sums on `summing_staging`'s staging: its fp32 operand's parts
     staged, or held in registers where the family's products read them there."""
     *staged, exact, scratch = staging
-    parts = PARTS if call.family.operands_in_registers else staged[0]
+    parts = product.EXACT_PARTS if call.family.operands_in_registers else staged[0]
     return Issuer(call, {"summed": parts, "summed.exact": exact}), column_sums(call, scratch)
 
 
@@ -1475,7 +1472,7 @@ def pairing_parts(family: mosaic.Family, held: int) -> int:
     it as TF32 (`Family.takes_tf32`), one product a pair as fla's sub-chunk products take, else two bf16
     parts (16 of their bits, past TF32's); an fp32 call's three bf16 parts."""
     if held > 1:
-        return PARTS
+        return product.EXACT_PARTS
     return 1 if family.takes_tf32 else 2
 
 

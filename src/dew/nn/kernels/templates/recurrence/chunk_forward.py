@@ -13,10 +13,9 @@ import numpy as np
 
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    PARTS,
     Call,
     Operand,
     Tiles,
@@ -307,7 +306,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     # and under the accurate forms, fp32's three parts, as the portable math holds them (a 16-bit call's
     # rounded put the output 1.7 times and the final memory up to 540 times the portable math's distance from
     # float64).
-    held = given if delta or rounded else Operand(rows, PARTS, jnp.dtype(jnp.float32))
+    held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged)
     beta = laid(beta).reshape(rows, heads).T

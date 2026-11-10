@@ -866,7 +866,7 @@ def test_an_fp32_delta_rules_route_computes_the_runs_declared_products():
         return kernels, sorted(launches)
 
     fast, fast_flops = routed("default")
-    whole_terms = len(product.terms(mainloop.PARTS, mainloop.PARTS))
+    whole_terms = len(product.terms(product.EXACT_PARTS, product.EXACT_PARTS))
     rounded_terms = len(product.terms(mainloop.FAST_PARTS, mainloop.FAST_PARTS))
     for matmul in ("highest", "F32_F32_F32"):
         kernels, flops = routed(matmul)

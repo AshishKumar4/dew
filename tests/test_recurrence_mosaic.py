@@ -528,7 +528,7 @@ def test_a_launch_states_the_part_pairs_it_issues_and_declares_the_models_produc
         assert ratios == {1.0}
     else:
         # A launch over fp32 operands issues every part pair; one over the rule's bf16 gates, one.
-        pairs = float(len(product.terms(mainloop.PARTS, mainloop.PARTS)))
+        pairs = float(len(product.terms(product.EXACT_PARTS, product.EXACT_PARTS)))
         assert pairs in ratios and ratios <= {1.0, pairs}
 
 
@@ -704,7 +704,7 @@ def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
     infinite and its remainder NaN."""
     largest = float(jnp.finfo(jnp.float32).max)
     x = jnp.array([largest, -largest, 1.0 + 2.0 ** -20, -3.0e-30, 0.0], jnp.float32)
-    parts = product.formed(x, mainloop.PARTS)
+    parts = product.formed(x, product.EXACT_PARTS)
     assert all(bool(jnp.all(jnp.isfinite(part))) for part in parts)
     total = sum(np.asarray(part, np.float64) for part in parts)
     np.testing.assert_array_equal(total, np.asarray(x, np.float64))
