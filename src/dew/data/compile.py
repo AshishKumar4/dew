@@ -466,8 +466,7 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     batched = _until(pipeline.stages, (BatchStage, TokenBudget))
     if batched == len(pipeline.stages):
         return pipeline
-    at = next((index for index, stage in enumerate(pipeline.stages[:batched])
-               if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
+    at = _one_example_until(pipeline)
     repeats = [stage for stage in pipeline.stages[:at] if isinstance(stage, Repeat)]
     if any(stage.epochs is not None for stage in repeats) or any(
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
@@ -484,6 +483,16 @@ def _expands(stage: Stage) -> bool:
     """Whether `stage` is an objective's step that makes, or once it binds will make, several rows of a
     source example (`FlatMap.examples`, `Configured.examples`)."""
     return isinstance(stage, (FlatMap, Configured)) and stage.examples
+
+
+def _one_example_until(pipeline: Pipeline) -> int:
+    """The place in `pipeline`'s stages before which a source example is still one example: its first
+    step that packs or windows records or makes several rows of each (`_expands`), else its batch's, else
+    its end. A bound in examples stands there (`_bounded`), one pass's examples are counted to it
+    (`_pass_examples`) and a memory read's epochs are bounded ahead of it (`_held_ahead`)."""
+    batched = _until(pipeline.stages, (BatchStage, TokenBudget))
+    return next((index for index, stage in enumerate(pipeline.stages[:batched])
+                 if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
 
 
 def _lays_out(pipeline: Pipeline) -> bool:
@@ -964,10 +973,7 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
     source = train.source
     if isinstance(source, Phases):
         return None
-    batched = _until(train.stages, (BatchStage, TokenBudget))
-    at = next((index for index, stage in enumerate(train.stages[:batched])
-               if isinstance(stage, (Pack, Windows)) or (isinstance(stage, FlatMap) and stage.examples)),
-              batched)
+    at = _one_example_until(train)
     # Every step before the bound's place reads the pass, a repeat's included; its slices and limits before
     # the first repeat bound it.
     if any(_drops(stage) or isinstance(stage, Native)
@@ -1026,9 +1032,7 @@ def _held_ahead(train: Pipeline, read: Read) -> str | None:
     eager = _analyzed(train, read, bound=True).eager
     while eager < len(train.stages) and _held_once_bound(train.stages[eager]):
         eager += 1
-    batched = _until(train.stages, (BatchStage, TokenBudget))
-    at = next((index for index, stage in enumerate(train.stages[:batched])
-               if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
+    at = _one_example_until(train)
     if at >= eager:
         return None
     if _expands(train.stages[at]):
