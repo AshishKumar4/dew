@@ -46,8 +46,3 @@ def test_a_save_whose_shards_have_no_copy_off_the_lost_process_is_not_covered():
     assert not _covered(unreplicated, frozenset({0}), PROCESS)
     assert not _covered(None, frozenset({0}), PROCESS)
 
-
-def test_a_grid_reads_back_as_a_save_recorded_it():
-    """A local save's metadata holds its grid as JSON; a recovery reads that record back to the grid it
-    was, so a run placing the state as the holders wrote it is recognized (`_check_recovered`)."""
-    assert Grid.read(GRID.record()) == GRID

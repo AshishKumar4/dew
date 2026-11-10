@@ -137,6 +137,7 @@ from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
+from dew.registry import from_record, to_record
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -1239,7 +1240,7 @@ class Checkpoints:
         holders = frozenset(index for index, step in enumerate(steps) if step == newest)
         recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
                                                        or {}).get("grid"))
-        grid = None if recorded is None else Grid.read(recorded)
+        grid = None if recorded is None else from_record(Grid, recorded)
         if grid is None or not _covered(grid, holders):
             return None
         self._recovery = newest, holders, grid
@@ -1770,7 +1771,7 @@ class Checkpoints:
                     **step_record(deltas, control, rung, artifact, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
-                    "grid": None if grid is None else grid.record(),
+                    "grid": None if grid is None else to_record(grid, Grid),
                 },
             )
         if _written_in_place(state_tree):

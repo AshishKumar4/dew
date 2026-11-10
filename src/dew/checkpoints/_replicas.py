@@ -14,8 +14,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import _records
-from dew._records import JSON, record
 from dew.checkpoints._state_trees import _UNSIGNED
 from dew.mesh import mesh_axes
 from dew.nn.kernels.options import owned_program
@@ -33,8 +31,8 @@ def _split_axes(spec: jax.sharding.PartitionSpec) -> list[str]:
 class Grid:
     """Where a local save's arrays lie, for a process that lost its copy to find each shard it held on a
     replica (`_covered`): the mesh's axes, its shape and its devices' ids in grid order, and, by path,
-    the axes each array splits over. A save writes it (`of`, `record`) and a recovery reads it back
-    (`read`): one schema both ways."""
+    the axes each array splits over. A save records it and a recovery reads it back by its fields, as
+    every record is (`dew.registry.to_record`, `from_record`)."""
 
     axes: tuple[str, ...]
     shape: tuple[int, ...]
@@ -62,20 +60,6 @@ class Grid:
         ((axes, devices, shape),) = meshes
         return cls(axes, tuple(shape), devices, split)
 
-    def record(self) -> JSON:
-        """The grid as a local save's metadata holds it (`read`)."""
-        return {"axes": list(self.axes), "shape": list(self.shape), "devices": list(self.devices),
-                "split": {path: list(axes) for path, axes in self.split.items()}}
-
-    @classmethod
-    def read(cls, recorded: JSON) -> Grid:
-        """The grid a local save recorded (`record`)."""
-        fields = record(recorded, "grid")
-        return cls(tuple(_records.strings(fields["axes"], "grid axes")),
-                   tuple(_records.integers(fields["shape"], "grid shape")),
-                   tuple(_records.integers(fields["devices"], "grid devices")),
-                   {path: tuple(_records.strings(axes, "split axes"))
-                    for path, axes in record(fields["split"], "grid split").items()})
 
 
 def _sources(grid: Grid, split: Sequence[str], holders: frozenset[int],

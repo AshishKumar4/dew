@@ -232,7 +232,11 @@ def main() -> None:
         losses.append(loss)
         if rank == 0 and (step % 10 == 0 or step < 5):
             print(f"step {step} loss {loss:.4f} {seconds[-1]:.3f} s", flush=True)
-        if reached is None and len(losses) >= 10 and sum(losses[-10:]) / 10 <= target:
+        # The mean of the last 10 losses; under DiLoCo the outer model is what reaches the target, read at
+        # each meeting of the groups, every H steps, over the groups' mean losses since the last.
+        window = args.diloco or 10
+        meets = not args.diloco or step % args.diloco == 0
+        if meets and len(losses) >= window and sum(losses[-window:]) / window <= target:
             reached = {"step": step, "seconds": sum(seconds)}
             break
         # Rank 0's clock decides, so every process stops at the same step.
