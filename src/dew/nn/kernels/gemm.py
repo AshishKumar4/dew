@@ -48,8 +48,15 @@ from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import axes as side_axes_of, swizzling
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
-from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed
-from dew.nn.precision import accumulated, at_least_fp32, projected, refuse_recipe
+from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
+from dew.nn.precision import (
+    accumulated,
+    asks_default_precision,
+    at_least_fp32,
+    exact_products,
+    projected,
+    refuse_recipe,
+)
 from dew.nn.sharding import explicit_spec, seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -239,8 +246,10 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
 
 def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, out_dtype,
             precision: PrecisionLike, interpret_on_cpu: bool, gather: tuple | None = None) -> jax.Array:
-    """`gemm_t` of side operands checked (`_split`), its groups the call's."""
+    """`gemm_t` of side operands checked (`_split`), its groups the call's, each operand multiplied whole: in
+    the wider of their dtypes (a wider cotangent never rounded to the rows')."""
     dense = group_sizes is None
+    compute = jnp.promote_types(lhs.dtype, rhs.dtype)
     group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     tables = (None, None) if gather is None else tuple(gather)
 
@@ -250,12 +259,25 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
                      for operand, table in zip((lhs, rhs), tables, strict=True))
 
     def kernel(lhs, rhs, group_sizes, prologue_arrays, tables, *, interpret):
+        tabled = any(table is not None for table in tables)
+        # An fp32 product asked above the default precision runs as its operands' bf16 parts (`_in_parts`),
+        # each operand's values its own dtype's.
+        counts = _part_counts(lhs.dtype, rhs.dtype, precision)
+        if counts is not None and prologue is None:
+            def part(left, right, epilogue, prior, axes, dtypes):
+                # A kernel gradient takes no epilogue: the earlier parts' sum is added after.
+                del epilogue, axes, dtypes
+                out = _gemm_t(left, right, None if dense else group_sizes, None, (), (),
+                              out_dtype=jnp.float32, precision=precision, interpret_on_cpu=interpret_on_cpu,
+                              gather=tables if tabled else None)
+                return out + prior[0] if prior else out
+            wide = (jnp.dtype(jnp.float32),)
+            return _in_parts(part, lhs, rhs, counts, None, (), (), wide).astype(out_dtype)
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast,
                                      prologue_dtypes=_dtypes(prologue, lhs, sides))
-        product = declared(lhs.dtype, precision, outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
-        tabled = any(table is not None for table in tables)
-        call = grouped_matmul.tgmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, sides,
+        product = declared(compute, precision, outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
+        call = grouped_matmul.tgmm_call(lhs.astype(compute), rhs.astype(compute), group_sizes, sides,
                                         tables if tabled else None, out_dtype=out_dtype,
                                         hooks=hooks, interpret=interpret, promoted=product.promoted,
                                         dense=dense)
@@ -278,7 +300,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
             sides = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])
             lhs = prologue(lhs, *sides).astype(lhs.dtype)
         lhs = jnp.where(routed[:, None], lhs, 0)
-        wide = at_least_fp32(lhs.dtype)  # an fp64 product's sum in fp64
+        wide = at_least_fp32(compute)  # an fp64 product's sum in fp64
         # Each group's rows contracted, XLA's ragged dot's own weight gradient (its transpose's form) on the
         # operands as they are: a pullback from a matrix made here would hand a vmapped call (a pipeline
         # stage's) an unbatched operand, which ragged_dot's batching rule refuses. The operands keep their
@@ -295,12 +317,12 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
             product = functools.partial(jax.lax.dot_general, dimension_numbers=(((0,), (0,)), ((), ())),
                                         precision=precision,
                                         out_sharding=grouped_matmul.ragged_placement(((lhs, 1), (rhs, 1))))
-            return accumulated(product, lhs, rhs.astype(lhs.dtype),
+            return accumulated(product, lhs.astype(compute), rhs.astype(compute),
                                preferred_element_type=wide)[None].astype(out_dtype)
         product = functools.partial(
             jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_CONTRACTED_ROWS, precision=precision,
             out_sharding=grouped_matmul.ragged_placement((None, (lhs, 1), (rhs, 1))))
-        return accumulated(product, lhs, rhs.astype(lhs.dtype), group_sizes,
+        return accumulated(product, lhs.astype(compute), rhs.astype(compute), group_sizes,
                            preferred_element_type=wide).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays, tables)
@@ -1446,6 +1468,17 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
     (`gemm`'s)."""
     def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired, first, gather, scatter, *,
                interpret):
+        # An fp32 product asked above the default precision runs as its operands' bf16 parts (`_in_parts`),
+        # the matrix's values `rhs`'s or, rounded to the rows' dtype as the product multiplies them, theirs.
+        values = rhs.dtype if jnp.dtype(rhs.dtype).itemsize <= jnp.dtype(lhs.dtype).itemsize else lhs.dtype
+        counts = _part_counts(lhs.dtype, values, precision)
+        if counts is not None and prologue is None and paired is None and scatter is None and not several:
+            def part(left, right, epilogue, epilogue_arrays, epilogue_axes, dtypes):
+                return _gemm(left, right, group_sizes, None, (), (), epilogue, epilogue_arrays, epilogue_axes,
+                             dtypes, several=False, transpose_rhs=transpose_rhs,
+                             interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense, first=first,
+                             gather=gather, summed_as=summed_as or dtypes)
+            return _in_parts(part, lhs, rhs, counts, epilogue, epilogue_arrays, epilogue_axes, dtypes)
         call, product = _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
                                    epilogue_arrays, epilogue_axes, dtypes, several=several,
                                    transpose_rhs=transpose_rhs, interpret=interpret, precision=precision,
@@ -1624,13 +1657,61 @@ def _kernel_gradient(lhs, d_product, matrix, group_sizes, prologue, prologue_arr
     else:
         operand = (lhs.astype(compute) if prologue is None else prologue(
             lhs, *_rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])).astype(lhs.dtype))
-        gradient = _gemm_t(operand.astype(work), d_product, sizes, None, (), (), out_dtype=matrix.dtype,
-                           **options)
+        # The operand in its own dtype beside the wider cotangent, multiplied in the wider (`_gemm_t`).
+        gradient = _gemm_t(operand, d_product, sizes, None, (), (), out_dtype=matrix.dtype, **options)
     gradient = jnp.swapaxes(gradient, 1, 2) if plain['transpose_rhs'] else gradient
     if plain['first'] is None:
         return gradient
     return jax.lax.dynamic_update_slice_in_dim(jnp.zeros(matrix.shape, gradient.dtype), gradient,
                                                plain['first'], 0)
+
+
+def _part_counts(lhs_dtype, rhs_dtype, precision) -> tuple[int, int] | None:
+    """The bf16 parts each operand of a product is multiplied as on a family's launch, its operands' values
+    `lhs_dtype`'s and `rhs_dtype`'s: where the product is fp32's and asked whole above the default precision,
+    which the families' tensor cores multiply only in TF32, each operand's bf16 parts (`product.parts`: an
+    fp32 operand's three, a 16-bit one's one or two), each pair's product exact and their sums fp32's
+    (`_in_parts`); None where the product is the operands' own (a 16-bit one's, an fp32 one at the default
+    precision TF32's, a declared algorithm's a portable route's)."""
+    if (jnp.promote_types(lhs_dtype, rhs_dtype) != jnp.float32
+            or asks_default_precision(precision, configured=True)
+            or not exact_products(precision, jnp.float32)):
+        return None
+    return parts(lhs_dtype), parts(rhs_dtype)
+
+
+def _in_parts(product, lhs, rhs, counts: tuple[int, int], epilogue, epilogue_arrays, epilogue_axes, dtypes):
+    """`product(left, right, epilogue, epilogue_arrays, epilogue_axes, dtypes)` of `lhs` and `rhs` as their
+    bf16 parts (`counts` of them, `product.formed`): each pair of parts a product issues (`product.terms`,
+    smallest first, those under fp32's significand), each exact, the earlier ones' fp32 sum added in the
+    next one's epilogue (`_added`), the last one's epilogue `epilogue` on the whole sum; as exact as the fp32
+    product whole, its sums fp32's (an exactly split operand's parts sum to it, row 5405)."""
+    def bf16_parts(x, count):
+        return (x.astype(jnp.bfloat16),) if count == 1 else formed(x.astype(jnp.float32), count)
+
+    left, right = bf16_parts(lhs, counts[0]), bf16_parts(rhs, counts[1])
+    pairs = terms(*counts)
+    wide = (jnp.dtype(jnp.float32),)
+    total = None
+    for index, (i, j) in enumerate(pairs):
+        last = index == len(pairs) - 1
+        if total is None and not last:
+            total = product(left[i], right[j], None, (), (), wide)
+            continue
+        if not last:
+            total = product(left[i], right[j], _added, (total,), (('rows', 'columns'),), wide)
+            continue
+        if total is None:
+            return product(left[i], right[j], epilogue, epilogue_arrays, epilogue_axes, dtypes)
+        whole = (functools.partial(_summed_then, epilogue) if epilogue is not None else _added)
+        return product(left[i], right[j], whole, (total, *epilogue_arrays),
+                       (('rows', 'columns'), *epilogue_axes), dtypes)
+    raise AssertionError("a product has a pair of parts")
+
+
+def _summed_then(epilogue, acc, prior, *sides):
+    """`epilogue` on an accumulator plus the earlier parts' sum before it (`_in_parts`' last part)."""
+    return epilogue(acc + prior, *sides)
 
 
 def _apart(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,

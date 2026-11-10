@@ -128,7 +128,13 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
 BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
 """bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
 
-EXACT_PARTS = -(-(jnp.finfo(jnp.float32).nmant + 1) // (jnp.finfo(jnp.bfloat16).nmant + 1))
+def parts(dtype) -> int:
+    """The bf16 parts that hold `dtype`'s whole significand (`formed`), 8 bits each: one of bf16's, two of
+    fp16's 11, three of fp32's 24 (fp16's and fp32's exponents within bf16's)."""
+    return -(-(jnp.finfo(dtype).nmant + 1) // (jnp.finfo(jnp.bfloat16).nmant + 1))
+
+
+EXACT_PARTS = parts(jnp.float32)
 """The bf16 parts that hold an fp32 value's whole significand (`formed`): three, 8 bits each of its 24."""
 
 
