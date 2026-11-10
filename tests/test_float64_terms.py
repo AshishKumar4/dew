@@ -86,7 +86,7 @@ def test_a_sums_magnitudes_are_its_terms_sizes_summed_beside_their_root_sum_of_s
     np.testing.assert_allclose(magnitudes, 0.25 * np.abs(products).sum(axis=1), rtol=1e-12)
     np.testing.assert_allclose(terms, 0.25 * np.sqrt((products**2).sum(axis=1)), rtol=1e-12)
     np.testing.assert_array_equal(again, terms)
-    assert np.all(np.abs(np.asarray(value)) <= terms) and np.all(terms <= magnitudes)
+    assert np.all(np.abs(np.asarray(value)) <= magnitudes) and np.all(terms <= magnitudes)
 
 
 def test_a_recomputed_body_sums_its_own_terms():
