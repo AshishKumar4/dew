@@ -353,16 +353,19 @@ def test_a_programs_whole_pass_is_recorded_by_either_entry():
         assert sum(passes) >= made.seconds > 0
 
 
+def two_products_summed(a, x, y):
+    """`sum(a * x) + sum(a * y)` over the last axis: two sums of products that share a factor, which the
+    program bounds none of."""
+    return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
+
+
 def test_a_region_no_rule_may_fire_in_is_recorded_unpriced():
     """A window whose values the program bounds none of builds no terms (`rules.reorderable`), so nothing
     prices it: its record holds no price where one a rule fires in holds both (row 5340: its 0.0 before and
     after read as a region that costs nothing)."""
-    def unbounded(x, y, a):
-        return jnp.sum(a * x, axis=-1) + jnp.sum(a * y, axis=-1)
-
-    x, y, a = rows(5, (8, 64), (8, 64), (8, 64))
+    a, x, y = rows(5, (8, 64), (8, 64), (8, 64))
     with report.refusals():
-        algebra.rewritten(unbounded)(x, y, a)
+        algebra.rewritten(two_products_summed)(a, x, y)
         [left] = report.rewrites()
         algebra.rewritten(two_sums)(x, y, a)
         fired = report.rewrites()[-1]
@@ -565,11 +568,8 @@ def test_a_tpus_program_is_rewritten_by_the_rates_it_states(tpu):
     program of a product reduced (`sum(a * b)` and two joinable sums of products) traces and runs rewritten
     for it, on par with the program (check 1), a form taken only where it does no more work at a rate the
     TPU states none of."""
-    def program_(a, b, x):
-        return jnp.sum(a * b, axis=-1) + jnp.sum(a * x, axis=-1)
-
     with algebra.passes(target=tpu):
-        assert_as_exact(jax.jit(algebra.rewritten(program_)), jax.jit(program_),
+        assert_as_exact(jax.jit(algebra.rewritten(two_products_summed)), jax.jit(two_products_summed),
                         lambda seed: rows(seed, (8, 64), (8, 64), (8, 64)), f"a {tpu} program", seeds=16)
 
 
