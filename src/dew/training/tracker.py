@@ -18,7 +18,6 @@ import functools
 import hashlib
 import io
 import json
-import posixpath
 import re
 import tempfile
 import time
@@ -509,27 +508,24 @@ def _(value: Decisions, prefix: Path) -> list[Path]:
                    targets=value.targets, ordinal=value.ordinal, scored=value.scored, **classes)
 
 
-MLFLOW_NAME = re.compile(r"[/\w.\- ]{0,250}")
-"""The metric names MLflow takes on every platform: alphanumerics, underscores, periods, dashes,
-spaces and slashes, at most 250 of them (mlflow/utils/validation.py, `validate_param_and_metric_name`
-and `MAX_ENTITY_KEY_LENGTH`; a colon only off Windows)."""
-
-
 def mlflow_name(name: str) -> str:
-    """`name` as an MLflow metric's: as it is where MLflow takes it, else with each character MLflow
-    refuses and each empty, `.` or `..` path segment as `_`, cut to fit, and the first 8 hex digits
-    of `name`'s SHA-256 after a period. A metric's name can carry free text (a rollout's data
-    source, `math[hard]`), which MLflow would refuse at the first log; the digest keeps two names
-    that read alike apart."""
-    taken = MLFLOW_NAME.fullmatch(name) and posixpath.normpath(name) == name
-    if taken and not name.startswith(("/", "..")) and name not in ("", "."):
+    """`name` as an MLflow metric's: as it is where MLflow takes it on every platform (its own policy,
+    `validate_param_and_metric_name`, `path_not_unique` and `MAX_ENTITY_KEY_LENGTH`, no colon, which
+    Windows refuses), else with each character outside that set and each empty, `.` or `..` path segment
+    as `_`, cut to fit, and the first 8 hex digits of `name`'s SHA-256 after a period. A metric's name can
+    carry free text (a rollout's data source, `math[hard]`), which MLflow would refuse at the first log;
+    the digest keeps two names that read alike apart."""
+    from mlflow.utils.validation import MAX_ENTITY_KEY_LENGTH, path_not_unique, validate_param_and_metric_name
+
+    if (validate_param_and_metric_name(name) and ":" not in name and not path_not_unique(name)
+            and len(name) <= MAX_ENTITY_KEY_LENGTH):
         return name
     digest = hashlib.sha256(name.encode()).hexdigest()[:8]
     segments = [segment if segment not in ("", ".", "..") else "_"
                 for segment in re.sub(r"[^/\w.\- ]", "_", name).split("/")]
     path = "/".join(segments)
     # MLflow refuses a name whose normal form starts with `..` (`path_not_unique`), `..loss` too.
-    return f"{'_' * path.startswith('..')}{path}"[:250 - len(digest) - 1] + f".{digest}"
+    return f"{'_' * path.startswith('..')}{path}"[:MAX_ENTITY_KEY_LENGTH - len(digest) - 1] + f".{digest}"
 
 
 class MLflowTracker(_OwnedTracker):
