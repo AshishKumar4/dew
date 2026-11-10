@@ -68,6 +68,42 @@ def turned(seed):
     return x * jnp.complex64(1 + 2j), weight * jnp.complex64(3 - 1j)
 
 
+def drawn_beside(x, weight):
+    """The product, and beside it a float32 draw scaled in float32."""
+    draw = jax.random.uniform(jax.random.key(5430), (16, 8), jnp.float32)
+    return x @ weight, draw * jnp.float32(0.5) + jnp.float32(0.25)
+
+
+def dropped_out_by_a_call(x, weight):
+    """One call gives the product and the draw; the draw is read only by a comparison."""
+    product, draw = jax.jit(drawn_beside)(x, weight)
+    return jnp.where(draw < 0.5, product, 0)
+
+
+def weighed_by_a_call(x, weight):
+    """The same call, its draw read as a value."""
+    product, draw = jax.jit(drawn_beside)(x, weight)
+    return product * draw.astype(product.dtype)
+
+
+def dropped_out_by_a_scan(x, weight):
+    """Each row's product from a scan's step, which gives a float32 draw beside it, read only by a
+    comparison."""
+    def step(carry, row):
+        return carry, (row @ weight, jnp.tanh(row.astype(jnp.float32)[:8]) * jnp.float32(0.5))
+
+    _, (products, draws) = jax.lax.scan(step, 0, x)
+    return jnp.where(draws < 0, products, 0)
+
+
+def weighed_by_a_carry(x, weight):
+    """A scan whose float32 carry, never returned, weighs each later row's product."""
+    def step(carry, row):
+        return carry + jnp.tanh(row.astype(jnp.float32)[:8]), (row @ weight) * carry.astype(row.dtype)
+
+    return jax.lax.scan(step, jnp.zeros(8, jnp.float32), x)[1]
+
+
 def with_a_dropped_value(x, weight):
     """The float64 product beside an fp32 one nothing reads."""
     jnp.tanh(x.astype(jnp.float32) @ weight.astype(jnp.float32))
@@ -114,6 +150,8 @@ NULL = {
     "a stated rounding's entries selected and negated": (selected, drawn, None),
     "a format's own division, declared": (dequantized, drawn, dequantized_declared),
     "a decision drawn in float32": (dropped_out, drawn, None),
+    "a decision a call draws beside a value": (dropped_out_by_a_call, drawn, None),
+    "a decision a scan's step draws beside a value": (dropped_out_by_a_scan, drawn, None),
     "complex operands, widened to complex128": (product, turned, None),
     "an fp32 value no output reads": (product, drawn, with_a_dropped_value),
     "an integer leaf beside": (with_its_place, drawn, None),
@@ -130,6 +168,8 @@ INJECTED = {
     "one leaf of two left float32": (two_leaves(product), drawn, two_leaves(fixed_float32), "['other']"),
     "a weight drawn and applied in fp32": (product, drawn, lambda x, weight: (x @ weight) * (
         1 + jax.random.uniform(jax.random.key(5430), (16, 8), jnp.float32) * 0).astype(jnp.float64), ""),
+    "a call's fp32 draw read as a value": (product, drawn, weighed_by_a_call, ""),
+    "a scan's fp32 carry weighing a later step": (product, drawn, weighed_by_a_carry, ""),
     "a NumPy truth in float32": (product, drawn, as_given(in_numpy(np.float32)), ""),
 }
 """Truths that are a second fp32 run, each with the leaf its refusal names."""
@@ -139,9 +179,10 @@ INJECTED = {
 def test_a_truth_that_computes_in_float64_is_judged(name):
     """The null control: a site whose truth is float64's (the reference on widened inputs, a formula of its
     own, parameters held in float64 or left float32 and read exactly, a stated rounding and what is selected
-    of it, a format's own division declared (`stored_as`), a float32 draw read only by a comparison,
-    complex operands (widened to complex128), a dead fp32 value, an integer leaf, a float32 leaf of no
-    entries, a float64 NumPy truth) is judged as before, its arm on par with itself."""
+    of it, a format's own division declared (`stored_as`), a float32 draw read only by a comparison (at
+    the top, from a call that returns it beside a value, from a scan's step), complex operands (widened to
+    complex128), a dead fp32 value, an integer leaf, a float32 leaf of no entries, a float64 NumPy truth)
+    is judged as before, its arm on par with itself."""
     arm, draw, truth = NULL[name]
     assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)
 
@@ -149,9 +190,9 @@ def test_a_truth_that_computes_in_float64_is_judged(name):
 @pytest.mark.parametrize("name", INJECTED)
 def test_a_truth_that_is_a_second_fp32_run_is_refused_by_its_leaf(name):
     """The injected faults: a truth that computes in fp32 (a model of a fixed dtype, an fp32 product
-    widened at the end, a float32 leaf, the same float32 draw read as a value, a float32 NumPy truth) is
-    refused before any verdict, naming the leaf, where an arm on par with itself would otherwise pass
-    against it."""
+    widened at the end, a float32 leaf, the same float32 draw read as a value at the top or from a call, a
+    scan's float32 carry that weighs a later step, a float32 NumPy truth) is refused before any verdict,
+    naming the leaf, where an arm on par with itself would otherwise pass against it."""
     arm, draw, truth, leaf = INJECTED[name]
     with pytest.raises(NarrowTruth) as refused:
         assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)

@@ -49,7 +49,7 @@ that only moves entries is exact too (`dew.nn.programs.rearranges`, read beside 
 An integer result rounds nothing either, nor does an array made to be written over (`empty2`); a collective
 that moves blocks between devices (a gather, an all-to-all, a permutation) is a move too. The one list of
 them: the rounding model reads it (tests/rounding_bound.py), and the truth rule
-(`reference_error._narrow_values`)."""
+(`reference_error._read_through_floats`)."""
 
 
 def rounds_nothing(primitive) -> bool:
@@ -62,7 +62,7 @@ FORMATTED = frozenset({jax.lax.bitcast_convert_type_p, jax.lax.nextafter_p, jax.
 bits read as another type, its neighbour on its format's grid, its rounding to a format's digits. JAX states
 no such fact of a primitive, so they are named here, once, by their objects: the float64 replay runs them at
 the traced dtypes (tests/float64_replay.py), and a float64 truth may hold their narrow results
-(`reference_error._narrow_values`)."""
+(`reference_error._read_through_floats`)."""
 
 
 def stored_as(value, dtype):
@@ -70,7 +70,7 @@ def stored_as(value, dtype):
     back at its own width. A truth's declaration that a value is a format's own (a dequantized weight, a
     decoded code, a quotient the format defines in its own arithmetic): the truth computes it in float64
     and states the format's rounding here, a cast, which the truth rule keeps
-    (`reference_error._narrow_values`), where the same arithmetic run in the format is refused as a
+    (`reference_error._read_through_floats`), where the same arithmetic run in the format is refused as a
     second fp32 run. One sum, difference, product, quotient or square root of the format's values so
     declared is the format's own result bit for bit: float64's 53 bits round twice to float32's 24, or to
     fewer, as once."""

@@ -66,10 +66,9 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 import dataclasses
 import functools
 import hashlib
-import itertools
 import os
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -89,7 +88,6 @@ from arm_forms import (
 )
 from check1_wire import CENSUS, DRAWS, STAGES
 from float64_terms import evaluated_on, float64_terms, lowered
-from jax.interpreters import partial_eval as pe
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
@@ -669,15 +667,17 @@ def _inexact(var) -> bool:
     return dtype is not None and jnp.issubdtype(dtype, jnp.inexact)
 
 
-def _narrow_values(program, lowering: str) -> Iterator[str]:
-    """Each result of `program`, a float64 truth's traced program with what no output reads removed, that an
-    operation rounds narrower than float64 and a float output reads through floats, in the program or in
-    one within it (of a platform's choice, the branch a program lowered for `lowering` keeps).
+def _read_through_floats(program, fed: Sequence[bool], lowering: str, found: dict) -> list[bool]:
+    """Which of `program`'s inputs its `fed` outputs read through floats, and into `found` (its keys, in the
+    order met) each result on the way that an operation rounds narrower than float64: what makes a float64
+    truth's traced program a second fp32 run (`_of_float64`).
 
-    A result is read through floats where a chain of float values runs from it to a float output. One read
-    only by a comparison or as an integer (a dropout's float32 uniform against its rate, a code's index) is
-    a decision of the program's, the same in every arm and in the truth, and no rounding of an output's
-    value. A call that feeds an output has its body read whole.
+    A result is read through floats where a chain of float values runs from it to a fed float output. One
+    read only by a comparison or as an integer (a dropout's float32 uniform against its rate, a code's
+    index) is a decision of the program's, the same in every arm and in the truth, and no rounding of an
+    output's value. The chain runs through the programs within an equation by what each is (`_within`): a
+    call's, a branch's and a step's outputs are its equation's one for one, so only the fed ones are read
+    there, a loop's carries to their fixed point.
 
     A narrow result is a format's own, and kept, where its operation rounds to a stated format (a cast,
     FORMATTED) or rounds nothing (`arm_arithmetic.rounds_nothing`: a move of entries, a selection, a
@@ -686,31 +686,74 @@ def _narrow_values(program, lowering: str) -> Iterator[str]:
     whatever its format, as JAX promotes it where a float64 operation reads it: a parameter left float32
     under a float64 run is no rounding."""
     jaxpr = getattr(program, "jaxpr", program)
-    feeding = {var for var in jaxpr.outvars if programs.computed(var) and _inexact(var)}
+    feeding = {var for var, read in zip(jaxpr.outvars, fed, strict=True)
+               if read and programs.computed(var) and _inexact(var)}
     for equation in reversed(jaxpr.eqns):
-        fed = [var for var in equation.outvars if var in feeding]
-        if not fed:
+        outs = [var in feeding for var in equation.outvars]
+        if not any(outs):
             continue
-        feeding.update(var for var in equation.invars if programs.computed(var) and _inexact(var))
+        reads = _within(equation, outs, lowering, found)
+        if reads is None:
+            primitive = equation.primitive
+            made = [var.aval for var, read in zip(equation.outvars, outs, strict=True)
+                    if read and _below_float64(var.aval.dtype)]
+            formats = (primitive is jax.lax.convert_element_type_p or primitive in FORMATTED
+                       or rounds_nothing(primitive))
+            if made and not formats:
+                found[f"`{primitive.name}` computed in {made[0].str_short()} in "
+                      f"{equation.source_info.name_stack or 'the truth itself'}"] = None
+            reads = [True] * len(equation.invars)
+        feeding.update(var for var, read in zip(equation.invars, reads, strict=True)
+                       if read and programs.computed(var) and _inexact(var))
+    return [var in feeding for var in jaxpr.invars]
+
+
+def _within(equation, outs: list[bool], lowering: str, found: dict) -> list[bool] | None:
+    """Which of `equation`'s operands its `outs` results read through floats, by the programs it runs within
+    it (`_read_through_floats` of each); None for an operation that runs none. A call's program is its
+    equation's, operand for operand and result for result (`programs.called`). A conditional's branches each
+    take its operands after the index and give its results, of a platform's choice the one branch a
+    program lowered for `lowering` keeps. A scan's step and a while loop's body carry results back into
+    operands, so what they read is taken to its fixed point; a loop's predicate decides, and feeds no
+    value. Any other equation that holds programs (a reduction's combining body) has them read whole."""
+    def read(body, fed, into=found):
+        return _read_through_floats(body, fed, lowering, into)
+
+    def carried(body, fed, before: int, count: int):
+        # A carry an output reads is an output the step before must feed: to the fixed point, then once more
+        # for what is found on the way.
+        while True:
+            reads = read(body, fed, {})
+            again = [old or new for old, new in zip(fed[:count], reads[before:before + count], strict=True)]
+            if again == fed[:count]:
+                return read(body, fed)
+            fed = again + fed[count:]
+
+    primitive, params = equation.primitive, equation.params
+    if primitive is jax.lax.cond_p:
         kept = _platform_branch(equation, lowering)
-        within = programs.bodies(equation) if kept is None else [kept]
-        for inner in within:
-            yield from _narrow_values(inner, lowering)
-        primitive = equation.primitive
-        made = [var.aval for var in fed if _below_float64(var.aval.dtype)]
-        formats = (primitive is jax.lax.convert_element_type_p or primitive in FORMATTED
-                   or rounds_nothing(primitive))
-        # A call's results are its body's, read there.
-        if made and not formats and not within:
-            yield (f"`{primitive.name}` computed in {made[0].str_short()} in "
-                   f"{equation.source_info.name_stack or 'the truth itself'}")
+        taken = programs.branches(equation) if kept is None else [kept]
+        each = [read(branch, outs) for branch in taken]
+        return [False, *(any(reads) for reads in zip(*each, strict=True))]
+    if primitive is jax.lax.scan_p:
+        return carried(programs.scan_body(equation), outs, params["num_consts"], params["num_carry"])
+    if primitive is jax.lax.while_p:
+        _, body = programs.loop_programs(equation)
+        return [False] * params["cond_nconsts"] + carried(body, outs, params["body_nconsts"], len(outs))
+    body = programs.called(equation)
+    if body is not None:
+        return read(body, outs)
+    within = programs.bodies(equation)
+    for body in within:
+        read(body, [True] * len(getattr(body, "jaxpr", body).outvars))
+    return [True] * len(equation.invars) if within else None
 
 
 def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     """Raise unless a site's truth is float64's: `truth`, its value on the site's first draw, holds no float
     leaf narrower than float64, and the program `truth_fn`'s own calls trace on those `inputs` widened
-    computes no narrower result that a float output reads through floats (`_narrow_values`, by JAX's
-    dead-code pass and its primitives' facts), a stated rounding apart. A model of a fixed float32 dtype
+    computes no narrower result that a float output reads through floats (`_read_through_floats`, by
+    JAX's primitives' facts), a stated rounding apart. A model of a fixed float32 dtype
     run on widened inputs computes in fp32, or rounds its answer to it: a second fp32 run, which equals
     the reference bit for bit and judges Dew against a truth no better than itself (a forked call's cells;
     row 5430). A leaf of no
@@ -740,10 +783,11 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     lowering = lowering_platform(device)
     count = len(program.outvars)
 
-    def narrow(used: list[bool]) -> list[str]:
-        """The first few distinct narrow values the `used` outputs read."""
-        fed = pe.dce_jaxpr(program, used)[0]
-        return list(dict.fromkeys(itertools.islice(_narrow_values(fed, lowering), 64)))[:3]
+    def narrow(fed: list[bool]) -> list[str]:
+        """The first few narrow results the `fed` outputs read."""
+        found: dict = {}
+        _read_through_floats(program, fed, lowering, found)
+        return list(found)[:3]
 
     if not narrow(held):
         return
