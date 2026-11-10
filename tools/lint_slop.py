@@ -989,18 +989,45 @@ def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
     return None
 
 
-def _handed(module: Module, function: ast.FunctionDef, tables: Mapping[int, Mapping[str, str]]) -> set[str]:
+def _handed(module: Module, function: ast.FunctionDef, tables: Mapping[int, Mapping[str, str]],
+            methods: Mapping[str, ast.FunctionDef], roots: frozenset[str] = frozenset({"call"}),
+            seen: frozenset[str] = frozenset()) -> set[str]:
     """The attributes the package's functions load that a mixer's call (`function`) hands what it was
-    called with: a call made in it with an argument read from `call`, or from a name its body binds from
-    one (`tokens = coordinates_of(call.metadata, ...)`), to a top-level function of a module of the package
-    it imports (`held_scan(..., coordinates=tokens)`), whose body's attribute loads are what it reads. The
-    call's own scope alone (`scopes.nodes_of`): a name a nested scope binds is that scope's, and a name
+    called with: a call made in it with an argument read from `call` (`roots`), or from a name its body
+    binds from one (`tokens = coordinates_of(call.metadata, ...)`), to a top-level function of a module of
+    the package it imports (`held_scan(..., coordinates=tokens)`), whose body's attribute loads are what it
+    reads; or to a method of its own class (`self.<name>(...)`, one of `methods`), which reads what it
+    hands on in turn from the parameters it was handed them as, each method once along a chain (`seen`).
+    The call's own scope alone (`scopes.nodes_of`): a name a nested scope binds is that scope's, and a name
     counts as bound only where it is stored (a tuple's names), not an attribute's receiver or a subscript's
     container."""
     nodes = scopes.nodes_of(function.body)
+    derived = _derived(nodes, roots)
+    handed: set[str] = set()
+    for node in nodes:
+        handed_on = (*node.args, *(keyword.value for keyword in node.keywords)) if isinstance(
+            node, ast.Call) else ()
+        if not any(_reads_names(argument, derived) for argument in handed_on):
+            continue
+        assert isinstance(node, ast.Call)
+        method = _own_method(node.func, methods)
+        if method is not None:
+            if method.name not in seen:
+                handed |= _handed(module, method, tables, methods,
+                                  _handed_parameters(node, method, derived), seen | {method.name})
+            continue
+        path = scopes.resolved(node.func, tables.get(id(node.func), {}))
+        if path.split(".")[0] == module.package:
+            handed |= _package_loads(module.path.parents[len(Path(module.relative).parents) - 1], path)
+    return handed
+
+
+def _derived(nodes: Sequence[ast.AST], roots: Iterable[str]) -> set[str]:
+    """`roots` and every name a scope's `nodes` bind from one of them, as far as it grows: what a call
+    handed on reads of what its scope was handed."""
     assignments = [node for node in nodes if isinstance(node, ast.Assign | ast.AnnAssign)
                    and node.value is not None]
-    derived = {"call"}
+    derived = set(roots)
     grown = True
     while grown:
         grown = False
@@ -1012,17 +1039,25 @@ def _handed(module: Module, function: ast.FunctionDef, tables: Mapping[int, Mapp
             bound = {name.id for target in targets for name in _stored(target)}
             grown |= not bound <= derived
             derived |= bound
-    handed: set[str] = set()
-    for node in nodes:
-        handed_on = (*node.args, *(keyword.value for keyword in node.keywords)) if isinstance(
-            node, ast.Call) else ()
-        if not any(_reads_names(argument, derived) for argument in handed_on):
-            continue
-        assert isinstance(node, ast.Call)
-        path = scopes.resolved(node.func, tables.get(id(node.func), {}))
-        if path.split(".")[0] == module.package:
-            handed |= _package_loads(module.path.parents[len(Path(module.relative).parents) - 1], path)
-    return handed
+    return derived
+
+
+def _own_method(called: ast.expr, methods: Mapping[str, ast.FunctionDef]) -> ast.FunctionDef | None:
+    """The method of the class `self.<name>` names, of its `methods`; None for any other callee."""
+    if isinstance(called, ast.Attribute) and isinstance(called.value, ast.Name) and called.value.id == "self":
+        return methods.get(called.attr)
+    return None
+
+
+def _handed_parameters(node: ast.Call, method: ast.FunctionDef, derived: set[str]) -> frozenset[str]:
+    """The parameters of `method` (`self` its first) that the call `node` hands an argument read from
+    `derived`: by position, then by keyword."""
+    positional = [argument.arg for argument in (*method.args.posonlyargs, *method.args.args)][1:]
+    by_position = {parameter for parameter, argument in zip(positional, node.args, strict=False)
+                   if not isinstance(argument, ast.Starred) and _reads_names(argument, derived)}
+    by_keyword = {keyword.arg for keyword in node.keywords
+                  if keyword.arg is not None and _reads_names(keyword.value, derived)}
+    return frozenset(by_position | by_keyword)
 
 
 def _stored(target: ast.expr) -> Iterator[ast.Name]:
@@ -1043,17 +1078,41 @@ def _reads_names(node: ast.AST, names: set[str]) -> bool:
 
 
 @functools.cache
-def _package_loads(root: Path, path: str) -> frozenset[str]:
+def _package_loads(root: Path, path: str, seen: frozenset[str] = frozenset()) -> frozenset[str]:
     """The attributes the top-level function `path` (`dew.nn.linear.held_scan`) loads in its body, read
-    from its module's source under `root`'s `src`; none where `path` names no such function."""
+    from its module's source under `root`'s `src`, and those the package's functions it hands what it was
+    handed load in turn (`dew.nn.mixers.attention.call_visibility` handing its metadata to
+    `dew.nn.inputs.fork_runs`), each once along a chain (`seen`); none where `path` names no such
+    function."""
     module, _, name = path.rpartition(".")
     source = root / "src" / Path(*module.split("."))
     for candidate in (source.with_suffix(".py"), source / "__init__.py"):
-        if candidate.is_file():
-            for node in ast.parse(candidate.read_text()).body:
-                if isinstance(node, ast.FunctionDef) and node.name == name:
-                    return frozenset(inner.attr for inner in ast.walk(node)
-                                     if isinstance(inner, ast.Attribute) and isinstance(inner.ctx, ast.Load))
+        if not candidate.is_file():
+            continue
+        tree = ast.parse(candidate.read_text())
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        if name not in functions:
+            return frozenset()
+        function = functions[name]
+        loads = {inner.attr for inner in ast.walk(function)
+                 if isinstance(inner, ast.Attribute) and isinstance(inner.ctx, ast.Load)}
+        tables = {id(node): table for node, table in scopes.scoped(
+            tree.body, {}, scopes.package_of(module, candidate.name == "__init__.py"))}
+        arguments = function.args
+        nodes = scopes.nodes_of(function.body)
+        derived = _derived(nodes, (argument.arg for argument in (
+            *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)))
+        for node in nodes:
+            if not isinstance(node, ast.Call) or not any(
+                    _reads_names(argument, derived)
+                    for argument in (*node.args, *(keyword.value for keyword in node.keywords))):
+                continue
+            local = isinstance(node.func, ast.Name) and node.func.id in functions
+            called = (f"{module}.{node.func.id}" if local and isinstance(node.func, ast.Name)
+                      else scopes.resolved(node.func, tables.get(id(node.func), {})))
+            if called.split(".")[0] == path.split(".")[0] and called != path and called not in seen:
+                loads |= _package_loads(root, called, seen | {path})
+        return frozenset(loads)
     return frozenset()
 
 
@@ -1105,7 +1164,8 @@ def calls(module: Module) -> Iterator[Finding]:
         else:
             unread = (declared & mixing) - loaded
             if unread:
-                unread -= _handed(module, function, tables)
+                unread -= _handed(module, function, tables, {
+                    method.name: method for method in cls.body if isinstance(method, ast.FunctionDef)})
             extra, unknown = read - declared, declared - mixing
         line, col = where.lineno, where.col_offset + 1
         for name in sorted(extra):
