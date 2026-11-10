@@ -14,7 +14,6 @@ import contextlib
 import dataclasses
 import datetime
 import functools
-import itertools
 import logging
 import os
 import sys
@@ -67,7 +66,7 @@ from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import gpu_target
-from dew.nn.kernels.options import owned_program, shapes_of
+from dew.nn.kernels.options import owned_program
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
@@ -143,16 +142,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import (
-    COOLDOWN,
-    EvalSuite,
-    Evaluation,
-    Split,
-    Summary,
-    admit_split,
-    episodic,
-    warmed_ahead,
-)
+from dew.training.evaluation import EvalSuite, Evaluator, Summary, episodic
 from dew.training.footprint import Footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, logged_scalars
@@ -197,7 +187,6 @@ from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorde
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
-from dew.training.staging import fetched
 from dew.training.startup import Startup, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
@@ -209,7 +198,6 @@ from dew.training.transaction import (
     outcome,
     pooled_by_mean,
     refuse_unpassed_progress,
-    with_ema,
 )
 
 _log = logging.getLogger(__name__)
@@ -615,16 +603,6 @@ class Trainer(Generic[Loss, Effects]):
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
 
-    def _fetched(self, state: TrainState, shardings: Placement[TrainState],
-                 fields: Sequence[str] | None = None) -> TrainState:
-        """Bring the layout's host-resident fields, or those of them among `fields`, to the device,
-        where a step or an evaluation reads them."""
-        if self.host_master:
-            return state
-        return dataclasses.replace(state, **{
-            field: fetched(getattr(state, field), getattr(shardings, field))
-            for field in self.layout.host if fields is None or field in fields})
-
     @ruled
     def validate(self, batch: Batch | None = None, *, steps: int | None = None,
                  capacity: int | None = None) -> Validation:
@@ -964,13 +942,6 @@ class Trainer(Generic[Loss, Effects]):
         held, staged = state.window, self._ramp or self._stage_starts
         return window > 1 and self.step is None and (
             held is None or (bool(staged) and not held.replays(candidate.prepared.window)))
-
-    def _schedule_step(self, state: TrainState) -> np.ndarray:
-        """The step `state`'s schedules read, as training reads it (`Transaction`: a window of window_size
-        microbatches is `accumulation` steps), on the host, where an evaluation reads its clocks
-        (`Evaluation.run`), in its clock's dtype: no program runs it on the devices."""
-        microstep = np.asarray(state.microstep)
-        return microstep * microstep.dtype.type(self.accumulation) // np.asarray(state.window_size)
 
     def _window_of(self, state: TrainState, candidate: Candidate, window: int) -> TrainState:
         """`state` with the accumulation `window` microbatches of `candidate`'s pool in, empty, on its shards
@@ -1494,7 +1465,8 @@ class Trainer(Generic[Loss, Effects]):
                 interval.compiles = len(compiled)
                 if len(compiled) > known:
                     with self._startup.phase("warm", "warming the evaluations", when=not known), run.held():
-                        self._warm_evaluations(plan, state, shardings, first=not known)
+                        self._evaluator().warm(plan, state, shardings, self._links(self.device_mesh),
+                                               first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
@@ -1838,8 +1810,9 @@ class Trainer(Generic[Loss, Effects]):
             with run.outside_window(), run.held(), region("evaluate"):
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
-                run.evaluation = self._evaluation(plan, state, shardings, run.training, names,
-                                                  examples=self._consumed(interval))
+                run.evaluation = self._evaluator().evaluation(
+                    plan, state, shardings, self._links(self.device_mesh), run.training, names,
+                    examples=self._consumed(interval))
                 run.scored = frozenset(plan.suites if names is None else names)
                 run.other += run.evaluation.elapsed_seconds
         scores = (
@@ -1959,8 +1932,9 @@ class Trainer(Generic[Loss, Effects]):
             self._display.note(f"The training data ran out {done} steps into the cooldown from step "
                                f"{run.current}, which records no score")
         else:
-            self._evaluation(dataclasses.replace(plan, summaries=()), dataclasses.replace(
-                cooled, step=step_at), shardings, {}, examples=self._consumed(interval, counted), cooled=True)
+            self._evaluator().evaluation(
+                dataclasses.replace(plan, summaries=()), dataclasses.replace(cooled, step=step_at), shardings,
+                self._links(self.device_mesh), {}, examples=self._consumed(interval, counted), cooled=True)
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
         for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
@@ -2086,9 +2060,9 @@ class Trainer(Generic[Loss, Effects]):
         if plan.evaluates and run.preempted is None and run.paused is None:
             missing = [name for name in plan.suites if name not in scored]
             if not plan.suites or missing:
-                run.evaluation = self._evaluation(plan, state, shardings, run.training, missing,
-                                                  joined=None if joined is None else joined.scores,
-                                                  examples=self._consumed(interval))
+                run.evaluation = self._evaluator().evaluation(
+                    plan, state, shardings, self._links(self.device_mesh), run.training, missing,
+                    joined=None if joined is None else joined.scores, examples=self._consumed(interval))
                 run.other += run.evaluation.elapsed_seconds
             assert run.evaluation is not None
             scores = run.evaluation.scores
@@ -2110,106 +2084,16 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.wait()
         return state
 
-    def _warm_evaluations(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState], *,
-                          first: bool) -> None:
-        """Compile the programs the run's evaluations run beside a step's compile, where any runs
-        between steps (`FitPlan.evaluates_midway`): every suite warms (`Evaluation.run`'s `warm`),
-        its preview included, and nothing is reported.
-
-        An evaluation's programs compile at their first call, which would otherwise be an
-        evaluation's inside the run, its seconds holding the compile (7.5 s at the first of 45
-        records), counted against the run's goodput. A new training shape can change the modules
-        the programs run (the fit ladder's rung), so each step compiled warms them again. The
-        training values a ranking reads ride on the first evaluation that reads them, whose gather
-        of them compiles there. Where none runs between steps, the run's `first` compile reads each
-        split's first batch for its declaration alone (`admit_split`)."""
-        if plan.evaluates_midway:
-            with region("evaluate"):
-                self._evaluation(plan, state, shardings, {}, warm=True)
-        elif first:
-            for split, suite in plan.suites.items():
-                admit_split(self.objective, suite.data, self.device_mesh, split)
-
-    def _warmed_ahead(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
-        """The programs `_warm_evaluations` compiles, called over `state`, the run's first state as shapes
-        placed by `shardings`, where a run compiled ahead collects them (`dew.training.ahead.started`):
-        each suite's warming pass (`dew.training.evaluation.warmed_ahead`) where it evaluates midway, and
-        its evaluations' own where those score otherwise (writing what it scores, `scored_to`), the event
-        alone where no suite is scored, over the weights, averaged weights and key `_evaluate` reads
-        (`_fetched`), under the rules it scores under (`_scoring`): a run that evaluates at its end alone
-        runs those as well."""
-        if not plan.evaluates:
-            return
-        # A warming pass writes nothing; an evaluation writes what it scores where the run says where.
-        kinds = {*((False,) if plan.evaluates_midway else ()), plan.scored_to is not None}
-        averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
-        # The step the objective's schedules read, of the dtype `_schedule_step` reads it in.
-        counters = {name: np.ones(getattr(state, name).shape, getattr(state, name).dtype)
-                    for name in ("microstep", "window_size")}
-        schedule = shapes_of(jax.ShapeDtypeStruct((), self._schedule_step(dataclasses.replace(state,
-                                                                                            **counters)).dtype))
-        scored = self._scored(plan) or [(None, None, False)]
-        with self._scoring(self.device_mesh):
-            for (_, suite, loss), kept in itertools.product(scored, sorted(kinds)):
-                warmed_ahead(self.objective, state.variables, None if suite is None else suite.data,
-                             self.device_mesh, key=state.key, schedule=schedule, averaged=averaged,
-                             metrics=() if suite is None else suite.metrics, loss=loss, kept=kept)
-
-    def _scored(self, plan: FitPlan, names: Sequence[str] | None = None) -> list[tuple[str, EvalSuite, bool]]:
-        """The suites in `names`, every suite when None, each by its split and whether an evaluation scores
-        its loss: wherever the objective defines one, and where the loss ranks the run's checkpoints or
-        the state it holds, which preflight checks it can, unless a metric of the suite is the loss."""
-        ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
-        return [(split, suite, (ranks or self.objective.defines_validation_loss)
-                 and not any(metric.name == 'loss' for metric in suite.metrics))
-                for split, suite in ((split, plan.suites[split])
-                                     for split in (plan.suites if names is None else names))]
-
-    @contextlib.contextmanager
-    def _scoring(self, mesh: Mesh) -> Iterator[None]:
-        """The rules an evaluation on `mesh` traces its programs under: the microbatch count, the layout's
-        rules and the mesh's links (`_evaluate`, `_warmed_ahead`)."""
-        with (pipeline_microbatches(self.microbatches),
-              nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
-            yield
+    def _evaluator(self) -> Evaluator:
+        """The run's evaluations (`Evaluator`), over what this trainer states of them."""
+        return Evaluator(self.objective, self.layout, self.device_mesh, self.state_mesh, self.microbatches,
+                         self.accumulation, self._display, self.tracker, self.checkpoints is not None)
 
     def _consumed(self, *intervals: Interval) -> int | None:
         """The examples a run on the examples clock had consumed, as its host counted them over `intervals`
         (`Interval.consumed`: the run's, and a cooldown branch's beyond it), the count its log records;
         None for a run counted in steps."""
         return None if self._examples is None else sum(interval.consumed for interval in intervals)
-
-    def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
-                    training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
-                    warm: bool = False, joined: Mapping[str, float] | None = None,
-                    examples: int | None = None, cooled: bool = False) -> Evaluation:
-        """Score the suites in `names`, every suite when None, as one evaluation, joined to the scores
-        the step's earlier evaluation of the others recorded (`joined`, `_wind_down`).
-
-        With no suite at all, the evaluation carries the training values a
-        ranking or a stopping rule reads. `warm` warms every suite instead and
-        reports nothing (`_warm_evaluations`)."""
-        ranks = self.checkpoints is not None or plan.best or plan.stop or plan.held_best
-        reports = training if ranks and not warm else None
-        chosen = self._scored(plan, names)
-        if not chosen:
-            return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports,
-                                  warm=warm, examples=examples, cooled=cooled)
-        evaluations = []
-        for split, suite, loss in chosen:
-            evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
-                                              loss=loss, split=split, training=reports, warm=warm,
-                                              scored_to=plan.scored_to, examples=examples, cooled=cooled))
-        scores = {**(joined or {}),
-                  **{name: value for report in evaluations for name, value in report.scores.items()}}
-        # Each summary is formed once a step, here, by the evaluation that completes the splits it weighs.
-        formed = {} if warm else {name: value for summary in plan.summaries
-                                  for name, value in summary.formed(scores).items() if name not in scores}
-        if formed:
-            dataclasses.replace(evaluations[0], split=Summary.SPLIT, scores=formed, previews=(),
-                                coordinated_batches=0)._report(self._display, self.tracker)
-        return dataclasses.replace(evaluations[0], scores={**scores, **formed},
-                                   elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
                    preview: bool, stated: Dataset | Loader | Handed, loss: bool) -> None:
@@ -2448,66 +2332,3 @@ class Trainer(Generic[Loss, Effects]):
 
     # ------------------------------------------------------------------ Validation
     # ------------------------------------------------------------------
-
-    def _evaluate(
-        self,
-        state: TrainState,
-        shardings: Placement[TrainState],
-        reader: Split | None,
-        metrics: Sequence[Metric],
-        preview: bool,
-        *,
-        loss: bool = False,
-        split: str = "val",
-        training: Mapping[str, jax.Array] | None = None,
-        warm: bool = False,
-        scored_to: str | None = None,
-        examples: int | None = None,
-        cooled: bool = False,
-    ) -> Evaluation:
-        """Score the validation split with this state's variables and report
-        it, returning the seconds it took: the run's, but not its steps', which is what the goodput fraction
-        is measured against. `warm` warms the split (`Evaluation.run`'s `warm`) and reports nothing.
-
-        A CPU-owned run evaluates on the accelerator, over the same snapshot
-        a step realizes, so validation reads the weights where the loss does."""
-        paused = time.perf_counter()
-        if not warm:
-            self._display.status("evaluating")
-        mesh, params = self.device_mesh, state.variables
-        averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
-        key = state.key
-        if self.host_master:
-            from dew.training.execution import HostExecution, stack_sites
-            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh,
-                                      stack_sites(self.objective, state.variables))
-            with jax.set_mesh(self.state_mesh):
-                params, averaged = execution.snapshot(params), execution.snapshot(averaged)
-            key = execution.on_accelerator(key)
-        assert params is not None, "evaluation always has model variables"
-        # The rules and the microbatch count; `Evaluation.run` scores under the mesh itself, and
-        # previews decode outside it. The objective's schedules read steps, as training does
-        # (`Transaction`): a window of window_size microbatches is `accumulation` steps.
-        with self._scoring(mesh):
-            evaluation = Evaluation.run(
-                self.objective, params, reader, metrics=metrics, key=key,
-                step=state.step, schedule_step=self._schedule_step(state),
-                averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
-                warm=warm, updates=state.updates,
-                # A cooldown branch's beside the run's at the step it branched at (`COOLDOWN`).
-                scored_to=None if scored_to is None else os.path.join(
-                    scored_to, f"step-{int(state.step)}", *((COOLDOWN,) if cooled else ())))
-        # On the examples clock an evaluation is placed by the examples the run had consumed, as its host
-        # counted them, its record their coordinate beside its step.
-        if examples is not None:
-            evaluation = dataclasses.replace(evaluation, examples=examples)
-        # A cooldown branch's scores, named under `cooldown/` as its report and its ranking read them.
-        evaluation = evaluation.branched() if cooled else evaluation
-        if not warm:
-            # The training values ride along for ranking (`_ranking`); the log interval reports
-            # them, so the evaluation's own report leaves them out.
-            dataclasses.replace(evaluation, scores={
-                name: value for name, value in evaluation.scores.items() if name not in (training or {})}
-            )._report(self._display, self.tracker)
-        return dataclasses.replace(evaluation, elapsed_seconds=time.perf_counter() - paused)
-

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import dataclasses
 import math
 from collections.abc import Callable, Sequence
 
@@ -153,11 +154,21 @@ def on_device(placement):
 
 def fetched(tree, placement):
     """`tree`, host-resident leaves placed by `placement`, brought to the device whole (`on_device`): every
-    fetch of a layout's host fields (`Trainer._fetched`, `Transaction.fetched`). A tree of shapes, a state
+    fetch of a layout's host fields (`fetched_state`, `Transaction.fetched`). A tree of shapes, a state
     a run compiled ahead holds (`dew.training.ahead`), is its shapes placed there."""
     if all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(tree)):
         return placed_shapes(tree, on_device(placement))
     return jax.device_put(tree, on_device(placement))
+
+
+def fetched_state(state, shardings, layout):
+    """`state` with the layout's host-resident fields brought to the device (`fetched`), where a step or an
+    evaluation reads them; as it is where the host holds the variables themselves (a CPU-owned run), whose
+    every read stays there."""
+    if "variables" in layout.host:
+        return state
+    return dataclasses.replace(state, **{field: fetched(getattr(state, field), getattr(shardings, field))
+                                         for field in layout.host})
 
 
 def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:

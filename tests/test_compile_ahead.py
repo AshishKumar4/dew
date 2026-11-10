@@ -113,7 +113,7 @@ def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_w
 def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs_its_fit_runs(
         asked, tmp_path):
     """A run's evaluations' programs, called over its first state's shapes where a run compiled ahead
-    collects them (`Trainer._warmed_ahead`, `dew.training.evaluation.warmed_ahead`), are the ones its fit
+    collects them (`Evaluator.warmed_ahead`, `dew.training.evaluation.warmed_ahead`), are the ones its fit
     compiles: a fit evaluating midway, at its end alone, or writing what it scores (`scored_to`, which
     reports its artifacts beside its loss) compiles each (its event's and scoring's keys, its loss or
     report, the loss's sum and reduction), and a fit handed the collection (`taking`) takes every program
@@ -156,7 +156,8 @@ def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs
     plan = fit_plan(ahead, batch, fit)
     start = ahead._started()
     with collecting() as collected:
-        ahead._warmed_ahead(plan, placed_shapes(start.abstract, start.shardings), start.shardings)
+        ahead._evaluator().warmed_ahead(plan, placed_shapes(start.abstract, start.shardings), start.shardings,
+                                        ahead._links(ahead.device_mesh))
     served: set[str] = set()
 
     def serving(digest, executable):

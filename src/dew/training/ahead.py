@@ -883,7 +883,7 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     a split step's whole (`whole_step`), its counters (`bookkeep`), a sampled step's latest sample
     (`latest`), its log's copies (`copied`) and its logged tokens' sum (`added_tokens`), and with the plan
     of its `fit` (`plan`), what its evaluations' warming pass compiles before they run
-    (`Trainer._warmed_ahead`; row 4752). Each by its program's digest, through the kernel templates'
+    (`Evaluator.warmed_ahead`; row 4752). Each by its program's digest, through the kernel templates'
     reports as every compile is."""
     from dew.training.distributed import start_compiled
     from dew.training.narrow import narrowing
@@ -936,5 +936,6 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             added_tokens(counted.tokens, counted.tokens)
             copied(together(moving, frozen))
         if plan is not None:
-            trainer._warmed_ahead(plan, placed, start.shardings)
+            trainer._evaluator().warmed_ahead(plan, placed, start.shardings,
+                                              trainer._links(trainer.device_mesh))
     return collected
