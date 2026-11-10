@@ -346,8 +346,8 @@ class NvFp4:
         (`bits.nvfp4_quantized`, each matrix: its block scales and tensor scale, each value rounded to E2M1),
         its codes packed in the staged order."""
         def one(x):
-            words, scales, scale = bits.nvfp4_quantized(jnp.asarray(x, jnp.float32))
-            return _codes(words), scales, scale
+            codes, scales, scale = bits.nvfp4_coded(jnp.asarray(x, jnp.float32))
+            return _e2m1_values(codes), scales, scale
 
         return cls.of(*(jax.vmap(one) if x.ndim == 3 else one)(x))
 
@@ -425,6 +425,14 @@ def staged_rows(depth: int) -> np.ndarray:
     word, code = np.divmod(np.arange(NVFP4_GROUP), 8)
     within = 16 * code + word
     return (np.arange(0, depth, NVFP4_GROUP)[:, None] + within[None]).reshape(-1)
+
+
+def _e2m1_values(codes: jax.Array) -> jax.Array:
+    """E2M1 codes' values (`bits.nvfp4_coded`'s uint32 codes), float32, read from the codes' table
+    (`fake_quant.E2M1`): a selection, no arithmetic."""
+    from dew.nn import fake_quant
+
+    return jnp.asarray(fake_quant.E2M1)[codes]
 
 
 def _codes(words: jax.Array, *, staged: bool = False) -> jax.Array:
@@ -1130,9 +1138,9 @@ class NvFp4Block:
         a float64 truth's float32 values quantize to the same operand)."""
         x = jnp.asarray(x)
         x = x.astype(at_least_fp32(x.dtype))
-        words, scales, scale = bits.nvfp4_quantized(x.reshape(-1, x.shape[-1]).T)
-        codes = _codes(words).T.reshape(x.shape).astype(jnp.float4_e2m1fn)
-        return cls(codes, scales.T.reshape(*x.shape[:-1], -1), scale)
+        codes, scales, scale = bits.nvfp4_coded(x.reshape(-1, x.shape[-1]).T)
+        values = _e2m1_values(codes.T).reshape(x.shape).astype(jnp.float4_e2m1fn)
+        return cls(values, scales.T.reshape(*x.shape[:-1], -1), scale)
 
     @classmethod
     def of(cls, matrix: NvFp4) -> "NvFp4Block":
