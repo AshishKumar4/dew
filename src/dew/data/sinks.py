@@ -26,7 +26,7 @@ from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import Format, _arrow_filesystem, declared_format
 from dew.data.steps.text import count_rules, stated_rules
-from dew.data.storage import Store, commit_export
+from dew.data.storage import EXPORT_MANIFEST, Store, commit_export
 
 if TYPE_CHECKING:
     from dew.data.pipeline import Dataset, Pipeline
@@ -59,7 +59,7 @@ def _hub_export(
     parent = api.repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha
     if parent is None:
         raise ValueError(f"HF export has no parent commit at {url}")
-    if fs.exists(path.rstrip("/") + "/_dew_manifest.json"):
+    if fs.exists(path.rstrip("/") + "/" + EXPORT_MANIFEST):
         raise FileExistsError(f"HF export is already committed at {url}")
     with tempfile.TemporaryDirectory(prefix="dew-hf-export-") as temporary:
         root = Path(temporary) / "export"

@@ -33,7 +33,7 @@ from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
-from dew.data.storage import Store
+from dew.data.storage import EXPORT_MANIFEST, Store
 
 
 def test_memory_columns_snapshot_changes_with_content():
@@ -556,7 +556,7 @@ def test_an_export_whose_writer_stops_commits_nothing_and_the_next_commits_only_
     rows = [{"id": index} for index in range(10)]
     with pytest.raises(RuntimeError):
         export(Memory(rows), str(tmp_path), format=ArrowFiles(stop=2), rows_per_shard=4)
-    assert not (tmp_path / "_dew_manifest.json").exists() and not (tmp_path / "_SUCCESS").exists()
+    assert not (tmp_path / EXPORT_MANIFEST).exists() and not (tmp_path / "_SUCCESS").exists()
     assert len(list(tmp_path.rglob("part-*.arrow"))) == 2
     with pytest.raises(ValueError):
         Files(str(tmp_path), format="arrow", spark=True).records("indexed")
@@ -635,7 +635,7 @@ def test_a_writer_of_a_format_no_reader_opens_is_refused_before_it_commits(tmp_p
     never be read, nor written again, there."""
     with pytest.raises(ValueError):
         export(Memory([{"text": "one"}]), str(tmp_path), format=LineOrTarFiles("tfrecord"))
-    assert not (tmp_path / "_dew_manifest.json").exists() and not list(tmp_path.rglob("part-*"))
+    assert not (tmp_path / EXPORT_MANIFEST).exists() and not list(tmp_path.rglob("part-*"))
 
 
 def ids_per_reader(path: Path, readers: int, kind: str = "jsonl") -> list[list[int]]:
@@ -706,7 +706,7 @@ def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
     assert len(Files(root.url, format="parquet").records("indexed")) == 1
-    root.child("_dew_manifest.json").write(b"not-json")
+    root.child(EXPORT_MANIFEST).write(b"not-json")
     with pytest.raises(ValueError):
         Files(root.url, format="parquet").records("indexed")
 
@@ -717,9 +717,9 @@ def test_export_manifest_cannot_reference_an_object_outside_its_root():
     root = Store(f"memory://escaping-export-{uuid4().hex}/dataset")
     export(Memory([{"id": 1}]), root.url)
     assert len(Files(root.url).manifest(LATEST).shards) == 1
-    manifest = json.loads(root.child("_dew_manifest.json").read())
+    manifest = json.loads(root.child(EXPORT_MANIFEST).read())
     manifest["files"][0]["path"] = "../" + manifest["files"][0]["path"]
-    root.child("_dew_manifest.json").write(json.dumps(manifest).encode())
+    root.child(EXPORT_MANIFEST).write(json.dumps(manifest).encode())
     with pytest.raises(ValueError):
         Files(root.url).manifest(LATEST)
 
@@ -920,7 +920,7 @@ def test_each_token_document_is_checked_against_its_producer_length(token_span_s
 
     root = token_span_store
     TokenFiles(str(root)).provision()
-    manifest_path = root / "_dew_manifest.json"
+    manifest_path = root / EXPORT_MANIFEST
     manifest = json.loads(manifest_path.read_bytes())
     path = root / manifest["files"][1]["lengths"]["path"]
     columns = np.load(path, allow_pickle=False)

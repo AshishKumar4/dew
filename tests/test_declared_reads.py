@@ -25,7 +25,7 @@ from token_support import export_byte_tokens
 from dew.data.declared import Replaced
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
-from dew.data.storage import Store
+from dew.data.storage import EXPORT_MANIFEST, Store
 
 
 @contextlib.contextmanager
@@ -67,7 +67,7 @@ def test_a_shard_replaced_under_its_exports_manifest_is_refused_where_it_is_read
             return [records[index]["id"] for index in range(len(records))]
 
         assert rows(taken) == list(range(8))
-        files = json.loads(Store(root + "/_dew_manifest.json", options).read())["files"]
+        files = json.loads(Store(root + "/" + EXPORT_MANIFEST, options).read())["files"]
         shard = Store(root, options).child(files[0]["path"])
         held = shard.read()
         middle = len(held) // 2
@@ -152,8 +152,8 @@ def test_a_token_exports_shard_replaced_under_its_manifest_is_refused_where_it_i
     taken = TokenFiles(str(held))
     # Five bytes and an end, four and an end.
     assert len(taken.tokens[:]) == 11
-    [entry] = json.loads((held / "_dew_manifest.json").read_text())["files"]
-    [swapped] = json.loads((other / "_dew_manifest.json").read_text())["files"]
+    [entry] = json.loads((held / EXPORT_MANIFEST).read_text())["files"]
+    [swapped] = json.loads((other / EXPORT_MANIFEST).read_text())["files"]
     (held / entry["path"]).write_bytes((other / swapped["path"]).read_bytes())
     with pytest.raises(Replaced):
         TokenFiles(str(held)).tokens[:]
@@ -169,8 +169,8 @@ def test_a_token_exports_lengths_index_replaced_under_its_manifest_is_refused_wh
     (tmp_path / "other").mkdir()
     held = export_byte_tokens(tmp_path / "held", ("first", "next"), "--format", "array_record")
     other = export_byte_tokens(tmp_path / "other", ("fjrst", "nexty"), "--format", "array_record")
-    [entry] = json.loads((held / "_dew_manifest.json").read_text())["files"]
-    [swapped] = json.loads((other / "_dew_manifest.json").read_text())["files"]
+    [entry] = json.loads((held / EXPORT_MANIFEST).read_text())["files"]
+    [swapped] = json.loads((other / EXPORT_MANIFEST).read_text())["files"]
     (held / entry["lengths"]["path"]).write_bytes((other / swapped["lengths"]["path"]).read_bytes())
     with pytest.raises(Replaced):
         TokenFiles(str(held)).tokens[:]
@@ -490,7 +490,7 @@ def test_a_version_only_array_record_shard_is_refused_where_its_reader_needs_its
         root = Store(f"s3://{bucket}/export", options)
         export(Memory([{"id": index} for index in range(4)]), root.url, format="array_record",
                rows_per_shard=4, storage_options=options)
-        [entry] = json.loads(Store(root.url + "/_dew_manifest.json", options).read())["files"]
+        [entry] = json.loads(Store(root.url + "/" + EXPORT_MANIFEST, options).read())["files"]
         url = root.child(entry["path"]).url
         source = Files((url,), format="array_record", storage_options=options,
                        file_info={url: {"bytes": entry["bytes"], "stored": entry["stored"]}})
