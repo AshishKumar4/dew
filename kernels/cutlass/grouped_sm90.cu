@@ -63,6 +63,8 @@ struct Kernel {
     StrideB* stride_b;
     StrideC* stride_c;
     StrideD* stride_d;
+
+    auto fields() { return std::tie(shapes, a, b, d, stride_a, stride_b, stride_c, stride_d); }
   };
 };
 
@@ -75,11 +77,11 @@ __global__ void prepare_grouped(typename K::Arrays arrays, const typename K::A* 
   extern __shared__ int64_t starts[];
   scanned(group_sizes, groups, starts);
   for (int i = threadIdx.x; i < groups; i += blockDim.x) {
-    const int rows = group_sizes[i];
-    arrays.shapes[i] = {rows, n, k};
-    arrays.a[i] = x + starts[i] * k;
-    arrays.b[i] = w + static_cast<int64_t>(i) * k * n;
-    arrays.d[i] = out + starts[i] * n;
+    const Group group = forward_group(i, group_sizes, starts, k, n);
+    arrays.shapes[i] = {static_cast<int>(group.m), static_cast<int>(group.n), static_cast<int>(group.k)};
+    arrays.a[i] = x + group.a;
+    arrays.b[i] = w + group.b;
+    arrays.d[i] = out + group.d;
     arrays.stride_a[i] = stride_a;
     arrays.stride_b[i] = stride_b;
     arrays.stride_c[i] = stride_c;
@@ -98,11 +100,11 @@ __global__ void prepare_grouped_k(typename K::Arrays arrays, const typename K::A
   extern __shared__ int64_t starts[];
   scanned(group_sizes, groups, starts);
   for (int i = threadIdx.x; i < groups; i += blockDim.x) {
-    const int rows = group_sizes[i];
-    arrays.shapes[i] = {rows > 0 ? k : 0, n, rows > 0 ? rows : 1};
-    arrays.a[i] = x + starts[i] * k;
-    arrays.b[i] = dy + starts[i] * n;
-    arrays.d[i] = out + static_cast<int64_t>(i) * k * n;
+    const Group group = gradient_group(i, group_sizes, starts, k, n);
+    arrays.shapes[i] = {static_cast<int>(group.m), static_cast<int>(group.n), static_cast<int>(group.k)};
+    arrays.a[i] = x + group.a;
+    arrays.b[i] = dy + group.b;
+    arrays.d[i] = out + group.d;
     arrays.stride_a[i] = stride_a;
     arrays.stride_b[i] = stride_b;
     arrays.stride_c[i] = stride_c;
@@ -121,19 +123,9 @@ const char* run(Prepare prepare, const void* lhs, const void* rhs, void* out, co
   const auto stride_b = cutlass::make_cute_packed_stride(typename K::StrideB{}, make_shape(n_extent, k_extent, 1));
   const auto stride_c = cutlass::make_cute_packed_stride(typename K::StrideC{}, make_shape(m_extent, n_extent, 1));
   const auto stride_d = cutlass::make_cute_packed_stride(typename K::StrideD{}, make_shape(m_extent, n_extent, 1));
-  const std::size_t bytes =
-      carved_bytes<typename ProblemShape::UnderlyingProblemShape>(groups) +
-      carved_bytes<const typename K::A*>(groups) + carved_bytes<const typename K::B*>(groups) +
-      carved_bytes<typename K::D*>(groups) + carved_bytes<typename K::StrideA>(groups) +
-      carved_bytes<typename K::StrideB>(groups) + carved_bytes<typename K::StrideC>(groups) +
-      carved_bytes<typename K::StrideD>(groups);
-  char* cursor = static_cast<char*>(allocate(bytes));
+  char* cursor = static_cast<char*>(allocate(arrays_bytes<typename K::Arrays>(groups)));
   if (cursor == nullptr) return "the scratch allocator has no room for the groups' arrays";
-  typename K::Arrays arrays{carved<typename ProblemShape::UnderlyingProblemShape>(cursor, groups),
-                            carved<const typename K::A*>(cursor, groups), carved<const typename K::B*>(cursor, groups),
-                            carved<typename K::D*>(cursor, groups), carved<typename K::StrideA>(cursor, groups),
-                            carved<typename K::StrideB>(cursor, groups), carved<typename K::StrideC>(cursor, groups),
-                            carved<typename K::StrideD>(cursor, groups)};
+  const auto arrays = carved_arrays<typename K::Arrays>(cursor, groups);
   prepare<<<1, 256, (groups + 1) * sizeof(int64_t), stream>>>(
       arrays, static_cast<const typename K::A*>(lhs), static_cast<const typename K::B*>(rhs),
       static_cast<typename K::D*>(out), group_sizes, groups, k, n, stride_a, stride_b, stride_c, stride_d);

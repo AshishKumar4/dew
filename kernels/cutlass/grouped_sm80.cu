@@ -53,6 +53,8 @@ struct Kernel {
     Index* lda;
     Index* ldb;
     Index* ldd;
+
+    auto fields() { return std::tie(shapes, a, b, d, lda, ldb, ldd); }
   };
 };
 
@@ -65,10 +67,11 @@ __global__ void prepare_grouped(typename K::Arrays arrays, const typename K::A* 
   extern __shared__ int64_t starts[];
   scanned(group_sizes, groups, starts);
   for (int i = threadIdx.x; i < groups; i += blockDim.x) {
-    arrays.shapes[i] = GemmCoord(group_sizes[i], n, k);
-    arrays.a[i] = const_cast<typename K::A*>(x + starts[i] * k);
-    arrays.b[i] = const_cast<typename K::B*>(w + static_cast<int64_t>(i) * k * n);
-    arrays.d[i] = out + starts[i] * n;
+    const Group group = forward_group(i, group_sizes, starts, k, n);
+    arrays.shapes[i] = GemmCoord(group.m, group.n, group.k);
+    arrays.a[i] = const_cast<typename K::A*>(x + group.a);
+    arrays.b[i] = const_cast<typename K::B*>(w + group.b);
+    arrays.d[i] = out + group.d;
     arrays.lda[i] = k;
     arrays.ldb[i] = transpose_w ? k : n;
     arrays.ldd[i] = n;
@@ -85,11 +88,11 @@ __global__ void prepare_grouped_k(typename K::Arrays arrays, const typename K::A
   extern __shared__ int64_t starts[];
   scanned(group_sizes, groups, starts);
   for (int i = threadIdx.x; i < groups; i += blockDim.x) {
-    const int rows = group_sizes[i];
-    arrays.shapes[i] = GemmCoord(rows > 0 ? k : 0, n, rows > 0 ? rows : 1);
-    arrays.a[i] = const_cast<typename K::A*>(x + starts[i] * k);
-    arrays.b[i] = const_cast<typename K::B*>(dy + starts[i] * n);
-    arrays.d[i] = out + static_cast<int64_t>(i) * k * n;
+    const Group group = gradient_group(i, group_sizes, starts, k, n);
+    arrays.shapes[i] = GemmCoord(group.m, group.n, group.k);
+    arrays.a[i] = const_cast<typename K::A*>(x + group.a);
+    arrays.b[i] = const_cast<typename K::B*>(dy + group.b);
+    arrays.d[i] = out + group.d;
     arrays.lda[i] = k;
     arrays.ldb[i] = n;
     arrays.ldd[i] = n;
@@ -103,15 +106,9 @@ template <class K, class Prepare>
 const char* run(Prepare prepare, const void* lhs, const void* rhs, void* out, const int32_t* group_sizes,
                 int groups, int k, int n, bool transpose_w, cudaStream_t stream, const Allocate& allocate,
                 int multiprocessors) {
-  const std::size_t bytes = carved_bytes<GemmCoord>(groups) + carved_bytes<typename K::A*>(groups) +
-                            carved_bytes<typename K::B*>(groups) + carved_bytes<typename K::D*>(groups) +
-                            3 * carved_bytes<typename K::Index>(groups);
-  char* cursor = static_cast<char*>(allocate(bytes));
+  char* cursor = static_cast<char*>(allocate(arrays_bytes<typename K::Arrays>(groups)));
   if (cursor == nullptr) return "the scratch allocator has no room for the groups' arrays";
-  typename K::Arrays arrays{carved<GemmCoord>(cursor, groups), carved<typename K::A*>(cursor, groups),
-                            carved<typename K::B*>(cursor, groups), carved<typename K::D*>(cursor, groups),
-                            carved<typename K::Index>(cursor, groups), carved<typename K::Index>(cursor, groups),
-                            carved<typename K::Index>(cursor, groups)};
+  const auto arrays = carved_arrays<typename K::Arrays>(cursor, groups);
   prepare<<<1, 256, (groups + 1) * sizeof(int64_t), stream>>>(
       arrays, static_cast<const typename K::A*>(lhs), static_cast<const typename K::B*>(rhs),
       static_cast<typename K::D*>(out), group_sizes, groups, k, n, transpose_w);
