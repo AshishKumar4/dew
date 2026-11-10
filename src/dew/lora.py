@@ -287,8 +287,9 @@ class LoRA:
         """Measure which projections of the base this adapter freezes run
         faster in FP8 at `tokens` rows a step, on process 0's GPU for the
         whole pool, and return the record `apply` takes as its `fp8_base`
-        (`measured_fp8_sites`): none until an FP8 product keeps fp32's sums
-        (ledger 1625), which saves neither memory nor time before then.
+        (`measured_fp8_sites`): the sites whose FP8 product, Dew's own FP8
+        GEMM on Hopper's and Blackwell's tensor cores (`quantization._fp8_rows`),
+        measures faster than bf16's there (ledger 1625, row 3620).
 
         `modules` names the projections as `modules` does (this adapter's own
         when None) and `layouts` resolves them as `apply` does. The

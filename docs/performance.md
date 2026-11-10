@@ -3425,11 +3425,14 @@ So a Qwen3.5-0.8B's projections (1024 wide) stay in bf16, and a 9B's attention a
 projections gain. That FP8 GEMM did not hold the accuracy gate on an H100: Hopper's FP8 tensor cores
 keep a narrower running sum, and at 512 x 4096 x 4096 its product lay 291 times the dequantized fp32
 product's distance from float64 at the highest precision (3011 times at the default), however K was
-split. The product now multiplies the codes widened to bf16 and held apart from the dot, which XLA
-runs as a bf16 GEMM with exact products and fp32 sums (0.53 times that distance), in 1.7 times the
-FP8 GEMM's time, so no site measures faster in FP8 until a kernel whose FP8 sum keeps fp32's
-accuracy returns (ledger 1625). Until then a frozen FP8 base saves neither memory nor time: its codes
-take two bytes a parameter, as bf16's do, and multiply as bf16 values. Which sites run FP8 is that measurement on the run's own GPU and token count
+split (ledger 1625). The product now runs on Dew's own FP8 GEMM where a GPU's tensor cores take FP8
+(Hopper's and Blackwell's: the GEMM template's FP8 MMA, each 128-deep step's product promoted into the
+fp32 sum apart), 2.8 to 12.8 times nearer float64 than cuBLASLt's FP8 GEMM on the same inputs
+(FS-FP8-PROOF3), at 1.36 times its time at a training shape (row 3620); elsewhere (an A100, a CPU) it
+multiplies the codes as exact bf16 values summed in fp32. A frozen FP8 base keeps two E4M3 copies of each
+kernel, the forward's and the input gradient's, two bytes a parameter as bf16's are, so its gain is the
+products' rate: on an H100 (FS-1625-TIME1) Qwen3-8B's wide projections run in 0.89 to 0.98 times bf16's
+time and its 4096 x 4096 query projection in 1.09 to 1.15 times. Which sites run FP8 is that measurement on the run's own GPU and token count
 (`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
 refused rather than reusing it. The function changes by E4M3's rounding of both operands.
 
