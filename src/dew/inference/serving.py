@@ -72,9 +72,8 @@ import hashlib
 import logging
 import math
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import CancelledError, Future
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -735,6 +734,12 @@ class Server:
         """The (slot, entry) pairs the next call restores before it runs: rows seated after a prefix, up
         to every slot, whether or not their first piece goes in that call."""
         self._captures: list[tuple[int, int]] = []
+        self._dropped: Counter[Ticket] = Counter()
+        """Each request cancelled while it waited whose continuations are not all dropped yet: how many are
+        (`_seat`)."""
+        self._gathering: dict[Ticket, dict[int, Generation[np.ndarray]]] = {}
+        """Each request drawing several continuations whose rows are not all finished: their generations
+        by continuation (`_finish`)."""
         """The (slot, entry) pairs whose state the last call left at a kept boundary."""
         rows = self.rows
         if isinstance(rows, PagedRows) and rows.stateful:
@@ -985,13 +990,15 @@ class Server:
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
                   fold: int, adapter: str | None = None, shared: int | None = None) -> Ticket:
         """A request queued: one row, or where the task draws `n` continuations of a prompt, `n` rows, each
-        a continuation (`_Row.continuation`), whose generations the ticket gathers, in order."""
-        if self.n == 1:
-            return self._queued(self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared))
-        # A row of its own each, its tokens, pages and ticket apart.
-        return _gathered([self._queued(dataclasses.replace(
-            self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared), continuation=continuation))
-            for continuation in range(self.n)])
+        a continuation (`_Row.continuation`) with its own tokens and pages, all on the request's one ticket,
+        which the first seated claims (`_seat`) and the last finished settles with their generations in
+        order (`_finish`)."""
+        first = self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared)
+        ticket = self._queued(first)
+        for continuation in range(1, self.n):
+            row = self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared)
+            self._queued(dataclasses.replace(row, ticket=ticket, continuation=continuation))
+        return ticket
 
     def _queued(self, row: _Row) -> Ticket:
         if row.budget:
@@ -1397,12 +1404,19 @@ class Server:
         # was read is seated too, and is admitted after it was submitted.
         now = time.perf_counter()
         for slot, row in seated:
-            if not row.ticket.set_running_or_notify_cancel():
-                # Cancelled while it waited: its slot stays free, and its reservation goes back.
+            # A request's first seated continuation claims its ticket, which can no longer be cancelled.
+            if row.ticket in self._dropped or (not row.ticket.running()
+                                               and not row.ticket.set_running_or_notify_cancel()):
+                # Cancelled while it waited: its slot stays free, and its reservation goes back; each of its
+                # continuations is dropped so, its ticket told once.
+                self._dropped[row.ticket] += 1
+                if self._dropped[row.ticket] == self.n:
+                    del self._dropped[row.ticket]
                 self.rows.release(row)
                 continue
             self.prefix_hits += row.prefilled
-            row.ticket.admitted = now
+            if row.ticket.admitted is None:
+                row.ticket.admitted = now
             self._rows[slot] = row
             if row.restore is not None:
                 self._restores.append((slot, row.restore))
@@ -1542,7 +1556,7 @@ class Server:
                 kept = np.flatnonzero(draws.drawn[step, slot])
                 if not len(kept):
                     continue
-                if not row.tokens:
+                if row.ticket.first is None:
                     row.ticket.first = now
                 row.tokens.extend(int(token) for token in draws.token[step, slot, kept])
                 row.behavior.extend(float(value) for value in draws.behavior[step, slot, kept])
@@ -1552,18 +1566,21 @@ class Server:
                     del self._rows[slot]
                     self.rows.release(row)
                     del drew[slot]
-                    row.ticket._drew(row.tokens)
+                    _streamed(row)
                     self._finish(row, terminated=bool(draws.ended[step, slot]))
         for row in drew.values():
-            row.ticket._drew(row.tokens)
+            _streamed(row)
 
     def fail(self, failure: BaseException) -> None:
         """Stop after `failure`: every waiting and running request settles with it, and a later
         submission or step is refused."""
         waiting = self._waiting.failed(failure, *self._rows.values())
         self._rows.clear()
-        for row in waiting:
-            settled(row.ticket, failure)
+        self._gathering.clear()
+        self._dropped.clear()
+        # A request's continuations share its ticket, settled once.
+        for ticket in dict.fromkeys(row.ticket for row in waiting):
+            settled(ticket, failure)
 
     def _finish(self, row: _Row, *, terminated: bool) -> None:
         budget = row.budget
@@ -1574,11 +1591,24 @@ class Server:
         drawn[0, :count] = row.tokens
         behavior[0, :count] = row.behavior
         raw[0, :count] = row.raw
-        decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
+        generation = Generation(np.concatenate([row.prompt[None], drawn], axis=1),
+                                np.array([count], np.int32), np.array([terminated]), behavior, raw, rows=1,
+                                decoder=self._decoder)
+        held = self._gathering.setdefault(row.ticket, {})
+        held[row.continuation] = generation
+        if len(held) < self.n:
+            return
+        del self._gathering[row.ticket]
         row.ticket.finished = time.perf_counter()
-        settled(row.ticket, Generation(
-            np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
-            np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+        # The continuations' rows in order, each declared leaf of theirs joined (`Generation`'s pytree).
+        settled(row.ticket, jax.tree.map(lambda *leaves: np.concatenate(leaves),
+                                         *(held[continuation] for continuation in range(self.n)))
+                .replace(rows=self.n))
+
+    @functools.cached_property
+    def _decoder(self) -> Callable[[ArrayLike, ArrayLike, int], tuple[str, ...]] | None:
+        """A generation's text decoder, one for the server, so its continuations' generations join."""
+        return None if self.processor is None else functools.partial(decoded_rows, self.processor)
 
 
 def _counted(n: int) -> int:
@@ -1588,37 +1618,11 @@ def _counted(n: int) -> int:
     return n
 
 
-def _gathered(tickets: Sequence[Ticket]) -> Ticket:
-    """One request's ticket over its continuations' (`Server.n`): its `Generation` theirs, a row each in
-    order, once every one is done, or the first one's error; it streams the first continuation's tokens,
-    and cancelling it cancels those still queued."""
-    gathered = Ticket()
-    first = tickets[0]
-    first.add_tokens_callback(lambda ticket: gathered._drew(ticket.tokens))
-
-    def done(_: Future) -> None:
-        if not all(ticket.done() for ticket in tickets) or gathered.done():
-            return
-        gathered.admitted = min((ticket.admitted for ticket in tickets if ticket.admitted is not None),
-                                default=None)
-        gathered.first = first.first
-        gathered.finished = max((ticket.finished for ticket in tickets if ticket.finished is not None),
-                                default=None)
-        failed = [ticket for ticket in tickets if ticket.cancelled() or ticket.exception() is not None]
-        if failed:
-            settled(gathered, CancelledError() if failed[0].cancelled() else failed[0].exception())
-            return
-        drawn = [ticket.result() for ticket in tickets]
-        settled(gathered, Generation(*(np.concatenate([getattr(generation, name) for generation in drawn])
-                                       for name in ("tokens", "lengths", "terminated", "behavior_log_probs",
-                                                    "raw_log_probs")),
-                                     rows=len(drawn), decoder=drawn[0].decoder))
-
-    for ticket in tickets:
-        ticket.add_done_callback(done)
-    gathered.add_done_callback(lambda ticket: [held.cancel() for held in tickets] if ticket.cancelled()
-                               else None)
-    return gathered
+def _streamed(row: _Row) -> None:
+    """A row's tokens so far to its ticket's readers (`Ticket.tokens`): a request's first continuation's,
+    which alone it streams."""
+    if row.continuation == 0:
+        row.ticket._drew(row.tokens)
 
 
 def _local_groups(rows: NamedSharding | None, slots: int, groups: int) -> tuple[int, ...]:
