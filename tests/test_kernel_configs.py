@@ -1196,8 +1196,9 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
     overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024, file=65536)
+    # Its producer lowered as its model states (`decreased`, the gate's `producer_failures`).
     disagreement = {**record, "models": {"k": overestimated.record()},
-                    "kernels": [{**within, "need": 160}]}
+                    "kernels": [{**within, "need": 160, "decreased": overestimated.producer}]}
     assert not mosaic_failures([disagreement])
     assert any(not row["agrees"] for row in disagreement["evidence"])
     # A kernel whose reports state no resources, spilling nothing, is no evidence: it fails, as a record

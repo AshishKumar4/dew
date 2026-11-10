@@ -1,7 +1,9 @@
 """Mamba's selective scan on the recurrence template (`templates.recurrence.selective`): its output and every
-input's gradient on par from float64 with the portable scan's (`dew.nn.mixers.mamba.selective_scan`, check
-1), one row and packed documents, interpreted off a GPU over two channel blocks (a block's view of a wider
-row strided in global memory), and at Falcon Mamba 7B's widths on a GPU (`tests/test_gpu_recurrence.py`);
+input's gradient on par from float64 with its reference's (`held_to`, check 1): the portable scan's
+(`dew.nn.mixers.mamba.selective_scan`) interpreted, whose arithmetic the interpreted template's is, and on a
+GPU mamba_ssm's own, which the template ports; one row and packed documents, interpreted off a GPU over two
+channel blocks (a block's view of a wider row strided in global memory), and at Falcon Mamba 7B's widths on
+a GPU (`tests/test_gpu_recurrence.py`);
 and a Mamba layer through its selector under the template's choice (`recurrence_chunk.SELECTIVE`) on par
 with the layer's portable scan, at the mixer's own dtypes (its scan in fp32), with packed documents and
 with a held state."""
@@ -25,8 +27,9 @@ from reference_error import (
     run_to_run,
     with_gradients,
 )
-from selective_support import selective_draw, selective_xla
+from selective_support import mamba_selective_side, selective_draw, selective_xla
 from test_recurrence_chunk import ROUTES, on_route
+from upstream_support import upstream_arm
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -34,6 +37,8 @@ from dew.nn.kernels import generation, recurrence_chunk
 from dew.nn.kernels.templates import bundles, mosaic_sm90, report
 from dew.nn.kernels.templates.recurrence import selective
 from dew.nn.mixers.mamba import Mamba, selective_scan as portable
+from dew.parity import MOST_SEEDS
+from dew.parity_stages import REDRAW
 
 pytestmark = pytest.mark.kernel
 
@@ -90,10 +95,34 @@ def scanned(fn, starts):
     return lambda *inputs: fn(*inputs, starts=starts)[0]
 
 
-def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype=jnp.bfloat16,
-                                                  tiles: selective.Tiles | None = None):
+def held_to(portable_arm, draws, starts, label: str, template_arm):
+    """A site's reference (check 1): on a GPU mamba_ssm's own selective scan run live (`mamba_selective_side`,
+    a packed row's documents each a call from a zero state), the upstream the template ports, whose decay is
+    `exp2f` under `--use_fast_math`, as the template's `exp2` lowers to the hardware's `ex2.approx` there
+    (M-JS-79, M-JS-82); its distance from the portable scan reported beside the verdict, never judged. Off a
+    GPU the portable scan: a lane is held to the tightest reference its own arithmetic can meet, and the
+    interpreted template's `exp2` is the portable scan's own."""
+    if INTERPRETED:
+        return portable_arm
+    distances = []
+    for seed in range(FEWEST_SEEDS):
+        args = draws(seed)
+        exact = jax.tree.map(lambda x: np.asarray(x, np.float64), portable_arm(*args))
+        for arm in (template_arm, portable_arm):
+            found = jax.tree.leaves(arm(*args))
+            distances.append([float(np.mean((np.asarray(a, np.float64) - t) ** 2))
+                              for a, t in zip(found, jax.tree.leaves(exact), strict=True)])
+    print(f"{label}: the template's leaves against the portable scan's (reported, not judged): "
+          f"{np.asarray(distances[0::2]).mean(0)}", flush=True)
+    return upstream_arm(lambda drawn: mamba_selective_side(drawn, starts), draws, (1 + REDRAW) * FEWEST_SEEDS,
+                        most=8 * MOST_SEEDS, keyed=lambda *args: args[:-1])
+
+
+def the_template_is_as_exact_as_its_reference(case: str, packed: bool, dtype=jnp.bfloat16,
+                                              tiles: selective.Tiles | None = None):
     """`case`'s output and every input's gradient through the template, at `tiles` where given (else the
-    device's plan), on par from float64 with the portable scan's, over check 1's fewest draws."""
+    device's plan), on par from float64 with its reference's (`held_to`: mamba_ssm's on a GPU, the portable
+    scan's interpreted), over check 1's fewest draws."""
     shape = SHAPES[case]
     family = bundles.of(generation.interpreted_target().generation if INTERPRETED
                         else generation.device_generation(), dtype)
@@ -105,9 +134,10 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
         return (*inputs, dy)
 
     starts = draw(dtype, 0, *shape, packed)[1]
-    assert_as_exact(run_to_run(jax.jit(with_gradients(scanned(template, starts))), ATOMIC),
-                    jax.jit(with_gradients(scanned(portable, starts))), draws,
-                    f"the selective template, {case}{', packed' if packed else ''}", seeds=FEWEST_SEEDS,
+    label = f"the selective template, {case}{', packed' if packed else ''}"
+    templated = jax.jit(with_gradients(scanned(template, starts)))
+    reference = held_to(jax.jit(with_gradients(scanned(portable, starts))), draws, starts, label, templated)
+    assert_as_exact(run_to_run(templated, ATOMIC), reference, draws, label, seeds=FEWEST_SEEDS,
                     truth_fn=jax.jit(with_gradients(scanned(portable, starts))))
 
 
@@ -116,19 +146,19 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
 # (site-tasks at c17a54df2); on each route (`ROUTES`).
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_template_is_as_exact_as_the_portable_scan_interpreted(route):
-    """`the_template_is_as_exact_as_the_portable_scan` over one row, on the route's bundle (`on_route`)."""
+def test_the_template_is_as_exact_as_its_reference_interpreted(route):
+    """`the_template_is_as_exact_as_its_reference` over one row, on the route's bundle (`on_route`)."""
     with on_route(route):
-        the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False)
+        the_template_is_as_exact_as_its_reference("interpreted", packed=False)
 
 
 @pytest.mark.parametrize("route", ROUTES)
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_template_is_as_exact_as_the_portable_scan_over_packed_documents_interpreted(route):
-    """`the_template_is_as_exact_as_the_portable_scan` over packed documents, on the route's bundle
+def test_the_template_is_as_exact_as_its_reference_over_packed_documents_interpreted(route):
+    """`the_template_is_as_exact_as_its_reference` over packed documents, on the route's bundle
     (`on_route`)."""
     with on_route(route):
-        the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
+        the_template_is_as_exact_as_its_reference("interpreted", packed=True)
 
 
 @pytest.mark.parametrize("regime", REGIMES)
@@ -157,12 +187,12 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
 
 
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_template_with_owned_partials_is_as_exact_as_the_portable_scan_interpreted(
+def test_the_template_with_owned_partials_is_as_exact_as_its_reference_interpreted(
         with_deterministic_ops):
-    """`the_template_is_as_exact_as_the_portable_scan` over packed documents where the backward's programs
+    """`the_template_is_as_exact_as_its_reference` over packed documents where the backward's programs
     own their partial sums and walk their channels in turn (`Scan.owned`, a run asking its reductions
     ordered)."""
-    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=True)
+    the_template_is_as_exact_as_its_reference("interpreted", packed=True)
 
 
 @pytest.mark.gpu(reason="the backward's atomic adds land in a GPU's order, which an interpreter fixes")
@@ -350,11 +380,12 @@ run (tests/test_gpu_recurrence.py), each held there to recorded mamba_ssm."""
 @pytest.mark.parametrize(("forms", "c_dtype"), ROUTE_CASES,
                          ids=[f"{forms}-C {jnp.dtype(c).name}" for forms, c in ROUTE_CASES])
 @pytest.mark.check1_shards(seeds=8, per_task=4)
-def test_the_selective_scan_through_its_dispatch_is_as_exact_as_the_portable_scan(forms, c_dtype):
+def test_the_selective_scan_through_its_dispatch_is_as_exact_as_its_reference(forms, c_dtype):
     """The selective scan through its dispatch with the template named, its placement and operand dtypes as
-    a call hands them over: its output and every input's gradient on par from float64 with the portable
-    scan's over drawn fp32 operands, `C` drawn in `c_dtype` (check 1), one row of a ragged chunk over two
-    channel blocks (KT5: no route held, the scan's behaviour)."""
+    a call hands them over: its output and every input's gradient on par from float64 with its reference's
+    (`held_to`: mamba_ssm's on a GPU, the portable scan's interpreted) over drawn fp32 operands, `C` drawn
+    in `c_dtype` (check 1), one row of a ragged chunk over two channel blocks (KT5: no route held, the
+    scan's behaviour)."""
     shape = SHAPES["interpreted"]
 
     def draws(seed):
@@ -364,11 +395,11 @@ def test_the_selective_scan_through_its_dispatch_is_as_exact_as_the_portable_sca
     def reference(x, dt, a, b, c, skip):
         return portable(x, dt, a, b, c.astype(jnp.float32), skip, None, None)[0]
 
-    assert_as_exact(run_to_run(jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype))),
-                               ATOMIC),
-                    jax.jit(with_gradients(reference)), draws,
-                    f"the selective scan's dispatch, the template named, under the {forms} forms, C in "
-                    f"{jnp.dtype(c_dtype).name}",
+    label = (f"the selective scan's dispatch, the template named, under the {forms} forms, C in "
+             f"{jnp.dtype(c_dtype).name}")
+    templated = jax.jit(with_gradients(dispatched(forms, named=True, c_dtype=c_dtype)))
+    assert_as_exact(run_to_run(templated, ATOMIC),
+                    held_to(jax.jit(with_gradients(reference)), draws, None, label, templated), draws, label,
                     seeds=FEWEST_SEEDS, truth_fn=jax.jit(with_gradients(reference)))
 
 
@@ -487,7 +518,7 @@ def test_a_spill_steps_the_kernel_that_spilled():
             assert selective.SELECTIVE.derived(bound, target) is None
         assert stepped is not None and stepped != derived
         assert selective.SELECTIVE.legal(bound, stepped, target)
-    the_template_is_as_exact_as_the_portable_scan("interpreted", packed=False, tiles=stepped)
+    the_template_is_as_exact_as_its_reference("interpreted", packed=False, tiles=stepped)
 
 
 @pytest.mark.parametrize('length', [129, 2048], ids=['129 tokens', '2048 tokens'])

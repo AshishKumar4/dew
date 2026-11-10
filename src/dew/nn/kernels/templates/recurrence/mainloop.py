@@ -817,7 +817,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                 return program(at, *arrays, streams=streams, staging=tuple(staged), landing=lands)
 
             if persistent:
-                _persisted(family, streams["walked"], given, live, arrays, grid, grid_names, call.interpret)
+                _persisted(family, streams["walked"], given, live, arrays, grid, grid_names, call.interpret,
+                           producer)
                 return
             walked = given({axis: lax.axis_index(axis) for axis in grid_names})
             if walked is not None:
@@ -849,10 +850,10 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
 
 
 def _persisted(family: mosaic.Family, streams, given, live, arrays, grid: tuple, grid_names: tuple,
-               interpret: bool) -> None:
+               interpret: bool, producer: int | None) -> None:
     """A persistent launch's program (`launch_kernel`'s): `grid`'s tiles' walks, each its program's at the
     tile's indices (`given`, `_tile_at`) where `live` holds, on the family's persist, its rings running on
-    across them."""
+    across them, its producer lowered to `producer` (the floor its launch plans with)."""
     def tile(at: dict) -> mosaic.Walk:
         """The tile's walk, which a persistent launch's program returns."""
         walked = given(at)
@@ -873,7 +874,7 @@ def _persisted(family: mosaic.Family, streams, given, live, arrays, grid: tuple,
         pass
 
     family.persist(streams, (math.prod(grid),), schedule, issue, finish, consumers=1, axis="programs",
-                   outputs=(), interpret=interpret)
+                   outputs=(), interpret=interpret, producer=producer)
 
 
 def _solving(call: Call) -> mosaic.Family:
@@ -1025,8 +1026,9 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
         out_type = (held.shape(call.heads * chunk), *out_type)
     work, hardware, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies,
                                                                      narrow=narrow)
+    # Its producer at 32 on a tcgen05 bundle: GDN's bf16 solve spilled 164 bytes at 24, none from 32.
     solved = launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                           grid_names=("chunks", "heads"),
+                           grid_names=("chunks", "heads"), producer=stated_producer(call, 32),
                            blocks=stream_blocks(keys=((chunk, width), call.given),
                                                 **({"values": ((chunk, value_width),
                                                                call.given)} if applies else {}))
@@ -1739,7 +1741,7 @@ def _weighted_values(v, a, beta, taken, call: Call):
 
 def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step, start,
                   count, kept, written, out, bv: int, *, landing, prefetch: Callable | None = None,
-                  walkers: int = 1) -> None:
+                  walkers: int = 1, producer: int | None = None) -> None:
     """A sequence's memory over `walkers` value blocks `bv` wide, one a consumer role beside one producer
     (`Tiles.walkers`): the memory each role takes, its columns of each key slice's tile `{name}{i}` of
     `memory` (`entering`, the opened streams and their views), zero where `kept` is 0; the role's
@@ -1749,7 +1751,9 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
     after the walk, `final_memory_landing`) (`_states`', and `_reverse`'s from its last chunk). Where
     `prefetch(n)` is given, it loads chunk `n`'s own values from global memory (its prefix), a step ahead:
     each step issues the next chunk's loads before its own work and takes the ones the step before issued
-    (`step(role)(n, slots, state, accumulators, loaded)`), so their latency is the step's, not on its path."""
+    (`step(role)(n, slots, state, accumulators, loaded)`), so their latency is the step's, not on its path.
+    Its producer lowers to `producer`, the floor its launch plans with (`launch_kernel`'s; where None
+    `resources.producer_floor`)."""
     family, slices = call.family, call.width // call.block
     (entered, entered_views), (chunks, views) = entering, walked
 
@@ -1797,11 +1801,11 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
             else:
                 store(landing(role))
 
-    def producer():
+    def streamed():
         family.stream(entered, entered_views, 0, 1)
         family.stream(chunks, views, start, start + count)
 
-    family.scheduled(walkers, consumer, producer)
+    family.scheduled(walkers, consumer, streamed, floor=producer)
 
 
 def _roles_staged(staging: tuple, landing: dict, consumers: int) -> tuple[tuple, dict]:
@@ -1969,6 +1973,10 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 
     # Where the keys take the write gate, the corrected values are the values as given: none stored.
     stores_corrected = not call.gated_keys
+    # Its producer's floor, the one value its plan and its walk's schedule read (`stated_producer`): 48, its
+    # loads spilling at 24 (60 bytes on Nemotron-H 4B's fp32 states, 52 on GDN's and 44 on KDA's bf16; none
+    # at 40 or 48, jsf-states-held, jsf-pfloor-ab).
+    producer = stated_producer(call, 48)
 
     def program(at, k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, h_ref,
                 *outputs, streams, staging, landing):
@@ -2039,7 +2047,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
                       prefetch=None if call.per_key else prefetch,
-                      landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
+                      landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer)
 
     out_type, blocks, initials, staging, landing, after, work = _states_launch(
         call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected)
@@ -2050,7 +2058,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                              consumers=walkers, held=_states_held(call, values, keys, bv), staging=staging,
                              once=initials, landing=landing, after=after,
                              # Its last write's column sums an fp32 call's alone (`column_sums`).
-                             reduces=held.parts > 1, producer=_states_producer(call))(
+                             reduces=held.parts > 1, producer=producer)(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
     if stores_corrected:
         return launched
@@ -2086,12 +2094,12 @@ def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values:
             Work(flops=4 * chunk * width * walked_width * steps, span=steps))
 
 
-def _states_producer(call: Call) -> int | None:
-    """The registers `_states`' producer role is lowered to: 48 where the family keeps its products in tensor
-    memory (tcgen05's), whose producer's loads spilled at `resources.producer_floor`'s 24 (60 bytes on
-    Nemotron-H 4B's fp32 states, 52 on GDN's and 44 on KDA's bf16; none at 48 or 40, jsf-states-held), else
-    the floor."""
-    return 48 if product_results(call) == "tensor" else None
+def stated_producer(call: Call, registers: int) -> int | None:
+    """`registers`, the floor a launch's producer lowers to on a family whose producers load past the floor
+    (`Issuer.loads_past_floor`, tcgen05's: its issue loop's live set, as ptxas assembled it), else None
+    (`resources.producer_floor`'s 24, which a warpgroup MMA's and mma.sync's launches hold)."""
+    return registers if call.family.loads_past_floor else None
+
 
 
 def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:

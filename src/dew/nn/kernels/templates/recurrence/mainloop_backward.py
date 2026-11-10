@@ -43,6 +43,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     sequence_walk,
     shared_allocation,
     staging_tiles,
+    stated_producer,
     stream_blocks,
     stream_tile,
     stream_views,
@@ -437,6 +438,13 @@ def _reverse_launched(call: Call, batch: int, bv: int, walked_width: int, *, gat
     return out_type, blocks, finals
 
 
+def _reverse_producer(call: Call) -> int | None:
+    """`_reverse`'s producer floor, the one value its plan and its walk's schedule read (`stated_producer`):
+    72, GDN's bf16 reverse walk's producer spilling 12 to 40 bytes at 24 to 64, none from 72 (row 5357,
+    jsf-pfloor-ab3 on the promotion's candidate; at 64 on its base before, jsf-pfloor-ab2)."""
+    return stated_producer(call, 72)
+
+
 @lowered_once
 def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, tiles: Tiles, *, scale: float,
              skip=None, memory=None):
@@ -457,17 +465,16 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
     fourth output `[Dv / BV, chunks * HV * Dk]` fp32 each value block's part of the memory decay's gradient
     `sum(h dh)` (`algebra.key_memory_decay`) from the memory's gradient the walk holds, its key rows a
     tile's (kda-lower5-sm90 at 6e03eb57e: where the keys' columns met them, no layout held)."""
-    chunk = call.chunk
     gates, skips = v is not None, skip is not None
-    width, value_width, family = call.width, call.value_width, call.family
+    chunk, width, value_width, family = call.chunk, call.width, call.value_width, call.family
     grads = _reverse_values(call, gates=gates)
     bv, slices, walkers = tiles.block_v, width // call.block, tiles.walkers
     walked_width = bv * walkers
     held, memories, given = dataclasses.replace(call.held, rows=call.rows), call.memories, call.given
-    batch = dht.shape[0] // (call.heads * width)
+    batch, chunks = dht.shape[0] // (call.heads * width), call.chunks
     final = Operand(dht.shape[0], 1, jnp.dtype(jnp.float32))
-    chunks = call.chunks
     assert gates or not skips, "the walk adds a skip where it gates the values"
+    producer = _reverse_producer(call)
     assert call.per_key == (memory is not None), "the walk takes the memories under a decay a key dimension"
 
     def program(at, q_ref, k_ref, w_ref, do_ref, local_ref, hi_ref, lo_ref, dht_ref, seq_ref, v_ref, beta_ref,
@@ -533,7 +540,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                       chunks - first - count, count, ends, begins,
                       lambda role, i: dh0_ref.at[pl.ds(memory(row, i), call.block),
                                                  pl.ds(walked + role * bv, bv)], bv,
-                      landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
+                      landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer)
 
     out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates, skips=skips)
     # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
@@ -546,6 +553,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                          # took 237920 and 282848 bytes, past an H100's 232448 (fp32-plan-sm90, cdcd620ef).
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=(1, 2), work=work,
                          held=_reverse_held(call, bv, gates=gates, skips=skips), consumers=walkers,
+                         producer=producer,
                          live=lambda at, refs: refs[8][at["sequences"], 1] > 0,
                          staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
                                   (plgpu.SMEM((chunk, bv), held.stored),)),

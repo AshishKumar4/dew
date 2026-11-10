@@ -791,6 +791,7 @@ Every family is in scope (owner). Each of these is a value or specialization of 
   - the T=1 scan mainloop over the same transition value (mamba_ssm's selective scan schedule: a sequential scan over tokens with V·N parallel).
   Both are the one algebra, the token update being the definitional form.
 - **Reference.** mamba_ssm's `selective_scan_fn` (the CUDA selective scan) for forward and backward. The speed bar is mamba_ssm at every shape.
+- **Precision.** The decay's exponential is the upstream's own: mamba_ssm takes `exp2f(Δ A)` under `--use_fast_math`, and the template's `exp2` lowers to the hardware's `ex2.approx` on a GPU (Mosaic GPU lowers it there with or without `approx_math`), about 2 ulp. On a GH200 the template sits 1.66 to 2.79 times the portable scan's distance from float64 in fp32 (M-JS-79); with a 1.2-ulp exponential it sat 0.84 to 1.12 times (M-JS-82). The portable scan, whose exponential is XLA's, is the more exact path. A GPU run of the template is held to mamba_ssm run live, and an interpreted one to the portable scan, whose arithmetic it then has.
 
 #### Mamba3: rotating basis and trapezoidal multi-write
 - **Transition value.** decay kind `complex_pairs`: the state's key axis is paired (K/2 complex dims), each pair decayed and rotated by `ρ_t e^{iθ_t}`. That is a diagonal decay over complex scalars, so a specialization of the per-key class with complex values.

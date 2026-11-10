@@ -45,6 +45,7 @@ from dew.nn.kernels.templates import (
     product,
     report,
     resources,
+    shifted_rows,
     swizzling,
 )
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, opaque, passed, streamed
@@ -716,6 +717,35 @@ class Issuer[Accumulator](abc.ABC):
         registers."""
         del rows, depth
         return 0
+
+    def row_shifted(self, tile, shift, *, period: int, interpret: bool) -> jax.Array:
+        """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
+        `i - shift`'s values within its `period`-row group, any value where that row leaves the group (a
+        caller's mask), `shift` traced: read at a row offset in registers, by the layout's own lane
+        permutation (`shifted_rows.row_shifted`, a warp's shuffles), not through shared memory, whose shifted
+        plain reads conflict on every bank (row 5305); interpreted, the tile's own rows gathered. A layout
+        whose warps hold no whole groups of `period` rows takes none (`shifted_rows.lanes`)."""
+        if interpret:
+            rows = lax.broadcasted_iota(jnp.int32, tile.shape, 0)
+            group = rows - rows % period
+            taken = group + jnp.clip(rows % period - shift, 0, period - 1)
+            return jnp.take_along_axis(tile, taken, axis=0)
+
+        def shifted(ctx, array, by):
+            del ctx
+            [value] = by.registers.flat
+            return shifted_rows.row_shifted(array, value, period)
+
+        returned = plgpu.ShapeDtypeStruct(tile.shape, tile.dtype, layout=self.layout)
+        return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(
+            shifted)(tile, jnp.asarray(shift, jnp.int32))
+
+    loads_past_floor: bool = False
+    """Whether this is an issuer on which some launches' producers hold more than `resources.producer_floor`'s
+    registers in their issue loop: each such launch states its floor where a receipt shows the need
+    (`Launch.producer`), and the compile gate holds the rest to the default (`producer_failures`, spills).
+    tcgen05's: the recurrence's states, solve and reverse walk spilled 52, 164 and 40 bytes at 24 on sm100
+    (row 5357), its other launches spill-free at 24; none of warpgroup MMA's or mma.sync's."""
 
     def entry_floor(self, tiles) -> int:
         """The least registers a thread a program issuing products into a consumer's fp32 `tiles` (each
@@ -1494,7 +1524,7 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = ()) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1513,7 +1543,9 @@ class Transport[Allocated, Opened](abc.ABC):
         `schedule` gives each of them the same `active`, `steps` and view of it. `walk`'s `in_flight` and
         `unrolled` are its consumers' walks'. `accumulators` are the shapes of the fp32 accumulators a
         tile's walk issues into, which a family holding them outside its consumers' registers allocates
-        (tcgen05's tensor memory, read out by `Issuer.chunks`); a register family's walk carries its own."""
+        (tcgen05's tensor memory, read out by `Issuer.chunks`); a register family's walk carries its own. Its
+        producer lowers to `producer` registers a thread (`roles`' floor, `resources.producer_floor` where
+        None), the floor its launch plans with; a family without a producer role takes none."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -1941,14 +1973,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = ()) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
         del accumulators  # its consumers' walks carry their own
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
         staging = self.output_staging(outputs, consumers)
 
-        def producer():
+        def loading():
             loaded, _ = persistent.tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
             drain(rings.values(), loaded)
 
@@ -1956,8 +1988,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
                                in_flight=in_flight, unrolled=unrolled)
 
-        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), producer), *staging,
-                      collective_axes="wg")
+        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), loading, floor=producer),
+                      *staging, collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,
                finish: Callable, smems, *, axis: str, interpret: bool, in_flight: int,

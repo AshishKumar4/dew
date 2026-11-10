@@ -223,18 +223,22 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
 
 def entered_memories(state, entered, starts, firsts=None):
     """A packed call's documents entering memories of their own (`Chunk.entered`): each document's memory
-    `[B, D, ...]`, its `entered` slot's of `state` `[B, D', ...]` (one-based, zero a zero memory), and each
-    one's first slot `[B, D]` (`firsts`, else `starts`' documents, `dew.batch.document_firsts`), `S` past a
-    row's last."""
+    `[B, D, ...]`, its `entered` slot's of `state` `[B, D', ...]` (one-based, zero a zero memory; a pytree
+    of such leaves, a carry's, each gathered alike), and each one's first slot `[B, D]` (`firsts`, else
+    `starts`' documents, `dew.batch.document_firsts`), `S` past a row's last."""
     if state is None:
         raise ValueError("documents entering memories of their own (`Chunk.entered`) read the slots' "
                          "memories, `state` `[B, D, ...]`")
     entered = jnp.asarray(entered, jnp.int32)
     documents = entered.shape[1]
     begins = document_firsts(starts, documents) if firsts is None else firsts[:, :documents]
-    picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(state, entered)
-    kept = (entered > 0).reshape(*entered.shape, *(1,) * (state.ndim - 2))
-    return jnp.where(kept, picked, jnp.zeros((), picked.dtype)), begins
+
+    def taken(leaf):
+        picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(leaf, entered)
+        kept = (entered > 0).reshape(*entered.shape, *(1,) * (leaf.ndim - 2))
+        return jnp.where(kept, picked, jnp.zeros((), picked.dtype))
+
+    return jax.tree.map(taken, state), begins
 
 
 @dataclasses.dataclass(frozen=True)
@@ -421,7 +425,8 @@ MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
 GATED_DELTA: Op[PortCase] = Op(Choice.GATED_DELTA_RULE,
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS, upstream='fla'),
+                                Kernel('xla', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
@@ -1398,8 +1403,9 @@ the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones
 the template's refusal, not a cell."""
 
 SCAN: Op[ScanCase] = Op(Choice.SSD, (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
-                               Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
-                               Kernel('xla', (), generic=True)), declared=SCAN_CELLS)
+                               Kernel('pallas', SSD_SUPPORTS, upstream='mamba_ssm'),
+                               Kernel('tpu', TPU_SCAN_SUPPORTS), Kernel('xla', (), generic=True)),
+                  declared=SCAN_CELLS)
 """The rated scan's selector: on a declared port cell (`SCAN_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
 recurrence template at its derived tiles (`TEMPLATE_SUPPORTS`, under the port's trace and placement), the

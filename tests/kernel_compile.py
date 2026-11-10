@@ -575,6 +575,8 @@ OCCUPANCY = re.compile(r"\.minnctapersm[^\n]*\n")
 RAISE = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 \d+;")
 RAISED = re.compile(r"setmaxnreg\.inc\.sync\.aligned\.u32 (\d+);")
 """A raise's registers (`RAISE`'s), as a kernel record states them (`raised`)."""
+DECREASED = re.compile(r"setmaxnreg\.dec\.sync\.aligned\.u32 (\d+);")
+"""A producer's decrease's registers, as a kernel record states them (`decreased`)."""
 
 
 RELOCATABLE = not resources.RAISES_HONORED
@@ -764,6 +766,8 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
                 # raise none or no PTX was printed for it.
                 ptx = printed.get(name, PTX.get(kernel["module"], ""))
                 kernel["raised"] = int(raise_.group(1)) if (raise_ := RAISED.search(ptx)) else None
+                # The registers its producer lowers to, as its PTX states (`setmaxnreg.dec`); None likewise.
+                kernel["decreased"] = int(lower.group(1)) if (lower := DECREASED.search(ptx)) else None
                 if least:
                     kernel["least"] = _least(kernel["module"], generation)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
@@ -807,8 +811,10 @@ def decisions(registers: int | dict | None, model: resources.RegisterModel,
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
-    """Compile errors, spills, and missing or excessive shared/TMEM allocations. A spill-free register
-    model disagreement remains an advisory row until the model matches allocation."""
+    """Compile errors, spills, missing or excessive shared/TMEM allocations, and a producer its schedule
+    lowers to other registers than its model states (`setmaxnreg.dec` against `RegisterModel.producer`: a
+    launch's plan and its emission one fact). A spill-free register model disagreement remains an advisory row
+    until the model matches allocation."""
     failed = failures(found)
     for record in found:
         if refused(record):
@@ -824,6 +830,20 @@ def mosaic_failures(found: list[dict]) -> list[str]:
                 failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of shared memory, the kernel asks for {found_kernel.shared}")
         record["evidence"] = _register_evidence(record)
+    return failed + producer_failures(found)
+
+
+def producer_failures(found: list[dict]) -> list[str]:
+    """Each kernel whose schedule lowers its producer to other registers than its model states, or none where
+    its model states a producer (`setmaxnreg.dec`, the record's `decreased`, against
+    `RegisterModel.producer`): a launch's plan and its emission one fact."""
+    failed = []
+    for record in found:
+        for kernel in record.get("kernels", ()):
+            stated = record.get("models", {}).get(_report(kernel).kernel)
+            if stated is not None and stated["producer"] and kernel.get("decreased") != stated["producer"]:
+                failed.append(f"{record['name']} {kernel['kernel']}: its schedule lowers its producer to "
+                              f"{kernel.get('decreased')} registers, its model {stated['producer']}")
     return failed
 
 

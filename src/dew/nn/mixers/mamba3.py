@@ -41,7 +41,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk, entered_memories
 from dew.nn.linear import forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
@@ -250,9 +250,7 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, entered, starts
     fresh = resets & (jnp.take_along_axis(taken, number, axis=1) == 0)
     unturned = jnp.where(fresh[..., None], 0, dt)
     # Each document's carry, its slot's (zero for none).
-    entering = Carried(*(jnp.where((taken > 0).reshape(*taken.shape, *(1,) * (leaf.ndim - 2)),
-                                   jax.vmap(lambda row, at: row[jnp.maximum(at - 1, 0)])(leaf, taken), 0)
-                         for leaf in carried))
+    entering, _ = entered_memories(carried, taken, resets, firsts)
     turned = _angles(unturned, _per_head(jnp.asarray(theta), heads), continues)
     angles = jnp.remainder(turned + jnp.take_along_axis(entering.angle, number[:, :, None, None], axis=1),
                            2 * jnp.pi)

@@ -44,3 +44,80 @@ def selective_xla(arrays, dtype=None, scan=selective_scan) -> dict[str, jax.Arra
     out = jax.eval_shape(run, *operands)
     found = with_gradients(run)(*operands, jnp.asarray(arrays["dy"], out.dtype))
     return dict(zip(("y", *names), found, strict=True))
+
+
+MAMBA_SELECTIVE_SIDE = '''
+import sys, time, numpy as np, torch
+from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+begun = time.perf_counter()
+given = np.load(sys.argv[1])
+kinds = dict(zip(str(given["leaves"]).split(","), str(given["dtypes"]).split(",")))
+held = {name: torch.from_numpy(given[name]).to("cuda", getattr(torch, kinds[name])).requires_grad_()
+        for name in kinds}
+draws, rows, length, channels = held["x"].shape
+states = held["a"].shape[-1]
+# Each draw its own channels (`[B, N D, L]`) and its own group of B and C (`[B, N, states, L]`), its decays
+# and skip its channels' (`[N D, states]`, `[N D]`): one call of the draws, each a group of the upstream's.
+u, delta = (held[name].permute(1, 0, 3, 2).reshape(rows, draws * channels, length) for name in ("x", "dt"))
+b, c = (held[name].permute(1, 0, 3, 2) for name in ("b", "c"))
+a, skip = held["a"].reshape(draws * channels, states), held["skip"].reshape(draws * channels)
+bounds = [int(x) for x in given["bounds"]]
+pieces = [selective_scan_fn(u[..., lo:hi].contiguous(), delta[..., lo:hi].contiguous(), a,
+                            b[..., lo:hi].contiguous(), c[..., lo:hi].contiguous(), skip.float())
+          for lo, hi in zip(bounds[:-1], bounds[1:])]
+y = torch.cat(pieces, dim=-1).reshape(rows, draws, channels, length).permute(1, 0, 3, 2)
+torch.cuda.synchronize()
+ran = time.perf_counter()
+dy = torch.from_numpy(given["dy"]).to("cuda", torch.float32)
+torch.autograd.backward(y.float(), dy)
+found = {"y": y, **{f"d_{name}": held[name].grad for name in kinds}}
+np.savez(sys.argv[2], **{name: value.detach().float().cpu().numpy() for name, value in found.items()})
+print(f"K mamba_ssm selective {draws} draws: kernels {ran - begun:.2f} s, "
+      f"back {time.perf_counter() - ran:.2f} s", flush=True)
+'''
+"""mamba_ssm's own `selective_scan_fn` (its CUDA kernel, `exp2f` under `--use_fast_math`) in the interpreter
+`DEW_MAMBA_PYTHON` names, over a block of draws run as one call (each draw its own channels and its own group
+of B and C), a row's documents each a call of its own from a zero state (the kernel takes no documents) at
+the request's `bounds`, its parameters' gradients the fp32 sum of the documents' pulls."""
+
+
+def mamba_selective_side(drawn: list, starts) -> list:
+    """mamba_ssm's selective scan (`MAMBA_SELECTIVE_SIDE`) on a block of draws, each `(x, dt, a, b, c, skip,
+    dy)` as the selective template's sites draw them (`[B, L, D]` and `[B, L, N]` in their dtype, the decays
+    `[D, N]` and skip `[D]` fp32): each draw's output and its six operands' gradients, `(y, dx, ddt, da, db,
+    dc, dskip)` in their operands' dtypes. `starts` `[B, L]` the rows' documents, alike in every row (None:
+    one sequence a row)."""
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    import pytest
+
+    python = os.environ.get("DEW_MAMBA_PYTHON")
+    if not python:
+        pytest.fail("DEW_MAMBA_PYTHON names no interpreter with mamba_ssm 2.3.2 and torch: the GPU tier's "
+                    "reference, which a run selecting the mamba reference gives it")
+    names = ("x", "dt", "a", "b", "c", "skip")
+    length = drawn[0][0].shape[1]
+    marks = np.zeros(length, bool) if starts is None else np.asarray(starts, bool)[0]
+    if starts is not None:
+        assert np.all(np.asarray(starts, bool) == marks), "a block's rows share their documents"
+    given = {name: np.stack([np.asarray(d[i], np.float32) for d in drawn]) for i, name in enumerate(names)}
+    # B and C in the values' dtype where theirs is narrower (a bf16 C beside fp32 x): the same values, as the
+    # upstream's kernel takes B and C in its inputs' type.
+    widest = jnp.dtype(drawn[0][0].dtype).name
+    kinds = [jnp.dtype(drawn[0][i].dtype).name for i in range(6)]
+    kinds[3:5] = [widest, widest]
+    given |= {"leaves": np.asarray(",".join(names)), "dtypes": np.asarray(",".join(kinds)),
+              "bounds": np.asarray(sorted({0, *np.flatnonzero(marks).tolist(), length}), np.int64),
+              "dy": np.stack([np.asarray(d[6], np.float32) for d in drawn])}
+    with tempfile.TemporaryDirectory() as root:
+        np.savez(Path(root) / "in.npz", **given)
+        subprocess.run([python, "-c", MAMBA_SELECTIVE_SIDE, Path(root) / "in.npz", Path(root) / "out.npz"],
+                       check=True)
+        with np.load(Path(root) / "out.npz") as found:
+            outputs = dict(found)
+    return [(jnp.asarray(outputs["y"][i], drawn[i][0].dtype),
+             *(jnp.asarray(outputs[f"d_{name}"][i], drawn[i][k].dtype) for k, name in enumerate(names)))
+            for i in range(len(drawn))]

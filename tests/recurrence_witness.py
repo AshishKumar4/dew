@@ -1196,12 +1196,13 @@ class BackRun(NamedTuple):
                         records["local"][n, head], records["dv"][n, head], records["ds"][n, head], dw)
 
 
-def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> BackRun:
+def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda prepared: ()) -> tuple:
     """The fast backward of a call over one row (`draw`'s `operands`; under the `delta` rule, or without it
     the SSD's route's under the run's fast forms), run as a training step runs it (the route's VJP), and the
     same build's `mainloop_backward.kept_backward` at the forward's kept values, checked to give the step's
-    gradients bit for bit: each launch's outputs as stored (`Kept`), laid a chunk and value head at a time
-    (their parts summed), for output and final memory gradients `seed` draws."""
+    gradients bit for bit: its forward's run (`recorded`), the output and final memory gradients `seed`
+    draws, the launches' outputs as stored (`Kept`, its prepared run left in the program) and `extras` of
+    that prepared run, as the program returns them."""
     import jax
     import jax.numpy as jnp
 
@@ -1214,8 +1215,7 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
     rng = np.random.default_rng([2084, seed])
     do = jnp.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
-    scale = run.scale
-    rounded = route_rounding(delta, dtype)
+    scale, rounded = run.scale, route_rounding(delta, dtype)
     family = mainloop.issued(dtype)[0]
     interpret = generation.backend() != "gpu"
 
@@ -1238,31 +1238,47 @@ def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> 
                                                            rounded=rounded, delta=delta, family=family,
                                                            interpret=interpret, inverse=inverse, kept=held)
             # The prepared run stays inside the program; the witness reads its records from `Run`.
-            return grads, saved._replace(run=None)
+            return grads, saved._replace(run=None), extras(saved.run)
 
-        grads, saved = jax.jit(kept)(*operands)
+        grads, saved, extra = jax.jit(kept)(*operands)
     for mine, theirs in zip(grads[:6], native, strict=True):
         assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
             "the certify build is the production program"
-    _, length, heads, value_width = v.shape
-    key_width, chunks = k.shape[-1], run.chunks
+    return run, do, dfinal, saved, extra
+
+
+def _back_run(run, do, dfinal, saved, named: dict, laid: int, dh: np.ndarray) -> BackRun:
+    """A captured backward's `BackRun` (`_captured_backward`): its `named` records (each its stored array and
+    width) laid a chunk and value head at a time over its `laid` chunks, beside the gradient `dh`
+    `[N, H, Dk, Dv]` of the memory each chunk leaves, each with the dtype it is stored in."""
+    import jax.numpy as jnp
+
+    _, length, heads, value_width = do.shape
+    key_width, chunks, chunk = dh.shape[-2], run.chunks, run.chunk
+    dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
+    dtypes["entering"] = jnp.dtype(saved.dh.dtype)
+    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(length, None, None, chunk), chunk)
+    return BackRun(run, hosted_do.reshape(chunks, chunk, heads, value_width).transpose(0, 2, 1, 3),
+                   np.asarray(dfinal, np.float64)[0], dh,
+                   np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width),
+                   _chunked(named, laid, heads, chunks, chunk), dtypes)
+
+
+def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> BackRun:
+    """The fast backward of a call over one row as its launches kept it (`_captured_backward`), each launch's
+    outputs laid a chunk and value head at a time (their parts summed)."""
+    run, do, dfinal, saved, _ = _captured_backward(operands, seed, delta=delta)
+    _, _, heads, value_width = do.shape
+    key_width, chunk = operands[1].shape[-1], run.chunk
     # The chunks the launches lay, of the memories' rows a part (`Run.held` of them stacked).
     laid = np.shape(saved.dh)[0] // (run.held * heads * key_width)
-
-    chunk = run.chunk
     named = {"local": (saved.local, value_width), "dv": (saved.dv, value_width), "ds": (saved.ds, chunk),
              "dq": (saved.dq, key_width), "dk": (saved.dk, key_width)}
     if delta:
         named |= {"dw": (saved.dw, key_width), "d_l": (saved.d_l, chunk),
                   "values": (saved.values, value_width), "keys": (saved.keys, key_width)}
-    records = _chunked(named, laid, heads, chunks, chunk)
-    dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
-    dh = np.asarray(saved.dh, np.float64).reshape(-1, laid, heads, key_width, value_width).sum(0)[:chunks]
-    dtypes["entering"] = jnp.dtype(saved.dh.dtype)
-    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(length, None, None, chunk), chunk)
-    return BackRun(run, hosted_do.reshape(chunks, chunk, heads, value_width).transpose(0, 2, 1, 3),
-                   np.asarray(dfinal, np.float64)[0], dh,
-                   np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width), records, dtypes)
+    dh = np.asarray(saved.dh, np.float64).reshape(-1, laid, heads, key_width, value_width).sum(0)
+    return _back_run(run, do, dfinal, saved, named, laid, dh[:run.chunks])
 
 
 def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
@@ -1438,69 +1454,24 @@ KEY_BACK_RECORDS = ("d_scores", "local", "dv", "entering", "dq_memory", "dk_memo
 """The records a decay a key dimension's fast backward keeps (`key_backward.KeyKept`), one value head's."""
 
 
-def recorded_key_backward(operands: tuple, seed: int = 0) -> tuple[BackRun, dict]:
+def recorded_key_backward(operands: tuple, seed: int = 0) -> BackRun:
     """The fast backward of a 16-bit call under the delta rule and a decay a key dimension over one row
-    (`draw(..., per_key=True)`'s `operands`), run as a training step runs it and kept by the same build
-    (`kept_backward`, `key_backward.KeyKept`), checked bit for bit against the step's gradients: its records
-    and its forward's stored intra scores and gated keys, `[N, H, ...]` float64."""
-    import jax
-    import jax.numpy as jnp
-
-    from dew.nn.kernels import generation, recurrence_chunk, tuning
-    from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward
-
-    q, k, v, _, _, h0 = operands
-    dtype = jnp.result_type(q, k, v)
-    run = recorded(*operands)
-    rng = np.random.default_rng([2084, seed])
-    do = jnp.asarray(rng.standard_normal(v.shape), dtype)
-    dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
-    scale, rounded = run.scale, route_rounding(delta=True, dtype=dtype)
-    family = mainloop.issued(dtype)[0]
-    interpret = generation.backend() != "gpu"
-
-    def route(*x):
-        return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
-
-    with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
-        with tuning.seen() as launches:
-            native = jax.jit(lambda *x: jax.vjp(route, *x)[1]((do, dfinal)))(*operands)
-        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, template.Mosaic)]
-
-        def kept(*x):
-            _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
-                                                         family=family, interpret=interpret)
-            grads, saved = mainloop_backward.kept_backward(
-                *x, do, dfinal, tiles=tiles, scale=scale, rounded=rounded, family=family,
-                interpret=interpret, inverse=inverse, kept=held)
-            # The prepared run stays inside the program: its intra scores and gated keys leave it.
-            return grads, saved._replace(run=None), saved.run.scores, saved.run.keys
-
-        grads, saved, scores, gated_keys = jax.jit(kept)(*operands)
-    for mine, theirs in zip(grads[:6], native, strict=True):
-        assert np.array_equal(np.asarray(mine).view(np.uint8), np.asarray(theirs).view(np.uint8)), \
-            "the certify build is the production program"
-    _, _, heads, value_width = v.shape
-    key_width, chunks = k.shape[-1], run.chunks
+    (`draw(..., per_key=True)`'s `operands`) as its launches kept it (`_captured_backward`,
+    `key_backward.KeyKept`): its records and its forward's stored intra scores and gated keys, `[N, H, ...]`
+    float64."""
+    run, do, dfinal, saved, (scores, gated_keys) = _captured_backward(
+        operands, seed, delta=True, extras=lambda prepared: (prepared.scores, prepared.keys))
+    _, _, heads, value_width = do.shape
+    key_width, chunk = operands[1].shape[-1], run.chunk
     laid = np.shape(saved.dh)[0] // (heads * key_width)
-
-    chunk = run.chunk
     named = {"d_scores": (saved.d_scores, chunk), "local": (saved.local, value_width),
              "dv": (saved.dv, value_width), "dq_memory": (saved.dq_memory, key_width),
              "dk_memory": (saved.dk_memory, key_width), "values": (saved.values, value_width),
              "d_system": (saved.d_system, chunk), "dq_pairs": (saved.dq_pairs, key_width),
              "dk_pairs": (saved.dk_pairs, key_width), "scores": (scores, chunk),
              "kg": (gated_keys, key_width)}
-    records = _chunked(named, laid, heads, chunks, chunk)
-    dtypes = {name: jnp.dtype(x.dtype) for name, (x, _) in named.items()}
-    dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)[:chunks]
-    dtypes["entering"] = jnp.dtype(saved.dh.dtype)
-    hosted_do = _laid(np.asarray(do, np.float64)[0], laid_chunks(v.shape[1], None, None, chunk), chunk)
-    back = BackRun(run, hosted_do.reshape(chunks, chunk, heads, value_width).transpose(0, 2, 1, 3),
-                   np.asarray(dfinal, np.float64)[0], dh,
-                   np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width), records, dtypes)
-    return back, records
+    dh = np.asarray(saved.dh, np.float64).reshape(laid, heads, key_width, value_width)
+    return _back_run(run, do, dfinal, saved, named, laid, dh[:run.chunks])
 
 
 def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
@@ -1537,7 +1508,7 @@ def key_back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
 def assert_key_backward_witnessed(lane: Lane, heads: int = 1) -> None:
     """The step witness of a decay a key dimension's fast backward (`key_back_enclosures`, Kimi delta
     attention's): a bf16 call of three chunks, every record each launch keeps inside its step's enclosure."""
-    back, _ = recorded_key_backward(draw(0, "mild", heads=heads, per_key=True))
+    back = recorded_key_backward(draw(0, "mild", heads=heads, per_key=True))
     held = key_back_witnessed(back, lane)
     for name, inside in held.items():
         assert np.all(inside), (name, np.mean(inside))

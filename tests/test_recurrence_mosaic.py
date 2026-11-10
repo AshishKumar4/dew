@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
-from generation_support import lowers
+from generation_support import COMPILES_ON_CPU, lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
     FORMED,
@@ -1309,6 +1309,22 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
         cases = compiled_cases(target, plans, [], apart, only=group, launched=launched)
         found = compile_mosaic_kernels(cases, target)
     return cases, found
+
+
+@COMPILES_ON_CPU
+def test_each_launchs_producer_lowers_its_registers_as_its_model_states_on_a_b200_spilling_none():
+    """The gated delta rule's 16-bit training pass on a B200's tcgen05 bundle, compiled by Mosaic on this CPU
+    (`compiled_cases`): each launch's producer warpgroup lowers its registers in its PTX (`setmaxnreg.dec`)
+    to what its register model states (`RegisterModel.producer`, its plan's `Launch.producer`), a launch's
+    plan and its schedule one fact, and no kernel spills: the states, solve and reverse walk's producers
+    spilled at the default 24 (52, 164 and 40 bytes; none from 40, 32 and 72, jsf-pfloor-ab, row 5357), the
+    states launch planned at 48 and run at 24 (the promotion's review)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    plans, apart = {}, {}
+    group = ('qwen3.5-27b-gdn', jnp.bfloat16, True, False, None)
+    found = compile_mosaic_kernels(compiled_cases('sm100', plans, [], apart, only=group), 'sm100')
+    assert mosaic_failures(found) == []
 
 
 @lowers('sm90')

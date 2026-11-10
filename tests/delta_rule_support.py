@@ -157,6 +157,126 @@ def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
     return [theirs[name] for name in NAMES]
 
 
+FLA_LAYER_SIDE = '''
+import sys, time, numpy as np, torch
+import torch.nn.functional as F
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+from fla.ops.kda import chunk_kda
+from fla.modules import FusedRMSNormGated
+
+
+def fla_layer(given, form, dtype):
+    begun = time.perf_counter()
+    dtype = getattr(torch, dtype)
+    leaves = str(given["leaves"]).split(",")
+    kinds = dict(zip(leaves, str(given["dtypes"]).split(",")))
+    cu_seqlens = torch.from_numpy(given["cu_seqlens"]).to("cuda", torch.long)
+    entering, last = (torch.from_numpy(given[name]).to("cuda", torch.long) for name in ("entering", "last"))
+    held = {name: torch.from_numpy(given[name]).to("cuda", getattr(torch, kinds[name])).requires_grad_()
+            for name in leaves}
+    draws, rows, length = held["query"].shape[:3]
+    def fold(x):
+        # [N, B, S, H, ...] to fla's one varlen row, each draw's heads its own: [1, B S, N H, ...].
+        x = x.movedim(0, 2)
+        return x.reshape(1, rows * length, -1, *x.shape[4:])
+    def unfold(x):
+        return x.reshape(rows, length, draws, -1, *x.shape[3:]).movedim(2, 0)
+    states = held["state"].float().movedim(0, 1)[entering.clamp(min=0)]
+    states = torch.where((entering >= 0)[:, None, None, None, None], states, torch.zeros_like(states))
+    states = states.reshape(len(entering), -1, *states.shape[3:])
+    q, k, v = (fold(held[name]).to(dtype) for name in ("query", "key", "value"))
+    scale = q.shape[-1] ** -0.5
+    torch.cuda.synchronize()
+    staged = time.perf_counter()
+    if form == "gdn":
+        a = held["log_a"].float().exp()[:, None, None, :]
+        g = -a * F.softplus(held["gate"].float() + held["bias"].float()[:, None, None, :])
+        beta = fold(held["beta"].sigmoid()).to(dtype)
+        o, final = chunk_gated_delta_rule(q, k, v, fold(g), beta, scale=scale, initial_state=states,
+                                          output_final_state=True, cu_seqlens=cu_seqlens,
+                                          use_qk_l2norm_in_kernel=True)
+        o = unfold(o)
+    else:
+        decay, beta = fold(held["log_decay"]).float(), fold(held["beta"]).to(dtype)
+        o, final = chunk_kda(q, k, v, decay, beta, scale=scale, initial_state=states, output_final_state=True,
+                             cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True)
+        o, norms = unfold(o), []
+        # fla's gated norm, its weight a draw's own: a launch a draw over the draw's outputs.
+        for draw in range(draws):
+            norm = FusedRMSNormGated(o.shape[-1], eps=float(given["epsilon"]), activation="swish")
+            norms.append(norm.to("cuda"))
+            norms[-1].weight = torch.nn.Parameter(held["weight"][draw].detach().float())
+        o = torch.stack([norm(o[draw].float(), held["z"][draw].float()).to(dtype)
+                         for draw, norm in enumerate(norms)])
+    final = final[last].reshape(rows, draws, -1, *final.shape[2:]).movedim(1, 0)
+    d_out, d_final = (torch.from_numpy(given[name]).to("cuda", torch.float32)
+                      for name in ("d_out", "d_final"))
+    torch.autograd.backward((o.float(), final.float()), (d_out, d_final))
+    if form == "kda":
+        held["weight"].grad = torch.stack([norm.weight.grad for norm in norms])
+    torch.cuda.synchronize()
+    ran = time.perf_counter()
+    found = {"out": o, "final": final, **{f"d_{n}": held[n].grad for n in leaves}}
+    answer = {name: value.detach().float().cpu().numpy() for name, value in found.items()}
+    print(f"K fla {form} {draws} draws: staged {staged - begun:.2f} s, kernels {ran - staged:.2f} s, "
+          f"back {time.perf_counter() - ran:.2f} s", flush=True)
+    return answer
+
+
+if __name__ == "__main__":
+    np.savez(sys.argv[2], **fla_layer(dict(np.load(sys.argv[1])), sys.argv[3], sys.argv[4]))
+'''
+"""fla's own layer, in the interpreter `DEW_FLA_PYTHON` names, over a block of draws run as one call (each
+draw's heads its own heads of one varlen row, a draw's gates and parameters per head): Qwen3.5's gated delta
+net (`gdn`, fla's GatedDeltaNet gates, `-exp(A_log) softplus(a + dt_bias)` and `sigmoid(b)`, into
+`chunk_gated_delta_rule`) or Kimi Linear's (`kda`, `chunk_kda` and fla's gated RMS norm), its queries' and
+keys' l2 norm in the kernel, each leaf in its own dtype and the kernels in the given one; each row's
+documents fla's varlen sequences (`cu_seqlens`), a sequence's memory its row's where it continues the row
+(`entering`), and each row's final memory its last sequence's (`last`)."""
+
+
+def fla_request(form: str, leaves: dict, cotangents: tuple, starts, dtype, *, epsilon: float = 0.0) -> dict:
+    """A request of fla's layer (`FLA_LAYER_SIDE`'s `fla_layer`) on draws stacked on a leading axis, `leaves`
+    its operands by name `[N, B, S, ...]` and `cotangents` of its output and final memory, the kernels in
+    `dtype`: each operand in fp32 beside its own dtype's name, and `starts` `[B, S]` marking the rows'
+    documents (None: one sequence a row), each a varlen sequence, a row's tokens before its first document
+    continuing its memory."""
+    rows, length = next(iter(leaves.values())).shape[1:3]
+    marks = np.zeros((rows, length), bool) if starts is None else np.asarray(starts, bool)
+    cuts, entering, last = [0], [], []
+    for row, begun in enumerate(marks):
+        bounds = sorted({0, *np.flatnonzero(begun).tolist(), length})
+        entering += [-1 if (begin > 0 or begun[0]) else row for begin in bounds[:-1]]
+        cuts += [row * length + end for end in bounds[1:]]
+        last.append(len(cuts) - 2)
+    given = {name: np.asarray(value, np.float32) for name, value in leaves.items()}
+    return given | {
+        "leaves": np.asarray(",".join(leaves)),
+        "dtypes": np.asarray(",".join(jnp.dtype(value.dtype).name for value in leaves.values())),
+        "cu_seqlens": np.asarray(cuts, np.int64), "entering": np.asarray(entering, np.int64),
+        "last": np.asarray(last, np.int64), "d_out": np.asarray(cotangents[0], np.float32),
+        "d_final": np.asarray(cotangents[1], np.float32), "epsilon": np.asarray(epsilon),
+        "form": np.asarray(form), "dtype": np.asarray(jnp.dtype(dtype).name)}
+
+
+def fla_layer_side(form: str, leaves: dict, cotangents: tuple, starts, dtype, *,
+                   epsilon: float = 0.0) -> dict:
+    """fla's layer (`FLA_LAYER_SIDE`) on a request of stacked draws (`fla_request`) in the interpreter
+    `DEW_FLA_PYTHON` names: its outputs and every leaf's gradient by name (`out`, `final`, `d_<leaf>`),
+    each stacked."""
+    python = os.environ.get("DEW_FLA_PYTHON")
+    if not python:
+        pytest.fail("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch: the GPU tier's reference, "
+                    "which a run selecting fla's gate gives it")
+    given = fla_request(form, leaves, cotangents, starts, dtype, epsilon=epsilon)
+    with tempfile.TemporaryDirectory() as root:
+        np.savez(Path(root) / "in.npz", **given)
+        subprocess.run([python, "-c", FLA_LAYER_SIDE, Path(root) / "in.npz", Path(root) / "out.npz", form,
+                        jnp.dtype(dtype).name], check=True)
+        with np.load(Path(root) / "out.npz") as found:
+            return dict(found)
+
+
 def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHUNKED):
     """The decay gradient Kimi's port sums, as fla's `chunk_kda_bwd` decomposes it, a value head at a
     time `[B, T, HV, K]`: within each chunk, each token's parts from the memory and the WY

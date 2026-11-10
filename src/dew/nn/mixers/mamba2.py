@@ -356,9 +356,13 @@ class Mamba2(nn.Module):
 
     def _fused_token(self, taps, bias, dt, valid, starts):
         """A decode token's conv, step and skip in one launch (`linear.fused_token` under `FUSED`): its
-        x, B and C convolved with their bias, the step through softplus with its bias and limit, the
-        decay `exp(A dt)`; the gated norm over its groups after (`_gated`)."""
-        hooks = dataclasses.replace(FUSED, gates=recurrence.Gates(write='step', limit=self.time_step_limit))
+        x, B and C convolved, with their bias where the module has one (`use_conv_bias`), the step through
+        softplus with its bias and limit, the decay `exp(A dt)`; the gated norm over its groups after
+        (`_gated`)."""
+        assert FUSED.conv is not None, "the fused step convolves its token"
+        conv = dataclasses.replace(FUSED.conv, bias=self.use_conv_bias)
+        hooks = dataclasses.replace(FUSED, conv=conv,
+                                    gates=recurrence.Gates(write='step', limit=self.time_step_limit))
         return fused_token(hooks, taps, heads=(self.n_groups, self.n_groups, self.num_heads),
                            widths=(self.state_size, self.state_size, self.head_dim),
                            per_row={'gate': dt[:, 0]},

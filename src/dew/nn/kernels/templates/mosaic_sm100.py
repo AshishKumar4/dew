@@ -390,6 +390,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     chunks (`chunks`, in an epilogue's register layout, `STORED`)."""
 
     name = "tcgen05"
+    loads_past_floor = True
 
     rows = 128  # a product's rows on one CTA (tcgen05's M without a CTA pair)
 
@@ -644,16 +645,17 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 else gathered.Committed(**scoped) for name, scoped in allocated.items()}
 
     def persist_schedule(self, consumers: int, width: int, *, summed: bool = False,
-                         rewrites: bool = False) -> handoffs.Schedule:
+                         rewrites: bool = False, producer: int | None = None) -> handoffs.Schedule:
         """A persistent walk's roles: its `consumers` epilogue warpgroups, a rewriting warpgroup where its
-        steps' slots are rewritten (`persist`'s `prepared`), and the issuing warpgroup's warps; and its
-        accumulator turns (`turns` of `width` columns, `Accumulators`, their running sums past them where
-        exactly `summed`), which the product warp fills and the epilogue gives back."""
+        steps' slots are rewritten (`persist`'s `prepared`), and the issuing warpgroup's warps, lowered to
+        `producer` (`handoffs.Schedule.floor`); and its accumulator turns (`turns` of `width` columns,
+        `Accumulators`, their running sums past them where exactly `summed`), which the product warp fills
+        and the epilogue gives back."""
         rewriting = (handoffs.Role("rewrite", 1),) if rewrites else ()
         roles = (handoffs.Role("epilogue", consumers), *rewriting, *ISSUING)
         return handoffs.Schedule(roles, (handoffs.HandOff(
             "accumulators", Accumulators(self.turns, self.rows, width, self.topology, running=summed), "mma",
-            ("epilogue",)),))
+            ("epilogue",)),), floor=producer)
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
         # Its accumulator turns' barriers, filled and drained (`persist`), each rewritten ring's slots'
@@ -665,7 +667,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
                 unrolled: bool = False, accumulators: tuple = (), summed: int = 0,
-                prepared: Callable | None = None) -> None:
+                prepared: Callable | None = None, producer: int | None = None) -> None:
         """`mosaic.Family.persist`. With `prepared`, `prepared(tile, index, slots)` rewrites each step's slots
         before its products read them (a kernel gradient's neighbouring groups' rows zeroed), run by a role
         of its own past the consumers (`warpgroups`: the launch's consumers one more): it waits for each
@@ -698,7 +700,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         def windows(steps):
             return 1 if not summed else (steps + summed - 1) // summed
 
-        roles = self.persist_schedule(consumers, width, summed=bool(summed), rewrites=prepared is not None)
+        roles = self.persist_schedule(consumers, width, summed=bool(summed), rewrites=prepared is not None,
+                                      producer=producer)
 
         def scoped(*allocated):
             (tensor,) = roles.opened(allocated[:1])
@@ -935,6 +938,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     and tcgen05's products, so interpreted it runs the same."""
 
     name = "tcgen05.chunks"
+    loads_past_floor = True
     # Mosaic GPU's tcgen05 lowering takes no TF32 operand ("Unsupported input element type: tf32",
     # jsf-gate100b): an fp32 product takes bf16 parts.
     takes_fp8 = True

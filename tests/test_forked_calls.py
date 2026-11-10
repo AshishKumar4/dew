@@ -465,23 +465,25 @@ FORKED_ROWS, FORKED_LENGTH = 8, 2048
 
 
 def _summed_gradient(function):
-    """The gradient of `function`'s summed output in every operand."""
-    def gradient(*operands):
-        return jax.grad(lambda *operands: function(*operands).astype(jnp.float32).sum(),
+    """The gradient of `function`'s summed output in every operand but its documents' layout, its first
+    argument, which a run supplies as an operand of the program too: a cost no constant layout
+    specializes."""
+    def gradient(layout, *operands):
+        return jax.grad(lambda *operands: function(layout, *operands).astype(jnp.float32).sum(),
                         argnums=tuple(range(len(operands))))(*operands)
     return gradient
 
 
-def _compiled_cost(function, shapes, counter: str) -> tuple[int, float]:
-    """The temporaries and FLOPs of `function`'s summed gradient (`_summed_gradient`) as `counter` counts
-    them where its count is whole: 'cpu', XLA's cost analysis of the program compiled for this cpu, which
-    counts every operation it runs; a CUDA generation ('sm80'), the program compiled for that GPU with no
-    device (`kernel_compile.lowered_for`), every matrix product and each kernel launch at the work it states
-    (`instrumentation.step_flops`), refused where a launch states none, whose work a count would leave
-    out."""
+def _compiled_cost(function, layout, shapes, counter: str) -> tuple[int, float]:
+    """The temporaries and FLOPs of `function`'s summed gradient (`_summed_gradient`, its documents' `layout`
+    an operand) as `counter` counts them where its count is whole: 'cpu', XLA's cost analysis of the program
+    compiled for this cpu, which counts every operation it runs; a CUDA generation ('sm80'), the program
+    compiled for that GPU with no device (`kernel_compile.lowered_for`), every matrix product and each
+    kernel launch at the work it states (`instrumentation.step_flops`), refused where a launch states none,
+    whose work a count would leave out."""
     gradient = _summed_gradient(function)
     if counter == "cpu":
-        compiled = jax.jit(gradient).lower(*shapes).compile()
+        compiled = jax.jit(gradient).lower(layout, *shapes).compile()
         cost = compiled.cost_analysis()
         flops = float((cost[0] if isinstance(cost, list) else cost)["flops"])
     else:
@@ -489,7 +491,7 @@ def _compiled_cost(function, shapes, counter: str) -> tuple[int, float]:
 
         from dew.telemetry.instrumentation import step_flops
 
-        compiled = lowered_for(gradient, tuple(shapes), counter).compile()
+        compiled = lowered_for(gradient, (layout, *shapes), counter).compile()
         counted = step_flops(compiled)
         assert counted is not None, "a loop of no stated trips: the program's count is its body's"
         assert counted.unsized == 0, (f"{counted.unsized:.0f} launches state no work, which no count may "
@@ -501,8 +503,8 @@ def _compiled_cost(function, shapes, counter: str) -> tuple[int, float]:
 def _recurrence_call(layer: str, length: int, documents: int):
     """`layer`'s chunked recurrence over `FORKED_ROWS` rows of `length` tokens, three documents a row, and
     with `documents` past zero each entering a memory of its own (`Chunk.entered`), two of them the first's
-    (a state and two questions over it): the function, its operands' shapes, its chunk and its memories'
-    elements."""
+    (a state and two questions over it): the function of its layout (`starts`, `entered`) and operands, its
+    layout as the call supplies it, its operands' shapes, its chunk and its memories' elements."""
     from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule
     from dew.nn.mixers.mamba2 import CHUNK_SIZE as SSD_CHUNK, _chunked
 
@@ -511,18 +513,18 @@ def _recurrence_call(layer: str, length: int, documents: int):
 
     starts = np.zeros((FORKED_ROWS, length), bool)
     starts[:, [0, length // 13, length // 2]] = True
-    starts = jnp.asarray(starts)
     entered = None
     if documents:
-        held = np.zeros((FORKED_ROWS, documents), np.int32)
-        held[:, 1:3] = 1
-        entered = jnp.asarray(held)
+        entered = np.zeros((FORKED_ROWS, documents), np.int32)
+        entered[:, 1:3] = 1
+    layout = (jnp.asarray(starts), None if entered is None else jnp.asarray(entered))
     if layer == "gated delta net":
         memory = (3, 8, 8)
         operands = [shaped(length, 1, 8), shaped(length, 1, 8), shaped(length, 3, 8), shaped(length, 3),
                     shaped(length, 3)]
 
-        def call(query, key, value, gate, beta, *state):
+        def call(layout, query, key, value, gate, beta, *state):
+            starts, entered = layout
             return chunk_gated_delta_rule(query, key, value, gate, beta, *state, starts=starts,
                                           max_segments=documents or 3, write_bound=1.0, entered=entered)[0]
         chunk = CHUNK_SIZE
@@ -531,13 +533,14 @@ def _recurrence_call(layer: str, length: int, documents: int):
         operands = [shaped(length, 4, 8), shaped(length, 4), shaped(length, 1, 8), shaped(length, 1, 8)]
         rate, skip = -jnp.ones((4,)), jnp.ones((4,))
 
-        def call(x, dt, keys, queries, *state):
+        def call(layout, x, dt, keys, queries, *state):
+            starts, entered = layout
             return _chunked(x, jax.nn.softplus(dt), rate, keys, queries, skip, state[0] if state else None,
                             SSD_CHUNK, starts=starts, entered=entered)[0]
         chunk = SSD_CHUNK
     if documents:
         operands.append(shaped(documents, *memory))
-    return call, operands, chunk, FORKED_ROWS * documents * math.prod(memory)
+    return call, layout, operands, chunk, FORKED_ROWS * documents * math.prod(memory)
 
 
 @pytest.mark.parametrize("counter", [
@@ -556,12 +559,14 @@ def test_a_forked_recurrence_costs_its_tokens_and_a_chunk_a_document(layer, docu
     memory, its cotangent, its final and that final's cotangent beside it, fp32, an operation an element: a
     decision window's rows at a documents bound of its own windows and at a loose one, nothing scaled by the
     bound times the row (armada, 11-09: 1.04 and 1.28 times the grid's packed row, gated delta net and
-    SSD). Counted where each count is whole (`_compiled_cost`): the portable walk on a cpu, and the routes
-    an A100 and an H100 take, compiled with no device, every launch at the work it states."""
-    call, operands, chunk, memories = _recurrence_call(layer, FORKED_LENGTH, documents)
-    temporaries, flops = _compiled_cost(call, operands, counter)
-    packed = _recurrence_call(layer, FORKED_LENGTH + documents * chunk, 0)
-    bound, work = _compiled_cost(packed[0], packed[1], counter)
+    SSD), its layout an operand of the compiled program as a run supplies it. Counted where each count is
+    whole (`_compiled_cost`): the portable walk on a cpu, and the routes an A100 and an H100 take, compiled
+    with no device, every launch at the work it states."""
+    call, layout, operands, chunk, memories = _recurrence_call(layer, FORKED_LENGTH, documents)
+    temporaries, flops = _compiled_cost(call, layout, operands, counter)
+    packed, packed_layout, packed_operands, _, _ = _recurrence_call(layer, FORKED_LENGTH + documents * chunk,
+                                                                    0)
+    bound, work = _compiled_cost(packed, packed_layout, packed_operands, counter)
     assert temporaries <= 2 * bound + 4 * 4 * memories, (temporaries, bound, flops, work, memories)
     assert flops <= 2 * work + 4 * memories, (temporaries, bound, flops, work, memories)
 
