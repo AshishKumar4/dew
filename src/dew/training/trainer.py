@@ -81,6 +81,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, settable_rates, with_rates
+from dew.registry import Unrecordable
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -757,14 +758,15 @@ class Trainer(Generic[Loss, Effects]):
     def _artifact(self) -> JSON:
         """The objective's inference record, which a checkpoint carries for
         loaders. Training and resuming never read it, so a model or component
-        no record can describe still checkpoints: the record says why, a
-        loader raises that, and the first checkpoint warns it, as it does a
-        model defined where no import path reaches it (`__main__`, a function)."""
+        no record can describe (`dew.registry.Unrecordable`: one defined where no import path reaches it,
+        `__main__` or a function, or holding what no record carries) still checkpoints: the record says
+        why, a loader raises that, and the first checkpoint warns it. Any other error is the record's own
+        bug, and raises."""
         artifact: JSON
         reason = None
         try:
             artifact = self.objective.inference_record()
-        except (KeyError, TypeError, ValueError) as error:
+        except Unrecordable as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}
         if reason is not None and reason != self._unrecorded:

@@ -125,6 +125,12 @@ type Importable = type | types.FunctionType | types.BuiltinFunctionType | types.
 """What a record names by import path: a class, a function, or a classmethod bound to its class."""
 
 
+class Unrecordable(TypeError, ValueError):
+    """What a record cannot describe: a member no import path names, a value or key no record carries, a
+    class whose constructor's parameters it does not keep. Written where the record is, it is a TypeError and
+    a ValueError, as each of these was raised before."""
+
+
 def import_path(member: Importable) -> str:
     """The path a record names a class or function by, `module:Qualified.name`.
 
@@ -134,7 +140,7 @@ def import_path(member: Importable) -> str:
     function = member.__func__ if isinstance(member, types.MethodType) else member
     module, name = function.__module__, function.__qualname__
     if not module or module == "__main__" or "<" in name:
-        raise ValueError(f"{member!r} has no import path a record can name; define it at module level "
+        raise Unrecordable(f"{member!r} has no import path a record can name; define it at module level "
                          f"in an importable module to record it")
     return f"{module}:{name}"
 
@@ -540,7 +546,7 @@ def to_record(value, annotation) -> JSON:
         # constructor's parameters as `_built` builds one; it declares no
         # fields, so its record always names it.
         return {"class": import_path(type(value)), "fields": _constructed(value)}
-    raise TypeError(
+    raise Unrecordable(
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
         f"functions with an import path")
@@ -568,7 +574,7 @@ def _constructed(value: Configured) -> dict[str, JSON]:
     fields = {}
     for name, (_, owner) in named.items():
         if not hasattr(value, name):
-            raise TypeError(f"{cls.__name__} keeps no attribute {name!r} for its constructor parameter, "
+            raise Unrecordable(f"{cls.__name__} keeps no attribute {name!r} for its constructor parameter, "
                             f"so a record cannot rebuild it")
         fields[name] = to_record(getattr(value, name), parameter_type(owner, name))
     return fields
@@ -589,7 +595,7 @@ def _record_key(key: object, declared: Annotation) -> str:
     elif isinstance(key, (str, int, float)):
         written = str(key)
     else:
-        raise TypeError(
+        raise Unrecordable(
             f"{key!r} is not a key a run record can carry; a config mapping is keyed "
             f"by a name, a number, or a tree path of them")
     try:
@@ -597,7 +603,7 @@ def _record_key(key: object, declared: Annotation) -> str:
     except ValueError:
         back = written
     if not _same_key(back, key):
-        raise ValueError(f"the key {key!r} would read back as {back!r} under the mapping's key type "
+        raise Unrecordable(f"the key {key!r} would read back as {back!r} under the mapping's key type "
                          f"{declared}; declare the key type, or key it by a name")
     return written
 
