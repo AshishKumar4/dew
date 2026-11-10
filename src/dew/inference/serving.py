@@ -1221,12 +1221,14 @@ class Server:
             [tuple(pair) for held in booked for pair in held[name]]
             for name in ("copies", "spills", "uploads", "state_spills", "state_uploads"))
         with self._context():
-            if finished:
-                # A finished row's state first, before a spill reads its entry or a restore seats it.
+            # A finished row's state first, before a spill reads its entry or a restore seats it: an
+            # admission's width of them a call, the capture's one program.
+            for start in range(0, len(finished), self.admission):
                 self._states = self._captured(self._states, self._resident, self._carried,
-                                              *_padded(finished, self.slots, 1))
-                self._finished = []
-                self._holding.clear()
+                                              *_padded(finished[start:start + self.admission],
+                                                       self.admission, 1))
+            self._finished = []
+            self._holding.clear()
             # Spills read reclaimed pages before anything writes them (a copy's fresh page may be one), and
             # a copy reads its segment's page after an upload lands it there.
             self._transferred(spills, uploads)

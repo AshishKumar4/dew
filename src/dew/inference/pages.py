@@ -199,12 +199,14 @@ class States:
         return entry
 
     def _vacated(self, transient: bool = False) -> int:
-        """A free entry, or the least recently used one not kept (a history's alone, for a `transient`
-        state), its state out to a host slot where one can take it (`spills`) unless it is a history's."""
+        """A free entry, or the least recently used one not kept, a history's first (a history's alone, for
+        a `transient` state), its state out to a host slot where one can take it (`spills`) unless it is a
+        history's."""
         if self._free:
             return self._free.popleft()
-        digest = next(held for held, entry in self._by_hash.items()
-                      if entry not in self._pinned and (not transient or entry in self._transient))
+        unkept = [(held, entry) for held, entry in self._by_hash.items() if entry not in self._pinned]
+        histories = [held for held, entry in unkept if entry in self._transient]
+        digest = histories[0] if histories else next(held for held, _ in unkept if not transient)
         entry = self._by_hash.pop(digest)
         if entry in self._transient:
             self._transient.discard(entry)
