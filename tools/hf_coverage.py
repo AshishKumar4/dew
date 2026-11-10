@@ -113,12 +113,12 @@ def _once[T](store: dict, key: tuple[str, str], compute: Callable[[], T]) -> T:
 
 def _route(config: dict, verified, admitted, qualified) -> tuple[str, str]:
     """The census route of `config`: the loader's own decision on the config alone
-    (`dew.interop.pretrained.source_route`), and for a refusal, the refusal's own words. `verified`
+    (`dew.interop.routes.source_route`), and for a refusal, the refusal's own words. `verified`
     checks an unregistered model_type against transformers, `admitted` decides whether tier 3 runs one
     it leaves unmapped, and `qualified` whether it runs one whose probe cannot run, each once per
     distinct config (`classify`)."""
     from dew.interop import decoder_parts
-    from dew.interop.pretrained import (
+    from dew.interop.routes import (
         DecoderRoute,
         DiffusionGemmaRoute,
         TorchRoute,

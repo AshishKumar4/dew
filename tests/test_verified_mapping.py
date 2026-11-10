@@ -294,7 +294,7 @@ def test_a_deep_release_verifies_at_its_probes_cut_depth_as_at_its_own():
     (`verify.logits_mapped`), which a computation of the same function meets at any depth and width,
     where a fixed rounding per layer measured on narrow fixtures refused it at two layers. The load's
     route reads it so (`source_route`), before any weight downloads."""
-    from dew.interop.pretrained import VerifiedRoute, source_route
+    from dew.interop.routes import VerifiedRoute, source_route
 
     route = source_route(SEED_OSS)
     assert isinstance(route, VerifiedRoute) and route.verified.family == "qwen2"

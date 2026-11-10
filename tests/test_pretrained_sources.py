@@ -217,7 +217,7 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     computes is verified against transformers (tier 2), an unregistered causal LM none computes runs
     as transformers' own forward (tier 3), and one transformers has no class for is refused, as are a
     storage format the codecs cannot decode and a family's refusal."""
-    from dew.interop.pretrained import (
+    from dew.interop.routes import (
         DecoderRoute,
         DiffusionGemmaRoute,
         TorchRoute,
@@ -258,7 +258,7 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     BERT decoder of 8 positions runs, causal by its program, and a BERT encoder of 8 is refused, its
     attention reading later keys."""
     from dew.interop import decoder_parts, verify
-    from dew.interop.pretrained import TorchRoute, source_route
+    from dew.interop.routes import TorchRoute, source_route
 
     assert isinstance(source_route(tiny_config("bert", is_decoder=True).to_dict()), TorchRoute)
     dynamic = {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}
@@ -292,7 +292,7 @@ def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for
     class declares no attention backend, and run on Dew's (a StableLM norming each head's queries and keys
     by a layer norm of its own, which tier 2 does not assemble); GPT-NeoX Japanese's compute their own,
     and keep it, saying why."""
-    from dew.interop.pretrained import source_route
+    from dew.interop.routes import source_route
 
     stablelm = source_route(tiny_config("stablelm", qk_layernorm=True).to_dict()).admitted
     assert stablelm.attends and not stablelm.why
