@@ -191,15 +191,20 @@ def vectorized(a: jax.Array, b: jax.Array) -> jax.Array:
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share():
+@pytest.mark.parametrize(("rows_shape", "matrix_shape"), [((12, 4), (4, 3)), ((4, 3, 4), (4, 2, 3))],
+                         ids=["rows", "batched-rows-headed-columns"])
+def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share(rows_shape, matrix_shape):
     """A projection's pairwise product (`pairwise_dot_general`) on a mesh whose Explicit data axis splits its
-    rows over two devices: its value and both gradients, the matrix's contracting the split rows a device's
-    share at a time (`_summed`), each the dot's own where every sum is exact (small integers) and placed as
-    XLA's product and gradients place them, each share summed in two-row blocks."""
+    rows over two devices, the rows a matrix or a batch of sequences, the columns flat or a head's (a
+    `DenseGeneral`'s, whose result a reshape splits off the split rows, row 5422): its value and both
+    gradients, the matrix's contracting the split rows a device's share at a time (`_summed`), each the
+    dot's own where every sum is exact (small integers) and placed as XLA's product and gradients place
+    them, each share summed in two-row blocks."""
     rng = np.random.default_rng(4863)
     rows, matrix = (jnp.asarray(rng.integers(-3, 4, size=shape), jnp.float32)
-                    for shape in ((12, 4), (4, 3)))
-    product = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=(((1,), (0,)), ((), ())))
+                    for shape in (rows_shape, matrix_shape))
+    numbers = (((len(rows_shape) - 1,), (0,)), ((), ()))
+    product = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=numbers)
 
     def gradients(product, rows, matrix):
         value, pull = jax.vjp(product, rows, matrix)
@@ -211,10 +216,47 @@ def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share():
         patched.setattr(pairwise, "contraction_block", lambda depth, lanes=None: min(depth, 2))
         split = jax.device_put(rows, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
         summed = jax.jit(functools.partial(gradients, product))(split, matrix)
-        plain = jax.jit(functools.partial(gradients, jnp.matmul))(split, matrix)
+        plain = jax.jit(functools.partial(gradients, functools.partial(
+            jax.lax.dot_general, dimension_numbers=numbers)))(split, matrix)
     for got, want in zip(summed, plain, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
         assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_headed_projection_on_an_explicit_data_split_trains_in_a_users_process(monkeypatch):
+    """A `DenseGeneral` projection into heads (an attention block's, `projected_heads`) of a batch of
+    sequences an Explicit data axis splits, in a process as a user's runs, without the suite's wide CPU
+    arithmetic (`WIDE_CPU_ARITHMETIC`), so a CPU sums it pairwise (`pairwise_dot_general`; row 5422: a
+    reshape of its result splitting the split rows raised ShardingTypeError): its value and the inputs' and
+    kernel's gradients those of the plain contraction, every sum exact (small integers), each placed as
+    that one's."""
+    from dew.nn.dense import DenseGeneral
+
+    monkeypatch.delenv(precision.WIDE_CPU_ARITHMETIC, raising=False)
+    rng = np.random.default_rng(5422)
+    inputs = jnp.asarray(rng.integers(-3, 4, size=(4, 3, 4)), jnp.float32)
+    layer = DenseGeneral((2, 3), use_bias=False)
+    kernel = jnp.asarray(rng.integers(-3, 4, size=(4, 2, 3)), jnp.float32)
+
+    def projected(kernel, inputs):
+        return layer.apply({"params": {"kernel": kernel}}, inputs)
+
+    def plain(kernel, inputs):
+        return jnp.einsum("btd,dhk->bthk", inputs, kernel)
+
+    def gradients(product, kernel, inputs):
+        value, pull = jax.vjp(product, kernel, inputs)
+        return value, *pull(jnp.round(4 * jnp.cos(value)))
+
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        split = jax.device_put(inputs, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+        summed = jax.jit(functools.partial(gradients, projected))(kernel, split)
+        want = jax.jit(functools.partial(gradients, plain))(kernel, split)
+    for got, wanted in zip(summed, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+        assert jax.typeof(got).sharding.spec == jax.typeof(wanted).sharding.spec
 
 
 @pytest.mark.parametrize("depth", [96, 1024])
