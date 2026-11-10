@@ -342,10 +342,6 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         del scratch, interpret
         return value.sum(axis=0)
 
-    def held(self, ref):
-        # A resident operand stays in shared memory between products, not beside every loop carry.
-        return ref
-
     def _left(self, lhs):
         """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's (an
         accumulator's) cast, in registers where each warp holds whole rows of it or no relay tile is bound,
