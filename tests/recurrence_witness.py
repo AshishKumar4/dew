@@ -29,7 +29,7 @@ scan, `recurrence_algebra.prefix`), then the kernel's own roundings of its diffe
 import dataclasses
 import functools
 import math
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import numpy as np
 from certified import allowance
@@ -540,7 +540,7 @@ class Run:
     """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
     pairing: int
     """The parts a factored pair's fp32 operand takes (`Lane.pairing`, `mainloop.pairing_parts`)."""
-    tf32: str
+    tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
 
