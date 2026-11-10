@@ -135,14 +135,15 @@ class Drained:
         self.lines: list[str] = []
         self.closed = False
         """Whether its output has closed: every process holding it has ended."""
-        self._process = process
+        # Its command alone, for a timeout's error: the map that holds it is weakly keyed by the process.
+        self._command = process.args
         self._written = threading.Condition()
-        self._reader = threading.Thread(target=self._read, args=(sink,), daemon=True)
+        self._reader = threading.Thread(target=self._read, args=(process, sink), daemon=True)
         self._reader.start()
 
-    def _read(self, sink: Callable[[str], None] | None) -> None:
+    def _read(self, process: subprocess.Popen[str], sink: Callable[[str], None] | None) -> None:
         try:
-            for line in self._process.stdout or ():
+            for line in process.stdout or ():
                 with self._written:
                     self.lines.append(line)
                     self._written.notify_all()
@@ -169,7 +170,7 @@ class Drained:
         `Popen.communicate` raises it."""
         with self._written:
             if not self._written.wait_for(lambda: self.closed, timeout):
-                raise subprocess.TimeoutExpired(self._process.args, timeout or 0.0, "".join(self.lines))
+                raise subprocess.TimeoutExpired(self._command, timeout or 0.0, "".join(self.lines))
             return "".join(self.lines)
 
 
