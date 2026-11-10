@@ -227,13 +227,17 @@ def draw(state: StepState, logits: jax.Array,
     """One categorical draw per row, with its behaviour and raw likelihood.
 
     The raw log probabilities come from the model's own distribution, before
-    any transform; the behaviour ones from the distribution that actually
-    draws, after the whole chain. A model distribution that is itself
+    any transform, at its logits' width (float32 at least, a float64 truth's
+    float64); the behaviour ones from the distribution that actually draws,
+    after the whole chain, which draws in float32 in every mode, as Dew's
+    dropout does (`dew.nn.dropout.kept`), so a wider run draws the tokens a
+    float32 run of its logits draws. A model distribution that is itself
     undefined cannot be reported truthfully, so an active row with one raises
     rather than returning a NaN, whatever a later repair does to the scores.
     """
+    model = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
     raw = logits.astype(jnp.float32)
-    checkify.check(jnp.all(wellformed(raw) | ~state.active),
+    checkify.check(jnp.all(wellformed(model) | ~state.active),
                    "the model produced an active row without a distribution to score")
     if isinstance(transform, decoding.LogitsChain) and transform.greedy:
         scores = decoding.chain(transform.transforms[:-1])(state, raw)
@@ -246,7 +250,7 @@ def draw(state: StepState, logits: jax.Array,
         keys = jax.vmap(jax.random.fold_in)(state.keys, state.step)
         token = select(keys, scores, state.active)
         behavior = categorical.token_log_probs(scores, token)
-    selected = categorical.token_log_probs(raw, token)
+    selected = categorical.token_log_probs(model, token)
     return token, behavior, selected
 
 
