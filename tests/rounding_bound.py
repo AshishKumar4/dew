@@ -32,36 +32,52 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import unrewritten
 from float64_terms import SUMS, _static, _target, evaluated_on, walked
+from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
+from dew.nn import programs
 from dew.nn.precision import compensated_add
 
-EXACT = frozenset({
-    "neg", "abs", "max", "min", "select_n", "reshape", "broadcast_in_dim", "transpose", "squeeze",
-    "expand_dims", "slice", "dynamic_slice", "dynamic_update_slice", "concatenate", "pad", "gather",
-    "copy", "copy_p", "rev", "iota", "sign", "floor", "ceil", "round", "reduce_max", "reduce_min",
-    "argmax", "argmin", "eq", "ne", "lt", "le", "gt", "ge", "and", "or", "not", "xor", "clamp",
-    "is_finite", "stop_gradient", "optimization_barrier", "cummax", "cummin", "sort",
-    "shift_left", "shift_right_logical", "shift_right_arithmetic", "population_count", "rem",
-    "name", "pjit_name", "nextafter", "random_bits", "random_seed", "random_wrap", "random_unwrap",
-    "threefry2x32", "split", "scatter", "stack", "unstack", "bitcast_convert_type", "device_put",
-    "sharding_constraint", "mesh_cast", "pvary", "reshard", "tie_in", "reduce_and", "reduce_or",
-    "select_and_gather_add_exact", "empty2", "all_gather", "all_gather_invariant", "all_to_all", "ppermute",
-    "pbroadcast", "axis_index"})
-"""Operations whose float results are their operands' values moved or selected, or exact: no rounding.
-An integer result rounds nothing either, nor does an array made to be written over (`empty2`); a collective
-that moves blocks between devices (a gather, an all-to-all, a permutation) is a move too."""
+EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, jax.lax.select_n_p,
+    jax.lax.copy_p, jax.lax.iota_p, jax.lax.sign_p, jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p,
+    jax.lax.reduce_max_p, jax.lax.reduce_min_p, jax.lax.argmax_p, jax.lax.argmin_p, jax.lax.eq_p,
+    jax.lax.ne_p, jax.lax.lt_p, jax.lax.le_p, jax.lax.gt_p, jax.lax.ge_p, jax.lax.and_p, jax.lax.or_p,
+    jax.lax.not_p, jax.lax.xor_p, jax.lax.clamp_p, jax.lax.is_finite_p, jax.lax.stop_gradient_p,
+    jax.lax.optimization_barrier_p, jax.lax.cummax_p, jax.lax.cummin_p, jax.lax.sort_p, jax.lax.shift_left_p,
+    jax.lax.shift_right_logical_p, jax.lax.shift_right_arithmetic_p, jax.lax.population_count_p,
+    jax.lax.rem_p, primitives.name_p, jax.lax.nextafter_p, primitives.random_bits_p, primitives.random_seed_p,
+    primitives.random_wrap_p, primitives.random_unwrap_p, primitives.threefry2x32_p, jax.lax.scatter_p,
+    jax.lax.stack_p, jax.lax.unstack_p, jax.lax.bitcast_convert_type_p, jax.lax.device_put_p,
+    jax.lax.sharding_constraint_p, primitives.pvary_p, primitives.reshard_p, jax.lax.reduce_and_p,
+    jax.lax.reduce_or_p, primitives.empty2_p, jax.lax.all_gather_p, primitives.all_gather_invariant_p,
+    jax.lax.all_to_all_p, jax.lax.ppermute_p, primitives.pbroadcast_p, jax.lax.axis_index_p})
+"""Operations whose float results are their operands' values selected, or exact: no rounding. An operation
+that only moves entries is exact too (`dew.nn.programs.rearranges`, read beside these, `_exact`). An integer
+result rounds nothing either, nor does an array made to be written over (`empty2`); a collective that moves
+blocks between devices (a gather, an all-to-all, a permutation) is a move too."""
 
-COLLECTED = {"psum": "axes", "psum_invariant": "axes", "reduce_scatter": "axis_name"}
+
+def _exact(primitive) -> bool:
+    """Whether `primitive` rounds nothing: a move of entries, or one of `EXACT`."""
+    return programs.rearranges(primitive) or primitive in EXACT
+
+
+COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
+             primitives.reduce_scatter_p: "axis_name"}
 """The collectives that sum over devices, by the parameter naming their axes: sums of terms, one a device of
 those axes, bounded as any sum is (`_weight`)."""
 
-ONCE = frozenset({"add", "add_any", "sub", "mul", "div", "sqrt", "square", "reduce_precision"})
+ONCE = frozenset({jax.lax.add_p, primitives.add_jaxvals_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p,
+                  jax.lax.sqrt_p, jax.lax.square_p, jax.lax.reduce_precision_p})
 """IEEE 754's correctly rounded operations: one rounding, at most u times the result."""
 
-SCATTERS = {"scatter": jax.lax.scatter, "scatter-add": jax.lax.scatter_add,
-            "scatter-mul": jax.lax.scatter_mul, "scatter-min": jax.lax.scatter_min,
-            "scatter-max": jax.lax.scatter_max}
+FUNCTIONS = {getattr(jax.lax, f"{name}_p"): bound for name, bound in ULPS.items()}
+"""Each elementary function's error bound (`ULPS`, by the function's name in JAX and torch alike), by JAX's
+primitive of that name."""
+
+SCATTERS = {jax.lax.scatter_p: jax.lax.scatter, jax.lax.scatter_add_p: jax.lax.scatter_add,
+            jax.lax.scatter_mul_p: jax.lax.scatter_mul, jax.lax.scatter_min_p: jax.lax.scatter_min,
+            jax.lax.scatter_max_p: jax.lax.scatter_max}
 """The scatters by primitive, each of whose equations holds its combining computation in its operands' dtype,
 which a float64 evaluation of a float32 program builds again (`TapRule.primitive`)."""
 
@@ -90,7 +106,7 @@ class TapRule:
         return _wide(dtype)
 
     def primitive(self, equation, inputs: list) -> list:
-        name, params = equation.primitive.name, dict(equation.params)
+        primitive, params = equation.primitive, dict(equation.params)
         for key in ("new_dtype", "preferred_element_type", "dtype"):
             if key in params:
                 params[key] = _wide(params[key])
@@ -99,8 +115,9 @@ class TapRule:
             params["precision"] = jax.lax.DotAlgorithmPreset.F64_F64_F64
         operands = [_widened(value) for value in inputs]
         # A reduce_precision's float64 evaluation keeps its value, the rounding it is weighed.
-        outputs = list(operands) if name == "reduce_precision" else _bound(equation, params, operands)
-        if name in EXACT:
+        rounded_to = primitive is jax.lax.reduce_precision_p
+        outputs = list(operands) if rounded_to else _bound(equation, params, operands)
+        if _exact(primitive):
             return outputs
         tapped = []
         for index, (var, value) in enumerate(zip(equation.outvars, outputs, strict=True)):
@@ -108,11 +125,11 @@ class TapRule:
             if not jnp.issubdtype(dtype, jnp.floating):
                 tapped.append(value)
                 continue
-            weight = _weight(equation, name, params, operands, value)
+            weight = _weight(equation, params, operands, value)
             if weight is None:
                 tapped.append(value)
                 continue
-            unit = _unit(name, params, dtype)
+            unit = _unit(primitive, params, dtype)
             tap = _mixed(self.key ^ (_GOLDEN * jnp.asarray(index + 1, jnp.uint64)))
             draw = _signs(tap, jnp.shape(value))
             # An infinite result (a masked logit's -inf carried on) is exact: nothing rounds it, and its
@@ -217,31 +234,32 @@ def _wide(dtype):
     return jnp.float64 if dtype is not None and jnp.issubdtype(dtype, jnp.floating) else dtype
 
 
-def _weight(equation, name, params, operands, value):
+def _weight(equation, params, operands, value):
     """The most one rounding at `equation` moves its float64 result `value` (module docstring), in units of
-    its format's u; None where it rounds nothing."""
-    magnitude = jnp.abs(value)
-    if name == "convert_element_type":
+    its format's u; None where it rounds nothing. An operation with no rule is refused by name."""
+    primitive, magnitude = equation.primitive, jnp.abs(value)
+    if primitive is jax.lax.convert_element_type_p:
         return _converted(equation, operands[0], magnitude)
-    if name in ONCE:
+    if primitive in ONCE:
         return magnitude
-    if name in ULPS:
-        return ULPS[name] * magnitude
-    if name == "integer_pow":
+    if primitive in FUNCTIONS:
+        return FUNCTIONS[primitive] * magnitude
+    if primitive is jax.lax.integer_pow_p:
         return max(abs(int(params["y"])) - 1, 1) * magnitude
-    if name == "reduce" and params["computation"] is compensated_add:
+    if primitive is jax.lax.reduce_p and params["computation"] is compensated_add:
         # Dew's compensated sum (`dew.nn.precision.compensated_sum`): a double-float pair's sum, its error
         # at most u |sum| + gamma_{n-1}^2 sum |x| (Ogita, Rump and Oishi, Sum2), in units of u; each of
         # the pair's halves by it, as the high half's rounding moves the low half by as much.
         terms = int(np.prod([equation.invars[0].aval.shape[axis] for axis in params["dimensions"]]))
-        u = _unit(name, params, equation.outvars[0].aval.dtype)
+        u = _unit(primitive, params, equation.outvars[0].aval.dtype)
         gamma = (terms - 1) * u / (1 - (terms - 1) * u)
         pair = operands[:len(operands) // 2]
         total = jnp.abs(sum(jnp.sum(operand, params["dimensions"]) for operand in pair))
         spread = sum(jnp.sum(jnp.abs(operand), params["dimensions"]) for operand in pair)
         return total + gamma * gamma / u * spread
-    if (name == "reduce" and isinstance(started := equation.invars[len(equation.invars) // 2],
-                                        jax.extend.core.Literal) and started.val == -np.inf):
+    if (primitive is jax.lax.reduce_p
+            and isinstance(started := equation.invars[len(equation.invars) // 2], jax.extend.core.Literal)
+            and started.val == -np.inf):
         # A running logsumexp (`dew.objectives.lm.chunked`'s, its maximum started at -inf), in float64
         # under Dew's wide CPU arithmetic (`dew.nn.precision.widened_reduction`) and float32 elsewhere:
         # each combine rescales a running sum by exp(a - larger), the difference rounding at most u
@@ -256,28 +274,28 @@ def _weight(equation, name, params, operands, value):
         lowest = jnp.min(jnp.where(finite, logits, jnp.inf), params["dimensions"])
         spread = jnp.where(jnp.any(finite, params["dimensions"]), highest - lowest, 0.0)
         return max(terms - 1, 1) * (2 + ULPS["exp"] + spread) * magnitude
-    if name == "one_minus_square":
+    if primitive is primitives.one_minus_square_p:
         # The square rounds by its magnitude, which the difference carries, and the difference by its own.
         return jnp.square(operands[0]) + magnitude
-    if name not in SUMS and name not in COLLECTED:
-        raise ValueError(f"the rounding scale has no rule for {name}: add it to EXACT, ONCE, ULPS, COLLECTED "
-                         "or float64_terms.SUMS")
+    if primitive not in SUMS and primitive not in COLLECTED:
+        raise ValueError(f"the rounding scale has no rule for {primitive.name}: give it one in EXACT, ONCE, "
+                         "ULPS, COLLECTED or float64_terms.SUMS")
     (terms,) = _bound(equation, params, [jnp.abs(operand) for operand in operands])
-    return _terms_count(equation, name, params) * terms
+    return _terms_count(equation, params) * terms
 
 
 def _bound(equation, params, operands) -> list:
     """`equation`'s primitive applied to `operands`, widened past its program's dtypes, with `params`: a
     scatter's combining computation, traced for its program's dtype, built again for theirs (`SCATTERS`)."""
-    name = equation.primitive.name
-    if name == "reduce":
+    primitive = equation.primitive
+    if primitive is jax.lax.reduce_p:
         # Its combining computation, traced for its program's dtypes, is called again on theirs.
         count = len(operands) // 2
         return list(jax.lax.reduce(tuple(operands[:count]), tuple(operands[count:]), params["computation"],
                                    params["dimensions"]))
-    if name in SCATTERS:
+    if primitive in SCATTERS:
         operand, indices, updates = operands
-        return [SCATTERS[name](operand, indices, updates, params["dimension_numbers"],
+        return [SCATTERS[primitive](operand, indices, updates, params["dimension_numbers"],
                                indices_are_sorted=params["indices_are_sorted"],
                                unique_indices=params["unique_indices"], mode=params["mode"])]
     outputs = equation.primitive.bind(*operands, **equation.primitive.get_bind_params(params))
@@ -300,41 +318,41 @@ def _converted(equation, operand, magnitude):
     return jnp.where(jnp.abs(jnp.asarray(operand, jnp.float64)) >= exact, magnitude, 0)
 
 
-def _unit(name: str, params, dtype) -> float:
+def _unit(primitive, params, dtype) -> float:
     """The unit roundoff of the format an equation rounds its result `dtype` to: a reduce_precision's
     stated significand (`mantissa_bits`), else its result's own (`jnp.finfo`), the format it is stored in
     being the one it rounds to."""
-    if name == "reduce_precision":
+    if primitive is jax.lax.reduce_precision_p:
         return 2.0 ** -(int(params["mantissa_bits"]) + 1)
     return float(jnp.finfo(dtype).eps) / 2
 
 
-def _terms_count(equation, name, params) -> int:
+def _terms_count(equation, params) -> int:
     """How many terms each element of a sum `equation` adds (`float64_terms.SUMS`, `COLLECTED`), its rounding
     weight's factor: an inner product's contraction length, a reduction's `m - 1`, a convolution's window
     times its input features a group, a scatter's updates an element at most, a device sum's devices less
     one."""
-    shape = equation.invars[0].aval.shape
-    if name == "dot_general":
+    primitive, shape = equation.primitive, equation.invars[0].aval.shape
+    if primitive is jax.lax.dot_general_p:
         (contracting, _), _ = params["dimension_numbers"]
         return int(np.prod([shape[axis] for axis in contracting]))
-    if name == "ragged_dot_general":
+    if primitive is primitives.ragged_dot_general_p:
         (contracting, _), _ = params["ragged_dot_dimension_numbers"].dot_dimension_numbers
         return int(np.prod([shape[axis] for axis in contracting]))
-    if name == "conv_general_dilated":
+    if primitive is jax.lax.conv_general_dilated_p:
         kernel = equation.invars[1].aval.shape
         numbers = params["dimension_numbers"]
         features = kernel[numbers.rhs_spec[1]]
         return int(features * np.prod([kernel[axis] for axis in numbers.rhs_spec[2:]]))
-    if name == "reduce_sum":
+    if primitive is jax.lax.reduce_sum_p:
         return max(int(np.prod([shape[axis] for axis in params["axes"]])) - 1, 1)
-    if name == "scatter-add":
+    if primitive is jax.lax.scatter_add_p:
         numbers = params["dimension_numbers"]
         updates = equation.invars[2].aval.shape
         return int(np.prod([size for axis, size in enumerate(updates)
                             if axis not in numbers.update_window_dims]))
-    if name in COLLECTED:
-        axes = params[COLLECTED[name]]
+    if primitive in COLLECTED:
+        axes = params[COLLECTED[primitive]]
         named = [axis for axis in (axes if isinstance(axes, tuple | list) else (axes,))
                  if isinstance(axis, str)]
         return max(int(np.prod([jax.lax.axis_size(axis) for axis in named])) - 1, 1)

@@ -92,6 +92,7 @@ from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, re
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
 from dew._accuracy import distance, reduction_bound, within
+from dew.nn import programs
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -538,7 +539,7 @@ def equations(graph, *, platform: str | None = None):
                 continue
             taken = next(index for index, platforms in enumerate(chosen)
                          if platforms is None or platform in platforms)
-            yield from equations(equation.params["branches"][taken], platform=platform)
+            yield from equations(programs.branches(equation)[taken], platform=platform)
     elif hasattr(graph, "jaxpr"):
         yield from equations(graph.jaxpr, platform=platform)
     elif isinstance(graph, dict):
@@ -562,7 +563,8 @@ def dot_precisions(function, *arguments) -> list:
         return [(equation.params["precision"],
                  jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
                  tuple(variable.aval.shape for variable in equation.invars))
-                for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
+                for equation in equations(graph, platform="cuda")
+                if equation.primitive is jax.lax.dot_general_p]
 
 
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
@@ -1754,16 +1756,16 @@ def chain_roundings(closed_jaxpr) -> int:
     visits each operation at most once, so no chain makes more."""
 
     def length(equation) -> int:
-        name, params = equation.primitive.name, equation.params
+        primitive, params = equation.primitive, equation.params
         shape = equation.invars[0].aval.shape if equation.invars else ()
-        if name == "dot_general":
+        if primitive is jax.lax.dot_general_p:
             (contracting, _), _ = params["dimension_numbers"]
             return int(np.prod([shape[axis] for axis in contracting], dtype=np.int64))
-        if name == "conv_general_dilated":
+        if primitive is jax.lax.conv_general_dilated_p:
             kernel = equation.invars[1].aval.shape
             spec = params["dimension_numbers"].rhs_spec
             return int(np.prod([kernel[axis] for axis in spec[1:]], dtype=np.int64))
-        if name.startswith(("reduce_", "argmax", "argmin", "cum")) and "axes" in params:
+        if programs.reduction(primitive):
             return int(np.prod([shape[axis] for axis in params["axes"]], dtype=np.int64))
         return 1
 
@@ -1771,12 +1773,8 @@ def chain_roundings(closed_jaxpr) -> int:
         total = 0
         for equation in jaxpr.eqns:
             total += times * length(equation)
-            steps = equation.params.get("length", 1) if equation.primitive.name == "scan" else 1
-            for value in equation.params.values():
-                for inner in value if isinstance(value, (tuple, list)) else (value,):
-                    body = getattr(inner, "jaxpr", inner)
-                    if hasattr(body, "eqns"):
-                        total += walk(body, times * steps)
+            steps = equation.params["length"] if equation.primitive is jax.lax.scan_p else 1
+            total += sum(walk(body, times * steps) for body in programs.bodies(equation))
         return total
 
     return walk(closed_jaxpr.jaxpr, 1)
