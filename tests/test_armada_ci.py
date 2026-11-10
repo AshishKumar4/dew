@@ -553,6 +553,9 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert ci.coverage_report.report(tmp_path / "runs") == 1
     [interrupted] = json.loads((tmp_path / "runs/2/rows.json").read_text())["rows"]
     assert (interrupted["kind"], interrupted["failed"]) == ("deadline", [])
+    # Its stall's record among this task's own artifacts (`stalls.kept`), never an enclosing task's.
+    [kept] = interrupted["artifacts"]
+    assert (tmp_path / "artifacts" / kept).is_file()
 
 
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
