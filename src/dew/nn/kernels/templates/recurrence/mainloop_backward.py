@@ -1006,7 +1006,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
         streamed = family.copies_vectors and group == 1
         if streamed:
             views |= vector_views(n, first, **vectors)
-        summing, accumulated = (staging, None) if group == 1 else (staging[:-1], staging[-1])
+        summing, accumulated = (staging, None) if group == 1 else (staging[:-2], staging[-2:])
 
         def step(index, slots, carry, accumulators, loaded=None):
             h = first + index
@@ -1029,15 +1029,20 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
             if accumulated is None:
                 grads.store(ds_ref, ds, row, chunk, h * chunk, chunk, family=family, smem=landing["square"])
             else:
-                # The key head's sum so far, in shared memory from step to step, zero at its first.
-                total = accumulated
+                # Keep the group's head-sum roundings, as mamba_ssd's dCB does (row 2066).
+                # Near-zero decays leave a token's own ds dominant; its 64 heads can cancel to
+                # 4e-4 from terms of order 100 (seed 117), so a plain sum loses a quarter of dq/dk.
+                total, correction = accumulated
 
                 @pl.when(index == 0)
                 def _():
                     total[...] = jnp.zeros(total.shape, jnp.float32)
+                    correction[...] = jnp.zeros(correction.shape, jnp.float32)
 
-                ds = family.tile_of(total) + ds
+                ds, tail = algebra.compensated_add(
+                    (family.tile_of(total), family.tile_of(correction)), (ds, jnp.zeros_like(ds)))
                 total[...] = ds
+                correction[...] = tail
 
                 @pl.when(index == group - 1)
                 def _():
@@ -1062,15 +1067,20 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
     # the pairs' sum's product: three fp32 tiles at once, the decays taken before the scores' product and
     # each block sum into one accumulator (`algebra.scores_gradient`; an accumulator a block, four, and an
-    # H100's need was 232 in a bf16 call, 192 in one, back-need-one-32 at 9482e4d26). A key head's sum read
-    # back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the remainder each
+    # H100's need was 232 in a bf16 call, 192 in one, back-need-one-32 at 9482e4d26). Where the scores'
+    # gradient leaves in parts (an fp32 call's), the remainder each
     # part after the first is formed from (`product.formed`): without it the model stated 232 registers
     # where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
-    held_tiles = Held(phases=([f32(chunk, chunk)] * (3 + (group > 1) + (grads.parts > 1))
-                              + held_tile(grads, chunk, chunk)
-                              + masks(chunk, chunk)
-                              + fragments(call, (given, chunk, call.block), (given, chunk, call.block)),))
-    summing = summing_staging(call) + ((plgpu.SMEM((chunk, chunk), jnp.float32),) if group > 1 else ())
+    phases = ([f32(chunk, chunk)] * (3 + (grads.parts > 1))
+              + held_tile(grads, chunk, chunk)
+              + masks(chunk, chunk)
+              + fragments(call, (given, chunk, call.block), (given, chunk, call.block)),)
+    if group > 1:
+        # After the pair reduction, no scores, masks or operand fragments remain: the incoming ds,
+        # the running pair and TwoSum's temporaries peak at six fp32 tiles.
+        phases += ([f32(chunk, chunk)] * 6,)
+    held_tiles = Held(phases=phases)
+    summing = summing_staging(call) + ((plgpu.SMEM((chunk, chunk), jnp.float32),) * 2 if group > 1 else ())
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads // group),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(8),
                          work=work,
