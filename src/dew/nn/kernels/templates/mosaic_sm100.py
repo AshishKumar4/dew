@@ -627,11 +627,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         64-row tiles a swizzled stage loads natively; tcgen05's own is tensor memory's 128 lanes."""
         return mosaic_sm90.WGMMA
 
-    def summed_window(self, block_k: int) -> int:
-        # A window is `product.SUMMED_DEPTH` deep, its in-order adds no deeper than mma.sync's window's.
-        from dew.nn.kernels.templates import product
-
-        return max(1, product.SUMMED_DEPTH // block_k)
+    sums_in_windows = True  # a window's partials a turn of tensor memory, its epilogue's to promote
 
     def tensor_columns(self, columns: int, accumulators: int, summed: bool = False) -> int:
         # Each turn holds every accumulator of a tile (`persist`); exactly summed, the turns hold a window's
