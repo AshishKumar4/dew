@@ -36,12 +36,19 @@ ring, not its walk's steps (a ring past them stages no more)."""
 
 def deepest(op, ba, config, target):
     """`config` at the most stages its launch's legality holds on `target` (`KernelOp.legal`: its stages'
-    shared memory within a block), each of which stages more (`staged_bytes`)."""
+    shared memory within a block), each of which stages more. A recurrence's launches run in separate
+    blocks: a fixed output's larger allocation must not hide a states ring's growth."""
+    def allocations(at):
+        if isinstance(op, recurrence.Mosaic):
+            return tuple(launch.shared for launch in op.launches(ba, at, target, backward=False))
+        return (op.staged_bytes(ba, at, target),)
+
     while True:
         deeper = dataclasses.replace(config, stages=config.stages + 1)
         if not op.legal(ba, deeper, target):
             return config
-        if op.staged_bytes(ba, deeper, target) <= op.staged_bytes(ba, config, target):
+        if not any(after > before for before, after in
+                   zip(allocations(config), allocations(deeper), strict=True)):
             raise AssertionError(f"{type(op).__name__} stages no more at {deeper.stages} stages than at "
                                  f"{config.stages}: its ring is its walk's, past a block's bound")
         config = deeper
