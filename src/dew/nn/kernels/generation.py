@@ -207,10 +207,13 @@ SETMAXNREG = RegisterRaises(24, 256, 8)
 @dataclasses.dataclass(frozen=True)
 class Multiprocessor:
     """A CUDA multiprocessor's resources, which the templates' register and resource models read
-    (`templates.resources`, `templates.cost`): the most threads and blocks resident at once
+    (`templates.resources`, `templates.cost`) and a compile ahead's target describes
+    (`dew.training.ahead.target_config`): the most threads and blocks resident at once
     (`resident_threads`, `resident_blocks`), its 32-bit `registers`, the most a thread holds
-    (`thread_registers`), the allocator's `register_step` a thread (256 a warp), the shared memory the driver
-    reserves for each resident block (`reserved_shared`), the bytes its shared memory serves a clock
+    (`thread_registers`), a block's limits (`block_registers`, `block_threads`, `block_shared`, the static
+    shared memory a block declares without opting in), the threads of a warp (`warp_threads`), the
+    allocator's `register_step` a thread (256 a warp), the shared memory the driver reserves for each
+    resident block (`reserved_shared`), the bytes its shared memory serves a clock
     (`shared_bytes_per_clock`), the base-2 exponentials its special-function units return a clock
     (`exponentials_per_clock`), and the range its warpgroups' `setmaxnreg` moves a thread's registers in
     (`register_raises`, None before Hopper). The defaults are the facts every CUDA compute capability from 7.5
@@ -226,6 +229,10 @@ class Multiprocessor:
     resident_blocks: int = 16
     registers: int = 64 * 1024
     thread_registers: int = 255
+    block_registers: int = 64 * 1024
+    block_threads: int = 1024
+    block_shared: int = 48 * 1024
+    warp_threads: int = 32
     register_step: int = 8
     reserved_shared: int = 1024
     shared_bytes_per_clock: int = 128
