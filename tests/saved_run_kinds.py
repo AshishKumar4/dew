@@ -195,7 +195,7 @@ def computed(directory: Path | str, step: int | None = None, *, wide: bool = Fal
     # A record names the repo's sources by their path in it, read from the checkout's root.
     found = process_support.fresh(Path(__file__).with_name("saved_run_products.py"), str(directory),
                                   *([] if step is None else [str(step)]), cwd=process_support.REPO_ROOT,
-                                  environment={WIDE_CPU_ARITHMETIC: "1" if wide else "0"})
+                                  variables={WIDE_CPU_ARITHMETIC: "1" if wide else "0"})
     assert found["products"], "the request lowered no matrix product"
     return found
 
