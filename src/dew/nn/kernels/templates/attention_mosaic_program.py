@@ -1325,7 +1325,7 @@ def _rows(family: mosaic.Family, ref, row, head, first, count: int):
 
 
 def _views_of(refs: dict, row, head) -> dict:
-    """The streams' views by name (`Family.opened`, `Family.stream`, `mosaic.viewed`): each `[B, S, H, D]`
+    """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each `[B, S, H, D]`
     operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
     return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
 

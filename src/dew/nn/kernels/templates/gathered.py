@@ -20,12 +20,12 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir as mgpu_ir
 from jax.extend.mlir.dialects import arith as mgpu_arith, memref as mgpu_memref, vector as mgpu_vector
 
-from dew.nn.kernels.templates import mosaic, swizzling
+from dew.nn.kernels.templates import mosaic, rings, swizzling
 
 
 @dataclasses.dataclass(frozen=True)
-class Ring(mosaic.Ring):
-    """A `mosaic.Ring` of rows each read where a table says (`mosaic.Rows` of one row a run), loaded by the
+class Ring(rings.Ring):
+    """A `rings.Ring` of rows each read where a table says (`rings.Rows` of one row a run), loaded by the
     producer warpgroup's cp.async copies: each thread copies its 16-byte pieces of the slot's rows from the
     rows the table names (`gathered_copies`), tracked at the slot's load barrier, an mbarrier of shared
     memory (`ring`: Pallas's barriers take no lane-level arrival); the consumers wait on it (`acquire`) and
@@ -42,8 +42,8 @@ class Ring(mosaic.Ring):
         ref, index_map = view
         return ref, index_map(step)
 
-    def load(self, turn: mosaic.Turn, view) -> None:
-        slot = mosaic.opaque(turn.slot)
+    def load(self, turn: rings.Turn, view) -> None:
+        slot = rings.opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
             self.consumed.at[slot], parity=turn.freed))
         tokens, rows = view
@@ -58,8 +58,8 @@ class Ring(mosaic.Ring):
             source, rows.table.at[pl.ds(rows.start, height)], self.smem.at[slot],
             self.full.at[pl.ds(slot, 1)])
 
-    def acquire(self, turn: mosaic.Turn):
-        slot = mosaic.opaque(turn.slot)
+    def acquire(self, turn: rings.Turn):
+        slot = rings.opaque(turn.slot)
         plgpu.inline_mgpu(arg_types=(plgpu.RefType(), plgpu.Layout.WG_SPLAT(())))(
             lambda ctx, barrier, parity: barrier_of(barrier).wait_parity(splat_value(parity)))(
                 self.full.at[pl.ds(slot, 1)], jnp.asarray(turn.parity, jnp.bool_))
@@ -71,7 +71,7 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, released_by_pr
     staged at the widest swizzle that fits (`swizzled`), a load mbarrier each in shared memory (`uint64`,
     `Ring.initialized`) and a release barrier each that `consumers` arrive at, or, `released_by_products`,
     that the products reading a slot arrive at once by their commit (`Committed`'s: tcgen05's, as
-    `mosaic.ring`'s)."""
+    `rings.ring`'s)."""
     consumed = (plgpu.Barrier(num_barriers=stages, orders_tensor_core=True) if released_by_products
                 else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
     return {'smem': swizzling.staged((stages, *block), dtype, swizzled(block, dtype)),
@@ -93,8 +93,8 @@ class Committed(Ring):
     slot's load mbarrier, expecting their bytes, which the copies complete. A row alone by tiled TMA is a
     copy of its own (an 8-row tile's slice no swizzled box takes); a gather moves four."""
 
-    def load(self, turn: mosaic.Turn, view) -> None:
-        slot = mosaic.opaque(turn.slot)
+    def load(self, turn: rings.Turn, view) -> None:
+        slot = rings.opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
             self.consumed.at[slot], parity=turn.freed))
         tokens, rows = view
@@ -109,8 +109,8 @@ class Committed(Ring):
             tokens, rows.table.at[pl.ds(rows.start, height)], self.smem.at[slot],
             self.full.at[pl.ds(slot, 1)], jnp.asarray(depth * width, jnp.int32))
 
-    def release(self, turn: mosaic.Turn) -> None:
-        plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
+    def release(self, turn: rings.Turn) -> None:
+        plgpu.tcgen05_commit_arrive(self.consumed.at[rings.opaque(turn.slot)])
 
 
 def barrier_of(memref) -> mgpu_utils.BarrierRef:

@@ -36,7 +36,7 @@ def test_a_gathered_grouped_product_reads_each_row_where_its_table_says():
 
 
 def a_deep_gathered_step_reads_its_rows_as_their_copy_would(interpret):
-    """A gathered product's 256-deep step, four swizzled tiles a row (its rows' copies, `mosaic.piece_copies`,
+    """A gathered product's 256-deep step, four swizzled tiles a row (its rows' copies, `rings.piece_copies`,
     the load barrier's arrivals: counted apart, the packed NVFP4 bank's gathered walk hung): bitwise the same
     tile's product of the rows gathered first, its groups ragged, one empty, rows past them."""
     tiles = mosaic_gpu.Tiles(128, 128, 256, 2, 1, warpgroups=2, family='wgmma')

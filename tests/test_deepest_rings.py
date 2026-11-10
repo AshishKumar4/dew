@@ -3,9 +3,9 @@ their GPU on this CPU (tests/kernel_compile.py): within their resources and spil
 per-slot state shows first at its deepest, which a derivation's own depth does not reach: a producer's
 drain guarded each slot's last waits apart for each of its rings, which ptxas held a predicate a slot from
 the first ring's waits to the last's, so an eight-stage tcgen05 kernel gradient spilled 16 bytes of
-predicates at every raise but 232 (`mosaic.drained`, FS-TGMM-PRED3). The GEMM's families' deepest rings are
+predicates at every raise but 232 (`rings.drained`, FS-TGMM-PRED3). The GEMM's families' deepest rings are
 its own gate's; these are the attention's and the recurrence's, whose producers drain two rings or more
-(`mosaic.drain`'s every site)."""
+(`rings.drain`'s every site)."""
 
 import dataclasses
 

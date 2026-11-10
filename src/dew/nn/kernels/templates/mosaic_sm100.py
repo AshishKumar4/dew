@@ -30,8 +30,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import handoffs, mosaic, mosaic_sm90, persistent, resources, swizzling
-from dew.nn.kernels.templates.mosaic import Ref
+from dew.nn.kernels.templates import handoffs, mosaic, mosaic_sm90, persistent, resources, rings, swizzling
+from dew.nn.kernels.templates.rings import Ref
 
 ISSUING = (handoffs.Role("load", warp=True, weight=0), handoffs.Role("mma", warp=True, weight=0))
 """The issuing warpgroup's roles after a template's own (`handoffs.Schedule`'s warp roles): its load warp's
@@ -45,7 +45,7 @@ STORED = plgpu.Layout.TCGEN05
 @dataclasses.dataclass(frozen=True)
 class Topology:
     """The CTAs one product spans (tcgen05's collective form): one, or a pair of a cluster's
-    (`mosaic.CLUSTER`), whose leader issues each product over both's rows into both's tensor memory, each
+    (`rings.CLUSTER`), whose leader issues each product over both's rows into both's tensor memory, each
     CTA loading its own rows' block of one operand and its half of the other's, the leader's load barriers
     tracking both halves and its products' commits arriving at both (CUTLASS's 2-SM UMMA)."""
     ctas: int = 1
@@ -56,11 +56,11 @@ class Topology:
 
     def index(self):
         """This CTA's place in the pair (0, the leader, without one)."""
-        return lax.axis_index(mosaic.CLUSTER) if self.paired else 0
+        return lax.axis_index(rings.CLUSTER) if self.paired else 0
 
     def leads(self):
         """Whether this CTA issues the products."""
-        return lax.axis_index(mosaic.CLUSTER) == 0 if self.paired else True
+        return lax.axis_index(rings.CLUSTER) == 0 if self.paired else True
 
     def copied(self, dimension: int) -> dict:
         """A load's partition across the pair: each CTA its share of the block along `dimension`, tracked
@@ -68,11 +68,11 @@ class Topology:
         if not self.paired:
             return {}
         return {'leader_tracked': plgpu.CopyPartition.PARTITIONED(dimension),
-                'collective_axes': mosaic.CLUSTER}
+                'collective_axes': rings.CLUSTER}
 
     def issued(self) -> dict:
         """A product's or a commit's spread over the pair."""
-        return {'collective_axis': mosaic.CLUSTER} if self.paired else {}
+        return {'collective_axis': rings.CLUSTER} if self.paired else {}
 
 
 SINGLE = Topology()
@@ -144,24 +144,24 @@ class Signal:
     shape: Signals
     barriers: state_types.AbstractRef
 
-    def turn(self, counter) -> mosaic.Turn:
-        return mosaic.Turn.of(counter, self.shape.count)
+    def turn(self, counter) -> rings.Turn:
+        return rings.Turn.of(counter, self.shape.count)
 
-    def loaded(self, turn: mosaic.Turn, view, ref) -> None:
+    def loaded(self, turn: rings.Turn, view, ref) -> None:
         """`view` copied into `ref` by TMA, its arrival `turn`'s."""
         plgpu.copy_gmem_to_smem(view, ref, self.barriers.at[turn.slot])
 
-    def committed(self, turn: mosaic.Turn, topology: Topology = SINGLE) -> None:
+    def committed(self, turn: rings.Turn, topology: Topology = SINGLE) -> None:
         """`turn`'s arrival once every product the thread issued is done (the tensor core's commit)."""
         plgpu.tcgen05_commit_arrive(self.barriers.at[turn.slot], **topology.issued())
 
-    def published(self, turn: mosaic.Turn) -> None:
+    def published(self, turn: rings.Turn) -> None:
         """`turn`'s arrival by the role's threads, their tensor-memory stores visible to the products first
         (`Tcgen05Issuer.write`)."""
         plgpu.commit_tmem()
         plgpu.barrier_arrive(self.barriers.at[turn.slot])
 
-    def wait(self, turn: mosaic.Turn) -> None:
+    def wait(self, turn: rings.Turn) -> None:
         plgpu.barrier_wait(self.barriers.at[turn.slot], parity=turn.parity)
 
 
@@ -192,7 +192,7 @@ class Accumulators:
         """The ring's done and read barriers (`scratch`'s, which a launch's shared memory counts)."""
         done = plgpu.Barrier(num_arrivals=self.produced, num_barriers=self.count, orders_tensor_core=True)
         if self.topology.paired:
-            return done, plgpu.ClusterBarrier(collective_axes=(mosaic.CLUSTER,), num_arrivals=self.released,
+            return done, plgpu.ClusterBarrier(collective_axes=(rings.CLUSTER,), num_arrivals=self.released,
                                               num_barriers=self.count, orders_tensor_core=True)
         read = plgpu.Barrier(num_arrivals=self.released, num_barriers=self.count, orders_tensor_core=True)
         return done, read
@@ -222,30 +222,30 @@ class Tensor:
     done: state_types.AbstractRef
     read_done: state_types.AbstractRef
 
-    def turn(self, counter) -> mosaic.Turn:
-        """Turn `counter` round the accumulators (`mosaic.Turn`, its slot the accumulator's index)."""
-        return mosaic.Turn.of(counter, self.shape.count)
+    def turn(self, counter) -> rings.Turn:
+        """Turn `counter` round the accumulators (`rings.Turn`, its slot the accumulator's index)."""
+        return rings.Turn.of(counter, self.shape.count)
 
-    def freed(self, turn: mosaic.Turn) -> None:
+    def freed(self, turn: rings.Turn) -> None:
         """The product warp waits for the turn's accumulator: given back by the turn `count` before."""
         pl.when(turn.counter >= self.shape.count)(lambda: plgpu.barrier_wait(
             self.read_done.at[turn.slot], parity=turn.freed))
 
-    def acquire(self, turn: mosaic.Turn):
+    def acquire(self, turn: rings.Turn):
         """The product warp's turn: the turn's accumulator, once `freed`."""
         self.freed(turn)
         return column_span(self.tmem, turn.slot * self.shape.columns, self.shape.columns)
 
-    def columns(self, turn: mosaic.Turn, first, count: int):
+    def columns(self, turn: rings.Turn, first, count: int):
         """Columns `first` to `first + count` of the turn's accumulator (several products' accumulators side
         by side in one turn's columns: a launch's paired outputs)."""
         return column_span(self.tmem, turn.slot * self.shape.columns + first, count)
 
-    def issued(self, turn: mosaic.Turn) -> None:
+    def issued(self, turn: rings.Turn) -> None:
         """The product warp's turn's products all issued: the reader may wait on them."""
         plgpu.tcgen05_commit_arrive(self.done.at[turn.slot], **self.shape.topology.issued())
 
-    def ready(self, turn: mosaic.Turn) -> None:
+    def ready(self, turn: rings.Turn) -> None:
         """A reading role's turn: its products done, once, however many parts it reads (`slot`)."""
         plgpu.barrier_wait(self.done.at[turn.slot], parity=turn.parity)
 
@@ -253,20 +253,20 @@ class Tensor:
         """Columns `first` to `first + count` of the tile's running sums (`Accumulators.running`)."""
         return column_span(self.tmem, self.shape.count * self.shape.columns + first, count)
 
-    def slot(self, turn: mosaic.Turn) -> "Accumulator":
+    def slot(self, turn: rings.Turn) -> "Accumulator":
         """The turn's accumulator, which the issuer reads, writes and updates in column parts
         (`Tcgen05Issuer.read`, `write`, `update`) once it is `ready`."""
         shape = (self.shape.rows, self.shape.columns)
         return Accumulator(column_span(self.tmem, turn.slot * self.shape.columns, self.shape.columns), shape)
 
-    def release(self, turn: mosaic.Turn) -> None:
+    def release(self, turn: rings.Turn) -> None:
         """A reading role's turn read out: its accumulator free for the turn `count` after."""
         plgpu.wait_load_tmem()
         plgpu.barrier_arrive(self.read_done.at[turn.slot])
 
     def drain(self, turns) -> None:
-        """The product warp's last turns' give-backs, which no later product waited for (`mosaic.drained`)."""
-        mosaic.drained((self.read_done,), turns, self.shape.count)
+        """The product warp's last turns' give-backs, which no later product waited for (`rings.drained`)."""
+        rings.drained((self.read_done,), turns, self.shape.count)
 
 
 def column_span(tmem, first, count: int):
@@ -287,35 +287,35 @@ class Accumulator:
     dtype: Any = jnp.float32
 
 
-class CommittedRing(mosaic.Ring):
+class CommittedRing(rings.Ring):
     """A ring whose slots tcgen05's products give back: the product warp's commit arrives at a slot's release
     once every product it issued has read the slot (`tcgen05_commit_arrive`), where a register family's
-    consumers arrive themselves (`mosaic.ring`'s `released_by_products`)."""
+    consumers arrive themselves (`rings.ring`'s `released_by_products`)."""
 
-    def release(self, turn: mosaic.Turn) -> None:
-        plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
+    def release(self, turn: rings.Turn) -> None:
+        plgpu.tcgen05_commit_arrive(self.consumed.at[rings.opaque(turn.slot)])
 
 
 @dataclasses.dataclass(frozen=True)
 class PairedRing(CommittedRing):
-    """A pair's ring (`Tcgen05Rings` over `PAIRED`): each step's block the pair's (`mosaic.Split`), each CTA
+    """A pair's ring (`Tcgen05Rings` over `PAIRED`): each step's block the pair's (`rings.Split`), each CTA
     loading its half into its own slot, the leader's load barrier tracking both halves (`Topology.copied`),
     which the leader's products read together; the leader's commit gives each slot back on both CTAs
     (`Topology.issued`), so each CTA's load waits for its own slot's release."""
 
     topology: Topology = PAIRED
 
-    def load(self, turn: mosaic.Turn, view) -> None:
-        if not isinstance(view, mosaic.Split):
-            raise ValueError(f"a pair's step is the pair's block (`mosaic.Paired` indices), not {view}")
-        slot = mosaic.opaque(turn.slot)
+    def load(self, turn: rings.Turn, view) -> None:
+        if not isinstance(view, rings.Split):
+            raise ValueError(f"a pair's step is the pair's block (`rings.Paired` indices), not {view}")
+        slot = rings.opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
             self.consumed.at[slot], parity=turn.freed))
         plgpu.copy_gmem_to_smem(view.ref, self.smem.at[slot], self.full.at[slot],
                                 **self.topology.copied(view.along))
 
-    def release(self, turn: mosaic.Turn) -> None:
-        plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)], **self.topology.issued())
+    def release(self, turn: rings.Turn) -> None:
+        plgpu.tcgen05_commit_arrive(self.consumed.at[rings.opaque(turn.slot)], **self.topology.issued())
 
 
 BLOCK_SCALED_COLUMNS = 128
@@ -337,13 +337,13 @@ class ScaleRing(CommittedRing):
 
     tmem: Any = None
 
-    def acquire(self, turn: mosaic.Turn):
+    def acquire(self, turn: rings.Turn):
         return super().acquire(turn), self._scales(turn)
 
-    def _scales(self, turn: mosaic.Turn):
+    def _scales(self, turn: rings.Turn):
         """`turn`'s slot's tensor memory: its columns of `tmem`."""
         columns = self.tmem.shape[1] // self.smem.shape[0]
-        return self.tmem.at[:, pl.ds(mosaic.opaque(turn.slot) * columns, columns)]
+        return self.tmem.at[:, pl.ds(rings.opaque(turn.slot) * columns, columns)]
 
 
 CHUNK_COLUMNS = 64
@@ -585,7 +585,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,
                 gathered: tuple[str, ...] = ()) -> dict:
-        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `mosaic.Ring`
+        from dew.nn.kernels.templates import gathered as gathered_rows  # it builds on `rings.Ring`
 
         if multicast:
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
@@ -597,7 +597,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         # A gathered stream's rows are its load warp's four-row gathers (`gathered.Committed`).
         streams = {name: gathered_rows.ring(shape, dtype, stages, released_by_products=True)
                    if name in gathered else
-                   mosaic.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
+                   rings.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
                                copies=(copies or {}).get(name, 1), released_by_products=True)
                    for name, (shape, dtype) in blocks.items()}
         # A block-scale stream's slots each pair with the tensor memory its products read them from: its
@@ -609,7 +609,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         return streams
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict:
-        from dew.nn.kernels.templates import gathered  # it builds on `mosaic.Ring`
+        from dew.nn.kernels.templates import gathered  # it builds on `rings.Ring`
 
         del views
         if self.topology.paired:
@@ -664,11 +664,11 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         if rows != {self.rows}:
             raise ValueError(f"a tcgen05 accumulator is {self.rows} rows on one CTA, not {sorted(rows)}")
         del in_flight  # the products' commit releases each step's slots
-        rings = self.opened(streams)
-        for ring in rings.values():
+        opened = self.opened(streams)
+        for ring in opened.values():
             ring.initialized()
         staging = self.output_staging(outputs, consumers)
-        rewrites = () if prepared is None else tuple(ring.stages for ring in rings.values())
+        rewrites = () if prepared is None else tuple(ring.stages for ring in opened.values())
         width = sum(shape[1] for shape in accumulators)
         offsets = [sum(shape[1] for shape in accumulators[:index]) for index in range(len(accumulators))]
         def windows(steps):
@@ -680,12 +680,12 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             (tensor,) = roles.opened(allocated[:1])
             # The product warp reads each step's slots once the rewrite publishes them (`prepared`): each
             # slot's `masked` barrier in its loads' place.
-            masked = dict(zip(rings, allocated[1:1 + len(rewrites)], strict=True)) if rewrites else {}
+            masked = dict(zip(opened, allocated[1:1 + len(rewrites)], strict=True)) if rewrites else {}
             smems = allocated[1 + len(rewrites):]
-            issued = ({name: _published(ring, masked[name]) for name, ring in rings.items()} if masked
-                      else rings)
+            issued = ({name: _published(ring, masked[name]) for name, ring in opened.items()} if masked
+                      else opened)
 
-            def held(turn: mosaic.Turn) -> tuple:
+            def held(turn: rings.Turn) -> tuple:
                 # The turn's accumulators: each its columns of the turn's share of tensor memory.
                 return tuple(Accumulator(tensor.columns(turn, offset, shape[1]), shape)
                              for offset, shape in zip(offsets, accumulators, strict=True))
@@ -727,9 +727,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
             def load():
-                loads = functools.partial(mosaic.loads, rings)
+                loads = functools.partial(rings.loads, opened)
                 loaded, _ = persistent.tiled(tiles, schedule, loads, axis=axis)
-                mosaic.drain(rings.values(), loaded)
+                rings.drain(opened.values(), loaded)
 
             def issue_all():
                 _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)
@@ -737,7 +737,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
             rewriting = {}
             if prepared is not None:
-                rewritten = functools.partial(_rewritten, rings, masked, prepared)
+                rewritten = functools.partial(_rewritten, opened, masked, prepared)
 
                 def rewrite(index):
                     del index
@@ -863,7 +863,7 @@ PAIR = Tcgen05PairRings()
 """The tcgen05 bundle over a pair of CTAs: a launch's config names it ('tcgen05.pair', `bundles`)."""
 
 
-def _published(ring: mosaic.Ring, masked) -> CommittedRing:
+def _published(ring: rings.Ring, masked) -> CommittedRing:
     """`ring` as the product warp reads it where a role rewrites its slots (`Tcgen05Rings.persist`'s
     `prepared`): each slot awaited at `masked`, the rewrite's publish barrier, in its loads' place, and
     released by the products' commit; a gathered ring's (its loads' barriers its own mbarriers,
@@ -879,7 +879,7 @@ def _publish_barriers(rewrites: tuple[int, ...]) -> tuple:
     return tuple(plgpu.Barrier(num_barriers=stages) for stages in rewrites)
 
 
-def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, steps, views, tile,
+def _rewritten(opened: dict, masked: dict, prepared: Callable, counter, active, steps, views, tile,
                done) -> None:
     """A rewriting role's visit of a persistent tile (`Tcgen05Rings.persist`'s `prepared`): each of its steps'
     slots, once loaded, rewritten (`prepared(tile, index, slots)`), published to the tensor cores and each
@@ -889,12 +889,12 @@ def _rewritten(rings: dict, masked: dict, prepared: Callable, counter, active, s
     @pl.when(active)
     def _():
         def step(index, carry):
-            turn = mosaic.Turn.of(counter + index, min(ring.stages for ring in rings.values()))
-            slots = {name: ring.acquire(turn) for name, ring in rings.items()}
+            turn = rings.Turn.of(counter + index, min(ring.stages for ring in opened.values()))
+            slots = {name: ring.acquire(turn) for name, ring in opened.items()}
             prepared(tile, index, slots)
             plgpu.commit_smem()
             for barriers in masked.values():
-                plgpu.barrier_arrive(barriers.at[mosaic.opaque(turn.slot)])
+                plgpu.barrier_arrive(barriers.at[rings.opaque(turn.slot)])
             return carry
 
         lax.fori_loop(0, steps, step, None)
