@@ -785,7 +785,7 @@ class Ring:
         its tile's row."""
         rows, smem = piece.shape[0], self.smem
         cells = piece_cells(self.block, smem.dtype, swizzling.swizzle_of(smem), rows)
-        if cells is None:
+        if cells is None or not isinstance(smem, state_types.TransformedRef):
             return [(piece, smem.at[slot, pl.ds(start, rows)])]
         unswizzled = next(transform for transform in smem.transforms
                           if isinstance(transform, plgpu_core.UnswizzleRef))
