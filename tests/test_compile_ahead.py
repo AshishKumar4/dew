@@ -1134,6 +1134,22 @@ def test_a_build_holds_a_call_to_the_memory_it_states_else_to_its_least_part_and
     assert not build.differences(dataclasses.replace(build, memory=None))
 
 
+def test_a_build_binds_its_loader_to_its_plugin_and_linked_libraries_and_not_to_its_topology():
+    """Programs compiled ahead carry the CUDA plugin that compiled them and the libraries it linked (a cuDNN
+    graph is serialized at compile), so a process of another plugin build or another version of one is
+    refused them, naming which; the topology they were compiled over names the compile alone, and a host's
+    own GPUs run what a generation's canonical ones built."""
+    from dew.training.ahead import BuildTarget
+
+    build = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64", plugin="-cuda12-0.12.0.1.post73",
+                        libraries=(("nvidia-cudnn-cu12", "9.27.0.42"),), topology=None)
+    plugin = dataclasses.replace(build, plugin="-cuda13-0.12.0.1.post73")
+    cudnn = dataclasses.replace(build, libraries=(("nvidia-cudnn-cu12", "9.28.0.1"),))
+    assert [line.split()[0] for line in build.differences(plugin)] == ["plugin"]
+    assert [line.split()[0] for line in build.differences(cudnn)] == ["libraries"]
+    assert not build.differences(dataclasses.replace(build, topology="0" * 64))
+
+
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
     """`--trainer.compile-ahead.frontier` (`RunConfig.cli`) asks the step compiled ahead for its frontier,
     which its saved plan records (rows 3108, 3147): on GPUs of 0.0007 GiB, where the plan needs two

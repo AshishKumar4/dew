@@ -58,7 +58,7 @@ import numpy as np
 from jax.experimental import serialize_executable
 
 from dew import communicators
-from dew._cache import uncached
+from dew._cache import linked_libraries, plugin_builds, topology_digest, uncached
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels import options
@@ -444,9 +444,14 @@ class BuildTarget:
     multiprocessors times its programs (tail.py:62-66, gemm/mosaic_gpu.py:597), and the program starting a
     tile waits on later programs' partials (mosaic.py:1875-1888), so a grid past the GPU's residency can
     wait on a program that never starts. A GPU whose multiprocessors are shared (MPS limits, MIG) holds
-    fewer than it states, and runs none of them. The CUDA plugin is not part of it: an H100 ran sm90
-    programs a CUDA 12 plugin built, unchanged, under the CUDA 13 plugin of a node's own environment, bit
-    for bit as the jitted programs (2026-11-02, GS-compileahead-pilot-h100)."""
+    fewer than it states, and runs none of them. The CUDA plugin that compiled them and the libraries the
+    compile linked are part of it (`plugin`, `libraries`): JAX's own persistent-cache key holds the
+    plugin's build, and a cuDNN graph is serialized at compile, so a program carries both. One run of sm90
+    programs a CUDA 12 plugin built, under a CUDA 13 plugin, matched the jitted programs bit for bit
+    (2026-11-02, GS-compileahead-pilot-h100), which one program's run does not extend to every graph a
+    library serializes. The topology a compile was placed on (`topology`) names the compile, and the
+    persistent cache and a shared bundle key by it, but no loader holds it: a program compiled over a
+    generation's canonical GPUs runs on a host's own of that generation and multiprocessors."""
 
     generation: str
     multiprocessors: int | None
@@ -464,15 +469,30 @@ class BuildTarget:
     the host that compiles it, so its executable runs on a host of the same ones. None for a GPU's or a
     TPU's, whose program is its devices' (a TPU's target is its kind's generation and its devices), and for
     a CPU host that states no processor, which programs kept by their calls refuse (`cpu_stated`)."""
+    plugin: str = ""
+    """The build of each CUDA PJRT plugin installed where they were compiled (`dew._cache.plugin_builds`),
+    empty where none is."""
+    libraries: tuple[tuple[str, str], ...] = ()
+    """The CUDA libraries the compile linked, each by its distribution and version
+    (`dew._cache.linked_libraries`)."""
+    topology: str | None = None
+    """The digest of the GPU topology the programs were compiled over (`dew._cache.topology_digest`): a
+    host's own GPUs, serialized (`host_gpus`, or the GPUs attached), None for a generation's canonical
+    ones (`compile_only_gpus`) and for any other platform's. It names the compile, which no loader holds
+    (`differences`)."""
 
     @staticmethod
-    def built(target: GpuTarget, devices: int, memory: int | None = None) -> BuildTarget:
+    def built(target: GpuTarget, devices: int, memory: int | None = None, *,
+              topology: bytes | None = None) -> BuildTarget:
         """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), each
-        holding the `memory` its plan states, under this process's JAX, jaxlib, computing XLA flags and host:
-        the one place a build's environment is read."""
+        holding the `memory` its plan states, over the serialized `topology` of a host's own GPUs where it
+        was given one, under this process's JAX, jaxlib, computing XLA flags, host, CUDA plugin and linked
+        libraries: the one place a build's environment is read."""
         return BuildTarget(target.generation, target.multiprocessors, devices,
                            importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
-                           computation_flags(), platform.machine(), memory)
+                           computation_flags(), platform.machine(), memory, plugin=plugin_builds(),
+                           libraries=linked_libraries(),
+                           topology=None if topology is None else topology_digest(topology))
 
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
@@ -486,14 +506,19 @@ class BuildTarget:
                              "compiled ahead load onto devices of one")
         limits = [stats["bytes_limit"] for device in devices
                   if "bytes_limit" in (stats := device.memory_stats() or {})]
-        built = BuildTarget.built(device_target(devices[0]), len(devices), min(limits, default=None))
+        # Attached GPUs are their client's topology, as a host serializes it for a prepare (`host_gpus`).
+        attached = (topologies.get_attached_topology("cuda").serialize() if devices[0].platform == "gpu"
+                    else None)
+        built = BuildTarget.built(device_target(devices[0]), len(devices), min(limits, default=None),
+                                  topology=attached)
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
     def differences(self, other: BuildTarget) -> list[str]:
         """Each field `other` holds otherwise, said as this one's and other's: memory where other's is
-        known and below this one's (a device holding more than a build planned for runs it)."""
-        named = [field.name for field in dataclasses.fields(self) if field.name != "memory"]
+        known and below this one's (a device holding more than a build planned for runs it), and never the
+        topology, which names the compile and binds no loader."""
+        named = [field.name for field in dataclasses.fields(self) if field.name not in ("memory", "topology")]
         found = [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
                  if getattr(self, name) != getattr(other, name)]
         if self.memory is not None and other.memory is not None and other.memory < self.memory:
@@ -675,8 +700,8 @@ def keeping() -> Iterator[Keeping]:
     A later process of the same target, code and settings hands them back (`kept`) and traces none of
     them. A program compiled before the block, or handed or taken within it, is not among them. The
     block compiles with JAX's persistent cache off (`dew._cache.uncached`): an executable XLA loaded
-    from that cache serializes without its kernels (on a CPU it then loads and fails at its first call, "Function ... not found"; plain JAX, 2026-11-09), so each kept one is
-    compiled here."""
+    from that cache serializes without its kernels (on a CPU it then loads and fails at its first call,
+    "Function ... not found"; plain JAX, 2026-11-09), so each kept one is compiled here."""
     kept = Keeping()
     with uncached(), options.keeping(kept.heard):
         yield kept
@@ -730,14 +755,6 @@ def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
 class NotTheKeptProgram(ValueError):
     """A call whose identity a kept program was compiled for lowers to another program (`kept`'s
     `verify`): its trace read something its identity does not state."""
-
-
-def substituted(taken: Sequence) -> list[str]:
-    """Each kernel a compile ahead's routes `taken` (`generation.routes`) lowered another in place of, as this
-    host lowers no such kernel (`Route.ran`: FlashAttention without its wheel, cuDNN with no GPU attached),
-    named once: the compiled program is not the one the target's GPU runs."""
-    return sorted({f"{route.choice}: {route.kernel} ran as {route.ran} at {route.site}" for route in taken
-                   if route.ran != route.kernel})
 
 
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
@@ -900,7 +917,8 @@ class AheadTarget:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
         ahead = _compiled_ahead(trainer, first_step_batch(trainer, loader, steps, examples, resume),
-                                self.capacity, frontier=self.frontier, plan=plan)
+                                self.capacity, frontier=self.frontier, plan=plan,
+                                topology=None if self.topology is None else Path(self.topology).read_bytes())
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -973,7 +991,8 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                    capacity: int | None = None, *, frontier: bool = False,
-                                   fit: FitArguments | None = None) -> AheadOfTime:
+                                   fit: FitArguments | None = None, topology: bytes | None = None
+                                   ) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
     mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
     (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
@@ -987,9 +1006,11 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     absent it, memory fit is unknown rather than measured. The GPU it compiles for is the one the mesh's
     compile-only GPUs state, as XLA compiles over them: their generation and multiprocessors
     (`compile_only_gpus`' `multiprocessors`, `built_target`), which the step's launches derive for and it
-    records. Profiling, tuning and rollout require execution and are refused."""
+    records. `topology` is the serialized topology of a host's own GPUs the mesh's devices were read from
+    (`host_gpus`), which the saved build names (`BuildTarget.topology`); None for a generation's canonical
+    GPUs. Profiling, tuning and rollout require execution and are refused."""
     return _compiled_ahead(trainer, batch, capacity, frontier=frontier,
-                           plan=None if fit is None else fit_plan(trainer, batch, fit))
+                           plan=None if fit is None else fit_plan(trainer, batch, fit), topology=topology)
 
 
 def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Dataset | Loader | Handed,
@@ -999,7 +1020,8 @@ def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Datase
 
 
 def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, capacity: int | None,
-                                     *, frontier: bool, plan: FitPlan | None) -> AheadOfTime:
+                                     *, frontier: bool, plan: FitPlan | None, topology: bytes | None = None
+                                     ) -> AheadOfTime:
     """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
     (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`)."""
     if capacity is not None and capacity <= 0:
@@ -1065,7 +1087,7 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget.built(target, len(devices), capacity),
+        built=BuildTarget.built(target, len(devices), capacity, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts)
 
 

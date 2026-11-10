@@ -11,6 +11,7 @@ import functools
 import hashlib
 import importlib.metadata
 import os
+import re
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -254,6 +255,38 @@ def plugin_builds() -> str:
     (row 3560)."""
     return "".join(f"-{build}-{importlib.metadata.version(f'jax-{build}-pjrt')}"
                    for build in sorted(cuda_builds()))
+
+
+LINKED_LIBRARIES = ("cublas", "cudnn", "nvjitlink")
+"""The CUDA libraries a GPU compile writes state of into its executable, so a process holding another
+version of one runs it otherwise or not at all: cuBLAS's (the GEMM algorithms XLA's autotuner picked for
+that version), cuDNN's (its graphs, serialized at compile) and nvJitLink's (the kernels it linked). Each is
+named by the stem every CUDA build's distribution of it carries (`nvidia-cudnn-cu12`, CUDA 13's
+`nvidia-cublas`), as the plugins require them; the other libraries a plugin requires are called at run
+time, holding nothing of a compile."""
+
+
+def linked_libraries() -> tuple[tuple[str, str], ...]:
+    """Each library of `LINKED_LIBRARIES` an installed CUDA plugin requires (`jax-cuda1x-plugin`'s own
+    requirements), with its installed version, sorted by name: what a compile here linked. A requirement no
+    distribution here installs is left out (a plugin installed without its `with-cuda` extra, over the
+    system's libraries, which no distribution states)."""
+    installed = {each.metadata["Name"].lower(): each.version for each in importlib.metadata.distributions()}
+    # A requirement's name runs up to the first character no distribution's name holds (PEP 508).
+    required = {re.split(r"[^A-Za-z0-9._-]", requirement, maxsplit=1)[0].lower()
+                for build in cuda_builds()
+                for requirement in importlib.metadata.requires(f"jax-{build}-plugin") or ()}
+    return tuple(sorted((name, installed[name]) for name in required
+                        if name in installed and any(library in name for library in LINKED_LIBRARIES)))
+
+
+def topology_digest(serialized: bytes) -> str:
+    """The digest of a GPU topology as its client serializes it
+    (`jax.experimental.topologies.get_attached_topology("cuda").serialize()`): a host's GPUs, its SKU's
+    memory, clocks and multiprocessors, which XLA's compile and its persistent cache key read. A process
+    reading its attached GPUs and a host's prepare reading the file its node wrote (`host_gpus`) digest the
+    same bytes."""
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def autotune_dir(path: str) -> str:
