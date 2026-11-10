@@ -25,7 +25,9 @@ The semantics assumed (PTX ISA, `mbarrier`, `cp.async.bulk`, `fence.proxy.async`
   program has not ended is a deadlock.
 
 The properties checked in every reachable state of every interleaving, within the bounds a test gives:
-- no deadlock, and at the end every barrier's phase whole (no arrival left in a phase that never completes);
+- no deadlock, and at the end every barrier's phase whole (no arrival left in a phase that never completes)
+  and every completed phase observed by each thread that waits on the barrier (a producer's drain: no slot
+  freed while a release is unseen);
 - each wait observes the completion it is the thread's next wait for on that barrier: no barrier runs two
   phases past a thread that still waits on it (a parity wait's aliasing), and no thread arrives twice in one
   phase of a barrier (an early arrival counted toward a phase it does not belong to);
@@ -303,8 +305,9 @@ def _body(jaxpr: jcore.Jaxpr) -> jcore.ClosedJaxpr:
 
 @dataclasses.dataclass
 class Violation(AssertionError):
-    """A property the exploration found broken: its class (`kind`: "deadlock", "unfinished" phase, "aliased"
-    parity, "early" arrival, "unordered" access, "unfenced" store, "bounds"), what broke (`what`), and the
+    """A property the exploration found broken: its class (`kind`: "deadlock", "unfinished" phase,
+    "unobserved" phase, "aliased" parity, "early" arrival, "unordered" access, "unfenced" store, "bounds"),
+    what broke (`what`), and the
     interleaving reaching it (`trace`, each move a thread's index and its event's place, or a landing)."""
 
     kind: str
@@ -348,7 +351,7 @@ def explore(threads: list[list[Event]], arrivals: dict[str, int], *, limit: int 
         if not moves:
             if not state.ended(threads):
                 raise Violation("deadlock", "no warpgroup can move and some has not ended", trace)
-            state.whole(arrivals, trace)
+            state.whole(arrivals, [count[-1] for count in counts], trace)
             completed = trace if completed is None else completed
             continue
         stack.extend(moves)
@@ -394,12 +397,18 @@ class _State:
         return not self.flight and all(position == len(program)
                                        for position, program in zip(self.positions, threads, strict=True))
 
-    def whole(self, arrivals, trace) -> None:
+    def whole(self, arrivals, waited: list[dict], trace) -> None:
+        """The ended state's barriers: each phase complete, and each seen whole by every thread that waits
+        on it (`waited`, each thread's waits on each barrier slot over its program)."""
         for at, state in self.barriers.items():
             if state.pending != arrivals[at[0]] or state.transactions:
                 left = arrivals[at[0]] - state.pending
                 raise Violation("unfinished", f"{at}: {left} arrivals and {state.transactions} transactions "
                                 "left in a phase that never completes", trace)
+            for thread, waits in enumerate(waited):
+                if at in waits and waits[at] != state.phases:
+                    raise Violation("unobserved", f"thread {thread} waited for {waits[at]} of {at}'s "
+                                    f"{state.phases} completed phases", trace)
 
     def arrive(self, at, arrivals, thread, trace, *, transaction: int = 0, count: bool = True) -> None:
         state = self.barrier(at, arrivals)

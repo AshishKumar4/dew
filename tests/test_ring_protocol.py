@@ -28,6 +28,17 @@ and a rotation unrolled or a step a trip."""
 CASES = [case for case in ring_protocol.configurations(**BOUNDS) if case["in_flight"] < case["stages"]]
 """Every configuration of `BOUNDS` a walk takes: fewer steps in flight than its ring's slots."""
 
+STREAMS = ("a", "b")
+"""The streams a two-ring walk reads, each step a slot of each (a GEMM's operands), drained together
+(`mosaic.drain`)."""
+
+TWO_RING_CASES = [
+    {**case, "streams": STREAMS} for case in ring_protocol.configurations(
+        stages=(1, 2, 3), consumers=(1, 2), tiles=((3,), (2, 0, 3)), in_flight=(0, 1),
+        unrolled=BOUNDS["unrolled"])
+    if case["in_flight"] < case["stages"]]
+"""Two rings' walk at the configurations within the bounds a GEMM's product takes."""
+
 SEGMENT_CASES = [
     case for case in ring_protocol.configurations(
         stages=(2, 3), consumers=BOUNDS["consumers"], segments=((6,), (3, 3), (0, 1, 0, 2, 3, 0)),
@@ -37,9 +48,11 @@ SEGMENT_CASES = [
 
 
 @functools.cache
-def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool):
-    """The ring family's persistent walk at the configuration, each step reading its slot: each warpgroup's
-    program and the barriers' arrivals (`ring_protocol.programs`)."""
+def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: bool,
+           streams: tuple = ("a",)):
+    """The ring family's persistent walk at the configuration over a ring of each of `streams`, each step
+    reading its slot of each: each warpgroup's program and the barriers' arrivals
+    (`ring_protocol.programs`)."""
     family = mosaic_sm90.WGMMA
     starts = [sum(tiles[:index]) for index in range(len(tiles))]
 
@@ -53,12 +66,13 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
             def schedule(index):
                 tile = index[0]
                 steps = at(tile, tiles)
-                views = {"a": (x_gmem, lambda step: (at(tile, starts) + step, 0))}
+                views = {name: (x_gmem, lambda step: (at(tile, starts) + step, 0)) for name in streams}
                 return steps > 0, steps, views, tile
 
             def issue(wg, tile, walk, *, active):
                 def step(index, slots, carry, accumulators):
-                    slots["a"][0, 0]
+                    for name in streams:
+                        slots[name][0, 0]
                     return carry, accumulators
 
                 walk(step, None, ())
@@ -70,7 +84,8 @@ def walked(stages: int, consumers: int, tiles: tuple, in_flight: int, unrolled: 
                            axis="programs", outputs=(), interpret=False, in_flight=in_flight,
                            unrolled=unrolled)
 
-        family.scoped(scope, streams=family.streams({"a": (BLOCK, jnp.bfloat16)}, stages, consumers))
+        family.scoped(scope, streams=family.streams(dict.fromkeys(streams, (BLOCK, jnp.bfloat16)), stages,
+                                                    consumers))
 
     kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((8, 8), jnp.float32), grid=(1,),
                            grid_names=("programs",), consumers=consumers, interpret=False, name="ring_model")
@@ -86,6 +101,19 @@ def test_the_ring_familys_walk_holds_every_property_in_every_interleaving(case):
     loads' landings explored, each property held (`ring_protocol.explore`)."""
     threads, arrivals = walked(**case)
     assert any(event.kind == "load" for event in threads[-1]), "the producer loads nothing"
+    assert explore(threads, arrivals) > 0
+
+
+@pytest.mark.parametrize("case", TWO_RING_CASES, ids=[
+    f"stages{c['stages']}-consumers{c['consumers']}-tiles{c['tiles']}-inflight{c['in_flight']}"
+    f"-{'unrolled' if c['unrolled'] else 'stepped'}" for c in TWO_RING_CASES])
+def test_two_rings_drained_together_hold_every_property_in_every_interleaving(case):
+    """Two rings' persistent walk, each step a slot of each and the producer's drain a slot of both at a time
+    (`mosaic.drain`): every interleaving explored, each property held, the producer's last waits each
+    ring's last releases."""
+    threads, arrivals = walked(**case)
+    loads = sum(event.kind == "load" for event in threads[-1])
+    assert loads == len(STREAMS) * sum(case["tiles"])
     assert explore(threads, arrivals) > 0
 
 
@@ -168,6 +196,18 @@ def test_a_missing_arrival_is_caught():
     with pytest.raises(Violation) as found:
         explore(_mutated(threads, 0, index, []), arrivals)
     assert found.value.kind in ("deadlock", "unfinished")
+
+
+@pytest.mark.parametrize("streams", [("a",), STREAMS])
+def test_a_missing_drain_is_caught(streams):
+    """The producer's drain of its last ring dropped (`mosaic.drain`): the last releases of that ring's slots
+    never waited for, a slot freed while its release is unseen, which the checker gives."""
+    threads, arrivals = walked(2, 1, (5,), 0, unrolled=False, streams=streams)
+    producer = threads[-1]
+    drained = [index for index, event in enumerate(producer) if event.kind == "wait"][-2:]
+    with pytest.raises(Violation) as found:
+        explore(_mutated(threads, len(threads) - 1, drained[0], []), arrivals)
+    assert found.value.kind == "unobserved"
 
 
 def test_an_early_release_is_caught():
