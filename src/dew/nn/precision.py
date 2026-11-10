@@ -36,7 +36,6 @@ scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, 
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import dataclasses
 import functools
 import math
@@ -977,31 +976,28 @@ class LowPrecision:
             raise ValueError(f"a recipe's roles are among {PROJECTION_ROLES}, not {unknown}")
 
 
-_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar("dew_projection_role", default=None)
-"""The role of the projections a trace is in (`projection_role`), None outside any."""
-
-
 @contextlib.contextmanager
 def projection_role(role: str):
     """Within the block, the projections a model traces play `role` (`PROJECTION_ROLES`), which the run's
     low-precision recipe reads (`recipe_role`): a block sets its mixer's and its feed-forward's, a mixture
-    its router's and its experts', the innermost holding."""
+    its router's and its experts', the innermost holding. JAX keys its trace caches on it
+    (`dew._cache.PROJECTION_ROLE`), so a function jitted under one role traces again under another."""
+    from dew import _cache
+
     if role not in PROJECTION_ROLES:
         raise ValueError(f"a projection's role is one of {PROJECTION_ROLES}, not {role!r}")
-    token = _ROLE.set(role)
-    try:
+    with _cache.PROJECTION_ROLE(role):
         yield
-    finally:
-        _ROLE.reset(token)
 
 
 def recipe_role() -> tuple[LowPrecision, str | None] | None:
     """The run's low-precision recipe and the role of the projection being traced (None for a projection of
     no role), or None where the run trains in no recipe (`Numerics.low_precision`)."""
+    from dew import _cache
     from dew.nn.kernels.generation import numerics
 
     recipe = numerics().low_precision
-    return None if recipe is None else (recipe, _ROLE.get())
+    return None if recipe is None else (recipe, _cache.PROJECTION_ROLE.value)
 
 
 class RecipeRefused(ValueError):
