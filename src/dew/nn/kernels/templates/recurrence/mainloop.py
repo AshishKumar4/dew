@@ -1796,10 +1796,10 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
             state, accumulators = stepped(n, slots, state, accumulators, *loaded)
             return (state if tabled is None else tabled.after(n, state)), accumulators
 
-        def walked_step(n, slots, state, accumulators):
-            return role_step(n, slots, taken_up(n, state), accumulators)
-
-        if (fetch := prefetch) is not None:
+        if (fetch := prefetch) is None:
+            def walked_step(n, slots, state, accumulators):
+                return role_step(n, slots, taken_up(n, state), accumulators)
+        else:
             last = start + count - 1
 
             def walked_step(n, slots, carry, accumulators):
