@@ -643,7 +643,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post73
+jax==0.12.0.1.post78
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -654,11 +654,11 @@ jax==0.12.0.1.post73
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda12-pjrt==0.12.0.1.post73
+jax-cuda12-pjrt==0.12.0.1.post75
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda12-plugin
-jax-cuda12-plugin==0.12.0.1.post73
+jax-cuda12-plugin==0.12.0.1.post75
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1
     # via
@@ -1182,6 +1182,7 @@ protobuf==6.33.6
     #   grain
     #   grpc-google-iam-v1
     #   grpcio-status
+    #   jax
     #   mlflow-skinny
     #   mlflow-tracing
     #   modal

@@ -29,6 +29,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dew requires its JAX build 0.12.0.1.post78, its CUDA and PJRT plugins post75's on every machine: a compile
+  ahead takes the kernels its GPU runs or refuses the program, naming it, as no kernel lowers in another's
+  place (cuDNN's fused attention compiles for a host's own GPUs with none attached; for a canonical target
+  it is refused, as a cuDNN plan holds to its GPU's model); a compile-only client keeps the persistent
+  cache's write and skips its read; Mosaic GPU's exponentials and tanh take lax's per-operation `accuracy`,
+  lowering as before where none is stated; a TMA copy over a partial tile runs in place; `ragged_dot` maps
+  under `vmap` with shared or non-leading batched operands; `checkify`
+  checks a `shard_map` inside a loop or a cond; and the kernel facts Dew read from HLO text are JAX's own
+  (`jax.extend.custom_call_targets`, `jax.extend.xla.instructions`, the primitives' stated facts).
 - Dew requires its JAX build 0.12.0.1.post73, its CUDA and PJRT plugins post73's on every machine: XLA:GPU's
   GEMM fusion moves a bitcast across an operand only where the operand keeps its layout (upstream a22dec8093);
   `MOSAIC_GPU_DUMP_TO` dumps the kinds named beside it alone; `MOSAIC_GPU_CAPTURE_LAUNCHES` writes each Mosaic
