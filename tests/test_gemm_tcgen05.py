@@ -24,9 +24,12 @@ TILES = (mosaic_gpu.Tiles(128, 128, 64, 2, 1, family='tcgen05'),
 """A tile of each accumulator width, its accumulators within the 512 columns of tensor memory, its ring within
 a B200's shared memory beside two outputs' staging (four stages asked 245,900 of its 232,448 bytes,
 gate-2738-gemm-b200, row 4449)."""
-DEEP = mosaic_gpu.Tiles(128, 128, 64, 6, 1, family='tcgen05')
-"""The deepest ring at a 128-column tile, the compile-ahead step's pin that spilled 56 bytes at 248 registers
-while its epilogue read every tensor-memory chunk at once (row 5358)."""
+DEEP = (mosaic_gpu.Tiles(128, 128, 64, 6, 1, family='tcgen05'),
+        mosaic_gpu.Tiles(128, 64, 64, 8, 1, family='tcgen05'))
+"""The compile-ahead step's two spilling pins (row 5358): the deepest ring a 128-column tile's shared memory
+holds, which spilled 56 bytes at 248 registers while its epilogue read every tensor-memory chunk at once, and
+an eight-slot ring, whose kernel gradient spilled the predicate file (P2R, STL) holding a predicate a slot
+past a thread's seven (`test_an_eight_slot_kernel_gradient_compiles_within_its_predicates`)."""
 PAIRED = mosaic_gpu.Tiles(128, 128, 64, 4, 1, cluster=2, family='tcgen05.pair')
 """A pair of CTAs' tile (`mosaic_sm100.PAIR`: 256 x 256, each CTA's accumulators its 128 rows by the pair's
 256 columns). Mosaic GPU's interpreter models no collective tcgen05 product, so it is compiled here and run
@@ -213,7 +216,7 @@ def tcgen05s_epilogues_hold_check_1_on_blackwell(case, tiles):
 
 
 def test_tcgen05s_mainloop_compiles_for_a_b200_within_its_resources():
-    """The shared mainloop at each tcgen05 tile, its deepest ring's (`DEEP`) and a pair's (`PAIRED`, each
+    """The shared mainloop at each tcgen05 tile, its deepest rings' (`DEEP`) and a pair's (`PAIRED`, each
     CTA's accumulators 256 columns), with a bias epilogue, compiled by Mosaic for a compile-only B200 on this
     CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's shared memory and its 512
     columns of tensor memory, no register spilled, its epilogue reading each tensor-memory chunk as it takes
@@ -237,21 +240,34 @@ def test_tcgen05s_mainloop_compiles_for_a_b200_within_its_resources():
 
         return support.KernelCase(f"tcgen05 gmm {tiles}", call)
 
-    found = compile_mosaic_kernels([case(tiles) for tiles in (*TILES, DEEP, PAIRED)], "sm100")
-    assert len(found) == len(TILES) + 2 and all(record.get("kernels") for record in found), found
+    found = compile_mosaic_kernels([case(tiles) for tiles in (*TILES, *DEEP, PAIRED)], "sm100")
+    assert len(found) == len(TILES) + len(DEEP) + 1 and all(record.get("kernels") for record in found), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
-def test_a_tcgen05_ring_deeper_than_six_stages_is_no_launchs():
-    """A tcgen05 ring of eight stages (`mosaic.Transport.most_stages`, six), which spilled 16 bytes at every
-    register cap up to 224 (the compile-ahead step's 128 x 64 x 64 pin spilled 64 at 248, row 5358): no
-    launch takes it, a pin of it refused by name as any illegal tile is."""
-    deep = mosaic_gpu.Tiles(128, 64, 64, 8, 1, family='tcgen05')
-    x, w = jnp.ones((256, 512), jnp.bfloat16), jnp.ones((1, 512, 256), jnp.bfloat16)
-    with (generation.assumed("sm100"), generation.chosen(grouped_matmul="mosaic"),
-          tuning.pinned({grouped_matmul.MosaicGmm: deep}), pytest.raises(tuning.Unpinnable)):
-        jax.eval_shape(lambda x, w: gemm.gemm(x, w, jnp.asarray([256], jnp.int32), out_dtype=jnp.bfloat16,
-                                              interpret_on_cpu=True), x, w)
+def test_an_eight_slot_kernel_gradient_compiles_within_its_predicates():
+    """The dense kernel gradient (`mosaic_gpu.tgmm`) on an eight-slot tcgen05 ring (`DEEP`'s second), into
+    fp32 and bf16, compiled by Mosaic for a compile-only B200 through ptxas: no spill, where its ring's
+    per-slot tests held one predicate more than a thread's seven (P2R and STL of the predicate file at every
+    raise to 200, row 5358)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    def case(out_dtype):
+        def call():
+            def product(lhs, rhs, sizes):
+                return mosaic_gpu.tgmm(lhs, rhs, sizes, tiles=DEEP[1], out_dtype=out_dtype,
+                                       multiprocessors=generation.gpu_target("sm100").multiprocessors,
+                                       dense=True)
+
+            return product, (jax.ShapeDtypeStruct((28672, 1024), jnp.bfloat16),
+                             jax.ShapeDtypeStruct((28672, 1024), jnp.bfloat16),
+                             jax.ShapeDtypeStruct((1,), jnp.int32))
+
+        return support.KernelCase(f"tcgen05 tgmm {DEEP[1]} {jnp.dtype(out_dtype).name}", call)
+
+    found = compile_mosaic_kernels([case(jnp.float32), case(jnp.bfloat16)], "sm100")
+    assert len(found) == 2 and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 def test_a_pairs_tile_is_twice_a_ctas_and_takes_only_what_its_views_read():

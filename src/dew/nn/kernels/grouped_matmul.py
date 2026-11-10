@@ -942,9 +942,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
             most = min(most, max(2, steps))
-        # A family fixing its rings' slots streams them whatever the stages (`mosaic.Transport.ring_slots`);
-        # one whose deeper rings spill takes no more than it holds (`mosaic.Transport.most_stages`).
-        most = family.ring_slots or min(most, family.most_stages or most)
+        # A family fixing its rings' slots streams them whatever the stages (`mosaic.Transport.ring_slots`).
+        most = family.ring_slots or most
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
@@ -979,11 +978,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
-        # No deeper ring than its family's launches hold (`mosaic.Transport.most_stages`), a pin or a
-        # tuning neighbour's as the derivation's.
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
-                or not self._divides(ba, config) or config.stages > (family.most_stages or config.stages)
-                or report.refused(self, ba, config)):
+                or not self._divides(ba, config) or report.refused(self, ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
         # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
@@ -1016,7 +1012,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         whole units of its family's tiles where they are not (its depth to the least step,
         `Family.depths`, or a tile's rows where the depth is a tile's; its width to whole column units,
         `Family.column_unit`), the output sliced back; the call itself where they are. A width of 100
-        columns, which no tile divides, so runs on 128, the template's where Triton's masked tiles ran it."""
+        columns, which no tile divides, so runs on 128, the template's where Triton's masked tiles ran it.
+        The padding stands where the loads cannot bound a partial tile: Mosaic GPU's TMA view of a partial
+        dimension is refused ("dimension 1 must have size smaller or a multiple of its tiling 64, but got
+        100", a022d3abb83), which the fork's row 5299 takes; its cost is the padded operands' copy."""
         layouts = self._families(ba, generation.gpu_target())
         if not layouts:
             return ba
@@ -2293,14 +2292,14 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     output = jnp.asarray(portable_projection(x, kernel, group_sizes, dtype, precision, out_dtype))
     work = at_least_fp32(jnp.result_type(output.dtype, x.dtype, kernel.dtype))
     compute = jnp.dtype(dtype) if dtype is not None else jnp.result_type(x.dtype, kernel.dtype)
-    # A symbolic zero tangent contributes no term. Only the others pass the
-    # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.
+    # A symbolic zero tangent contributes no term, so none is formed.
     live = [(name, tangent) for name, tangent in (('x', dx), ('kernel', dkernel))
             if not isinstance(tangent, SymbolicZero)]
     if not live:
         return output, SymbolicZero(jax.typeof(output))
-    # The tangents keep their dtypes to this point whatever produced them, so
-    # an activation's bf16 cotangent is not fused into a wider expression.
+    # The tangents keep their dtypes to this point whatever produced them, so an activation's bf16 cotangent
+    # is not fused into a wider expression: XLA's excess-precision simplification (`SimplifyFPConversions`,
+    # on under `xla_allow_excess_precision`, its default) drops a round trip through bf16 a fusion forms.
     held = dict(zip((name for name, _ in live),
                     jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
                     strict=True))
