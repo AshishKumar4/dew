@@ -8,6 +8,7 @@ the shared memory a program stages at each (`staged_bytes`). The launch takes it
 every run.
 """
 
+import collections
 import dataclasses
 import functools
 import threading
@@ -20,8 +21,14 @@ from dew import _cache
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import report, resources
 
-_DERIVED: dict[Hashable, Hashable] = {}
-"""Each launch's derived config by what its derivation reads (`_derived_once`)."""
+DERIVATIONS_HELD = 4096
+"""The launches' derived configs a process keeps (`_derived_once`), the least recently read dropped past
+them: a model's distinct launches (each call's shapes and dtypes on its target), 182 for a Qwen3.5-4B decode
+step's trace (FS-WALKELIG)."""
+
+_DERIVED: collections.OrderedDict[Hashable, Hashable] = collections.OrderedDict()
+"""Each launch's derived config by what its derivation reads (`_derived_once`), the least recently read
+first."""
 
 _DERIVED_GUARD = threading.Lock()
 
@@ -38,10 +45,15 @@ def _derived_once(derive: Callable) -> Callable:
                _cache.ALGEBRA.value, _cache.KERNEL_CHOICES.value)
         with _DERIVED_GUARD:
             if key in _DERIVED:
+                _DERIVED.move_to_end(key)
                 return _DERIVED[key]
         config = derive(self, ba, target)
         with _DERIVED_GUARD:
-            return _DERIVED.setdefault(key, config)
+            config = _DERIVED.setdefault(key, config)
+            _DERIVED.move_to_end(key)
+            while len(_DERIVED) > DERIVATIONS_HELD:
+                _DERIVED.popitem(last=False)
+            return config
 
     return derived
 
