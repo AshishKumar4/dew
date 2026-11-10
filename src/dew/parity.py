@@ -19,7 +19,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew._accuracy import distance
 from dew.parity_stages import staged_units
 
 FACTOR = 2.0
@@ -615,7 +614,8 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     truth = np.asarray(truth, np.float64)
     if truth.ndim < 2:
         return np.zeros(0), np.zeros(0)
-    return _row_sizes(truth, terms)[1], _rows_rms(np.asarray(value, np.float64) - truth, truth.shape[-1])
+    held = None if terms is None else np.asarray(terms, np.float64)
+    return _row_sizes(truth, held)[1], _rows_rms(np.asarray(value, np.float64) - truth, truth.shape[-1])
 
 
 def _rows_rms(values, width: int) -> np.ndarray:
@@ -623,14 +623,22 @@ def _rows_rms(values, width: int) -> np.ndarray:
     return _scaled_rms(np.reshape(values, (-1, width)))
 
 
-def _row_sizes(truth: np.ndarray, terms=None) -> tuple[np.ndarray, np.ndarray]:
-    """A truth leaf's rows, of rank two or more: each row's own RMS, and its size as `row_errors` reads
-    it, the RMS (or, with `terms`, the larger of it and its terms') where it is past RESOLUTION of the
-    leaf, else zero."""
-    own = _rows_rms(truth, truth.shape[-1])
-    sized = own if terms is None else np.maximum(own, _rows_rms(terms, truth.shape[-1]))
-    leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
-    return own, np.where(sized > RESOLUTION * leaf, sized, 0.0)
+def _row_sizes(truth, terms=None, *, xp=np) -> tuple:
+    """A float64 truth leaf's rows, of rank two or more: each row's own RMS (`_scaled_rms`), and its size,
+    the RMS or, with the leaf's float64 `terms` (`float64_terms`), the larger of it and its terms' RMS,
+    where that is past RESOLUTION of the leaf's size, else zero. The leaf's size is taken as its rows' are:
+    its RMS, or with terms the larger of it and its terms' RMS, so a row sized by what it sums is held
+    against a leaf sized by what it sums (the owner's 10-29 decision, ledger 2442: check 1 sizes by terms
+    as the one-draw rule's `row_errors` does). The gate's one sizing of a row: one draw's (`row_errors`)
+    and check 1's own (`_truth_rows`), in NumPy or in `xp`, where a draw's leaves live."""
+    rows = truth.reshape(-1, truth.shape[-1])
+    own, leaf = _scaled_rms(rows, xp), xp.sqrt(xp.mean(xp.square(truth)))
+    if terms is None:
+        return own, xp.where(own > RESOLUTION * leaf, own, 0.0)
+    sized = xp.maximum(own, _scaled_rms(terms.reshape(rows.shape), xp))
+    leaf = xp.maximum(leaf, xp.sqrt(xp.mean(xp.square(terms))))
+    return own, xp.where(sized > RESOLUTION * leaf, sized, 0.0)
+
 
 NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 
@@ -765,22 +773,16 @@ def _laid(leaf, xp):
 
 
 def _truth_rows(truths, terms, *, xp):
-    """Each truth leaf's rows' own RMS (`_scaled_rms`) and size, the larger of it and its terms' RMS
-    where `terms` holds the leaf's float64 terms, the RMS past RESOLUTION of the leaf's own RMS, else zero;
-    and whether its every value is finite. A leaf of rank under two has no rows."""
+    """Each truth leaf's rows' own RMS and size (`_row_sizes`, with the leaf's float64 terms where `terms`
+    holds them), and whether its every value is finite. A leaf of rank under two has no rows."""
     found = []
     for truth, term in zip(truths, terms, strict=True):
         truth = _laid(truth, xp)
-        width = _width(truth)
-        if not width:
+        if not _width(truth):
             found.append((np.zeros(0), np.zeros(0), xp.isfinite(truth).all()))
             continue
-        rows = truth.reshape(-1, width)
-        own = _scaled_rms(rows, xp)
-        sized = own if term is None else xp.maximum(
-            own, _scaled_rms(xp.abs(_laid(term, xp)).reshape(rows.shape), xp))
-        resolved = RESOLUTION * xp.sqrt(xp.mean(xp.square(truth)))
-        found.append((own, xp.where(sized > resolved, sized, 0.0), xp.isfinite(truth).all()))
+        own, sizes = _row_sizes(truth, None if term is None else _laid(term, xp), xp=xp)
+        found.append((own, sizes, xp.isfinite(truth).all()))
     return found
 
 
