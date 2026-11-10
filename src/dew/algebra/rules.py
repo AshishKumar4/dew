@@ -161,6 +161,28 @@ def product_magnitude(left: tuple, right: tuple, length) -> tuple[list, i64]:
     return facts + more, power + other + length
 
 
+def shared_factored(t: Term, x: Term, y: Term, shared: Term, params, summed, *, combined: str, side: str,
+                    length: tuple[list, i64]) -> tuple[list, list]:
+    """Two products of one shared operand summed, as the summed operands' one product with it: `x @ shared
+    (+|-) y @ shared` as `(x (+|-) y) @ shared` (the shared operand on the `right`), or `shared @ x (+|-)
+    shared @ y` as `shared @ (x (+|-) y)` (on the `left`); `combined` the sum's operation. Its facts and its
+    actions, the one declaration of the identity and of what makes it safe, which each rule set that factors
+    takes and adds its own guards to (the linear set's plain products, the carried set's matrices that read
+    the state): the summands of one shape, and the new sum and its contraction with the shared operand each
+    under the program's reach (`dominated`), the contraction of `length`'s power (its facts and its
+    variable: what each of the two products it replaces contracts). The new sum states its magnitude
+    (`made`)."""
+    def product(operand: Term) -> Term:
+        return operand.dot(shared, params) if side == "right" else shared.dot(operand, params)
+
+    facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
+    new = x.binary(combined, y, summed)
+    bounds, contracted = product_magnitude(([], power), magnitude(shared, "shared"), length[1])
+    return ([eq(t).to(product(x).binary(combined, product(y), summed)), eq(shape(x)).to(shape(y)), *facts,
+             *dominated(power, "new"), *length[0], *bounds, *dominated(contracted, "factored")],
+            [union(t).with_(product(new)), *made(new, power)])
+
+
 type Draw = Callable[[int], tuple[jax.Array, ...]]
 """A rewrite's operands by seed."""
 
@@ -395,15 +417,6 @@ def _linear() -> tuple[RuleFamily, ...]:
             (lambda x, y, a: jnp.dot(x, y.T) * 0.5, moved, _ROWS)))
     facts, power = summed_magnitude(magnitude(x, "x"), magnitude(y, "y"))
     new = x.binary("add", y, added)
-    # A shared operand factored out of two contractions: the summed operand and its contraction with the
-    # shared one each under the program's reach.
-    shared_bound = var("shared_bound", i64)
-    shared_length = var("shared_length", i64)
-    def factored(product: Term) -> tuple:
-        # The factored contraction contracts what `product`, one of the two it replaces, does.
-        return (eq(shared_bound).to(log2_bound(a)), eq(shared_length).to(contracted_length(product)),
-                *dominated(power + shared_bound + shared_length, "factored"))
-
     families += [
         RuleFamily("distributivity", (rule(
             eq(t).to(a.binary("mul", x, multiplied).binary("add", a.binary("mul", y, multiplied), added)),
@@ -411,20 +424,20 @@ def _linear() -> tuple[RuleFamily, ...]:
             *dominated(power, "new")).then(
             union(t).with_(a.binary("mul", new, multiplied)), *made(new, power)),),
             (lambda x, y, a: a * x + a * y, lambda x, y, a: a * (x + y), _ROWS)),
-        RuleFamily("a shared left operand out of two products", (rule(
-            eq(t).to(a.dot(x, multiplied).binary("add", a.dot(y, multiplied), added)),
-            eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
-            *dominated(power, "new"), *factored(a.dot(x, multiplied))).then(
-            union(t).with_(a.dot(new, multiplied)), *made(new, power)),),
-            (lambda x, y, a: jnp.dot(a, x.T) + jnp.dot(a, y.T), lambda x, y, a: jnp.dot(a, (x + y).T),
-             _ROWS)),
-        RuleFamily("a shared right operand out of two products", (rule(
-            eq(t).to(x.dot(a, multiplied).binary("add", y.dot(a, multiplied), added)),
-            eq(shape(x)).to(shape(y)), plain(multiplied), plain(added), *facts,
-            *dominated(power, "new"), *factored(x.dot(a, multiplied))).then(
-            union(t).with_(new.dot(a, multiplied)), *made(new, power)),),
-            (lambda x, y, a: jnp.dot(x, a.T) + jnp.dot(y, a.T), lambda x, y, a: jnp.dot(x + y, a.T), _ROWS)),
     ]
+    # A shared operand factored out of two contractions (`shared_factored`), each product in its operands'
+    # dtype; the factored contraction contracts what either of the two it replaces does.
+    shared_length = var("shared_length", i64)
+    for side, replaced, written in (
+            ("left", a.dot(x, multiplied),
+             (lambda x, y, a: jnp.dot(a, x.T) + jnp.dot(a, y.T), lambda x, y, a: jnp.dot(a, (x + y).T))),
+            ("right", x.dot(a, multiplied),
+             (lambda x, y, a: jnp.dot(x, a.T) + jnp.dot(y, a.T), lambda x, y, a: jnp.dot(x + y, a.T)))):
+        conditions, actions = shared_factored(
+            t, x, y, a, multiplied, added, combined="add", side=side,
+            length=([eq(shared_length).to(contracted_length(replaced))], shared_length))
+        families.append(RuleFamily(f"a shared {side} operand out of two products", (
+            rule(*conditions, plain(multiplied), plain(added)).then(*actions),), (*written, _ROWS)))
     facts, power = magnitude(x, "x")
     length = var("length", i64)
     sum_of = x.reduce("sum", axes, summed)

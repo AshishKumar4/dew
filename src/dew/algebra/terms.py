@@ -291,12 +291,20 @@ class Region[Node: (Term, Skeleton)]:
     """Each product's parameters' index (`Term.dot`'s), its operands' dtypes (a rule's product its own's)."""
     literal_keys: frozenset[Hashable] = frozenset()
     """Each literal's term's key (`literals`' terms)."""
+    indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
+    """Each interned entry of `params` by what makes two entries one (`interned`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
         self.extents = {}
         for term, extent in self.shapes:
             self.extents.setdefault(key(term), extent)
+
+    def interned(self, primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
+        """The index of `primitive` at `values` in the region's table (`params`), added where it holds none
+        (`_interned`): a rule set's own parameters (a transposed product's plain one) by the rule the
+        region's equations were interned by."""
+        return _interned(self.params, self.products, self.indexed, primitive, values, operands)
 
     def shape(self, term: Node) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
@@ -327,6 +335,21 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     if not isinstance(term, RuntimeExpr):
         raise TypeError(f"{term!r} is no egglog term")
     return term.__egg_typed_expr__
+
+
+def _interned(params: list, products: dict, indexed: dict, primitive: jcore.Primitive, values: Mapping,
+              operands: tuple | None = None) -> int:
+    """The index of `primitive` at `values` in a region's table `params`, added where it holds none: two
+    entries are one where their primitive and parameters are (`parameters_key`) and, of a product, its
+    `operands`' dtypes too, which key its mode (`cost.work`) and are kept in `products`. The one interning
+    of a region's parameters, while it is built (`_region`) and after (`Region.interned`)."""
+    entry = (*parameters_key(primitive, values), operands)
+    if entry not in indexed:
+        indexed[entry] = len(params)
+        params.append((primitive, dict(values)))
+        if operands is not None:
+            products[indexed[entry]] = operands
+    return indexed[entry]
 
 
 def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.Primitive, Hashable]:
@@ -500,15 +523,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
 
     products: dict[int, tuple[np.dtype | None, ...]] = {}
 
-    def param(primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
-        # A product's operands' dtypes key its parameters too, its mode's (`cost.work`).
-        key = (*parameters_key(primitive, values), operands)
-        if key not in indexed:
-            indexed[key] = len(params)
-            params.append((primitive, dict(values)))
-            if operands is not None:
-                products[indexed[key]] = operands
-        return indexed[key]
+    param = functools.partial(_interned, params, products, indexed)
 
     env: dict[jcore.Var, Node] = {}
     dtypes: dict[Hashable, np.dtype] = {}
@@ -593,7 +608,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
-                  frozenset(key(forms.literal(index)) for index in range(len(literals))))
+                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed)
 
 
 BOUNDED = _symbols(lambda operation: operation.bounded)

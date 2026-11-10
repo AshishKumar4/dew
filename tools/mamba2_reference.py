@@ -310,8 +310,8 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
     `WEIGHED`'s, recorded whole with the weighed check's seeds and each draw's rounding scale, the
     reference's float64 run with every operation tapped (`rounding_scale`) in float32's unit."""
     import jax
-    from recorded_references import record_case
-    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+    from recorded_references import held_to_the_oracle, record_case
+    from reference_error import chain_roundings, widened
 
     exact_run = jax.jit(lambda inputs: twin(site, inputs))
     with jax.enable_x64(new_val=True):
@@ -322,11 +322,7 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
             narrow = reference(site, inputs, torch.float32)
             with float64():
                 exact = reference(site, inputs, torch.float64)
-        with jax.enable_x64(new_val=True):
-            found = jax.tree.map(np.asarray, exact_run(widened(inputs)))
-        for name, value in exact.items():
-            assert_computes_the_oracle(found[name], value, f"transformers float64 {site} {name}",
-                                       roundings=roundings)
+        held_to_the_oracle(exact_run, inputs, exact, roundings, f"transformers {site}")
         return narrow, exact
 
     def scale(inputs, seed):
@@ -407,8 +403,8 @@ def write_interop() -> None:
     import jax
     import jax.numpy as jnp
     import ssd_support as support
-    from recorded_references import provenance, record_case, save
-    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+    from recorded_references import held_to_the_oracle, provenance, record_case, save
+    from reference_error import chain_roundings, widened
 
     from _dew_torch.precision import float64_twin
 
@@ -432,10 +428,7 @@ def write_interop() -> None:
     def evaluate(inputs):
         with float64():
             exact = logits(twin, inputs)
-        with jax.enable_x64(new_val=True):
-            found = np.asarray(exact_run(widened(inputs))["logits"])
-        assert_computes_the_oracle(found, exact["logits"], "transformers float64 interop logits",
-                                   roundings=roundings)
+        held_to_the_oracle(exact_run, inputs, exact, roundings, "transformers interop")
         return logits(narrow, inputs), exact
 
     stored = record_case("interop", support.mamba2_interop_draw, evaluate, store_inputs=False, summary=True,

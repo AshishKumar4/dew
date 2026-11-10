@@ -56,17 +56,25 @@ class Format:
         return (2.0 - 2.0 ** (1 - self.precision)) * 2.0 ** self.emax
 
 
-FLOAT32 = Format("float32", 24, -126, 127)
-BFLOAT16 = Format("bfloat16", 8, -126, 127)
-FORMATS = {"float32": FLOAT32, "bfloat16": BFLOAT16}
-TFLOAT32 = Format("tfloat32", 11, -126, 127)
-"""TF32: fp32's range at 11 bits, the operands a GPU's tensor cores multiply fp32 products in at the default
-precision (src/dew/nn/kernels/templates/product.py); no array holds it, so it is no dtype's (FORMATS)."""
-FLOAT16 = Format("float16", 11, -14, 15)
-"""fp16, a 16-bit product's operand beside bf16 (the recurrence inverse's merges): not a format whose
-lanes the certifier measures (`FORMATS`)."""
 DTYPES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16, "float16": np.float16}
 """Each format's NumPy type, by name."""
+
+
+def _stated(name: str) -> Format:
+    """The format of `name`'s dtype as the dtype states it (`ml_dtypes.finfo`: its significand's bits
+    beside the leading one, its least normal exponent, and one past its greatest)."""
+    stated = ml_dtypes.finfo(DTYPES[name])
+    return Format(name, stated.nmant + 1, stated.minexp, stated.maxexp - 1)
+
+
+FLOAT32, BFLOAT16, FLOAT16 = (_stated(name) for name in DTYPES)
+"""fp32 and bf16, the formats whose lanes the certifier measures (`FORMATS`), and fp16, a 16-bit product's
+operand beside bf16 (the recurrence inverse's merges), which is none of them."""
+FORMATS = {"float32": FLOAT32, "bfloat16": BFLOAT16}
+TFLOAT32 = Format("tfloat32", 11, FLOAT32.emin, FLOAT32.emax)
+"""TF32: fp32's range at 11 bits, the operands a GPU's tensor cores multiply fp32 products in at the default
+precision (src/dew/nn/kernels/templates/product.py); no array holds it, so it is no dtype's (FORMATS) and
+its precision is declared here."""
 
 
 def two_sum(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
