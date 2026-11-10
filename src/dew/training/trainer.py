@@ -184,7 +184,7 @@ from dew.training.planning import (
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
-from dew.training.runtime import Preempted, PreemptionNotice, ready_process
+from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched
@@ -1313,22 +1313,25 @@ class Trainer(Generic[Loss, Effects]):
         # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
         # owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
-        try:
-            # A run handed a step compiled ahead runs every program compiled with it as compiled (`_taking`).
-            with self._taking():
-                trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state,
-                                              resume)
-            # The state a checkpoint would hold: the step rebuilds its narrow copies.
-            trained = dataclasses.replace(trained, compute=None)
-            # Whether this fit trained or found the run complete, inside the lifecycle, so a selection
-            # that fails is the run's outcome.
-            if plan.restore_best and run.preempted is None:
-                trained = self._best_model(trained, run)
-        finally:
-            primary = sys.exception()
-            error = self._closed(run, primary, profiler)
-            if primary is None and error is not None:
-                raise error
+        # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`).
+        with signal_wake():
+            try:
+                # A run handed a step compiled ahead runs every program compiled with it as compiled
+                # (`_taking`).
+                with self._taking():
+                    trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state,
+                                                  resume)
+                # The state a checkpoint would hold: the step rebuilds its narrow copies.
+                trained = dataclasses.replace(trained, compute=None)
+                # Whether this fit trained or found the run complete, inside the lifecycle, so a selection
+                # that fails is the run's outcome.
+                if plan.restore_best and run.preempted is None:
+                    trained = self._best_model(trained, run)
+            finally:
+                primary = sys.exception()
+                error = self._closed(run, primary, profiler)
+                if primary is None and error is not None:
+                    raise error
         if run.preempted is not None:
             raise Preempted(run.preempted)
         # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on

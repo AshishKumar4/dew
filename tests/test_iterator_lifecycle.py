@@ -669,6 +669,41 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
         stopped.set()
 
 
+def test_a_fit_inside_an_asyncio_loop_leaves_the_loop_its_signals(tmp_path):
+    """A fit run inside an asyncio loop on the main thread takes the loop's wakeup fd for its waits on the
+    data's workers (`dew.training.runtime.signal_wake`) and hands every signal it took to the loop's: the
+    loop's own handler runs once the fit returns, and the loop's fd is set again, as it was."""
+    import asyncio
+
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0))
+    heard = []
+
+    class Signalling(Source):
+        def __next__(self):
+            if self.position == 1:
+                os.kill(os.getpid(), signal.SIGUSR1)
+            return super().__next__()
+
+    async def fitted():
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGUSR1, lambda: heard.append(signal.SIGUSR1))
+        try:
+            own = signal.set_wakeup_fd(-1)
+            signal.set_wakeup_fd(own)
+            trainer.fit(Loader(lambda partition: Signalling(), None, None, 8), steps=3)
+            after = signal.set_wakeup_fd(-1)
+            signal.set_wakeup_fd(after)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return own, after
+        finally:
+            loop.remove_signal_handler(signal.SIGUSR1)
+
+    own, after = asyncio.run(fitted())
+    assert own != -1 and after == own
+    assert heard == [signal.SIGUSR1]
+
+
 @pytest.mark.parametrize("host", [False, True])
 def test_wrapped_cancellation_reaches_source_during_finalization(host):
     entered, stopped, closed = threading.Event(), threading.Event(), threading.Event()

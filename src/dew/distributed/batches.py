@@ -318,16 +318,6 @@ def restore_position(source: Checkpointable, saved: bytes) -> None:
     source.set_state(saved if isinstance(source.get_state(), bytes) else json.loads(saved))
 
 
-SIGNAL_WAKE_SECONDS = 0.1
-"""How often a wait of the main thread on the prefetch worker (`DevicePrefetchIterator._waited`) wakes and
-waits again. CPython runs a signal's handler only when the main thread executes bytecode, and a signal that
-trips as that thread enters a native lock wait leaves the wait uninterrupted: a Ctrl-C during a source's
-restore, which the worker holds until fit unwinds and asks it to stop, was never delivered (6 of 200
-runs of tests/test_iterator_lifecycle.py's restore case, rows 5215 and 5229), as PyTorch's DataLoader
-waits on its workers for the same reason. A tenth of a second bounds how late a Ctrl-C is felt; the wait
-gives up nothing."""
-
-
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -438,7 +428,7 @@ class DevicePrefetchIterator:
         first = not self._stop.is_set()
         self._stop.set()
         with self._ready:
-            self._ready.notify_all()
+            self._notify()
         if first:
             self._stop_source()
 
@@ -485,7 +475,7 @@ class DevicePrefetchIterator:
                 if not self._placing:
                     with self._ready:
                         self._first = batch
-                        self._ready.notify_all()
+                        self._notify()
                         self._ready.wait_for(lambda: self._stop.is_set() or self._placing)
                         self._first = None
                     if self._stop.is_set():
@@ -501,13 +491,13 @@ class DevicePrefetchIterator:
                 finally:
                     with self._ready:
                         self._placing_now = False
-                        self._ready.notify_all()
+                        self._notify()
                 batch = None
                 with region("data.enqueue"), self._ready:
                     self._ready.wait_for(lambda: self._stop.is_set() or len(self._queued) < self._depth)
                     if not self._stop.is_set():
                         self._queued.append((placed, state))
-                        self._ready.notify_all()
+                        self._notify()
                 placed = state = read = None
         except StopIteration:
             # A drained source is how a prefetch thread ends; the finally
@@ -534,7 +524,7 @@ class DevicePrefetchIterator:
                     self._discard()
                 with self._ready:
                     self._done.set()
-                    self._ready.notify_all()
+                    self._notify()
 
     @contextlib.contextmanager
     def held(self) -> Iterator[None]:
@@ -557,7 +547,7 @@ class DevicePrefetchIterator:
         finally:
             with self._ready:
                 self._holds -= 1
-                self._ready.notify_all()
+                self._notify()
 
     def read_held(self) -> Batch:
         """The next batch, read by a block that holds this iterator's placements (`held`): the hold is
@@ -566,7 +556,7 @@ class DevicePrefetchIterator:
         (`dew.training.rollout.rolled_out`)."""
         with self._ready:
             self._holds -= 1
-            self._ready.notify_all()
+            self._notify()
         try:
             return next(self)
         finally:
@@ -578,7 +568,7 @@ class DevicePrefetchIterator:
         """Drop every batch already queued, without waiting for more."""
         with self._ready:
             self._queued.clear()
-            self._ready.notify_all()
+            self._notify()
 
     def close(self, *, timeout: float | None = None) -> None:
         """Stop the worker and wait for it, discarding unread batches but keeping `source_state`.
@@ -654,7 +644,7 @@ class DevicePrefetchIterator:
             raise StopIteration
         with self._ready:
             self._placing = True
-            self._ready.notify_all()
+            self._notify()
         self._start()
         with self._ready:
             self._waited(lambda: self._queued or self._done.is_set() or self._stop.is_set())
@@ -662,18 +652,33 @@ class DevicePrefetchIterator:
                 raise StopIteration
             if self._queued:
                 batch, position = self._queued.popleft()
-                self._ready.notify_all()
+                self._notify()
                 self.source_state = position
                 return batch
         self._raise_ended()
         raise StopIteration
 
     def _waited(self, ready: Callable[[], object]) -> None:
-        """Wait, holding `_ready`, until `ready()` holds: a consumer's wait on the worker, which the main
-        thread waits in, woken every `SIGNAL_WAKE_SECONDS` to run a signal's handler there and waiting
-        again. Nothing but `ready()` ends it."""
-        while not self._ready.wait_for(ready, timeout=SIGNAL_WAKE_SECONDS):
-            pass
+        """Wait, holding `_ready`, until `ready()` holds: a consumer's wait on the worker. On the main
+        thread under a fit's `SignalWake` it waits there, so a signal ends the wait and its handler runs
+        (rows 5215, 5229); elsewhere on the condition."""
+        # Read when waited on: dew.training, which owns the process's signals, imports this module.
+        from dew.training.runtime import installed
+
+        wake = installed()
+        if wake is None or threading.current_thread() is not threading.main_thread():
+            self._ready.wait_for(ready)
+        else:
+            wake.wait(self._ready, ready)
+
+    def _notify(self) -> None:
+        """Wake every wait on the worker, holding `_ready` (`_waited`): the condition's and a main thread's
+        `SignalWake`."""
+        from dew.training.runtime import installed
+
+        self._ready.notify_all()
+        if (wake := installed()) is not None:
+            wake.notify()
 
     def _raise_ended(self) -> None:
         """Raise the worker's error, now it has ended with every batch it published read, if it had
