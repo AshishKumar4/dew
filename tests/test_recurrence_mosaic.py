@@ -1312,17 +1312,19 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
 
 
 @COMPILES_ON_CPU
-def test_each_launchs_producer_lowers_its_registers_as_its_model_states_on_a_b200_spilling_none():
-    """The gated delta rule's 16-bit training pass on a B200's tcgen05 bundle, compiled by Mosaic on this CPU
-    (`compiled_cases`): each launch's producer warpgroup lowers its registers in its PTX (`setmaxnreg.dec`)
-    to what its register model states (`RegisterModel.producer`, its plan's `Launch.producer`), a launch's
-    plan and its schedule one fact, and no kernel spills: the states, solve and reverse walk's producers
-    spilled at the default 24 (52, 164 and 40 bytes; none from 40, 32 and 72, jsf-pfloor-ab, row 5357), the
-    states launch planned at 48 and run at 24 (the promotion's review)."""
+@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
+def test_each_launchs_producer_lowers_its_registers_as_its_model_states_on_a_b200_spilling_none(training):
+    """The gated delta rule's 16-bit forward and training pass on a B200's tcgen05 bundle, compiled by Mosaic on
+    this CPU (`compiled_cases`): each launch's producer warpgroup lowers its registers in its PTX
+    (`setmaxnreg.dec`) to what its register model states (`RegisterModel.producer`, its plan's
+    `Launch.producer`), a launch's plan and its schedule one fact, and no kernel spills: the states, solve,
+    reverse walk's and the forward's one walk's producers spilled at the default 24 (52, 164, 40 and 52 bytes;
+    none from 40, 32, 72 and 80, jsf-pfloor-ab and armada 20261110172902-73ad9c43, row 5357), the states
+    launch planned at 48 and run at 24 (the promotion's review)."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     plans, apart = {}, {}
-    group = ('qwen3.5-27b-gdn', jnp.bfloat16, True, False, None)
+    group = ('qwen3.5-27b-gdn', jnp.bfloat16, training, False, None)
     found = compile_mosaic_kernels(compiled_cases('sm100', plans, [], apart, only=group), 'sm100')
     assert mosaic_failures(found) == []
 

@@ -2144,10 +2144,12 @@ def stated_producer(call: Call, registers: int) -> int | None:
 
 def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     """What `_scan`'s consumer thread holds: `_states`' memory and prefix vectors carried (`_states_held`),
-    beside the chunk's prefix as a column's vectors and its write gates; its step's phase; and the output's
-    phase beside the memory: the corrected values and the output's fp32 sum, the chunk's own pairs' scores,
-    their decays' two terms and their masks (an fp32 call's split into parts), and one product's fragments
-    at a time, the scores', the memory's and the local one's issuing in turn."""
+    beside the chunk's prefix as a column's vectors and its write gates; its step's phase; the chunk's own
+    pairs' scores, their decays' two terms and their masks (an fp32 call's split into parts), staged before
+    the output's products issue; and the output's phase beside the memory: the corrected values and the
+    output's fp32 sum, one product's fragments at a time, the memory's and the local one's issuing in turn.
+    Stated in one phase with the output's, the scores held a B200's unrounded write gate cell at 256 registers
+    a 32-column block, no program, where the walk compiles spilling none (224 apart; row 5355)."""
     chunk = call.chunk
     held, given = call.held, call.given
     states = _states_held(call, values, keys, bv)
@@ -2161,7 +2163,7 @@ def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     # the inverse's product.
     applied = [f32(chunk, bv)] * 2 + products if call.delta else []
     return Held(carried=[*states.carried, f32(chunk, 1)],
-                phases=(*states.phases, applied, [f32(chunk, bv)] * 2 + scores + products))
+                phases=(*states.phases, applied, scores + products, [f32(chunk, bv)] * 2 + products))
 
 
 @lowered_once
@@ -2194,6 +2196,10 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
     assert delta == call.delta, "the delta rule's walk corrects its values from the chunks' inverses"
     values = keys = call.given
     skipped = int(skip is not None)
+    # Its producer's floor (`stated_producer`): 80, its loads spilling at 24 to 64 (52 bytes on a B200's
+    # 27B GDN and Nemotron-H 4B SSD forwards), 16 at 72, none at 80 (rows 5357 and 5355, armada
+    # 20261110172539-d12d4eb1 and 20261110172902-73ad9c43).
+    producer = stated_producer(call, 80)
 
     def program(at, q_ref, k_ref, a_ref, v_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
                 streams, staging, landing):
@@ -2270,11 +2276,12 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
                       prefetch=prefetch, landing=lambda role: roled(role)[1].get("final"), walkers=walkers,
+                      producer=producer,
                       table=taken_by(table, table_refs, stored_ref, call, h, lambda role: walked + role * bv,
                                      bv, row, lambda role: roled(role)[1].get("table")))
 
     launched = _scan_launched(program, call, tiles, out_dtype, sequences=sequences.shape[0], batch=batch,
-                              table=table)(
+                              table=table, producer=producer)(
         q, k, k if a is None else a, v, hi, lo, beta, h0, sequences, taken,
         *(() if skip is None else (skip.astype(jnp.float32),)), *(() if table is None else table.operands))
     # The output and final memories; a forked call's stored slots no caller reads.
@@ -2301,7 +2308,7 @@ def _scan_corrected(call: Call, slots, tile, bv: int, state, prefix: tuple, beta
 
 
 def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: int, batch: int,
-                   table: Table | None):
+                   table: Table | None, producer: int | None):
     """`_scan`'s `program` launched (`launch_kernel`): its streams (the inverse under the delta rule, the
     queries, keys and a role's values a chunk), the entering memories' once-streams, its staging tiles and
     landings (a stored slot's, `table_landing`), its work over the laid sequences' mean of chunks, its
@@ -2339,6 +2346,7 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
                          live=lambda at, refs: refs[8][at["sequences"], 1] > 0, work=work,
                          consumers=walkers, staging=staging,
                          held=table_held(_scan_held(call, keys, keys, bv), call, table, bv),
-                         once=initials, landing=landing, after=after, reduces=held.parts > 1)
+                         once=initials, landing=landing, after=after, reduces=held.parts > 1,
+                         producer=producer)
 
 
