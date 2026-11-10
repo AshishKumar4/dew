@@ -284,6 +284,25 @@ def _predicted(states: jax.Array, before: jax.Array) -> jax.Array:
     return jnp.take_along_axis(states, at, axis=1)
 
 
+def _finals(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]) -> int:
+    """The trailing slots of the rows `fields` lay out that hold targets alone (`Coordinates.finals`): 1
+    for rows whose ids shift by one. Every slot before them is an input, every slot after the first a
+    target, the one reading of a row's inputs."""
+    laid = laid_coordinates(fields)
+    return 1 if laid is None else laid.finals
+
+
+def _predicted_by_slot(laid: Coordinates | None) -> bool:
+    """Whether each target of rows laid out by `laid` is scored from its predecessor's slot
+    (`Coordinates.predecessors`): where they carry forks or a tail of finals, not where ids shift by one."""
+    return laid is not None and (laid.forks is not None or laid.finals > 1)
+
+
+def _inputs(prepared: ModelInputs) -> ModelInputs:
+    """The rows' inputs: their slots before their finals (`_finals`), with every token field."""
+    return prepared.slice_tokens(stop=-_finals(prepared.token_fields))
+
+
 def _prepared(tokens: ModelInputs | jax.Array, coordinates: Coordinates | None = None,
               block_groups: jax.Array | None = None) -> ModelInputs:
     """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields, their
@@ -653,7 +672,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         segment ids on different rows remain separate documents.
         """
         valid, documents = self._counted_tokens(batch)
-        return self._row_lengths(valid[:, :-1], None if documents is None else documents[:, :-1])
+        finals = _finals(self._token_geometry(batch)[1])
+        return self._row_lengths(valid[:, :-finals], None if documents is None else documents[:, :-finals])
 
     @staticmethod
     def _row_lengths(valid, documents) -> np.ndarray:
@@ -730,7 +750,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         depth_rows = []
         for depth in range(1, model.num_nextn_predict_layers + 1):
             span = valid.shape[1] - 1 - depth
-            admitted = shifted_span(valid.shape, depth, valid=valid, segments=documents, xp=np)[:, :-1]
+            admitted = shifted_span(valid.shape, depth, valid=valid, segments=documents, xp=np)[
+                :, :-_finals(fields)]
             segments = None if documents is None else documents[:, :span]
             scored = self._scored(np, tokens, fields, self._batch_roles(batch, np), depth)
             depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
@@ -764,7 +785,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         lengths = (np.full(context.shape[:1], context.shape[1]) if lengths is None
                    else np.asarray(lengths)).astype(np.int64)
         counted = model.held_cross_flops if held else model.cross_flops
-        return float(counted(np.sum(valid[:, :-1], axis=-1, dtype=np.int64), lengths))
+        inputs = valid[:, :-_finals(self._token_geometry(batch)[1])]
+        return float(counted(np.sum(inputs, axis=-1, dtype=np.int64), lengths))
 
     def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
         """Each row's targets the loss scores at `depth` (`scored_targets`)."""
@@ -902,17 +924,18 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         """
         prepared = _prepared(tokens, coordinates)
         self._refuse_blocks(prepared, depths)
-        inputs, targets = self._rows(prepared.tokens)
-        packing = prepared.slice_tokens(stop=-1).kwargs()
+        inputs, targets = self._rows(prepared)
+        packing = _inputs(prepared).kwargs()
+        finals = _finals(prepared.token_fields)
         params = thaw(params)
         replay = {}
         if routes is not None:
             # The last id is never forwarded, so its row drops with it, from each site's record where the
             # record is keyed by site (`dew.nn.inputs.LayerInputs.experts`).
             routed, covered = routes
-            replay["routed_experts"] = jax.tree.map(lambda record: jnp.asarray(record)[:, :-1], routed)
+            replay["routed_experts"] = jax.tree.map(lambda record: jnp.asarray(record)[:, :-finals], routed)
             if covered is not None:
-                replay["routed"] = jnp.asarray(covered, bool)[:, :-1]
+                replay["routed"] = jnp.asarray(covered, bool)[:, :-finals]
         collections = (([ROUTER_COLLECTION] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
@@ -970,16 +993,16 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return self._depth_scores(params, states, targets, prepared, roles, dtype, table, rows), records
 
     def _predecessors(self, prepared, depths: bool) -> jax.Array | None:
-        """Each target's predecessor's slot among the inputs `[B, seq_len]` where the rows' coordinates carry
-        forks (`Forks.predecessors`), None where they carry none."""
+        """Each target's predecessor's slot among the inputs where the rows' coordinates carry forks or a
+        tail of finals (`Coordinates.predecessors`), None where the ids shift by one."""
         laid = laid_coordinates(prepared.token_fields)
-        if laid is None or laid.forks is None:
+        if not _predicted_by_slot(laid):
             return None
+        assert laid is not None
         if depths or self.adaptation is not None or prepared.token_fields.get(BLOCKS_FIELD) is not None:
             raise ValueError("prediction depths, blocks and in-context steps read a row's tokens in its "
-                             "order, which forks do not lay out; lay the rows whole")
-        assert laid.segments is not None
-        return laid.forks.predecessors(laid.segments)[:, 1:]
+                             "order, which forks and a tail of finals do not lay out; lay the rows whole")
+        return laid.predecessors()[:, 1:]
 
     def _exit_scores(self, params, gathered, targets, losses, before=None):
         """A looped decoder's per-pass losses, each earlier pass's states as its forward gathered them
@@ -1012,7 +1035,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         dtype = at_least_fp32(jnp.dtype(self.model.dtype or jnp.float32))
         weights = self._target_weights(prepared, roles, dtype, rows)
         hidden, adapted = stacked_scores(self.model, params, inputs, targets, weights,
-                                         prepared.slice_tokens(stop=-1).token_fields, adaptation,
+                                         _inputs(prepared).token_fields, adaptation,
                                          predict=predict, logits=logits, train=train, rngs=rngs)
         losses = adapted.losses
         correct = None if adapted.predicted is None else (adapted.predicted == targets).astype(losses.dtype)
@@ -1046,7 +1069,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if self.adaptation is not None:
             # The level steps window by window over these targets, weighted as the loss weighs them.
             adapted = adapted_scores(self.model, params, hidden, targets, weights,
-                                     prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
+                                     _inputs(prepared).token_fields, self.adaptation,
                                      predict=predict, logits=logits)
             return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits, adapted.moved
         if logits:
@@ -1080,7 +1103,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         laid = laid_coordinates(fields)
         return scored_targets(xp, tokens, self.pad_id, mask, documents, depth, roles=roles,
                               role=None if self.loss_role is None else int(self.loss_role),
-                              blocks=fields.get(BLOCKS_FIELD), forks=None if laid is None else laid.forks)
+                              blocks=fields.get(BLOCKS_FIELD),
+                              predecessors=(laid.predecessors(xp=xp)
+                                            if laid is not None and _predicted_by_slot(laid) else None))
 
     def _layer_states(self) -> LayerStates:
         """The model as the reader of its layers' states that a request for `layers` needs."""
@@ -1193,19 +1218,22 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
         A query counts when its token is real (`real_slots`), and not the pad id.
         """
-        real = real_slots(prepared.token_fields, prepared.tokens.shape)[:, :-1]
+        finals = _finals(prepared.token_fields)
+        real = real_slots(prepared.token_fields, prepared.tokens.shape)[:, :-finals]
         if self.pad_id is not None:
-            real = real & (prepared.tokens[:, :-1] != self.pad_id)
+            real = real & (prepared.tokens[:, :-finals] != self.pad_id)
         return real.astype(dtype)
 
-    def _rows(self, tokens) -> tuple[jax.Array, jax.Array]:
-        """Split a `[B, n + 1]` batch into its `n` inputs and their shifted targets, each batch at its
-        own row length, as a schedule's stages lay theirs out, up to the objective's `context`."""
-        if tokens.shape[-1] > self.context + 1:
+    def _rows(self, prepared: ModelInputs) -> tuple[jax.Array, jax.Array]:
+        """Split rows of `n` ids into their inputs, the slots before their finals (`_finals`), and their
+        targets, every slot after the first, each batch at its own row length, as a schedule's stages lay
+        theirs out, its inputs up to the objective's `context`."""
+        tokens, finals = prepared.tokens, _finals(prepared.token_fields)
+        if tokens.shape[-1] - finals > self.context:
             raise ValueError(
-                f"rows of {tokens.shape[-1]} ids hold {tokens.shape[-1] - 1} inputs, more than the "
+                f"rows of {tokens.shape[-1]} ids hold {tokens.shape[-1] - finals} inputs, more than the "
                 f"{self.context}-token context of the objective's seq_len and the model's max_seq_len")
-        return tokens[:, :-1], tokens[:, 1:]
+        return tokens[:, :-finals], tokens[:, 1:]
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
@@ -1432,7 +1460,7 @@ class LMObjective(TokenScorer):
         if not self._warmup:
             return super().scored_tokens(batch)
         valid, _ = self._counted_tokens(batch)
-        return np.sum(valid[:, :-1], axis=-1, dtype=np.int64)
+        return np.sum(valid[:, :-_finals(self._token_geometry(batch)[1])], axis=-1, dtype=np.int64)
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Split the tree as the indexer phase trains it.
@@ -1533,12 +1561,12 @@ class LMObjective(TokenScorer):
         """
         assert self.indexer is not None
         prepared = self._text(batch)
-        inputs, _ = self._rows(prepared.tokens)
+        inputs, _ = self._rows(prepared)
         collections = step.sown(INDEXER_COLLECTION)
         with self._watched(prepared, step.watched is not None):
             _, gathered = self._hidden_states(
                 thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
-                collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs(),
+                collections=collections, packing=_inputs(prepared).kwargs(),
                 progress=self.progress(step))
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": kl}

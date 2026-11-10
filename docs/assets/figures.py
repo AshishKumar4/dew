@@ -304,7 +304,7 @@ def post_training_figure():
             ("SFT", "Chat", ["conversations, rendered by", "the chat template"],
              "text, text_roles", ["[B, L + 1]"], "LMObjective", ["loss_role=Role.ASSISTANT"]),
             ("DPO", "Preferences", ["chosen, rejected and", "their completion masks"],
-             "input_ids", ["completion_mask, halves", "windows [B, 2S + 1]"], "DPOObjective",
+             "input_ids", ["completion_mask, halves", "windows [B, 2S + finals]"], "DPOObjective",
              ["policy against the frozen", "reference in TrainState.ema"]),
             ("GRPO", "Prompts", ["left-padded prompt,", "prompt_length, reward fields"],
              "PolicyCollector → pack", ["G completions per prompt,", "reward → advantages"],
