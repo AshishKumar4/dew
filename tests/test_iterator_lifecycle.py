@@ -640,14 +640,16 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
     trainer.fit(Loader(lambda partition: Source(), None, None, 8), steps=1)
-    entered, stopped = threading.Event(), threading.Event()
+    stopped = threading.Event()
 
     class Restoring(Source):
         restoring = False
 
         def set_state(self, state):
             self.restoring = True
-            entered.set()
+            # Interrupted as restoration begins, however long the run took to reach it (rows 5215, 5229: a
+            # sender that gave up waiting for it sent nothing on a loaded host, and the restore waited on).
+            os.kill(os.getpid(), signal.SIGINT)
             stopped.wait()
             super().set_state(state)
             self.restoring = False
@@ -660,13 +662,6 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
             super().close()
 
     source = Restoring()
-
-    def interrupt():
-        if entered.wait(10):
-            os.kill(os.getpid(), signal.SIGINT)
-
-    sender = threading.Thread(target=interrupt)
-    sender.start()
     try:
         with pytest.raises(KeyboardInterrupt):
             trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
@@ -675,7 +670,6 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
         assert source.owners[0] != threading.get_ident()
     finally:
         stopped.set()
-        sender.join(10)
 
 
 @pytest.mark.parametrize("host", [False, True])
