@@ -322,9 +322,13 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
             jnp.asarray(arrays["pipeline.context"]), jnp.asarray(arrays["pipeline.pooled"]),
             guidance=jnp.full((2,), pipeline_record["default_guidance"], jnp.float32))
     times = jnp.asarray([500.0, 100.0])
-    trained = loaded.model.apply({"params": state.variables["params"]}, latent, times, condition)
-    reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
-    np.testing.assert_array_equal(reloaded, trained)
+
+    def compiled(model, params):
+        """`model`'s forward under `params` at the pipeline's times and condition, compiled whole."""
+        return jax.jit(lambda drawn: model.apply({"params": params}, drawn, times, condition))
+
+    forward = compiled(loaded.model, state.variables["params"])
+    np.testing.assert_array_equal(compiled(again.model, again.variables["params"])(latent), forward(latent))
 
     # Diffusers' own classes read the export: every component cleanly, the
     # pipeline whole, and its transformer recomputes the trained forward on
@@ -334,8 +338,6 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     from tools import diffusers_consumer as consumer
 
     consumer.assert_components_load(export)
-    forward = jax.jit(lambda drawn: loaded.model.apply({"params": state.variables["params"]}, drawn, times,
-                                                       condition))
 
     def draw(seed):
         """A latent of the pipeline's shape, its values drawn."""
