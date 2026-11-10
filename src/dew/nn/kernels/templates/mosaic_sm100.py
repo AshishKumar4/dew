@@ -368,10 +368,6 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
     takes_pairs = False
 
-    # Eight stages spilled 16 bytes at every cap to 224 where two to six held at 64-80 registers, a
-    # 128 x 64 x 64 kernel gradient's, split or not (the GEMM compile gate's caps, EM-s8).
-    most_stages = 6
-
     takes_register_left = False
 
     takes_block_scales = True
