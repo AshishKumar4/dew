@@ -7,7 +7,10 @@ those the caller slices away among them. Interpreted, an output the kernel never
 generic interpreter's `uninitialized_value`, Mosaic GPU's and Mosaic TPU's `uninitialized_memory='nan'`),
 so on finite operands a NaN is an unwritten element."""
 
+from typing import NamedTuple
+
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax._src.pallas import mpmd, pallas_call as pallas_call_module
 from jax.extend import core
@@ -27,12 +30,25 @@ def launched_outputs(function, *args) -> list[tuple[str, list[np.ndarray]]]:
     return found
 
 
-def unwritten(found: list[tuple[str, list[np.ndarray]]]) -> list[str]:
-    """`launched_outputs`' launches with a floating output holding NaN, each with the output's index and how
-    many of its elements: an element the launch never wrote, on finite operands."""
-    return [f"{name} output {index} {output.shape}: {int(np.isnan(output).sum())} unwritten"
+class Unwritten(NamedTuple):
+    """A launch's output holding elements it never wrote (`unwritten`): the launch's name, the output's index
+    and shape, and how many of its elements."""
+    launch: str
+    output: int
+    shape: tuple[int, ...]
+    elements: int
+
+    def __str__(self) -> str:
+        return f"{self.launch} output {self.output} {self.shape}: {self.elements} unwritten"
+
+
+def unwritten(found: list[tuple[str, list[np.ndarray]]]) -> list[Unwritten]:
+    """`launched_outputs`' launches with a floating output holding NaN, bfloat16 and the narrower floats
+    among them (JAX's floating kinds, which NumPy's own hierarchy does not hold), each output with how many
+    of its elements: an element the launch never wrote, on finite operands."""
+    return [Unwritten(name, index, output.shape, int(np.isnan(output).sum()))
             for name, outputs in found for index, output in enumerate(outputs)
-            if np.issubdtype(output.dtype, np.floating) and np.isnan(output).any()]
+            if jnp.issubdtype(output.dtype, jnp.floating) and np.isnan(output).any()]
 
 
 def _evaluated(jaxpr: core.Jaxpr, consts, args, found: list) -> list:
@@ -51,14 +67,14 @@ def _evaluated(jaxpr: core.Jaxpr, consts, args, found: list) -> list:
             found.append((str(label),
                           [np.asarray(jax.device_get(output)) for output in launched]))
             outs = list(launched)
-        elif name in LOOPS and any(_launches(inner) for inner in _bodies(equation)):
+        elif name in LOOPS and any(_launches(inner) for inner in programs.bodies(equation)):
             outs = LOOPS[name](equation, values, found)
         elif (body := programs.called(equation)) is not None:
             # A call runs its program on its operands one for one (`programs.called`): a jit's, a contracted
             # derivative's, a custom rule's, a Mosaic GPU kernel's `custom_vmap_call` around its `mpmd_map`.
             outs = _evaluated(body, body.consts, values, found)
         else:
-            if any(_launches(inner) for inner in _bodies(equation)):
+            if any(_launches(inner) for inner in programs.bodies(equation)):
                 raise NotImplementedError(f"a launch inside {name}'s body, which the audit does not walk "
                                           "(a loop or branch `LOOPS` runs, a call `programs.called` reads)")
             outs = equation.primitive.bind(*values, **equation.primitive.get_bind_params(equation.params))
@@ -119,19 +135,7 @@ LOOPS = {"while": _while, "scan": _scan, "cond": _cond}
 trip, a branch as its index chooses, each launch inside run alone; a launch in any other body is refused."""
 
 
-def _bodies(equation) -> list[core.Jaxpr]:
-    """The jaxprs an equation's parameters hold, closed or open, in tuples too (a branch's)."""
-    found = []
-    for value in equation.params.values():
-        for each in value if isinstance(value, tuple | list) else (value,):
-            if isinstance(each, core.ClosedJaxpr):
-                found.append(each.jaxpr)
-            elif isinstance(each, core.Jaxpr):
-                found.append(each)
-    return found
-
-
 def _launches(jaxpr: core.Jaxpr) -> bool:
     """Whether `jaxpr` runs a launch (`LAUNCHES`), at any depth."""
-    return any(equation.primitive in LAUNCHES or any(_launches(inner) for inner in _bodies(equation))
+    return any(equation.primitive in LAUNCHES or any(_launches(inner) for inner in programs.bodies(equation))
                for equation in jaxpr.eqns)

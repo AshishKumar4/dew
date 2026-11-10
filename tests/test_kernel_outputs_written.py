@@ -245,9 +245,10 @@ def test_the_attention_certify_launch_writes_every_record():
                        query, key, value)
 
 
-def test_an_unwritten_output_is_found():
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_an_unwritten_output_is_found(dtype):
     """The audit's own check: a launch that leaves its second output's last row unwritten is reported, its
-    first output, written whole, is not."""
+    first output, written whole, is not; in bfloat16 too, which NumPy's floating kinds do not hold."""
     from jax.experimental import pallas as pl
 
     def kernel(x_ref, whole_ref, partial_ref):
@@ -255,11 +256,11 @@ def test_an_unwritten_output_is_found():
         partial_ref[:3] = x_ref[:3]
 
     def launch(x):
-        return pl.pallas_call(kernel, out_shape=(jax.ShapeDtypeStruct((4, 8), jnp.float32),) * 2,
+        return pl.pallas_call(kernel, out_shape=(jax.ShapeDtypeStruct((4, 8), dtype),) * 2,
                               interpret=True)(x)[0]
 
-    found = launched_outputs(launch, jnp.ones((4, 8), jnp.float32))
-    assert [line.split(" output ")[1] for line in unwritten(found)] == ["1 (4, 8): 8 unwritten"]
+    found = launched_outputs(launch, jnp.ones((4, 8), dtype))
+    assert [(gap.output, gap.elements) for gap in unwritten(found)] == [(1, 8)]
 
 
 def test_a_launch_inside_a_loop_or_a_branch_is_run_trip_by_trip():
