@@ -1269,13 +1269,19 @@ def test_a_devices_own_target_is_its_kinds_with_the_facts_it_reports():
     resolves for it unassumed: an H100 PCIe its own kind and peaks with the multiprocessors it reports, and an
     sm90 kind the table names no SKU of its own kind, its peaks unknown, never the generation's canonical
     device's."""
-    from types import SimpleNamespace
-
     from dew.nn.kernels.generation import device_target
 
+    # Hashable, as a JAX device is: a device's target is resolved once a device and generation.
+    @dataclasses.dataclass(frozen=True)
+    class Device:
+        device_kind: str
+        core_count: int
+        platform: str = "gpu"
+        compute_capability: str = "9.0"
+        local_hardware_id: int = 0
+
     def device(kind, cores):
-        return SimpleNamespace(platform="gpu", device_kind=kind, compute_capability="9.0", core_count=cores,
-                               local_hardware_id=0)
+        return Device(kind, cores)
 
     pcie = device_target(device("NVIDIA H100 PCIe", 114))
     unnamed = device_target(device("NVIDIA H20", 78))
