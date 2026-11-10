@@ -37,7 +37,7 @@ from test_recurrence_chunk import (
     unit,
 )
 
-from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels import chunked_launch, generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk_rounding, fast_rounding, recomputed_memory
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
@@ -1324,6 +1324,73 @@ def test_each_launchs_producer_lowers_its_registers_as_its_model_states_on_a_b20
     plans, apart = {}, {}
     group = ('qwen3.5-27b-gdn', jnp.bfloat16, True, False, None)
     found = compile_mosaic_kernels(compiled_cases('sm100', plans, [], apart, only=group), 'sm100')
+    assert mosaic_failures(found) == []
+
+
+FORKED_GATE = [(target, name, training) for target in ('sm80', 'sm90', 'sm100') for name in RESOURCE_SHAPES
+               if name != 'a 192-wide value head' for training in (False, True)]
+"""The forked gate's cases (`forked_case`): each scoreboard geometry's 16-bit forward and training pass over
+a forked call on each family's bundle."""
+
+
+def forked_case(target: str, name: str, training: bool):
+    """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
+    and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
+    template's derived tiles on `target`, its forward or training pass as a gate case (`KernelCase`): its
+    operands laid from the chunks' edges and its table as the walks take it (`template.forked_laid`)."""
+    from fla_gdn_support import KernelCase
+
+    facts = generation.gpu_target(target)
+    family = template.bundle(facts)
+    q, k, v, g, beta, h0 = resource_operands(name, jnp.bfloat16, 1, 256)
+    given = jax.ShapeDtypeStruct((1, 1, *h0.shape[1:]), jnp.float32)
+    slots = jax.ShapeDtypeStruct((1, 3), jnp.int32)
+    entry = None if name != 'qwen3.5-27b-gdn' else (
+        jax.ShapeDtypeStruct((1, 3, 1, *k.shape[2:]), jnp.float32),
+        jax.ShapeDtypeStruct((1, 3, 1, *v.shape[2:]), jnp.float32),
+        jax.ShapeDtypeStruct((1, 3, v.shape[2]), jnp.float32))
+    forked = chunked_launch.Forked(slots, slots, slots, entry, 2)
+    skip = list(_skipped(name, jnp.bfloat16).values())
+    bound = template.MOSAIC.bind(q, k, v, g, beta, given, None, forked=forked,
+                                 bound=None if name in RATED else 1.0, **_form(name, jnp.bfloat16),
+                                 **_skipped(name, jnp.bfloat16))
+    with generation.assumed(facts):
+        tiles = template.MOSAIC.derived(bound, facts)
+    assert tiles is not None, f"{name} on {target}: the template derives no tiles for a forked call"
+    laid, table = jax.eval_shape(lambda *x: template.forked_laid(*x, tiles.chunk)[:2], q, k, v, g, beta,
+                                 given, forked)
+    formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
+    cotangents = [jax.ShapeDtypeStruct(laid[2].shape, jnp.bfloat16), h0] if training else []
+    tabled = [leaf for leaf in table if leaf is not None]
+
+    def call():
+        def fn(*operands):
+            (q, k, v, g, beta), table, rest = (operands[:5], operands[5:5 + len(tabled)],
+                                               operands[5 + len(tabled):])
+            *rest, fused = rest if skip else (*rest, None)
+            forked = chunk_forward.ForkedTable(*table, *[None] * (4 - len(table)), 2)
+            if training:
+                return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
+                                                   forked=forked, skip=fused, **formed)
+            return chunk_forward.forward(q, k, v, g, beta, None, tiles=tiles, family=family, forked=forked,
+                                         skip=fused, **formed)
+
+        return fn, (*laid, *tabled, *cotangents, *skip)
+
+    label = f"{name} bfloat16 {'training' if training else 'forward'} forked {tiles}"
+    return KernelCase(label, call)
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize(('target', 'name', 'training'), FORKED_GATE)
+def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, training):
+    """A forked call's launches (`forked_case`) compiled by Mosaic on this CPU for `target`: its walks taking
+    each document's memory up from the call's table and keeping its stored finals (`mainloop.Taking`,
+    `mainloop.Returning`; ledger 5376) lower, every kernel spilling none and every report read
+    (`kernel_compile.mosaic_failures`)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    found = compile_mosaic_kernels([forked_case(target, name, training)], target)
     assert mosaic_failures(found) == []
 
 
