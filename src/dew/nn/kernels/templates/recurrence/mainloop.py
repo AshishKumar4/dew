@@ -531,10 +531,9 @@ def product_fragments(call: Call, lhs: tuple, rhs: tuple, *, rhs_transposed: boo
     none where they read shared memory. A register operand staged for this product states that source
     (`lhs_staged`, `rhs_staged`): its value dies before the reload, so their live sets are separate."""
     (left, rows, depth), (right, _, columns) = lhs, rhs
-    return resources.operand_fragments(call.family, rows, depth, columns, left.stored, right.stored,
-                                       lhs_parts=left.parts, rhs_parts=right.parts,
-                                       rhs_transposed=rhs_transposed, rhs_swizzle=rhs_swizzle,
-                                       lhs_staged=lhs_staged, rhs_staged=rhs_staged)
+    return resources.operand_fragments(
+        call.family, rows, depth, columns, resources.OperandRead.of(left, staged=lhs_staged),
+        resources.OperandRead.of(right, swizzle=rhs_swizzle, staged=rhs_staged, transposed=rhs_transposed))
 
 
 @dataclasses.dataclass(frozen=True)

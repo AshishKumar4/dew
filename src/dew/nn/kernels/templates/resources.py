@@ -12,7 +12,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Hashable, Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +23,7 @@ from dew.nn.kernels import generation
 if TYPE_CHECKING:
     from dew.nn.kernels.generation import GpuTarget
     from dew.nn.kernels.templates.mosaic import Family
+    from dew.nn.kernels.templates.operands import Operand
 
 
 CONTROL_REGISTERS = 16
@@ -88,7 +89,7 @@ def allocated(*sizes: int) -> int:
 
 
 def _register_words(tiles) -> float:
-    return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
+    return sum(rows * columns * jax.dtypes.itemsize_bits(dtype) / 32 for rows, columns, dtype in tiles)
 
 
 def largest_live_set(*phases):
@@ -110,64 +111,92 @@ def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
             + int(-(-(_register_words(carried) + phase) // THREADS)))
 
 
-def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
-                      rhs_parts: int = 1, rhs_transposed: bool = False, lhs_swizzle: int | None = None,
-                      rhs_swizzle: int | None = None, lhs_retained: bool = False,
-                      rhs_retained: bool = False, lhs_staged: bool = False,
-                      rhs_staged: bool = False) -> list:
-    """The register live set of a product's operands: their issuer at the operand dtype, the slices
-    consumed and loaded ahead within a stage's granule, and each operand's replicating warps and parts.
-    An operand retained across products keeps its whole loaded granule. A value staged for its product dies
-    before the product reloads its fragments: those are separate phases, whose larger set is returned.
-    Where products read shared memory, only that staging phase holds registers."""
-    staged = ([(rows, depth, lhs)] * lhs_parts if lhs_staged else [])
-    staged += ([(depth, columns, rhs)] * rhs_parts if rhs_staged else [])
+class OperandRead(NamedTuple):
+    """How a product reads one operand: its `dtype` (its issuer's, `Family.for_dtype`), the 16-bit `parts`
+    an fp32 value is split into (none where it is already held), its stage's `swizzle` (bytes; the
+    family's default where None), whether it stays live across products (`retained`: its whole loaded
+    granule) or is staged for this product from registers (`staged`: dead before the product reloads its
+    fragments), and, a right operand's, whether its storage is transposed."""
+
+    dtype: jnp.dtype
+    parts: int = 1
+    swizzle: int | None = None
+    retained: bool = False
+    staged: bool = False
+    transposed: bool = False
+
+    @classmethod
+    def of(cls, operand: "Operand", **read) -> "OperandRead":
+        """A launch's operand (`operands.Operand`) read so: its stored dtype and its parts, and `read`'s
+        facts."""
+        return cls(operand.stored, operand.parts, **read)
+
+
+def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs: OperandRead,
+                      rhs: OperandRead) -> list:
+    """The register live set of a product `[rows, depth] @ [depth, columns]`'s operands, each read as `lhs`
+    and `rhs` state: their issuer at the operand's dtype, the slices consumed and loaded ahead within a
+    stage's granule (`Family.operand_live_depth`), each operand's replicating warps and parts. An operand
+    retained across products keeps its whole loaded granule. A value staged for its product dies before the
+    product reloads its fragments: those are separate phases, whose larger set is returned. Where products
+    read shared memory, only that staging phase holds registers."""
+    staged = ([(rows, depth, lhs.dtype)] * lhs.parts if lhs.staged else [])
+    staged += ([(depth, columns, rhs.dtype)] * rhs.parts if rhs.staged else [])
     if not family.operands_in_registers:
         return staged
-    left_issuer, right_issuer = family.for_dtype(lhs), family.for_dtype(rhs)
+    left_issuer, right_issuer = family.for_dtype(lhs.dtype), family.for_dtype(rhs.dtype)
     left_depth = left_issuer.operand_live_depth(
-        depth, left_issuer.lhs_fragment_depth(depth, swizzle=lhs_swizzle), retained=lhs_retained)
+        depth, left_issuer.lhs_fragment_depth(depth, swizzle=lhs.swizzle), retained=lhs.retained)
     right_depth = right_issuer.operand_live_depth(
-        depth, right_issuer.rhs_fragment_depth(depth, transposed=rhs_transposed, swizzle=rhs_swizzle),
-        retained=rhs_retained)
-    left = (rows * family.lhs_copies, left_depth, lhs)
-    fragments = ([left] * lhs_parts
-                 + [(right_depth, columns * family.rhs_copies, rhs)] * rhs_parts)
+        depth, right_issuer.rhs_fragment_depth(depth, transposed=rhs.transposed, swizzle=rhs.swizzle),
+        retained=rhs.retained)
+    fragments = ([(rows * family.lhs_copies, left_depth, lhs.dtype)] * lhs.parts
+                 + [(right_depth, columns * family.rhs_copies, rhs.dtype)] * rhs.parts)
     # A value staged into shared memory dies before its product loads the fragments back.
     return largest_live_set(staged, fragments) if staged else fragments
 
 
-def product_phases(family: "Family", dtype, *products, lhs_swizzle: int | None = None,
-                   rhs_swizzle: int | None = None,
-                   rhs_sources: tuple[Hashable | None, ...] | None = None) -> list:
-    """Products' operand live sets beside their register tiles. Each product states its rows, depth,
-    columns, the tiles beside it, whether its left value is already held, and its right storage orientation.
-    Equal right-source identifiers retain that operand from its first reader through its last, including
-    intervening products. The largest of its readers' register representations bounds that shared value."""
+class Product(NamedTuple):
+    """One product a launch issues (`product_phases`): `[rows, depth] @ [depth, columns]`, the register
+    tiles live `beside` it, whether its left value is already `held` in registers (no fragments of its
+    own), whether its right operand's storage is `transposed`, and the right operand's `source`: products
+    naming one source read one staged value, live from its first reader through its last."""
+
+    rows: int
+    depth: int
+    columns: int
+    beside: tuple = ()
+    held: bool = False
+    transposed: bool = False
+    source: Hashable | None = None
+
+
+def product_phases(family: "Family", dtype, *products: Product, lhs_swizzle: int | None = None,
+                   rhs_swizzle: int | None = None) -> list:
+    """`products`' operand live sets beside their register tiles, a phase each. A right operand several
+    products read (one `Product.source`) is retained from its first reader through its last, including
+    intervening products, at the largest of its readers' register forms."""
     if not family.operands_in_registers:
         return []
-    sources = (None,) * len(products) if rhs_sources is None else rhs_sources
+    sources = [product.source for product in products]
     retained = {}
     for source in dict.fromkeys(source for source in sources
                                 if source is not None and sources.count(source) > 1):
         readers = [i for i, own in enumerate(sources) if own == source]
-        forms = []
-        for i in readers:
-            rows, depth, columns, _, _, transposed = products[i]
-            forms.append(operand_fragments(family, rows, depth, columns, dtype, dtype,
-                                           lhs_parts=0, rhs_retained=True, rhs_transposed=transposed,
-                                           rhs_swizzle=rhs_swizzle))
+        forms = [operand_fragments(family, products[i].rows, products[i].depth, products[i].columns,
+                                   OperandRead(dtype, parts=0),
+                                   OperandRead(dtype, swizzle=rhs_swizzle, retained=True,
+                                               transposed=products[i].transposed))
+                 for i in readers]
         retained[source] = (readers[0], readers[-1], largest_live_set(*forms))
     phases = []
-    for i, ((rows, depth, columns, beside, held, transposed), source) in enumerate(
-            zip(products, sources, strict=True)):
-        fragments = operand_fragments(family, rows, depth, columns, dtype, dtype,
-                                       lhs_parts=0 if held else 1,
-                                       rhs_parts=0 if source in retained else 1,
-                                       rhs_transposed=transposed, lhs_swizzle=lhs_swizzle,
-                                       rhs_swizzle=rhs_swizzle)
+    for i, product in enumerate(products):
+        left = OperandRead(dtype, parts=0 if product.held else 1, swizzle=lhs_swizzle)
+        right = OperandRead(dtype, parts=0 if product.source in retained else 1, swizzle=rhs_swizzle,
+                            transposed=product.transposed)
+        fragments = operand_fragments(family, product.rows, product.depth, product.columns, left, right)
         live = [tile for first, last, tiles in retained.values() if first <= i <= last for tile in tiles]
-        phases.append([*beside, *fragments, *live])
+        phases.append([*product.beside, *fragments, *live])
     return phases
 
 
@@ -182,15 +211,15 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     its epilogue holds one copy's rows (`copied_rows`) in the widest `stored` dtype beside the accumulator."""
     rows, columns, depth = block
     share = rows // consumers
-    fragments = operand_fragments(family, share, depth, columns, dtype, dtype,
-                                 rhs_transposed=rhs_transposed, lhs_retained=lhs_retained)
+    fragments = operand_fragments(family, share, depth, columns, OperandRead(dtype, retained=lhs_retained),
+                                  OperandRead(dtype, transposed=rhs_transposed))
     # The accumulator's columns its consumer holds at once: all of them, or an epilogue's chunk of one held
     # in tensor memory (`Issuer.chunk_columns`).
     accumulator = (share, family.chunk_columns(columns), jnp.float32)
     walk = live_registers(family, [accumulator], fragments)
     if not (family.stores_through_registers and stored):
         return walk
-    widest = max(stored, key=lambda stored_dtype: jnp.dtype(stored_dtype).itemsize)
+    widest = max(stored, key=jax.dtypes.itemsize_bits)
     copied = (min(share, copied_rows(columns, widest)), columns, widest)
     return max(walk, live_registers(family, [accumulator, copied]))
 

@@ -792,9 +792,9 @@ def _query_key_held(call: Call, vq: int) -> Held:
 
     def read(rows: int, lhs, rhs_parts: int, *, retained: bool = False) -> list:
         # A product of `lhs` `[rows, vb]` and the memories read transposed, their fragments `rhs_parts` times.
-        return resources.operand_fragments(call.family, rows, vb, call.block, lhs.stored, memories.stored,
-                                           lhs_parts=lhs.parts, rhs_parts=rhs_parts, rhs_transposed=True,
-                                           lhs_retained=retained, rhs_retained=retained)
+        return resources.operand_fragments(
+            call.family, rows, vb, call.block, resources.OperandRead.of(lhs, retained=retained),
+            resources.OperandRead(memories.stored, rhs_parts, retained=retained, transposed=True))
 
     # The output's gradient and the corrected values against the memories entered and leaving, read
     # transposed ('memory_dq', 'memory_dk'); then the memories against themselves (`_memory_sum`).

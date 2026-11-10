@@ -490,8 +490,9 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
     # the rows' parts, and a product's fragments with mma.sync's right operand loaded ahead.
     # In turn: a pair's gradient against the keys raised; a sub-chunk's (read transposed) against its gated
     # rows (`algebra.key_decayed_pairs_back`); with the first's right operand loaded ahead.
-    ahead = resources.operand_fragments(call.family, chunk, chunk, keys, parted.stored, parted.stored,
-                                        lhs_parts=0, rhs_parts=parted.parts)
+    ahead = resources.operand_fragments(call.family, chunk, chunk, keys,
+                                        resources.OperandRead(parted.stored, parts=0),
+                                        resources.OperandRead.of(parted))
     return Held(carried=[f32(chunk, 1)], phases=(
         [f32(chunk, keys)] * 9 + masks(chunk, keys) * 2 + held_tile(parted, chunk, keys)
         + largest_live_set(
