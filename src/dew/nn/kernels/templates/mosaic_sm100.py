@@ -82,8 +82,9 @@ PAIRED = Topology(2)
 """A product over a pair of CTAs, its leader issuing it."""
 
 PRODUCT_COLUMNS = 256
-"""tcgen05's widest product, its columns (N): one CTA's, or a pair's, each CTA reading its half of them (PTX
-ISA, tcgen05.mma's shapes)."""
+"""tcgen05's widest product, its columns (N) (PTX ISA, tcgen05.mma's shapes): one CTA's, or a pair's, where
+each CTA's shared memory holds half of the right operand's columns and its tensor memory all of them for its
+own rows."""
 
 
 def swizzled(dtype, contraction: int) -> tuple:
@@ -830,9 +831,11 @@ class Tcgen05PairRings(Tcgen05Rings):
     """tcgen05's bundle over a pair of CTAs (`PAIRED`, CUTLASS's 2-SM UMMA): each step's blocks the pair's,
     each CTA loading its half (`PairedRing`); the leader's product warp issuing each product over both CTAs'
     rows into both's tensor memory, allocated together; each CTA's epilogue reading its own rows, a turn freed
-    once both have (`Accumulators`' cluster read barrier). Its tile is twice a CTA's rows and columns, each
-    CTA's columns half of tcgen05's widest product's; no block scales (a scale tile's tensor memory is one
-    CTA's) and no gathered rows (a pair's step block is copied partitioned, whole)."""
+    once both have (`Accumulators`' cluster read barrier). Its tile is twice a CTA's rows and twice its right
+    operand's columns: a CTA stages half of the product's columns of the right operand (`widest_product`, a
+    CTA's block of them) and holds all of them for its own rows in tensor memory, as the product it shares
+    writes them; no block scales (a scale tile's tensor memory is one CTA's) and no gathered rows (a pair's
+    step block is copied partitioned, whole)."""
 
     name = "tcgen05.pair"
     topology = PAIRED

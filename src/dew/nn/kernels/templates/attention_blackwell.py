@@ -243,7 +243,9 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
         acc = Accumulator(scratch.acc_tmem, scratch.acc_tmem.shape, accumulate=index > 0)
 
         def product(p_tmem):
-            RINGS.products(acc, p_tmem, v_smem, released=consumed)
+            # The weights the softmax wrote to tensor memory (tcgen05's TS form, `Tcgen05Issuer.products`).
+            weighed = Accumulator(p_tmem, (RINGS.rows, block.block_k), dtype=v_smem.dtype)
+            RINGS.products(acc, weighed, v_smem, released=consumed)
 
         for slot, p_tmem in enumerate(scratch.p_tmems):
             pl.when(lax.rem(index, 2) == slot)(functools.partial(product, p_tmem))
@@ -446,6 +448,9 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
         kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
         interpret=bodies.interpreted(interpret), warpgroups=roles.warpgroups(), family=RINGS.name,
+        # Its register decision, its two raised roles at the registers the schedule raises them to and the
+        # issuing warpgroup lowered (`report.Launch.kernels`), which the compile point judges its kernel by.
+        model=resources.register_model(RINGS, roles.warpgroups() - 1, roles.registers()["softmax"]),
         # A name a form (the default's fold and its natural rewalk compile apart).
         name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)
