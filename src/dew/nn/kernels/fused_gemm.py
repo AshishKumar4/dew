@@ -51,6 +51,7 @@ from dew import _cache, algebra
 from dew.algebra import cost as algebra_cost
 from dew.nn import programs
 from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.generation import Choice
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, analysed, select
 from dew.nn.kernels.templates import cost
 
@@ -285,13 +286,13 @@ def _stage[S: tuple](op: Op[Tiling], found: S | Refusal) -> S | None:
             return found if select(op, Tiling(found)).kernel == 'fused' else None
 
 
-EPILOGUE: Op[Tiling] = Op('gemm_epilogue', (
+EPILOGUE: Op[Tiling] = Op(Choice.GEMM_EPILOGUE, (
     Kernel('fused', (analysed('tiled', lambda case: case.refusal, FUSION_ROW),)),
     Kernel('xla', (), generic=True)))
 """The epilogue's selector: the consumers in the kernel's epilogue where the analysis takes them tile by
 tile (`_axes`), else after the product in XLA."""
 
-PROLOGUE: Op[Tiling] = Op('gemm_prologue', (
+PROLOGUE: Op[Tiling] = Op(Choice.GEMM_PROLOGUE, (
     Kernel('fused', (analysed('tiled', lambda case: case.refusal, FUSION_ROW),)),
     Kernel('xla', (), generic=True)))
 """The prologue's selector: the producer's element stage in the kernel's prologue where the analysis

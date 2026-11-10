@@ -18,7 +18,7 @@ from dew.nn.kernels.tuning import Unpinnable
 
 
 def test_a_dependent_named_choice_holds_unless_the_child_names_its_own():
-    operation = Op("delta_decode", (
+    operation = Op(generation.Choice.DELTA_DECODE, (
         Kernel("wide", ()),
         Kernel("narrow", (Requirement("width", lambda width: width <= 4,
                                        "the narrow launch holds four columns", row=generation.INHERENT),))),
@@ -55,7 +55,7 @@ def test_a_gemm_pullback_keeps_its_named_choice_and_restores_the_callers_scope()
 
 def test_a_templates_refusal_reaches_the_forced_call_without_reconstruction():
     limit = Refusal("workspace", "the call exceeds the available workspace", "resource model")
-    operation = Op("grouped_matmul", (
+    operation = Op(generation.Choice.GROUPED_MATMUL, (
         Kernel("native", (analysed("workspace", lambda size: limit if size > 4 else None,
                                                "resource model"),)),
         Kernel("plain", (), generic=True)))
@@ -212,14 +212,13 @@ def test_a_launch_derives_once_for_what_its_derivation_reads():
     assert DERIVATIONS == [2048, 4096, 2048]
 
 
-def test_a_selector_serves_a_choice_chosen_may_name_and_no_other():
-    """A selector (`selection.Op`) is built for a choice `generation.chosen` may name, and one built for a
-    name it may not is refused as it is built: no selector serves a choice no call can name. A choice no
-    selector or site reads (a decode once named 'ssd_decode') is none `chosen` takes."""
-    kernels = (Kernel("xla", (), generic=True),)
-    assert Op("swiglu", kernels).choice == "swiglu"
-    with pytest.raises(ValueError):
-        Op("swiglu_packed", kernels)
+def test_chosen_names_a_declared_choice_and_no_other():
+    """`generation.chosen` names a choice by the name its declaration gives it (`generation.Choice`), which a
+    site deciding by that declaration reads (`chosen_kernel`), and refuses a name no choice is declared by (a
+    decode once named 'ssd_decode')."""
+    with generation.chosen(narrow_copies="off"):
+        assert generation.chosen_kernel(generation.Choice.NARROW_COPIES, "on") == "off"
+    assert generation.chosen_kernel(generation.Choice.NARROW_COPIES, "on") == "on"
     with pytest.raises(ValueError), generation.chosen(ssd_decode="xla"):
         pass
 
@@ -227,7 +226,7 @@ def test_a_selector_serves_a_choice_chosen_may_name_and_no_other():
 def choose(implementations, x) -> Template:
     """The implementation of `implementations` a selector over them runs for a call on `x`: each its
     kernel where it runs the call (`Template.eligible`), in their order."""
-    op = Op("decode", tuple(Kernel(
+    op = Op(generation.Choice.DECODE, tuple(Kernel(
         implementation.name,
         (Requirement[Call]("eligible", lambda case, name=implementation.name: case.eligible(name),
                            "it does not run the call here", row=generation.INHERENT),))
@@ -273,7 +272,7 @@ def _selected(kernels: dict, generic: tuple = (), named: str | None = None) -> s
     ops = [Kernel[None](name, (requirement(takes),)) for name, takes in kernels.items()]
     ops += [Kernel[None](name, (), generic=True) for name in generic]
     with generation.assumed("sm90"), generation.chosen(decode=named):
-        return select(Op("decode", tuple(ops)), None).kernel
+        return select(Op(generation.Choice.DECODE, tuple(ops)), None).kernel
 
 
 def test_a_selector_runs_the_first_kernel_that_takes_the_call_and_a_named_one_only_by_name():

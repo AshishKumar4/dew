@@ -52,7 +52,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import INHERENT
+from .kernels.generation import INHERENT, Choice
 from .kernels.recurrence_chunk import (
     CHUNK_SIZE,
     chunk_gated_delta_rule,
@@ -950,14 +950,14 @@ bf16; beside them each kernel's own widths of whole warpgroups (`_widths`: a thr
 step's values one block a head, as its conv's history and its gated norm read a head whole)."""
 
 
-DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
+DELTA_DECODE: Op[DecodeCase] = Op(Choice.DELTA_DECODE, (
     Kernel('fused', (*_LAUNCH, _widths(fused=True),
                      Requirement('unfused', lambda case: case.fuses,
                                  "the caller has no conv, gates or gated norm for the fused step to take; "
                                  "its token runs the step alone", row=INHERENT, kind='handoff'))),
     Kernel('step', (*_LAUNCH, _widths(fused=False))),
     Kernel('xla', (), generic=True)), lambda case: 'step',
-    named_from={('gated_delta_rule', 'xla'): 'xla'})
+    named_from={(Choice.GATED_DELTA_RULE, 'xla'): 'xla'})
 """The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s), by what each
 kernel takes (no table of GPUs): the step (`recurrence.step` alone, `decode_gated_delta_rule`) between a
 caller's own conv and norm on any GPU the template's step runs on, its preference (the fused step won at
@@ -1130,7 +1130,7 @@ class GatedDeltaNet(nn.Module):
 
         if not self.fused_in_proj:
             gates = (self.in_proj_b, self.in_proj_a)
-            if joins('delta_gates', gates):
+            if joins(Choice.DELTA_GATES, gates):
                 b, a = jnp.moveaxis(constrain(joined_dense(x, gates, axis=-1), HEADS), -1, 0)
             else:
                 b, a = (projected(dense, HEADS[:3]) for dense in gates)

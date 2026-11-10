@@ -95,7 +95,7 @@ from ..precision import (
 )
 from ..sharding import automatic_axes, manual_map, on_shards, varying_like
 from . import generation, tuning
-from .generation import INHERENT, device_generation
+from .generation import INHERENT, Choice, device_generation
 from .selection import Kernel, Op, Requirement, select
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
@@ -536,7 +536,7 @@ NORM_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
 and its receipt: a literal of them, which the selector reads and thresh's declared-set seam registers
 (.thresh/thresh.cue, row 3209)."""
 
-NORM: Op[NormCase] = Op('rms_norm', (Kernel('pallas', NORM_SUPPORTS), Kernel('xla', (), generic=True)),
+NORM: Op[NormCase] = Op(Choice.RMS_NORM, (Kernel('pallas', NORM_SUPPORTS), Kernel('xla', (), generic=True)),
                         lambda case: 'xla', declared=NORM_CELLS)
 """The norm selector: XLA's arithmetic, but the fused kernel where it measured faster (bf16 rows on an
 A100 and an H100: the seam 76/187 against 103/200 us and 36/81 against 44/89, the gated norm's 118;224
@@ -602,7 +602,8 @@ SWIGLU_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
 }
 """The fused SiLU product's declared cells (`selection.Op.declared`), as `NORM_CELLS` holds the norm's."""
 
-SWIGLU: Op[SwigluCase] = Op('swiglu', (Kernel('pallas', SWIGLU_SUPPORTS), Kernel('xla', (), generic=True)),
+SWIGLU: Op[SwigluCase] = Op(Choice.SWIGLU,
+                            (Kernel('pallas', SWIGLU_SUPPORTS), Kernel('xla', (), generic=True)),
                             lambda case: 'xla', declared=SWIGLU_CELLS)
 """The SwiGLU selector: XLA's arithmetic, but the fused product where it measured faster (a bf16 product
 on an A100 and an H100: 193;320 against 235;361 us and 87;147 against 113;171) and its requirements hold.

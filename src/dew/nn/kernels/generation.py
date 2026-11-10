@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import enum
 import functools
 import inspect
 import logging
 import os
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -85,20 +86,37 @@ def _facts(value: Hashable | Mapping | list) -> Hashable:
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_mainloop', 'blockwise_fp8', 'decode', 'delta_decode',
-                     'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
-                     'grouped_matmul', 'low_rank', 'mxfp8', 'narrow_copies', 'nvfp4', 'nvfp4_block',
-                     'paged_decode', 'rms_norm', 'selective_scan', 'short_conv', 'ssd', 'swiglu'})
-"""The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`): every one a
-selector serves (`selection.Op`, which refuses a choice this does not hold as it is built) or a site reads
-(`chosen_kernel`, likewise)."""
+class Choice(enum.StrEnum):
+    """A kernel choice, declared once: the name `chosen` reads and a dispatch reports (`route`), which every
+    selector (`selection.Op.choice`) and every site deciding without one (`chosen_kernel`) refers to by this
+    object, never by its name."""
+
+    ATTENTION = 'attention'
+    ATTENTION_MAINLOOP = 'attention_mainloop'
+    BLOCKWISE_FP8 = 'blockwise_fp8'
+    DECODE = 'decode'
+    DELTA_DECODE = 'delta_decode'
+    DELTA_GATES = 'delta_gates'
+    GATE_UP = 'gate_up'
+    GATED_DELTA_RULE = 'gated_delta_rule'
+    GEMM_EPILOGUE = 'gemm_epilogue'
+    GEMM_PROLOGUE = 'gemm_prologue'
+    GROUPED_MATMUL = 'grouped_matmul'
+    LOW_RANK = 'low_rank'
+    MXFP8 = 'mxfp8'
+    NARROW_COPIES = 'narrow_copies'
+    NVFP4 = 'nvfp4'
+    NVFP4_BLOCK = 'nvfp4_block'
+    PAGED_DECODE = 'paged_decode'
+    RMS_NORM = 'rms_norm'
+    SELECTIVE_SCAN = 'selective_scan'
+    SHORT_CONV = 'short_conv'
+    SSD = 'ssd'
+    SWIGLU = 'swiglu'
 
 
-def known_choices(choices: Iterable[str]) -> None:
-    """Refuse any of `choices` that `CHOICES` does not hold, naming every one it holds."""
-    if unknown := set(choices) - CHOICES:
-        raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
-                         f"the choices are {', '.join(sorted(CHOICES))}")
+CHOICES = frozenset(choice.value for choice in Choice)
+"""The choices' names (`Choice`), those `chosen` may name (`dew.kernels.choices`)."""
 
 
 @contextlib.contextmanager
@@ -110,8 +128,11 @@ def chosen(**kernels: str) -> Iterator[None]:
     outside the block traces again within it."""
     from dew import _cache
 
-    known_choices(kernels)
-    with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **kernels}.items()))):
+    if unknown := set(kernels) - CHOICES:
+        raise ValueError(f"no kernel choice is named {', '.join(sorted(unknown))}; "
+                         f"the choices are {', '.join(sorted(CHOICES))}")
+    named = {str(choice): kernel for choice, kernel in kernels.items()}
+    with _cache.KERNEL_CHOICES(tuple(sorted({**dict(_cache.KERNEL_CHOICES.value), **named}.items()))):
         yield
 
 
@@ -979,12 +1000,11 @@ def _resolved(device, generation: str, real: bool) -> GpuTarget:
     return runtime_facts(target, device) if real else target
 
 
-def chosen_kernel(choice: str, default: str) -> str:
+def chosen_kernel(choice: Choice, default: str) -> str:
     """The kernel `chosen` names for `choice` within its block, else `default`: a choice a site decides
-    without a selector (the attention template's form, a step's narrow copies)."""
+    without a selector (a step's narrow copies)."""
     from dew import _cache
 
-    known_choices((choice,))
     return dict(_cache.KERNEL_CHOICES.value).get(choice, default)
 
 
@@ -1003,7 +1023,7 @@ class Route:
     `assumed` on a CPU), and `forced` the kernel the call named or `chosen` named, which forced the choice
     (None where the selector chose). A route is generic exactly where `kernel != preferred`."""
 
-    choice: str
+    choice: Choice
     kernel: str
     preferred: str
     refusal: Refusal | None
@@ -1048,7 +1068,7 @@ def _site() -> str:
 _logged: set[tuple[str, str, str]] = set()
 
 
-def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
+def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
           ran: str | None = None, forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
     decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
@@ -1057,7 +1077,6 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     both and the refusal's reason; one that runs the preferred kernel logs nothing."""
     from dew import _cache
 
-    known_choices((choice,))
     generation = device_generation()
     preferred = preferred or dict(_cache.KERNEL_CHOICES.value).get(choice) or kernel
     found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
