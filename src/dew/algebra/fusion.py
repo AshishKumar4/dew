@@ -36,7 +36,7 @@ from jax.extend import core as jcore
 
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
-from dew.nn.programs import entrywise
+from dew.nn.programs import RaggedLayout, entrywise, ragged_layout
 
 CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
 """The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows), so
@@ -138,12 +138,12 @@ DENSE_FORMS = {((1,), (0,)): FORWARD, ((1,), (1,)): FORWARD._replace(transpose_r
                ((0,), (0,)): FORWARD._replace(transpose_lhs=True)}
 """A rank-2 `dot_general`'s contracted axes, no batch axes, to its form: x @ W, dy @ Wᵀ and xᵀ @ dy."""
 
-GROUPED_FORMS = {((1,), (1,), 3): FORWARD._replace(grouped=True),
-                 ((1,), (2,), 3): FORWARD._replace(transpose_rhs=True, grouped=True),
-                 ((0,), (0,), 2): FORWARD._replace(transpose_lhs=True, grouped=True)}
-"""A `ragged_dot_general`'s contracted axes and its right operand's rank, its left operand's rows ragged and
-no batch axes, to its form: rows times their group's matrix (`[groups, depth, columns]`, or columns by
-depth), and the kernel gradient's rows contracted within each group (`[groups, depth, columns]` out)."""
+GROUPED_FORMS = {RaggedLayout.ROWS: FORWARD._replace(grouped=True),
+                 RaggedLayout.ROWS_TRANSPOSED: FORWARD._replace(transpose_rhs=True, grouped=True),
+                 RaggedLayout.GROUPS: FORWARD._replace(transpose_lhs=True, grouped=True)}
+"""A `ragged_dot_general`'s layout (`dew.nn.programs.ragged_layout`) to its form: rows times their group's
+matrix (`[groups, depth, columns]`, or columns by depth), and the kernel gradient's rows contracted within
+each group (`[groups, depth, columns]` out)."""
 
 
 def _form(equation: jcore.JaxprEqn) -> Form | None:
@@ -162,15 +162,9 @@ def _form(equation: jcore.JaxprEqn) -> Form | None:
         if batch != ((), ()) or any(len(_shape(var)) != 2 for var in equation.invars):
             return None
         return DENSE_FORMS.get((tuple(left), tuple(right)))
-    numbers = equation.params["ragged_dot_dimension_numbers"]
-    # Its axes as lists (`lax.ragged_dot`'s), a dot_general's as tuples.
-    (left, right), batch = numbers.dot_dimension_numbers
-    if (any(batch) or tuple(numbers.lhs_ragged_dimensions) != (0,)
-            or len(_shape(equation.invars[0])) != 2):
-        return None
-    form = GROUPED_FORMS.get((tuple(left), tuple(right), len(_shape(equation.invars[1]))))
-    groups = tuple(numbers.rhs_group_dimensions)
-    return form if form is not None and groups == ((0,) if not form.transpose_lhs else ()) else None
+    layout = ragged_layout(len(_shape(equation.invars[0])), len(_shape(equation.invars[1])),
+                           equation.params["ragged_dot_dimension_numbers"])
+    return None if layout is None else GROUPED_FORMS[layout]
 
 
 def _shape(atom) -> tuple[int, ...]:

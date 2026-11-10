@@ -635,6 +635,28 @@ def _row_sizes(truth: np.ndarray, terms=None) -> tuple[np.ndarray, np.ndarray]:
 NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 
 
+RECORDED_KINDS = {
+    "reference": "output", "truth": "output",
+    "mse": "seed", "worst": "seed", "finite": "seed", "sketch": "seed", "example_mse": "seed",
+    "example_worst": "seed", "scale": "seed",
+    "zero_rows": "span", "zero_errors": "span", "zero_offsets": "offsets",
+    "shape": "whole", "dtype": "whole",
+}
+"""A recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's `<site>.pilot.<kind>.<leaf>`),
+each kind by how it is held: a full recording's outputs and truths over its seeds (`output`); a summarized
+one's evidence, one row a seed (`seed`: a `RecordedLeaf`'s summary, its truth's sketch, a stacked site's
+examples, a weighed site's rounding scales); its rows of float64 zero joined over the seeds (`span`), each
+seed's span of them between consecutive `offsets`; and what the whole recording holds once a leaf
+(`whole`). The one statement of the layout: the recorder writes and cuts by it
+(tools/recorded_references.py) and the gate reads by it (tests/reference_error.py). Every other entry
+(inputs, digests, counts, provenance) is the whole recording's."""
+
+
+def recorded_kinds(*held: str) -> tuple[str, ...]:
+    """The kinds of a recording's leaf entries held as one of `held` (`RECORDED_KINDS`), in its order."""
+    return tuple(kind for kind, how in RECORDED_KINDS.items() if how in held)
+
+
 @dataclasses.dataclass(frozen=True)
 class RecordedLeaf:
     """A recorded reference's evidence for one leaf at one seed, all check 1 reads of it (`_drawn`): its

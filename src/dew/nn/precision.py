@@ -60,7 +60,7 @@ from dew.nn.derivatives import (
     surrogate,
 )
 from dew.nn.nested import nested
-from dew.nn.programs import equations, purely_called
+from dew.nn.programs import equations, purely_called, ragged_layout
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -624,7 +624,7 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
     product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
     takes it too (`_paired`). With `group_sizes`, `product` is a ragged dot (`jax.lax.ragged_dot_general`, its
-    `dimension_numbers` the ragged ones) of a grouped GEMM's form (`pairwise.ragged_form`), summed so by
+    `dimension_numbers` the ragged ones) of a grouped GEMM's layout (`programs.ragged_layout`), summed so by
     `pairwise.pairwise_ragged_dot_general`; None for any other form."""
     from dew.nn import pairwise
 
@@ -632,7 +632,8 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
             or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
             or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
                        for operand in (lhs, rhs))
-            or (group_sizes is not None and pairwise.ragged_form(lhs, rhs, dimension_numbers) is None)):
+            or (group_sizes is not None
+                and ragged_layout(jnp.ndim(lhs), jnp.ndim(rhs), dimension_numbers) is None)):
         return None
 
     if group_sizes is not None:

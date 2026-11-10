@@ -29,6 +29,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.derivatives import Protected, contracted
+from dew.nn.programs import RaggedLayout, ragged_layout
 
 FMA_LATENCY = 4
 """Cycles from an FMA's issue to its result on the cores Dew runs on (Intel Skylake-SP through Sapphire
@@ -294,39 +295,21 @@ def _whole_rows(operand: jax.Array) -> jax.Array:
     return jax.sharding.reshard(operand, jax.sharding.PartitionSpec(None, *sharding.spec[1:]))
 
 
-def ragged_form(lhs, rhs, ragged_dot_dimension_numbers) -> str | None:
-    """Which of a grouped GEMM's ragged products `jax.lax.ragged_dot_general` of `lhs` and `rhs` is
-    (`pairwise_ragged_dot_general` sums these): 'rows', rows grouped and their depth contracted, `[rows,
-    depth]` by `[groups, depth, width]`; 'rows transposed', its matrices `[groups, width, depth]`; 'groups',
-    each group's rows contracted, `[rows, depth]` by `[rows, width]` into `[groups, depth, width]`; None for
-    any other."""
-    (contracted_axes, against), batch = (tuple(map(tuple, pair))
-                                         for pair in ragged_dot_dimension_numbers.dot_dimension_numbers)
-    ragged = tuple(ragged_dot_dimension_numbers.lhs_ragged_dimensions)
-    grouped = tuple(ragged_dot_dimension_numbers.rhs_group_dimensions)
-    if batch != ((), ()) or jnp.ndim(lhs) != 2 or ragged != (0,):
-        return None
-    if grouped == (0,) and jnp.ndim(rhs) == 3 and contracted_axes == (1,) and against in ((1,), (2,)):
-        return 'rows' if against == (1,) else 'rows transposed'
-    if grouped == () and jnp.ndim(rhs) == 2 and contracted_axes == (0,) and against == (0,):
-        return 'groups'
-    return None
-
-
 def pairwise_ragged_dot_general(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array,
                                 ragged_dot_dimension_numbers, precision=None, out_sharding=None) -> jax.Array:
-    """`jax.lax.ragged_dot_general` of float32 `lhs` and `rhs` into float32 in a form `ragged_form` names,
+    """`jax.lax.ragged_dot_general` of float32 `lhs` and `rhs` into float32 in a layout
+    `programs.ragged_layout` names,
     summed blocked and pairwise as `pairwise_dot_general` sums a dense one: rows grouped and their depth
     contracted by `_rows_blocked`, each group's rows contracted by `_groups_blocked`. Its reverse pass is the
     plain product's, each cotangent a product of its own summed so over its own contraction (Protected, as
     the dense form's). Its result placed at `out_sharding` where given, the ragged product's own."""
     from dew.nn.kernels.generation import linear_tangent
 
-    form = ragged_form(lhs, rhs, ragged_dot_dimension_numbers)
-    if form is None:
+    layout = ragged_layout(jnp.ndim(lhs), jnp.ndim(rhs), ragged_dot_dimension_numbers)
+    if layout is None:
         raise ValueError(f"no pairwise ragged product takes {ragged_dot_dimension_numbers}")
-    summed, pulled = (_ragged_groups(precision) if form == 'groups'
-                      else _ragged_rows(form == 'rows transposed', precision))
+    summed, pulled = (_ragged_groups(precision) if layout is RaggedLayout.GROUPS
+                      else _ragged_rows(layout is RaggedLayout.ROWS_TRANSPOSED, precision))
     product = contracted("test_a_cpu_pairwise_grouped_product_holds_every_order")(
         linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
                        kind=Protected()))

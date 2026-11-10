@@ -103,6 +103,7 @@ from dew.parity import (
     MOST_SEEDS,
     NARROW_FACTORS,
     PARITY,
+    RECORDED_KINDS,
     ROW_FACTOR,
     SIZING_FROM,
     UPPER_TAIL,
@@ -130,6 +131,7 @@ from dew.parity import (
     _term_leaves,
     _verdict,
     heavy_masks,
+    recorded_kinds,
 )
 from dew.parity_stages import REDRAW, staged_units
 from dew.training.compiled_program import lowering_platform
@@ -1577,20 +1579,14 @@ def input_digest(inputs) -> np.uint64:
     return np.frombuffer(digest.digest()[:8], np.uint64)[0]
 
 
-LEAF_ENTRIES = ("reference", "truth", "mse", "worst", "finite", "sketch", "zero_rows", "zero_errors",
-                "zero_offsets", "shape", "dtype")
-"""The kinds of a recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's
-`<site>.pilot.<kind>.<leaf>`): a full recording's outputs and truths, a summarized one's evidence and
-sketches. Every other entry (inputs, digests, counts, provenance) is the whole recording's."""
-
-
 def _of_leaves(stored, site: str, leaves) -> dict:
-    """`stored` with the entries of `leaves` alone of those kept one a leaf (LEAF_ENTRIES), verdict and
-    pilot alike, and every entry the whole recording shares; a leaf the recording lacks is refused."""
+    """`stored` with the entries of `leaves` alone of those kept one a leaf (`dew.parity.RECORDED_KINDS`),
+    verdict and pilot alike, and every entry the whole recording shares; a leaf the recording lacks is
+    refused."""
     wanted, found, kept = set(leaves), set(), {}
     for key, value in stored.items():
         kind, _, name = key.removeprefix(f"{site}.").removeprefix("pilot.").partition(".")
-        if key.startswith(f"{site}.") and kind in LEAF_ENTRIES and name:
+        if key.startswith(f"{site}.") and kind in RECORDED_KINDS and name:
             if name not in wanted:
                 continue
             found.add(name)
@@ -1720,12 +1716,12 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "example_mse",
-             "example_worst")
+    # A summary's evidence, each kind as the recording's layout holds it (`dew.parity.RECORDED_KINDS`).
+    kinds = recorded_kinds("seed", "span", "offsets")
     verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
-    shapes, dtypes = tree("shape"), tree("dtype")
+    shapes, dtypes = (tree(kind) for kind in recorded_kinds("whole"))
     if truth_fn is None or inputs_of is None:
         raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
                              f"Dew's float64 path, and `inputs_of`, its inputs drawn again")

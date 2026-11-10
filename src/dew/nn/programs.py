@@ -10,6 +10,7 @@ which branch a platform runs and which bodies XLA sees.
 from __future__ import annotations
 
 import contextlib
+import enum
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TypeGuard
 
@@ -93,6 +94,34 @@ def equations(jaxpr: jcore.Jaxpr) -> Iterator[jcore.JaxprEqn]:
 def computed(value) -> TypeGuard[jcore.Var]:
     """Whether `value` is a program's variable, not a literal it reads."""
     return isinstance(value, jcore.Var) and not isinstance(value, jcore.Literal)
+
+
+class RaggedLayout(enum.Enum):
+    """A grouped product's layout as `jax.lax.ragged_dot_general` states it (`ragged_layout`)."""
+
+    ROWS = "rows"
+    """Rows grouped and their depth contracted: `[rows, depth]` by `[groups, depth, width]`."""
+    ROWS_TRANSPOSED = "rows transposed"
+    """The same over matrices held `[groups, width, depth]`."""
+    GROUPS = "groups"
+    """Each group's rows contracted: `[rows, depth]` by `[rows, width]` into `[groups, depth, width]`, a
+    grouped matrix's gradient."""
+
+
+def ragged_layout(lhs_rank: int, rhs_rank: int, numbers) -> RaggedLayout | None:
+    """Which grouped product a `ragged_dot_general` of operands of those ranks under `numbers` (its
+    `RaggedDotDimensionNumbers`) is, its left operand's rows ragged and no batch axes; None for any other.
+    The one reading of those dimensions: the algebra's fusion takes a product's form from it
+    (`dew.algebra.fusion`), and a CPU's pairwise sum what it blocks (`dew.nn.pairwise`)."""
+    (contracted, against), batch = (tuple(map(tuple, pair)) for pair in numbers.dot_dimension_numbers)
+    grouped = tuple(numbers.rhs_group_dimensions)
+    if batch != ((), ()) or lhs_rank != 2 or tuple(numbers.lhs_ragged_dimensions) != (0,):
+        return None
+    if grouped == (0,) and rhs_rank == 3 and contracted == (1,) and against in ((1,), (2,)):
+        return RaggedLayout.ROWS if against == (1,) else RaggedLayout.ROWS_TRANSPOSED
+    if grouped == () and rhs_rank == 2 and contracted == (0,) and against == (0,):
+        return RaggedLayout.GROUPS
+    return None
 
 
 def read_by(jaxpr: jcore.Jaxpr, sinks: Iterable) -> set[jcore.Var]:
