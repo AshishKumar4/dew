@@ -14,11 +14,7 @@ from armada_support import interpreter, loaded, written
 
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
-    loaded_ci = loaded(tmp_path, monkeypatch)
-    # Each test's task keeps its artifacts (a stall's record, `stalls.kept`) under its own directory, never
-    # an enclosing CI task's.
-    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
-    return loaded_ci
+    return loaded(tmp_path, monkeypatch)
 
 
 def test_a_task_past_its_deadline_is_interrupted_its_hung_file_red_and_the_rest_run_again(ci, tmp_path):

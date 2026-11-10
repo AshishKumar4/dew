@@ -18,10 +18,12 @@ def loaded(tmp_path: Path, monkeypatch):
     armada task these tests run in: CI's own environment names the shared test cache, and the task's own
     artifacts and the progress of its recalled attempt (ARMADA_ARTIFACTS, ARMADA_RESUME), which these runs
     of the tools must neither read nor write (a recalled attempt's nested tasks set aside the tests its
-    progress named, and recorded none)."""
+    progress named, and recorded none); their own task's artifacts under `tmp_path`."""
     module = load("ci", "tools/armada")
     monkeypatch.chdir(tmp_path)
     apart(monkeypatch)
+    # Each test's task keeps its artifacts (a stall's record, `stalls.kept`) under its own directory.
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
     (tmp_path / "tests").mkdir()
     return module
 
