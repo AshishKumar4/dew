@@ -688,15 +688,17 @@ def test_bf16_rows_multiply_an_fp16_matrix_rounded_to_bf16_at_the_highest_precis
 
 @INTERPRETS
 def test_a_mixed_kernel_gradients_prologue_reads_and_rounds_the_rows_in_their_dtype():
-    """A kernel gradient of bf16 rows and fp32 cotangent rows (`gemm.gemm_t`, multiplied in fp32) whose
-    prologue adds 2^-8 to the rows, the template named and interpreted as an H100's: the prologue reads the
-    rows in their bf16 and rounds its result there (1 + 2^-8 to 1), as the portable program does, so the
-    gradient is the rows' 128 per entry, where the widened rows kept 1 + 2^-8 (128.5)."""
+    """A kernel gradient of bf16 rows and fp32 cotangent rows (`gemm.gemm_t`, multiplied in fp32 whole at the
+    highest precision, so on the template as the cotangent's bf16 parts) whose prologue adds 2^-8 to the
+    rows, the template named and interpreted as an H100's: the prologue reads the rows in their bf16 and
+    rounds its result there (1 + 2^-8 to 1), as the portable program does, so the gradient is the rows' 128
+    per entry, where the widened rows kept 1 + 2^-8 (128.5)."""
     rows = jnp.ones((128, 128), jnp.bfloat16)
     cotangent = jnp.ones((128, 128), jnp.float32)
 
     def gradient(kernel):
-        with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+              jax.default_matmul_precision("highest")):
             return np.asarray(jax.jit(lambda x, dy: gemm.gemm_t(
                 x, dy, None, prologue=lambda r: r + 2.0 ** -8, out_dtype=jnp.float32,
                 interpret_on_cpu=True))(rows, cotangent))
