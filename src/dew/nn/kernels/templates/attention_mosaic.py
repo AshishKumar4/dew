@@ -694,7 +694,7 @@ class MosaicForward(_Mainloop[Tiles]):
         computed = query.dtype if scales is not None else value.dtype
         return ForwardRegisters(query.dtype, query.shape[-1], value.shape[-1], residuals is Kept.SPLIT,
                                 self._natural(query), params, self.parts,
-                                self._scales(table, sources, scales, computed))
+                                self._scales(table, sources, scales, computed), codes=scales is not None)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
