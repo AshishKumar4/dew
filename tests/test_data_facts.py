@@ -132,7 +132,7 @@ def test_the_prompt_presets_facts_are_its_first_batchs_rows():
 
 def test_the_preference_presets_facts_are_its_first_batchs_rows():
     """Chosen and rejected completions packed into windows of two halves' inputs of eleven and a tail of
-    their final ids, or a pair a row, its halves a window each (`segments=1`): the facts shape the ids, the
+    their final ids, or a pair a row, its halves two rows (`segments=1`): the facts shape the ids, the
     completion mask and the windows' documents as the first batch holds them, and name a half's
     longest."""
     rows = Memory([{"chosen": [1, 2, 3], "rejected": [4, 5]} for _ in range(4)])
