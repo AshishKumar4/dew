@@ -15,10 +15,11 @@ from typing import NamedTuple
 
 import numpy as np
 from certified import allowance
-from native_certificates import TRUNCATING, truncating_underflow
+from native_certificates import TRUNCATING, tf32_operand, truncating_underflow
 from op_certificates import (
     BFLOAT16,
     FLOAT32,
+    TFLOAT32,
     Format,
     above,
     below,
@@ -116,6 +117,14 @@ class Lane:
     """The parts its operands, the queries, keys and values, are given in (`mainloop.Call.given`)."""
     wide: bool = False
     """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
+    pairing: int = 1
+    """The parts a factored pair's fp32 operand takes (`mainloop.pairing_parts`, `operand`)."""
+    tf32: str = "read"
+    """How a one-part fp32 operand reaches its product (`operand`), the issuer's: 'plain', as itself (an
+    interpreted product, a plain fp32 dot: mosaic_sm80.py's and mosaic_sm90.py's interpreted branches);
+    'rna', rounded to TF32 to nearest, a tie away from zero, first (`cvt.rna.tf32.f32`,
+    `Family.rounds_tf32`: mma.sync's); 'read', read as TF32 from its fp32 register by the instruction, no
+    conversion stated (warpgroup MMA's), which encloses either of the others."""
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:
@@ -193,9 +202,9 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16, into: Iv | None = None
 
     pa, pb = parts
     if lane.wide and pa == 1:
-        a, fmt = operand(a), FLOAT32
+        a, fmt = operand(a, lane), FLOAT32
     if lane.wide and pb == 1:
-        b, fmt = operand(b), FLOAT32
+        b, fmt = operand(b, lane), FLOAT32
     issued = product.terms(pa, pb)
     dropped = [(i, j) for i in range(pa) for j in range(pb) if (i, j) not in issued]
     share = sum(PART_BOUNDS[i] * PART_BOUNDS[j] for i, j in issued) if pa * pb > 1 else 1.0
@@ -242,12 +251,20 @@ def exp2(x: Iv, lane: Lane) -> Iv:
     return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
 
 
-def operand(iv: Iv) -> Iv:
-    """An fp32 value as the factored pairs' products take it (`mainloop._pairing_operand`): TF32 (10 bits
-    past the leading one, rounded or truncated) or two bf16 parts and their pairs' products of orders under
-    two (16 bits, the dropped term under 2^-16 of the product), both within 2^-10 of the value."""
-    widen = 2.0 ** -10 * np.maximum(np.abs(iv.lo), np.abs(iv.hi))
-    return outward(iv.lo - widen, iv.hi + widen)
+def operand(iv: Iv, lane: Lane, parts: int = 1) -> Iv:
+    """An fp32 value within `iv` as a product takes it in `parts`: one part as the lane's issuer reaches its
+    TF32 product (`Lane.tf32`: itself; `native_certificates.tf32_operand`'s rounding, monotone, at both
+    ends; or read as TF32 from the register, both ends rounded outward on its grid, which encloses nearest
+    under either tie and truncation); two bf16 parts (`product.formed`) within the third part's bound of it
+    (`PART_BOUNDS`); three, the value itself."""
+    if parts == 1 and lane.tf32 == "rna":
+        return Iv(tf32_operand(iv.lo), tf32_operand(iv.hi))
+    if parts == 1 and lane.tf32 == "read":
+        return Iv(below(iv.lo, TFLOAT32), above(iv.hi, TFLOAT32))
+    if parts == 2:
+        widen = PART_BOUNDS[2] * np.maximum(np.abs(iv.lo), np.abs(iv.hi))
+        return outward(iv.lo - widen, iv.hi + widen)
+    return iv
 
 
 def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:

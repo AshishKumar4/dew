@@ -862,6 +862,12 @@ class Issuer[Accumulator](abc.ABC):
     load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so
     a product of transposed fp32 operands there takes bf16 parts."""
 
+    rounds_tf32: bool = False
+    """Whether its TF32 products round each fp32 operand to TF32 first (`takes_tf32`; `cvt.rna.tf32.f32`, to
+    nearest, a tie away from zero): mma.sync's, the fork's lane-level `mma` rounding it
+    (mosaic/gpu/mma.py `_rounded_to_tf32`); else the instruction reads the fp32 operand as TF32 itself, no
+    conversion stated (warpgroup MMA's)."""
+
     takes_prologue_tiles: bool = True
     """Whether its kernels lower a prologue over a side operand's tile (a SwiGLU gate's): mma.sync's do not
     (a kernel gradient's 'layout casts are unsatisfiable', and a forward's 64 x 192 x 32 spilled 24 bytes at

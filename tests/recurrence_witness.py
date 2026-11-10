@@ -376,16 +376,19 @@ def key_pairs(rows: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     firsts, lasts = sub_of * SUB, sub_of * SUB + SUB - 1
     down = between(exact, bound, exact[firsts], bound[firsts], lane)
     gated = fp32(mul(rows, down), lane)
-    up = operand(fp32(mul(point(k), between(exact[lasts], bound[lasts], exact, bound, lane)), lane))
+    up = operand(fp32(mul(point(k), between(exact[lasts], bound[lasts], exact, bound, lane)), lane), lane,
+                 lane.pairing)
     found = point(np.zeros((size, size)))
     for t in range(size // SUB):
         reached = sub_of > t
         middle = between(exact[firsts], bound[firsts], exact[t * SUB + SUB - 1][None, :],
                          bound[t * SUB + SUB - 1][None, :], lane)
         middle = where(reached[:, None], middle, point(np.zeros(middle.lo.shape)))
-        left = operand(fp32(mul(gated, middle), lane))
+        left = operand(fp32(mul(gated, middle), lane), lane, lane.pairing)
         columns = slice(t * SUB, (t + 1) * SUB)
-        product = dot(left, Iv(up.lo[columns].T, up.hi[columns].T), lane, FLOAT32)
+        # Each operand its pairing form (`operand`), the product over its parts' issued pairs.
+        product = dot(left, Iv(up.lo[columns].T, up.hi[columns].T), lane, FLOAT32,
+                      parts=(lane.pairing, lane.pairing))
         found = Iv(np.concatenate([found.lo[:, :t * SUB], product.lo, found.lo[:, (t + 1) * SUB:]], 1),
                    np.concatenate([found.hi[:, :t * SUB], product.hi, found.hi[:, (t + 1) * SUB:]], 1))
     return found
@@ -534,6 +537,11 @@ class Run:
     """Whether it is an fp32 call (`Lane.wide`)."""
     walked: bool
     """Whether it is the fused inference walk's (`walk_enclosures`), its records `WALKED`'s."""
+    pairing: int
+    """The parts a factored pair's fp32 operand takes (`Lane.pairing`, `mainloop.pairing_parts`)."""
+    tf32: str
+    """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
+    the launches were interpreted."""
 
     @property
     def chunks(self) -> int:
@@ -716,6 +724,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                          for first, _ in table])
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
+               pairing=mainloop.pairing_parts(family, held),
+               tf32=("plain" if generation.backend() != "gpu" else "rna" if family.rounds_tf32 else "read"),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -771,7 +781,8 @@ def enclosed(run: Run, lane: Lane) -> dict[str, Iv]:
     leaves."""
     writes = {"delta": enclosures, "keys": keys_gated_enclosures, "values": values_gated_enclosures}
     enclose = functools.partial(walk_enclosures, write=run.write) if run.walked else writes[run.write]
-    lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide)
+    lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
+                               tf32=run.tf32)
     found: dict[str, list] = {}
     for n in range(run.chunks):
         for head in range(run.heads):
@@ -1038,7 +1049,8 @@ def assert_parts_witnessed(lane: Lane, heads: int = 1) -> None:
     q, k, v, g, beta, h0 = wide
     narrow = recorded(*(x.astype(jnp.bfloat16) for x in (q, k, v)), g, beta.astype(jnp.bfloat16), h0)
     claimed = recorded(*wide)
-    held = {"write": claimed.write, "held": claimed.held, "given": claimed.given, "wide": True}
+    held = {"write": claimed.write, "held": claimed.held, "given": claimed.given, "wide": True,
+            "pairing": claimed.pairing, "tf32": claimed.tf32}
     as_claimed = dataclasses.replace(narrow, **hosted(wide, given=claimed.given), **held)
     assert_refusals(refusals(narrow, as_claimed, lane), PARTS_SHARES)
 
@@ -1326,7 +1338,8 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
     its record's dtype): `[N, H, ...]` each, the gradient each chunk's memory enters with the record before
     it (the initial memory's, `dh0`, for the first)."""
     run = back.run
-    lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide)
+    lane = dataclasses.replace(lane, held=run.held, given=run.given, wide=run.wide, pairing=run.pairing,
+                               tf32=run.tf32)
 
     def stored(iv: Iv, dtype) -> Iv:
         """An enclosure as its record is stored: fp32 as it is; a 16-bit record its one rounding, or where

@@ -205,6 +205,8 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     transposes_tf32 = True
 
+    rounds_tf32 = True
+
     def specialized(self, rows: int, columns: int) -> Self:
         # Its warps split `m_warps` along a warpgroup's `rows` and the rest along its `columns` (`MMALayouts`;
         # each product states it, `plgpu.mma`'s `m_warps`): of the splits whose atom, `m_warps * 16` rows by

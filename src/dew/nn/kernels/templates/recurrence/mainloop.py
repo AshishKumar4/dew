@@ -1470,14 +1470,19 @@ def _intra_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
     return (_pairing(call, keys), scanned, placing, *sums), landing
 
 
+def pairing_parts(family: mosaic.Family, held: int) -> int:
+    """The parts the factored pairs' fp32 operands take to their products (`algebra.key_block_pairs`) in a
+    call holding its values in `held` parts: in a 16-bit call, fp32 itself where the family's products take
+    it as TF32 (`Family.takes_tf32`), one product a pair as fla's sub-chunk products take, else two bf16
+    parts (16 of their bits, past TF32's); an fp32 call's three bf16 parts."""
+    if held > 1:
+        return PARTS
+    return 1 if family.takes_tf32 else 2
+
+
 def _pairing_operand(call: Call) -> Operand:
-    """The form the factored pairs' fp32 operands take to their products (`algebra.key_block_pairs`): in a
-    16-bit call, fp32 itself where the family's products take it as TF32 (`Family.takes_tf32`, warpgroup
-    MMA's), one product a pair as fla's sub-chunk products take, else two bf16 parts (16 of their bits,
-    past TF32's); an fp32 call's three bf16 parts."""
-    if call.held.parts > 1:
-        return Operand(call.rows, PARTS, jnp.dtype(jnp.float32))
-    return Operand(call.rows, 1 if call.family.takes_tf32 else 2, jnp.dtype(jnp.float32))
+    """The form the factored pairs' fp32 operands take (`pairing_parts`)."""
+    return Operand(call.rows, pairing_parts(call.family, call.held.parts), jnp.dtype(jnp.float32))
 
 
 def staged_parts(family: mosaic.Family, value: jax.Array, buffers) -> Parts:
