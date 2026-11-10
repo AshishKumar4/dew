@@ -49,6 +49,37 @@ def test_an_explicit_readout_tensor_file_uses_the_native_safe_weight_reader(tmp_
         np.testing.assert_array_equal(restored[name], value.numpy())
 
 
+def test_a_releases_task_reads_back_and_writes_the_bytes_its_export_wrote(tmp_path):
+    """An export's release states its run's task as one record (`dew.interop.release.ReleaseTask`): a
+    bundle saved with its run's settings and numerics writes its task as the hand-built record did (the
+    settings' and numerics' records, the dtype it computes in, how it rounds, its cache's capacity), and the
+    load reads it back to the same task, which writes the same bytes again."""
+    import dataclasses
+
+    from dew.config.release import RELEASE_FILE
+    from dew.inference.tasks import TaskSettings, TextSettings
+    from dew.interop import Pretrained
+    from dew.interop.release import ReleaseTask, capacity, released, rounding
+    from dew.nn.precision import Numerics
+    from dew.registry import to_record
+    from dew.sampling import Sampling
+
+    settings = TextSettings(seq_len=8, max_new_tokens=2, tokenizer=None, processor=None, sampling=Sampling())
+    numerics = Numerics(forms="accurate")
+    bundle = dataclasses.replace(Pretrained.load(FIXTURES / "qwen3-tiny", dtype="float32"), settings=settings,
+                                 numerics=numerics)
+    bundle.save(tmp_path / "export")
+    task = json.loads((tmp_path / "export" / RELEASE_FILE).read_text())["task"]
+    held = capacity(bundle.model)
+    assert json.dumps(task) == json.dumps({
+        "settings": to_record(settings, TaskSettings), "numerics": to_record(numerics, Numerics),
+        "dtypes": {"compute": "float32"}, "rounds": rounding(bundle.model),
+        **({} if held is None else {"max_seq_len": held})})
+    run = released(tmp_path / "export")
+    assert run == ReleaseTask.read(task) and run.settings == settings and run.numerics == numerics
+    assert json.dumps(run.record()) == json.dumps(task)
+
+
 def test_a_saved_processor_record_reloads_its_selected_folder(tmp_path):
     """A processor selected below a repository root survives the task-settings JSON round trip;
     the unrelated root config cannot replace its vocabulary and preprocessing."""
