@@ -240,7 +240,8 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
         scratch.p_full.wait(scratch.p_full.turn(index))
         pl.when(index > 0)(lambda: scratch.corrected.wait(scratch.corrected.turn(index - 1)))
         consumed = _released(scratch.values, turn)
-        acc = Accumulator(scratch.acc_tmem, scratch.acc_tmem.shape, accumulate=index > 0)
+        acc = Accumulator(scratch.acc_tmem, (RINGS.rows, int(scratch.acc_tmem.shape[-1])),
+                          accumulate=index > 0)
 
         def product(p_tmem):
             # The weights the softmax wrote to tensor memory (tcgen05's TS form, `Tcgen05Issuer.products`).
@@ -259,8 +260,8 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
             k_smem = scratch.keys.acquire(turn)
             scores = scratch.scores.turn(index)
             s_tmem = scratch.scores.acquire(scores)
-            RINGS.products(Accumulator(s_tmem, s_tmem.shape), scratch.q_smem, k_smem.T, accumulate=False,
-                           released=_released(scratch.keys, turn))
+            RINGS.products(Accumulator(s_tmem, (RINGS.rows, block.block_k)), scratch.q_smem, k_smem.T,
+                           accumulate=False, released=_released(scratch.keys, turn))
             scratch.scores.issued(scores)
             pl.when(index > 0)(functools.partial(values, index - 1))
 
