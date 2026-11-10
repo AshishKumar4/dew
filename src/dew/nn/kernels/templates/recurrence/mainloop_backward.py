@@ -24,7 +24,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Held,
     Operand,
     Tiles,
-    addressed,
     block_stored,
     chunk_liveness,
     column_tile,
@@ -739,50 +738,37 @@ def _query_key_split(call: Call) -> int:
     landing). Compiled as interpreted: the weights' gradient a split once landed zero natively, `-dw` read
     from its accumulator, because CUDA 12.9's ptxas folded the read's sign flip (an xor) so that the
     product's HGMMA wrote the zero register, not the split (row 4346: the JAX fork's float-sign-ops
-    lowering, post66; M-JS-22q native as interpreted). Its thread holds the split's register model too
-    (`_query_key_held`): an A100's SSD training took a 128-wide split at 255 registers spilling 96 bytes,
-    where 64 held 208 and none (armada 20261110180605-2b5392e0)."""
-    def holds(vq: int) -> bool:
+    lowering, post66; M-JS-22q native as interpreted)."""
+    def streamed(vq: int) -> int:
         tiles, _ = _query_key_launched(call, vq)
-        landing = _query_key_landing(call, call.value_width // vq)
-        _, scope, _, _ = shared_allocation(call, tiles, (), landing)
-        return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
-                and _query_key_held(call, vq).registers(call.family, addressed((), landing))
-                <= call.family.registers(1))
+        _, scope, _, _ = shared_allocation(call, tiles, (), _query_key_landing(call, call.value_width // vq))
+        return resources.shared_bytes(call.family, scope(1))
 
-    return next((vq for vq in whole_blocks(call.value_width, call.value_block) if holds(vq)),
+    budget = generation.shared_budget(call.target)
+    return next((vq for vq in whole_blocks(call.value_width, call.value_block) if streamed(vq) <= budget),
                 call.value_block)
 
 
-def _query_key_held(call: Call, vq: int) -> Held:
-    """What `_query_key`'s consumer thread holds at value split `vq` (`algebra.memory_gradients`): a block's
-    gradient's fp32 sum (one accumulator over the value blocks), that sum gated, its scores' product where
-    the program takes the value head whole (a split's are added after its memory products, the first
-    split's alone), and a block's queries or keys in fp32 for the range terms, beside the memory products'
-    fragments, the memories read transposed (a whole swizzle of their depth in each warp replicating them,
-    `resources.operand_fragments`); then `sum(S dS)` (`_memory_sum`): the memories' product and its
-    diagonal's mask where products read registers, else the memories in fp32. An accumulator a value
-    block, the SSD's spilled 168 bytes a thread on an A100, where one needed 249 registers (gateqk at
-    c2808ebbe); its transposed memories stated as one untransposed tile, 48 registers short, an A100's SSD
-    took a 128-wide split at 255 spilling 96 bytes (row 5376's forked gate, armada
-    20261110180605-2b5392e0)."""
+def _query_key_held(call: Call) -> Held:
+    """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum
+    (one accumulator over the value blocks), that sum gated, its scores' product, and a block's queries or
+    keys in fp32 for the range terms; then `sum(S dS)` (`_memory_sum`): the memories' product and its
+    diagonal's mask where products read registers, with a block of each operand, else the memories in fp32.
+    An accumulator a value block, the SSD's spilled 168 bytes a thread on an A100, where one needed 249
+    registers (gateqk at c2808ebbe)."""
     chunk, vb = call.chunk, call.value_block
-    held, memories, given, family = call.held, call.memories, call.given, call.family
-    def read(rows: int, lhs, rhs_parts: int) -> list:
-        # A product of `lhs` `[rows, vb]` and the memories read transposed, their fragments `rhs_parts` times.
-        return resources.operand_fragments(family, rows, vb, call.block, lhs.stored, memories.stored,
-                                           lhs_parts=lhs.parts, rhs_parts=rhs_parts, rhs_transposed=True)
-
-    products = read(chunk, given, memories.parts) + read(chunk, held, 0)
-    summed = ([f32(call.block, call.block), *masks(call.block, call.block),
-               *read(call.block, memories, memories.parts)]
-              if family.operands_in_registers else [f32(call.block, vb)] * 2)
+    held, memories, given = call.held, call.memories, call.given
+    block = (memories, call.block, vb)
+    summed = ([f32(call.block, call.block), *masks(call.block, call.block), *fragments(call, block, block)]
+              if call.family.operands_in_registers else [f32(call.block, vb)] * 2)
     # An fp32 call's products overlapping (warpgroup MMA's) keep its row results `after` and `leaving`
     # beside them: unstated, Qwen3.5's fp32 training claimed 3 programs an H100 at 136 registers, whose cap
     # spilled 36 bytes (jsf-owncap).
     rows = [f32(chunk, 4)] * 2 if call.family.products_overlap and held.parts > 1 else []
-    sums = 4 if vq == call.value_width else 3
-    return Held(phases=([f32(chunk, call.block)] * sums + rows + products, summed))
+    return Held(phases=(
+        [f32(chunk, call.block)] * 4 + rows
+        + fragments(call, (given, chunk, vb), (held, chunk, vb), (memories, call.block, vb)),
+        summed))
 
 
 def _query_key_landing(call: Call, splits: int) -> dict:
@@ -928,7 +914,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
-        work=work, held=_query_key_held(call, vq), landing=_query_key_landing(call, splits))(
+        work=work, held=_query_key_held(call), landing=_query_key_landing(call, splits))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
     if splits > 1:
