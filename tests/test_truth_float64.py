@@ -140,8 +140,8 @@ def test_a_truth_that_computes_in_float64_is_judged(name):
     """The null control: a site whose truth is float64's (the reference on widened inputs, a formula of its
     own, parameters held in float64 or left float32 and read exactly, a stated rounding and what is selected
     of it, a format's own division declared (`stored_as`), a float32 draw read only by a comparison,
-    complex operands (widened to complex128), a dead fp32 value, an integer leaf, a float32 leaf of no entries, a float64 NumPy truth) is judged as before,
-    its arm on par with itself."""
+    complex operands (widened to complex128), a dead fp32 value, an integer leaf, a float32 leaf of no
+    entries, a float64 NumPy truth) is judged as before, its arm on par with itself."""
     arm, draw, truth = NULL[name]
     assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)
 
