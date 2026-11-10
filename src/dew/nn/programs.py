@@ -104,6 +104,20 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
 
 
 
+def with_bodies(params: Mapping, rebuilt: Callable[[jcore.Jaxpr], jcore.Jaxpr]) -> dict:
+    """`params` with each program within them (`bodies`' finder's: a parameter that is a program, or a tuple
+    holding them, a branch's) replaced by `rebuilt(program)`, every other parameter as it is: what a
+    program's equation retraced at other shapes binds."""
+    def replaced(value):
+        if isinstance(value, jcore.Jaxpr):
+            return rebuilt(value)
+        if isinstance(value, tuple) and any(isinstance(each, jcore.Jaxpr) for each in value):
+            return tuple(rebuilt(each) if isinstance(each, jcore.Jaxpr) else each for each in value)
+        return value
+
+    return {key: replaced(value) for key, value in params.items()}
+
+
 def equations(jaxpr: jcore.Jaxpr) -> Iterator[jcore.JaxprEqn]:
     """Every equation of `jaxpr` and of every program within it, at any depth (`jax.extend.core.subjaxprs`):
     a call's, a loop's, a branch's, a custom derivative's, a kernel's."""

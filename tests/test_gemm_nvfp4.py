@@ -12,24 +12,12 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS
 from jax.sharding import Mesh
+from low_precision_support import nvfp4
 
 from dew.algebra import bits
+from dew.nn import fake_quant
 from dew.nn.kernels import gemm, generation, grouped_matmul
 from dew.nn.kernels.templates.gemm import mosaic_gpu
-
-E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-"""An E2M1 code's magnitude by its low three bits; the fourth is its sign."""
-
-
-def nvfp4(seed: int, depth: int, width: int, *, scale: float = 0.25) -> tuple[gemm.NvFp4, np.ndarray]:
-    """An NVFP4 matrix of random codes under power-of-two block scales (`gemm.NvFp4.of`, each value exact in
-    float64), and its values: code times block scale times the tensor's `scale`."""
-    rng = np.random.default_rng(seed)
-    codes = rng.integers(0, 16, size=(depth, width))
-    magnitudes = np.where(codes >= 8, -1.0, 1.0) * np.asarray(E2M1)[codes & 7]
-    block = np.exp2(rng.integers(-3, 4, size=(depth // 16, width))).astype(np.float32)
-    matrix = gemm.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), jnp.asarray(block, jnp.float8_e4m3fn), scale)
-    return matrix, magnitudes * np.repeat(block.astype(np.float64), 16, axis=0) * scale
 
 
 def test_an_nvfp4_matrix_holds_its_codes_and_the_staged_order_reads_back():
@@ -54,7 +42,7 @@ def test_an_nvfp4_product_is_its_decoded_products_times_the_deferred_factor():
     """XLA's route (a CPU's): the rows rounded to bfloat16 times the decoded matrix, summed in fp32, times
     `bits.NVFP4_OWED` and the tensor's scale, then rounded once: bitwise the program written out, and, its
     operands small integers and powers of two, exactly the float64 product of the matrix's values."""
-    matrix, values = nvfp4(0, 256, 192)
+    matrix, values = nvfp4(0, 256, 192, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(1).integers(-3, 4, size=(64, 256)), jnp.bfloat16)
     got = jax.jit(lambda x, m: gemm.nvfp4_product(x, m, out_dtype=jnp.float32))(rows, matrix)
     written = jnp.dot(rows, matrix.decoded(), preferred_element_type=jnp.float32) * matrix.factor
@@ -68,7 +56,7 @@ def test_an_nvfp4_product_through_the_template_is_exact(generation_name):
     """The template's launch interpreted on each family, the template named for the product: the same exact
     product; and the rows' gradient through the decoded matrix, the weights frozen, on the route its selector
     picks (the cotangent fp32 beside a bfloat16 matrix)."""
-    matrix, values = nvfp4(2, 256, 256)
+    matrix, values = nvfp4(2, 256, 256, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(3).integers(-3, 4, size=(128, 256)), jnp.bfloat16)
     cotangent = jnp.asarray(np.random.default_rng(4).integers(-2, 3, size=(128, 256)), jnp.float32)
 
@@ -94,7 +82,7 @@ def test_the_mainloop_decodes_an_nvfp4_stage_in_place(family):
     256-deep stage into bfloat16 in the consumer's own buffer before its products: the rows times the
     decoded values, bitwise `NvFp4.decoded`'s product (small integer rows, every product and sum exact),
     two column tiles and two steps, interpreted on each family; a 128-deep step is refused."""
-    matrix, _ = nvfp4(6, 512, 128)
+    matrix, _ = nvfp4(6, 512, 128, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(7).integers(-3, 4, size=(136, 512)), jnp.bfloat16)
     expected = np.asarray(rows, np.float64) @ np.asarray(matrix.decoded(), np.float64)
     tiles = mosaic_gpu.Tiles(64, 64, 256, 2, 1, family=family)
@@ -137,7 +125,7 @@ def test_an_nvfp4_products_packed_kernel_is_its_decoded_product(generation_name)
     mainloop decoding each stage in place, row 3621) gives the decoded product's value and rows' gradient
     bitwise, its route reporting the packed kernel: small integer rows, every product and sum exact in
     fp32."""
-    matrix, values = nvfp4(8, 512, 128)
+    matrix, values = nvfp4(8, 512, 128, scale=0.25)
     rows = jnp.asarray(np.random.default_rng(9).integers(-3, 4, size=(96, 512)), jnp.float32)
     cotangent = jnp.asarray(np.random.default_rng(10).integers(-2, 3, size=(96, 128)), jnp.float32)
 
@@ -226,7 +214,7 @@ def test_an_nvfp4_bank_packs_its_nibbles_on_the_host_as_its_values():
     scale = np.asarray([0.5, 0.25], np.float32)
     host = gemm.NvFp4.of(nibbles, scales, scale)
     assert all(isinstance(field, np.ndarray) for field in (host.words, host.scales, host.scale))
-    values = np.where(nibbles >= 8, -1.0, 1.0) * np.asarray(E2M1)[nibbles & 7]
+    values = fake_quant.E2M1[nibbles]
     device = gemm.NvFp4.of(jnp.asarray(values, jnp.float32), jnp.asarray(scales), jnp.asarray(scale))
     np.testing.assert_array_equal(host.words, np.asarray(device.words))
 
