@@ -532,3 +532,53 @@ def test_a_forked_recurrence_costs_its_tokens_and_a_chunk_a_document(layer, docu
     bound, work = _compiled_cost(packed[0], *packed[1])
     assert temporaries <= 2 * bound + 4 * 4 * memories, (temporaries, bound, flops, work, memories)
     assert flops <= 2 * work + 4 * memories, (temporaries, bound, flops, work, memories)
+
+
+def test_a_forked_conv_reads_each_documents_real_tokens_past_its_holes():
+    """A forked call whose parent and child each hold invalid slots inside their runs (paused tokens, a
+    caller's own Coordinates) convolves each real token after the real tokens before it in its chain, as the
+    same call laid with the holes taken out does (`forked_conv`, the paused-token contract of
+    `_masked_conv1d`); a hole reads and advances nothing and is zero."""
+    from dew.nn.linear import forked_conv
+
+    channels, taps = 4, 3
+    segments = np.asarray([[1, 1, 1, 1, 2, 2, 2, 3, 3, 0]], np.int32)
+    held = np.asarray([[True, False, True, True, True, False, True, True, False, False]])
+    parents = jnp.asarray([[0, 1, 1]], jnp.int32)
+    forks = Forks(parents, depth=1)
+
+    def laid(segments, valid):
+        return dataclasses.replace(coordinates(segments=jnp.asarray(segments), valid=jnp.asarray(valid),
+                                               max_segments=3), forks=forks)
+
+    rng = np.random.default_rng(3)
+    x = jnp.asarray(rng.standard_normal((1, segments.shape[1], channels)), jnp.float32)
+    kernel = jnp.asarray(rng.standard_normal((channels, taps)), jnp.float32)
+    found = np.asarray(forked_conv(x, kernel, laid(segments, held)))
+    order = np.flatnonzero(held[0])
+    compact = np.zeros_like(segments)
+    compact[0, :len(order)] = segments[0, order]
+    moved = jnp.zeros_like(x).at[0, :len(order)].set(x[0, order])
+    expected = np.asarray(forked_conv(moved, kernel, laid(compact, compact > 0)))
+    np.testing.assert_allclose(found[0, order], expected[0, :len(order)], rtol=1e-6, atol=1e-6)
+    assert np.all(found[0, ~held[0]] == 0)
+
+
+def test_a_cached_call_stating_no_validity_places_its_keys_as_real_tokens():
+    """A cached call over forks whose coordinates state no validity (a one-document call, which the
+    backbone fills none for) places its keys as one whose every token is real (`fork_key_places`)."""
+    from dew.nn.inputs import AttentionMetadata
+    from dew.nn.mixers.attention import fork_key_places
+
+    rows, queries, keys = 2, 3, 8
+    plain = dataclasses.replace(coordinates((rows, queries)), forks=Forks(jnp.zeros((rows, 1), jnp.int32),
+                                                                          depth=0))
+    positions = jnp.broadcast_to(jnp.arange(5, 5 + queries), (rows, queries))
+    first = jnp.asarray([5, 5], jnp.int32)
+
+    def placed(laid):
+        return np.asarray(fork_key_places(AttentionMetadata(coordinates=laid), positions, first, rows,
+                                          queries, keys))
+
+    real = dataclasses.replace(plain, valid=jnp.ones((rows, queries), bool))
+    np.testing.assert_array_equal(placed(plain), placed(real))
