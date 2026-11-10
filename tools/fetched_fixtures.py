@@ -77,12 +77,14 @@ def pins(root: Path = REPO_ROOT) -> dict[str, dict]:
             for path in sorted((root / FIXTURES).rglob(f"*{PINNED}"))}
 
 
-def _pin_file(name: str, root: Path) -> Path:
-    return root / f"{name}{PINNED}"
+def manifest(payload: Path) -> Path:
+    """The pin of the fixture whose payload is `payload`: the file beside it its name and `PINNED` name, which
+    the checkout carries in the payload's place (and a run's key reads the payload by: digests.contents)."""
+    return payload.with_name(payload.name + PINNED)
 
 
 def _pinned(name: str, pin: dict, root: Path) -> None:
-    _pin_file(name, root).write_text(json.dumps(pin, indent=1, sort_keys=True) + "\n")
+    manifest(root / name).write_text(json.dumps(pin, indent=1, sort_keys=True) + "\n")
 
 
 def digest(data: bytes) -> str:
@@ -166,9 +168,9 @@ def local(path, root: Path = REPO_ROOT) -> Path:
     """The file a test reads for the recording at `path`: where a pin holds it, its file in the local
     store, checked against the pin on every read, whatever sits at `path`; else the file itself."""
     name = fixture(path, root)
-    if name is None or not _pin_file(name, root).is_file():
+    if name is None or not manifest(root / name).is_file():
         return root / path
-    pin = json.loads(_pin_file(name, root).read_text())
+    pin = json.loads(manifest(root / name).read_text())
     stored = _stored(pin, root)
     if not stored.is_file():
         raise FileNotFoundError(f"{name}: pinned ({pin['sha256'][:12]}) and not in {LOCAL}; run "
@@ -193,7 +195,7 @@ def save(path, arrays: dict, *, reference: str, license: str, root: Path = REPO_
     if len(data) <= IN_GIT:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-        _pin_file(name, root).unlink(missing_ok=True)
+        manifest(root / name).unlink(missing_ok=True)
         return target
     sha = digest(data)
     pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,

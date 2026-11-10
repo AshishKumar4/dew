@@ -14,17 +14,18 @@ import types
 from pathlib import Path
 
 
-def _followed():
-    """followed.py, beside this file, loaded by its path as ci.py loads its neighbours."""
-    path = Path(__file__).resolve().with_name("followed.py")
-    spec = importlib.util.spec_from_file_location("armada_followed", path)
+def _loaded(path: Path, name: str) -> types.ModuleType:
+    """The module at `path`, loaded by its path as ci.py loads its neighbours."""
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-followed = _followed()
+followed = _loaded(Path(__file__).resolve().with_name("followed.py"), "armada_followed")
+fetched = _loaded(Path(__file__).resolve().parents[1] / "fetched_fixtures.py", "armada_fetched_fixtures")
+"""tools/fetched_fixtures.py, whose `manifest` says where a fetched fixture's pin is."""
 
 
 def code_of(name: str) -> bytes:
@@ -152,10 +153,6 @@ FIXTURES = Path("tests/fixtures")
 directories up to it (`native_inputs`)."""
 
 
-FETCHED = ".fetched.json"
-"""A fetched fixture's manifest's suffix, beside the payload it pins (tools/fetched_fixtures.py)."""
-
-
 def built(path: Path) -> bool:
     """Whether `path` is a build's output, never an input: compiled bytecode, or an editable install's
     metadata (setuptools' <name>.egg-info), which a task's environment writes into its checkout and a
@@ -190,7 +187,7 @@ def contents(name: str) -> bytes:
             return b"missing"
         return code_of(path) if executed == followed.WHOLE else unit(path, executed)
     path = Path(name)
-    manifest = path.parent / (path.name + FETCHED)
+    manifest = fetched.manifest(path)
     if path.name and manifest.is_file():
         return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
     if path.is_file():

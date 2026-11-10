@@ -311,12 +311,12 @@ def shared(python: str) -> str:
     # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`;
     # 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures). A build's output and a fetched
     # payload, which a planner's checkout lacks, are not named: they are their build's and their manifest's
-    # (`digests.built`, FETCHED, `digests.contents`), whose names are.
+    # (`digests.built`, fetched_fixtures' `manifest`, `digests.contents`), whose names are.
     for root in ("tests", "src"):
         for path in sorted(Path(root).rglob("*")):
             if (path.is_file() and path.suffix != ".py" and not digests.built(path)
                     and digests.FIXTURES not in path.parents
-                    and not path.with_name(path.name + digests.FETCHED).is_file()):
+                    and not digests.fetched.manifest(path).is_file()):
                 digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
