@@ -32,7 +32,6 @@ import jax.experimental.topologies as topologies
 import numpy as np
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 from sharded import collective_axes
 
 from dew.nn.kernels import grouped_matmul
@@ -310,15 +309,10 @@ def _compiled(case, generation: str, record: dict,
         return None
     # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
     calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
-    named = [report.launch_name(call.name, call.launch) for call in calls]
     modules = kernel_modules(calls)
     if directory is not None:
         record["modules"] = modules
         record["estimates"] = _estimates(calls, "".join(estimated))
-    if "models" in record:
-        record["lowered"] = {
-            name: [dataclasses.asdict(launch) for launch in lowered_registers(call.ir, _compiler())]
-            for name, call in zip(named, calls, strict=True)}
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
     printing = _printed(MOSAIC_GPU_DUMP_PTX="1") if directory else contextlib.nullcontext([])
@@ -752,13 +746,12 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
         with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory:
             _compiled(case, generation, record, directory)
             kernels = mosaic_kernels(record)
-            lowered_models = _lowered_models(record, kernels, generation, models)
-            # Each kernel's model: its lowered launch's, else the one its launch stated as it traced, else the
-            # case's declared one for its name (`_declared`).
+            # Each kernel's model: the one its launch stated as it traced, else the case's declared one for
+            # its name (`_declared`), the decision its derivation made.
             modelled = {}
             for kernel in kernels:
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
-                if (model := lowered_models.get(name, _declared(kernel, models))) is not None:
+                if (model := _declared(kernel, models)) is not None:
                     modelled[name] = model
             record["stated_models"] = {
                 report.launch_name(kernel["kernel"], kernel["launch"]): stated.record() for kernel in kernels
@@ -790,26 +783,6 @@ def _declared(kernel: dict, models: dict[str, resources.RegisterModel]) -> resou
     launch = None if kernel["launch"] is None else report.traced(kernel["launch"])
     stated = None if launch is None else launch.kernels.get(kernel["kernel"])
     return stated if stated is not None else models.get(kernel["kernel"])
-
-
-def _lowered_models(record: dict, kernels: list[dict], generation: str,
-                    declared: dict[str, resources.RegisterModel]) -> dict[str, resources.RegisterModel]:
-    target = gpu_target(generation)
-    models = {}
-    for kernel in kernels:
-        name = report.launch_name(kernel["kernel"], kernel["launch"])
-        launches = record.get("lowered", {}).get(name, ())
-        if not launches or kernel["shared"] is None or kernel["tmem"] is None:
-            continue
-        if len(launches) != 1:
-            raise ValueError(f"{name} has {len(launches)} launches but one compiled report")
-        stated = _declared(kernel, declared)
-        if stated is None or stated.family is None:
-            continue
-        launch = LoweredRegisters(**launches[0])
-        models[name] = launch.model(stated, target, shared=kernel["shared"], tmem=kernel["tmem"])
-    record["lowered_models"] = {name: model.record() for name, model in models.items()}
-    return models
 
 
 def decisions(registers: int | dict | None, model: resources.RegisterModel,
@@ -877,6 +850,41 @@ def model_failures(found: list[dict]) -> list[str]:
     return failed
 
 
+def undercounts(found: list[dict]) -> list[str]:
+    """Each kernel whose register model claims more than ptxas holds where that changes its launch, and each
+    launch no model states. The model is the one that decided the launch (`_register_evidence`: its stated
+    one, else the case's declared one); ptxas is asked at the launch's own caps (`register_decisions`, each a
+    residency's, compiled at that cap, no cap inferred from another): the model under-counts where it admits
+    a tile its budget's cap does not hold spill-free, or runs more programs a multiprocessor than the most
+    whose cap does (a raising consumer judged at its raise, not at the count ptxas reports, which is the
+    raise). The run-time decision is the model's alone (owner, 10-29: no run-time ptxas), so such a launch
+    spills or is planned past its residency. An over-count only costs a smaller tile, which `model_failures`
+    reports where a family's models are held to agree."""
+    failed = []
+    for record in found:
+        for kernel in record.get("kernels", ()):
+            found_kernel = _report(kernel)
+            case = f"{record['name']} {found_kernel.kernel}"
+            stated = record.get("stated_models", {}).get(found_kernel.traced,
+                                                          record.get("models", {}).get(found_kernel.kernel))
+            if stated is None:
+                failed.append(f"{case}: a launch no register model states")
+                continue
+            model, need = resources.RegisterModel(**stated), kernel.get("need")
+            if model.registers is None or not isinstance(need, dict):
+                continue
+            admits, programs = decisions(model.registers, model)
+            if not admits:
+                continue
+            if not need["admitted"] or programs > need["programs"]:
+                held = ", ".join(f"{cap['cap']}: {'holds' if cap['holds'] else f'spills {cap['spilled']}'}"
+                                 for cap in sorted(need["caps"], key=lambda cap: cap["cap"]))
+                holding = need["programs"] if need["admitted"] else "none"
+                failed.append(f"{case}: the model's {model.registers} registers run {programs} programs a "
+                              f"multiprocessor where ptxas holds {holding} (caps {held})")
+    return failed
+
+
 def compiled_kernels(record: dict) -> set[str]:
     """The names of the kernels `record` compiled, as its models name them (`Report.kernel`)."""
     return {_report(kernel).kernel for kernel in record.get("kernels", ())}
@@ -889,42 +897,33 @@ def _report(kernel: dict) -> Report:
 
 
 def _register_evidence(record: dict) -> list[dict]:
-    """Each modelled kernel's evidence, one row a model that decided it, judged against ptxas: the one its
-    launch stated as it traced (`stated_models`, the derivation's own prediction, which admitted its tile and
-    chose its residency) and the one its launch lowered (`lowered_models`, whose residency its need was
-    searched at, `_needs`); where its launch has neither, the case's declared one for its name (`models`), a
-    fallback no launch of a model of its own reads; and its spills and unmodelled launches."""
+    """Each kernel's evidence: its decision under the model that decided its launch, the one its launch stated
+    as it traced (`stated_models`, the derivation's own prediction, which admitted its tile and chose its
+    residency), else the case's declared one for its name (`models`, for launches that state none), against
+    ptxas's need (`_needs`); a kernel with neither is unmodelled; and its spills."""
     rows = []
     for kernel in record.get("kernels", ()):
         found = _report(kernel)
-        own = any(found.traced in record.get(source, {}) for source in ("stated_models", "lowered_models"))
-        for source, key in (("stated_models", found.traced), ("models", found.kernel),
-                            ("lowered_models", found.traced)):
-            if (stated := record.get(source, {}).get(key)) is None or (source == "models" and own):
-                continue
-            model = resources.RegisterModel(**stated)
-            need = kernel.get("need")
-            actual = record.get("lowered_models", {}).get(found.traced)
-            evidence = _evidence(record, found, model, need,
-                                 measured_model=None if actual is None else resources.RegisterModel(**actual))
+        source = "stated_models" if found.traced in record.get("stated_models", {}) else "models"
+        stated = record.get(source, {}).get(found.traced if source == "stated_models" else found.kernel)
+        if stated is not None:
+            evidence = _evidence(record, found, resources.RegisterModel(**stated), kernel.get("need"))
             rows.append({"source": source, **evidence.record()})
+        else:
+            rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "unmodelled",
+                         "reason": "no register model: its launch states none and the case declares none"})
         if found.spilled:
             rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "spill",
                          "spilled": found.spilled, "registers": found.registers})
-        if (launches := record.get("lowered", {}).get(found.traced)) and found.traced not in record.get(
-                "lowered_models", {}):
-            rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "unmodelled",
-                         "reason": "no declared family budget", "lowered": launches})
     return rows
 
 
 def _evidence(record: dict, kernel: "Report", model: resources.RegisterModel,
-              need: int | dict | None, *,
-              measured_model: resources.RegisterModel | None = None) -> compile_evidence.Evidence:
+              need: int | dict | None) -> compile_evidence.Evidence:
     """A modelled kernel's evidence: the model's registers and the decision they give against ptxas's need
     and its decision (`decisions`)."""
     predicted = decisions(model.registers, model)
-    compiled = decisions(need, measured_model or model)
+    compiled = decisions(need, model)
     # ptxas's registers a thread: its least spill-free cap, or where it decided at the launch's own caps
     # (`register_decisions`), its use at the budget.
     if isinstance(need, dict):
@@ -953,15 +952,6 @@ def _ptxas_version() -> str:
     """The version line of the ptxas the gate assembles with (`PTXAS`)."""
     ran = subprocess.run([str(PTXAS), "--version"], capture_output=True, text=True, check=False)
     return ran.stdout.strip()
-
-
-@functools.cache
-def _compiler() -> Compiler:
-    version = _ptxas_version()
-    matched = re.search(r"V(\d+)\.(\d+)", version)
-    if matched is None:
-        raise ValueError(f"ptxas states no compiler version: {version}")
-    return Compiler((int(matched[1]), int(matched[2])))
 
 
 TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}
