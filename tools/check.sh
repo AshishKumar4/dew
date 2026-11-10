@@ -68,8 +68,8 @@ case "${1:-}" in
         JAX_PLATFORMS=cpu xargs -0r "$PYTHON" tools/lint_slop.py < "$listed"
     }
     # Pyright over the changed files under its inputs (`pyright_inputs`, tools/lint_inputs.sh): its gate's own
-    # command, its inputs bound to those files (2026-11-10: read off the command's last word, its roots src/dew
-    # unread, a head whose FitSearch calls were all type errors read "pyright ok (0 s)").
+    # command, the files, each one word as git names it, in place of its inputs (2026-11-10: read off the command's
+    # last word, its roots src/dew unread, a head whose FitSearch calls were all type errors read "pyright ok").
     changed_pyright() {
       command=$(grep -v '^#' "$gates" | awk -F'\t' '$1 == "pyright" {print $2}')
       case $command in
@@ -77,7 +77,8 @@ case "${1:-}" in
         *) echo "check --changed: the pyright gate reads no \$pyright_inputs: $command"; return 2 ;;
       esac
       changed_files $pyright_inputs || return 2
-      [ ! -s "$listed" ] || xargs -0 sh -c ". tools/lint_inputs.sh; pyright_inputs=\$*; $command" sh < "$listed"
+      [ ! -s "$listed" ] || xargs -0 sh -c \
+        ". tools/lint_inputs.sh; ${command%%'$pyright_inputs'*}\"\$@\"${command#*'$pyright_inputs'}" sh < "$listed"
     }
     wanted() { [ -z "$only" ] || [ "$only" = "$1" ]; }
     wanted ruff && gate ruff changed_ruff
