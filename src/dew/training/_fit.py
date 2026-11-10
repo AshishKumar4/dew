@@ -37,6 +37,7 @@ from dew.data.dataset import (
     Ends,
     Loader,
     PhasedStream,
+    row_field,
     rows_of,
     stream_ends,
 )
@@ -765,7 +766,7 @@ def resized(batch: Batch, rows: int) -> Batch:
     held = rows_of(batch)
 
     def cut(leaf):
-        if np.ndim(leaf) and np.shape(leaf)[0] == held:
+        if row_field(leaf, held):
             return np.take(np.asarray(leaf), np.arange(rows) % held, axis=0)
         return leaf
 

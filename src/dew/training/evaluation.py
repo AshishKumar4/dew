@@ -30,7 +30,7 @@ from dew._coordination import (
 )
 from dew.artifacts import Artifact, Artifacts, FixedRows
 from dew.batch import VALID_ROWS, Batch, Variables
-from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
+from dew.data.dataset import Closeable, DataPartition, Reader, row_field, rows_of, take_rows
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import (
     batch_signature,
@@ -821,12 +821,9 @@ def _cut(leaf, keep: np.ndarray):
     """`leaf` without the rows `keep` marks as repeats, when its leading axis
     is the batch's rows: an array, a per-row tuple of captions or texts, or a
     per-row list of opaque records (`dew.data.dataset.take_rows`)."""
-    if isinstance(leaf, list | tuple):
-        return take_rows(leaf, np.flatnonzero(keep)) if len(leaf) == keep.size else leaf
-    array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
-    if array is None or not array.ndim or array.shape[0] != keep.size:
+    if not row_field(leaf, keep.size):
         return leaf
-    return take_rows(array, np.flatnonzero(keep))
+    return take_rows(leaf if isinstance(leaf, list | tuple) else np.asarray(leaf), np.flatnonzero(keep))
 
 
 def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:
