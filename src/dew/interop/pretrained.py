@@ -1528,11 +1528,12 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                                         max_seq_len=max_seq_len, weights=weights,
                                         overrides=overrides,
                                         code=None if composite.backbone is None else code(),
-                                        prediction_depths=prediction_depths)
+                                        prediction_depths=prediction_depths, packed_experts=packed_experts)
     elif fallback is not None:
         from dew.interop import torchax_fallback
 
         _unread_overrides(overrides, "the transformers forward")
+        _unpacked(packed_experts, "the transformers forward")
         loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
                                        weights=weights, placed=placed)
@@ -1543,6 +1544,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                                   streaming=streaming)
         if loaded is not None:
             _unread_overrides(overrides, "a diffusion pipeline")
+            _unpacked(packed_experts, "a diffusion pipeline")
     else:
         loaded = None
     if loaded is None:
@@ -1580,6 +1582,13 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
     """Refuse `overrides` on a route whose model no override reaches, rather than load without them."""
     if overrides is not None:
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
+
+
+def _unpacked(packed_experts: bool, route: str) -> None:
+    """Refuse `packed_experts` on a route that reads no expert bank packed, rather than load it dense."""
+    if packed_experts:
+        raise ValueError(f"packed_experts serves the expert banks of a decoder Dew translates; {route} "
+                         "loads its weights dense")
 
 
 def _processor_code(directory: Path) -> Mapping[str, object]:
@@ -2068,11 +2077,14 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                            max_seq_len: int | None, weights: bool,
                            overrides: Mapping[str, object] | None = None,
-                           code: Path | None = None, prediction_depths: int | None = None) -> Pretrained:
+                           code: Path | None = None, prediction_depths: int | None = None,
+                           packed_experts: bool = False) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
     All Hub paths remain relative to the resolved snapshot root, including a selected subfolder. `code`
     is the snapshot holding the source's own modules where the load runs them (`trust_remote_code`),
-    which the backbone's route and load read at its component's folder, as a decoder alone reads its."""
+    which the backbone's route and load read at its component's folder, as a decoder alone reads its.
+    `packed_experts` reaches the backbone's load (`_load_native_source`), and is refused where there is
+    none."""
     from dew.interop.streaming import materialize
     from dew.interop.weights import record_layouts
 
@@ -2108,9 +2120,11 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
-            remote=remote, routed=routed, prediction_depths=prediction_depths, config_root=config_root)
+            remote=remote, routed=routed, prediction_depths=prediction_depths, config_root=config_root,
+            packed_experts=packed_experts)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
+        _unpacked(packed_experts, "a release without a native backbone")
     missing = False
     if head_source.weight_file is None:
         head_tensors = {} if component is None else component.other_tensors(shared)
@@ -2417,6 +2431,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     config, route, language = routed
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
+
+        _unpacked(packed_experts, "the transformers forward (tier 3)")
         selected = source if component is None else source.component(component.config_folder)
         loaded = torchax_fallback.load(selected, root, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
