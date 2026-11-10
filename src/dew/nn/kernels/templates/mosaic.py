@@ -23,7 +23,7 @@ import dataclasses
 import functools
 import math
 import operator
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import jax
@@ -416,8 +416,7 @@ def streamed(rings: tuple, views, lo, hi, *, adds: tuple | None = None) -> None:
             box, targets = adds
             pl.when(index - lag >= lo)(lambda: box.take(targets(index - lag)))
 
-    for ring in rings:
-        ring.drain(hi - lo)
+    drain(rings, hi - lo)
 
 
 def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -807,12 +806,6 @@ class Ring:
         """A consumer's release of `turn`'s slot, whose reads (and MMAs) are done."""
         plgpu.barrier_arrive(self.consumed.at[opaque(turn.slot)])
 
-    def drain(self, end) -> None:
-        """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot
-        it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
-        release is seen (`drained`)."""
-        drained(self.consumed, end, self.stages)
-
 
 def piece_cells(block: tuple, dtype, swizzle: int | None, rows: int
                 ) -> tuple[int, tuple[tuple[int, int], ...]] | None:
@@ -840,13 +833,29 @@ def split(swizzle: int | None, rows: int) -> bool:
             and rows % swizzling.TILE_ROWS != 0)
 
 
-def drained(barriers, end, stages: int) -> None:
-    """The completions of the last `stages` of `end` turns round `barriers`, a slot's each (`Turn`), which no
-    later turn of the slot waited for: each barrier ends at the phase its waiters saw."""
+def drain(rings: Iterable[Ring], end) -> None:
+    """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot of
+    `rings` it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
+    release is seen: the rings of a depth drained together (`drained`)."""
+    rings = tuple(rings)
+    for stages in sorted({ring.stages for ring in rings}):
+        drained(tuple(ring.consumed for ring in rings if ring.stages == stages), end, stages)
+
+
+def drained(barriers: Sequence, end, stages: int) -> None:
+    """The completions of the last `stages` of `end` turns round each of `barriers` (`stages` a ring each), a
+    slot's each (`Turn`), which no later turn of the slot waited for: each barrier ends at the phase its
+    waiters saw. A slot's turn is every ring's, waited for under its one guard: drained a ring after another,
+    ptxas held each slot's guard from the first ring's wait to the last's, a predicate a slot live at once,
+    and a thread holds `resources.PREDICATES` (an eight-stage tcgen05 kernel gradient's two rings spilled
+    16 bytes of predicates at every raise but 232, FS-TGMM-PRED3)."""
     for back in range(1, stages + 1):
         turn = Turn.of(end - back, stages)
-        pl.when(turn.counter >= 0)(lambda turn=turn: plgpu.barrier_wait(barriers.at[opaque(turn.slot)],
-                                                                       parity=turn.parity))
+
+        @pl.when(turn.counter >= 0)
+        def _(turn=turn):
+            for barrier in barriers:
+                plgpu.barrier_wait(barrier.at[opaque(turn.slot)], parity=turn.parity)
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
@@ -2280,8 +2289,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         def producer():
             loaded, _ = persistent.tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
-            for ring in rings.values():
-                ring.drain(loaded)
+            drain(rings.values(), loaded)
 
         def consuming(smems):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
