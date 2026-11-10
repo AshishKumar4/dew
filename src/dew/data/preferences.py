@@ -234,32 +234,31 @@ class PreferenceWindows(grain.MapTransform):
         return shaped(rows, PARENTS_KEY, [self.documents]) if self.share else rows
 
     def map(self, element: Batch) -> Batch:
-        packed = {name: np.asarray(element[name]) for name in TOKEN_FIELDS}
-        pairs = np.asarray(element["text_segment_ids"])
-        documents = np.where(pairs > 0, packed["pair_documents"], 0)
-        parents = np.where(pairs > 0, packed["pair_parents"], 0)
-        # Each pair's leaf documents, those no other continues, and the last slot of each: its final.
-        width = int(documents.max(initial=0)) + 1
-        keys = pairs * width + documents
-        continued = set((pairs * width + parents)[(pairs > 0) & (parents > 0)].tolist())
-        last = len(keys) - 1 - np.unique(keys[::-1], return_index=True)[1]
-        finals = np.sort([slot for slot in last if pairs[slot] > 0 and int(keys[slot]) not in continued])
+        # The packed window's keys in its packed order, then each half's final moved to the tail.
+        packed = window({name: np.asarray(element[name]) for name in TOKEN_FIELDS},
+                        np.asarray(element["text_segment_ids"]), self.documents, share=self.share)
+        documents = packed[DOCUMENTS_KEY]
+        continued = set(np.asarray(packed.get(PARENTS_KEY, ())).tolist())
+        # Each leaf document's last slot, a document no other continues: its half's final.
+        numbers, last = np.unique(documents[::-1], return_index=True)
+        ends = len(documents) - 1 - last
+        finals = np.sort(ends[(numbers > 0) & ~np.isin(numbers, list(continued))]).astype(np.int64)
         if len(finals) > self.finals:
             raise ValueError(f"a window holds {len(finals)} halves' finals, past its {self.finals}")
-        body = np.ones(len(keys), bool)
+        body = documents > 0
         body[finals] = False
-        body &= pairs > 0
-        order = np.concatenate([np.flatnonzero(body), finals])
-        spans = (int(body.sum()), len(finals))
-        if spans[0] > self.inputs:
-            raise ValueError(f"a window's inputs hold {spans[0]} ids, past its {self.inputs}")
-        slots = np.concatenate([np.arange(spans[0]), self.inputs + np.arange(spans[1])])
-        fields = {name: np.zeros(self.width, values.dtype) for name, values in packed.items()}
-        held = np.zeros(self.width, np.int32)
-        for name, values in packed.items():
-            fields[name][slots] = values[order]
-        held[slots] = pairs[order]
-        laid = window(fields, held, self.documents, share=self.share)
+        inputs = np.flatnonzero(body)
+        if len(inputs) > self.inputs:
+            raise ValueError(f"a window's inputs hold {len(inputs)} ids, past its {self.inputs}")
+        order = np.concatenate([inputs, finals])
+        slots = np.concatenate([np.arange(len(inputs)), self.inputs + np.arange(len(finals))])
+
+        def moved(values):
+            laid = np.zeros(self.width, values.dtype)
+            laid[slots] = values[order]
+            return laid
+
+        laid = {key: value if key == PARENTS_KEY else moved(value) for key, value in packed.items()}
         kept = {key: value for key, value in element.items()
                 if key not in TOKEN_FIELDS and not key.endswith(("_segment_ids", "_positions"))}
         return {**kept, **laid}

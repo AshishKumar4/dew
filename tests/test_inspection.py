@@ -604,26 +604,29 @@ def test_a_pipelined_language_models_watched_layers_read_none_of_its_padding():
 
 
 def test_a_preference_runs_watched_layers_read_each_halfs_real_tokens_alone():
-    """A preference pair objective's watched layers are summarized over each half's real tokens alone
+    """A preference pair objective's watched layers are summarized over each half's real inputs alone
     (row 2324), as its pairs' layout marks them, whatever their completion marks: a pair whose chosen half
-    ends in an unmarked token, its padding filled with another id, gives the same summaries to the bit,
-    and that last real token changed gives others."""
+    reads an unmarked token last before its final, its padding filled with another id, gives the same
+    summaries to the bit, and that last real input changed gives others."""
     from objective_cases import decoder
 
     from dew.data import Memory, presets
     from dew.objectives.rl import DPOObjective
     from dew.training import MeshSpec
 
-    pair = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5], "chosen_mask": [0, 0, 1, 0],
+    pair = {"chosen": [1, 2, 3, 4, 6], "rejected": [1, 2, 5], "chosen_mask": [0, 0, 1, 0, 0],
             "rejected_mask": [0, 0, 1]}
-    (batch,) = list(Memory([pair] * 2).pipe(presets.preferences, seq_len=6, batch=1))
-    run = Trainer(DPOObjective(decoder(), 5), optax.sgd(RATE), key=jax.random.key(0),
+    (batch,) = list(Memory([pair] * 2).pipe(presets.preferences, seq_len=6, batch=1, pairs=2))
+    objective = DPOObjective(decoder(), 5, pairs=2)
+    run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
                   mesh=MeshSpec().build(jax.devices()[:1]),
                   inspection=Inspection(modules=("*MLP",), targets=("params",)))
     ids = np.asarray(batch["input_ids"])
     padding = np.asarray(batch["real_mask"]) == 0
-    # The first pair's chosen half's last real token, unmarked by its completion mask.
+    # The first pair's chosen half's last real input, unmarked by its completion mask, before the window's
+    # finals, which no input reads.
     chosen = (np.asarray(batch["pair_ids"]) == 1) & (np.asarray(batch["halves"]) == 1)
+    chosen[:, ids.shape[1] - objective.finals:] = False
     last = np.zeros(ids.shape, bool)
     last[0, np.flatnonzero(chosen[0])[-1]] = True
 
