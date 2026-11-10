@@ -420,6 +420,12 @@ def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling, *,
     ramp = np.clip((np.arange(pairs, dtype=dtype) - low) / span, 0, 1)
     return (inv_interpolation * ramp + inv_extrapolation * (1 - ramp)).astype(dtype)
 
+def yarn_mscale(scale: float, weight: float) -> float:
+    """YaRN's attention magnitude at a context `scale` under `weight` (`get_mscale`): `0.1 weight ln(scale)
+    + 1`, 1 at no extension."""
+    return 1.0 if scale <= 1 else 0.1 * weight * math.log(scale) + 1.0
+
+
 def yarn_attention_factor(yarn: YarnScaling) -> float:
     """The cos/sin multiplier of `_compute_yarn_parameters`.
 
@@ -429,13 +435,9 @@ def yarn_attention_factor(yarn: YarnScaling) -> float:
     """
     if yarn.attention_factor is not None:
         return float(yarn.attention_factor)
-    def mscale(scale: float, weight: float) -> float:
-        return 1.0 if scale <= 1 else 0.1 * weight * math.log(scale) + 1.0
-
     if yarn.mscale and yarn.mscale_all_dim:
-        return float(mscale(yarn.factor, yarn.mscale)
-                     / mscale(yarn.factor, yarn.mscale_all_dim))
-    return float(mscale(yarn.factor, 1.0))
+        return float(yarn_mscale(yarn.factor, yarn.mscale) / yarn_mscale(yarn.factor, yarn.mscale_all_dim))
+    return float(yarn_mscale(yarn.factor, 1.0))
 
 
 def yarn_query_scale(yarn: YarnScaling) -> float:
@@ -446,9 +448,9 @@ def yarn_query_scale(yarn: YarnScaling) -> float:
     ratio, the same way `attention_scale` does on the standard mixer. For
     the released configs this is `(0.1 * ln(40) + 1) ** 2`.
     """
-    if not yarn.mscale_all_dim or yarn.factor <= 1:
+    if not yarn.mscale_all_dim:
         return 1.0
-    mscale = 0.1 * yarn.mscale_all_dim * math.log(yarn.factor) + 1.0
+    mscale = yarn_mscale(yarn.factor, yarn.mscale_all_dim)
     return mscale * mscale
 
 

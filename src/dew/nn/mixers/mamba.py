@@ -212,7 +212,7 @@ class Mamba(nn.Module):
                 norm(name=name) for name in ('dt_layernorm', 'b_layernorm', 'c_layernorm'))
         # The reference's init (init_mamba_weights, modeling_mamba.py:337-343):
         # A_log = log(1..N) on every channel, D ones.
-        self.A_log = self.param('A_log', _log_state_index, (self.intermediate_size, self.state_size))
+        self.A_log = self.param('A_log', log_index, (self.intermediate_size, self.state_size))
         self.D = self.param('D', nn.initializers.ones, (self.intermediate_size,), jnp.float32)
         self.out_proj = dense(self.emb_features, use_bias=self.use_bias, name='out_proj',
                               kernel_axes=('attention', 'embed'),
@@ -298,10 +298,11 @@ class _StepProjection(nn.Module):
         return nn.softplus(widened.astype(wide) + bias.astype(wide))
 
 
-def _log_state_index(key, shape):
-    """`A_log = log(1..N)` on every channel, the S4D-real init (modeling_mamba.py:339-341)."""
+def log_index(key, shape):
+    """`A_log = log(1..N)` along the last axis, every leading index alike: the S4D-real init, a Mamba
+    channel's states' (modeling_mamba.py:339-341) and Mamba-2's heads' (modeling_mamba2.py:430-431)."""
     del key
-    return jnp.broadcast_to(jnp.log(jnp.arange(1, shape[1] + 1, dtype=jnp.float32)), shape)
+    return jnp.broadcast_to(jnp.log(jnp.arange(1, shape[-1] + 1, dtype=jnp.float32)), shape)
 
 
 def inverse_softplus_step(key, shape):
