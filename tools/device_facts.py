@@ -102,7 +102,6 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=20)
     args = parser.parse_args()
     device = jax.devices()[0]
-    l2 = int(getattr(device, "l2_cache_size", 0) or 64 * 2 ** 20)
     read = jax.jit(lambda x: jnp.sum(x, dtype=jnp.float32))
     copy = jax.jit(lambda x: x + jnp.asarray(1, x.dtype))
     rows = []
@@ -120,7 +119,8 @@ def main() -> None:
                                                  repeats=args.repeats)))
               for length in CHAINS]
     slope, intercept = np.polyfit([length for length, _ in chains], [seconds for _, seconds in chains], 1)
-    facts = {"device": device.device_kind, "l2_bytes": l2, "least_kernel_seconds": least, "points": rows,
+    facts = {"device": device.device_kind, "l2_bytes": generation.gpu_facts().l2_bytes,
+             "least_kernel_seconds": least, "points": rows,
              "chain": {"launch_seconds": float(slope), "call_seconds": float(intercept),
                        "points": [{"kernels": length, "seconds": seconds} for length, seconds in chains]}}
     if generation.gpu_target().architecture.tma:
