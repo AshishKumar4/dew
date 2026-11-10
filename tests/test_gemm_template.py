@@ -2498,7 +2498,7 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
     eight-slot tcgen05 kernel gradient spilled where its producer drained its two rings one after the other,
     one predicate a slot held past a thread's seven (row 5358)."""
     from fla_gdn_support import KernelCase
-    from kernel_compile import compile_mosaic_kernels, mosaic_failures, refused
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     multiprocessors = generation.gpu_target(generation_name).multiprocessors
 
@@ -2523,13 +2523,22 @@ def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name
 
         return KernelCase(f"{family} {product} 128x64x64 at {stages} stages", call)
 
-    # The deepest ring that compiles within the shared memory: from the most whole stages it holds, down.
-    stages = generation.gpu_target(generation_name).shared_limit // ((128 + 64) * 64 * 2)
-    while stages > 2:
-        found = compile_mosaic_kernels([case(stages)], generation_name)
-        if found[0].get("kernels") and not refused(found[0]):
-            break
-        stages -= 1
-    assert stages > 2, f"no ring deeper than two stages compiles on {generation_name}"
+    # The deepest ring the launch's resource model holds in one program's shared memory (`resources.plan`),
+    # compiled: any compile failure there is the test's, never a reason to try a shallower ring.
+    shapes = case(2).call()[1]
+    launch = grouped_matmul.MosaicGmm() if product == "forward" else grouped_matmul.MosaicTgmm()
+    options = ({"out_dtype": "bfloat16", "trans_rhs": False} if product == "forward"
+               else {"out_dtype": "float32", "dense": True})
+    tiles = mosaic_gpu.Tiles(128, 64, 64, 2, 1, family=family)
+    target = generation.gpu_target(generation_name)
+    with generation.assumed(generation_name):
+        bound = launch.bind(*shapes, interpret=False, **options)
+        planned = resources.plan([launch.launch_of(bound, tiles)], mosaic_gpu.family_of(tiles, jnp.bfloat16),
+                                 target, programs=1)
+    assert planned is not None, f"no plan of {tiles} on {generation_name}"
+    stages = planned[0].stages
+    assert stages > 2, f"{generation_name}'s shared memory holds no ring deeper than two stages: {planned}"
+    found = compile_mosaic_kernels([case(stages)], generation_name)
+    assert found[0].get("kernels"), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
