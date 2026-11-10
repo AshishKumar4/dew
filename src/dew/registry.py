@@ -45,7 +45,7 @@ import sys
 import types
 import typing
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -533,9 +533,12 @@ def to_record(value, annotation) -> JSON:
             with recording() as written:
                 written.taken.add(number)
         return mapping
+    if isinstance(value, Enum):
+        # A member is recorded as its value, which `from_record` reads back as the member (`_rebuilt`).
+        return to_record(value.value, None)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
-    if not isinstance(value, (type, Enum)) and _owned(type(value), called=False):
+    if not isinstance(value, type) and _owned(type(value), called=False):
         # A plain class of Dew's or a trusted package's, rebuilt from its
         # constructor's parameters as `_built` builds one; it declares no
         # fields, so its record always names it.
@@ -1186,9 +1189,10 @@ def _derives(member: type, base: type) -> bool:
     return _owned(member, called=False) if is_protocol(base) else issubclass(member, base)
 
 
-def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
+def record_fields(value: DataclassInstance, owner: type, *, without: Collection[str] = ()) -> dict[str, JSON]:
     """The record of a dataclass value's constructor fields, each as `owner`
-    declares it, at every level of a nested value alike.
+    declares it, at every level of a nested value alike; the fields named
+    `without` left out, where another record carries them.
 
     A field still holding its declared callable default, such as a Flax
     layer's initializer closure, is left out: no record can name a closure,
@@ -1204,7 +1208,8 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
             held = getattr(value, field.name)
             binding = isinstance(value, nn.Module) and (field.name == 'parent' or (field.name == 'name'
                                                                                     and held is None))
-            if _recorded(field) and not binding and not (callable(held) and held is field.default):
+            if (_recorded(field) and not binding and field.name not in without
+                    and not (callable(held) and held is field.default)):
                 fields[field.name] = to_record(held, declared_type(owner, field.name))
     return fields
 

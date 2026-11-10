@@ -40,6 +40,36 @@ def test_collected_episodes_survive_verl_rows_and_context_compaction():
         np.testing.assert_array_equal(before[key], after[key], err_msg=key)
 
 
+def test_dews_record_of_a_verl_row_is_its_sessions_and_its_calls_own():
+    """A row's `extra_fields.dew` holds its session's record and each call's, as their dataclasses declare
+    them (`verl.DewRow`), in the bytes the hand-written record had, and reads back to the session."""
+    from dew.objectives.rl.sessions import chains
+
+    trainer, collector = build()
+    session = rollouts_of(collect(collector, trainer.initial_state()))[0]
+    built = chains(session, 0, 1 << 62)
+    rows = json.loads(json.dumps(to_verl([session])))
+    identity = {"task": session.task, "group": session.group, "sample": session.sample,
+                "attempt": session.attempt, "status": session.status.value,
+                "components": dict(session.components), "detail": session.detail, "source": session.source}
+
+    def written(call, first, count):
+        transcript = None if call.transcript is None else {
+            "messages": [dict(message) for message in call.transcript.messages],
+            "response": None if call.transcript.response is None else dict(call.transcript.response)}
+        return {"start": first, "count": count, "finish_reason": call.finish_reason, "version": call.version,
+                "raw_log_probs": None if call.raw_log_probs is None else list(call.raw_log_probs),
+                "support": None if call.support is None else [list(kept) for kept in call.support],
+                "reward": call.reward, "transcript": transcript}
+
+    for number, (row, chain) in enumerate(zip(rows, built, strict=True)):
+        assert json.dumps(row["extra_fields"]["dew"]) == json.dumps({
+            "session": identity, "chain": number, "chains": len(built),
+            "calls": [written(session.calls[index], first, count) for index, first, count in chain.members],
+            "stamped": True})
+    assert [trajectory.session for trajectory in from_verl(rows)] == [session]
+
+
 def test_an_episode_record_reads_back_every_sampling_control():
     """A recorded episode's sampling policy comes back whole, its penalties and stop strings
     included, and an unset pad id stays the task's to fill."""

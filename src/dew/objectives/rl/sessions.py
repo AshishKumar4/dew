@@ -48,7 +48,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
-from dew._records import JSON, finite, json_value, record as section
+from dew._records import JSON, finite, json_value, record as section, text
 from dew.batch import Coordinates, Forks, Variables, coordinates
 from dew.data.forked_rows import ForkedRows, token_keys, windows_needed
 from dew.inference.rollouts import Draw, Routing, routing_rows
@@ -205,8 +205,8 @@ class Transcript:
     for scoring it.
     """
 
-    messages: tuple[Mapping[str, object], ...]
-    response: Mapping[str, object] | None = None
+    messages: tuple[Mapping[str, JSON], ...]
+    response: Mapping[str, JSON] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "messages", json_objects(self.messages, "a transcript's messages"))
@@ -301,6 +301,11 @@ class Session:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"session {name} must be a nonnegative integer")
+        for name in ("task", "group", "detail", "source"):
+            text(getattr(self, name), f"session {name}")
+        object.__setattr__(self, "components", MappingProxyType({
+            text(name, "a session component's name"): finite(value, f"session component {name}")
+            for name, value in self.components.items()}))
 
 
 @dataclass(frozen=True)
