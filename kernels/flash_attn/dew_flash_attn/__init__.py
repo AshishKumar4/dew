@@ -12,6 +12,7 @@ import functools
 import math
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -35,18 +36,40 @@ ARCHITECTURES = _two + _three
 'sm120')."""
 
 
+class Target(NamedTuple):
+    """An FFI target of the libraries, as a reader of a program's calls takes it: the place of the query
+    among its operands (`query`; a backward's first operand is the output's gradient), whether it computes a
+    backward (`backward`), and whether its sequences lie between cumulative offsets given as it runs
+    (`packed`: varlen), so its operands' shapes state no sequence's length and so not its work."""
+
+    query: int
+    backward: bool
+    packed: bool
+
+
+TARGETS: dict[str, Target] = {
+    prefix + ("_varlen" if packed else "") + ("_bwd" if backward else "_fwd"):
+        Target(query=int(backward), backward=backward, packed=packed)
+    for prefix in ("dew_flash_mha", "dew_flash3_mha")
+    for packed in (False, True) for backward in (False, True)}
+"""Every FFI target of the two libraries by name (FlashAttention-2's `dew_flash_mha_*`, 3's
+`dew_flash3_mha_*`): `_registered` registers them and `_call` calls them, and a reader of a program's
+custom calls reads them (Dew's FLOP counter)."""
+
+
 @functools.cache
 def _registered() -> None:
-    """Both libraries' FFI targets, registered with jax once, at the first call that needs them:
+    """Both libraries' FFI targets (`TARGETS`), registered with jax once, at the first call that needs them:
     importing the package to read ARCHITECTURES leaves jax's registry as it was."""
-    for library, prefix in ((_library, "dew_flash_mha"), (_library3, "dew_flash3_mha")):
-        for suffix in ("_fwd", "_bwd", "_varlen_fwd", "_varlen_bwd"):
-            name = prefix + suffix
-            jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(library, name)), platform="CUDA")
+    for name in TARGETS:
+        library = _library3 if name.startswith("dew_flash3_") else _library
+        jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(library, name)), platform="CUDA")
 
 
 def _call(name: str, results):
-    """`jax.ffi.ffi_call` of one of the libraries' targets."""
+    """`jax.ffi.ffi_call` of one of the libraries' targets (`TARGETS`)."""
+    if name not in TARGETS:
+        raise ValueError(f"{name} is no target of the libraries: {sorted(TARGETS)}")
     _registered()
     return jax.ffi.ffi_call(name, results)
 
