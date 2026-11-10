@@ -103,6 +103,17 @@ def plain_scan(x, *, coordinates):
 """
 """A package module of scans a mixer hands its coordinates to: one reads the call's forks, one never does."""
 
+HANDED_INPUTS = textwrap.dedent("""
+    class AttentionMetadata:
+        forks: object = struct.field(default=None, metadata={MIXES: True})
+        token_ids: object = None
+
+        @mixing_property
+        def admitted(self):
+            return None
+    """)
+"""The inputs module those mixers read their call through: its `forks` and `admitted` mix tokens."""
+
 HANDED = {
     "its coordinates handed to a package function that reads the field": ("""
         from dew.nn.scans import held_scan
@@ -167,11 +178,12 @@ def test_a_field_counts_as_read_where_the_call_hands_it_to_a_package_function_th
     function handed nothing of the call, it still declares a field it never reads."""
     body, reported = HANDED[case]
     (tmp_path / "src" / "dew" / "nn").mkdir(parents=True)
-    (tmp_path / "src" / "dew" / "nn" / "inputs.py").write_text('MIXING = ("forks", "admitted")\n')
+    (tmp_path / "src" / "dew" / "nn" / "inputs.py").write_text(HANDED_INPUTS)
     (tmp_path / "src" / "dew" / "nn" / "scans.py").write_text(HELD)
     (tmp_path / "src" / "dew" / "nn" / "layer.py").write_text(textwrap.dedent(body))
     [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew")
                 if module.path.stem == "layer"]
+    assert any(True for _ in lint.calls(module)) is reported
 
 
 @pytest.mark.parametrize("inputs, reported", [
