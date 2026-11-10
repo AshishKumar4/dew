@@ -39,9 +39,9 @@ from dew.nn.kernels.options import (
 )
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
+    PER_TOKEN_HEAD,
     POOLED,
     ROW_CURSORS,
-    SCALES,
     TABLE,
     as_words,
     from_words,
@@ -655,8 +655,9 @@ def state_shardings(mesh: Mesh | None, state: Slots, *, offloaded: bool = False)
             return placed(leaf, *layers, "activation_batch")
         if paged:
             return placed(leaf, *layers, "activation_kv", "pages")
-        if leaf_name(path) in SCALES:
-            # A dense cache's scales head-major, `[rows, heads, capacity]` (`dew.nn.kv_cache.scale_shape`).
+        if leaf_name(path) in PER_TOKEN_HEAD:
+            # A dense cache's scales and value bound head-major, `[rows, heads, capacity]`
+            # (`dew.nn.kv_cache.scale_shape`).
             return placed(leaf, *layers, "activation_batch", "activation_kv")
         return placed(leaf, *layers, "activation_batch", None, "activation_kv")
 
