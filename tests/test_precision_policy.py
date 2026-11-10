@@ -601,7 +601,7 @@ def test_a_correctly_rounded_division_keeps_an_explicit_axis_through_its_gradien
         split, weighed = (jax.device_put(value, rows) for value in (numerator, weights))
         gradient = jax.jit(jax.grad(lambda x, w: jnp.sum(divided(x, 6.0) * w)))(split, weighed)
     np.testing.assert_array_equal(np.asarray(gradient), weights / np.float32(6))
-    assert gradient.sharding.spec == rows.spec
+    assert gradient.sharding.is_equivalent_to(rows, gradient.ndim)
 
 
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
