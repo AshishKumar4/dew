@@ -48,7 +48,9 @@ from dew.data.pipeline import (
     Slice,
     Windows,
     Workers,
+    earlier,
 )
+from dew.data.plan import PAIR_WINDOWS
 from dew.data.prompts import PROMPT_LONG, PROMPT_PAD
 from dew.data.text import SavedTokenizer
 
@@ -280,6 +282,7 @@ def _rendered_prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, max_pro
     return dataset.map(Configured(configure, needs=("reward_bytes",), measures=RewardWidth()))
 
 
+@earlier(PAIR_WINDOWS, segments=1)
 def preferences(dataset: Dataset, *, seq_len: int, batch: int | None, share: bool = True,
                 segments: int | None = None, pairs: int = 1, pad_id: int = 0, bins: int = PACK_BINS,
                 cache: str | Cached | None = None, records: int | None = None,
@@ -296,7 +299,9 @@ def preferences(dataset: Dataset, *, seq_len: int, batch: int | None, share: boo
     pair's (`preferences.PreferencePair`, main's pair a row), so whatever deals a batch's rows deals whole
     pairs, in batches of
     `batch` pairs. Every window's padding is `pad_id`, the id the model reads where its pairs leave slots
-    empty. No tokenizer: a pair of raw text is tokenized by a step before it."""
+    empty. No tokenizer: a pair of raw text is tokenized by a step before it. A data plan from before
+    pairs packed into windows (`dew.data.plan.PAIR_WINDOWS`) reads a call that states no `segments` a pair
+    a row, as it laid them (`earlier`), so a run saved under one resumes by the stages it saved."""
     from dew.data.preferences import (
         PreferencePair,
         PreferenceWindows,
