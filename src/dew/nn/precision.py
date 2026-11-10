@@ -1345,8 +1345,9 @@ is a constant or a broadcast on a CPU (openxla/xla#51148) and off IEEE on 30 to 
 a quantizer's scale or a rate's gradient left the reference's by an ulp on a third of its entries (row
 5277). It is entrywise (`Primitive.elementwise`), which the analyses of a program's entries read."""
 correctly_rounded_divide_p.def_impl(_correctly_rounded_divide)
-correctly_rounded_divide_p.def_abstract_eval(lambda numerator, denominator: jax.core.ShapedArray(
-    jnp.broadcast_shapes(numerator.shape, denominator.shape), jnp.float32))
+# Its result is typed as JAX types its own division's: the operands' broadcast shape, their dtype, and
+# their sharding and varying axes, which a mesh's Explicit axis carries in a value's type.
+correctly_rounded_divide_p.def_effectful_abstract_eval(jax.lax.div_p.abstract_eval)
 mlir.register_lowering(correctly_rounded_divide_p,
                        mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
 batching.defbroadcasting(correctly_rounded_divide_p)

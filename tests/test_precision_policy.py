@@ -585,6 +585,25 @@ def test_a_correctly_rounded_divisions_derivatives_divide_as_ieee_division():
     np.testing.assert_array_equal(np.asarray(over_both), np.float32(1) / first + np.float32(1) / second)
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_correctly_rounded_division_keeps_an_explicit_axis_through_its_gradient():
+    """A correctly rounded division of rows a mesh's Explicit data axis splits is typed as JAX's own division
+    is, its result and its gradient split along that axis as its numerator is: the gradient over a constant
+    divisor is the cotangent's IEEE quotient, placed as the numerator. Typed without its operands' sharding,
+    the division's transpose was refused its cotangent (a JEPA step on an Explicit data axis)."""
+    from dew.nn.precision import divided
+
+    rng = np.random.default_rng(5277)
+    numerator, weights = (rng.uniform(-8, 8, (8, 16)).astype(np.float32) for _ in range(2))
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data"))
+        split, weighed = (jax.device_put(value, rows) for value in (numerator, weights))
+        gradient = jax.jit(jax.grad(lambda x, w: jnp.sum(divided(x, 6.0) * w)))(split, weighed)
+    np.testing.assert_array_equal(np.asarray(gradient), weights / np.float32(6))
+    assert gradient.sharding.spec == rows.spec
+
+
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
 
 
