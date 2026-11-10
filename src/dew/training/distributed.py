@@ -321,13 +321,12 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     as they are, the same arrays where they are placed already, and kept: no
     copy of them is made."""
     where, takes = _placements(held, variables, shardings, mesh, shared)
-    # A copy of an array already on the devices, which the transfer makes (`may_alias=False`): device_put can
-    # otherwise reuse a buffer the target shares with the source, which donation would free. No program
-    # compiles for it (`jax.Array.copy` compiles one per shape), so a run handed its programs compiled ahead
-    # compiles nothing to place its held tree (row 4779).
+    # A copy of an array already on the devices: device_put can reuse a
+    # buffer the target shares with the source, which donation would free.
     shared = shared or {}
-    aliased = jax.tree.map(lambda leaf: id(leaf) in shared or not isinstance(leaf, jax.Array), held)
-    return _split(takes, jax.device_put(held, where, may_alias=aliased))
+    owned = jax.tree.map(lambda leaf: leaf if id(leaf) in shared or not isinstance(leaf, jax.Array)
+                         else leaf.copy(), held)
+    return _split(takes, jax.device_put(owned, where))
 
 
 def held_shapes[Held](held: Held, variables: Variables, shardings: Placement[Variables], mesh: Mesh,

@@ -456,7 +456,7 @@ class Trainer(Generic[Loss, Effects]):
     def _stepping(self) -> Stepping[Loss, Effects]:
         """What a fit search's candidates read of this trainer beside its public fields, as it stands
         (`dew.training._candidates.Stepping`)."""
-        return Stepping(self._settings(), self._step_key(), self.shardings, self._loss_shape, self._staging,
+        return Stepping(self._settings(), self._step_key, self.shardings, self._loss_shape, self._staging,
                         self._initialize_accumulation, self._model_batch, self._model_shapes, self._step_body,
                         functools.partial(fetched_state, layout=self.layout), self._traced_on, self._shape,
                         self._validation, self._builds_window, self._window_of)
@@ -855,8 +855,8 @@ class Trainer(Generic[Loss, Effects]):
         phase its batch was read in (`PhasePasses.scoped`).
         """
         with self.phase_passes.scoped(self, self._compiler):
-            compiled = self._took(self._compiler.compile(self._settings(), self._stepping(), state, batch,
-                                                         trials, capacity=capacity))
+            compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials,
+                                                         capacity=capacity))
         assert compiled.step is not None
         return compiled.step
 
@@ -865,7 +865,7 @@ class Trainer(Generic[Loss, Effects]):
                        frontier: bool = False) -> Planned:
         """The plan the run's step compiles at (`StepCompiler.plan`), taken as `compile` takes its compile;
         the caller reads its lowering before releasing it or serializing its executable (`compile_ahead`)."""
-        planned, compiled = self._compiler.plan(self._settings(), self._stepping(), state, batch, trials,
+        planned, compiled = self._compiler.plan(self._stepping(), state, batch, trials,
                                                 capacity, frontier)
         self._took(compiled)
         return planned

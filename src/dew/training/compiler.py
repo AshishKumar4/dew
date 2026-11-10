@@ -25,7 +25,7 @@ from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.instrumentation import StepFlops
-from dew.training._candidates import Stepping, StepSettings, candidate_for, lowered_for
+from dew.training._candidates import Stepping, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
 from dew.training.distributed import link_figure, link_figures, resumed_link_figures
 from dew.training.footprint import Footprint
@@ -235,7 +235,7 @@ class StepCompiler:
             links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 
-    def compile(self, settings: StepSettings, stepping: Stepping, state: TrainState, batch: Batch,
+    def compile(self, stepping: Stepping, state: TrainState, batch: Batch,
                 trials: Trials | None = None, *, capacity: int | None = None) -> Compiled:
         """Compile a transaction over the state and one already-produced global batch (`Trainer.compile`),
         the step and what its compile found (`Compiled`).
@@ -250,6 +250,7 @@ class StepCompiler:
         the executable it replaces released with its program (`Planned.released`). A device that states
         no memory, a compile-only GPU's, holds `capacity` bytes, as a step compiled ahead states them.
         """
+        settings = stepping.settings
         if (target := settings.lower_for) is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`); it lowers at
             # the base rung.
@@ -272,22 +273,23 @@ class StepCompiler:
             if self.ahead is not None or settings.inspection is not None:
                 raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
                                  "this layout keeps the variables on the host")
-            return Compiled(stepping.shape.split, step=self._compile_host(settings, stepping, state, batch))
-        planned, compiled = self.plan(settings, stepping, state, batch, trials, capacity)
-        return dataclasses.replace(compiled, step=self.runner(settings, stepping, planned.released(),
+            return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
+        planned, compiled = self.plan(stepping, state, batch, trials, capacity)
+        return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
                                                               settings.device_mesh))
 
-    def plan(self, settings: StepSettings, stepping: Stepping, state: TrainState, batch: Batch,
+    def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
              trials: Trials | None, capacity: int | None, frontier: bool = False) -> tuple[Planned, Compiled]:
         """The shared device-step planner: the plan it admitted and what its compile found (`Compiled`, its
         step none: the caller reads its lowering before releasing it, `compile`, or serializing its
         executable, `compile_ahead`), with `frontier` the rungs above it (`FitSearch.above`)."""
+        settings = stepping.settings
         mesh = settings.device_mesh
         links = self.links(mesh)
         shaped = self.at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with stepping.traced_on(mesh, links) as schedule, held_objects():
-            planned, flops, plan, validation = self._planned(settings, stepping, state, batch, mesh, schedule,
+            planned, flops, plan, validation = self._planned(stepping, state, batch, mesh, schedule,
                                                              resumed, trials, capacity, frontier)
             split, candidate = planned.split, planned.candidate
             self._shape_rungs[batch_layout(batch)] = self.rung()
@@ -295,9 +297,10 @@ class StepCompiler:
         return planned, Compiled(split, plan, memory, planned.executable, flops and split * flops, links,
                                  validation)
 
-    def runner(self, settings: StepSettings, stepping: Stepping, planned: Planned,
+    def runner(self, stepping: Stepping, planned: Planned,
                mesh: Mesh) -> CompiledStep:
         """The step `planned` compiled, which reads a batch in its microbatches."""
+        settings = stepping.settings
         # The program compiled above, not the jit: a call through the jit traces and compiles its own,
         # without the step's compiler options, which was 25 s of an A100's cold start.
         split, candidate = planned.split, planned.candidate
@@ -332,7 +335,7 @@ class StepCompiler:
                 return (together(moving, frozen), *(outputs[0] if split == 1 else whole_step(outputs)))
         return run
 
-    def _planned(self, settings: StepSettings, stepping: Stepping, state: TrainState, batch: Batch,
+    def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
                  mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None, capacity: int | None,
                  frontier: bool) -> tuple[Planned, StepFlops | None, JSON, Validation]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
@@ -341,6 +344,7 @@ class StepCompiler:
         it. A plan recorded beside the compilation cache
         (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity`
         the bytes a device that states none holds (`FitSearch.capacity`); `frontier` asks the rungs above."""
+        settings = stepping.settings
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)
@@ -382,7 +386,7 @@ class StepCompiler:
         self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
         if runs := pgle_runs():
             trials = Trials(state, batch, owned=False) if trials is None else trials
-            run = self.runner(settings, stepping, planned, mesh)
+            run = self.runner(stepping, planned, mesh)
             # A step lowered afresh past a spilled kernel derives no footprint, as the search's own do
             # (`FitSearch.relowering`).
             relower = functools.partial(lower, planned.split, planned.narrow, derived=False)
@@ -403,8 +407,9 @@ class StepCompiler:
             _log.info("the step fits the devices in the plan %s", plan)
         return planned, flops, plan, validation
 
-    def _compile_host(self, settings: StepSettings, stepping: Stepping, state: TrainState, batch: Batch
+    def _compile_host(self, stepping: Stepping, state: TrainState, batch: Batch
                       ) -> CompiledStep:
+        settings = stepping.settings
         from dew.distributed.host import transfer
         from dew.training.execution import HostExecution, frozen_trees, stack_sites
         cpu = settings.state_mesh

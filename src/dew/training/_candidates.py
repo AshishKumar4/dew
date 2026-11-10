@@ -11,8 +11,8 @@ import contextlib
 import dataclasses
 import functools
 import threading
-from collections.abc import Callable, Hashable
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Hashable, Mapping
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +28,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import owned_program, trace_context
 from dew.nn.kernels.templates import report
-from dew.nn.sharding import Schedule
+from dew.nn.sharding import Link, Schedule
 from dew.state import TrainState, apart, together
 from dew.training import staging
 from dew.training._lowering import KernelReport, Routed
@@ -49,6 +49,14 @@ if TYPE_CHECKING:
     from dew.objectives.base import Objective
     from dew.training.diloco import DiLoCo
     from dew.training.inspection import Inspection
+
+
+class TracedOn(Protocol):
+    """What a traced step reads from context, on `mesh`, with the links of the axes it measured, none by
+    default (`Trainer._traced_on`)."""
+
+    def __call__(self, mesh: Mesh | AbstractMesh, links: Mapping[str, Link] | None = None, /
+                 ) -> contextlib.AbstractContextManager[Schedule]: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -110,17 +118,17 @@ class StepSettings[LossT, EffectsT]:
 @dataclasses.dataclass(frozen=True)
 class Stepping[LossT, EffectsT]:
     """What a fit search's candidates read of the run, as it stands as it plans (`Trainer._stepping`): the
-    run's settings (`StepSettings`), the value its step traces from beside its arguments (`step_key`,
-    `Trainer._step_key`), where it places a state (`shardings`), its loss's traced shapes (`loss_shape`),
-    where its step keeps
-    a pipelined run (`staging`), its window's accumulation (`initialize_accumulation`), its model's batch
+    run's settings (`StepSettings`), the value its step traces from beside its arguments, read as each
+    candidate is made at the rung the search stands at (`step_key`, `Trainer._step_key`), where it places
+    a state (`shardings`), its loss's traced shapes (`loss_shape`), where its step keeps a pipelined run
+    (`staging`), its window's accumulation (`initialize_accumulation`), its model's batch
     and its shapes (`model_batch`, `model_shapes`), its step's body (`step_body`) and the fields it fetches
     (`fetched`), the mesh it traces on (`traced_on`), how its batches are cut and counted (`shape`), how
     the layout validates a state it holds between steps (`validation`) and whether and how a step lays out
     its window (`builds_window`, `window_of`): read here, none off the trainer itself (row 4555)."""
 
     settings: StepSettings[LossT, EffectsT]
-    step_key: Hashable | None
+    step_key: Callable[[], Hashable | None]
     shardings: Callable[[TrainState], Placement[TrainState]]
     loss_shape: Callable[..., tuple]
     staging: StageLocal
@@ -129,7 +137,7 @@ class Stepping[LossT, EffectsT]:
     model_shapes: Callable[[Batch], Batch]
     step_body: Callable[..., Callable]
     fetched: Callable[..., TrainState]
-    traced_on: Callable[[Mesh | AbstractMesh], contextlib.AbstractContextManager[Schedule]]
+    traced_on: TracedOn
     shape: RunShape
     validation: Callable[[TrainState], Validation]
     builds_window: Callable[[TrainState, Candidate, int], bool]
@@ -183,7 +191,8 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     (`Trainer._step_key`; row 3873: each fit of a resumed run traced its step again, 6.5 to 12.9 s, and
     lowered it, 9 s), its pipeline's schedule the one its microbatches make; a trainer whose step no value
     states traces its own."""
-    stated = stepping.step_key
+    # Read as the candidate is made, at the rung the search put the objective at (row 3873).
+    stated = stepping.step_key()
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
