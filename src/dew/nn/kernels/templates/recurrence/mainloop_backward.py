@@ -13,8 +13,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation, recurrence_algebra as algebra
-from dew.nn.kernels.chunked_launch import column, unpacked
+from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product, resources
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
@@ -42,6 +41,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     prefix_reader,
     product_results,
     role_tiles,
+    sequence_live,
     sequence_walk,
     shared_allocation,
     staging_tiles,
@@ -487,7 +487,7 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
                                    span=steps),
                          held=table_held(_reverse_held(call, bv, gates=gates, skips=skips), call, table, bv),
                          consumers=tiles.walkers, producer=producer,
-                         live=lambda at, refs: refs[8][at["sequences"], column(Walked, "count")] > 0,
+                         live=sequence_live(8),
                          staging=(*staging_tiles(held, *dict.fromkeys(((call.block, bv), (chunk, bv)))),
                                   (plgpu.SMEM((chunk, bv), held.stored),)),
                          once=finals,
@@ -548,7 +548,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
         refs, returned_refs = refs[:len(refs) - returns], refs[len(refs) - returns:]
         dh_ref, dv_ref, dh0_ref, *gated_ref = refs
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        sequence = unpacked(Walked, lambda i: seq_ref[s, i])
+        sequence = chunked_launch.unpacked(Walked, lambda i: seq_ref[s, i])
         first, count, row = sequence.first, sequence.count, sequence.row
         begins, ends = sequence.takes, sequence.gives
         roled = role_tiles(staging, landing, walkers)

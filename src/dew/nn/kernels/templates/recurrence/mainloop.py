@@ -57,8 +57,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
-from dew.nn.kernels.chunked_launch import column, unpacked
+from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import bundles, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work, estimate
 from dew.nn.kernels.templates.operands import Issuer, Parts
@@ -1447,6 +1446,13 @@ class Walked(NamedTuple):
     gives: Any
 
 
+def sequence_live(table: int) -> Callable:
+    """A walk's program's liveness (`launch_kernel`'s `live`): its sequence's chunks past zero
+    (`Walked.count`), its walks' table its launch's `table`-th operand."""
+    count = chunked_launch.column(Walked, "count")
+    return lambda at, refs: refs[table][at["sequences"], count] > 0
+
+
 def fp32_operand(call: Call) -> Operand:
     """The form of the launches' fp32 gradients between them: one fp32 part, a row a token."""
     return Operand(call.rows, 1, jnp.dtype(jnp.float32))
@@ -2055,7 +2061,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
         table_refs, (h_ref, *outputs), stored_ref = program_refs(table, refs)
         corrected_ref, final_ref = outputs if stores_corrected else (None, *outputs)
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        sequence = unpacked(Walked, lambda i: seq_ref[s, i])
+        sequence = chunked_launch.unpacked(Walked, lambda i: seq_ref[s, i])
         first, count, row = sequence.first, sequence.count, sequence.row
         begins, ends = sequence.takes, sequence.gives
         roled = role_tiles(staging, landing, walkers)
@@ -2171,7 +2177,7 @@ def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Opera
     return launch_kernel(program, call, out_type=out_type, grid=(value_width // walked_width, sequences,
                                                                  call.heads),
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                         live=lambda at, refs: refs[7][at["sequences"], column(Walked, "count")] > 0,
+                         live=sequence_live(7),
                          work=Work(flops=4 * chunk * width * walked_width * steps, span=steps),
                          consumers=tiles.walkers, staging=staging,
                          held=table_held(_states_held(call, values, keys, bv), call, table, bv),
@@ -2249,7 +2255,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
         skip_ref = refs[:skipped]
         table_refs, (o_ref, final_ref), stored_ref = program_refs(table, refs[skipped:])
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        sequence = unpacked(Walked, lambda i: seq_ref[s, i])
+        sequence = chunked_launch.unpacked(Walked, lambda i: seq_ref[s, i])
         first, count, row = sequence.first, sequence.count, sequence.row
         begins, ends = sequence.takes, sequence.gives
         roled = role_tiles(staging, landing, walkers)
@@ -2388,7 +2394,7 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
     return launch_kernel(program, call, out_type=out_type,
                          grid=(call.value_width // walked_width, sequences, call.heads),
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                         live=lambda at, refs: refs[8][at["sequences"], column(Walked, "count")] > 0,
+                         live=sequence_live(8),
                          work=work,
                          consumers=walkers, staging=staging,
                          held=table_held(_scan_held(call, keys, keys, bv), call, table, bv),
