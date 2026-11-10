@@ -496,9 +496,11 @@ def _reverse_launched(program, call: Call, tiles: Tiles, batch: int, sequences: 
 
 def _reverse_producer(call: Call) -> int | None:
     """`_reverse`'s producer floor, the one value its plan and its walk's schedule read (`stated_producer`):
-    72, GDN's bf16 reverse walk's producer spilling 12 to 40 bytes at 24 to 64, none from 72 (row 5357,
-    jsf-pfloor-ab3 on the promotion's candidate; at 64 on its base before, jsf-pfloor-ab2)."""
-    return stated_producer(call, 72)
+    80, GDN's bf16 reverse walk's producer spilling 12 to 40 bytes at 24 to 64, none from 72 (row 5357,
+    jsf-pfloor-ab3 on the promotion's candidate; at 64 on its base before, jsf-pfloor-ab2), and a forked
+    call's, whose producer loads its table's slots too, 12 bytes at 72 and none at 80 (its PTX's decrement
+    alone changed, armada 20261110174422-11220d9e)."""
+    return stated_producer(call, 80)
 
 
 @lowered_once
