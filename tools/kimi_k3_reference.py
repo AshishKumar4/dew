@@ -377,7 +377,9 @@ def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]])
     arrays = truth(directory)
     with np.load(directory / "reference.npz") as stored:
         valid = stored["attention_mask"].astype(bool)
-        for key in ("logits", "updated_logits", "step_logits"):
+        # The forward's own logits left the fixtures with their float64 truth (b1bc076b842: check 1 holds
+        # them over drawn batches, tools/kimi_worker.py); the trained and the stepped ones stay.
+        for key in ("updated_logits", "step_logits"):
             exact, recorded = arrays[f"{key}_f64"], stored[key]
             if key != "step_logits":
                 exact, recorded = exact[valid], recorded[valid]
