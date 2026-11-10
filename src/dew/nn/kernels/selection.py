@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 class Refusal:
     """Why the kernel a target prefers does not take a call, from the call's own facts on that
     target (its shapes, dtypes, mask): a stable `code`, which a kernel's `SUPPORTS` keys its declared
-    limits on, and the `detail` a log names. What the host cannot run is no refusal (`Route.ran`)."""
+    limits on, and the `detail` a log names. What the host cannot lower is no refusal (`Unlowerable`)."""
 
     code: str
     detail: str
@@ -151,8 +151,9 @@ class Celled(Protocol):
 class Op[C]:
     """A family of ops one selector serves: its `choice` (the name `chosen` and routes use), its `kernels`
     in the order the selector tries them after the preferred one, `preferred(case)` the op's own rule for
-    the kernel it prefers (else the first of its kernels that takes the case, `select`), `hosted(kernel)`
-    what this host runs for the target's kernel (`generation.gpu_placed`), and `declared`: the cells where
+    the kernel it prefers (else the first of its kernels that takes the case, `select`), `unlowered(kernel)`
+    why this host cannot lower the target's kernel, None where it lowers it (`Unlowerable`), and
+    `declared`: the cells where
     a measurement found another kernel faster than the op's preference (a template's old route, owner,
     bible da64ae5; a standalone kernel against XLA's program), each cell (`Celled.cell`: the scope the
     receipt measured, a template's instruction family or a device's generation, and the kind of call) to
@@ -162,7 +163,7 @@ class Op[C]:
     choice: Choice
     kernels: tuple[Kernel[C], ...]
     preferred: Callable[[C], str] | None = None
-    hosted: Callable[[str], str] = lambda kernel: kernel
+    unlowered: Callable[[str], str | None] = lambda kernel: None
     declared: Mapping[tuple[str | None, str], tuple[str, str]] = dataclasses.field(
         default_factory=dict, compare=False, hash=False)
     named_from: Mapping[tuple[Choice, str], str] = dataclasses.field(
@@ -192,6 +193,17 @@ class Op[C]:
                 return call(*args, **kwargs)
 
         return scoped
+
+
+class Unlowerable(RuntimeError):
+    """A kernel the target runs that this host cannot lower for it (`Op.unlowered`: a step traced for an
+    assumed GPU on a host without the kernel's library): no kernel lowers in its place, as the program would
+    not be the GPU's (row 4616), so a compile ahead refuses the program, naming it. The op's `choice`, the
+    `kernel` and `why`."""
+
+    def __init__(self, choice: str, kernel: str, why: str) -> None:
+        super().__init__(f"{choice} kernel {kernel!r} does not lower on this host: {why}")
+        self.choice, self.kernel, self.why = choice, kernel, why
 
 
 class KernelRefused(ValueError):
@@ -237,12 +249,13 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple
     of the op's kernels: the first of them that takes the case, the first passing what the targets measured
     of it as a named kernel does, and its refusal reported (a norm's per-call implementation, an explicit
     xla's decode step). `Op.named_from` declares a named dependency where neither the call nor this op
-    names its own kernel. The route states what forced it (`Route.forced`)."""
+    names its own kernel. The route states what forced it (`Route.forced`). A kernel this host cannot lower
+    for the target raises (`Unlowerable`)."""
     from . import generation
 
     kernel, preferred, refusal, insisted = _decided(op, case, named, preference)
-    return generation.route(op.choice, kernel=kernel.name, preferred=preferred, refusal=refusal,
-                            ran=op.hosted(kernel.name), forced=insisted)
+    return generation.route(op.choice, kernel=_lowered(op, kernel).name, preferred=preferred,
+                            refusal=refusal, forced=insisted)
 
 
 def selected[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple[str, ...] = ()
@@ -252,7 +265,14 @@ def selected[C](op: Op[C], case: C, named: str | None = None, *, preference: tup
     program and the GEMM template's launches, which select their own), raising as `select` does. A
     declared cell's kernel is read without the kernel the op would prefer there, which only a report names
     (`_old_route`): deriving that one's plan for no report cost a decode's trace a second a projection."""
-    return _decided(op, case, named, preference, reported=False)[0]
+    return _lowered(op, _decided(op, case, named, preference, reported=False)[0])
+
+
+def _lowered[C](op: Op[C], kernel: Kernel[C]) -> Kernel[C]:
+    """`kernel`, which this host lowers for the target, else `Unlowerable` (`Op.unlowered`)."""
+    if (why := op.unlowered(kernel.name)) is not None:
+        raise Unlowerable(op.choice, kernel.name, why)
+    return kernel
 
 
 def _decided[C](op: Op[C], case: C, named: str | None, preference: tuple[str, ...], *,

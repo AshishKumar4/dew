@@ -214,7 +214,7 @@ def _on_gpu(case: AttentionCase) -> bool:
 
 def _flash_installed(case: AttentionCase) -> bool:
     # A step traced for an assumed GPU on a host without the wheel takes the wheel its target
-    # installs: what the host lacks shows as what it ran (`_hosted`), not as the target's refusal.
+    # installs: what the host lacks refuses the program it is traced into (`_unlowered`), not the call.
     return flash_architectures() is not None or generation.assumption() is not None
 
 
@@ -639,18 +639,42 @@ def _attention_preferred(case: AttentionCase) -> str:
     return {'gpu': 'template', 'tpu': 'tpu'}.get(backend, 'xla')
 
 
-def _hosted(kernel: str) -> str:
-    """What this host runs for the target's `kernel`: FlashAttention's where its call lowers for the target
-    (`flash_lowered`: on its own GPU, or for an assumed GPU's compile-only devices on any host holding the
-    wheel, a GPU of the target's or none: a step compiled ahead for an H100 on an H100 ran XLA's attention,
-    its fp32 scores 4.3 GB the run's step never holds, row 3792; on a CPU every compile ahead did, row 4616),
-    cuDNN's where this process places the call on its own GPU (`gpu_placed`), else jax.nn's xla attention, as
-    a step traced for an assumed GPU on a CPU lowers; Dew's own Pallas kernels and tokamax's Triton kernel
-    (`generation.assumed`'s cross-compile) lower for the target on any host. The route reports a
-    substitution (`Route.ran`), which a compile ahead names (`dew.training.ahead.substituted`)."""
-    if kernel == 'flash':
-        return kernel if flash_lowered() else 'xla'
-    return 'xla' if kernel == 'cudnn' and not gpu_placed() else kernel
+def _unlowered(kernel: str) -> str | None:
+    """Why this host cannot lower the target's `kernel` for a GPU a step is traced for on it, None where it
+    lowers it: FlashAttention where its call lowers for no GPU here (`flash_lowered`: its wheel holds no code
+    for the target); cuDNN's where this host loads no cuDNN, without which its call traces nothing ("cuDNN
+    not found", a CPU environment's host), or where the program is compiled for any GPU of the generation
+    (`generation.Assumption.portable`), as a cuDNN plan compiled with no device holds to its GPU's model
+    alone: one compiled for a canonical sm90 failed on a GH200 ("CUDNN_BACKEND_EXECUTION_PLAN_DESCRIPTOR:
+    cudnnFinalize Descriptor Failed", FS-CANONICAL-CUDNN-gh200), one compiled for that GH200's own topology
+    ran there exactly (FS-DEVICELESS-C3B-gh200). The call is refused, not lowered as another kernel: a step
+    compiled ahead with XLA's attention in its place was not the GPU's program (an H100's ran XLA's attention,
+    its fp32 scores 4.3 GB the run's step never holds, row 3792; every CPU's compile ahead did, row 4616).
+    Dew's own Pallas kernels and tokamax's Triton kernel (`generation.assumed`'s cross-compile) lower for
+    the target on any host; on its own GPU every kernel does."""
+    if gpu_placed():
+        return None
+    if kernel == 'flash' and not flash_lowered():
+        return "FlashAttention's wheel here holds no code for the target"
+    found = generation.assumption()
+    if kernel != 'cudnn' or found is None:
+        return None
+    if found.portable:
+        return (f"a cuDNN plan compiled with no device holds to its GPU's model alone, and this program is "
+                f"compiled for any {found.generation}: compile it for the run host's own GPUs "
+                "(`dew.training.ahead.host_gpus`)")
+    return None if _cudnn_loads() else "this host loads no cuDNN library"
+
+
+def _cudnn_loads() -> bool:
+    """Whether this process loads cuDNN: the CUDA plugin found its library (read once a GPU's devices,
+    compile-only or attached, are made: before, the plugin has loaded none)."""
+    from jax._src.lib import cuda_versions
+
+    try:
+        return cuda_versions is not None and cuda_versions.cudnn_get_version() > 0
+    except RuntimeError:
+        return False
 
 
 ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
@@ -665,7 +689,7 @@ ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
         'spans_only', lambda case: not case.spans_only,
         "the call's visibility is spans alone, which a differentiated call's xla attention would build "
         "densely: the template takes it", row=INHERENT), _FITS)),
-), _attention_preferred, _hosted, DECLARED)
+), _attention_preferred, _unlowered, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
 splash, xla and the reference path, the first that takes the call. The old routes take only the fast
@@ -713,7 +737,7 @@ DECODE = Op[AttentionCase](Choice.DECODE, (
     Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
-), _decode_preferred, _hosted, DECODE_DECLARED)
+), _decode_preferred, _unlowered, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
 (`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's
 kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the run's declared products
