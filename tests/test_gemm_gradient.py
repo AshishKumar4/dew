@@ -87,3 +87,31 @@ def test_an_exact_kernel_gradients_depth_split_sums_its_partials_once(generation
             for splits in (2, 3):
                 assert gradient.legal(call, dataclasses.replace(tile, splits=splits), target), (tile, splits)
                 np.testing.assert_array_equal(np.asarray(dew(splits)), whole, err_msg=f"{sizes} at {splits}")
+
+
+@INTERPRETS
+def test_a_split_kernel_gradient_reads_each_groups_side_operand_at_its_own_group():
+    """A kernel gradient split in two (`Tiles.splits`), each group's rows two runs of their own groups
+    (`mosaic_gpu._sliced`), whose prologue scales each group's rows by its group's own vector (`('groups',
+    'depth')`, an expert's input scale): each run reads its own group's vector (it read the run's index
+    modulo the groups, so a group's second run took the next group's), and over ones the gradient is each
+    group's rows times its scale, 128 and 256, as unsplit."""
+    rows, depth, width = 256, 64, 128
+    x, dy = jnp.ones((rows, depth), jnp.bfloat16), jnp.ones((rows, width), jnp.bfloat16)
+    scales = jnp.asarray([[1.0] * depth, [2.0] * depth], jnp.float32)
+    tiles = mosaic_gpu.Tiles(64, 128, 64, 2, 1, family='wgmma')
+
+    def scaled(stage, scale):
+        return (stage * scale).astype(stage.dtype)
+
+    def dew(splits):
+        return mosaic_gpu.tgmm(x, dy, jnp.asarray([128, 128], jnp.int32),
+                               tiles=dataclasses.replace(tiles, splits=splits), out_dtype=jnp.float32,
+                               multiprocessors=8, interpret=grouped_matmul.INTERPRETED, prologue=scaled,
+                               prologue_operands=(scales,), prologue_axes=(("groups", "depth"),),
+                               exact_sums=True)
+
+    expected = np.broadcast_to(np.asarray([128.0, 256.0])[:, None, None], (2, depth, width))
+    with generation.assumed("sm90"):
+        for splits in (1, 2):
+            np.testing.assert_array_equal(np.asarray(dew(splits)), expected, err_msg=f"at {splits} runs")

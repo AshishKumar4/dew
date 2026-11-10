@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, equations
 
-from dew.nn.kernels import gemm, generation, grouped_matmul
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 SEEDS = 8
@@ -210,22 +210,15 @@ def a_blackwells_gathered_product_is_its_gathered_rows_product(interpret_on_cpu:
     cotangent = jnp.asarray(rng.integers(-1, 2, size=(384, 256)), jnp.bfloat16)
     sizes = jnp.asarray([128, 0, 200], jnp.int32)
     options = {"out_dtype": jnp.bfloat16, "precision": "default", "interpret_on_cpu": interpret_on_cpu}
-    derived, original = [], mosaic_gpu.gmm
-
-    def recorded(*args, tiles, **kwargs):
-        derived.append(tiles)
-        return original(*args, tiles=tiles, **kwargs)
-
-    with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(mosaic_gpu, "gmm", recorded)
+    # The template's launch named, its product at tcgen05's tile (`tuning.pinned`, a pin its legality checks).
+    tile = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+    with generation.chosen(grouped_matmul="mosaic"), tuning.pinned({grouped_matmul.MosaicGmm: tile}):
         got = jax.jit(lambda: gemm.gemm(tokens, matrices, sizes, gather=table, scatter=slots, **options))()
-        assert {tile.family for tile in derived} == {"tcgen05"}
         apart = jax.jit(lambda: gemm.gemm(tokens[table], matrices, sizes, **options))()
     np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.zeros_like(apart).at[slots].set(apart)))
     gradient = {**options, "out_dtype": jnp.float32}
-    with generation.routes() as routes:
+    with generation.chosen(grouped_matmul="mosaic"):
         got = jax.jit(lambda: gemm.gemm_t(tokens, cotangent, sizes, gather=(table, slots), **gradient))()
-    assert {route.kernel for route in routes} == {"mosaic"}, routes
     expected = jax.jit(lambda: gemm.gemm_t(tokens[table], cotangent[slots], sizes, **gradient))()
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 

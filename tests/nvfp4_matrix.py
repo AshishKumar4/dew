@@ -23,6 +23,7 @@ import pytest
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
+from low_precision_support import nvfp4
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation
@@ -37,20 +38,10 @@ KERNELS = {"nvfp4": frozenset({"packed"})}
 """The kernels under test of each choice the cells run: the template's in-stage decode."""
 XLA = {"grouped_matmul": "xla"}
 """The product's other choice, named XLA in every cell."""
-E2M1 = np.asarray([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-"""Each E2M1 code's magnitude (its sign the code's high bit)."""
-
-
 def _matrix(case: dict[str, str]) -> tuple[gemm.NvFp4, np.ndarray]:
-    """`case`'s NVFP4 matrix (`gemm.NvFp4.of`: random codes under power-of-two block scales, tensor scale
-    0.75) and its values in float64: code times block scale times tensor scale."""
+    """`case`'s NVFP4 matrix (`low_precision_support.nvfp4`, tensor scale 0.75) and its values in float64."""
     depth, width = int(case["depth"]), int(case["width"])
-    rng = np.random.default_rng(depth + width)
-    codes = rng.integers(0, 16, size=(depth, width))
-    magnitudes = np.where(codes >= 8, -1.0, 1.0) * E2M1[codes & 7]
-    block = np.exp2(rng.integers(-3, 4, size=(depth // 16, width)))
-    matrix = gemm.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), jnp.asarray(block, jnp.float8_e4m3fn), 0.75)
-    return matrix, magnitudes * np.repeat(block, 16, axis=0) * 0.75
+    return nvfp4(depth + width, depth, width, scale=0.75)
 
 
 def supported(case: dict[str, str]) -> bool:
