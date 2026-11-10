@@ -82,6 +82,7 @@ def tied(variables):
     (`SHARED_LEAVES`), its feed-forward's gate zero, which leaves the feed-forward's maps out, and
     every other leaf the shared model's own."""
     own = flat_tree(variables["params"])
+    width = jnp.result_type(*own.values())
     shapes = flat_tree(nn.unbox(jax.eval_shape(TIED_MODEL.init, jax.random.key(0),
                                       jnp.zeros((1, 1), jnp.int32)))["params"])
 
@@ -93,7 +94,8 @@ def tied(variables):
         if name in SHARED_LEAVES:
             return own[f"{layer}.{SHARED_LEAVES[name]}"]
         filled = jnp.zeros if rest == "alpha_dense" else jnp.ones
-        return filled(shape.shape, shape.dtype)
+        # At the variables' own width, as the shared leaves are: a float64 truth's float64.
+        return filled(shape.shape, jnp.promote_types(shape.dtype, width))
 
     params = {}
     for path, shape in shapes.items():

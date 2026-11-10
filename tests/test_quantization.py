@@ -1512,15 +1512,17 @@ def _assert_blocks_on_par(block: Callable[[str], nn.Module], ours: str, label: s
     params = block("reference").init(jax.random.key(4), jnp.zeros((2, 32, 64)))
 
     def arm(implementation: str):
-        def run(x, cotangent):
+        def run(params, x, cotangent):
             out, pullback = jax.vjp(lambda params, x: block(implementation).apply(params, x), params, x)
             return out, pullback(cotangent)
 
         return run
 
     def draw(seed):
+        # The parameters among the draw's inputs, which the truth reads widened as it reads the rest.
         streams = jax.random.split(jax.random.key(seed))
-        return (jax.random.normal(streams[0], (2, 32, 64)) * 2, jax.random.normal(streams[1], (2, 32, 64)))
+        return (params, jax.random.normal(streams[0], (2, 32, 64)) * 2,
+                jax.random.normal(streams[1], (2, 32, 64)))
 
     assert_as_exact(arm(ours), arm("reference"), draw, label, seeds=QUANTIZED_ATTENTION_SEEDS)
 

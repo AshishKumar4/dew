@@ -241,11 +241,18 @@ def dequantize(stored: jax.Array, scale: jax.Array, dtype: jnp.dtype) -> jax.Arr
     return (stored.astype(wide) * scale[..., None].astype(wide)).astype(dtype)
 
 
+def bound_dtype(storage: jax.typing.DTypeLike) -> jnp.dtype:
+    """The dtype a cache of `storage` keeps its values' bound in (`BOUND`): float32 at least, a float64
+    cache's own (a float64 truth's)."""
+    return jnp.promote_types(storage, jnp.float32)
+
+
 def value_bound(stored: jax.Array, scale: jax.Array | None) -> jax.Array:
-    """The largest magnitude of each vector of `stored` `[..., D]` as a cache reads it back, float32
-    `[...]` (`BOUND`): a quantized cache's largest code times its `scale` (`dequantize`'s product before
-    its cast, `scale` positive), a full-precision cache's stored values' own."""
-    largest = jnp.max(jnp.abs(stored.astype(jnp.float32)), axis=-1)
+    """The largest magnitude of each vector of `stored` `[..., D]` as a cache reads it back, in its bound's
+    dtype `[...]` (`BOUND`, `bound_dtype`): a quantized cache's largest code times its `scale`
+    (`dequantize`'s product before its cast, `scale` positive), a full-precision cache's stored values'
+    own."""
+    largest = jnp.max(jnp.abs(stored.astype(bound_dtype(stored.dtype))), axis=-1)
     return largest if scale is None else largest * scale
 
 
@@ -582,7 +589,7 @@ class KVStore:
             module.variable("cache", name, jnp.zeros, stored, storage)
             if layout.quantized is not None:
                 module.variable("cache", scale, jnp.ones, scale_shape(shape, layout), jnp.float32)
-        module.variable("cache", BOUND, jnp.zeros, scale_shape(shape, layout), jnp.float32)
+        module.variable("cache", BOUND, jnp.zeros, scale_shape(shape, layout), bound_dtype(storage))
         # A scale's storage with one head: every key head of a token sits at its place and in its group.
         held = (*shape[:2], 1) if layout.page_size is None else (1, *shape[1:3])
         if places:
