@@ -1003,7 +1003,7 @@ def check_inputs(trainer, device: Batch) -> None:
     if inputs is None:
         return
     with jax.set_mesh(trainer.device_mesh):
-        checked = trainer._model_shapes(device) if trainer._device else device
+        checked = trainer._model_shapes(device) if trainer._shape.device else device
     agreed("training input declaration", functools.partial(inputs.check, checked))
 
 

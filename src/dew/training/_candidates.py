@@ -20,7 +20,9 @@ import numpy as np
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.batch import CLOSES_WINDOW, Batch
-from dew.distributed.batches import batch_shardings, prefetched_bytes
+from dew.data.dataset import Stage
+from dew.data.pipeline import DeviceStep
+from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_bytes
 from dew.distributed.placement import Placement, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
@@ -47,6 +49,25 @@ if TYPE_CHECKING:
     from dew.objectives.base import Objective
     from dew.training.diloco import DiLoCo
     from dew.training.inspection import Inspection
+
+
+@dataclasses.dataclass(frozen=True)
+class RunShape:
+    """How a fit's batches are cut and counted, which every compile of its step reads: the rows its batches
+    hold, each phase's (`rows`, `Loader.batches`), the device steps its reader runs (`device`) and the
+    batches it prefetches (`prefetch`), the examples clock it runs on (`examples`, `clocked`), the stages of
+    its batch ramp and the steps each begins at (`ramp`, `stage_starts`), the microbatches a step's batch is
+    read in once decided (`split`: a pooling state's window or the first plan), and the updates its
+    optimizer was built for (`updates`). A fit holds one, each part replaced as the run decides it."""
+
+    rows: tuple[int, ...] | None = None
+    device: tuple[DeviceStep, ...] = ()
+    prefetch: int = PREFETCH_DEPTH
+    examples: int | None = None
+    ramp: tuple[Stage, ...] = ()
+    stage_starts: frozenset[int] = frozenset()
+    split: int | None = None
+    updates: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -91,9 +112,8 @@ class Stepping[LossT, EffectsT]:
     where its step keeps
     a pipelined run (`staging`), its window's accumulation (`initialize_accumulation`), its model's batch
     and its shapes (`model_batch`, `model_shapes`), its step's body (`step_body`) and the fields it fetches
-    (`fetched`), the batches it prefetches (`prefetch`), the examples clock it runs on (`examples`), the
-    mesh it traces on (`traced_on`), and the rows and split its batches are cut in (`rows`, `split`): read
-    here, none off the trainer itself (row 4555)."""
+    (`fetched`), the mesh it traces on (`traced_on`), and how its batches are cut and counted (`shape`):
+    read here, none off the trainer itself (row 4555)."""
 
     settings: StepSettings[LossT, EffectsT]
     step_key: Hashable | None
@@ -105,11 +125,8 @@ class Stepping[LossT, EffectsT]:
     model_shapes: Callable[[Batch], Batch]
     step_body: Callable[..., Callable]
     fetched: Callable[..., TrainState]
-    prefetch: int
-    examples: int | None
     traced_on: Callable[[Mesh | AbstractMesh], contextlib.AbstractContextManager[Schedule]]
-    rows: tuple[int, ...] | None
-    split: int | None
+    shape: RunShape
 
 
 KEPT_CANDIDATES = 4
@@ -166,8 +183,9 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
         stated, _shaped(state), _shaped(batch), _shaped(placement), replicated, split, narrow,
         # No launch record lowers as an empty one (`_candidate`'s untuned lowering).
         launches or "[]",
-        lowering, mesh, platforms, capacity, _footprinted(footprint), derived, stepping.rows, stepping.split,
-        stepping.prefetch, stepping.examples, report.refused_launches(), trace_context())
+        lowering, mesh, platforms, capacity, _footprinted(footprint), derived, stepping.shape.rows,
+        stepping.shape.split, stepping.shape.prefetch, stepping.shape.examples, report.refused_launches(),
+        trace_context())
     if key is not None:
         with _KEEPING:
             if (kept := _CANDIDATES.get(key)) is not None:
@@ -234,7 +252,7 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     built = 0 if mesh is not None else placed_bytes([field for field, kept in (
         (prepared.compute, state.compute), (prepared.window, None if rebuilt else last))
         if kept is None and field is not None])
-    held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.prefetch) + built
+    held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.shape.prefetch) + built
     jitted = step_program(stepping, shapes, copies, shardings, placement, replicated, split)
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
     # The batch as shapes with the placement it is read under, whoever lowers it: a lowering over the host
@@ -279,7 +297,7 @@ def consumes_where_made[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], pr
     settings = stepping.settings
     with group_of(prepared, micro) as (view, _):
         return consumed_where_made(settings.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
-                                   progressed=stepping.examples is not None)
+                                   progressed=stepping.shape.examples is not None)
 
 
 def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
@@ -358,7 +376,7 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tra
     mesh = gpu_mesh(settings.device_mesh, generation)
     with assumed(generation), stepping.traced_on(mesh) as schedule:
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
-        split = splits(stepping.rows, batch, mesh, settings.microbatches, stepping.split)[0]
+        split = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)[0]
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
         return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow, None,
                                mesh=mesh, platforms=('cuda',)).lowered

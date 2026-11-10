@@ -228,7 +228,7 @@ def test_a_step_whose_rows_an_explicit_axis_types_is_read_whole():
     with pytest.raises(ValueError):
         Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0), split=2, mesh=spec)
     trainer = Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0), mesh=spec)
-    assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._split) == [1]
+    assert splits(None, BATCH, MeshSpec().build(jax.devices()[:1]), 1, trainer._shape.split) == [1]
 
 
 EXECUTED: list[int] = []

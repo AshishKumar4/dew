@@ -772,7 +772,7 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
 
     partition = DataPartition.of(trainer.device_mesh) if partition is None else partition
     device, _ = split_fields(marked(partition, trainer._counted_batch)(batch))
-    return closes_window(device, trainer._examples)
+    return closes_window(device, trainer._shape.examples)
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
