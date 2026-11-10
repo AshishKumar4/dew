@@ -547,7 +547,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
         Rows asking a request's questions over one copy of its state (`DecisionInputs.documents`) score
         what each question's own row scores (`_forked_input_terms`)."""
-        from dew.batch import coordinates
+        from dew.batch import coordinates, scored_targets
         from dew.nn.progress import progressed
         from dew.objectives.lm.chunked import chunked_tile, final_read, head_cross_entropy
 
@@ -561,8 +561,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         read = final_read(backbone, held, tokens[:, :-1], train=step.training, coordinates=laid,
                           rngs=model_rngs(step.key, training=step.training),
                           **progressed(backbone, self.progress(step)))
-        # A token's successor in its own row: none after a row's last token or on the padding.
-        scored = ((segments[:, 1:] == segments[:, :-1]) & (segments[:, :-1] > 0)).astype(jnp.float32)
+        # A token's successor in its own row, as a language model scores its targets (`scored_targets`): none
+        # after a row's last token or on the padding.
+        scored = scored_targets(jnp, tokens, None, None, segments).astype(jnp.float32)
         losses, _, _ = head_cross_entropy(backbone, held, read, tokens[:, 1:], 4, tile=chunked_tile(),
                                           predict=False)
         return self.row_mean(losses, batch, weights=scored)
