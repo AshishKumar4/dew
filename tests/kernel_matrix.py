@@ -199,6 +199,20 @@ SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "blockwise_fp8": (
         (5415, ("sm90", "128", "1", "float32")),
     ),
+    "recurrence": (
+        (5330, ("sm90", "gated delta net", "mosaic_gpu", "bfloat16", "one")),
+        (5330, ("sm90", "rated scan", "pallas", "bfloat16", "packed")),
+        (5409, ("sm80", "gated delta net", "fla", "bfloat16", "packed")),
+        (5409, ("sm80", "rated scan", "pallas", "bfloat16", "one")),
+        (5409, ("sm80", "rated scan", "mosaic_gpu", "bfloat16", "one")),
+    ),
+    "short_conv": (
+        (5411, ("sm80", "0.8b", "bfloat16", "packed")),
+        (5441, ("sm90", "0.8b", "bfloat16", "one")),
+        (5441, ("sm90", "0.8b", "float32", "one")),
+        (5441, ("sm90", "9b", "bfloat16", "one")),
+        (5441, ("sm80", "9b", "float32", "one")),
+    ),
 }
 """Each family's cases a ledger row names, by the row, its axis values in `AXES`' order: its cells take them
 whatever the covering takes besides (`covering`), so the row's own case proves it closed."""
