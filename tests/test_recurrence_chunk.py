@@ -611,8 +611,8 @@ def test_a_value_read_by_the_write_and_the_skip_rounds_its_gradient_once():
     hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True)
     operands = Chunk(query=jnp.full((1, 1, 1, 1), 1.0078125, jnp.bfloat16),
                      key=jnp.ones((1, 1, 1, 1), jnp.bfloat16), value=jnp.ones((1, 1, 1, 8), jnp.bfloat16),
-                     beta=jnp.full((1, 1, 1), 0.99609375, jnp.bfloat16), skip=jnp.array([-0.9999], jnp.float32),
-                     state=jnp.zeros((1, 1, 1, 8), jnp.float32))
+                     beta=jnp.full((1, 1, 1), 0.99609375, jnp.bfloat16),
+                     skip=jnp.array([-0.9999], jnp.float32), state=jnp.zeros((1, 1, 1, 8), jnp.float32))
 
     def gradient(run, operands):
         def loss(value):
