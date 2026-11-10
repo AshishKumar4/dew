@@ -16,6 +16,7 @@ from dew.data import Loading
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
+from dew.data.plan import PLAN_VERSIONS
 from dew.data.sources import Concatenate, Files, Memory
 from dew.data.storage import Store
 
@@ -382,12 +383,12 @@ def test_a_parquet_store_reads_each_footer_once_however_many_reads_count_its_row
     assert len(Opening.opened) == opened and len(set(Opening.opened)) == FILES
 
 
-@pytest.mark.parametrize("version", [5, 12])
+@pytest.mark.parametrize("version", [5, PLAN_VERSIONS[-1] + 1], ids=["before", "after"])
 def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
     """Every read builds by its data plan version (`dew.data.compile._build`): a pass, a publication and an
-    export at one this Dew reads by none of is refused, as a run's compile is, where 12 read as 11 and 5 as
-    8 (train 654's review, row 4583); a publication of it is refused where a version it read as already
-    published the store's generation too, which it would have returned."""
+    export at one this Dew reads by none of is refused, as a run's compile is, where one past the latest
+    read as the latest and 5 as 8 (train 654's review, row 4583); a publication of it is refused where a
+    version it read as already published the store's generation too, which it would have returned."""
     from uuid import uuid4
 
     from dew.data.cache import Cache
@@ -399,7 +400,7 @@ def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
     cache = Cache(f"memory://parquet-files-refused-{uuid4().hex}")
     with pytest.raises(ValueError):
         publish(chain, cache, plan_version=version)
-    publish(chain, cache, plan_version=11 if version > 11 else 8)
+    publish(chain, cache, plan_version=PLAN_VERSIONS[-1] if version > PLAN_VERSIONS[-1] else 8)
     with pytest.raises(ValueError):
         publish(chain, cache, plan_version=version)
     # Refused before the read prepares anything: a memory read's steps, which it runs as it is compiled,
@@ -430,11 +431,11 @@ def test_a_token_export_reads_its_documents_by_the_plan_version_it_names(tmp_pat
     from dew.data.sources import TokenFiles
 
     documents = ["one", "two words", "three of them"]
-    for name in ("nine", "twelve"):
+    for name in ("nine", "unread"):
         (tmp_path / name).mkdir()
     exported = export_byte_tokens(tmp_path / "nine", documents, "--plan-version", "9")
     read = [bytes(row["text"][:-1].astype(np.uint8)).decode() for row in iterate(Pipeline(TokenFiles(
         str(exported))), read="streamed")]
     assert read == documents
     with pytest.raises(ValueError):
-        export_byte_tokens(tmp_path / "twelve", documents, "--plan-version", "12")
+        export_byte_tokens(tmp_path / "unread", documents, "--plan-version", str(PLAN_VERSIONS[-1] + 1))
