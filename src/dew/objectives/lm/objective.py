@@ -368,15 +368,23 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
     return restored, valid
 
 
-def batch_text(batch) -> ModelInputs:
-    """The batch's `text` rows as `_prepared` gives them, a packed batch's `text_coordinates` folded in,
-    and its `text_block_groups` beside them."""
+def text_columns(batch) -> dict[str, object]:
+    """The packing columns a batch carries beside its `text` rows, by the token field each is: its
+    `text_coordinates` and `text_block_groups`, a column the batch leaves out or holds as None absent. The
+    one reading of them, which the loss (`batch_text`) and the host's counts (`_token_geometry`) convert
+    each its own way; a batch laid out in the flat fields of old is refused."""
     stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
     if stale:
         raise ValueError(f"a packed batch lays its documents out in text_coordinates "
                          f"(dew.batch.coordinates), not {', '.join(stale)}")
-    laid = batch.get("text_coordinates")
-    blocks = batch.get(BLOCKS_KEY)
+    named = ((COORDINATES_FIELD, "text_coordinates"), (BLOCKS_FIELD, BLOCKS_KEY))
+    return {name: batch[key] for name, key in named if batch.get(key) is not None}
+
+
+def batch_text(batch) -> ModelInputs:
+    """The batch's `text` rows as `_prepared` gives them, its packing columns (`text_columns`) folded in."""
+    columns = text_columns(batch)
+    laid, blocks = columns.get(COORDINATES_FIELD), columns.get(BLOCKS_FIELD)
     return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid),
                      block_groups=None if blocks is None else jnp.asarray(blocks, jnp.int32))
 
@@ -650,9 +658,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         loss reads."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
-        extra = {name: batch[key] for name, key in ((COORDINATES_FIELD, "text_coordinates"),
-                                                    (BLOCKS_FIELD, BLOCKS_KEY)) if key in batch}
-        return np.asarray(prepared.tokens), _with_columns(prepared, extra)
+        return np.asarray(prepared.tokens), _with_columns(prepared, text_columns(batch))
 
     def _counted_tokens(self, batch: Batch):
         """Host input geometry: each real token, and the documents."""
