@@ -285,11 +285,9 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
     if runs is not None:
-        if sliding_window is not None and positions is not None:
-            before, after = window_sides(causal, sliding_window)
-            query_places, key_places = _widened(positions)
-            by_places.append((key_places, _moved(query_places, -before), _moved(query_places, after)))
-        start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys, by_places)
+        sides = None if sliding_window is None or positions is None else window_sides(causal, sliding_window)
+        start, end = _read_runs(jnp.asarray(runs, jnp.int32), start, end, keys,
+                                (by_places, sides, positions), (place, own, block_groups))
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
     narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs, slots)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
@@ -331,6 +329,46 @@ def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
             begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
             start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
     return start, end
+
+
+def _read_runs(runs: jax.Array, start: jax.Array, end: jax.Array, keys: int, narrowings: tuple,
+               blocks: tuple) -> tuple[jax.Array, jax.Array]:
+    """`spans`' intervals over its key `runs` (`_within_runs`), each narrowed by places (`narrowings`, the
+    spans' `by_places` and a window's sides over the call's `positions`, None for none), then the block
+    holding each query's own key whole within its run (`blocks`, `(place, own, block_groups)`,
+    `_whole_blocks`) where the call has block groups."""
+    by_places, windowed, positions = narrowings
+    if windowed is not None:
+        before, after = windowed
+        query_places, key_places = _widened(positions)
+        by_places = [*by_places, (key_places, _moved(query_places, -before), _moved(query_places, after))]
+    start, end = _within_runs(runs, start, end, keys, by_places)
+    place, own, block_groups = blocks
+    if block_groups is None:
+        return start, end
+    return _whole_blocks(start, end, jnp.clip(runs, 0, keys), place, own, block_groups)
+
+
+def _whole_blocks(start: jax.Array, end: jax.Array, runs: jax.Array, place: jax.Array, own: jax.Array,
+                  block_groups) -> tuple[jax.Array, jax.Array]:
+    """Each query's runs' `[start, end)` (`_within_runs`'s, `[B, Q, R]`, or `[B, Q]` for one run) with the
+    block holding its own key (`own`, at `place`) read whole within the run holding that key (`runs`
+    `[B, Q, R, 2]`, before any window): a block is read whatever the window, `(window and causal) or
+    block`, and never past the run, a fork's document."""
+    from dew.nn.visibility import block_ends, block_starts
+
+    groups = jnp.asarray(block_groups)
+    at = jnp.clip(place, 0, groups.shape[1] - 1)
+    inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
+    begins = jnp.take_along_axis(block_starts(groups), at, axis=1)[..., None]
+    ends = jnp.take_along_axis(block_ends(groups), at, axis=1)[..., None]
+    lo, hi = runs[..., 0], runs[..., 1]
+    holding = (lo <= place[..., None]) & (place[..., None] < hi) & inside[..., None]
+    single = start.ndim == 2
+    start, end = (start[..., None], end[..., None]) if single else (start, end)
+    start = jnp.where(holding, jnp.minimum(start, jnp.maximum(begins, lo)), start)
+    end = jnp.where(holding, jnp.maximum(end, jnp.minimum(ends, hi)), end)
+    return (start[..., 0], end[..., 0]) if single else (start, end)
 
 
 def _narrowed(start: jax.Array, end: jax.Array, order: jax.Array, run_lo: jax.Array, run_hi: jax.Array,

@@ -426,7 +426,10 @@ class AlignedDocuments:
         group = value.shape[-2] // key.shape[-2]
         if group > 1:
             key = jnp.repeat(key, group, axis=-2)
-        spelled = 'bcrhv,bcrhk->bchvk' if transposed else 'bcrhk,bcrhv->bchkv'
-        written = jnp.einsum(spelled, *((value, key) if transposed else (key, value)))
-        live = (self.takes >= 0)[:, :, None]
-        return jnp.where(live[..., None, None], (weight * live)[..., None, None] * written, 0)
+        # The weight inside the contraction, so its gradient is one too (`dot_general`'s accumulation), not
+        # an elementwise product summed after: the SSD port's weight gradient took 1.6 to 1.9 times the
+        # error each document alone takes from float64 summed after (armada, 11-11).
+        live = self.takes >= 0
+        weighed = jnp.where(live[..., None], weight, 0)
+        spelled = 'bcrhv,bcrhk,bch->bchvk' if transposed else 'bcrhk,bcrhv,bch->bchkv'
+        return jnp.einsum(spelled, *((value, key) if transposed else (key, value)), weighed)

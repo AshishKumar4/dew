@@ -353,25 +353,32 @@ draw."""
 
 def documents_draw(seed: int):
     """Two rows of three documents (`DOCUMENTS`) of a forked call (`FORKED`) over one given memory a row,
-    and cotangents of the output and the row's last memory."""
+    each document's entry write (`recurrence_chunk.Chunk.entry_key`: two terms of a state's keys `[N]` and
+    a head's values `[P]`, a weight a head), and cotangents of the output and the row's last memory."""
     x, dt, A, B, C, _, _ = mixer_operands((2, 190, 2, 16, 16, 1), seed)
     x, b, c, a = (jnp.asarray(t, jnp.float32) for t in ssd_operands(x, dt / 64, A, B, C, 1))
-    keys = jax.random.split(jax.random.key(seed + 11), 3)
+    keys = jax.random.split(jax.random.key(seed + 11), 6)
     given = 0.3 * jax.random.normal(keys[0], (2, 1, 2, 16, 16), jnp.float32)
+    entry = (0.3 * jax.random.normal(keys[3], (2, 3, 2, 2, 16), jnp.float32),
+             0.3 * jax.random.normal(keys[4], (2, 3, 2, 2, 16), jnp.float32),
+             jax.random.uniform(keys[5], (2, 3, 2), jnp.float32))
     seeded = (jax.random.normal(keys[1], x.shape, jnp.float32),
               jax.random.normal(keys[2], (2, 2, 16, 16), jnp.float32))
-    return (x, b, c, a, given), seeded
+    return (x, b, c, a, given, *entry), seeded
 
 
-def documents_on_the_kernel(x, b, c, a, given):
+def documents_on_the_kernel(x, b, c, a, given, key, value, weight):
     """The kernel over a forked call, each document laid from a chunk's edge and taking its table slot's
-    memory up there (`recurrence_chunk._ported_documents`): the output and the row's last memory."""
+    memory up there with its entry write added (`recurrence_chunk._ported_documents`): the output and the
+    row's last memory."""
     from dew.nn.kernels.chunked_launch import AlignedDocuments, Forked
     from dew.nn.kernels.recurrence_chunk import _ported_documents
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
-    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, None, 2)
-    aligned, documents = _ported_documents(given, forked, x.shape[1], 64)
+    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, (key, value, weight), 2)
+    # The table's memories as a chunk's call holds them, `[N, P]`, the SSD's transposed.
+    aligned, documents = _ported_documents(jnp.swapaxes(given, -1, -2), forked, x.shape[1], 64, jnp.float32,
+                                           (16, 16))
     assert isinstance(aligned, AlignedDocuments)
     laid = aligned.laid(x, b, c, a)
     start = jnp.zeros((x.shape[0], *given.shape[2:]), jnp.float32)
@@ -379,9 +386,10 @@ def documents_on_the_kernel(x, b, c, a, given):
     return aligned.unlaid(y), final
 
 
-def documents_one_by_one(x, b, c, a, given):
+def documents_one_by_one(x, b, c, a, given, key, value, weight):
     """Each document a sequence of its own, a step at a time (`stepwise_scan`), in the row's order from its
-    table slot's memory: a given one, or the final an earlier document stored."""
+    table slot's memory (a given one, or the final an earlier document stored) with its entry write
+    added."""
     rows, lasts = [], []
     ends = np.concatenate([np.asarray(DOCUMENTS), np.full((2, 1), x.shape[1])], axis=1)
     for row in range(x.shape[0]):
@@ -390,6 +398,8 @@ def documents_one_by_one(x, b, c, a, given):
         for index, (first, end) in enumerate(zip(ends[row, :-1], ends[row, 1:], strict=True)):
             span = slice(int(first), int(end))
             entering = table[loads[index] - 1] if loads[index] else jnp.zeros_like(given[row, 0])
+            entering = entering + weight[row, index][:, None, None] * jnp.einsum(
+                'rhp,rhn->hpn', value[row, index], key[row, index])
             y, final = stepwise_scan(x[row:row + 1, span], b[row:row + 1, span], c[row:row + 1, span],
                                      a[row:row + 1, span], entering[None])
             outs.append(y[0])
@@ -403,14 +413,15 @@ def documents_one_by_one(x, b, c, a, given):
 def test_documents_entering_their_own_states_scan_as_each_alone():
     """The TPU kernel over a forked call (a request's questions over its shared prefix's state, a chain's
     each over its predecessor's, `Chunk.loads`): each document laid from a chunk's edge, the kernel's carry
-    taking its table slot's state up there and its resident table keeping the finals its documents store;
-    its output, the row's last state and every operand's gradient, the given states' included, as each
+    taking its table slot's state up there with its entry write added (`Chunk.entry_key`) and its resident
+    table keeping the finals its documents store; its output, the row's last state and every operand's
+    gradient, the given states' and the entry writes' included, as each
     document scanned alone a step at a time in the row's order, from float64 (check 1)."""
     def under(scan):
         def run(operands, seeded):
             output, *gradients = with_gradients(lambda *o: scan(*o))(*operands, seeded)
-            return dict(zip(("output", "final", "x", "B", "C", "A dt", "given"),
-                            (*output, *gradients[:5]), strict=True))
+            return dict(zip(("output", "final", "x", "B", "C", "A dt", "given", "entry keys", "entry values",
+                             "entry weights"), (*output, *gradients[:8]), strict=True))
         return run
 
     mine = without_ynn(under(documents_on_the_kernel))

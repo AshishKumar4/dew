@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import TINY_DECODER, float64_twin
 from reference_error import assert_as_exact
 
@@ -23,7 +24,9 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.engram import Engram, PLELayer
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.inputs import MixerCall
 from dew.objectives.lm.objective import LMObjective
 
 VOCAB = 37
@@ -72,6 +75,14 @@ def attention_model(**fields) -> CausalTransformer:
                                 **fields})
 
 
+def engram_model() -> CausalTransformer:
+    """An attention decoder with an engram lookup at its first layer, its n-grams three ids long, over two
+    residual streams."""
+    lookup = Engram(layer_ids=(0,), num_embeddings=(168,), max_ngram_size=3, vocab_size=VOCAB, n_heads=2,
+                    head_dim=4, compressed_vocab_size=VOCAB)
+    return attention_model(engram=lookup, hyper_connections=HyperConnections(hc_mult=2, head="weighted"))
+
+
 MODELS = {
     "attention": lambda: attention_model(),
     "windowed attention": lambda: attention_model(layer_types=("windowed", "windowed"),
@@ -80,10 +91,11 @@ MODELS = {
     "kimi linear": lambda: hybrid_model("kimi_delta_attention", {"class": "mla", "fields": MLA}),
     "mixture": lambda: attention_model(mixture=Mixture(experts=4, top_k=2, expert_features=16)),
     "looped": lambda: attention_model(loop=Loop(2, exit_gate=True)),
+    "engram": engram_model,
 }
 """The decoders whose every layer reads forks: attention, windowed attention, each recurrent mixer beside
-attention, a latent attention beside Kimi's delta attention, a routed feed-forward, and a looped stack whose
-every pass reads the forks."""
+attention, a latent attention beside Kimi's delta attention, a routed feed-forward, a looped stack whose
+every pass reads the forks, and engram's n-gram lookups, each token's n-grams its chain's."""
 
 
 @pytest.mark.parametrize("kind", sorted(MODELS))
@@ -149,22 +161,16 @@ def test_forked_rows_lay_each_prefix_once_and_each_row_back_at_its_tokens():
 
 
 def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
-    """A decoder that reads its tokens in their row's order beyond its mixers (engram's n-gram hashes, a
-    block router, an expert capacity), whose mixer reads no forks (DeepSeek V4's compressed windows, which
+    """A decoder that reads its tokens in their row's order beyond its mixers (a block router, an expert
+    capacity), whose mixer reads no forks (DeepSeek V4's compressed windows, which
     pool a row's tokens in its order), that reads each token's later ones (a bidirectional decoder, whose
     prefix would read its branches), or that draws dropout in a training step, says why a call over forks
     would not compute each row as its own (`ForkedCalls`): its objective lays its rows whole
     (`shares_prefixes`), and a call over forks is refused, where the same decoder without the cause runs
     it. A joint tree (`Forks.joint`), one row read together, draws its dropout once and runs in training;
     its other causes refuse it all the same."""
-    from dew.nn.engram import Engram
-
     forks = ForkedRows.pack(ROWS, WIDTH)
     refusing = {
-        "engram": attention_model(engram=Engram(layer_ids=(0,), num_embeddings=(168,), max_ngram_size=3,
-                                                vocab_size=VOCAB, n_heads=2, head_dim=4,
-                                                compressed_vocab_size=VOCAB),
-                                  hyper_connections=HyperConnections(hc_mult=2, head="weighted")),
         "block routing": attention_model(mixture=Mixture(experts=4, top_k=2, expert_features=16,
                                                          routing_block=2, block_experts=2)),
         "capacity": attention_model(mixture=Mixture(experts=4, top_k=2, expert_features=16,
@@ -642,3 +648,67 @@ def test_a_cached_call_stating_no_validity_places_its_keys_as_real_tokens():
 
     real = dataclasses.replace(plain, valid=jnp.ones((rows, queries), bool))
     np.testing.assert_array_equal(placed(plain), placed(real))
+
+
+class _PerLayerOverHidden(nn.Module):
+    """A per-layer embedding (`dew.nn.engram.PLELayer`) over a layer's `[B, S, 2W]` input as two streams of
+    `W`, each token's bucket ids its own input's (the same token's in a forked call and its own row), giving
+    what it adds to the streams: zero on padding."""
+
+    layer: PLELayer
+
+    @nn.compact
+    def __call__(self, hidden, call):
+        batch, length, width = hidden.shape
+        streams = hidden.reshape(batch, length, 2, width // 2)
+        ids = (jnp.floor(jnp.abs(hidden[..., :2]) * 13).astype(jnp.int32) % self.layer.rows)
+        return (self.layer(streams, ids, call) - streams).reshape(batch, length, width)
+
+
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_the_per_layer_embedding_reads_each_documents_chain_over_forks(layout):
+    """Qwen4-Exp's per-layer embedding over documents that continue another (`dew.batch.Forks`) gives each
+    document's tokens, and the gradients through them, what its own row of its chain and itself gives (check
+    1): its dilated conv reads its chain's last gated values (`forked_conv`), across a short parent into its
+    grandparent."""
+    module = _PerLayerOverHidden(PLELayer(rows=23, head_dim=4, hc_mult=2, emb_features=8, norm_eps=1e-6,
+                                          kernel_size=3, dilation=2, use_bias=True))
+    hidden = jnp.ones((1, 4, 16), jnp.float32)
+    variables = module.init(jax.random.key(0), hidden, MixerCall())
+    assert_forks_as_own_rows(module, variables, 16, layout, "the per-layer embedding")
+
+
+def test_a_windowed_block_over_forks_reads_its_block_whole_and_its_window_else():
+    """A windowed layer reading a prompt's block over forks (`fork_runs` with the block groups it reads, the
+    spans' `_whole_blocks`) sees what the dense rule gives within each token's chain: a key of its own
+    block whatever the window, else a key at or before it within the window of its place, `(window and
+    causal) or block`, and nothing past its chain."""
+    from dew.nn.attention_masks import visibility_mask
+    from dew.nn.inputs import AttentionMetadata, fork_runs
+
+    forks = ForkedRows.pack(ROWS, WIDTH)
+    laid = forks.coordinates
+    assert laid.forks is not None and laid.segments is not None and laid.positions is not None
+    segments, places = np.asarray(laid.segments), np.asarray(laid.positions)
+    windows, width = segments.shape
+    slots = np.arange(width)
+    # A prompt block: each window's first document's first five tokens.
+    blocks = np.where((segments == 1) & (slots < 5), 1, -1).astype(np.int32)
+    window = 2
+    runs = fork_runs(AttentionMetadata(coordinates=laid, block_groups=jnp.asarray(blocks)), windows, width,
+                     groups=("block_groups",))
+    found = np.asarray(visibility_mask(width, width, causal=False, sliding_window=window, key_runs=runs,
+                                       block_groups=jnp.asarray(blocks), places=jnp.asarray(places)))[:, 0]
+    parents = np.asarray(laid.forks.parents)
+    for row in range(windows):
+        for query in np.flatnonzero(segments[row] > 0):
+            chain, document = set(), segments[row, query]
+            while document:
+                chain.add(document)
+                document = parents[row, document - 1]
+            for key in np.flatnonzero(segments[row] > 0):
+                mine = segments[row, key] == segments[row, query]
+                before = (segments[row, key] in chain) and (key <= query or not mine)
+                windowed = before and 0 <= places[row, query] - places[row, key] < window
+                blocked = mine and blocks[row, query] >= 0 and blocks[row, key] == blocks[row, query]
+                assert found[row, query, key] == (windowed or blocked), (row, query, key)

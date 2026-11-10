@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from dew.batch import Coordinates, Forks, coordinates
+from dew.batch import BLOCKS_FIELD, Coordinates, Forks, coordinates
 from dew.data.tokens import common_prefix, first_fit
 
 
@@ -191,7 +191,8 @@ def _keyed(rows: Sequence[Sequence[int]], positions: Sequence[Sequence[int]] | N
         if len(given) != len(laid) or any(len(value) != row.size for value, row in zip(given, laid,
                                                                                         strict=True)):
             raise ValueError(f"{name} holds one entry a token of each row")
-    keys = ([token_keys(row, place, [values[number] for values in extra.values()])
+    keys = ([token_keys(row, place, [values[number] for values in extra.values()],
+                        extra[BLOCKS_FIELD][number] if BLOCKS_FIELD in extra else None)
              for number, (row, place) in enumerate(zip(laid, places, strict=True))] if share else None)
     return laid, places, extra, keys
 
@@ -204,11 +205,21 @@ def _planned(lengths: Sequence[int], width: int, keys: Sequence[Sequence[bytes]]
     return _windows(groups, lengths, keys, width, None if keys is not None else documents)
 
 
-def token_keys(row: np.ndarray, places: np.ndarray, extra: Sequence[np.ndarray]) -> list[bytes]:
-    """Each token's identity as a shared prefix compares it: its id, its place and every field it carries."""
-    return [b"".join([np.int64(token).tobytes(), np.int64(place).tobytes(),
+def token_keys(row: np.ndarray, places: np.ndarray, extra: Sequence[np.ndarray], blocks=None) -> list[bytes]:
+    """Each token's identity as a shared prefix compares it: its id, its place and every field it carries,
+    and in a block (`blocks`, `dew.batch.BLOCKS_FIELD`'s numbers, -1 for none) the block's every token's,
+    which a block's tokens read whole: two rows alike up to inside a block share none of that block."""
+    keys = [b"".join([np.int64(token).tobytes(), np.int64(place).tobytes(),
                       *(np.ascontiguousarray(values[at]).tobytes() for values in extra)])
             for at, (token, place) in enumerate(zip(row.tolist(), places.tolist(), strict=True))]
+    if blocks is None:
+        return keys
+    blocks = np.asarray(blocks)
+    # A block's tokens each read its every token: id, place and fields alike.
+    wholes = {block: b"".join(keys[at] for at in np.flatnonzero(blocks == block))
+              for block in np.unique(blocks[blocks >= 0]).tolist()}
+    return [key + wholes[block] if block >= 0 else key
+            for key, block in zip(keys, blocks.tolist(), strict=True)]
 
 
 def _groups(keys: Sequence[Sequence[bytes]], width: int) -> list[list[int]]:

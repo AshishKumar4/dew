@@ -292,16 +292,34 @@ HELD = 2
 """The stored slots a row's table holds (`Chunk.held`)."""
 
 
-def entered_draw(hooks, seed: int):
-    """`draw`'s packed operands over a table of `GIVEN` memories a row, and cotangents of the output and
-    the row's last memory."""
+def entered_draw(hooks, seed: int, entries: bool = False):
+    """`draw`'s packed operands over a table of `GIVEN` memories a row, with `entries` an entry write a
+    document (`Chunk.entry_key`: two terms a document, a weight a value head), and cotangents of the output
+    and the row's last memory."""
     (operands,) = draw(hooks, packed=True, seed=seed)
-    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 9), 3)
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 9), 6)
     given = 0.3 * jax.random.normal(keys[0], (ROWS, GIVEN, *operands.state.shape[1:]))
     out = jax.random.normal(keys[1], operands.value.shape)
     final = jax.random.normal(keys[2], operands.state.shape)
     # The documents' bounds and slots are the call's structure, which the arms close over: no gradient.
-    return dataclasses.replace(operands, state=given, starts=None), (out, final)
+    drawn = dataclasses.replace(operands, state=given, starts=None)
+    if entries:
+        documents = len(DOCUMENTS[0])
+        drawn = dataclasses.replace(
+            drawn,
+            entry_key=0.3 * jax.random.normal(keys[3], (ROWS, documents, 2, *operands.key.shape[2:])),
+            entry_value=0.3 * jax.random.normal(keys[4], (ROWS, documents, 2, *operands.value.shape[2:])),
+            entry_weight=jax.random.uniform(keys[5], (ROWS, documents, operands.value.shape[2])))
+    return drawn, (out, final)
+
+
+def entry_write(operands, row: int, document: int):
+    """The entry write `operands` give a row's document (`Chunk.entry_key`), `[Hv, Dk, Dv]`: its weight
+    times its terms' summed outer products, each key head's keys read by its value heads."""
+    group = operands.entry_value.shape[3] // operands.entry_key.shape[3]
+    key = jnp.repeat(operands.entry_key[row, document], group, axis=1)
+    written = jnp.einsum('rhk,rhv->hkv', key, operands.entry_value[row, document])
+    return operands.entry_weight[row, document][:, None, None] * written
 
 
 def entering_documents(operands):
@@ -316,7 +334,8 @@ def entering_documents(operands):
 def document_by_document(hooks, operands, run=None):
     """Each document of `operands` a sequence of its own through `run(hooks, piece)` (`token_by_token`
     where None), in the row's order from its `FORKED` table slot's memory (a given one, or the final an
-    earlier document stored), its outputs back in place, and each row's last memory."""
+    earlier document stored, with its entry write added where `operands` give one), its outputs back in
+    place, and each row's last memory."""
     run = token_by_token if run is None else run
     tokens = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z')
     outs, lasts = [], []
@@ -324,12 +343,15 @@ def document_by_document(hooks, operands, run=None):
         ends = (*begins[1:], operands.value.shape[1])
         table = list(operands.state[row]) + [None] * HELD
         pieces, final = [], None
-        for begin, end, load, store in zip(begins, ends, loads, stores, strict=True):
+        for document, (begin, end, load, store) in enumerate(zip(begins, ends, loads, stores, strict=True)):
             state = table[load - 1] if load else jnp.zeros_like(operands.state[row, 0])
+            if operands.entry_key is not None:
+                state = state + entry_write(operands, row, document)
             fields = {name: getattr(operands, name)[row:row + 1, begin:end] for name in tokens
                       if getattr(operands, name) is not None}
             piece = dataclasses.replace(operands, **fields, state=state[None], starts=None, loads=None,
-                                        stores=None, held=0)
+                                        stores=None, held=0, entry_key=None, entry_value=None,
+                                        entry_weight=None)
             out, final = run(hooks, piece)
             pieces.append(out[0])
             if store:
@@ -423,10 +445,11 @@ def assert_forked_as_each_alone(kernel: str, hooks, draw, site: str, seeds: int)
 @pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=str)
 def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
     """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
-    state passing taking up its table slot's memory there, keeping the finals its documents store
-    (`_ported_documents`), as the port's call over each document alone (`assert_forked_as_each_alone`). The
-    port's own numbers (mamba_ssm's) are tests/test_mamba_ssd.py's."""
-    assert_forked_as_each_alone('pallas', hooks, functools.partial(entered_draw, hooks),
+    state passing taking up its table slot's memory there with its entry write added (`Chunk.entry_key`),
+    keeping the finals its documents store (`_ported_documents`), as the port's call over each document
+    alone from its slot's memory and entry write (`assert_forked_as_each_alone`). The port's own numbers
+    (mamba_ssm's) are tests/test_mamba_ssd.py's."""
+    assert_forked_as_each_alone('pallas', hooks, functools.partial(entered_draw, hooks, entries=True),
                                 f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80)
 
 

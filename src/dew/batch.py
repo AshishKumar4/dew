@@ -308,11 +308,13 @@ class Forks:
         before = xp.where(opening, xp.where(parent > 0, last, -1), slots - 1)
         return xp.where(segments > 0, before, -1).astype(np.int32)
 
-    def runs(self, segments):
+    def runs(self, segments, reach=None):
         """Each token's key runs `[B, S, depth + 1, 2]` over the call's own slots
         (`dew.nn.inputs.AttentionMetadata.key_runs`): its ancestors whole, its root's first, then its own
-        document up to itself, empty runs `(0, 0)` past a shallower chain; a padding slot reads itself
-        alone. A cached call's attention places them after the row's cache (`fork_runs`)."""
+        document up to itself, or up to `reach` `[B, S]` (the slot past the last it reads, a bidirectional
+        group's end) within its document, empty runs `(0, 0)` past a shallower chain; a
+        padding slot reads itself alone. A cached call's attention places them after the row's cache
+        (`fork_runs`)."""
         segments = jnp.asarray(segments, jnp.int32)
         batch, length = segments.shape
         first, end = self.spans(segments)
@@ -321,6 +323,8 @@ class Forks:
         # Each token's document's ancestors `[B, S, depth]`, nearest first.
         chain = jnp.take_along_axis(self.ancestors(), number[:, :, None], axis=1)
         level = jnp.sum(chain > 0, axis=-1)
+        reached = slots + 1 if reach is None else jnp.clip(
+            jnp.asarray(reach, jnp.int32), slots + 1, jnp.take_along_axis(end, number, axis=1))
         runs = []
         for index in range(self.depth + 1):
             # Run `index` is the ancestor `level - index` above the token's document, its own at `level`.
@@ -331,7 +335,7 @@ class Forks:
             hi = jnp.take_along_axis(end, jnp.maximum(ancestor - 1, 0), axis=1)
             own = distance == 0
             lo = jnp.where(own, jnp.take_along_axis(first, number, axis=1), lo)
-            hi = jnp.where(own, slots + 1, hi)
+            hi = jnp.where(own, reached, hi)
             kept = (distance >= 0) & (segments > 0)
             pad = segments == 0
             lo = jnp.where(kept, lo, jnp.where(pad & (index == 0), slots, 0))
@@ -837,8 +841,9 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     `token_scores` refuses depths with blocks. With `predecessors` (`Coordinates.predecessors`, at
     `depth` 0, where its rows carry forks or a tail of finals), each target is its own token's, scored from
     its predecessor's state: it counts where it has one and both are real, a document's first token from
-    its parent's last."""
+    its parent's last, and a block's from the predecessor's block."""
     span = depth + 1
+    before = None
     if predecessors is not None:
         if depth or segment_ids is None:
             raise ValueError("a target scored from its predecessor is its own token's, at depth 0 over the "
@@ -856,8 +861,10 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     if role is not None and roles is not None:
         counted = counted & (roles[:, span:] == role)
     if blocks is not None:
-        # The state's block holds the target (`dew.nn.visibility.same_group`, which this module sits below).
-        source = blocks[:, :-span]
+        # The state's block holds the target (`dew.nn.visibility.same_group`, which this module sits below):
+        # the state at the target's predecessor where the rows carry forks.
+        source = (blocks[:, :-span] if before is None
+                  else xp.take_along_axis(xp.asarray(blocks), xp.maximum(before, 0), axis=1))
         counted = counted & ~((source == blocks[:, span:]) & (source >= 0))
     return counted
 

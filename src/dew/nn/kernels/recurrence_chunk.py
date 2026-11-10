@@ -129,8 +129,7 @@ class Chunk(recurrence.Gated):
     last, `[B, Hv, Dk, Dv]`. `entry_key` `[B, D, R, Hk, Dk]`, `entry_value` `[B, D, R, Hv, Dv]` and
     `entry_weight` `[B, D, Hv]`, where given, add `entry_weight sum_r entry_key_r entry_value_r^T` to the
     memory a document enters (Mamba-3's trapezoid: a document's first token writes its parent's last token
-    again at its own weight, `dew.nn.mixers.mamba3.entered_mamba3`); the rated scan without the delta rule
-    (the SSD's state passing, `_rated_scan`) takes none."""
+    again at its own weight, `dew.nn.mixers.mamba3.entered_mamba3`)."""
     query: jax.Array
     key: jax.Array
     value: jax.Array
@@ -197,9 +196,6 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         firsts = forked.firsts
         max_segments = firsts.shape[1]
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
-        if forked is not None and forked.entry is not None:
-            raise ValueError("an entry write (`Chunk.entry_key`) is an unrated decay's (Mamba-3's); a rated "
-                             "scan's state passing (`_rated_scan`) takes none")
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
                                  work, dtype, max_segments=max_segments, forked=forked)
@@ -971,7 +967,9 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     kernels' blocks (`_blocked_rule`) and cut back. Off a GPU its kernels
     interpret, as the CPU suite runs them.
     """
-    _taking_no_table(state, GATED_DELTA.choice, 'fla', PORT_FORKED)
+    if state is not None and state.ndim == 5:
+        # A forked call's table (`Chunk.loads`) handed here, refused as the selector refuses the call.
+        raise KernelRefused(GATED_DELTA.choice, 'fla', PORT_FORKED, iter(()))
     dtype = jnp.result_type(query, key, value)
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
     g = g.astype(jnp.float32)
@@ -991,14 +989,6 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     return manual_map(functools.partial(_blocked_rule, segments=segments, scale=scale, wide=wide),
                       (four, four, four, decays, three, memory, resets, resets),
                       (four, memory))(query, key, value, g, beta, state, starts, firsts)
-
-
-def _taking_no_table(state, choice: str, kernel: str, refusal: Refusal) -> None:
-    """A forked call's table of memories `state` `[B, S', Hv, Dk, Dv]` (`Chunk.loads`) handed to `kernel`
-    of `choice`, which takes no forked call, refused as its selector refuses the call (`refusal`), not by
-    a shape."""
-    if state is not None and state.ndim == 5:
-        raise KernelRefused(choice, kernel, [refusal])
 
 
 def _shard_specs(shape: tuple[int, ...], key_heads: int, decay_ndim: int) -> tuple:
@@ -1215,8 +1205,8 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             documents = aligned = None
             if forked is not None and state is not None:
                 # Each document laid from a chunk's edge, taking its table slot's memory up there.
-                given = _padded(_padded(jnp.swapaxes(state, -1, -2).astype(work), 3, columns), 4, rows)
-                aligned, documents = _ported_documents(given, forked, x.shape[1], chunk_size)
+                aligned, documents = _ported_documents(state, forked, x.shape[1], chunk_size, work,
+                                                       (columns, rows))
                 x, B, C, beta = aligned.laid(x, B, C, beta)
                 carried = rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x)
                 starts = None
@@ -1279,16 +1269,14 @@ def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work
     skip = D[None, None, :, None] * x
     scaled, B, C, a = ssd_operands(x, dt, A, B, C, chunk_size, starts)
 
-    def kernel(x, B, C, a, carried, *documents):
-        return _chunk_scan(x, B, C, a, carried, documents or None, chunk_size, platform, held)
+    def kernel(x, B, C, a, carried, documents):
+        return _chunk_scan(x, B, C, a, carried, documents, chunk_size, platform, held)
 
     # The groups are expanded, so any split of the heads divides them.
     rows, split = grouped_heads(scaled.shape, scaled.shape[2])
     four, state = P(rows, None, split, None), P(rows, split, None, None)
-    extra = () if documents is None else (P(rows, None, split, None, None), P(rows, None), P(rows, None))
-    scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), state, *extra),
-                                (four, state))(scaled, B, C, a, carried,
-                                               *(() if documents is None else documents))
+    specs = (four, four, four, P(rows, None, split), state, _ported_specs(documents, rows, split))
+    scanned, final = manual_map(kernel, specs, (four, state))(scaled, B, C, a, carried, documents)
     return scanned[:, :length] + skip, final
 
 
@@ -1459,13 +1447,12 @@ def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts, documents=Non
     rows, heads = grouped_heads(x.shape, B.shape[2])
     four, carried = P(rows, None, heads, None), P(rows, heads, None, None)
     if documents is not None:
-        def scan_documents(x, dt, A, B, C, D, state, given, loads, stores):
-            return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, (given, loads, stores), chunk_size,
-                                      interpret, held)
+        def scan_documents(x, dt, A, B, C, D, state, documents):
+            return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, documents, chunk_size, interpret, held)
 
         specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), carried,
-                 P(rows, None, heads, None, None), P(rows, None), P(rows, None))
-        return manual_map(scan_documents, specs, (four, carried))(x, dt, A, B, C, D, state, *documents)
+                 _ported_specs(documents, rows, heads))
+        return manual_map(scan_documents, specs, (four, carried))(x, dt, A, B, C, D, state, documents)
 
     def scan(x, dt, A, B, C, D, state, *seq):
         return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), None, chunk_size, interpret, 0)
@@ -1475,13 +1462,31 @@ def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts, documents=Non
     return manual_map(scan, specs[:len(operands)], (four, carried))(*operands)
 
 
-def _ported_documents(given, forked: Forked, length: int, chunk_size: int):
+def _ported_documents(state, forked: Forked, length: int, chunk_size: int, work, widths: tuple[int, int]):
     """A forked call's documents (`forked`, `Chunk.loads`) as the SSD ports take them: laid from chunks'
-    edges (`AlignedDocuments`), and `(given [B, S', H, P, N] float32, loads [B, NC], stores [B, NC])`: the
-    table's given memories, the table slot each chunk takes up (-1 none, zero a zero memory) and the stored
-    slot it leaves its memory in (zero none), `held` stored slots (`forked.held`)."""
+    edges (`AlignedDocuments`), and `(given [B, S', H, P, N] float32, loads [B, NC], stores [B, NC],
+    entries [B, NC, H, P, N] float32 or None)`: the table's given memories (`state` `[B, S', H, N, P]`, the
+    SSD's `[P, N]` transposed), the table slot each chunk takes up (-1 none, zero a zero memory), the stored
+    slot it leaves its memory in (zero none), and each chunk's entry write added to the memory it takes up
+    (`AlignedDocuments.entries`, None where the call gives none), `held` stored slots (`forked.held`); the
+    memories padded with zero columns to the ports' `widths` (`_scan_widths`), heads' then states'."""
     aligned = AlignedDocuments.of(forked, length, chunk_size)
-    return aligned, (given.astype(jnp.float32), aligned.loads, aligned.stores)
+    entries = aligned.entries(forked, transposed=True)
+
+    def wide(memory):
+        return _padded(_padded(memory.astype(work), 3, widths[0]), 4, widths[1]).astype(jnp.float32)
+
+    return aligned, (wide(jnp.swapaxes(state, -1, -2)), aligned.loads, aligned.stores,
+                     None if entries is None else wide(entries))
+
+
+def _ported_specs(documents, rows, heads):
+    """`_ported_documents`' placements on a shard map (`manual_map`): the memories `[B, ., H, P, N]` by
+    rows and heads, the slots `[B, NC]` by rows, None for absent entries or documents."""
+    if documents is None:
+        return None
+    memories = P(rows, None, heads, None, None)
+    return memories, P(rows, None), P(rows, None), None if documents[3] is None else memories
 
 
 @dataclasses.dataclass(frozen=True)

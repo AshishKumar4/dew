@@ -302,9 +302,8 @@ class DewLM(TemplateLM):
             rows.append([*context, *continuation][-(self.max_length + 1):])
         answers: list[tuple[float, bool]] = []
         # A request's options share its context, computed once for them all where the model computes a
-        # shared prefix as each row's own; a prefix run's blocks read a row's context whole, which forks
-        # do not lay out.
-        share = self.task.prefix is None and LMObjective(self.task.model, 1).shares_prefixes()
+        # shared prefix as each row's own, a prefix run's blocks inside it.
+        share = LMObjective(self.task.model, 1).shares_prefixes()
         for batch in _batches(len(rows), self.batch_size):
             inputs, forks = _scoring_inputs(
                 [rows[index] for index in batch],
