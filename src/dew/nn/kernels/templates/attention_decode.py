@@ -186,10 +186,27 @@ def _spec(query: jax.Array, spans: KeySpans, hooks: Hooks, *, scale: float | Non
     return algebra.finished_form(spec)
 
 
+def planned(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
+            scale: float | None = None, table: jax.Array | None = None, sources: jax.Array | None = None,
+            scales: tuple[jax.Array, jax.Array] | None = None
+            ) -> tuple[Plan | None, jax.Array, KeySpans, Hooks]:
+    """A decode step's work list as `attend` takes the step (its operands as `attend`'s): its query rows
+    packed with their spans and initial state (`packed`), the hooks that read them, and the plan its
+    launches run at (`plan`), None where none derives on the GPU. `attend` launches it; a cache's selector
+    asks of the same step's operands whether it derives (`dew.nn.kv_cache._template_tiles`): one planning
+    of one call."""
+    kv_heads = key.shape[2] if table is None else key.shape[0]
+    rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
+    whole = dataclasses.replace(hooks, initial=initial)
+    work = plan(rows, key, value, row_spans, whole, scale=scale, target=generation.gpu_target(), table=table,
+                sources=sources, scales=scales)
+    return work, rows, row_spans, whole
+
+
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None, interpret: bool = False, table: jax.Array | None = None,
-           sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None
-           ) -> jax.Array:
+           sources: jax.Array | None = None, scales: tuple[jax.Array, jax.Array] | None = None,
+           bounds: jax.Array | None = None) -> jax.Array:
     """A decode step's attention through the template: `query` `[B, T, H, D]` over `key` `[B, K, KV, D]` and
     `value` `[B, K, KV, Dv]` (`[R, K, KV, D]` with `sources`, batch row `b` reading key row `sources[b]`;
     or a paged cache's pools `[KV, P, page, D]` and their page table, `table`: each
@@ -202,32 +219,71 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     (`MosaicForward.masked`, row 1978). A quantized cache's keys and values are its codes (int8 or an FP8)
     and `scales` their keys' and values' `[B, KV, K]` fp32 in each row's key order (a dense cache's
     head-major scales, a paged pool's gathered by its table), dequantized in the walk
-    (`attention_mosaic.forward`'s `scales`, ledger 3624)."""
+    (`attention_mosaic.forward`'s `scales`, ledger 3624). `bounds` holds each key's largest value magnitude,
+    head-major as the scales are (`[R, KV, K]`, `[B, KV, K]` with no `sources`, a pool's `[KV, P, page]`): a
+    cache's, which states it as it writes each key, so the call launches the walk its rows need, unscaled
+    unless some row can pass fp32's largest (`algebra.bounded_past`, as a training call's `may_scale`),
+    reading no value to choose it; given none, the call takes each key's from the values it reads, one pass
+    over them (a quantized cache's codes times their scales), where the scaled walk a cache's call takes
+    unchosen (`MosaicForward.cached`) took 2.25 times the unscaled kernel's time (a bf16 step at 8 rows over
+    32768 keys, 64 wide, on an H100: 522 against 232 us, M-ET-61c and M-ET-49b)."""
     hooks = Hooks() if hooks is None else hooks
     if not packable(hooks):
         raise NotImplementedError("the template's decode packs no query-placed hook, parameter, output "
                                   "hook or dropout (`packable`)")
-    heads, kv_heads = query.shape[2], (key.shape[2] if table is None else key.shape[0])
-    rows, row_spans, initial = packed(query, spans, kv_heads, hooks.initial)
-    whole = dataclasses.replace(hooks, initial=initial)
-    target = generation.gpu_target()
-    work = plan(rows, key, value, row_spans, whole, scale=scale, target=target, table=table, sources=sources,
-                scales=scales)
+    heads = query.shape[2]
+    work, rows, row_spans, whole = planned(query, key, value, spans, hooks, scale=scale, table=table,
+                                           sources=sources, scales=scales)
+    initial = whole.initial
     if work is None:
-        raise NotImplementedError(f"the template's decode derives no config on {target}")
+        raise NotImplementedError(f"the template's decode derives no config on {generation.gpu_target()}")
     form = {"scale": scale, "natural": False, "interpret": interpret, "masked": True, "table": table,
             "sources": sources, "subtracted": True, "scales": scales}
-    if work.slices == 1:
-        # A row's walk from the initial state, finished in the query's dtype, no merge past it (its fp32 rows
-        # and their merge took 45 of B128's 820 us at 4096 keys, ET-DECODE6-h100).
+
+    def walked(**chosen) -> jax.Array:
+        # The step's walk, scaled or unscaled as `chosen` names (`attention_mosaic.forward`'s), else a cache
+        # call's own (`MosaicForward.cached`).
+        if work.slices == 1:
+            # A row's walk from the initial state, finished in the query's dtype, no merge past it (its fp32
+            # rows and their merge took 45 of B128's 820 us at 4096 keys, ET-DECODE6-h100).
+            with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
+                out = attention_mosaic.forward(rows, key, value, row_spans, whole, residuals=Kept.NONE,
+                                               **form, **chosen)
+            return ungrouped_rows(out, heads)
+        stateless = dataclasses.replace(hooks, initial=None)
         with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
-            out = attention_mosaic.forward(rows, key, value, row_spans, whole, residuals=Kept.NONE, **form)
-        return ungrouped_rows(out, heads)
-    walked = dataclasses.replace(hooks, initial=None)
-    with tuning.pinned({attention_mosaic.MosaicForward: work.config}):
-        out, maximum, total = attention_mosaic.forward(
-            rows, key, value, row_spans, walked, residuals=Kept.OUTPUT, out_dtype=jnp.float32,
-            splits=work.slices, **form)[:3]
-    merged_rows = algebra.merged_slices(_spec(rows, row_spans, walked, scale=scale), out, maximum, total,
-                                        initial)
-    return ungrouped_rows(merged_rows, heads).astype(query.dtype)
+            out, maximum, total = attention_mosaic.forward(
+                rows, key, value, row_spans, stateless, residuals=Kept.OUTPUT, out_dtype=jnp.float32,
+                splits=work.slices, **form, **chosen)[:3]
+        merged_rows = algebra.merged_slices(_spec(rows, row_spans, stateless, scale=scale), out, maximum,
+                                            total, initial)
+        return ungrouped_rows(merged_rows, heads).astype(query.dtype)
+
+    if not algebra.headroom(query.dtype if scales is not None else value.dtype):
+        return walked()
+    largest = _largest(value, table, sources, scales) if bounds is None else _held(bounds, table, sources)
+    may = algebra.bounded_past(largest, keys_axis=-1, initial=None if initial is None else initial.acc)
+    return jax.lax.cond(may, lambda: walked(scaled=True), lambda: walked(bounded=True))
+
+
+def _held(leaf: jax.Array, table: jax.Array | None, sources: jax.Array | None) -> jax.Array:
+    """Each call row's keys' entries of a head-major per-key `leaf` (`[R, KV, K]`, `[B, KV, K]`, or a pool's
+    `[KV, P, page]`), `[B, KV, K]`, as the row reads its keys: by its source row, or its table's pages. An
+    unwritten key's bound is 0, and a key past a row's span counts too, which only raises its bound."""
+    if table is not None:
+        return jnp.moveaxis(leaf[:, table].reshape(leaf.shape[0], table.shape[0], -1), 0, 1)
+    return leaf if sources is None else leaf[sources]
+
+
+def _largest(value: jax.Array, table: jax.Array | None, sources: jax.Array | None,
+             scales: tuple[jax.Array, jax.Array] | None) -> jax.Array:
+    """Each call row's keys' largest value magnitudes, `[B, KV, K]`, from the values it reads (`attend`'s
+    `value`, by its source rows or its table's pages): a quantized cache's codes' times their scales, which
+    a dense cache holds by its storage rows and a paged call in its rows' key order (`attend`'s `scales`)."""
+    magnitudes = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
+    # A dense cache's `[R, K, KV]` head-major as its leaves are; a pool's `[KV, P, page]` is.
+    largest = _held(magnitudes if table is not None else jnp.moveaxis(magnitudes, 1, 2), table, sources)
+    if scales is None:
+        return largest
+    value_scale = scales[1] if table is not None else _held(scales[1], None, sources)
+    return largest * jnp.abs(value_scale.astype(jnp.float32))

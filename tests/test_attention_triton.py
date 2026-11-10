@@ -734,9 +734,11 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
     `generation_name` on this CPU (tests/kernel_compile.py): the shared bytes it launched with, and its
     model's count of them at the config it traced (`report.traced`), by kernel; none where either launch
     refuses `config`."""
+    import tempfile
+
     import tokamax
     from fla_gdn_support import KernelCase
-    from kernel_compile import KERNEL, UNIQUIFIED, _compiled
+    from kernel_compile import _compiled
 
     from dew.nn.kernels.templates import report
 
@@ -775,28 +777,25 @@ def _staged_launches(generation_name: str, dtype, width: int, hooks: tuple, conf
         return {}
     pins = {attention_triton.TritonForward: config, attention_triton.TritonBackward: backward}
     record: dict = {}
-    with tuning.pinned(pins):
-        found = _compiled(KernelCase("staged", lambda: (call, operands)), generation_name, record)
+    with tempfile.TemporaryDirectory(prefix="dew-staged-") as directory, tuning.pinned(pins):
+        found = _compiled(KernelCase("staged", lambda: (call, operands)), generation_name, record, directory)
     assert found is not None, record
-    thunks, calls = found
     staged = {}
-    for text in thunks:
-        for name, size in KERNEL.findall(text):
-            name = UNIQUIFIED.sub("", name)
-            if name not in calls:
-                continue
-            kernel, digest = report.kernel_of(name)
-            launch = report.traced(digest)
-            if kernel.startswith("attention_forward"):
-                op = attention_triton.TritonForward(score_kinds=score_kinds,
-                                                    scaled=kernel.endswith("_scaled"))
-                staging = op.staging(tokamax.BoundArguments(op, arrays), launch.config, target)
-            else:
-                op = attention_triton.TritonBackward(score_kinds=score_kinds)
-                counted = (attention_triton._dq_staging if kernel == "attention_dq"
-                           else attention_triton._dkv_staging)
-                staging = counted(tokamax.BoundArguments(op, arrays), launch.config, target, score_kinds)
-            staged[kernel] = (int(size), staging)
+    # Each template launch's kernel and the shared bytes it launches with, as its executable carries them
+    # (`report.binaries`): the launch it names gives its config.
+    for binary in record["binaries"]:
+        if binary["launch"] is None or binary["shared"] is None:
+            continue
+        kernel, launch = binary["kernel"], report.traced(binary["launch"])
+        if kernel.startswith("attention_forward"):
+            op = attention_triton.TritonForward(score_kinds=score_kinds, scaled=kernel.endswith("_scaled"))
+            staging = op.staging(tokamax.BoundArguments(op, arrays), launch.config, target)
+        else:
+            op = attention_triton.TritonBackward(score_kinds=score_kinds)
+            counted = (attention_triton._dq_staging if kernel == "attention_dq"
+                       else attention_triton._dkv_staging)
+            staging = counted(tokamax.BoundArguments(op, arrays), launch.config, target, score_kinds)
+        staged[kernel] = (binary["shared"], staging)
     return staged
 
 

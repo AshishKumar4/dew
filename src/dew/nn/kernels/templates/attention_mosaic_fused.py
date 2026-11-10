@@ -14,6 +14,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    STATISTICS,
     BackwardTiles,
     TileWalk,
     _coords,
@@ -27,13 +28,13 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _tile_scores
-
-STATISTICS = {"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32, "delta": jnp.float32,
-              "key_index": jnp.int32}
-"""A query tile's per-row statistics the fused launch streams beside its queries and output cotangents, in
-`_fused_launch`'s operands' order, and their dtypes: the forward's maxima and denominators, D's anchor and
-its delta, and the anchor keys."""
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _dq_added,
+    _parts_dq,
+    _rescaled_parts,
+    _tile_scores,
+)
 
 
 def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
@@ -58,15 +59,16 @@ def streamed_statistics(family: mosaic.Family, config: BackwardTiles, width: int
 
 
 def stores_typed(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int, *,
-                 grouped: bool, reduced: int) -> bool:
+                 grouped: bool, reduced: int, rounded: bool) -> bool:
     """Whether the fused launch at `config` stores dK and dV in the operands' `dtype` (`_fused_allocations`'
-    `typed`): where no key head is shared (not `grouped`, whose adds sum fp32) and its block holds the typed
-    stage beside its own allocations (the GPU's `shared_limit`, `launch_scope`: on a layout whose stage is
-    held across the walks, beside it, 32 KB at 64 x 64 and width 128 past an H100's 232,448 bytes,
-    fa9dbcf122);
+    `typed`): where its caller takes them rounded there (`rounded`, `MosaicBackward.rounded`: one that sums
+    them across shards first takes them fp32 and rounds once, `attention.gradients`), no key head is shared
+    (not `grouped`, whose adds sum fp32) and its block holds the typed stage beside its own allocations (the
+    GPU's `shared_limit`, `launch_scope`: on a layout whose stage is held across the walks, beside it, 32 KB
+    at 64 x 64 and width 128 past an H100's 232,448 bytes, fa9dbcf122);
     else it stores fp32 and XLA converts them after the launch (11-06: 35 us of a step's glue). `reduced`
     as `streamed_statistics` takes it."""
-    if grouped:
+    if grouped or not rounded:
         return False
     limit = generation.gpu_target().shared_limit
     allocations = _fused_allocations(family, config, width, dtype, stages, typed=True, reduced=reduced)
@@ -171,23 +173,18 @@ def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumul
     exponents, dV's then dK's), dV's and dK's accumulators taken to the new scale before their parts'
     products issue into them, and the tile's dQ, both cotangent parts times the resident keys, taken back by
     its scale (`algebra.running_restored`) before its add."""
-    family, tiles = walk.program.family, walk.program.tiles
+    tiles = walk.program.tiles
     q_slot, do_slot = slots["queries"], slots["douts"]
     (dk_acc, dv_acc), exponents, issued = accumulators, [], []
     for (acc, rhs, first), exponent, left in zip(((dv_acc, do_slot, 0), (dk_acc, q_slot, 2)), carry,
                                                  operands, strict=True):
         exponent, shift, parts = algebra.running_parts(left, exponent)
-        # The accumulator taken to the new scale (`algebra.scaled_by`, a power of two at most 1).
-        acc = family.rescaled_products(acc, lambda value, shift=shift: algebra.scaled_by(value, shift), (),
-                                       rhs, walk.interpret)
-        for offset, part in enumerate(parts):
-            family.staged(part, staged.at[first + offset])
-            acc = family.products(acc, staged.at[first + offset].transpose((1, 0)), rhs)
+        issued.append(_rescaled_parts(walk, acc, shift, rhs, (staged.at[first], staged.at[first + 1]),
+                                      parts))
         exponents.append(exponent)
-        issued.append(acc)
-    shape = (tiles.block_q, k_smem.shape[-1])
-    dq = family.product(staged.at[2], k_smem, shape) + family.product(staged.at[3], k_smem, shape)
-    add_dq(q_first, algebra.running_restored(dq, exponents[1]))
+    dq = _parts_dq(walk, (staged.at[2], staged.at[3]), k_smem, (tiles.block_q, k_smem.shape[-1]),
+                   exponents[1])
+    add_dq(q_first, dq)
     return tuple(exponents), (issued[1], issued[0])
 
 
@@ -312,7 +309,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     # A score hook's warpgroups' scratch, or fp16's running scale's (`staged_parts`).
     reduced = reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1)
     stats_streamed = streamed_statistics(family, program.tiles, width, query.dtype, stages, reduced=reduced)
-    typed = stores_typed(family, program.tiles, width, query.dtype, stages, grouped=grouped, reduced=reduced)
+    typed = stores_typed(family, program.tiles, width, query.dtype, stages, grouped=grouped, reduced=reduced,
+                         rounded=walk.rounded)
     scoped, rings, after = _fused_allocations(family, program.tiles, width, query.dtype, stages,
                                               reduced=reduced, streamed=stats_streamed, typed=typed)
 
@@ -325,6 +323,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         entry, out_type=() if grouped else gradients, grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused", reducing_warpgroups=reduced,
+        registers=walk.registers(dq=False),
         # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
         # and of dQ's (`part_count`); the model's of them it owns (`modelled`): dQ's, dK's, dV's and dP's.
         cost=stated(walk.spec, batch, heads,

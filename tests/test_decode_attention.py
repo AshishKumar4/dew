@@ -268,6 +268,35 @@ SINK_SEEDS = 256
 256 on an H100, either cap."""
 
 
+CUDNN_DECODE_SEEDS = 8
+"""Check 1's declared draws for the cuDNN decode differentiated under deterministic ops (unsized)."""
+
+
+def a_decode_call_naming_cudnn_differentiates_under_deterministic_ops():
+    """A bf16 call of one query over its keys' lengths naming cuDNN, which the decode selector admits under
+    --xla_gpu_deterministic_ops (`attention_kernels.DECODE`: a decode step takes no gradient), differentiated
+    on this GPU under the lane's deterministic ops: its gradients on par (check 1) with the reference path's,
+    its derivative the reference path's (`forward_differentiable`), where XLA's cuDNN attention backward
+    crashed under those ops (`CUDNN_SUPPORTS`)."""
+    lengths = jnp.asarray([512, 300], jnp.int32)
+
+    def gradients(implementation):
+        def attend(query, key, value):
+            out = scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
+                                               implementation=implementation)
+            return out.astype(jnp.float32).sum()
+        return jax.jit(jax.grad(attend, argnums=(0, 1, 2)))
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        return tuple(jax.random.normal(stream, shape, jnp.bfloat16)
+                     for stream, shape in zip(streams, ((2, 1, 8, 64), (2, 512, 8, 64), (2, 512, 8, 64)),
+                                              strict=True))
+
+    assert_as_exact(gradients("cudnn"), gradients("reference"), draw, "cuDNN decode under deterministic ops",
+                    seeds=CUDNN_DECODE_SEEDS)
+
+
 def a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(softcap):
     """A grouped decode step with sinks through Dew's attention (`scaled_dot_product_attention`), the sinks
     an operand of its derivative: on a GPU its gradient and tangent with respect to them are on par with the

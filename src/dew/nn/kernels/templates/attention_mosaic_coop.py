@@ -29,7 +29,12 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _tile_scores
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _parts_dq,
+    _rescaled_parts,
+    _tile_scores,
+)
 
 
 def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
@@ -116,7 +121,6 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
     back by the cotangents' scale (`algebra.running_restored`) before its add."""
     k_smem = resident[0]
     family, tiles, consumers = walk.program.family, walk.program.tiles, walk.consumers
-    dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     operands, own, mine, q_first = _share_scores(walk, share, resident, rows_of, coords_of, whole, index,
                                                  slots, masked=masked, whole_operands=True)
@@ -132,19 +136,13 @@ def _sixteen_step(walk: _Backward, share: int, resident: tuple, exchanged, expon
         for offset, part in enumerate(algebra.parts_at(left, joined[operand])):
             family.staged(part, exchanged.at[2 * operand + offset, :, own])
     exchange.publish()
-    issued = []
-    for operand, (acc, rhs) in enumerate(((dv_acc, do_slot.at[:, mine]), (dk_acc, q_slot.at[:, mine]))):
-        shift = algebra.running_shift(carry[operand], joined[operand])
-        # The accumulator taken to the new scale (`algebra.scaled_by`, a power of two at most 1).
-        acc = family.rescaled_products(acc, lambda value, shift=shift: algebra.scaled_by(value, shift), (),
-                                       rhs, walk.interpret)
-        for offset in range(2):
-            acc = family.products(acc, exchanged.at[2 * operand + offset].transpose((1, 0)), rhs)
-        issued.append(acc)
-    shape = (tiles.block_q, mine.size)
-    dq = (family.product(exchanged.at[2], k_smem.at[:, mine], shape)
-          + family.product(exchanged.at[3], k_smem.at[:, mine], shape))
-    add_dq(q_first, algebra.running_restored(dq, joined[1]))
+    dk_acc, dv_acc = accumulators
+    issued = [_rescaled_parts(walk, acc, algebra.running_shift(carry[operand], joined[operand]), rhs,
+                              (exchanged.at[2 * operand], exchanged.at[2 * operand + 1]))
+              for operand, (acc, rhs) in enumerate(((dv_acc, do_slot.at[:, mine]),
+                                                    (dk_acc, q_slot.at[:, mine])))]
+    add_dq(q_first, _parts_dq(walk, (exchanged.at[2], exchanged.at[3]), k_smem.at[:, mine],
+                              (tiles.block_q, mine.size), joined[1]))
     exchange.release()
     return joined, (issued[1], issued[0])
 
@@ -238,6 +236,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         entry, out_type=(), grid=(heads, keys_padded // block_k, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_shared",
+        registers=walk.registers(dq=False),
         # A score hook's warpgroups reserve their reduction scratch, and fp16's running scale's (`reducing`).
         reducing_warpgroups=reducing(family, consumers, walk.reduces, scaled=staged_parts(query.dtype) > 1),
         # The products this launch issues (`stated`): its `S` recomputed, dP's, dV's, and each part of dK's
