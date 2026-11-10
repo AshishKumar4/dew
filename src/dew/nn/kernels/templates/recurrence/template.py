@@ -97,7 +97,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: mainloop.Tiles, family: mosaic.
 
     def run(q, k, v, g, beta, h0, starts, skip, forked):
         token = mainloop.PLANNED.set(found)
-        tabled = None if forked is None else chunk_forward.ForkedTable(*forked, held)
+        tabled = None if forked is None else chunk_forward.ForkedTable(*forked, held=held)
         try:
             out, final, (inverse, kept) = chunk_forward.kept_forward(
                 q, k, v, g, beta, h0, tiles=tiles, starts=starts, max_segments=max_segments, delta=delta,
@@ -253,7 +253,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
     def tabled(table):
-        return None if table is None else chunk_forward.ForkedTable(*table, held)
+        return None if table is None else chunk_forward.ForkedTable(*table, held=held)
 
     def primal(query, key, value, g, beta, state, starts, firsts, skip, table):
         # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
@@ -313,6 +313,11 @@ def forked_laid(query, key, value, g, beta, given, forked: chunked_launch.Forked
     table = (given.astype(jnp.float32), aligned.loads, aligned.stores,
              None if entries is None else entries.astype(jnp.float32))
     return aligned.laid(query, key, value, g, beta), table, aligned
+
+
+def _laid_shapes(query, key, value, g, beta, given, forked, *, chunk: int) -> tuple:
+    """`forked_laid`'s operands and table alone, the arrays a plan's shapes read."""
+    return forked_laid(query, key, value, g, beta, given, forked, chunk)[:2]
 
 
 def walk_roles(family: mosaic.Family) -> int:
@@ -381,7 +386,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         forked, table, held, max_segments = arguments.get("forked"), None, 0, arguments.get("max_segments")
         if forked is not None:
             # A forked call's walks over its documents laid at the config's chunk, and its table.
-            laid, table = jax.eval_shape(lambda *x: forked_laid(*x, config.chunk)[:2], *given[:6], forked)
+            laid, table = jax.eval_shape(functools.partial(_laid_shapes, chunk=config.chunk), *given[:6],
+                                         forked)
             shapes, held, max_segments = (*laid, None, None), forked.held, None
         return _planned(shapes, config, family, target, max_segments, delta, bool(fast),
                         arguments.get("rounded", False), arguments.get("wide", False),

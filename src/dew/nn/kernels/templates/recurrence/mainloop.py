@@ -49,6 +49,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -1856,10 +1857,10 @@ class Returning:
     (`returned`, read back by the walk, `Family.kept`), the walk before it carrying none."""
 
     slots: Slots
-    loads: object
-    stores: object
-    taken: object
-    returned: object
+    loads: Any
+    stores: Any
+    taken: Any
+    returned: Any
     row: jax.Array
     count: int
     held: int
@@ -1936,6 +1937,18 @@ def table_landing(call: Call, keeps: bool, bv: int) -> dict:
     return {"table": ((call.block, bv), jnp.float32)} if keeps else {}
 
 
+def _tabled(stepped, table) -> Callable:
+    """A walk's step `stepped` between its role's `table`'s reads and writes (`Taking`, `Returning`), the
+    table opened as the walk begins."""
+    table.opened()
+
+    def step(n, slots, carry, accumulators, *loaded):
+        carry, accumulators = stepped(n, slots, table.before(n, carry), accumulators, *loaded)
+        return table.after(n, carry), accumulators
+
+    return step
+
+
 def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step, start,
                   count, kept, written, out, bv: int, *, landing, prefetch: Callable | None = None,
                   walkers: int = 1, producer: int | None = None, table: Callable | None = None) -> None:
@@ -1961,15 +1974,7 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
         mosaic.per_role(wg, walkers, walk)
 
     def walk(role, wg):
-        role_step = step(role)
-        if table is not None:
-            tabled, stepped = table(role), role_step
-            tabled.opened()
-
-            def role_step(n, slots, state, accumulators, *loaded):
-                state, accumulators = stepped(n, slots, tabled.before(n, state), accumulators, *loaded)
-                return tabled.after(n, state), accumulators
-
+        role_step = step(role) if table is None else _tabled(step(role), table(role))
         walked_step = role_step
         if (fetch := prefetch) is not None:
             last = start + count - 1
@@ -2257,7 +2262,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                 gated, decay, held.dtype, issue, last=separate)
             return state, accumulators
 
-        def taking(role):
+        def taking(table: Table, role):
             slots = Slots(call, h, walked + role * bv, bv)
             return Taking.of(table, table_refs, stored_ref, slots, row, roled(role)[1].get("table"))
 
@@ -2267,7 +2272,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                                                    pl.ds(walked + role * bv, bv)], bv,
                       prefetch=None if call.per_key else prefetch,
                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer,
-                      table=None if table is None else taking)
+                      table=None if table is None else functools.partial(taking, table))
 
     out_type, blocks, initials, staging, landing, after, work = _states_launch(
         call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected, table)
@@ -2452,7 +2457,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                                     held.dtype, issue, last=separate)
             return state, accumulators
 
-        def taking(role):
+        def taking(table: Table, role):
             slots = Slots(call, h, walked + role * bv, bv)
             return Taking.of(table, table_refs, stored[0] if stored else None, slots, row,
                              roled(role)[1].get("table"))
@@ -2462,7 +2467,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
                       prefetch=prefetch, landing=lambda role: roled(role)[1].get("final"), walkers=walkers,
-                      table=None if table is None else taking)
+                      table=None if table is None else functools.partial(taking, table))
 
     blocks, initials, staging, landing, after, work, out_type = _scan_launched(
         call, tiles, out_dtype, steps=call.chunks / sequences.shape[0], rows=batch * call.heads * width)

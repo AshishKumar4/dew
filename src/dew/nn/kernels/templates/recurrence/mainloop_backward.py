@@ -521,8 +521,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                 *refs, streams, staging, landing):
         skip_ref, refs = (refs[0], refs[1:]) if skips else (None, refs)
         entered_ref, refs = (refs[0], refs[1:]) if call.per_key else (None, refs)
-        table_refs, refs = (refs[:2], refs[2:]) if table is not None else ((), refs)
-        refs, returned_refs = (refs[:-returns], refs[-returns:]) if returns else (refs, ())
+        table_refs, refs = refs[:2 * (table is not None)], refs[2 * (table is not None):]
+        refs, returned_refs = refs[:len(refs) - returns], refs[len(refs) - returns:]
         dh_ref, dv_ref, dh0_ref, *gated_ref = refs
         j, s, h = at["blocks"], at["sequences"], at["heads"]
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
@@ -578,9 +578,9 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                         smem=lands["corrected"], wait=False)
             return grad, accumulators
 
-        def returning(role):
+        def returning(table: Table, role):
             taken_ref, *returned = returned_refs
-            return Returning(Slots(call, h, walked + role * bv, bv), *table_refs, taken_ref,
+            return Returning(Slots(call, h, walked + role * bv, bv), table_refs[0], table_refs[1], taken_ref,
                              returned[0] if returned else None, row, table.count, table.held, chunks,
                              roled(role)[1]["table"])
 
@@ -589,7 +589,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                       lambda role, i: dh0_ref.at[pl.ds(memory(row, i), call.block),
                                                  pl.ds(walked + role * bv, bv)], bv,
                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer,
-                      table=None if table is None else returning)
+                      table=None if table is None else functools.partial(returning, table))
 
     out_type, blocks, finals = _reverse_launched(call, batch, bv, walked_width, gates=gates, skips=skips)
     out_type = (*out_type, *(() if table is None else table_returned(call, table, batch)))

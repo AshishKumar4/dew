@@ -1017,6 +1017,7 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
     P = jax.sharding.PartitionSpec
+    walked = ()
     if forked is not None:
         # The documents' slots a row's, and the entry write's key, value and weight its terms' heads.
         memory = P(four[0], None, four[2], None, None)
@@ -1026,7 +1027,7 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None),
                 *(() if forked is None else forked.walked))
     specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None),
-             *(() if forked is None else walked))
+             *walked)
 
     def local(query, key, value, g, beta, *given):
         given = iter(given)

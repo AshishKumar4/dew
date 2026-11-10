@@ -448,6 +448,14 @@ def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
     return [(piece, view.at[..., pl.ds(first, width)]) for first, piece in column_chunks(value, width)]
 
 
+def _fenced(ctx) -> None:
+    """An inline body (`plgpu.inline_mgpu`) ordering the thread's global writes the async proxy made (TMA's)
+    before its generic loads (PTX's `fence.proxy.async.global`); it returns nothing, an inline body's
+    results its returned values alone."""
+    del ctx
+    nvvm.fence_proxy(nvvm.ProxyKind.async_global)
+
+
 def stored(parts, views, *, smem, wait: bool = True) -> None:
     """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, a
     chunk of its columns at a time where `smem` is narrower (`chunked`), the buffer reused once its copy
@@ -2157,14 +2165,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # TMA wrote them in the async proxy; the threads' loads read in the generic one (PTX's proxy fence).
         if interpret:
             return
-
-        @plgpu.inline_mgpu()
-        def fenced(ctx) -> None:
-            # Its op unreturned: an inline body returns its results alone.
-            del ctx
-            nvvm.fence_proxy(nvvm.ProxyKind.async_global)
-
-        fenced()
+        plgpu.inline_mgpu()(_fenced)()
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         if interpret:
