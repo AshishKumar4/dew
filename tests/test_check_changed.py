@@ -164,7 +164,8 @@ def test_a_changed_type_check_reads_the_heads_files_under_every_root_its_gate_re
         else f"{line}\n" for line in lines))
     git(root, "commit", "-qam", "the type gate stood in for, its inputs as the real gate's")
     (root / "src/dew/fit.py").write_text("search: int = 'TYPE_ERROR'\n")
-    (root / "src/_dew_torch/fit.py").write_text("search: int = 1\n")
+    # A name holding a space, as git names it, is one file to the checker.
+    (root / "src/_dew_torch/fit search.py").write_text("search: int = 1\n")
     git(root, "add", "-A")
     git(root, "commit", "-qm", "a head whose src/dew file is a type error")
     assert check(root, "--changed", "pyright").returncode == 1
@@ -173,7 +174,8 @@ def test_a_changed_type_check_reads_the_heads_files_under_every_root_its_gate_re
     (root / "typecheck.log").unlink()
     assert check(root, "--changed", "pyright").returncode == 0
     # It read the head's files under both inputs, never an input whole in their place.
-    assert sorted((root / "typecheck.log").read_text().split()) == ["src/_dew_torch/fit.py", "src/dew/fit.py"]
+    assert sorted((root / "typecheck.log").read_text().splitlines()) == [
+        "src/_dew_torch/fit search.py", "src/dew/fit.py"]
     (root / "typecheck.log").unlink()
     assert check(root, "--gate", "pyright").returncode == 0
-    assert (root / "typecheck.log").read_text().split() == ["src/dew", "src/_dew_torch"]
+    assert (root / "typecheck.log").read_text().splitlines() == ["src/dew", "src/_dew_torch"]
