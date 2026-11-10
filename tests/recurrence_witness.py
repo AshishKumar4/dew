@@ -641,7 +641,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                 delta=delta, rounded=rounded, family=family, keeps=not walked,
                 interpret=generation.backend() != "gpu"))(*x)
 
-        kept_o, kept_final, (a, (w, h, c)) = kept(*operands)
+        kept_o, kept_final, (a, (w, h, c, _)) = kept(*operands)
         for native, own in ((o, kept_o), (final, kept_final)):
             assert np.array_equal(np.asarray(native).view(np.uint8), np.asarray(own).view(np.uint8)), \
                 "the certify build is the production program"
