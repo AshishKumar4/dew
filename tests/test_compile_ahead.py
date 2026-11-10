@@ -623,14 +623,15 @@ def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus
             ("grouped_matmul", "mosaic")} <= kernels, kernels
 
 
-@pytest.mark.parametrize("implementation", ["auto", "template"])
+@pytest.mark.parametrize("implementation", ["auto", "template", "triton"])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs(generation,
                                                                                     implementation):
     """A training step compiled ahead for a compile-only GPU of `generation` on this host, which has no GPU
     attached: its attention the route the GPU takes ('auto': FlashAttention where the cell declares it, its
-    FFI targets lowered for the target the wheel is told, `attention_kernels.flash_target`; the template
-    where named), so no kernel lowers in another's place (`AheadOfTime.substituted`, row 4616: every
+    FFI targets lowered for the target the wheel is told, `attention_kernels.flash_target`; the template or
+    tokamax's Triton kernel where named, the latter's check of this host's device set aside,
+    `generation.assumed`), so no kernel lowers in another's place (`AheadOfTime.substituted`, row 4616: every
     compile ahead's attention ran as XLA's, and each GPU job compiled its own step at run time)."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 

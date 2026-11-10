@@ -644,13 +644,13 @@ def _hosted(kernel: str) -> str:
     (`flash_lowered`: on its own GPU, or for an assumed GPU's compile-only devices on any host holding the
     wheel, a GPU of the target's or none: a step compiled ahead for an H100 on an H100 ran XLA's attention,
     its fp32 scores 4.3 GB the run's step never holds, row 3792; on a CPU every compile ahead did, row 4616),
-    cuDNN's or tokamax's Triton kernel where this
-    process places the call on its own GPU (`gpu_placed`), else jax.nn's xla attention, as a step traced for
-    an assumed GPU on a CPU lowers; Dew's own Pallas kernels lower for the target on any host. The route
-    reports a substitution (`Route.ran`), which a compile ahead names (`dew.training.ahead.substituted`)."""
+    cuDNN's where this process places the call on its own GPU (`gpu_placed`), else jax.nn's xla attention, as
+    a step traced for an assumed GPU on a CPU lowers; Dew's own Pallas kernels and tokamax's Triton kernel
+    (`generation.assumed`'s cross-compile) lower for the target on any host. The route reports a
+    substitution (`Route.ran`), which a compile ahead names (`dew.training.ahead.substituted`)."""
     if kernel == 'flash':
         return kernel if flash_lowered() else 'xla'
-    return 'xla' if kernel in ('cudnn', 'triton') and not gpu_placed() else kernel
+    return 'xla' if kernel == 'cudnn' and not gpu_placed() else kernel
 
 
 ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
