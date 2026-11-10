@@ -171,6 +171,19 @@ def pytest_runtest_makereport(item, call):
         gate.BELOW.clear()
         outcome.get_result().user_properties.append(below)
         item.user_properties.append(below)
+    # A test of a process that computes as a user's does (`lane_environment.USERS_ARITHMETIC`, set for
+    # tests/test_users_process.py's children) reports the arithmetic it ran in, the JUnit property
+    # `users_arithmetic`: whether its programs trace wide, its default matmul precision and its devices.
+    precision = sys.modules.get("dew.nn.precision")
+    users = os.environ.get(lane_environment.USERS_ARITHMETIC) == "1"
+    if call.when == "call" and users and precision is not None:
+        import jax
+
+        computed = ("users_arithmetic", json.dumps({
+            "wide_cpu_arithmetic": precision.wide_cpu_arithmetic(),
+            "matmul_precision": jax.config.jax_default_matmul_precision, "devices": jax.device_count()}))
+        outcome.get_result().user_properties.append(computed)
+        item.user_properties.append(computed)
 
 
 def pytest_sessionfinish(session, exitstatus):
