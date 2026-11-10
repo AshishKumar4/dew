@@ -21,14 +21,15 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import compile_evidence
 import jax
 import jax.experimental.topologies as topologies
+import jax.numpy as jnp
 import numpy as np
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -474,6 +475,30 @@ compiled. jaxlib registers the pass once a process and assembles every later ker
 (custom_call.cc's GetPassPipeline; an sm_90a kernel after an sm80 one fails in ptxas, 'SM version
 specified by .target is higher than default SM version assumed', and an sm80 kernel after an sm90 one is
 assembled for sm90). Production compiles for one GPU a process; the gates compile for several."""
+
+
+def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
+                     needs: Callable[[Any, Any], bool] | None = None) -> tuple[str, ...]:
+    """The generations a compile gate's cells take for a template's launches of `dtype` (its launch's
+    `stated`, `scoped` and `tpu`, as it asks `bundles.of`): one for each CUDA architecture Dew names a device
+    of whose bundles serve the launch (`bundles.of` not None), the earliest named, so its register and
+    residency models are held to ptxas on every family its launches run on (each architecture's
+    multiprocessor and issuers, `generation.architecture`), never on a typed list (a recurrence gate of
+    sm80 and sm90 alone left seven sm100 residency undercounts unseen). `needs(family, architecture)` is the
+    typed fact a cell that is one family's by nature needs of it (an issuer, an instruction); every family's
+    where None."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import bundles
+
+    found: list[tuple[Any, str]] = []
+    for name in sorted((name for name in generation.TARGETS if capability(name) is not None), key=capability):
+        architecture = generation.architecture(name)
+        family = bundles.of(name, dtype, stated=stated, scoped=scoped, tpu=tpu)
+        if family is None or any(architecture == seen for seen, _ in found):
+            continue
+        if needs is None or needs(family, architecture):
+            found.append((architecture, name))
+    return tuple(name for _, name in found)
 
 
 def compile_mosaic_kernels(cases, generation: str, *, least: bool = False) -> list[dict]:
