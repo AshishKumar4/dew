@@ -159,12 +159,12 @@ def intra_rows(q, k, g, beta, *, scale: float, g_lo, chunk: int = 64, spans: Seq
 
 
 def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chunk: int, aligned: bool,
-                        exact: bool, solve):
+                        exact: bool):
     """fla's `chunk_kda_fwd_kernel_inter_solve_fused` (chunk_intra.py:43-391), safe_gate off, from the
     rows `intra_rows` computed, for one chunk of one head in 16-row blocks: `Aqk` stored in the keys'
     dtype, and `I + Akk`'s diagonal blocks inverted by forward substitution and merged in fla's
     order, `X_IJ = -(X_II A_IJ) X_JJ` for neighbours and `-X_II (sum_M A_IM X_MJ)` beyond, at the
-    call's solve precision (`fla_gdn._dot`'s `solve`), the inverse stored in the keys' dtype; both
+    precision fla's are (`fla_gdn._dot`), the inverse stored in the keys' dtype; both
     zero above the diagonal. A chunk's rows past its end are none of them stored."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
@@ -184,7 +184,7 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
             for j in range(count):
                 store(aqk_ref, i, j, part(aqkd_ref, i, j) if j <= i else zero)
         kks = {(i, j): part(akkd_ref, i, j) for i in range(count) for j in range(i + 1)}
-        inverse = algebra.inverted(kks, lambda name, a, b: _dot(a, b, exact=exact, solve=solve),
+        inverse = algebra.inverted(kks, lambda name, a, b: _dot(a, b, exact=exact),
                                    neighbours_first=True)
         for i in range(count):
             for j in range(count):
@@ -212,7 +212,7 @@ class IntraSolve(_Launch):
         shape = jax.ShapeDtypeStruct((tokens, value_heads, chunk), aqk.dtype)
         found = launches.pallas_call(
             functools.partial(_intra_solve_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
-                              exact=interpret, solve=aqk.dtype),
+                              exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
             in_specs=[_CHUNK, headed(chunk), headed(chunk)],
             out_specs=[headed(chunk), headed(chunk)], out_shape=[shape, shape],
@@ -692,7 +692,7 @@ class _SubChunk:
         return algebra.between(later, earlier)
 
     def solved(self, left_operand, right_operand):
-        return _dot(left_operand, right_operand, exact=self.exact, solve=self.refs["k"].dtype)
+        return _dot(left_operand, right_operand, exact=self.exact)
 
     def earlier(self, j):
         """Sub-chunk `j`'s keys decayed to this one's first row, `k_t exp2(g_first - g_t)`."""

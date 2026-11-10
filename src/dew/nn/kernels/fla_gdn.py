@@ -53,6 +53,7 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
+from dew.nn.kernels.templates.product import Product, interpreted
 
 RCP_LN2 = 1 / math.log(2)
 """1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
@@ -86,49 +87,30 @@ def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, b
         write_rows(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
 
 
-def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = None):
-    """`a @ b`, same-dtype operands, with fp32 accumulation; reject mismatches before any interpret-mode
-    widening, so CPU tests catch dots Triton rejects. Exact interpretation widens bf16/fp16 inputs
-    for CPUs without narrow-input/fp32-accumulating dots.
-
-    Each operand dtype names its products, so no global `jax_default_matmul_precision` changes the
-    kernel (the suite's 'highest' made every fp32 product IEEE):
+def _dot(a, b, *, exact: bool, ieee: bool = False):
+    """`a @ b`, same-dtype operands, with fp32 accumulation, at fla's own precision; reject mismatches
+    before any interpreted product, so CPU tests catch dots Triton rejects. Each operand dtype names its
+    products, so no global `jax_default_matmul_precision` changes the kernel (the suite's 'highest' made
+    every fp32 product IEEE):
     - bf16 or fp16: exact products summed in fp32 (fla's `tl.dot` of narrow operands); no precision.
     - fp32 with `ieee`: IEEE products, fla's `allow_tf32=False` dots (`recompute_w_u`'s `A @ v`).
-    - fp32 otherwise: BF16x6 (`DotAlgorithmPreset.BF16_BF16_F32_X6`), six bf16 products, an fp32
-      product's accuracy where fla's own dots take one TF32 (Triton's default `input_precision` for fp32,
-      and `SOLVE_TRIL_DOT_PRECISION`, chunk_fwd.py:21). TF32x3 drops the low parts' product: an
-      A100 gave (1 + 2^-11)^2 as 1.0009765625, its fp32 1.0009768 (SE-dbg-kda-dot-redgreen-3f3c64bb2),
-      which put Kimi delta attention's fp32 rule past check 1 against fla's recorded torch. jax 0.11's
-      Pallas lowers `Precision.HIGH` as plain TF32 (pallas/triton/lowering.py `_TF32_PRECISIONS`), so
-      the preset is named. IEEE there lowers on sm80 to FMA loops ptxas took 3.5 to over 15 minutes to
-      compile for the WY backward; the presets compile in seconds.
-    - fp32 with `solve`, the call's dtype, at the solves' products of fp32 intermediates (the kkt and
-      KDA sub-chunk merges and products, fla's SOLVE_TRIL_DOT_PRECISION): BF16x6 in an fp32 call,
-      where one TF32 put a Kimi linear layer's logits 100 times the reference's distance from
-      float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
-      and where an fp32 product's three-part form cost Kimi Linear's bf16 layer 17% on an H100 and 19%
-      on an A100.
-    - interpreted (`exact`): an fp32 product summed in float64 and rounded once, as the interpreted
-      template's (`product.interpreted`) and the portable math's on a CPU (`precision.accumulated`), where
-      XLA's CPU dot picks its fp32 accumulation by shape: it put 20 of the stability suite's port arms 1.5 to
-      2.7 times the portable math's distance from float64 (row 2321); a narrow one's exact products summed
-      in fp32."""
+    - fp32 otherwise: one TF32, fla's, its `tl.dot`'s default `input_precision` for fp32 and its
+      `SOLVE_TRIL_DOT_PRECISION` on a GPU that runs TF32 (fla 0.5.2 gated_delta_rule/chunk_fwd.py), held
+      to fla's own kernels (the recurrence matrix's upstream oracle). An fp32 call took BF16x6 here, an
+      fp32 product's accuracy fla's dots do not take.
+    - interpreted (`exact`): the product as the interpreted template issues it (`product.interpreted`):
+      an IEEE one summed in float64 and rounded once, every other one as Dew sums an fp32 contraction
+      (`precision.accumulated`), its products exact; XLA's CPU dot, which picks its fp32 accumulation by
+      shape, put the stability suite's port arms 1.5 to 2.7 times the portable math's distance from
+      float64 (row 2321), and 1.5 to 2.3 times on the delta rule's and the gated net's sites in a user's
+      process at 4c884d57b89 (jsf-a3-dot)."""
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
-    wide = jnp.dtype(a.dtype) == jnp.float32
-    if exact and wide:
-        with jax.enable_x64(new_val=True):
-            return jnp.dot(a.astype(jnp.float64), b.astype(jnp.float64)).astype(jnp.float32)
     if exact:
-        a, b = a.astype(jnp.float32), b.astype(jnp.float32)
-        precision = None
-    elif wide:
-        narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
-        precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
-                     else jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6)
-    else:
-        precision = None
+        product = Product(jnp.dtype(a.dtype), promoted=ieee, refusal=None)
+        return interpreted(product, a, b, (((a.ndim - 1,), (0,)), ((), ())))
+    wide = jnp.dtype(a.dtype) == jnp.float32
+    precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT) if wide else None
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
@@ -166,8 +148,7 @@ def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chu
         return part(k_ref, i, pl.ds(c * bk, bk))
 
     def issue(name, a, b):
-        # The keys' products at the call's precision, the merges at its solve precision (`_dot`).
-        return _dot(a, b, exact=exact, solve=k_ref.dtype if name == "merge" else None)
+        return _dot(a, b, exact=exact)
 
     def decay(i, j):
         """The pairs' decays of sub-chunks `i` and `j` (`_paired`)."""
