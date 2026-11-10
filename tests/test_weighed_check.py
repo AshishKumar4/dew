@@ -13,8 +13,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import widened
 from reference_error import GateFailure, Inconclusive, assert_as_exact, null_rate_bound, null_runs
 from rounding_bound import rounding_scale
+
+from dew import parity
 
 ROWS, HALF = 1, 16
 
@@ -144,6 +147,37 @@ def test_the_weighed_check_passes_the_reference_against_its_reformulation():
     reds = sum(verdict != "pass, conditioned" for verdict in weighed)
     assert reds == 0, (reds, null_rate_bound(reds, len(weighed)), verdicts)
     assert len(weighed) >= WEIGHED_DECIDED, (len(weighed), verdicts)
+
+
+def judged_on_its_own(dew, label: str) -> None:
+    """dew.parity's `judge` of `dew` against the reference weighed, as a caller of its own draws (the
+    library's load-time check) runs it: each draw's two arms, its float64 truth and its inputs, the
+    reference's heavy elements over the declared seeds' first draws and its rounding scale at each."""
+    ours, theirs = jax.jit(dew), jax.jit(reference)
+
+    def truth(inputs):
+        with jax.enable_x64(new_val=True):
+            return jax.device_get(reference(*widened(inputs)))
+
+    def drawn(seed):
+        inputs = draw(seed)
+        return jax.device_get(ours(*inputs)), jax.device_get(theirs(*inputs)), truth(inputs), inputs
+
+    heavy = parity.heavy_masks((jax.device_get(theirs(*draw(seed))), truth(draw(seed)))
+                               for seed in range(CONDITIONED_SEEDS))
+    conditioning = parity.Conditioning(lambda inputs, seed: rounding_scale(reference, *inputs, seed=seed)[1],
+                                       heavy)
+    parity.judge(drawn, CONDITIONED_SEEDS, label, conditioning=conditioning)
+
+
+def test_the_librarys_judge_weighs_its_arms_as_the_suite_does():
+    """dew.parity's `judge` with a conditioning decides alike: the reformulated arm passes, and the biased
+    product, which the unweighted check leaves undecided, fails decided on its light elements."""
+    judged_on_its_own(reformulated, "the products swapped, judged on its own")
+    with pytest.raises(GateFailure) as raised:
+        judged_on_its_own(biased, "a biased product, judged on its own")
+    assert not isinstance(raised.value, Inconclusive)
+    assert any("['light']" in finding.leaf for finding in raised.value.findings)
 
 
 def test_a_rounding_reaches_an_element_its_first_derivative_does_not():
