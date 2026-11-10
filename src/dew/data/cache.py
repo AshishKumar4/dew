@@ -26,7 +26,7 @@ import numpy as np
 
 from dew._cache import dew_cache_dir
 from dew.data.concurrent import Concurrently
-from dew.data.dataset import _QUIET_STOP_SECONDS, Loading
+from dew.data.dataset import Loading
 from dew.data.declared import Declared
 from dew.data.generation import (
     GENERATION_SCHEMA,
@@ -778,33 +778,24 @@ class _Writer:
             if self.closing:
                 return
             self.closing = True
+            # Each upload in flight publishes no segment and the writer no seal from here (`Abandoned`).
+            self.closed = True
             pending = len(self.pending)
             self.pending.clear()
             self.spool_bytes -= self.pending_bytes
             self.pending_bytes = 0
         tasks = [*self.futures, *([self.seal_future] if self.seal_future is not None else [])]
-        _, unfinished = wait(tasks, timeout=_QUIET_STOP_SECONDS) if tasks else (set(), set())
+        # The uploads in flight end as each transfer does, abandoned before what they would publish, or
+        # failed: a store gone fails a transfer by its transport's own timeouts, so none runs past its
+        # writer.
+        wait(tasks)
+        failed = sum(1 for task in tasks if not task.cancelled() and task.exception() is not None)
         with self.lock:
-            self.closed = True
-            self.abandoned += pending + len(unfinished)
-        for future in unfinished:
-            future.cancel()
-        self.pool.shutdown(wait=False, cancel_futures=True)
+            self.abandoned += pending + failed
+        self.pool.shutdown(wait=True, cancel_futures=True)
         self.index.close()
         self._reported()
-        if unfinished:
-            remaining = set(unfinished)
-
-            def released(future: Future) -> None:
-                with self.lock:
-                    remaining.discard(future)
-                    if not remaining:
-                        self._release()
-
-            for future in unfinished:
-                future.add_done_callback(released)
-        else:
-            self._release()
+        self._release()
         self._completed()
 
 

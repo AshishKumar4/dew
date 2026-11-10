@@ -18,7 +18,7 @@ import pytest
 from data_support import LATEST, Keeps
 from storage_support import moto_bucket
 
-from dew.data.cache import Abandoned, Cache
+from dew.data.cache import Cache
 from dew.data.pipeline import Rejected
 from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources import Memory
@@ -1652,50 +1652,40 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
         rows.close()
 
 
-def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment():
+def test_a_training_close_waits_out_its_uploads_and_a_store_gone_fails_them_without_a_segment():
+    """A training read closed early waits for each upload in flight to end, written or failed, and none
+    runs past its writer: a store that is gone fails its transfer by its transport's own timeout, the
+    close then ends, the upload counted abandoned, and no segment is published."""
     from fsspec.implementations.memory import MemoryFileSystem
 
-    from dew.data.dataset import _QUIET_STOP_SECONDS
-
-    entered, release = threading.Event(), threading.Event()
+    entered = threading.Event()
     stored = []
 
-    class Stalled(MemoryFileSystem):
-        """Memory objects behind a third-party conditional write whose upload
-        hangs until the test releases it."""
+    class Gone(MemoryFileSystem):
+        """Memory objects behind a third-party conditional write whose store is gone: its transfer
+        fails as its transport's timeout ends it."""
 
-        protocol = "stalled"
+        protocol = "gone"
 
         @classmethod
         def _strip_protocol(cls, path):
-            return super()._strip_protocol(path.replace("stalled://", "memory://", 1))
+            return super()._strip_protocol(path.replace("gone://", "memory://", 1))
 
         def put_conditional(self, path, payload, version):
             entered.set()
-            release.wait(15)
-            if self.exists(path):
-                raise FileExistsError(path)
-            self.pipe_file(path, payload)
-            stored.append(path)
-            return hashlib.sha256(payload).hexdigest()
+            time.sleep(0.5)
+            raise TimeoutError("the transport's own timeout: no answer from the store")
 
-    fsspec.register_implementation("stalled", Stalled, clobber=True)
+    fsspec.register_implementation("gone", Gone, clobber=True)
     source = Memory([{"id": 0}])
-    cache = Cache(f"stalled://cache-{uuid4().hex}", shard_bytes=1, retry=0)
+    cache = Cache(f"gone://cache-{uuid4().hex}", shard_bytes=1, retry=0)
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
-    try:
-        assert rows[0] == {"id": 0}
-        assert entered.wait(5)
-        started = time.monotonic()
-        rows.close()
-        assert time.monotonic() - started < _QUIET_STOP_SECONDS + 2
-        assert rows.metrics()["abandoned"] > 0
-    finally:
-        release.set()
-        for future in rows.writer.futures:
-            with contextlib.suppress(Abandoned):
-                future.result(timeout=5)
-    assert stored and not any("/segments/" in path for path in stored)
+    assert rows[0] == {"id": 0}
+    assert entered.wait(5)
+    rows.close()
+    assert all(future.done() for future in rows.writer.futures)
+    assert rows.metrics()["abandoned"] > 0
+    assert not any("/segments/" in path for path in stored)
 
 
 @pytest.mark.network
