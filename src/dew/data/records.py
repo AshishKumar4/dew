@@ -344,6 +344,83 @@ def _fits(value: JSON, annotation: Annotation) -> bool:
     return value is not None
 
 
+def _entries(value: object, where: str) -> list[JSON]:
+    if not isinstance(value, list):
+        raise ValueError(f"a chain's {where} is a list, not {type(value).__name__}")
+    return [json_value(entry, where) for entry in value]
+
+
+_OMITTED = "omitted at its default"
+
+
+def _reads(read: Callable[[object, str], object], *, omitted: bool = False) -> dict[str, object]:
+    """A layout field's metadata: how it reads back (`read`, given the value and what it is), and whether
+    a record leaves it out at its default."""
+    return {"read": read, _OMITTED: omitted}
+
+
+def _kept(value: object, what: str) -> object:
+    return value
+
+
+@dataclasses.dataclass(frozen=True)
+class _ChainRecord:
+    """A version-1 chain's record, as `_chain` writes it and `_read_chain` reads it: the source (a store, a
+    call of `pipe` with its input, a mix or phases), the chain's name, how it reads, its loading, whether it
+    is elastic (written only where it is) and its stages, in that order."""
+
+    source: Mapping[str, JSON] = dataclasses.field(metadata=_reads(lambda value, what: record(value, what)))
+    name: str | None = dataclasses.field(default=None, metadata=_reads(
+        lambda value, what: None if value is None else str(value)))
+    read: JSON = dataclasses.field(default=None, metadata=_reads(_kept))
+    loading: JSON = dataclasses.field(default=None, metadata=_reads(_kept))
+    elastic: bool = dataclasses.field(default=False, metadata=_reads(boolean, omitted=True))
+    stages: Sequence[JSON] = dataclasses.field(default=(), metadata=_reads(_entries))
+
+
+@dataclasses.dataclass(frozen=True)
+class _MixRecord:
+    """A mixture's record: its corpora's chains, their weights, its token count and its seed (written only
+    where it has one, so a record of an unseeded mix is as it was)."""
+
+    mix: Sequence[JSON] = dataclasses.field(metadata=_reads(_entries))
+    weights: Sequence[float] = dataclasses.field(metadata=_reads(numbers))
+    tokens: JSON = dataclasses.field(default=None, metadata=_reads(_kept))
+    seed: int | None = dataclasses.field(default=None, metadata=_reads(
+        lambda value, what: None if value is None else integer(value, what), omitted=True))
+
+
+@dataclasses.dataclass(frozen=True)
+class _PhasesRecord:
+    """Phases' record: their chains and the steps or tokens each ends at, under the one clock they keep."""
+
+    phases: Sequence[JSON] = dataclasses.field(metadata=_reads(_entries))
+    until_steps: Sequence[JSON] | None = dataclasses.field(default=None,
+                                                           metadata=_reads(_entries, omitted=True))
+    until_tokens: Sequence[JSON] | None = dataclasses.field(default=None,
+                                                            metadata=_reads(_entries, omitted=True))
+
+
+def _laid_out(laid: _ChainRecord | _MixRecord | _PhasesRecord) -> dict[str, JSON]:
+    """`laid` as its record holds it: each of its fields in their declared order, one its layout omits
+    at its default left out there."""
+    return {field.name: typing.cast(JSON, getattr(laid, field.name)) for field in dataclasses.fields(laid)
+            if not (field.metadata[_OMITTED] and getattr(laid, field.name) == field.default)}
+
+
+def _read_laid[Laid: (_ChainRecord, _MixRecord, _PhasesRecord)](
+        layout: type[Laid], written: Mapping[str, object], what: str) -> Laid:
+    """The record `written` as `layout` lays it out (`_laid_out`): each field read as it declares, a field
+    it leaves out its default where it has one."""
+    values = {}
+    for field in dataclasses.fields(layout):
+        if field.name in written:
+            values[field.name] = field.metadata["read"](written[field.name], f"{what} {field.name}")
+        elif field.default is dataclasses.MISSING:
+            raise ValueError(f"a {what}'s record names its {field.name}")
+    return layout(**values)
+
+
 def _chain(pipeline: Pipeline) -> dict[str, JSON]:
     """`pipeline`'s record: each call of `pipe` that made its stages (`Piped`) written as the call
     where making it again from its recorded arguments makes the same stages, the outermost of
@@ -371,14 +448,10 @@ def _chain(pipeline: Pipeline) -> dict[str, JSON]:
         else:
             stages.append(chosen[1])
             index = chosen[0].end
-    return {
-        "source": source,
-        "name": pipeline.name,
-        "read": pipeline.mode,
-        "loading": None if loading is None else _typed(loading, Loading, "loading"),
-        **({"elastic": True} if pipeline._elastic else {}),
-        "stages": stages,
-    }
+    return _laid_out(_ChainRecord(
+        source=source, name=pipeline.name, read=pipeline.mode,
+        loading=None if loading is None else _typed(loading, Loading, "loading"), elastic=pipeline._elastic,
+        stages=stages))
 
 
 def _invocation(entry: Piped, input: Pipeline, pipeline: Pipeline) -> dict[str, JSON] | None:
@@ -434,13 +507,13 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
     if isinstance(source, Mixture):
         tokens = (None if source.tokens is None
                   else _typed(source.tokens, declared_type(Mixture, "tokens"), "a mixture's token count"))
-        # A mix's seed is written only where it has one, so a record of an unseeded mix is as it was.
-        seeded: dict[str, JSON] = {} if source.seed is None else {"seed": source.seed}
-        return {"mix": [_chain(child) for child in source.pipelines], "weights": list(source.weights),
-                "tokens": tokens, **seeded}
+        return _laid_out(_MixRecord([_chain(child) for child in source.pipelines], list(source.weights),
+                                    tokens, source.seed))
     if isinstance(source, Phases):
-        clock = "until_steps" if source.clock == "steps" else "until_tokens"
-        return {"phases": [_chain(child) for child in source.pipelines], clock: list(source.ends)}
+        ends = list(source.ends)
+        return _laid_out(_PhasesRecord([_chain(child) for child in source.pipelines],
+                                       until_steps=ends if source.clock == "steps" else None,
+                                       until_tokens=ends if source.clock == "tokens" else None))
     written = _typed(source, Source, "store")
     if not isinstance(written, dict):
         raise _Unrecordable(f"the store ({type(source).__name__}) is written as no record of its class")
@@ -543,24 +616,20 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
 
 
 def _read_chain(written: Mapping[str, object]) -> Pipeline:
-    chain = record(written, "chain")
-    if "source" not in chain:
-        raise ValueError("a chain's record names its store under \"source\"")
-    source = record(chain["source"], "chain source")
+    chain = _read_laid(_ChainRecord, record(written, "chain"), "chain")
+    source = chain.source
     if "pipe" in source:
         built = _read_call(_read_chain(record(source.get("input"), "a call's input")), source)
     else:
         built = Pipeline(_read_source(source))
-    for written_stage in _entries(chain.get("stages", []), "stages"):
+    for written_stage in chain.stages:
         stage = record(written_stage, "stage")
         built = _read_call(built, stage) if "pipe" in stage else built._then(_read_stage(stage))
-    loading = chain.get("loading")
     return dataclasses.replace(
-        built,
-        name=None if chain.get("name") is None else str(chain["name"]),
-        mode=_read_mode(chain.get("read")),
-        _loading=None if loading is None else from_record(Loading, json_value(loading, "loading")),
-        _elastic=boolean(chain.get("elastic", False), "chain elastic"),
+        built, name=chain.name, mode=_read_mode(chain.read),
+        _loading=(None if chain.loading is None
+                  else from_record(Loading, json_value(chain.loading, "loading"))),
+        _elastic=chain.elastic,
     )
 
 
@@ -585,23 +654,21 @@ def _function(written: object) -> types.FunctionType:
 
 def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
     if "mix" in written:
-        tokens = written.get("tokens")
-        corpora = _entries(written["mix"], "mix")
+        mix = _read_laid(_MixRecord, written, "mix")
         counting = _annotated(declared_type(Mixture, "tokens"))
-        counted = None if tokens is None else from_record(counting, json_value(tokens, "tokens"))
+        counted = None if mix.tokens is None else from_record(counting, json_value(mix.tokens, "tokens"))
         if counted is not None and not _counts(counted):
             raise ValueError("a mixture's token count reads back as no function")
-        seed = written.get("seed")
-        return Mixture(tuple(_read_chain(record(child, "corpus")) for child in corpora),
-                       numbers(written.get("weights"), "weights"), counted,
-                       None if seed is None else integer(seed, "mix seed"))
+        return Mixture(tuple(_read_chain(record(child, "corpus")) for child in mix.mix), mix.weights, counted,
+                       mix.seed)
     if "phases" in written:
-        clock = "until_tokens" if "until_tokens" in written else "until_steps"
-        until = _entries(written.get(clock), clock)
-        phases = _entries(written["phases"], "phases")
-        return Phases(tuple(_read_chain(record(child, "phase")) for child in phases),
-                      tuple(None if end is None else integer(end, clock) for end in until),
-                      "tokens" if clock == "until_tokens" else "steps")
+        phases = _read_laid(_PhasesRecord, written, "phases")
+        clock, until = (("tokens", phases.until_tokens) if phases.until_tokens is not None
+                        else ("steps", phases.until_steps))
+        if until is None:
+            raise ValueError("a phases record names the steps or tokens each phase ends at")
+        return Phases(tuple(_read_chain(record(child, "phase")) for child in phases.phases),
+                      tuple(None if end is None else integer(end, f"until_{clock}") for end in until), clock)
     return from_record(Source, written)
 
 
@@ -614,12 +681,6 @@ def _read_stage(written: Mapping[str, object]) -> Stage:
 
 def _stage(value: Configured) -> TypeGuard[Stage]:
     return isinstance(value, Stage.__value__)
-
-
-def _entries(value: object, where: str) -> list[JSON]:
-    if not isinstance(value, list):
-        raise ValueError(f"a chain's {where} is a list, not {type(value).__name__}")
-    return [json_value(entry, where) for entry in value]
 
 
 def _read_mode(value: object) -> Read | None:
