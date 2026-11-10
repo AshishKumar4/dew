@@ -565,9 +565,10 @@ class Decide(SavedRunTask, InItsForm):
         pinned = [SavedRun.at(directory, step) for directory in runs]
         recorded = [run.record for run in pinned]
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
-        padded = ("questions", "options")
+        # A setting its data derives (its padding, `metadata["derived"]`) may differ between the runs.
         for directory, own in zip(runs, settings, strict=True):
-            differing = [entry.name for entry in fields(DecideSettings) if entry.name not in padded
+            differing = [entry.name for entry in fields(DecideSettings)
+                         if entry.metadata.get("derived") != "data"
                          and getattr(own, entry.name) != getattr(settings[0], entry.name)]
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
