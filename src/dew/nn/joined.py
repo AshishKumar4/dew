@@ -85,11 +85,11 @@ DELTA_GATES_FASTER = ("e5198da4e: a gated delta net's b and a, 24,576 tokens, fo
 """The receipt behind the delta net's gates' joined cells."""
 
 JOINED_FASTER = {
-    ('gate_up', 'sm80'): "dbf402f36: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for "
+    (Choice.GATE_UP, 'sm80'): "dbf402f36: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for "
                          "two 1024 -> 3584 ones, 0.36 ms a layer less on an A100 80GB (forward 1.67 -> 1.54, "
                          "input gradient 1.55 -> 1.49, weight gradient 1.70 -> 1.51 ms); none on an H100",
-    ('delta_gates', 'sm80'): DELTA_GATES_FASTER,
-    ('delta_gates', 'sm90'): DELTA_GATES_FASTER,
+    (Choice.DELTA_GATES, 'sm80'): DELTA_GATES_FASTER,
+    (Choice.DELTA_GATES, 'sm90'): DELTA_GATES_FASTER,
 }
 """Each join's cells, (the join, the device generation it measured faster on) to its receipt: a literal of
 them, which each join's selector reads and thresh's declared-set seam registers (.thresh/thresh.cue)."""
