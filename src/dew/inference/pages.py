@@ -152,6 +152,9 @@ class States:
         """Entries holding a finished request's state at its history's end (`take`'s `transient`): such a
         state takes a free entry or another history's, never a prompt's, and goes to no host slot; a
         prompt that reads it makes it a prefix's."""
+        self.withdrawn: set[int] = set()
+        """History entries a prompt's state took before their owed capture ran (`_vacated`): their capture
+        is not made, the entry the prompt's now (`Server`'s finished captures)."""
         self.spills: list[tuple[int, int]] = []
         """The (entry, host slot) moves owed: an entry giving way, out to its slot."""
         self.uploads: list[tuple[int, int]] = []
@@ -163,7 +166,10 @@ class States:
         return digest in self._by_hash or (digest in self.host and self._vacant())
 
     def _vacant(self) -> bool:
-        return bool(self._free) or any(entry not in self._pinned for entry in self._by_hash.values())
+        """Whether an entry can take a state: a free one, one not kept for the step, or a history's (whose
+        owed capture it withdraws, `_vacated`)."""
+        return bool(self._free) or any(entry not in self._pinned or entry in self._transient
+                                       for entry in self._by_hash.values())
 
     def entry(self, digest: bytes) -> int:
         """The entry holding the state after `digest`'s page, now the most recently used, kept until the
@@ -204,12 +210,16 @@ class States:
         history's."""
         if self._free:
             return self._free.popleft()
-        unkept = [(held, entry) for held, entry in self._by_hash.items() if entry not in self._pinned]
-        histories = [held for held, entry in unkept if entry in self._transient]
-        digest = histories[0] if histories else next(held for held, _ in unkept if not transient)
+        # A history gives way first, even one whose capture is owed, which is then withdrawn.
+        histories = [held for held, entry in self._by_hash.items() if entry in self._transient
+                     and (entry not in self._pinned or not transient)]
+        digest = histories[0] if histories else next(
+            held for held, entry in self._by_hash.items() if entry not in self._pinned and not transient)
         entry = self._by_hash.pop(digest)
         if entry in self._transient:
             self._transient.discard(entry)
+            if entry in self._pinned:
+                self.withdrawn.add(entry)
             return entry
         slot = self.host.kept(digest)
         if slot is not None:
@@ -240,6 +250,7 @@ class States:
         self.host.forget()
         self._pinned.clear()
         self._transient.clear()
+        self.withdrawn.clear()
 
 
 @dataclass

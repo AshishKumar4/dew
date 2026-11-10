@@ -550,6 +550,16 @@ class PagedRows:
                                  prefix_hashes(row.prompt, part.size, pages, row.salt)[-1])
         return None if entry is None else row.group * self.states + entry
 
+    def withdrawn(self) -> set[int]:
+        """The `States` entries, global over the groups, whose finished row's owed capture a prompt's state
+        took before it ran (`States.withdrawn`), each told once."""
+        held = set()
+        for group, part in enumerate(self.pages):
+            if part.states is not None:
+                held.update(group * self.states + entry for entry in part.states.withdrawn)
+                part.states.withdrawn.clear()
+        return held
+
     def reloaded(self) -> None:
         self.weights += 1
         for part in self.pages:
@@ -1209,6 +1219,10 @@ class Server:
             admission = self._admit(pending, max(held["waiting"] for held in said),
                                     max(held["widest"] for held in said),
                                     sorted({name for held in said for name in held["fields"]}))
+            if isinstance(self.rows, PagedRows):
+                # A history whose entry a prompt's state took this seating keeps nothing (`States.withdrawn`).
+                withdrawn = self.rows.withdrawn()
+                self._finished = [(slot, entry) for slot, entry in self._finished if entry not in withdrawn]
             return admission, {"captures": [list(pair) for pair in self._captures],
                                "finished": [list(pair) for pair in self._finished], **self._owed()}
 
