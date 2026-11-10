@@ -9,11 +9,17 @@ of `depth / partials` FMAs and `log2(partials)` adds. Here the contraction is sp
 block a dot of its own (XLA's chain, `block` FMAs long), and the blocks' sums are added as a pairwise
 tree (`log2(blocks)` adds): the block is the longest power of two whose path is no longer than the
 CPU's own vectorized accumulation (`contraction_block`), read from the CPU's vector lanes and its FMA
-latency. Every row sums alike whatever rows share its call, so a row's product is its own: a decode
-step's the prefill's, a packed document's its own row's (its partial sums move `depth / block` outputs'
-bytes: on armada's EPYC, NS4863-PROF2, 0.55-0.67 of XLA's time at 1-16 rows of 1024-4096 deep, 5-11 times
-it at 256 rows; a float64 sum for many rows, cheaper there, made a row's product depend on its batch's
-rows, row 4863's base reds). A product's gradients are products too, each summed
+latency. Its partial sums move `depth / block` outputs' bytes: on armada's EPYC, NS4863-PROF2, 0.55-0.67
+of XLA's time at 1-16 rows of 1024-4096 deep, 5-11 times it at 256 rows.
+
+A product's bits are the host's (testing.md, row 3177: XLA promises no common bits across programs). Each
+block's sum is XLA's dot, whose algorithm XLA picks by the program's shapes and the host's instruction
+level (a vectorized product for a few rows, a YNN library fusion or a plain dot for more), so two programs
+summing one row (the dense, ragged and grouped forms, a call of one row and one of many, a decode step and
+its prefill) agree to the blocked tree's accuracy, held by check 1, and bit for bit only where they are one
+program: one group's products summed by the grouped form and by the dense one differed by 1 to 4 ulp on an
+x86-64-v3 EPYC 7713 and agreed on a v4 EPYC 9684X (the host-level verdicts of 2026-11-10; a fixed order of
+Dew's own, at 4.9 to 23 times XLA's dot, is row 5383's). A product's gradients are products too, each summed
 over its own contraction (`pairwise_dot_general`'s reverse pass). On another platform the product is XLA's own
 (`accumulated`'s `platform_dependent`).
 """
