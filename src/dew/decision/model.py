@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import HOWS
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.inspection import QK
@@ -314,7 +315,8 @@ def stream_runs(streams: jax.Array, segments: jax.Array, reads: Sequence[Sequenc
     read = jnp.where(kind < 0, count_streams, kind)
     how = jnp.where(read == reader[..., None], table[reader, 0][..., None],
                     table[reader[..., None], 1 + read])
-    hi = jnp.where(how == 2, jnp.minimum(hi, index[None, :, None] + 1), hi)
+    # A causal read (`HOWS`) reads up to the token itself.
+    hi = jnp.where(how == HOWS["causal"], jnp.minimum(hi, index[None, :, None] + 1), hi)
     kept = (how > 0) & (hi > lo)
     return jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1).astype(jnp.int32)
 
