@@ -890,6 +890,30 @@ def test_an_amperes_gpt_oss_projection_runs_the_template_named_for_it():
     assert route_failures(cases, compile_mosaic_kernels(cases, "sm80")) == []
 
 
+def test_a_route_whose_launch_runs_no_trip_does_not_take_it():
+    """A route's launches are those its run reaches: the template's grouped product named inside a loop of no
+    trips lowers all the same, and its route evidence (`kernel_compile.Expected`) states no launch of it,
+    so a case expecting one fails (`route_failures`)."""
+    from kernel_compile import Expected, compile_mosaic_kernels, route_failures
+
+    from dew.nn.kernels import gemm
+
+    def step(x, w, sizes):
+        def trip(_, total):
+            with generation.chosen(grouped_matmul="mosaic"):
+                return total + gemm.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+
+        return jax.lax.fori_loop(0, 0, trip, jnp.zeros((), jnp.float32))
+
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    operands = (shaped((256, 512)), shaped((2, 512, 512)), jax.ShapeDtypeStruct((2,), jnp.int32))
+    expected = Expected(axes=(("data", 1),), specs=(None, None, None), launches=frozenset({"dew_gmm"}))
+    cases = [support.KernelCase("a projection of no trips", lambda: (step, operands), expected=expected)]
+    found = compile_mosaic_kernels(cases, "sm80")
+    assert [failure.startswith("a projection of no trips: no launch of dew_gmm")
+            for failure in route_failures(cases, found)] == [True]
+
+
 def _blockwise_projected():
     """A blockwise-scaled FP8 MoE projection (`gemm.blockwise_fp8_product`, DeepSeek-V3's 1 x 128 rows and
     128 x 128 weight blocks, eight experts) through the template named."""
