@@ -172,6 +172,18 @@ def test_a_field_counts_as_read_where_the_call_hands_it_to_a_package_function_th
     (tmp_path / "src" / "dew" / "nn" / "layer.py").write_text(textwrap.dedent(body))
     [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew")
                 if module.path.stem == "layer"]
+
+
+@pytest.mark.parametrize("inputs, reported", [
+    (INPUTS, False), ("class AttentionMetadata:\n    token_ids = None\n", True), ("MIXES = 'mixes'\n", True),
+], ids=["marked", "no marks", "no metadata class"])
+def test_inputs_whose_mixing_fields_read_as_none_are_reported(lint, inputs, reported, tmp_path):
+    """An `nn/inputs.py` whose AttentionMetadata marks no mixing field, or that holds no such class, is
+    reported: SLOP014 would read no mixing fields and check no mixer's reads."""
+    (tmp_path / "src" / "dew" / "nn").mkdir(parents=True)
+    (tmp_path / "src" / "dew" / "nn" / "inputs.py").write_text(inputs)
+    [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew")
+                if module.path.stem == "inputs"]
     assert any(True for _ in lint.calls(module)) is reported
 
 

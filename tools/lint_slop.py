@@ -1063,6 +1063,11 @@ def calls(module: Module) -> Iterator[Finding]:
     the module loads, or a package function its call hands its call's fields to
     (`_handed`)."""
     mixing = _mixing(module)
+    if Path(module.relative).parts[-2:] == ("nn", "inputs.py") and not mixing:
+        # The marks every other module's check reads: none read, and SLOP014 would check no mixer.
+        yield Finding(module.relative, 1, 1, "SLOP014",
+                      "reads no mixing fields of AttentionMetadata (`MIXES`, `mixing_property`), so no "
+                      "mixer's reads are checked")
     loaded = {node.attr for node in ast.walk(module.tree)
               if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)}
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
