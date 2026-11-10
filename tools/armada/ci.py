@@ -987,16 +987,41 @@ def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | No
     return spans + [(start, min(start + weighed, end)) for start in range(mark.units, end, weighed)]
 
 
-def cut_draws(mark: Mark, rates: Mapping[bool, float | None], target: float) -> list[tuple[int, int]]:
-    """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its units'
-    measured rate (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether
-    weighed) puts a task of its declared cut past `target`: as many as `target` holds at that rate, at least
-    one, so no map task is the run's longest for its mark's cut (row 4376: a 64-seed shard ran 966 s where
-    every other group took 256 s or less). Its tasks' starts are among what the rate measures, so a cut
-    converges from above on the one that fills the target. A kind whose finer cut would pass what its
-    judges' job takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest of its own within it."""
-    def fitting(units: int, declared: int, each: float | None) -> int:
-        return declared if not each else max(1, min(declared, int(target // each), units))
+@dataclasses.dataclass(frozen=True)
+class Cost:
+    """What a site's map task takes as armada measured them (`rate`): its setup, once a task (its
+    environment, imports and compiles before its first draw), and each unit it draws after (2026-11-09: a
+    task of one draw and one of two both took 516 s, so task seconds over units charged each draw the setup
+    a task pays once)."""
+
+    setup: float
+    unit: float
+
+    def seconds(self, units: int) -> float:
+        """A task's seconds drawing `units`."""
+        return self.setup + self.unit * units
+
+    def fitting(self, declared: int, target: float) -> int:
+        """The most units a task draws within `target` past its setup, at most `declared`, at least one; where
+        its setup alone passes the target, the declared cut, as a finer one pays the setup again for nothing
+        but holding each task's draws within the target."""
+        if not self.unit:
+            return declared
+        room = target - self.setup if self.seconds(1) <= target else target
+        return max(1, min(declared, int(room // self.unit)))
+
+
+def cut_draws(mark: Mark, rates: Mapping[bool, Cost | None], target: float) -> list[tuple[int, int]]:
+    """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its
+    measured cost (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether
+    weighed) puts a task of its declared cut past `target`: as many as `target` holds past its setup
+    (`Cost.fitting`), at least one, so no map task is the run's longest for its mark's cut (row 4376: a
+    64-seed shard ran 966 s where every other group took 256 s or less). Its tasks' starts are among what
+    the cost measures, so a cut converges from above on the one that fills the target. A kind whose finer
+    cut would pass what its judges' job takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest
+    of its own within it."""
+    def fitting(units: int, declared: int, cost: Cost | None) -> int:
+        return declared if cost is None else max(1, min(units, cost.fitting(declared, target)))
 
     per_task = fitting(mark.units, mark.per_task, rates[False])
     weighed = fitting(mark.weighed, mark.weighed_per_task, rates[True]) if mark.weighed else None
@@ -1035,19 +1060,32 @@ def site_task(python: str, name: str, test: str, span: tuple[int, int] | None = 
 
 
 def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]],
-         measured: Mapping[str, float]) -> float | None:
-    """The seconds a unit of test file `name`'s site `test` takes under `python`, over those of its map tasks'
-    `spans` that armada measured (under their task names, `site_task`); None where it measured none. Once a
-    site runs as map tasks, the durations record holds no whole run of it (its test's seconds are one task's,
-    its judge's pooling among them), so its map tasks are what tell a unit's cost."""
+         measured: Mapping[str, float]) -> Cost | None:
+    """What a map task of test file `name`'s site `test` takes under `python` (`Cost`), over those of its map
+    tasks' `spans` that armada measured (under their task names, `site_task`); None where it measured none.
+    Tasks of two sizes or more tell its setup from its draws (a least-squares line of seconds over units, its
+    setup and draws none below zero); tasks of one size alone tell no setup, their seconds all the draws'.
+    Once a site runs as map tasks, the durations record holds no whole run of it (its test's seconds are one
+    task's, its judge's pooling among them), so its map tasks are what tell its cost."""
     timed = [(stop - start, seconds) for start, stop in spans
              if (seconds := measured.get(site_task(python, name, test, (start, stop))))]
-    return sum(seconds for _, seconds in timed) / sum(units for units, _ in timed) if timed else None
+    if not timed:
+        return None
+    units, seconds = sum(count for count, _ in timed), sum(taken for _, taken in timed)
+    mean_units, mean_seconds = units / len(timed), seconds / len(timed)
+    spread = sum((count - mean_units) ** 2 for count, _ in timed)
+    if not spread:
+        return Cost(0.0, seconds / units)
+    unit = max(0.0, sum((count - mean_units) * (taken - mean_seconds) for count, taken in timed) / spread)
+    setup = mean_seconds - unit * mean_units
+    # A line through the origin where the fit's setup falls below zero: no task pays less than its draws.
+    return Cost(setup, unit) if setup >= 0 else Cost(0.0, sum(count * taken for count, taken in timed)
+                                                     / sum(count * count for count, _ in timed))
 
 
 def site_rate(python: str, name: str, test: str, mark: Mark, measured: Mapping[str, float], *,
-              weighed: bool) -> float | None:
-    """The seconds a unit of test file `name`'s site `test` takes under `python` (`rate`), over its map tasks
+              weighed: bool) -> Cost | None:
+    """What a map task of test file `name`'s site `test` takes under `python` (`rate`), over its map tasks
     of any cut armada measured, by their names (`site_task`), each span read from its name's end: its weighed
     check's units apart from the rest (`weighed`), as they cost their own."""
     prefix = f"{site_task(python, name, test)}-draws-"
@@ -1066,7 +1104,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
     their draws from its inputs and reports the site's row as a run that drew every unit itself would. A site
     whose judge's row ran green on exactly these inputs (`kept`, `reusable`) has none: a kept task reads its
     row, and no draw runs. A map task weighs what armada measured it at, under its task's name
-    (`site_task`), else its units at the rate of the site's map tasks of its kind that armada measured
+    (`site_task`), else its setup and units as the site's map tasks of its kind that armada measured cost
     (`rate`: its first stage runs every time, so a later task its judge has not asked for since weighs what
     its seeds take), else the target: armada keeps the measures of the tasks a run named, so a site the last
     run reused has none, and the durations record times its judge's pooling, no measure of its draws
@@ -1091,9 +1129,10 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
             for start, stop in spans:
                 group = f"{test}.draws-{start}-{stop}"
                 task_name = site_task(python, name, test, (start, stop))
-                # A weighed check's units cost their own, at the rate of those of them armada measured.
-                each = rates[start >= mark.units]
-                weight = measured.get(task_name) or (each * (stop - start) if each is not None else target)
+                # A weighed check's units cost their own, as those of them armada measured did.
+                cost = rates[start >= mark.units]
+                weight = measured.get(task_name) or (
+                    cost.seconds(stop - start) if cost is not None else target)
                 # A check-1 site's second-stage seeds, drawn only where its judge's first stage asks for
                 # them (armada's `later`), or at once where its last judgement needed them (`eager`).
                 maps.append({"name": task_name, "python": python, "tests": name, "split": group,
