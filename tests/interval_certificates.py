@@ -11,7 +11,7 @@ ulp, a mainloop's `approx_math`). A lane (`Lane`) states the arithmetic a launch
 holds the values its launches pass between them."""
 
 import dataclasses
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import numpy as np
 from certified import allowance
@@ -119,7 +119,7 @@ class Lane:
     """Whether the call is fp32's, its output stored fp32 and a one-part operand TF32."""
     pairing: int = 1
     """The parts a factored pair's fp32 operand takes (`mainloop.pairing_parts`, `operand`)."""
-    tf32: str = "read"
+    tf32: Literal["plain", "rna", "read"] = "read"
     """How a one-part fp32 operand reaches its product (`operand`), the issuer's: 'plain', as itself (an
     interpreted product, a plain fp32 dot: mosaic_sm80.py's and mosaic_sm90.py's interpreted branches);
     'rna', rounded to TF32 to nearest, a tie away from zero, first (`cvt.rna.tf32.f32`,
@@ -257,6 +257,8 @@ def operand(iv: Iv, lane: Lane, parts: int = 1) -> Iv:
     ends; or read as TF32 from the register, both ends rounded outward on its grid, which encloses nearest
     under either tie and truncation); two bf16 parts (`product.formed`) within the third part's bound of it
     (`PART_BOUNDS`); three, the value itself."""
+    if parts == 1 and lane.tf32 == "plain":
+        return iv
     if parts == 1 and lane.tf32 == "rna":
         return Iv(tf32_operand(iv.lo), tf32_operand(iv.hi))
     if parts == 1 and lane.tf32 == "read":
@@ -264,7 +266,9 @@ def operand(iv: Iv, lane: Lane, parts: int = 1) -> Iv:
     if parts == 2:
         widen = PART_BOUNDS[2] * np.maximum(np.abs(iv.lo), np.abs(iv.hi))
         return outward(iv.lo - widen, iv.hi + widen)
-    return iv
+    if parts == 3:
+        return iv
+    raise ValueError(f"no enclosure of an fp32 operand in {parts} parts under conversion {lane.tf32!r}")
 
 
 def exp2_reach(native, low: float = -2.0, high: float = 2.0) -> int:
