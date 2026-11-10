@@ -67,11 +67,17 @@ case "${1:-}" in
       changed_files $("$PYTHON" tools/lint_slop.py --print-roots) &&
         JAX_PLATFORMS=cpu xargs -0r "$PYTHON" tools/lint_slop.py < "$listed"
     }
-    # Pyright over the changed files under its gate's root (its command's last word), in place of the root.
+    # Pyright over the changed files under its inputs (`pyright_inputs`, tools/lint_inputs.sh): its gate's own
+    # command, its inputs bound to those files (2026-11-10: read off the command's last word, its roots src/dew
+    # unread, a head whose FitSearch calls were all type errors read "pyright ok (0 s)").
     changed_pyright() {
       command=$(grep -v '^#' "$gates" | awk -F'\t' '$1 == "pyright" {print $2}')
-      changed_files "${command##* }" || return 2
-      [ ! -s "$listed" ] || xargs -0 sh -c ". tools/lint_inputs.sh; ${command% *} \"\$@\"" sh < "$listed"
+      case $command in
+        *'$pyright_inputs'*) ;;
+        *) echo "check --changed: the pyright gate reads no \$pyright_inputs: $command"; return 2 ;;
+      esac
+      changed_files $pyright_inputs || return 2
+      [ ! -s "$listed" ] || xargs -0 sh -c ". tools/lint_inputs.sh; pyright_inputs=\$*; $command" sh < "$listed"
     }
     wanted() { [ -z "$only" ] || [ "$only" = "$1" ]; }
     wanted ruff && gate ruff changed_ruff

@@ -3,6 +3,9 @@
 # it. tools/lint_slop.py owns its own roots (`--print-roots`).
 ruff_inputs="src/dew src/_dew_torch tests tools/lint_slop.py tools/lint_scopes.py tools/lint_assertions.py tools/lint_layers.py tools/changelog_released.py tools/complexity.py examples recipes"
 
+# The roots pyright reads (tools/check_gates); check.sh --changed binds it to the changed Python files under them.
+pyright_inputs="src/dew src/_dew_torch"
+
 # The roots the duplicate-code gate reads (tools/duplicates.py), as text and as structure (tools/check_gates).
 duplicate_roots="src/dew src/_dew_torch tools tests examples site"
 
