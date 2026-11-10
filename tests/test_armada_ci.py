@@ -866,6 +866,25 @@ def test_a_tier_cut_group_is_admitted_on_its_files_whole_measure_and_no_need_is_
     assert "admitted at 40.0 GiB, below its measured need of 61.0 GiB" in row["output"]
 
 
+def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
+        ci, tmp_path, monkeypatch, cache_worker, capsys):
+    """`gpu-holds` says, for each test file (a group as its file), the most any GPU class's last whole run
+    of it held with its children (`gpu_needs`), in bytes, so a GPU tier sizes each part's job by what its
+    lane will admit its files at (2026-11-10: a part given a default 8 GiB had a 4 GiB lane for a file
+    measured at 5.9 GiB); a file no class measured is absent."""
+    url, stored, _ = cache_worker
+    cached(monkeypatch, url)
+    gib = 2 ** 30
+    for other, peak in (("NVIDIA-H100-80GB-HBM3-x86", 4), ("NVIDIA-A10-x86", 2)):
+        at = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_wide.py", ""), other)
+        stored[at] = json.dumps({"key": None, "depends": ["tests/test_wide.py"], "row": {}, "reads": [],
+                                 "peak": peak * gib, "shares": 1, "pools": 0}).encode()
+    monkeypatch.setattr(sys, "argv",
+                        ["ci.py", "gpu-holds", "--tests=tests/test_wide.py#2/3 tests/test_new.py"])
+    assert ci.main() == 0
+    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (4 * gib * 1.25 + gib)}
+
+
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
     """`coverage items` runs the floor's tasks with the test cache off, each writing its data among
     its artifacts; `coverage report` combines them, so a branch one task took and its other branch
