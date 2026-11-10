@@ -103,7 +103,8 @@ class Exponents:
 
     def raised(self, lane: Lane) -> Iv:
         """`algebra.raised(hi, lo)` at each position: the decay from the chunk's start."""
-        return exp2(outward(self.exact - self.bound - FRACTION, self.exact + self.bound + FRACTION), lane)
+        return raised_exponent(outward(self.exact - self.bound - FRACTION, self.exact + self.bound + FRACTION),
+                               lane)
 
     def gated(self, lane: Lane) -> Iv:
         """`algebra.scalar_write`'s gate at each position, `raised(last - hi, last_lo - lo)`: the
@@ -111,13 +112,29 @@ class Exponents:
         difference = self.exact[-1] - self.exact
         spread = (self.bound[-1] + self.bound + 2.0 ** -24 * np.abs(difference) * (1 + 2.0 ** -20)
                   + 2.0 ** -46 * (np.abs(self.exact[-1]) + np.abs(self.exact)) + FRACTION)
-        return exp2(outward(difference - spread, difference + spread), lane)
+        return raised_exponent(outward(difference - spread, difference + spread), lane)
 
     def pairs(self, lane: Lane) -> Iv:
         """`algebra.decayed(hi, lo, hi, lo)` `[C, C]`: each pair's decay `exp2(E_s - E_t)` (`between`), the
         upper triangle's left to the caller's mask."""
         return between(self.exact[:, None], self.bound[:, None], self.exact[None, :], self.bound[None, :],
                        lane)
+
+
+def raised_exponent(exponents: Iv, lane: Lane) -> Iv:
+    """`exp2` of a base-2 exponent within `exponents` as `algebra.raised` forms it: its integer part's power
+    of two exact, its fraction's exp2 at the lane's reach (`exp2`, the fraction an fp32 under 2), each end at
+    its own floor (`exp2(x)` is monotone in `x`), zero where it may fall below fp32's normal range. Taken as
+    one fp32 operand of exp2, an exponent near -40 sat on a grid 2^-18 apart, past the fraction's own: legal
+    decays the algebra forms between its points lay outside (778 of 1024 at decays down to -3 a token, row
+    5412's witness)."""
+    def scaled(at, side):
+        whole = np.floor(at)
+        fraction = exp2(Iv(at - whole, at - whole), lane)
+        return np.ldexp(getattr(fraction, side), whole.astype(np.int32))
+
+    lo, hi = scaled(exponents.lo, "lo"), scaled(exponents.hi, "hi")
+    return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
 
 
 def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
@@ -127,7 +144,7 @@ def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
     `PAIR_FLOOR`."""
     difference = later - earlier
     spread = later_bound + earlier_bound + 2.0 ** -46 * (np.abs(later) + np.abs(earlier)) + PAIR_FRACTION
-    found = exp2(outward(difference - spread, np.minimum(difference + spread, 126.0)), lane)
+    found = raised_exponent(outward(difference - spread, np.minimum(difference + spread, 126.0)), lane)
     # The integers' difference lies within two of the exponent's.
     lo = np.where(difference - spread < PAIR_FLOOR + 2, 0.0, found.lo)
     return Iv(lo, np.where(difference + spread < PAIR_FLOOR - 2, 0.0, found.hi))
@@ -628,11 +645,21 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
         with tuning.seen() as launches:
-            # The training forward: the primal of the route's VJP, as a training step runs it; or the
-            # inference forward.
-            o, final = jax.jit(route if walked else lambda *x: jax.vjp(route, *x)[0])(*operands)
-        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                   if isinstance(op, template.Mosaic)]
+            o, final = jax.jit(route)(*operands)
+        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
+                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
+        # The training forward, the primal of the route's VJP as a training step runs it, where the template
+        # trains the call (`Mosaic.trains`); else, or where no gradient follows (`walked`), the inference
+        # forward: a training step takes another kernel for a call the template does not train (an fp32
+        # call's backward on an A100's registers, 264 to 328 a thread).
+        if not walked and template.MOSAIC.trains(bound, template.Mosaic.launched()):
+            with tuning.seen() as launches:
+                o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
+            [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                       if isinstance(op, template.Mosaic)]
+        # The fused walk where the forward runs one (`chunk_forward.walks_once`): an mma.sync family's
+        # inference forward runs its states and output launches, whose records it keeps.
+        walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
         chunk = tiles.chunk
 
         def kept(*x, starts=starts):
@@ -693,11 +720,15 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                begins=begins)
 
 
-def _chunked(named, laid: int, heads: int, chunks: int, chunk: int) -> dict[str, np.ndarray]:
+def _chunked(named, laid: int, chunks: int, chunk: int) -> dict[str, np.ndarray]:
     """Each named backward record `(x, width)`, its stacked parts summed exactly, laid `[N, H, C, width]`
-    over the `laid` chunks of `chunk` tokens its launches lay, the first `chunks` of them."""
+    over the `laid` chunks of `chunk` tokens its launches lay, the first `chunks` of them: `H` its own heads,
+    a value head's, or a key head's where its launch sums a key head's value heads into one record (the
+    queries' and keys' gradients; the scores' without the delta rule, `mainloop_backward._query_key`)."""
     def chunked(x, width):
-        rows = np.asarray(x, np.float64).reshape(-1, laid * chunk, heads * width).sum(0)
+        x = np.asarray(x, np.float64)
+        heads = x.shape[-1] // width
+        rows = x.reshape(-1, laid * chunk, heads * width).sum(0)
         return rows.reshape(laid, chunk, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
     return {name: chunked(x, width) for name, (x, width) in named.items()}
@@ -1130,7 +1161,11 @@ def back_enclosures(step: BackStep, scale: float, lane: Lane, *, write: str = "d
     if keyed_gate:
         ds = fp32(mul(ds, point(beta.T)), lane)
     ds = fp32(mul(fp32(mul(ds, pairs), lane), factor), lane)
-    ds = staged(where(lag >= 0, ds, zeros), lane)
+    # The delta rule's a value head's record, staged; without it summed over a key head's value heads in
+    # fp32 first, then stored (`back_witnessed`).
+    ds = where(lag >= 0, ds, zeros)
+    if write == "delta":
+        ds = staged(ds, lane)
     narrow, scored = point(step.ds), (given if keyed_gate else held)
     entered = tr(point(step.h))
     dq = fp32(add(fp32(mul(fp32(mul(blocked(do, entered, lane, parts=(given, held)), rows), lane), factor),
@@ -1191,9 +1226,14 @@ class BackRun(NamedTuple):
         # Without the delta rule there are no weights' gradients, which nothing then reads.
         dw = records["dw"][n, head] if "dw" in records else np.zeros_like(run.w[n, head])
         forward = run.step(n, head)
+        # The scores' gradient a key head's without the delta rule (`_chunked`): its first value head's
+        # products read it, the rest none (`mainloop_backward._query_key`'s first step's alone).
+        scores = records["ds"][n, head * records["ds"].shape[1] // run.heads]
+        if records["ds"].shape[1] < run.heads and head % (run.heads // records["ds"].shape[1]):
+            scores = np.zeros_like(scores)
         return BackStep(forward.q, forward.k, forward.v, forward.g, forward.beta, forward.a, forward.w,
                         corrected, forward.h, self.do[n, head], grad, self.dh[n, head],
-                        records["local"][n, head], records["dv"][n, head], records["ds"][n, head], dw)
+                        records["local"][n, head], records["dv"][n, head], scores, dw)
 
 
 def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda prepared: ()) -> tuple:
@@ -1261,7 +1301,7 @@ def _back_run(run, do, dfinal, saved, named: dict, laid: int, dh: np.ndarray) ->
     return BackRun(run, hosted_do.reshape(chunks, chunk, heads, value_width).transpose(0, 2, 1, 3),
                    np.asarray(dfinal, np.float64)[0], dh,
                    np.asarray(saved.dh0, np.float64).reshape(heads, key_width, value_width),
-                   _chunked(named, laid, heads, chunks, chunk), dtypes)
+                   _chunked(named, laid, chunks, chunk), dtypes)
 
 
 def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> BackRun:
@@ -1298,15 +1338,24 @@ def back_witnessed(back: BackRun, lane: Lane) -> dict[str, np.ndarray]:
 
     found: dict[str, list] = {}
     for n in range(run.chunks):
-        for head in range(run.heads):
-            step = back_enclosures(back.step(n, head, lane), run.scale, lane, write=run.write)
-            for name in step:
-                if name == "entering":
+        steps = [back_enclosures(back.step(n, head, lane), run.scale, lane, write=run.write)
+                 for head in range(run.heads)]
+        for name in steps[0]:
+            if name == "entering":
+                for head in range(run.heads):
                     record = back.dh0[head] if n == 0 else back.dh[n - 1, head]
                     dtype = np.float32 if n == 0 else back.dtypes["entering"]
-                else:
-                    record, dtype = back.records[name][n, head], back.dtypes[name]
-                found.setdefault(name, []).append(within(record, stored(step[name], dtype)))
+                    found.setdefault(name, []).append(within(record, stored(steps[head][name], dtype)))
+                continue
+            # A key head's record the fp32 sum of its value heads', added in their order (`_chunked`).
+            records = back.records[name]
+            group = run.heads // records.shape[1]
+            for owner in range(records.shape[1]):
+                summed = steps[owner * group][name]
+                for head in range(owner * group + 1, (owner + 1) * group):
+                    summed = fp32(add(summed, steps[head][name]), lane)
+                held = within(records[n, owner], stored(summed, back.dtypes[name]))
+                found.setdefault(name, []).append(held)
     return {name: np.stack(held) for name, held in found.items()}
 
 

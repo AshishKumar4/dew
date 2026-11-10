@@ -149,6 +149,18 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     return out, final
 
 
+def walks_once(dtype, *, per_key: bool, family: mosaic.Family | None, keeps: bool) -> bool:
+    """Whether a forward of `dtype` runs its states and output in one walk (`_scan`), no memory kept for a
+    backward to take: one keeping nothing (`keeps`) under a decay a head, where its `family`'s products read
+    their operands from shared memory (warpgroup MMA's) and a 16-bit call's operands are one part. Where
+    they read registers (mma.sync's), the walk's two phases' operand fragments held its thread past its
+    registers at every tile (an sm87's and an A100's), as the output launch's two phases at once did
+    (`output._output_held`); an fp32 call's parts spilled it at an H100's widest (132 bytes at two roles of 16
+    columns, jsf-scan4 at d54ec6b02)."""
+    return (not keeps and not per_key and jnp.dtype(dtype).itemsize == 2 and family is not None
+            and not family.operands_in_registers)
+
+
 def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
                  max_segments: int | None = None,
                  scale: float | None = None, delta: bool = True, wide: bool = False,
@@ -162,17 +174,9 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     `A`, and the launches' weighted keys, memories, corrected values and a forked call's stored slots,
     `(w, h, corrected, stored)`, which the port
     keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
-    # A forward keeping nothing for a backward under a decay a head runs its states and output in one walk
-    # (`_scan`), no memory kept for a backward to take, where its family's products read their operands from
-    # shared memory (warpgroup MMA's) and a 16-bit call's operands are one part: where they read registers
-    # (mma.sync's), the walk's two phases' operand fragments held its thread past its registers at every tile
-    # (an sm87's and an A100's), as the output launch's two phases at once did (`_output_held`); an fp32
-    # call's parts spilled it at an H100's widest (132 bytes at two roles of 16 columns, jsf-scan4 at
-    # d54ec6b02).
     dtype = jnp.result_type(q, k, v)
-    reads = family_of(dtype) if family is None else family
-    scans = (not keeps and g.ndim == 3 and jnp.dtype(dtype).itemsize == 2 and reads is not None
-             and not reads.operands_in_registers)
+    scans = walks_once(dtype, per_key=g.ndim == 4, family=family_of(dtype) if family is None else family,
+                       keeps=keeps)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
                    rounded=rounded, ranged=ranged, states=not scans, forked=forked)
