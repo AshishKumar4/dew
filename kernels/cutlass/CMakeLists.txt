@@ -31,16 +31,6 @@ foreach(target dew_cutlass dew_cutlass_sm80 dew_cutlass_sm90)
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:
       -O3 --expt-relaxed-constexpr --expt-extended-lambda>)
 endforeach()
-# The library reports the architectures it holds grouped kernels for (dew_cutlass.ARCHITECTURES): each
-# kernel object's, not the handlers', which compile for every architecture and refuse a device none of
-# the kernels runs on. Dew asks the installed wheel rather than knowing each release's list.
-set(kernels)
-foreach(object dew_cutlass_sm80 dew_cutlass_sm90)
-  get_target_property(built ${object} CUDA_ARCHITECTURES)
-  list(APPEND kernels ${built})
-endforeach()
-list(JOIN kernels "," ARCHITECTURES)
-target_compile_definitions(dew_cutlass PRIVATE DEW_CUTLASS_ARCHITECTURES="${ARCHITECTURES}")
 target_link_libraries(dew_cutlass PRIVATE CUDA::cudart)
 # The CUDA runtime comes from the nvidia wheel jax's CUDA plugin installs beside this one: CUDA 12's
 # nvidia/cuda_runtime/lib, CUDA 13's nvidia/cu13/lib.
