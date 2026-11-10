@@ -903,6 +903,24 @@ def converts(dtype) -> bool:
     return architecture is not None and "8bit" in architecture.tensor_rates
 
 
+class WholeSlots:
+    """A step's operand slots by stream name (`Slots`' interface) where the walk hands the step its blocks
+    whole and refills a slot only after the step that read it (`emit_pipeline`'s on cp.async, a TPU core's
+    walk awaiting its blocks): releasing one early is nothing."""
+
+    def __init__(self, refs: dict):
+        self._refs = refs
+
+    def __getitem__(self, name: str):
+        return self._refs[name]
+
+    def release(self, name: str) -> None:
+        del name
+
+    def acquire_all(self) -> None:
+        """Every slot acquired: the step's blocks are its whole."""
+
+
 class Slots:
     """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
     it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
@@ -1333,12 +1351,19 @@ class Issuer[Accumulator](abc.ABC):
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
+    sums_in_windows: bool = False
+    """Whether an exactly summed walk's partial may span several steps before its add into the running sum
+    (`summed_window`): an accumulator carried as a value across a window's steps (mma.sync's: a partial a step
+    cost the A100's fp32 kernel gradients 2.13-2.26x their plain sums on 13 dense shapes, M-FS-4,
+    W13-a100-1), or a turn of tensor memory its epilogue promotes a window at a time (tcgen05's); where not
+    (warpgroup MMA's), each step's partial is added apart."""
+
     def summed_window(self, block_k: int) -> int:
         """The steps of `block_k` depths an exactly summed kernel gradient's partial covers before it is
-        added into the running sum (`gemm.mosaic_gpu._walked_gradient`): one, each step's partial apart,
-        unless its accumulator is a value it may carry across steps."""
-        del block_k
-        return 1
+        added into the running sum (`gemm.mosaic_gpu._walked_gradient`): `product.SUMMED_DEPTH` of them,
+        its truncating in-order adds no deeper than a promoted FP8 product's step, where its family sums in
+        windows (`sums_in_windows`); one, each step's partial apart, otherwise."""
+        return max(1, product.SUMMED_DEPTH // block_k) if self.sums_in_windows else 1
 
     def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:

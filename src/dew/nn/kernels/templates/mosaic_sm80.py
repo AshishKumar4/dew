@@ -22,16 +22,7 @@ from jax.experimental.mosaic import gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import launches
-from dew.nn.kernels.templates import (
-    bodies,
-    handoffs,
-    mosaic,
-    persistent,
-    product,
-    report,
-    resources,
-    swizzling,
-)
+from dew.nn.kernels.templates import bodies, handoffs, mosaic, persistent, report, resources, swizzling
 
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
@@ -104,7 +95,7 @@ def _gathered_walk(streams, segments, carry, interpret: bool):
                 slot = lax.rem(index - lo, stages)
                 started, accumulators = carried
                 tiles = {name: ring.at[slot] for name, ring in zip(names, slots, strict=True)}
-                return step(index, Slots(tiles), started, accumulators)
+                return step(index, mosaic.WholeSlots(tiles), started, accumulators)
 
             return lax.fori_loop(lo, hi, body, carry)
 
@@ -148,24 +139,6 @@ def _depth_granule(ref, axis: int, instruction: int) -> int:
     if axis != (0 if transposed else 1):
         return instruction
     return max(instruction, swizzling.swizzle_columns(ref.dtype, swizzling.swizzle_of(ref)))
-
-
-class Slots:
-    """A pipelined step's operand slots by stream name (`mosaic.Slots`'s interface): `emit_pipeline` hands
-    the step its shared-memory tiles and takes them back when the step returns, so releasing one early is
-    nothing."""
-
-    def __init__(self, refs: dict):
-        self._refs = refs
-
-    def __getitem__(self, name: str):
-        return self._refs[name]
-
-    def release(self, name: str) -> None:
-        del name
-
-    def acquire_all(self) -> None:
-        """Every slot acquired: `emit_pipeline` hands the step its tiles whole."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -450,12 +423,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         return self.products(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, rhs)
 
-    def summed_window(self, block_k: int) -> int:
-        # Its accumulator is a value, carried across a window's steps and added into the running sum at
-        # the window's end: a partial a step cost the A100's fp32 kernel gradients 2.13-2.26x their plain
-        # sums on 13 dense shapes (M-FS-4, W13-a100-1). A window is `product.SUMMED_DEPTH` deep, its
-        # truncating in-order adds no deeper than a promoted FP8 product's step.
-        return max(1, product.SUMMED_DEPTH // block_k)
+    sums_in_windows = True  # its accumulator a value carried across a window's steps
 
     def summed_apart(self, running: jax.Array, lhs, rhs, scale: Callable | None = None
                      ) -> jax.Array:
@@ -641,7 +609,7 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
 
             def body(indices, *refs, step=step, lo=lo):
                 (index,), (carried, accumulators) = indices, refs[-1]
-                slots = Slots(dict(zip(names, refs[:-1], strict=True)))
+                slots = mosaic.WholeSlots(dict(zip(names, refs[:-1], strict=True)))
                 return step(index + lo, slots, carried, accumulators)
 
             # A tile's blocks staged swizzled for ldmatrix (`_staging`).
