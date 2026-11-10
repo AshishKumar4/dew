@@ -148,12 +148,11 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
-    dfinal = dfinal.astype(jnp.float32).reshape(run.memories, *dfinal.shape[-3:])
-    dht = zero_padded(zero_padded(dfinal, 2, width), 3, columns).reshape(-1, columns)
+    dht = zero_padded(zero_padded(dfinal.astype(jnp.float32), 2, width), 3, columns).reshape(-1, columns)
     if call.per_key:
         (dq, dk, dv, dg, dbeta, dh0), key_kept = key_backward.gradients(run, laid_do, dht, tiles)
         dg = run.unlaid(dg.reshape(rows, heads, width))[..., :run.key_width]
-        grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts, dfinal)
+        grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, dg, run.unlaid(dbeta), dh0, starts)
         return (*grads, None), key_kept
     local = _local_back(run.q, run.k, laid_do, run.hi, run.lo, run.taken, call, scale=run.scale)
     # Without the delta rule the walk gates the values where their columns are the call's own. Padded, it
@@ -211,17 +210,16 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     dk_w = None if dk_w is None else call.held.joined(dk_w)
     extra = 0.0 if dk_w is None else keyed(headed(dk_w, width))
     grads = _unlaid(run, (q, k, v, g, beta), dq, dk, dv, run.unlaid(dg), run.unlaid(dbeta), dh0, starts,
-                    dfinal, extra_dk=extra)
+                    extra_dk=extra)
     return (*grads, dskip), kept_
 
 
-def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, dfinal, *, extra_dk=0.0) -> tuple:
+def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, *, extra_dk=0.0) -> tuple:
     """The backward's gradients laid back as the call's operands (`operands`, `(q, k, v, g, beta)`) and in
     their dtypes: the queries' and keys' `[R, H * Dk]` a key head's, `extra_dk` `[B, T, H, Dk]` added to the
     keys', the values' `[R, HV * Dv]`, the log decay's and write gates' as the call's (laid back already), and
-    the entering memories' `[M * HV * Dk, Dv]` (`chunk_forward._Run.shaped`), zero for a row a document
-    starts, the final's gradient `dfinal` `[M, HV, Dk, Dv]` for a document's no sequence gives back
-    (`_Run.final_of`)."""
+    the entering memories' `[B * HV * Dk, Dv]` (`chunk_forward._Run.shaped`), zero for a row a document
+    starts."""
     call = run.call
     q, k, v, g, beta = operands
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
@@ -232,10 +230,8 @@ def _unlaid(run, operands: tuple, dq, dk, dv, dg, dbeta, dh0, starts, dfinal, *,
         return laid[..., :run.key_width]
 
     dv = run.unlaid(dv.reshape(rows, heads, columns))[..., :run.value_width]
-    dh0 = run.shaped(dh0.reshape(run.memories, heads * width, columns))
-    if run.documents is not None:
-        dh0 = jnp.where(run.given().reshape(*dh0.shape[:2], 1, 1, 1), dh0, dfinal.reshape(dh0.shape))
-    elif starts is not None:
+    dh0 = run.shaped(dh0)
+    if starts is not None:
         dh0 = jnp.where(jnp.asarray(starts, bool)[:, 0, None, None, None], 0.0, dh0)
     return (key_headed(dq).astype(q.dtype), (key_headed(dk) + extra_dk).astype(k.dtype), dv.astype(v.dtype),
             dg.astype(g.dtype), dbeta.astype(beta.dtype), dh0)

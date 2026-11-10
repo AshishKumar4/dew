@@ -394,12 +394,10 @@ class ChunkFwdH(_Launch):
             return sh % value_heads
 
         per_key = g.ndim == 4
-        # The call's memories: a row's each, or each of its documents' (`Sequences`).
-        memories = h0.shape[0]
-        rows = pl.BlockSpec((memories, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
+        rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
-        held = slots(spans, batch, length, chunk, memories)
+        held = slots(spans, batch, length, chunk)
         h, corrected, final = launches.pallas_call(
             functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
                               **({"per_key": True} if per_key else {})),
@@ -414,7 +412,7 @@ class ChunkFwdH(_Launch):
                        rows],
             out_shape=[jax.ShapeDtypeStruct((held, value_heads, width, columns), k.dtype),
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), u.dtype),
-                       jax.ShapeDtypeStruct((memories, value_heads, width, columns), jnp.float32)],
+                       jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_fwd_h",
         )(spans.spans, *_flat(k, u, w, g), h0, *_flat(g_lo))
@@ -554,16 +552,14 @@ class ChunkBwdDhu(_Launch):
         bv, warps, stages = config.bv, config.warps, config.stages
         spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
             q, do, chunk_spans, sequence_spans, chunk)
-        # The call's memories: a row's each, or each of its documents' (`Sequences`).
-        memories = dht.shape[0]
-        held = slots(spans, batch, length, chunk, memories)
+        held = slots(spans, batch, length, chunk)
 
         def head(i_v, sh):
             return sh % value_heads
 
         keys = pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0))
         values = pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v))
-        rows = pl.BlockSpec((memories, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
+        rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
         per_key = g.ndim == 4
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
@@ -579,7 +575,7 @@ class ChunkBwdDhu(_Launch):
                        rows,
                        values],
             out_shape=[jax.ShapeDtypeStruct((held, value_heads, width, columns), q.dtype),
-                       jax.ShapeDtypeStruct((memories, value_heads, width, columns), jnp.float32),
+                       jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32),
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), dv.dtype)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_bwd_dhu",
@@ -1145,12 +1141,8 @@ def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chun
     cumulated in base 2 within each chunk (`recurrence.cumulated`, compensated: its `(hi, lo)` halves,
     separated into the prefix's whole part and fraction, `algebra.separated`, whose differences every
     decay takes exactly), named 'delta_decay' for a block's remat policy, then the port's `cumulated`
-    forward on it (this module's `cumulated_fwd`, or `fla_kda`'s). Where `h0` holds more memories than
-    the rows, each of a row's documents takes and gives back its own (`Sequences`, `cu_seqlens` a row's
-    documents' each)."""
-    rows = q.shape[0]
-    documents = None if h0.shape[0] == rows else h0.shape[0] // rows
-    spans = sequences(rows, q.shape[1], cu_seqlens, chunk=chunk, documents=documents)
+    forward on it (this module's `cumulated_fwd`, or `fla_kda`'s)."""
+    spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans, compensated=True,
                                              interpret=interpret),
                         'delta_decay')

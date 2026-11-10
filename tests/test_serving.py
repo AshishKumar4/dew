@@ -822,25 +822,9 @@ WIDE_HYBRID = HybridSite(vocab=512, width=64, budget=16, seeds=256)
 users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 seeds, which 512 words, 64
 wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
 NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=512)
-SHORT_HYBRID = HybridSite(seeds=256, budget=4)
-"""NARROW_HYBRID's model drawing 4 tokens a request, so a request of 7 to 9 prompt tokens holds 3 or 4
-pages and a pool of 6 or 8 runs the segment's host cases."""
 """The sites at 256 words, 16 wide and 8 draws, sized paired by `seeds_for` on armada (11-03, at
 0fccb01d79): every-page's and restores-past-admission's resolve at 256, evicted's and
 one-entry-booked-twice's at 512."""
-
-
-SEGMENT_HOST = {"slots": 2, "admission": 2, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 2,
-                "prefix_states": 4}
-"""A pool whose host tier keeps a segment's pages: two rows at once over 6 pages of 4 tokens, 2 host slots
-and 4 states."""
-
-SEGMENT = (Served(12, shared=6), Served(12, flipped=(7,), shared=6), Served(12, flipped=(6,), shared=6))
-"""A segment of 6 tokens three prompts declare shared (a decision's state, each question past it its own
-request), ending inside their second page: past it they differ before any kept page boundary, so each
-later one reads the first's first page and its segment's 2 tokens of the second, copied into its own,
-starting from the state kept at the segment's end (`dew.inference.pages.segment_hash`); asked at once,
-the later ones wait for the first to write it."""
 
 
 @pytest.mark.parametrize("requests, options, hits, rounds, site", [
@@ -857,18 +841,9 @@ the later ones wait for the first to write it."""
       "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
     ((Served(9), Served(9, flipped=(0,)), Served(9)),
      {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
-      "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID),
-    (SEGMENT, {}, (0, 6, 12), None, NARROW_HYBRID),
-    (SEGMENT, {}, (12,), (3,), NARROW_HYBRID),
-    ((Served(7, shared=6), Served(7, flipped=(0,)), Served(7, flipped=(0, 1)),
-      Served(7, flipped=(6,), shared=6), Served(7, shared=6)), SEGMENT_HOST, (0, 0, 12), (1, 2, 2),
-     SHORT_HYBRID),
-    ((Served(9, flipped=(0,)), Served(7, shared=6), Served(9, flipped=(0, 1)),
-      Served(7, flipped=(6,), shared=6), Served(9, flipped=(0,))),
-     {**SEGMENT_HOST, "kv_cache": KVCache(page_size=4, pages=8)}, (0, 0, 6, 14), (1, 1, 2, 1), SHORT_HYBRID)],
+      "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID)],
     ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
-         "from-one-host-slot", "a-state-from-the-host", "a-shared-segment", "a-shared-segment-asked-at-once",
-         "a-segment-uploaded-and-copied-at-once", "a-segment-copied-into-a-spilled-page"])
+         "from-one-host-slot", "a-state-from-the-host"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -911,14 +886,8 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
     a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
     and its repeat reads it back with its pages (`dew.inference.pages.States`; a tier holds as many states
-    as its host pages' bytes, one in six pages' here). A segment three prompts
-    declare shared, ending inside a page (`SEGMENT`), is read by each later one from the state kept at
-    its end, its last page copied into the prompt's own, one a round or all asked at once. With a host
-    tier (`SEGMENT_HOST`): a segment two other prompts spill to the host, its page named by the segment
-    alone, comes back for two prompts seated together, the first uploading it and the second copying it
-    from there after the upload lands; and a prompt copying a segment into a page the pool reclaims from
-    a cached prefix spills that prefix first, which its repeat reads back. Each request draws what it
-    draws alone and scores it as a full forward does (check 1)."""
+    as its host pages' bytes, one in six pages' here). Each request draws what it draws alone and scores
+    it as a full forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
     model = hybrid_model(vocab_size=site.vocab, width=site.width)
@@ -987,20 +956,6 @@ def test_a_one_tap_convolutions_empty_state_fits_any_host_tier():
         server = Server.from_task(task, **{**HYBRID_SHARED, "host_pages": host_pages})
         part = server.rows.pages[0]
         assert part.states is not None and part.states.host.slots == part.host == host_pages
-
-
-def test_a_shared_segment_is_refused_where_no_server_keeps_it_or_it_splits_its_prompt():
-    """A declared shared segment (`Server.submit`'s `shared`) is kept by a paged server with a prefix cache
-    alone and holds some of the prompt's tokens but not its last: a dense server's, an empty one and a
-    whole prompt are refused."""
-    bound = hybrid_task()
-    prompt = np.arange(1, 9, dtype=np.int32)
-    with pytest.raises(ValueError):
-        Server.from_task(bound, slots=2, capacity=64).submit(prompt, 2, key=0, shared=4)
-    server = Server.from_task(bound, **HYBRID_SHARED)
-    for shared in (0, 8):
-        with pytest.raises(ValueError):
-            server.submit(prompt, 2, key=0, shared=shared)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
@@ -1100,6 +1055,29 @@ def test_a_pooled_servers_host_tier_reads_each_processs_prefix_back_from_its_own
     assert [report["shared"] for report in reports] == [8, 8]
 
 
+@pytest.mark.parametrize("chunk", [None, 16], ids=["whole", "in-pieces-past-the-prompt"])
+def test_prompts_seated_together_share_the_pages_the_first_writes_in_that_step(chunk):
+    """Three prompts submitted at once whose first two pages agree, over a prefix cache of pages of four
+    tokens: the first prefills its whole prompt in the step it is seated in, so the two after it are seated
+    in that step too, naming its pages as they would a cached prompt's (`Pages.reserve`'s `whole`), each
+    reading 8 tokens from them before any of them draws; every request draws what its lone call draws. A
+    cancelled request seated in their midst gives its pages back and none of them names it."""
+    bound = task(Sampling(temperature=1.0))
+    prompts, budget = ["123456781", "123456789", "1234567812"], 4
+    alone = [bound(held, budget, key=index) for index, held in enumerate(prompts)]
+    server = Server.from_task(bound, slots=4, capacity=64, admission=4, prefix_cache=True, chunk=chunk,
+                              kv_cache=KVCache(page_size=4, pages=32))
+    cancelled = server.submit("1234567811", budget, key=9)
+    assert cancelled.cancel()
+    tickets = [server.submit(held, budget, key=index) for index, held in enumerate(prompts)]
+    server.step()
+    assert server.prefix_hits == 16
+    assert all(ticket.running() or ticket.done() for ticket in tickets) and cancelled.cancelled()
+    server.run()
+    for ticket, lone in zip(tickets, alone, strict=True):
+        assert_same_generation(ticket.result(), lone)
+
+
 @pytest.mark.parametrize("host_pages, hits, offloaded",
                          [(0, 0, False), (1, 4, False), (8, 8, False), (8, 8, True)],
                          ids=["device", "one-slot", "host", "host beside an offloaded pool"])
@@ -1151,10 +1129,11 @@ def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaim
 
 def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
     """Four samples of one prompt and another prompt behind them, submitted together to a paged server with
-    a prefix cache: the first sample writes the prompt's full pages, the other three wait and read them
-    once written, as vLLM shares a running prompt's blocks, while the other prompt seats past them at
-    once, so 3 x 16 of the 19-token prompt's tokens come from shared pages; each request draws under its
-    own key what its lone call draws (ledger 1423)."""
+    a prefix cache: the first sample writes the prompt's full pages in the step it is seated in, and the
+    other three, seated in that step after it, read them there (`Pages.reserve`'s `whole`), as vLLM shares
+    a running prompt's blocks, the other prompt seated once a slot frees, so 3 x 16 of the 19-token
+    prompt's tokens come from shared pages; each request draws under its own key what its lone call draws
+    (ledger 1423)."""
     bound = task(Sampling(temperature=1.0))
     prompt, other, budget = "1234567812345678912", "9876543", 6
     requests = [prompt] * 4 + [other]
@@ -1164,7 +1143,7 @@ def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alon
     tickets = [server.submit(held, budget, key=index) for index, held in enumerate(requests)]
     server.run()
     assert server.prefix_hits == 3 * 16
-    assert tickets[4].admitted <= tickets[1].admitted
+    assert tickets[0].admitted == tickets[1].admitted == tickets[3].admitted < tickets[4].admitted
     for ticket, lone in zip(tickets, alone, strict=True):
         assert_same_generation(ticket.result(), lone)
 

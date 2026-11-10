@@ -204,21 +204,21 @@ class KimiDeltaAttention(nn.Module):
         def split(part):
             return part.reshape(B, S, self.num_heads, self.head_dim)
 
-        def scan(convolved, *, starts, valid, held, entered=None):
+        def scan(convolved, *, starts, valid, held, forked=None):
             query, key, value = (split(part) for part in convolved)
-            if S == 1 and entered is None:
+            if S == 1 and forked is None:
                 return decode_delta_rule(query, key, value, g, beta, held, starts=starts)
             # A held history can make the convolved operands vary where the projections did not, so the
             # route is asked again of them. The batch's documents' firsts, built once with it
-            # (`Coordinates.firsts`); documents each from a memory of their own (a call over forks,
-            # `held_scan`) name theirs (`entered`), a call's other tokens keeping its memory, as padding does
-            # (exp(0) = 1, beta = 0).
-            kept = None if entered is None else valid
+            # (`Coordinates.firsts`); a forked call's documents from its table (`held_scan`,
+            # `Chunk.loads`), its padded tokens keeping the memory (exp(0) = 1, beta = 0).
+            kept = None if forked is None else valid
+            loads, stores, table = (None, None, 0) if forked is None else forked
             return chunk_gated_delta_rule(
                 query, key, value, g if kept is None else jnp.where(kept[:, :, None, None], g, 0.0),
                 beta if kept is None else jnp.where(kept[:, :, None], beta, 0.0), held, self.chunk_size,
                 starts=starts, max_segments=tokens.max_segments, write_bound=1.0,
-                firsts=tokens.firsts if entered is None else None, entered=entered)
+                firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=table)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv

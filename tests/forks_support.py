@@ -47,7 +47,7 @@ def assert_forks_as_own_rows(module, variables, width: int, layout: str, label: 
     rows = np.tile(documents, (FORKED_ROWS, 1))
     tokens = coordinates(valid=jnp.asarray(rows > 0), segments=jnp.asarray(rows), max_segments=len(enters))
     parents = np.asarray([enters] * FORKED_ROWS, np.int32)
-    forks = Forks(jnp.asarray(parents), depth=Forks.depth_of(parents))
+    forks = Forks(jnp.asarray(parents), depth=Forks.depth_of(parents), held=Forks.held_of(parents))
     call = MixerCall(AttentionMetadata(coordinates=dataclasses.replace(tokens, forks=forks)))
     begins = dict(zip((number for number, _ in placed), np.cumsum([0, *(length for _, length in placed)]),
                       strict=False))

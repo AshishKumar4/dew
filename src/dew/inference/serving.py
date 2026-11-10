@@ -73,7 +73,7 @@ import logging
 import math
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -98,7 +98,7 @@ from dew.batch import (
     token_validity,
 )
 from dew.inference.engine import Timed, Waiting, normalized, reloaded, settled
-from dew.inference.pages import Pages, States, prefix_hashes, segment_hash
+from dew.inference.pages import Pages, States, prefix_hashes
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
     Admission,
@@ -106,7 +106,6 @@ from dew.inference.serving_kernel import (
     Draws,
     Paged,
     Placement,
-    copy_program,
     decode_programs,
     dispatched,
     entry_programs,
@@ -314,10 +313,6 @@ class _Row:
     restore: int | None = None
     """The `States` entry the row's slot starts from after its shared prefix pages, before its first piece;
     None where it starts afresh."""
-    shared: int | None = None
-    """The prompt tokens the request declares a segment other requests share (`Server.submit`), whose
-    keys and state the server keeps at its end and reads there for a prompt that starts with it; None for
-    none."""
     snapshots: tuple[int, ...] = ()
     """The prompt lengths, page boundaries past its shared prefix, after which the row's state is kept for a
     later prompt that shares its pages (`PagedRows.boundaries`)."""
@@ -359,7 +354,8 @@ class DenseRows:
         """The capacity check `check_inputs` makes covers a dense row."""
 
     def seat(self, queue: deque[_Row], free: list[list[int]], admission: int) -> list[tuple[int, _Row]]:
-        """Seat queued requests in order; `free` is each group's free slots."""
+        """Seat queued requests in order, each running from here (`_seated`'s); `free` is each group's free
+        slots. A request cancelled while it waited leaves the queue unseated."""
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
         while queue:
@@ -368,7 +364,9 @@ class DenseRows:
             if not open_groups:
                 break
             group = max(open_groups, key=lambda group: len(free[group]) - taken[group])
-            seated.append(_seated_in(group, free, taken, queue.popleft()))
+            row = queue.popleft()
+            if row.ticket.set_running_or_notify_cancel():
+                seated.append(_seated_in(group, free, taken, row))
         return seated
 
     def table(self, row: _Row) -> list[int]:
@@ -446,13 +444,10 @@ class PagedRows:
 
     def boundaries(self, row: _Row, size: int) -> tuple[int, ...]:
         """The page boundaries past the row's shared prefix after which its state is kept: its deepest
-        shareable one, the pages before its last token, and every `every` pages below it; and the end of
-        the segment it declares shared, wherever it ends."""
+        shareable one, the pages before its last token, and every `every` pages below it."""
         deepest = (len(row.prompt) - 1) // size
         kept = {page * size for page in {deepest, *(range(self.every, deepest, self.every) if self.every
                                                      else ())}}
-        if row.shared is not None:
-            kept.add(row.shared)
         return tuple(sorted(boundary for boundary in kept if boundary > row.prefilled))
 
     def refuse(self, length: int, budget: int) -> None:
@@ -463,20 +458,25 @@ class PagedRows:
             raise ValueError(f"the request needs {needed} pages; the pool holds {part.count}{where}")
 
     def seat(self, queue: deque[_Row], free: list[list[int]], admission: int) -> list[tuple[int, _Row]]:
-        """Seat queued requests in order while some group's part of the pool covers the next one."""
+        """Seat queued requests in order while some group's part of the pool covers the next one, each
+        running from here (`_seated`'s); a request cancelled while it waited leaves the queue unseated, so
+        no prompt seated after it names the pages it would have written. A row prefilling the rest of its
+        prompt in the step it is seated in writes its full prompt pages in it, which a prompt seated after
+        it in the step names at once (`Pages.reserve`'s `whole`)."""
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
         for row in list(queue):
-            if any(part.waits(row.prompt, row.salt, row.shared) for part in self.pages):
-                # Another row writes this prompt's next page, or its segment, now: it reads it once written.
+            if any(part.waits(row.prompt, row.salt) for part in self.pages):
+                # Another row writes this prompt's next page in a later step: it reads it once written.
                 continue
             open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
-                                 key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt,
-                                                                                 row.shared)),
+                                 key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt)),
                                                     self.pages[group].available), reverse=True)
             for group in open_groups:
                 part = self.pages[group]
-                reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt, row.shared)
+                held = len(part.shared(row.prompt, row.salt)) * part.size
+                whole = self.chunk is None or len(row.prompt) - held <= self.chunk
+                reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt, whole=whole)
                 if reserved is not None:
                     row.pages, row.prefilled, entry, row.writing = reserved
                     row.restore = None if entry is None else group * self.states + entry
@@ -488,6 +488,11 @@ class PagedRows:
                 break
             # By identity: a row is one request, and its arrays compare by value.
             queue.remove(row)
+            if not row.ticket.set_running_or_notify_cancel():
+                # Cancelled while it waited: its reservation goes back before any later prompt names it.
+                row.group = group
+                self.release(row)
+                continue
             seated.append(_seated_in(group, free, taken, row))
         return seated
 
@@ -499,7 +504,7 @@ class PagedRows:
         where every key came from the weights served now, and not where it was seated before a
         reload and its earlier pieces kept the old weights' keys."""
         if row.weights == self.weights:
-            self.pages[row.group].publish(row.prompt, row.pages, row.salt, row.shared)
+            self.pages[row.group].publish(row.prompt, row.pages, row.salt)
         self.pages[row.group].written(row.writing)
         row.writing = ()
 
@@ -511,16 +516,13 @@ class PagedRows:
 
     def kept(self, row: _Row) -> int | None:
         """The `States` entry, global over the groups, that keeps the row's state after its prompt's first
-        `row.prefilled` tokens, a boundary its piece ended at, a page's or its shared segment's end
-        (`segment_hash`); None where one is held already, or the row's keys came from weights a reload
-        replaced."""
+        `row.prefilled` tokens, a page boundary its piece ended at (`boundaries`); None where one is held
+        already, or the row's keys came from weights a reload replaced."""
         part = self.pages[row.group]
         if part.states is None or row.weights != self.weights:
             return None
-        pages = row.prefilled // part.size
-        entry = part.states.take(segment_hash(row.prompt, part.size, row.prefilled, row.salt)
-                                 if row.prefilled % part.size else
-                                 prefix_hashes(row.prompt, part.size, pages, row.salt)[-1])
+        digest = prefix_hashes(row.prompt, part.size, row.prefilled // part.size, row.salt)[-1]
+        entry = part.states.take(digest)
         return None if entry is None else row.group * self.states + entry
 
     def reloaded(self) -> None:
@@ -755,8 +757,6 @@ class Server:
         if isinstance(rows, PagedRows) and rows.pages[0].host:
             self._host = {}
             self._read_pages, self._written_pages = map(Fetched, page_programs(formats, self._admitted))
-        if isinstance(rows, PagedRows) and rows.pages[0].prefix_cache:
-            self._copy_pages = Fetched(copy_program(formats))
 
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
@@ -943,7 +943,7 @@ class Server:
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
-               key: int | jax.Array, adapter: str | None = None, shared: int | None = None) -> Ticket:
+               key: int | jax.Array, adapter: str | None = None) -> Ticket:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
@@ -962,22 +962,13 @@ class Server:
         adapter set's (`dew.lora.AdapterSet`), each row drawing under its own:
         a request draws what a task over that adapter alone draws, and the
         base model's where it names none.
-        `shared` declares the prompt's first `shared` tokens a segment other
-        requests share, wherever it ends (a decision's encoded state, each
-        question past it a request of its own): a paged server with
-        `prefix_cache` keeps the keys and the row state at its end, and a
-        request whose prompt starts with the same segment, declaring it too,
-        prefills only its rest, the page the segment ends inside copied into
-        its own (`dew.inference.pages.segment_hash`). Such requests submitted
-        together wait for the first to write it. A segment ends between two
-        tokens no group (a block, an image) holds both of.
         """
         # One row's key, folded the way `RowPlan.keys` folds row zero.
-        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0, adapter, shared)
+        return self._enqueued(prompt, max_new_tokens, _seed(key, self.prng), 0, adapter)
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
-                  fold: int, adapter: str | None = None, shared: int | None = None) -> Ticket:
-        row = self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared)
+                  fold: int, adapter: str | None = None) -> Ticket:
+        row = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
         if row.budget:
             self._waiting.append(row)
         else:
@@ -988,7 +979,7 @@ class Server:
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int,
-                  adapter: str | None = None, shared: int | None = None) -> _Row:
+                  adapter: str | None = None) -> _Row:
         names = adapter_names(self.model)
         if adapter is not None and adapter not in names:
             raise ValueError(f"this server's model holds no adapter named {adapter!r}"
@@ -1063,24 +1054,8 @@ class Server:
                     hasher.update(held[:reach].tobytes())
                 hasher.update(tokens[:reach].tobytes())
             salt = hasher.digest()
-        if shared is not None:
-            self._check_segment(shared, len(tokens), groups)
         return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups,
-                    adapter=chosen, shared=shared)
-
-    def _check_segment(self, shared: int, length: int, groups: Mapping[str, np.ndarray]) -> None:
-        """Refuse a declared shared segment (`submit`'s) that no server of these rows keeps, that holds
-        none of the prompt's tokens or every one (the last is computed, its logits the first draw's), or
-        that ends inside a group, whose members' keys are computed together."""
-        if not isinstance(self.rows, PagedRows) or not self.rows.pages[0].prefix_cache:
-            raise ValueError("a shared segment is kept by a paged server with prefix_cache=True")
-        if not 0 < shared < length:
-            raise ValueError(f"a shared segment holds 1 to {length - 1} of the prompt's {length} tokens, "
-                             f"got {shared}")
-        for name, held in groups.items():
-            if np.intersect1d(held[:shared][held[:shared] >= 0], held[shared:]).size:
-                raise ValueError(f"the shared segment ends inside a group of {name}, whose members' keys are "
-                                 f"computed together")
+                    adapter=chosen)
 
     def _book_capture(self, slot: int, row: _Row) -> None:
         """Keep the state the call leaves in `slot` where the row's piece ends at a boundary it keeps
@@ -1157,14 +1132,12 @@ class Server:
         # seating's does; each process's captures and page copies come back with it.
         (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
         captures = [tuple(pair) for held in booked for pair in held["captures"]]
-        copies, spills, uploads, state_spills, state_uploads = (
+        spills, uploads, state_spills, state_uploads = (
             [tuple(pair) for held in booked for pair in held[name]]
-            for name in ("copies", "spills", "uploads", "state_spills", "state_uploads"))
+            for name in ("spills", "uploads", "state_spills", "state_uploads"))
         with self._context():
-            # Spills read reclaimed pages before anything writes them (a copy's fresh page may be one), and
-            # a copy reads its segment's page after an upload lands it there.
+            # Spills read reclaimed pages before anything writes them.
             self._transferred(spills, uploads)
-            self._copied(copies)
             # A state giving way goes to the host, and one a seated row reads comes back, before restores.
             self._moved_states(state_spills, state_uploads)
             if restores:
@@ -1207,7 +1180,7 @@ class Server:
         """The page copies this process's seating owes (`dew.inference.pages.Transfers`), by the pool's and
         the host tier's global page and slot: its groups' pages and slots lie at their groups' offsets."""
         if not isinstance(self.rows, PagedRows):
-            return {"copies": [], "spills": [], "uploads": [], "state_spills": [], "state_uploads": []}
+            return {"spills": [], "uploads": [], "state_spills": [], "state_uploads": []}
         per, host = self.rows.pages[0].count, self.rows.pages[0].host
         owed = [(group, self.rows.pages[group].drained()) for group in self._local]
         # The row states' moves, by the store's global entry and its own host tier's global slot.
@@ -1215,9 +1188,7 @@ class Server:
         state_host = 0 if self.rows.pages[0].states is None else self.rows.pages[0].states.host.slots
         moved = [(group, (([], []) if part.states is None else part.states.drained()))
                  for group, part in ((group, self.rows.pages[group]) for group in self._local)]
-        return {"copies": [[group * per + source, group * per + page] for group, held in owed
-                           for source, page in held.copies],
-                "spills": [[group * per + page, group * host + slot] for group, held in owed
+        return {"spills": [[group * per + page, group * host + slot] for group, held in owed
                            for page, slot in held.spills],
                 "uploads": [[group * host + slot, group * per + page] for group, held in owed
                             for slot, page in held.uploads],
@@ -1225,21 +1196,6 @@ class Server:
                                  for group, (spills, _) in moved for entry, slot in spills],
                 "state_uploads": [[group * state_host + slot, group * entries + entry]
                                   for group, (_, uploads) in moved for slot, entry in uploads]}
-
-    def _copied(self, copies: Sequence[tuple[int, int]]) -> None:
-        """Copy each shared segment's last page into the fresh page a prompt sharing it writes past the
-        segment (`dew.inference.pages.Transfers.copies`), after the spills and uploads (`_transferred`):
-        a copy's fresh page may be a reclaimed one a spill reads first, and its segment's page one an
-        upload lands; an admission's width a call so one program serves every step."""
-        if not copies:
-            return
-        assert isinstance(self.rows, PagedRows)
-        width = self.admission * self.rows.width
-        for start in range(0, len(copies), width):
-            sources, targets = (np.full(width, DROPPED, np.int32) for _ in range(2))
-            for index, (source, target) in enumerate(copies[start:start + width]):
-                sources[index], targets[index] = source, target
-            self._resident, self._carried = self._copy_pages(self._resident, self._carried, sources, targets)
 
     def _transferred(self, spills: Sequence[tuple[int, int]], uploads: Sequence[tuple[int, int]]) -> None:
         """Make the page copies every process's seating owes before the step's program writes any page: each
@@ -1376,15 +1332,12 @@ class Server:
         # Another process's groups hold no slot this one seats.
         free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
                 if group in self._local else [] for group in range(self.groups)]
+        # The seating runs each request it seats and leaves one cancelled while it waited unseated.
         seated = self.rows.seat(self._waiting.queue, free, share)
         # After seating: a request another thread submitted while the queue
         # was read is seated too, and is admitted after it was submitted.
         now = time.perf_counter()
         for slot, row in seated:
-            if not row.ticket.set_running_or_notify_cancel():
-                # Cancelled while it waited: its slot stays free, and its reservation goes back.
-                self.rows.release(row)
-                continue
             self.prefix_hits += row.prefilled
             row.ticket.admitted = now
             self._rows[slot] = row

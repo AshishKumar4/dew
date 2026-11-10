@@ -891,7 +891,9 @@ def packed_coordinates(batch: Mapping[str, object], stop: int | None = None) -> 
     laid = coordinates(segments.shape, segments=segments,
                        positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :stop],
                        max_segments=parents.shape[1])
-    return replace(laid, forks=Forks(parents, depth=1))
+    # A shared prompt's chains each continue it, a prompt continuing nothing: at most half a row's documents
+    # are continued (`Forks.held`).
+    return replace(laid, forks=Forks(parents, depth=1, held=max(parents.shape[1] // 2, 1)))
 
 
 def routing_of[Leaf](batch: Mapping[str, Leaf]) -> Leaf | dict[str, Leaf] | None:

@@ -162,7 +162,7 @@ def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
     XLA's, and XLA's independently checked float64 truth. The kernel and the scan, two Dew paths,
     compile without YNNPACK fusions on the CPU lane (`without_ynn`)."""
     mine = without_ynn(lambda operands, seeded: evaluated(
-        lambda *o: _chunk_scan(*o, chunk_size, platform), operands, seeded))
+        lambda *o: _chunk_scan(*o, None, chunk_size, platform), operands, seeded))
     xla = without_ynn(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
@@ -313,7 +313,7 @@ def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, 
     operands, seeded = case_draw(reference, kind, case)(0)
     chunk_size = case[0] if kind == "fixture" else case[1]
     run = jax.jit(lambda inputs, cotangents: evaluated(
-        lambda *args: _chunk_scan(*args, chunk_size, "tpu"), inputs, cotangents))
+        lambda *args: _chunk_scan(*args, None, chunk_size, "tpu"), inputs, cotangents))
     actual = jax.tree.map(np.asarray, run(operands, seeded))
     expected = {"output": operands[0], "final": operands[-1],
                 **dict(zip(("x", "B", "C", "A dt", "state"), operands, strict=True))}
@@ -337,6 +337,84 @@ def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, 
                                           without_state["output"][row, prefix:])
             np.testing.assert_array_equal(actual["final"][row], without_state["final"][row])
             np.testing.assert_array_equal(final_only["state"][row], np.zeros_like(final_only["state"][row]))
+
+
+DOCUMENTS = ((0, 70, 100), (0, 40, 150))
+"""Each row's documents' first steps, over rows of 190 steps: a document that ends inside a chunk, one
+shorter than a chunk, and one longer than two."""
+
+FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
+"""Each row's documents' table slots and stored slots (`recurrence_chunk.Chunk.loads`, `Chunk.stores`), one
+given memory a row then two stored: the first row's start continued by its first document, whose final both
+later ones enter; the second row a chain from its start, each document entering its predecessor's final.
+Every memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each
+draw."""
+
+
+def documents_draw(seed: int):
+    """Two rows of three documents (`DOCUMENTS`) of a forked call (`FORKED`) over one given memory a row,
+    and cotangents of the output and the row's last memory."""
+    x, dt, A, B, C, _, _ = mixer_operands((2, 190, 2, 16, 16, 1), seed)
+    x, b, c, a = (jnp.asarray(t, jnp.float32) for t in ssd_operands(x, dt / 64, A, B, C, 1))
+    keys = jax.random.split(jax.random.key(seed + 11), 3)
+    given = 0.3 * jax.random.normal(keys[0], (2, 1, 2, 16, 16), jnp.float32)
+    seeded = (jax.random.normal(keys[1], x.shape, jnp.float32),
+              jax.random.normal(keys[2], (2, 2, 16, 16), jnp.float32))
+    return (x, b, c, a, given), seeded
+
+
+def documents_on_the_kernel(x, b, c, a, given):
+    """The kernel over a forked call, each document laid from a chunk's edge and taking its table slot's
+    memory up there (`recurrence_chunk._ported_documents`): the output and the row's last memory."""
+    from dew.nn.kernels.recurrence_chunk import AlignedDocuments, Forked, _ported_documents
+
+    loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
+    forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, None, 2)
+    aligned, documents = _ported_documents(given, forked, x.shape[1], 64)
+    assert isinstance(aligned, AlignedDocuments)
+    laid = aligned.laid(x, b, c, a)
+    start = jnp.zeros((x.shape[0], *given.shape[2:]), jnp.float32)
+    y, final = _chunk_scan(*laid, start, documents, 64, "tpu", 2)
+    return aligned.unlaid(y), final
+
+
+def documents_one_by_one(x, b, c, a, given):
+    """Each document a sequence of its own, a step at a time (`stepwise_scan`), in the row's order from its
+    table slot's memory: a given one, or the final an earlier document stored."""
+    rows, lasts = [], []
+    ends = np.concatenate([np.asarray(DOCUMENTS), np.full((2, 1), x.shape[1])], axis=1)
+    for row in range(x.shape[0]):
+        outs, table, final = [], [*given[row], None, None], None
+        loads, stores = FORKED[row]
+        for index, (first, end) in enumerate(zip(ends[row, :-1], ends[row, 1:], strict=True)):
+            span = slice(int(first), int(end))
+            entering = table[loads[index] - 1] if loads[index] else jnp.zeros_like(given[row, 0])
+            y, final = stepwise_scan(x[row:row + 1, span], b[row:row + 1, span], c[row:row + 1, span],
+                                     a[row:row + 1, span], entering[None])
+            outs.append(y[0])
+            if stores[index]:
+                table[given.shape[1] + stores[index] - 1] = final[0]
+        rows.append(jnp.concatenate(outs, axis=0))
+        lasts.append(final[0])
+    return jnp.stack(rows), jnp.stack(lasts)
+
+
+def test_documents_entering_their_own_states_scan_as_each_alone():
+    """The TPU kernel over a forked call (a request's questions over its shared prefix's state, a chain's
+    each over its predecessor's, `Chunk.loads`): each document laid from a chunk's edge, the kernel's carry
+    taking its table slot's state up there and its resident table keeping the finals its documents store;
+    its output, the row's last state and every operand's gradient, the given states' included, as each
+    document scanned alone a step at a time in the row's order, from float64 (check 1)."""
+    def under(scan):
+        def run(operands, seeded):
+            output, *gradients = with_gradients(lambda *o: scan(*o))(*operands, seeded)
+            return dict(zip(("output", "final", "x", "B", "C", "A dt", "given"),
+                            (*output, *gradients[:5]), strict=True))
+        return run
+
+    mine = without_ynn(under(documents_on_the_kernel))
+    theirs = jax.jit(under(documents_one_by_one))
+    assert_as_exact(mine, theirs, documents_draw, "the TPU kernel's forked call", seeds=24)
 
 
 @pytest.mark.tpu(reason="the recurrence matrix's TPU cells run on the TPU tier's own TPU")

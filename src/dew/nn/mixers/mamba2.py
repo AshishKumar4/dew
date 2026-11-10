@@ -105,18 +105,19 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     return out, jnp.swapaxes(final, -1, -2)
 
 
-def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=None, entered=None):
+def _chunked(x, dt, A, B, C, D, held=None, chunk_size: int = CHUNK_SIZE, starts=None, forked=None):
     """`chunk_ssd` with its state `[B, H, N, P]`, keys by values, as the recurrence holds it
-    (`recurrence.Step`'s): the layer's own, which its decode cache holds so (`Mamba2`). Where `entered`
-    `[B, D]` is given, each packed document enters a state of its own, `held` `[B, D, H, N, P]`
-    (`recurrence_chunk.Chunk.entered`)."""
+    (`recurrence.Step`'s): the layer's own, which its decode cache holds so (`Mamba2`). A forked call's
+    documents from its table (`forked` its `(loads, stores, held)`, `held` its given states `[B, S', H, N,
+    P]`, `recurrence_chunk.Chunk.loads`)."""
     operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
     x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
     dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
     held = None if held is None else jnp.asarray(held, work)
-    return chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts, entered=entered),
-                 chunk_size=chunk_size, dtype=work)
+    loads, stores, table = (None, None, 0) if forked is None else forked
+    return chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts, loads=loads,
+                            stores=stores, held=table), chunk_size=chunk_size, dtype=work)
 
 
 SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
@@ -427,7 +428,7 @@ class Mamba2(nn.Module):
 
 def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
          state_size: int, chunk_size: int, time_step_limit, starts=None, valid=None, held=None,
-         axis: str | None = None, entered=None):
+         axis: str | None = None, forked=None):
     """The scan after the conv: `convolved` `[B, S, conv_dim]` split into
     `x`, `B` and `C`, the step through softplus with its bias and the limit,
     then the recurrent step for one token and the chunked scan otherwise.
@@ -451,10 +452,10 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     if valid is not None:
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
-    if length == 1 and axis is None and entered is None:
+    if length == 1 and axis is None and forked is None:
         out, final = decoded_ssd(xs, step, A, B, C, D, held, starts)
     else:
-        out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts, entered=entered)
+        out, final = _chunked(xs, step, A, B, C, D, held, chunk_size, starts=starts, forked=forked)
     if axis is not None:
         log_decay = A * step                                # [B, S, H]
         if starts is not None:

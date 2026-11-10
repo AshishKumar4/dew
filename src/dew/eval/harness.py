@@ -77,10 +77,11 @@ def _scored(model: nn.Module, variables, rows: ModelInputs) -> tuple[jax.Array, 
 
 
 def _scoring_inputs(rows: list[list[int]], contexts: list[int], prefix: int | Literal["prompt"] | None,
-                    share: bool) -> tuple[ModelInputs, ForkedRows]:
+                    share: bool, size: int) -> tuple[ModelInputs, ForkedRows]:
     """`rows`, each its context's first `contexts` ids and its continuation after, packed into windows as
     the scorer reads them (`ForkedRows`): with `share`, a context its continuations share computed once for
-    them all, else each row in a window of its own. Under a prefix run, each context's blocks a server
+    them all, else each row in a window of its own, at most half a batch of `size` rows' contexts shared
+    (`Forks.held`), a bound every batch keeps. Under a prefix run, each context's blocks a server
     makes of a prompt (`served_blocks`, the context whole under "prompt"), each continuation token in no
     block (-1), so a continuation is scored as its generation reads it."""
     fields = None
@@ -90,7 +91,8 @@ def _scoring_inputs(rows: list[list[int]], contexts: list[int], prefix: int | Li
                                           -1).astype(np.int32) for row, context in zip(rows, contexts,
                                                                                          strict=True)]}
     width = max(len(row) for row in rows)
-    forks = ForkedRows.pack(rows, width, share=share, fields=fields, documents=None if share else 1)
+    forks = ForkedRows.pack(rows, width, share=share, fields=fields, documents=None if share else 1,
+                            continued=max(size // 2, 1))
     return ModelInputs(jnp.asarray(forks.tokens), token_fields={
         COORDINATES_FIELD: forks.coordinates, **{name: jnp.asarray(value) for name, value in
                                                  forks.fields.items()}}), forks
@@ -306,7 +308,8 @@ class DewLM(TemplateLM):
         for batch in _batches(len(rows), self.batch_size):
             inputs, forks = _scoring_inputs(
                 [rows[index] for index in batch],
-                [len(rows[index]) - len(requests[index][2]) for index in batch], self.task.prefix, share)
+                [len(rows[index]) - len(requests[index][2]) for index in batch], self.task.prefix, share,
+                self.batch_size)
             scoring = program(_scored, self.task.model, static_argnums=(0,))
             # Scored in the attention form the run trained in, as its generation is (`SavedRunTask.traced`).
             with self.task.traced():

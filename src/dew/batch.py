@@ -199,7 +199,13 @@ class Forks:
     (`positions`). So a document computes what its own row of its ancestors and itself computes, and a
     prefix that several continue is computed once: a request's questions over its state, a prompt's
     completions, a speculative tree's candidates (each a document of one token). `dew.batch.ForkedRows`
-    packs rows that share prefixes into such documents."""
+    packs rows that share prefixes into such documents. A document's parent is laid before it in its row,
+    so one walk over the row in order computes every parent before its children.
+
+    `held`, static, is the most of a row's documents that another continues, which a recurrent layer
+    keeps the final memories of (`dew.nn.linear.forked_scan`): its layout's own bound, one value a run (a
+    request's shared part a window's row, a pair's prompt, a tree's inner nodes), never the documents bound;
+    None where it states none, which a recurrent layer refuses."""
 
     parents: jax.Array | np.ndarray
     depth: int = struct.field(pytree_node=False, default=1)
@@ -207,6 +213,7 @@ class Forks:
     """Whether each tree's documents are one row's, read together, its dropout drawn once (a decision
     row's questions with siblings, `QuestionLayout.siblings`), rather than rows a shared prefix stands in
     for, each of which would draw its own (`dew.nn.backbones.decoder_refusals.forked`)."""
+    held: int | None = struct.field(pytree_node=False, default=None)
 
     @property
     def count(self) -> int:
@@ -331,6 +338,13 @@ class Forks:
             hi = jnp.where(kept, hi, jnp.where(pad & (index == 0), slots + 1, 0))
             runs.append(jnp.stack([lo, hi], axis=-1))
         return jnp.stack(runs, axis=2).astype(jnp.int32)
+
+    @staticmethod
+    def held_of(parents) -> int:
+        """The most of a row's documents another continues, of `parents` `[B, D]` (host arrays): the
+        `held` a layout packed ahead states, its plan's whole."""
+        parents = np.asarray(parents, np.int64)
+        return max((len(set(row[row > 0].tolist())) for row in parents), default=0)
 
     @staticmethod
     def depth_of(parents) -> int:

@@ -89,7 +89,8 @@ class ForkedRows:
     def pack(cls, rows: Sequence[Sequence[int]], width: int, *, windows: int | None = None,
              length: int | None = None, documents: int | None = None, blocks: int = 1, share: bool = True,
              positions: Sequence[Sequence[int]] | None = None,
-             fields: Mapping[str, Sequence[np.ndarray]] | None = None, xp=np) -> ForkedRows:
+             fields: Mapping[str, Sequence[np.ndarray]] | None = None, continued: int | None = None,
+             xp=np) -> ForkedRows:
         """`rows` (token ids, each at least one) packed into windows of `width` slots, each group of rows
         that begin alike over one copy of their common prefix.
 
@@ -103,8 +104,10 @@ class ForkedRows:
         so `documents=1` lays each row in a window of its own, as the rows laid out alone are.
         `positions` are each row's tokens' places, its indices where None. `length` is the rows' laid
         length `L` (the longest row's where None) and `documents` the documents a window may hold (the
-        most any holds where None): stated, they keep a compiled program's shapes across calls. `xp` is
-        the array module the result is in."""
+        most any holds where None): stated, they keep a compiled program's shapes across calls, as
+        `continued` does the most of a window's documents another continues (`Forks.held`: the most any
+        window holds where None, a pack planned whole; a flow packing batch by batch states its own bound,
+        such as half the rows a batch). `xp` is the array module the result is in."""
         if width < 1 or blocks < 1:
             raise ValueError(f"windows hold at least one slot in at least one block, got width {width} and "
                              f"{blocks} blocks")
@@ -135,7 +138,7 @@ class ForkedRows:
         for block, plan in enumerate(plans):
             for at, window in enumerate(plan):
                 layout.write(block * held + at, at, window, laid, places, extra)
-        return layout.forked(blocks, xp)
+        return layout.forked(blocks, xp, continued)
 
 
 def window_forks(segments: np.ndarray, local: np.ndarray, parent: np.ndarray,
@@ -320,15 +323,22 @@ class _Layout:
                     first = document(row, prefix, size, root)
                     self.index[row, prefix:size] = local * self.width + first + np.arange(size - prefix)
 
-    def forked(self, blocks: int, xp) -> ForkedRows:
-        """The windows as `ForkedRows`, in the array module `xp`."""
+    def forked(self, blocks: int, xp, continued: int | None = None) -> ForkedRows:
+        """The windows as `ForkedRows`, in the array module `xp`, at most `continued` of a window's documents
+        another continues (`Forks.held`; the most any holds where None)."""
         laid = coordinates(segments=self.segments, valid=self.segments > 0, positions=self.positions,
                            max_segments=self.documents, xp=np)
         depth = Forks.depth_of(self.parents)
         # Windows of whole rows alone are plain packed rows, which every model reads. A window's real tokens
         # are its first (`right_padded`), so each document's is a run its conv reads in place (`forked_conv`).
         if depth:
-            laid = dataclasses.replace(laid, forks=Forks(self.parents, depth=depth), right_padded=True)
+            held = Forks.held_of(self.parents)
+            if continued is not None and held > continued:
+                raise ValueError(f"a window's {held} documents another continues are past the {continued} "
+                                 "its flow states (`Forks.held`)")
+            laid = dataclasses.replace(laid, forks=Forks(self.parents, depth=depth,
+                                                         held=held if continued is None else continued),
+                                       right_padded=True)
         if xp is not np:
             laid = jax.tree.map(xp.asarray, laid)
         return ForkedRows(xp.asarray(self.tokens), laid, xp.asarray(self.index),

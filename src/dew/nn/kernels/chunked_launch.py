@@ -119,9 +119,7 @@ class Sequences(NamedTuple):
     `[N, SPAN]` is each sequence's first token and count, the slot its second chunk enters less one,
     the slots its first chunk enters and its last leaves, the call's memory it takes and gives back
     (`h0`'s and the final's index), and whether it takes it and gives it back. Sequences never cross
-    rows, so a row's first sequence takes its initial memory and its last gives its final one; where
-    each of a row's documents enters a memory of its own (`documents`), each of its sequences takes and
-    gives back its document's, `row * documents + d` for the row's `d`-th.
+    rows, so a row's first sequence takes its initial memory and its last gives its final one.
 
     The memories are stored by where they pass, not by chunk: one slot for each that passes between
     two chunks of a sequence, then a slot a memory, its initial one, which its first chunk enters, and
@@ -143,21 +141,18 @@ SPAN = 8
 """The columns of a sequence's span (`Sequences.spans`)."""
 
 
-def slots(spans: Sequences, batch: int, length: int, chunk: int = 64, memories: int | None = None) -> int:
+def slots(spans: Sequences, batch: int, length: int, chunk: int = 64) -> int:
     """How many memories the kernels store for `spans` over `batch` rows of `length` tokens
-    (`Sequences`): those passing between chunks, each of the call's `memories` (a row's each where None),
-    and a slot of zeros where documents are packed, whose sequences take more chunks than the rows'
-    own."""
+    (`Sequences`): those passing between chunks, a row's each, and a slot of zeros where documents are
+    packed, whose sequences take more chunks than the rows' own."""
     packed = spans.chunks.shape[0] != batch * -(-length // chunk)
-    return _passing(batch, length, chunk, packed) + (memories or batch) + packed
+    return _passing(batch, length, chunk, packed) + batch + packed
 
 
-def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64,
-              documents: int | None = None) -> Sequences:
+def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> Sequences:
     """The spans of `cu_seqlens` (`[N + 1]` int32 over the `batch * length` tokens, each row's
-    boundaries among them, at most `documents` a row where each enters a memory of its own), or of the
-    rows themselves where None. A traced `cu_seqlens` takes the most chunks its N sequences can split
-    `batch * length` tokens into."""
+    boundaries among them), or of the rows themselves where None. A traced `cu_seqlens` takes the most
+    chunks its N sequences can split `batch * length` tokens into."""
     # The rows' own spans are constants; a traced `cu_seqlens` takes the same arithmetic in XLA.
     xp = np if cu_seqlens is None else jnp
     packed = cu_seqlens is not None
@@ -175,13 +170,8 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64,
     # A memory's slots follow the passing ones, and the zeros theirs.
     passing = _passing(batch, length, chunk, packed)
     row = first // length
-    if documents is None:
-        memory, takes, gives = row, first % length == 0, (first + lengths) % length == 0
-    else:
-        # Each row's sequences in its documents' order, the first at the row's first token.
-        memory = row * documents + xp.arange(first.shape[0]) - xp.searchsorted(first, row * length)
-        takes = gives = lengths > 0
-    zeros = passing + batch * (documents or 1)
+    memory, takes, gives = row, first % length == 0, (first + lengths) % length == 0
+    zeros = passing + batch
     entered = xp.where(takes, passing + memory, zeros)
     left = xp.where(gives, passing + memory, zeros)
     index = xp.arange(count, dtype=np.int32)

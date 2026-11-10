@@ -505,12 +505,12 @@ class KeyKept(NamedTuple):
 def _first_decays(dg, run, dh0):
     """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales, as
     fla_kda's port takes it (`fla_kda.first_decay_grad`): `<h0, dh0>` over the values for a sequence that
-    takes its memory (begins its row, or a document entering its own), exactly zero for any other, which
+    takes its memory (begins its row), exactly zero for any other, which
     starts from no memory. Cumulated from its chunk's end, that token's gradient is every term of its chunk,
     which cancel to fp32's residue where the memory is zero: rows of float64 zero 1.5e-7 from it against fla's
     3.3e-9 (row 5194, M-JS-26-a100)."""
     call = run.call
-    shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.memories, -1)
+    shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.batch, -1)
     first, sizes, row, begins = (run.sequences[:, i] for i in range(4))
     value = jnp.where((begins == 1)[:, None], shared[row], 0.0)
     index = jnp.where(sizes > 0, first * call.chunk, call.rows)

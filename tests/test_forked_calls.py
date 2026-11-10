@@ -206,7 +206,9 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
 
 def test_a_mask_beside_forks_narrows_what_they_read():
     """A call's pairwise mask beside its forks reads a key where both let it (`call_visibility`): the same
-    as the call whose mask is already the forks' visibility narrowed by it, over drawn weights (check 1)."""
+    as the call whose mask is already the forks' visibility narrowed by it, over drawn weights (check 1),
+    each held to the float64 twin's narrowed call: a model of a stated `dtype` computes in it whatever its
+    inputs, so the reference widened would be the reference again, its rounding no truth's."""
     from dew.nn.attention_masks import visibility_mask
 
     model = attention_model(attention_impl="xla")
@@ -229,13 +231,15 @@ def test_a_mask_beside_forks_narrows_what_they_read():
         return jnp.where(real, model.apply(variables, forks.tokens, coordinates=laid,
                                            attention_pairwise_mask=mask), 0)
 
-    def narrowed(variables):
-        return jnp.where(real, model.apply(variables, forks.tokens, coordinates=plain,
-                                           attention_pairwise_mask=mask & seen), 0)
+    def narrowed(model):
+        def run(variables):
+            return jnp.where(real, model.apply(variables, forks.tokens, coordinates=plain,
+                                               attention_pairwise_mask=mask & seen), 0)
+        return run
 
-    assert_as_exact(jax.jit(beside), jax.jit(narrowed),
+    assert_as_exact(jax.jit(beside), jax.jit(narrowed(model)),
                     lambda seed: (initialized(jax.random.key(seed), jnp.ones((1, WIDTH), jnp.int32)),),
-                    "a mask beside forks", seeds=FORK_SEEDS)
+                    "a mask beside forks", seeds=FORK_SEEDS, truth_fn=narrowed(float64_twin(model)))
 
 
 # ---------------------------------------------------------------- a cached call over a tree of candidates
@@ -269,7 +273,7 @@ def tree_coordinates(tree: tuple[int, ...], rows: int, base: int, valid=None):
     at the root's `base` plus its depth (`Forks.positions`)."""
     segments = jnp.broadcast_to(jnp.arange(1, len(tree) + 1, dtype=jnp.int32), (rows, len(tree)))
     parents = np.asarray([[parent + 1 for parent in tree]] * rows, np.int32)
-    forks = Forks(jnp.asarray(parents), depth=Forks.depth_of(parents))
+    forks = Forks(jnp.asarray(parents), depth=Forks.depth_of(parents), held=Forks.held_of(parents))
     laid = coordinates(segments=segments, valid=valid, max_segments=len(tree),
                        positions=forks.positions(segments, jnp.full((rows,), base, jnp.int32), valid))
     return dataclasses.replace(laid, forks=forks)
@@ -317,7 +321,8 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
     document and its own ancestors alone (`fork_anchor`: the cache's run from that document's first slot):
     each token's logits are on par with the tree after the last document prefilled alone (check 1), so the
     earlier document never leaks into the verify, as a packed prompt's continuation reads its last document
-    alone."""
+    alone; each held to the float64 twin's tree after the document alone, as a model of a stated `dtype`
+    computes in it whatever its inputs."""
     model = attention_model(max_seq_len=16)
     rows = 2
     initialized = jax.jit(model.init)
@@ -328,7 +333,7 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
         ids = jax.random.randint(key, (rows, 6 + len(TREE)), 0, VOCAB)
         return nn.unbox(initialized(jax.random.fold_in(key, 1), ids)), ids[:, :6], ids[:, 6:]
 
-    def after(*, packed: bool):
+    def after(model, *, packed: bool):
         @jax.jit
         def run(params, prompt, block):
             cache = (cached(model, params, prompt, segments) if packed
@@ -340,8 +345,9 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
             return logits
         return run
 
-    assert_as_exact(after(packed=True), after(packed=False), draw, "a tree after a packed prompt",
-                    seeds=FORK_SEEDS)
+    assert_as_exact(after(model, packed=True), after(model, packed=False), draw,
+                    "a tree after a packed prompt", seeds=FORK_SEEDS,
+                    truth_fn=after(float64_twin(model), packed=False))
 
 
 def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str, *,
@@ -500,47 +506,62 @@ def _compiled_cost(function, layout, shapes, counter: str) -> tuple[int, float]:
     return int(compiled.memory_analysis().temp_size_in_bytes), flops
 
 
-def _recurrence_call(layer: str, length: int, documents: int):
-    """`layer`'s chunked recurrence over `FORKED_ROWS` rows of `length` tokens, three documents a row, and
-    with `documents` past zero each entering a memory of its own (`Chunk.entered`), two of them the first's
-    (a state and two questions over it): the function of its layout (`starts`, `entered`) and operands, its
-    layout as the call supplies it, its operands' shapes, its chunk and its memories' elements."""
+def _recurrence_call(layer: str, length: int, documents: int, depth: int = 0):
+    """`layer`'s chunked recurrence over `FORKED_ROWS` rows of `length` tokens, `documents` a row of about
+    equal lengths (three where zero), and with `depth` past zero a forked call through `forked_scan`, its
+    first `depth` documents a chain and every later one continuing the chain's last (a state and questions
+    over it, `depth` one): the function of its layout (its coordinates) and operands, the layout as the call
+    supplies it, its operands' shapes, its chunk and its table's stored elements a row (`Forks.held`
+    memories)."""
     from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule
+    from dew.nn.linear import fork_start, forked_scan
     from dew.nn.mixers.mamba2 import CHUNK_SIZE as SSD_CHUNK, _chunked
 
     def shaped(*dims):
         return jax.ShapeDtypeStruct((FORKED_ROWS, *dims), jnp.float32)
 
-    starts = np.zeros((FORKED_ROWS, length), bool)
-    starts[:, [0, length // 13, length // 2]] = True
-    entered = None
-    if documents:
-        entered = np.zeros((FORKED_ROWS, documents), np.int32)
-        entered[:, 1:3] = 1
-    layout = (jnp.asarray(starts), None if entered is None else jnp.asarray(entered))
+    count = documents or 3
+    numbers = np.minimum(np.arange(length) * count // length + 1, count).astype(np.int32)
+    segments = jnp.asarray(np.broadcast_to(numbers, (FORKED_ROWS, length)))
+    layout = coordinates(segments=segments, valid=segments > 0, max_segments=count)
+    if depth:
+        parents = np.asarray([0, *range(1, depth), *([depth] * (count - depth))], np.int32)
+        held = np.broadcast_to(parents, (FORKED_ROWS, count))
+        layout = dataclasses.replace(layout, forks=Forks(jnp.asarray(held), depth=Forks.depth_of(held),
+                                                         held=Forks.held_of(held)))
     if layer == "gated delta net":
-        memory = (3, 8, 8)
+        memory, chunk = (3, 8, 8), CHUNK_SIZE
         operands = [shaped(length, 1, 8), shaped(length, 1, 8), shaped(length, 3, 8), shaped(length, 3),
                     shaped(length, 3)]
 
-        def call(layout, query, key, value, gate, beta, *state):
-            starts, entered = layout
-            return chunk_gated_delta_rule(query, key, value, gate, beta, *state, starts=starts,
-                                          max_segments=documents or 3, write_bound=1.0, entered=entered)[0]
-        chunk = CHUNK_SIZE
+        def run(query, key, value, gate, beta, *, valid, starts, state=None, **table):
+            kept = valid[:, :, None]
+            return chunk_gated_delta_rule(query, key, value, jnp.where(kept, gate, 0.0),
+                                          jnp.where(kept, beta, 0.0), state, starts=starts,
+                                          max_segments=count, write_bound=1.0, **table)
     else:
-        memory = (4, 8, 8)
+        memory, chunk = (4, 8, 8), SSD_CHUNK
         operands = [shaped(length, 4, 8), shaped(length, 4), shaped(length, 1, 8), shaped(length, 1, 8)]
         rate, skip = -jnp.ones((4,)), jnp.ones((4,))
 
-        def call(layout, x, dt, keys, queries, *state):
-            starts, entered = layout
-            return _chunked(x, jax.nn.softplus(dt), rate, keys, queries, skip, state[0] if state else None,
-                            SSD_CHUNK, starts=starts, entered=entered)[0]
-        chunk = SSD_CHUNK
-    if documents:
-        operands.append(shaped(documents, *memory))
-    return call, layout, operands, chunk, FORKED_ROWS * documents * math.prod(memory)
+        def run(x, dt, keys, queries, *, valid, starts, state=None, **table):
+            step = jnp.where(valid[:, :, None], jax.nn.softplus(dt), 0.0)
+            forked = None if not table else (table['loads'], table['stores'], table['held'])
+            return _chunked(x, step, rate, keys, queries, skip, state, SSD_CHUNK, starts=starts,
+                            forked=forked)
+
+    def call(laid, *operands):
+        if not depth:
+            return run(*operands, valid=laid.valid, starts=laid.starts)[0]
+
+        def rule(convolved, *, valid, starts, state, loads, stores, held):
+            return run(*convolved, valid=valid, starts=starts, state=state, loads=loads, stores=stores,
+                       held=held)
+
+        return forked_scan(operands, rule, laid, fork_start(None, (FORKED_ROWS, *memory), jnp.float32))
+
+    stored = 0 if not depth else layout.forks.held * math.prod(memory)
+    return call, layout, operands, chunk, FORKED_ROWS * stored
 
 
 @pytest.mark.parametrize("counter", [
@@ -549,26 +570,28 @@ def _recurrence_call(layer: str, length: int, documents: int):
         reason="XLA's cost analysis counts no GPU kernel launch's work, so a native program's FLOPs are a "
                "part reported as the whole (ledger 5372)")),
     "sm80", "sm90"], ids=["the portable walk on a cpu", "an A100's routes", "an H100's routes"])
+@pytest.mark.parametrize("depth", [1, 3], ids=["a state and its questions", "a chain three deep"])
 @pytest.mark.parametrize("documents", [6, 173], ids=["the windows' own", "a loose bound"])
 @pytest.mark.parametrize("layer", ["gated delta net", "SSD"])
-def test_a_forked_recurrence_costs_its_tokens_and_a_chunk_a_document(layer, documents, counter):
-    """A recurrence whose documents each enter a memory of their own (a call over forks) costs, in its
-    gradient's temporaries and FLOPs, at most twice what its packed row costs laid one chunk longer a
-    document (`AlignedDocuments`: each document from a chunk's edge): the walk once on that grid, and the
-    call's own operands and their cotangents laid onto it and back at most once more, with each document's
-    memory, its cotangent, its final and that final's cotangent beside it, fp32, an operation an element: a
-    decision window's rows at a documents bound of its own windows and at a loose one, nothing scaled by the
-    bound times the row (armada, 11-09: 1.04 and 1.28 times the grid's packed row, gated delta net and
-    SSD), its layout an operand of the compiled program as a run supplies it. Counted where each count is
-    whole (`_compiled_cost`): the portable walk on a cpu, and the routes an A100 and an H100 take, compiled
-    with no device, every launch at the work it states."""
-    call, layout, operands, chunk, memories = _recurrence_call(layer, FORKED_LENGTH, documents)
+def test_a_forked_recurrence_costs_its_tokens_and_a_chunk_a_document(layer, documents, depth, counter):
+    """A forked call's recurrence (`forked_scan`) costs, in its gradient's temporaries and FLOPs, at most
+    twice what its packed row costs laid one chunk longer a document (`AlignedDocuments`: each document
+    from a chunk's edge), whatever its depth: one walk over the row, the call's own operands and their
+    cotangents laid onto the grid and back at most once more, beside its table of stored finals and their
+    cotangents, fp32, an operation an element (`Forks.held` memories a row, never the documents bound): a
+    decision window's rows at a documents bound of its own windows and at a loose one, a state and its
+    questions and a chain three deep, its layout an operand of the compiled program as a run supplies it.
+    Counted where each count is whole (`_compiled_cost`): the portable walk on a cpu, and the routes an
+    A100 and an H100 take, compiled with no device, every launch at the work it states. Before the one walk
+    the recurrence ran the row once a level of the forks' chains, 2.4 to 3.1 times the packed row at depth
+    one (armada, 11-10)."""
+    call, layout, operands, chunk, stored = _recurrence_call(layer, FORKED_LENGTH, documents, depth)
     temporaries, flops = _compiled_cost(call, layout, operands, counter)
     packed, packed_layout, packed_operands, _, _ = _recurrence_call(layer, FORKED_LENGTH + documents * chunk,
-                                                                    0)
+                                                                    documents)
     bound, work = _compiled_cost(packed, packed_layout, packed_operands, counter)
-    assert temporaries <= 2 * bound + 4 * 4 * memories, (temporaries, bound, flops, work, memories)
-    assert flops <= 2 * work + 4 * memories, (temporaries, bound, flops, work, memories)
+    assert temporaries <= 2 * bound + 4 * 4 * stored, (temporaries, bound, flops, work, stored)
+    assert flops <= 2 * work + 4 * stored, (temporaries, bound, flops, work, stored)
 
 
 def test_a_forked_conv_reads_each_documents_real_tokens_past_its_holes():

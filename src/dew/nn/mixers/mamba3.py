@@ -41,7 +41,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.recurrence import Hooks
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk, entered_memories
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 from dew.nn.linear import forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
@@ -205,55 +205,61 @@ def chunk_mamba3(x, dt, A, B, C, lam, theta, carried: Carried | None = None, sta
 
 
 def _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, state, starts, *, work, operand,
-                   chunk_size: int | None, entered=None):
+                   chunk_size: int | None, forked=None):
     """The chunked op of a call's tokens (`chunk_mamba3`, `entered_mamba3`): `B` and `C` rotated by
     `angles` and rounded to the operands' dtype, the first rank's decay `unturned * A`, the write gate
-    `lam dt + following`, from `state` (`[B, H, N, P]`, or each document's `[B, D, H, N, P]` where
-    `entered` names them, `Chunk.entered`) with `starts` `[B, S]` each document's first token, and the
-    rank terms on the rounded keys and queries the op read, so they cancel its own. Returns `(output,
-    final state, rotated keys)`."""
+    `lam dt + following`, from `state` (`[B, H, N, P]`, or a forked call's table's given memories `[B, S',
+    H, N, P]`) with `starts` `[B, S]` each document's first token, and the rank terms on the rounded keys and
+    queries the op read, so they cancel its own. A forked call's `forked` is `(loads, stores, held,
+    entries)`, `entries(keys)` its documents' entry writes from the rotated keys (`Chunk.entry_key`).
+    Returns `(output, final state, rotated keys)`."""
     batch, length, rank, heads, _ = x.shape
     keys, queries = (rotated(_per_head(jnp.asarray(t, work), heads), angles[:, :, None]).astype(operand)
                      for t in (B, C))
     decay = jnp.zeros((batch, length, rank, heads), work).at[:, :, 0].set(unturned * jnp.asarray(A, work))
     gate = jnp.broadcast_to((lam * dt + following)[:, :, None], decay.shape)
     begins = None if starts is None else jnp.zeros((batch, length, rank), bool).at[:, :, 0].set(starts)
+    table = {}
+    if forked is not None:
+        loads, stores, held, entries = forked
+        entry_key, entry_value, entry_weight = entries(keys)
+        table = {'loads': loads, 'stores': stores, 'held': held, 'entry_key': entry_key,
+                 'entry_value': entry_value, 'entry_weight': entry_weight}
     out, final = chunk(MAMBA3, Chunk(_ranked(queries), _ranked(keys), _ranked(jnp.asarray(x, operand)),
                                      log_decay=_ranked(decay), beta=_ranked(gate), state=state,
-                                     starts=None if begins is None else _ranked(begins), entered=entered),
+                                     starts=None if begins is None else _ranked(begins), **table),
                        **({} if chunk_size is None else {'chunk_size': chunk_size}), dtype=work)
     out = out.reshape(x.shape) + _rank_terms(queries.astype(work), keys.astype(work), jnp.asarray(x, work),
                                              lam * dt, following)
     return out, final, keys
 
 
-def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, entered, starts, valid=None,
+def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, forked, starts, valid=None,
                    chunk_size: int | None = None):
-    """`chunk_mamba3` whose documents each continue a carry of their own (a call over forks,
-    `dew.nn.linear.forked_scan`): `carried`'s leaves `[B, D', ...]` a carry a slot, `entered` `[B, D]` the
-    one-based slot each of `starts`' documents continues (zero, none; the row's first slot beginning one,
-    `dew.batch.document_firsts`). Each document's angles run on from its carry's, its first real token
-    writes the carry's token again at its `(1 - lambda) dt`, and the chunked op enters each document's state
-    (`Chunk.entered`); returns `(output, Carried)`, a carry a document `[B, D, ...]`, a document holding no
-    real token its entering carry."""
+    """`chunk_mamba3` over a forked call (`dew.nn.linear.forked_scan`), in one pass whatever its depth:
+    `carried`'s leaves `[B, 1, ...]` the row's start (a cache's carry, or zero), `forked` the call's
+    `(loads, stores, held)` (`recurrence_chunk.Chunk.loads`), each of `starts`' documents (the row's first
+    slot beginning one, `dew.batch.document_firsts`) continuing table slot `loads[d]` (one, the start; past
+    one, the final carry of the earlier document that stored it; zero, none) and storing its own in
+    `stores[d]`. Each document's angles run on from its source's (a scan over the row's documents, a carry
+    of angles each), its first real token writes its source's last token again at its `(1 - lambda) dt` (the
+    chunked op's entry write, `Chunk.entry_key`), and the chunked op enters its source's state from its
+    table. Returns `(output, None)`: a forked call leaves the carry as it was."""
     batch, length, _, heads, _ = x.shape
+    loads, stores, held = forked
     work, operand, continues, dt, lam, real = _stepped(x, dt, B, C, lam, starts, valid)
     resets = jnp.asarray(starts, bool)
-    documents = entered.shape[1]
+    documents = loads.shape[1]
     firsts = document_firsts(resets, documents)
     slots = jnp.arange(length, dtype=jnp.int32)
     number = jnp.clip(jnp.sum(slots[None, :, None] >= firsts[:, None, :], axis=-1) - 1, 0, documents - 1)
     rows = jnp.arange(batch)[:, None]
-    taken = jnp.asarray(entered, jnp.int32)
-    # A document entering no carry begins as `chunk_mamba3`'s do, its first token's turn and decay acting on
+    loads, stores = jnp.asarray(loads, jnp.int32), jnp.asarray(stores, jnp.int32)
+    # A document entering nothing begins as `chunk_mamba3`'s do, its first token's turn and decay acting on
     # nothing; one continuing a carry turns and decays it at its first token, as its own row's next token.
-    fresh = resets & (jnp.take_along_axis(taken, number, axis=1) == 0)
+    fresh = resets & (jnp.take_along_axis(loads, number, axis=1) == 0)
     unturned = jnp.where(fresh[..., None], 0, dt)
-    # Each document's carry, its slot's (zero for none).
-    entering, _ = entered_memories(carried, taken, resets, firsts)
     turned = _angles(unturned, _per_head(jnp.asarray(theta), heads), continues)
-    angles = jnp.remainder(turned + jnp.take_along_axis(entering.angle, number[:, :, None, None], axis=1),
-                           2 * jnp.pi)
     delta = (1 - lam) * dt
     following, _ = _trapezoid(delta, real, resets)
     # Each document's first and last real tokens, `length` and -1 where it holds none.
@@ -261,22 +267,52 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, entered, starts
         jnp.where(real, slots, length))
     last = jnp.full((batch, documents), -1, jnp.int32).at[rows, number].max(jnp.where(real, slots, -1))
     holding = first < length
-    opening = jnp.take_along_axis(delta, jnp.minimum(first, length - 1)[..., None], axis=1)
-    weight = jnp.where(holding[..., None], opening, 0)
-    again = jnp.einsum('bdhrn,bdhrp->bdhnp', entering.key, entering.value)
-    memories = jnp.swapaxes(entering.state, -1, -2) + weight[..., None, None] * again
-    own = jnp.broadcast_to(jnp.arange(1, documents + 1, dtype=jnp.int32), (batch, documents))
-    out, finals, keys = _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, memories, resets,
-                                       work=work, operand=operand, chunk_size=chunk_size, entered=own)
-    # Each document's last real token's angles, keys and values; one holding none keeps its carry's.
-    at = jnp.maximum(last, 0)
+    ended = jnp.maximum(last, 0)
+    # Each document's angles' offset, its source's last angle: the documents in the row's order, a parent
+    # before its children, a table of angles carried through them (the start's, then each stored one's).
+    reached = gather_positions(turned, ended)
 
-    kept = holding.reshape(*holding.shape, *(1,) * 3)
-    angle = jnp.where(holding[..., None, None], gather_positions(angles, at), entering.angle)
-    key = jnp.where(kept, jnp.swapaxes(gather_positions(keys.astype(work), at), 2, 3), entering.key)
-    value = jnp.where(kept, jnp.swapaxes(gather_positions(jnp.asarray(x, work), at), 2, 3), entering.value)
-    state = jnp.where(kept, jnp.swapaxes(finals, -1, -2), entering.state)
-    return out, Carried(state, angle, key, value)
+    def offset(table, document):
+        load, store, total = document
+        taken = jnp.where(load > 0, table[jnp.maximum(load - 1, 0)], 0)
+        leaving = jnp.remainder(total + taken, 2 * jnp.pi)
+        return _angle_stored(table, store, leaving), taken
+
+    angles_table = jnp.concatenate([carried.angle, jnp.zeros((batch, held, *carried.angle.shape[2:]),
+                                                               carried.angle.dtype)], axis=1)
+    _, offsets = jax.lax.scan(
+        lambda table, document: jax.vmap(offset)(table, document),
+        angles_table, tuple(jnp.moveaxis(t, 1, 0) for t in (loads, stores, reached)))
+    offsets = jnp.moveaxis(offsets, 0, 1)
+    entering = jnp.take_along_axis(offsets, number[:, :, None, None], axis=1)
+    angles = jnp.remainder(turned + entering, 2 * jnp.pi)
+    # Each stored slot's document, by the slot it stores in, to read its last token's keys and values.
+    stored_by = jnp.zeros((batch, held + 1), jnp.int32).at[rows, stores].set(
+        jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), stores.shape), mode="drop")
+    weight = jnp.where(holding[..., None], gather_positions(delta, jnp.minimum(first, length - 1)), 0)
+
+    def entries(keys):
+        # Each document's source's last token: the start's carried keys and values, or the storing
+        # document's last real token's.
+        source = jnp.take_along_axis(stored_by, jnp.maximum(loads - 1, 0), axis=1)
+        at = jnp.take_along_axis(ended, source, axis=1)
+        key = jnp.where((loads > 1)[..., None, None, None], gather_positions(keys.astype(work), at),
+                        jnp.swapaxes(carried.key, 2, 3).astype(work))
+        value = jnp.where((loads > 1)[..., None, None, None], gather_positions(jnp.asarray(x, work), at),
+                          jnp.swapaxes(carried.value, 2, 3).astype(work))
+        return key, value, jnp.where((loads > 0)[..., None], weight, 0)
+
+    given = jnp.swapaxes(carried.state, -1, -2)
+    out, _, _ = _rotated_chunk(x, dt, A, B, C, lam, angles, unturned, following, given, resets, work=work,
+                               operand=operand, chunk_size=chunk_size, forked=(loads, stores, held, entries))
+    return out, None
+
+
+def _angle_stored(table, store, angle):
+    """`table` `[1 + held, ...]` of angles with `angle` in one-based stored slot `store` (the table's `1 +
+    store`-th), as it was at slot zero."""
+    at = jnp.maximum(store, 0)
+    return table.at[at].set(jnp.where(store > 0, angle, table[at]))
 
 
 def step_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, valid=None, begins=None):
@@ -532,9 +568,9 @@ class Mamba3(nn.Module):
         if tokens.forks is not None:
             # Each document from the carry its parent leaves, a root from the row's (`forked_scan`); a cached
             # call's carry left as it was.
-            def forked_rule(values, *, valid, starts, state, entered):
-                return entered_mamba3(values, dt, A, B, C, lam, theta, state, entered, starts, valid=valid,
-                                      chunk_size=self.chunk_size)
+            def forked_rule(values, *, valid, starts, state, loads, stores, held):
+                return entered_mamba3(values, dt, A, B, C, lam, theta, state, (loads, stores, held), starts,
+                                      valid=valid, chunk_size=self.chunk_size)
 
             start = Carried(*(jnp.zeros(shape, wide) for shape in self._shapes(batch)) if carried is None
                             else (leaf.astype(wide) for leaf in carried))

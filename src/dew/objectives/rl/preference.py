@@ -41,13 +41,14 @@ from dew.rl.surrogate import preference_logsigmoid_terms
 from ..lm.objective import TokenScorer
 
 
-def window_coordinates(batch, finals: int) -> Coordinates | None:
+def window_coordinates(batch, finals: int, pairs: int = 1) -> Coordinates | None:
     """A batch's windows laid out as the model reads them: each pair's documents, each token at its own
     half's place, a half's rest continuing the prompt it shares (`dew.data.preferences`), each half's
     final id in the windows' tail of `finals` (`Coordinates.finals`); halves laid out whole
     (`share=False`, no `PARENTS_KEY`) are documents of their own; a window of one half (no
     `DOCUMENTS_KEY`) is a plain row, its half first and padding after, None, as a model that reads one
-    document a row takes it."""
+    document a row takes it. A window holds at most `pairs` pairs, each prompt shared one document its
+    halves continue (`Forks.held`)."""
     if DOCUMENTS_KEY not in batch:
         return None
     real = jnp.asarray(batch[REAL_KEY]) > 0
@@ -57,7 +58,9 @@ def window_coordinates(batch, finals: int) -> Coordinates | None:
     laid = replace(coordinates(segments=documents, valid=real, positions=positions,
                                max_segments=documents.shape[1] if held is None else jnp.shape(held)[1],
                                right_padded=True), finals=finals)
-    return laid if held is None else replace(laid, forks=Forks(jnp.asarray(held, jnp.int32), depth=1))
+    # Each pair's prompt the one document its halves continue (`Forks.held`).
+    forks = None if held is None else Forks(jnp.asarray(held, jnp.int32), depth=1, held=pairs)
+    return laid if forks is None else replace(laid, forks=forks)
 
 
 def _completions(batch, scored: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -240,7 +243,7 @@ class DPOObjective(TokenScorer):
                 "a DPO run always freezes one")
         batch = self.windows(batch)
         ids = jnp.asarray(batch[IDS_KEY])
-        laid = window_coordinates(batch, self.finals)
+        laid = window_coordinates(batch, self.finals, self.pairs)
         # The policy and its reference score the windows in one forward each, through the same function,
         # so a policy equal to its reference earns zero rewards wherever the two compile alike.
         real = jnp.asarray(batch[REAL_KEY])[:, :-self.finals] > 0
@@ -283,8 +286,8 @@ class DPOObjective(TokenScorer):
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The chosen responses' per-token cross entropies, with their completion marks as weights."""
         laid = self.windows(batch)
-        scores = self.token_scores(params, jnp.asarray(laid[IDS_KEY]),
-                                   coordinates=window_coordinates(laid, self.finals), predict=True)
+        scores = self.token_scores(params, jnp.asarray(laid[IDS_KEY]), predict=True,
+                                   coordinates=window_coordinates(laid, self.finals, self.pairs))
         assert scores.correct is not None
         return self._chosen(scores.losses, scores.correct, scores.weights, batch)
 
