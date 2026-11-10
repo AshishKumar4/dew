@@ -250,11 +250,10 @@ def test_the_attention_kernels_matrix_holds_on_this_gpu():
     run_cells(cells_of(kernels_matrix.a_kernels_training_step_is_on_par))
 
 
-@pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_decode_matrix_holds_on_this_gpu():
     """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
-    the reference path at every pair of axis values its selectors serve, each cell on its own GPU, without
-    XLA's deterministic ops (cuDNN's decode refuses a deterministic call)."""
+    the reference path at every pair of axis values its selectors serve, each cell on its own GPU, under the
+    lane's deterministic ops."""
     run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
 
 

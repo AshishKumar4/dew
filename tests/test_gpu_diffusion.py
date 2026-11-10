@@ -14,13 +14,12 @@ from gpu_flow import Cell, run_cells
 pytestmark = pytest.mark.gpu(reason="the models' fused attention kernels: flash and cuDNN")
 
 
-def test_the_image_models_run_their_gpu_kernels(without_deterministic_ops):
+def test_the_image_models_run_their_gpu_kernels():
     """Every image and diffusion cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept
-    and all raised together, without XLA's deterministic ops (`without_deterministic_ops`): the fused
-    kernels' default schedules, as a user's process runs them."""
+    and all raised together, under the lane's deterministic ops."""
     run_cells([
         Cell("MeanFlow trains through a fused attention kernel",
              mean_flow.meanflow_trains_through_a_fused_attention_kernel),
         Cell("Qwen-Image attends a padded batch through cuDNN as XLA does",
-             lambda: qwen_image.cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops)),
+             qwen_image.cudnn_attends_a_padded_batch_as_xla_does),
     ])

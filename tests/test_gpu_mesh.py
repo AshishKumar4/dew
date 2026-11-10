@@ -51,18 +51,18 @@ def test_two_gpus_run_their_collectives_and_shards(tmp_path_factory):
 
 
 def test_two_gpus_shard_cudnn_attention(tmp_path_factory, without_deterministic_ops):
-    """The two-GPU cuDNN cells, without XLA's deterministic ops (`without_deterministic_ops`), as a user's
-    process runs them."""
+    """The two-GPU cuDNN cells under the lane's deterministic ops, and FlashAttention's mesh cells without
+    them (`without_deterministic_ops`), its default schedule, as a user's process runs it."""
     run_cells([
         *(Cell(f"cuDNN runs inside the {exchange} exchange: {'causal' if causal else 'full'}",
-               on_two(functools.partial(sequence_parallel.cudnn_runs_inside_either_exchange, exchange, causal,
-                                        without_deterministic_ops)))
+               on_two(functools.partial(sequence_parallel.cudnn_runs_inside_either_exchange, exchange,
+                                        causal)))
           for exchange in sorted(sequence_parallel.EXCHANGES) for causal in (False, True)),
         *(Cell(cell.label, on_two(cell.run))
           for cell in cells_of(kernels.flash_keeps_the_kernel_contract_on_a_mesh,
                                without_deterministic_ops=without_deterministic_ops)),
         Cell("a sharded cuDNN attention compiles once across processes",
              on_two(isolated(tmp_path_factory)(
-                 sharded_attention_cells.a_sharded_cudnn_attention_compiles_once_across_processes, "sharded",
-                 without_deterministic_ops=without_deterministic_ops))),
+                 sharded_attention_cells.a_sharded_cudnn_attention_compiles_once_across_processes,
+                 "sharded"))),
     ])

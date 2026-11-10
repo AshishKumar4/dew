@@ -159,7 +159,7 @@ def test_a_padded_row_is_its_own_prompt_alone(source, record):
                prediction(qwen_walk(source, record, "padded", wide=True)), leaves=["output"])
 
 
-def cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
+def cudnn_attends_a_padded_batch_as_xla_does():
     """The fused kernel runs both of the block's attention calls over a
     padded prompt, forward and backward, and computes what xla computes.
 
@@ -169,12 +169,12 @@ def cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
     key-padding mask this model passed (a [B, 1, 1, K] bool), which only a
     run through the kernel shows. The bound is two bf16 ulps (2**-7 each)
     of each array's scale: the two kernels round the same products in a
-    different order, and the block carries that into the output and the
-    gradients. One block, because the cuda lane's deterministic ops crash
-    an executable holding two identical cuDNN backward calls
-    (openxla/xla#46500); two blocks outside that lane: 1.1 ulps on an
-    RTX 4080."""
-    model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=1, heads=2, head_dim=64,
+    different order, and the blocks carry that into the output and the
+    gradients (1.1 ulps on an RTX 4080). Two blocks, so the executable holds
+    two identical cuDNN backward calls, which XLA's graph cache crashed on
+    under deterministic ops until the fork's post74 (a cache hit takes its
+    compiled call's backend config, FS-CUDNN3-VERIFY-a100)."""
+    model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=2, heads=2, head_dim=64,
                                  context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16,
                                  attention_impl="cudnn")
     keys = jax.random.split(jax.random.PRNGKey(0), 4)

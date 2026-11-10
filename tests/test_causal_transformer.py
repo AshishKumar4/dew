@@ -990,8 +990,7 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
-        rng, without_deterministic_ops):
+def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(rng):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
     raises, naming the kernel (`dew.nn.kernels.selection.select`), as torch's `sdpa_kernel` does,
     rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
@@ -1007,8 +1006,7 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
     tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
-def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(
-        rng, without_deterministic_ops):
+def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(rng):
     """Rotary positions rotate q and k and narrow nobody's view, so a batch
     that carries them keeps causality as a kernel flag. Pinning cudnn is what
     proves the routing, as in the packed case above: cudnn refuses the fp32
@@ -1657,7 +1655,7 @@ def test_a_parallel_layer_reads_its_branches_initializers_and_indexers():
     assert indexed.indexed_mixers == (latent,)
 
 
-def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels(without_deterministic_ops):
+def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
     """One bf16 decoder through the GPU's own attention kernels in one process, every property judged
     together by check 1 from the model in float64 over drawn weights and tokens (the GPU's ones beside the
     xla kernel's):

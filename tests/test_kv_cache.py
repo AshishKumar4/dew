@@ -179,7 +179,7 @@ def test_a_quantized_read_is_the_rotated_write_within_the_formats_rounding(quant
         assert bool(jnp.all(error <= limit))
 
 
-def the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention(without_deterministic_ops):
+def the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention():
     """The native paged decode kernel in one flow on a GPU, every case judged together by check 1:
 
     - over reordered and shared pages and distinct key counts, at heads 64 and 256 wide, from each row's

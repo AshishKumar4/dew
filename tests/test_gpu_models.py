@@ -40,8 +40,7 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
     schedules, as a user's process runs them."""
     run_cells([
         Cell("a bf16 decoder trains on a packed batch and serves its cache through the GPU's kernels",
-             lambda: causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels(
-                 without_deterministic_ops)),
+             causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels),
         *(Cell(f"a float32 {fixture}'s logits and gradients under the accurate policy are as exact as "
                "transformers",
                functools.partial(
@@ -49,7 +48,7 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
                    fixture))
           for fixture in ("qwen3-tiny", "llama-tiny")),
         Cell("ModernBERT's states in bf16 on its GPU kernels",
-             lambda: modernbert.modernbert_states_in_bf16_on_the_gpu_kernels(without_deterministic_ops)),
+             modernbert.modernbert_states_in_bf16_on_the_gpu_kernels),
         Cell("a packed window decides each row as the row alone: the joint arm",
              functools.partial(decision_packing.packed_rows_decided_alone, "joint")),
         Cell("a bf16 joint head on flash reads each packed row alone",
@@ -58,7 +57,6 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
         Cell("a push whose replica refuses its join aborts its NCCL group",
              rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting),
         Cell("the paged decode kernel decodes on par with the gathered attention, a softcapped model too",
-             when(bf16_dot_runs(), BF16_PRODUCTS, functools.partial(
-                 kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention,
-                 without_deterministic_ops))),
+             when(bf16_dot_runs(), BF16_PRODUCTS,
+                  kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention)),
     ])
