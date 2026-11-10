@@ -121,10 +121,10 @@ dew = "dew._cli.main:main"
 # resolves for every machine at once, carrying each machine's pins under its markers
 # (tools/lock_environment.sh).
 cuda12 = ["jax-cuda12-plugin[with-cuda]==0.12.0.1.post73", "jax-cuda12-pjrt==0.12.0.1.post73", "jaxlib==0.12.0.1",
-          "dew-flash-attn-cu12~=0.3.8; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+          "dew-flash-attn-cu12~=0.3.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu12~=0.2.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 cuda13 = ["jax-cuda13-plugin[with-cuda]==0.12.0.1.post73", "jax-cuda13-pjrt==0.12.0.1.post73", "jaxlib==0.12.0.1",
-          "dew-flash-attn-cu13~=0.3.8; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+          "dew-flash-attn-cu13~=0.3.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
           "dew-cutlass-cu13~=0.2.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 tpu = ["libtpu==0.0.50.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
@@ -295,7 +295,7 @@ kernel-compile = ["jax-cuda12-plugin==0.12.0.1.post73; sys_platform == 'linux' a
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "dew-flash-attn-cu12~=0.3.8; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "dew-flash-attn-cu12~=0.3.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "dew-cutlass-cu12~=0.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-runtime-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
