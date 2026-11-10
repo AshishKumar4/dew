@@ -959,6 +959,36 @@ class Prepared[LossT, EffectsT]:
                                validation=self.validation)
 
 
+_SUBCOMMAND = type(tyro.conf.subcommand("dew"))
+"""The marker a field's annotation declares a subcommand with (`tyro.conf.subcommand`)."""
+
+
+def flag_subcommands(config: type, prefix: str = "") -> dict[str, str]:
+    """The optional settings `config` declares that `cli` turns on by their own flags (`flag_selected`),
+    by flag path, each with the subcommand its flags imply: a field annotated as one or more subcommands or
+    None (`tyro.conf.subcommand`), its first; and those within each such setting's settings and within a
+    nested run setting (a `dew.config` dataclass, the trainer's), parents before their own."""
+    found: dict[str, str] = {}
+    hints = typing.get_type_hints(config, include_extras=True)
+    for field in dataclasses.fields(config):
+        path, hint = f"{prefix}{field.name.replace('_', '-')}", hints[field.name]
+        options = typing.get_args(hint) if typing.get_origin(hint) in (Union, types.UnionType) else (hint,)
+        given = [option for option in options if option is not type(None)]
+        marked = [(typing.get_args(option)[0], marker.name) for option in given
+                  if typing.get_origin(option) is Annotated
+                  for marker in typing.get_args(option)[1:] if isinstance(marker, _SUBCOMMAND)]
+        if marked and len(marked) == len(given) < len(options):
+            found[path] = marked[0][1]
+            nested = [kind for kind, _ in marked]
+        else:
+            nested = given if len(given) == 1 else []
+        for kind in nested:
+            if (isinstance(kind, type) and dataclasses.is_dataclass(kind)
+                    and kind.__module__.startswith("dew.config")):
+                found.update(flag_subcommands(kind, f"{path}."))
+    return found
+
+
 def flag_selected(given: Sequence[str], selected: Mapping[str, str]) -> list[str]:
     """`given` command-line arguments with each optional setting of `selected`, a field's name and its
     subcommand's, turned on by its own flags: `--lora.rank 16` stands for `lora:lora --lora.rank 16`,
@@ -1235,13 +1265,6 @@ class RunConfig:
     on the run with its Hub sources pinned); `run` trains it.
     """
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
-                                                   "trainer.inspection": "inspect",
-                                                   "trainer.cooldowns": "cooldowns",
-                                                   "trainer.compile-ahead": "ahead",
-                                                   "trainer.diloco": "diloco"}
-    """The optional settings `cli` turns on by their own flags, each with the
-    subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
                                             "val_metrics", "val_every", "val_summaries", "kernels")
     """The fields a run resumed under its name may change: how it trains and optimizes, what it reads
@@ -1571,7 +1594,7 @@ class RunConfig:
         (`--set data.lm.seq_len=512`), which have no flags of their own.
         """
         given, settings = _set_arguments(list(sys.argv[1:] if args is None else args))
-        given = flag_selected(given, cls._FLAG_SELECTED)
+        given = flag_selected(given, flag_subcommands(cls))
         model, objective = cls._started(default, "model"), cls._started(default, "objective")
         if not isinstance(model, ModelConfig) or not isinstance(objective, ObjectiveConfig | None):
             raise TypeError(f"{cls.__name__} starts from the model {model!r} and the objective "

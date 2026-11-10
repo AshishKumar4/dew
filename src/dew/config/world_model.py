@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import Annotated, ClassVar, Self
+from typing import Annotated, Self
 
 import jax
 import jax.numpy as jnp
@@ -57,7 +57,6 @@ class WorldModelRunConfig(RunConfig):
     labeled. The objectives read frames in [-1, 1]; uint8 pixels, as the data workers write them, are
     scaled to it (`dew.objectives.world_model.unit_frames`)."""
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**RunConfig._FLAG_SELECTED, "tokenizer": "tokenizer"}
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("dew.objectives.world_model:CausalTokenizer"))
