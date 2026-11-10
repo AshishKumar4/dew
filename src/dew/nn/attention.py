@@ -671,7 +671,7 @@ def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:
 
 
 def _filled(ran: Callable[[], jax.Array], portable: Callable[[], jax.Array], fill: float, live, query, key,
-            value, *, bias, sinks, softcap, dropping: bool) -> jax.Array:
+            value, *, bias, sinks, softcap, precision, dropping: bool) -> jax.Array:
     """A call's output where every key a row may not see has the logit `fill` (`mask_fill`), exactly the
     portable path's (`portable()`, `reference_attention`'s `where(mask, logits, fill)`): the fused kernel
     (`ran()`) weighs a masked key nothing, which the fill weighs too wherever it lies past fp32's exp from
@@ -686,15 +686,16 @@ def _filled(ran: Callable[[], jax.Array], portable: Callable[[], jax.Array], fil
         if sinks is not None or live is None:
             return _read_nothing(ran(), live)
         out = ran()
-        return jnp.where(live, out, _unread(value, query.shape[-2], jnp.nan, None).astype(out.dtype))
+        unread = _unread(value.astype(out.dtype), query.shape[-2], jnp.nan, None, precision)
+        return jnp.where(live, out, unread)
     weighs = _fill_weighs(fill, query, key, bias, softcap)
     if dropping and live is not None:
         weighs = weighs | ~jnp.all(live)
 
     def fused() -> jax.Array:
         out = ran()
-        return out if live is None else jnp.where(live, out, _unread(value, query.shape[-2], fill, sinks)
-                                                  .astype(out.dtype))
+        return out if live is None else jnp.where(
+            live, out, _unread(value.astype(out.dtype), query.shape[-2], fill, sinks, precision))
 
     return jax.lax.cond(weighs, portable, fused)
 
@@ -715,22 +716,27 @@ def _fill_weighs(fill: float, query, key, bias, softcap) -> jax.Array:
     return fill > least - 105.0 - jnp.abs(least) * 2.0 ** -6
 
 
-def _unread(value, heads: int, fill: float, sinks) -> jax.Array:
-    """A row's output where it sees no key, `[B, 1, H, Dv]` fp32: each of the call's keys' logit `fill`, so
-    each head reads its values alike, beside its sink (`sinks` `[H]`) each key's weight `e^fill` against the
-    sink's `e^sink`; NaN times the values where `fill` is NaN, whose gradient is NaN at every value."""
-    keys, kv_heads = value.shape[-3], value.shape[-2]
-    total = jnp.repeat(jnp.sum(value.astype(jnp.float32), axis=-3), heads // kv_heads, axis=-2)
+def _unread(value, heads: int, fill: float, sinks, precision) -> jax.Array:
+    """A row's output where it sees no key, `[B, 1, H, Dv]` in the value's dtype: each of the call's keys'
+    logit `fill`, so each head weighs its values alike, beside its sink (`sinks` `[H]`) each key's weight
+    `e^fill` against the sink's `e^sink`. Each value is weighed before the sum, by the portable path's
+    grouped value product (`reference_attention`'s: the weights in the value's dtype, each key head's
+    values read by its query heads in place), so values whose sum overflows read their finite mean as that
+    path reads them; NaN where `fill` is NaN, whose gradient is NaN at every value."""
+    *rows, keys, kv_heads, width = value.shape
     if fill != fill:
-        return (total * fill)[..., None, :, :]
-    if sinks is None:
+        share = jnp.full((heads,), jnp.nan, jnp.float32)
+    elif sinks is None:
         share = jnp.full((heads,), 1.0 / keys, jnp.float32)
     else:
         sink = jnp.asarray(sinks, jnp.float32)
         peak = jnp.maximum(sink, fill)
         weight = jnp.exp(fill - peak)
         share = weight / (jnp.exp(sink - peak) + keys * weight)
-    return (total * share[:, None])[..., None, :, :]
+    groups = share.reshape(kv_heads, heads // kv_heads, 1, 1).astype(value.dtype)
+    weights = jnp.broadcast_to(groups, (*rows, kv_heads, heads // kv_heads, 1, keys))
+    return float32_einsum('...kgts,...skd->...tkgd', weights, value, precision=precision).reshape(
+        *rows, 1, heads, width)
 
 
 def _fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
@@ -967,7 +973,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     if resolved == 'reference':
         return portable()
     return _filled(ran, portable, mask_fill, live, query, key, value, bias=bias, sinks=sinks, softcap=softcap,
-                   dropping=dropout_seed is not None)
+                   precision=precision, dropping=dropout_seed is not None)
 
 
 def forward_differentiable(value, tangent, *arrays, precision: str | None = None, primal_alone: bool = False):
