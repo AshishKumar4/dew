@@ -179,44 +179,63 @@ def test_a_quantized_read_is_the_rotated_write_within_the_formats_rounding(quant
         assert bool(jnp.all(error <= limit))
 
 
-def native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_deterministic_ops, width,
-                                                                             windowed, softcap, sunk):
-    """Over reordered and shared pages and distinct key counts, from each
-    row's first key under a window where `windowed`, with sinks where `sunk`,
-    the Pallas kernel's value, gradients (the sinks' among them) and jvp are
-    as exact as the gathered attention's (`_gathered_attention`, which its
-    derivatives delegate to, in forward mode by `_gathered_tangent`), each from
-    the gathered attention in float64 over the declared draws (check 1, row
-    1931): at 256-wide heads too, which cuDNN's backward does not take before
-    Hopper, as the derivative's own kernel needs nothing of cuDNN."""
+def the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention(without_deterministic_ops):
+    """The native paged decode kernel in one flow on a GPU, every case judged together by check 1:
+
+    - over reordered and shared pages and distinct key counts, at heads 64 and 256 wide, from each row's
+      first key or under a window, with or without a softcap and sinks, the Pallas kernel's value,
+      gradients (the sinks' among them) and jvp are as exact as the gathered attention's
+      (`_gathered_attention`, which its derivatives delegate to, in forward mode by `_gathered_tangent`),
+      each from the gathered attention in float64 over the declared draws (row 1931): at 256-wide heads
+      too, which cuDNN's backward does not take before Hopper, as the derivative's own kernel needs
+      nothing of cuDNN;
+    - a bf16 decoder with a logit softcap decodes a paged cache (where the step used to raise), its logits
+      step by step on par with the compact cache's, the compact cache's reference decode in float64 the
+      truth."""
     table = jnp.asarray([[2, 0], [0, 3]], jnp.int32)
     lengths = jnp.asarray([21, 32], jnp.int32)
-    starts = jnp.asarray([5, 17], jnp.int32) if windowed else None
-    argnums = (0, 1, 2, 3) if sunk else (0, 1, 2)
+    cases = {f"width {width}{' window' if windowed else ''}{' softcap' if softcap else ''}"
+             f"{' sinks' if sunk else ''}": (width, windowed, softcap, sunk)
+             for width in (64, 256) for windowed in (False, True) for softcap in (None, 0.5)
+             for sunk in (False, True)}
 
     def draw(seed):
-        keys = jax.random.split(jax.random.fold_in(jax.random.key(3), seed), 5)
-        q = jax.random.normal(keys[0], (2, 4, width), jnp.bfloat16)
-        k = jax.random.normal(keys[1], (2, 4, 16, width), jnp.bfloat16)
-        v = jax.random.normal(keys[2], k.shape, jnp.bfloat16)
-        s = jax.random.normal(keys[3], (4,), jnp.float32)
-        return q, k, v, s, jax.random.normal(keys[4], q.shape, jnp.bfloat16)
+        inputs = {}
+        for width in (64, 256):
+            keys = jax.random.split(jax.random.fold_in(jax.random.key(3 + width), seed), 5)
+            q = jax.random.normal(keys[0], (2, 4, width), jnp.bfloat16)
+            k = jax.random.normal(keys[1], (2, 4, 16, width), jnp.bfloat16)
+            v = jax.random.normal(keys[2], k.shape, jnp.bfloat16)
+            s = jax.random.normal(keys[3], (4,), jnp.float32)
+            inputs[width] = (q, k, v, s, jax.random.normal(keys[4], q.shape, jnp.bfloat16))
+        return (inputs,)
 
-    def native(q, k, v, s):
-        return gpu_paged(softcap)(q, k, v, table, lengths, starts, s if sunk else None)
+    def native(windowed, softcap, sunk):
+        def run(q, k, v, s):
+            starts = jnp.asarray([5, 17], jnp.int32) if windowed else None
+            return gpu_paged(softcap)(q, k, v, table, lengths, starts, s if sunk else None)
+        return run
 
-    def gathered(q, k, v, s):
-        return _gathered_attention(q, k, v, table, lengths, starts, s if sunk else None, softcap=softcap)
+    def gathered(windowed, softcap, sunk):
+        def run(q, k, v, s):
+            starts = jnp.asarray([5, 17], jnp.int32) if windowed else None
+            return _gathered_attention(q, k, v, table, lengths, starts, s if sunk else None, softcap=softcap)
+        return run
 
-    def wide(q, k, v, s):
-        return scaled_dot_product_attention(
-            q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
-            implementation="reference", key_value_seq_lengths=lengths, key_value_seq_starts=starts,
-            softcap=softcap, sinks=s if sunk else None, precision=jax.lax.Precision.HIGHEST,
-            force_fp32_for_softmax=False)[:, 0]
+    def wide(windowed, softcap, sunk):
+        def run(q, k, v, s):
+            starts = jnp.asarray([5, 17], jnp.int32) if windowed else None
+            return scaled_dot_product_attention(
+                q[:, None], _gather_pages(k, table, 1), _gather_pages(v, table, 1),
+                implementation="reference", key_value_seq_lengths=lengths, key_value_seq_starts=starts,
+                softcap=softcap, sinks=s if sunk else None, precision=jax.lax.Precision.HIGHEST,
+                force_fp32_for_softmax=False)[:, 0]
+        return run
 
-    def derivatives(attention):
+    def derivatives(attention, sunk):
         """`attention`'s value, the gradients of its squared sum and its jvp along the drawn direction."""
+        argnums = (0, 1, 2, 3) if sunk else (0, 1, 2)
+
         @jax.jit
         def run(q, k, v, s, direction):
             def loss(*inputs):
@@ -228,9 +247,14 @@ def native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_d
             return (attention(q, k, v, s), *gradients, tangent)
         return run
 
-    assert_as_exact(derivatives(native), derivatives(gathered), draw, "paged decode kernel",
-                    seeds=PAGED_DERIVATIVE_SEEDS,
-                    truth_fn=derivatives(wide))
+    def every(form):
+        runs = {name: (width, derivatives(form(windowed, softcap, sunk), sunk))
+                for name, (width, windowed, softcap, sunk) in cases.items()}
+        return lambda inputs: {name: run(*inputs[width]) for name, (width, run) in runs.items()}
+
+    assert_as_exact(every(native), every(gathered), draw, "paged decode kernel", seeds=PAGED_DERIVATIVE_SEEDS,
+                    truth_fn=every(wide))
+    a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache()
 
 
 def greedy(layout):
@@ -617,7 +641,7 @@ SOFTCAP_PAGED_SEEDS = 8
 """The softcapped paged decode's declared draws (check 1)."""
 
 
-def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(without_deterministic_ops):
+def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache():
     """A bf16 decoder with a logit softcap decodes a paged cache on a GPU (where the step used to raise),
     its logits step by step on par with the compact cache's (check 1), the compact cache's reference
     decode in float64 the truth."""

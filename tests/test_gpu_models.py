@@ -1,9 +1,10 @@
 """The models' GPU flow (G14, the owner's rule: no unit tests on GPUs): each model that runs a GPU kernel
 of its own, run through it in one process (`gpu_flow`), each cell its own file's property:
 
-- A causal transformer's cached prompt reads its cache as the uncached forward does, through
-  FlashAttention; a layer naming cuDNN takes a packed batch as its document mask, decodes plain steps
-  and prefills a padded batch through it (test_causal_transformer).
+- A bf16 causal transformer, in one flow, trains a packed batch through a layer naming cuDNN (its
+  documents the kernel's mask, logits and every gradient), reads a cached prompt as the uncached forward
+  whatever kernel the GPU takes, decodes plain steps through cuDNN and prefills a padded batch
+  (test_causal_transformer).
 - A float32 decoder under a run's accurate precision policy is as exact as transformers' float32 on a
   GPU, its logits and every parameter's gradient from one program, JAX's TF32 default cleared
   (test_hf_decoders).
@@ -13,8 +14,8 @@ of its own, run through it in one process (`gpu_flow`), each cell its own file's
 - A packed window decides each row as the row alone on the joint arm, its float64 truth at model size,
   and a bf16 joint head on flash reads each packed row alone (test_decision_packing).
 - The paged BF16 decode kernel's value and derivatives are the gathered attention's, every width, window,
-  softcap and sink, and a softcapped model decodes a paged cache on par with its compact one, on sm80 or
-  later (test_kv_cache).
+  softcap and sink, and a softcapped model decodes a paged cache on par with its compact one, one flow on
+  sm80 or later (test_kv_cache).
 """
 
 import functools
@@ -33,23 +34,14 @@ from dew.nn.kernels.generation import bf16_dot_runs
 pytestmark = pytest.mark.gpu(reason="each model's own GPU kernels: flash, cuDNN, TF32 products, NCCL")
 
 
-def test_the_models_run_their_gpu_kernels(rng, without_deterministic_ops):
+def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
     """Every model cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together. The cuDNN cells run without XLA's deterministic ops, which Dew refuses cuDNN attention
     under (`without_deterministic_ops`)."""
     run_cells([
-        Cell("a causal transformer's cached prompt reads its cache as the uncached forward (flash)",
-             lambda: causal.a_cached_prompt_reads_its_cache_as_the_uncached_forward(
+        Cell("a bf16 decoder trains on a packed batch and serves its cache through the GPU's kernels",
+             lambda: causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels(
                  without_deterministic_ops)),
-        Cell("a layer naming cuDNN takes a packed batch as its document mask",
-             lambda: causal.a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(
-                 rng, without_deterministic_ops)),
-        Cell("a plain decode step attends through cuDNN",
-             lambda: causal.a_plain_decode_step_attends_through_cudnn_where_it_runs(
-                 rng, without_deterministic_ops)),
-        Cell("a padded prefill is on par with the full pass",
-             lambda: causal.a_padded_prefill_is_on_par_with_the_full_pass(
-                 rng, without_deterministic_ops)),
         *(Cell(f"a float32 {fixture}'s logits and gradients under the accurate policy are as exact as "
                "transformers",
                functools.partial(
@@ -65,15 +57,8 @@ def test_the_models_run_their_gpu_kernels(rng, without_deterministic_ops):
                                without_deterministic_ops)),
         Cell("a push whose replica refuses its join aborts its NCCL group",
              rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting),
-        *(Cell(f"the paged decode kernel's value and derivatives are the gathered attention's: width {width}"
-               f"{' window' if windowed else ''}{' softcap' if softcap else ''}{' sinks' if sunk else ''}",
-               when(bf16_dot_runs(), BF16_PRODUCTS, functools.partial(
-                   kv_cache.native_gpu_paged_value_and_derivatives_are_the_gathered_attentions,
-                   without_deterministic_ops, width, windowed, softcap, sunk)))
-          for width in (64, 256) for windowed in (False, True) for softcap in (None, 0.5)
-          for sunk in (False, True)),
-        Cell("a softcapped model decodes a paged cache on par with its compact cache",
+        Cell("the paged decode kernel decodes on par with the gathered attention, a softcapped model too",
              when(bf16_dot_runs(), BF16_PRODUCTS, functools.partial(
-                 kv_cache.a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache,
+                 kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention,
                  without_deterministic_ops))),
     ])
