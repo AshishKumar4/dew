@@ -164,6 +164,8 @@ followed = _loaded(HERE / "followed.py")
 progress = _loaded(HERE / "progress.py")
 digests = _loaded(HERE / "digests.py")
 grading = _loaded(HERE / "grading.py")
+host = _loaded(HERE / "host.py")
+stalls = _loaded(HERE / "stalls.py")
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
 STALE, node_of = grading.STALE, grading.node_of
@@ -1540,7 +1542,7 @@ def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the group
     has exited (`record`); how collection found each file (executed.py); pytest's report; the files the
     durations record does not wholly name (split.py); and its process id, whose stacks are read at its
-    deadline (executed.py, `dumped`)."""
+    deadline (executed.py, `stalls.dumped`)."""
     log, collection, report, unrecorded, pid = (out.with_name(f"{out.name}.{suffix}") for suffix in (
         "lifetime.log", "collected.json", "junit.xml", "unrecorded.json", "pid"))
     for stale in (report, log, collection, unrecorded, pid):
@@ -1549,31 +1551,10 @@ def task_files(out: Path) -> tuple[Path, Path, Path, Path, Path]:
     return log, collection, report, unrecorded, pid
 
 
-DUMP_SECONDS = 10.0
-"""How long py-spy gets to read a stalled pytest's stacks (`dumped`): it stops the process and reads every
-thread's frames out of its memory, in under a second for a test's threads (0.14 s on armada, 2026-11-07)."""
-
-
-def dumped(pid: Path, spy: Path) -> str:
-    """Every thread's stack of a task's pytest past its deadline, its Python frames and the native ones under
-    them, read from outside it by `spy` (py-spy, the task environment's) while it is stopped: nothing runs
-    in the stalled process, so one stalled in the interpreter, or in native code holding the GIL or not (an
-    XLA compile, a wait on a device, a collective), says where it stood alike (row 4828). pytest's id is the
-    one executed.py wrote to `pid` as it loaded; none where it never loaded."""
-    if not pid.is_file():
-        return ""
-    try:
-        read = subprocess.run([str(spy), "dump", "--native", "--pid", pid.read_text()],
-                              capture_output=True, text=True, timeout=DUMP_SECONDS)
-    except subprocess.TimeoutExpired:
-        return f"py-spy read no stacks of pytest in {DUMP_SECONDS:.0f} s"
-    return read.stdout or f"py-spy read no stacks of pytest: {read.stderr.strip()}"
-
-
 def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: float, grace: float,
                pid: Path, spy: Path) -> tuple[int, str, bool, str, set[str] | None, set[str]]:
     """A task's pytest `command` run to its `deadline`: its exit code, output, whether it passed the deadline,
-    its threads' stacks then (`dumped`), the data files it opened (`watched`), none where its group
+    its threads' stacks then (`stalls.dumped`), the data files it opened (`watched`), none where its group
     outlived the kill, and the checkout's files it wrote (`watched.changed`). pytest leads its own process
     group; its output streams through a reader nothing waits on past its end, so a child holding the pipe
     open cannot keep the verdict from being written."""
@@ -1599,7 +1580,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
         done.wait(deadline)
     except subprocess.TimeoutExpired:
         # Every thread's stack as pytest stands at its deadline, before the interrupt below.
-        expired, dump = True, dumped(pid, spy)
+        expired, dump = True, stalls.dumped(pid, spy)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
@@ -1610,6 +1591,17 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     reader.join(10)
     wrote = watched.changed(before, watched.stamps(os.getcwd(), followed.HIDDEN_INPUTS))
     return done.returncode, "".join(lines), expired, dump, None if left else closed, wrote
+
+
+def stall_evidence(python: str, tests: list[str], group: str, dump: str, began: float) -> str:
+    """A run past its deadline kept whole among the task's artifacts (`stalls.kept`), its path there: its red
+    rows' evidence (armada's `artifacts`), named by the rows it grades, so a task's several runs (a GPU
+    lane's) each keep their own. `began` is the run's monotonic start."""
+    root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
+    graded = hashlib.sha256("\n".join(row(python, name, group) for name in tests).encode()).hexdigest()[:16]
+    kept = stalls.kept(root, f"{python}-{graded}", dump, time.time() - (time.monotonic() - began),
+                       host.state())
+    return str(kept.relative_to(root))
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1666,9 +1658,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`dumped`).
+    # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`stalls.dumped`).
     returncode, output, expired, dump, opened, wrote = ran_pytest(command, environment, deadline, grace, pid,
                                                                   Path(f".venv-{python}/bin/py-spy"))
+    stall = stall_evidence(python, tests, group, dump, began) if expired else None
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
@@ -1696,9 +1689,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart; a check-1 site's judge apart from its file, its pooling no part of the file's tasks.
         ran.append({"name": row(python, name, group), "exitCode": 1 if red else 0, "seconds": seconds,
-                     # A stall's stacks whole, then the end of what pytest wrote.
+                     # A stall's stacks whole, then the end of what pytest wrote; a red's stall's whole record
+                     # among its evidence (`stalls.kept`).
                      "output": "\n".join(red + ([dump[:12000]] if dump else [])
                                          + ([output[-12000:]] if red else [])),
+                     **({"artifacts": [stall]} if stall is not None and red else {}),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ...").
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      # Where the task ran out of time, a file that never started: no seconds to time it by.
