@@ -346,13 +346,13 @@ class ShortcutObjective(DiffusionObjective):
         # take by different paths (`_bootstrapped`), so each example's is a boundary of its own.
         target = step.boundary("shortcut targets", jnp.where(expand(bootstrap, v), self._bootstrapped(
             taught, given, bootstrap, rows, count, total, x, sigma, step_size), v))
-        # The student's own call, as its velocity makes it (`_model_velocity`), opening what the step sows.
-        u, sown = self.model.apply(
-            self.model_variables(variables), x, schedule.model_time(sigma), **conditions,
-            duration=schedule.model_time(sigma) - schedule.model_time(sigma - step_size), train=step.training,
-            rngs=model_rngs(dropout_key, training=step.training), mutable=step.sown())
+        # The student's own call through its velocity (`_model_velocity`), recording what a watched step
+        # sows.
+        recorded: list[Variables] | None = [] if step.watched is not None else None
+        u = velocity(self.model_variables(variables), conditions, train=step.training,
+                     recorded=recorded)(x, sigma, sigma - step_size)
         losses = jnp.square(u - target)
-        inspected = sown.get(INSPECTED, {}) if step.watched is not None else None
+        inspected = None if recorded is None else recorded[0]
         return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
     @staticmethod
