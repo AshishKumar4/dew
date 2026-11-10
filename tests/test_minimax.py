@@ -83,8 +83,12 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
 
 def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did():
     """A run saved before the stack handed each lightning layer its place recorded a kind for each,
-    `linear_attention_{index}` stating its `layer_idx` (ledger 2564); its record still builds and
+    `linear_attention_{index}` stating its `layer_idx` (ledger 2564); its model record, read as a saved
+    run's and a checkpoint's declaration are (`dew.inference.tasks.earlier_model`), still builds and
     computes minimax-tiny's logits bit for bit as the record of one kind does."""
+    from dew.inference.tasks import earlier_model
+    from dew.registry import import_path
+
     loaded = load()
     record = translate_config(released('minimax-tiny'))
     lightning = record['kinds']['linear_attention']
@@ -96,7 +100,8 @@ def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did(
     legacy['kinds'] = {**others, **{
         name: {**lightning, 'mixer': {**lightning['mixer'], 'fields': {**fields, 'layer_idx': index}}}
         for index, name in enumerate(legacy['layer_types']) if name.startswith('linear_attention_')}}
-    model = from_record(CausalTransformer, {**legacy, 'attention_impl': 'reference'})
+    saved = {'class': import_path(CausalTransformer), 'fields': {**legacy, 'attention_impl': 'reference'}}
+    model = from_record(CausalTransformer, earlier_model({'model': saved})['model'])
     ids = np.load(TINY / 'input_ids.npy')
     np.testing.assert_array_equal(model.apply(loaded.variables, ids),
                                   loaded.model.apply(loaded.variables, ids))
