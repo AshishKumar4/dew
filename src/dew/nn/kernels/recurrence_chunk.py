@@ -43,7 +43,7 @@ from dew.nn.precision import asks_default_precision, at_least_fp32, exact_produc
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
-from .generation import INHERENT, triton_runs
+from .generation import INHERENT, Choice, triton_runs
 from .selection import Kernel, KernelRefused, Op, Requirement, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
 from .templates import base, scan as block_scan
@@ -420,7 +420,7 @@ port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
-GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
+GATED_DELTA: Op[PortCase] = Op(Choice.GATED_DELTA_RULE,
                                (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
@@ -1397,7 +1397,7 @@ arms' order). The template trains the rated scan under
 the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones its training is the port's by
 the template's refusal, not a cell."""
 
-SCAN: Op[ScanCase] = Op('ssd', (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
+SCAN: Op[ScanCase] = Op(Choice.SSD, (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
                                Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
                                Kernel('xla', (), generic=True)), declared=SCAN_CELLS)
 """The rated scan's selector: on a declared port cell (`SCAN_CELLS`) the port where it takes the call;
@@ -1502,7 +1502,7 @@ to the portable math), and the run's fast forms. Off Hopper too: on an A100 it b
 every cell, forward 4.0 to 9.1 times, training 11.2 to 13.8 (Mamba 130M and 2.8B at 2k and 8k tokens,
 W84-a100, M-JS-23)."""
 
-SELECTIVE: Op[SelectiveCase] = Op('selective_scan', (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
+SELECTIVE: Op[SelectiveCase] = Op(Choice.SELECTIVE_SCAN, (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
                                                      Kernel('xla', (), generic=True)))
 """The selective scan's selector: the recurrence template's scan (`templates.recurrence.selective`) where
 it takes the call, else the portable math. On an A100 its training step, B's and C's gradients added

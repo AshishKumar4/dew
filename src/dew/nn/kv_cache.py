@@ -48,7 +48,7 @@ from dew.batch import prefix_sum
 from dew.mesh import LayoutRefused, logical_spec, mesh_axes
 from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import decode_attention, generation
-from dew.nn.kernels.generation import INHERENT, backend
+from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select, selected
 from dew.nn.precision import float32_einsum
 from dew.nn.scatter import DROPPED
@@ -1071,7 +1071,7 @@ def _paged_preferred(case: PagedCase) -> str:
     return 'gathered'
 
 
-PAGED: Op[PagedCase] = Op('paged_decode', (
+PAGED: Op[PagedCase] = Op(Choice.PAGED_DECODE, (
     Kernel('triton', TRITON_PAGED_SUPPORTS),
     Kernel('template', TEMPLATE_PAGED_SUPPORTS),
     Kernel('tpu', TPU_PAGED_SUPPORTS),

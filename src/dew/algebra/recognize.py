@@ -39,6 +39,7 @@ from dew import _cache
 from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program, rules, terms
 from dew.algebra.forms import aval
 from dew.nn.kernels import generation
+from dew.nn.kernels.generation import Choice
 from dew.nn.programs import bodies, jax_name, named
 from dew.nn.sharding import sequence_shards
 
@@ -879,7 +880,7 @@ def _attention_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
         except KernelRefused:
             # A kernel a call names that does not take the call: the program's own math runs it.
             return False
-    return any(route.choice == "attention" and route.kernel not in KEPT for route in found)
+    return any(route.choice == Choice.ATTENTION and route.kernel not in KEPT for route in found)
 
 
 ATTENTION = (Family("exp", _attentions),)

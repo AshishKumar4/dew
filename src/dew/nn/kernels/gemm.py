@@ -309,7 +309,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
 LOW_RANK_ROW = 'ledger 1304'
 """The adapted product's fused form (docs/design/kernel-templates.md, Appendix C row 26)."""
 
-LOW_RANK: selection.Op[None] = selection.Op('low_rank', (
+LOW_RANK: selection.Op[None] = selection.Op(generation.Choice.LOW_RANK, (
     selection.Kernel('fused', (selection.Requirement(
         'measured', lambda case: False, "no receipt yet has the fused form beat the base product and the "
         "update apart", LOW_RANK_ROW, kind='measured'),)),
@@ -490,7 +490,7 @@ packed kernel and its receipt: a literal of them, which the selector reads and t
 registers (.thresh/thresh.cue)."""
 
 
-NVFP4: selection.Op[PackedCase] = selection.Op('nvfp4', (
+NVFP4: selection.Op[PackedCase] = selection.Op(generation.Choice.NVFP4, (
     selection.Kernel('packed', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
@@ -634,7 +634,7 @@ class BlockwiseCase:
     tile: mosaic_gpu.Tiles | None
 
 
-BLOCKWISE_FP8: selection.Op[BlockwiseCase] = selection.Op('blockwise_fp8', (
+BLOCKWISE_FP8: selection.Op[BlockwiseCase] = selection.Op(generation.Choice.BLOCKWISE_FP8, (
     selection.Kernel('mosaic', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no step-scaled tile here: an "
@@ -756,7 +756,8 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
         refusal = selection.Refusal("block_shape", f"a {depth} x {width} projection holds no whole "
                                     f"{edge}-wide blocks", kind="handoff")
     if refusal is not None:
-        generation.route("blockwise_fp8", kernel="unquantized", preferred=recipe.recipe, refusal=refusal)
+        generation.route(generation.Choice.BLOCKWISE_FP8, kernel="unquantized", preferred=recipe.recipe,
+                         refusal=refusal)
         return None
     if (placed := explicit_spec(rows)) is not None and placed.spec[0] is not None:
         return _projected_apart(rows, matrix, group_sizes, out_dtype=out_dtype, bias=bias, placed=placed)
@@ -960,7 +961,7 @@ class MxCase:
     tile: mosaic_gpu.Tiles | None
 
 
-MXFP8: selection.Op[MxCase] = selection.Op('mxfp8', (
+MXFP8: selection.Op[MxCase] = selection.Op(generation.Choice.MXFP8, (
     selection.Kernel('mosaic', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "
@@ -1124,7 +1125,7 @@ class NvFp4Block:
         return _block_values(self.codes, self.scales, NVFP4_BLOCK)
 
 
-NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op('nvfp4_block', (
+NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op(generation.Choice.NVFP4_BLOCK, (
     selection.Kernel('mosaic', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no block-scaled tile here: "

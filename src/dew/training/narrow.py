@@ -173,10 +173,10 @@ def narrow_copies(objective, state, batch, model_batch, *, composed: bool, windo
     copied. `traced` is that loss as the trainer traced it for its shapes (`footprint.traced_loss`, the
     state's variables its first inputs), whose casts are read in place of a trace of its own: a trace of
     a Qwen3.5-4B step's loss is seconds of its compile (row 4260)."""
-    from dew.nn.kernels.generation import backend, chosen_kernel
+    from dew.nn.kernels.generation import Choice, backend, chosen_kernel
     from dew.training.transaction import attempt_step
 
-    if (chosen_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
+    if (chosen_kernel(Choice.NARROW_COPIES, 'on' if backend() == 'gpu' else 'off') == 'off'
             or not composed or FROZEN in state.variables):
         return {}
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)

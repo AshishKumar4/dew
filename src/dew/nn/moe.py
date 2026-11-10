@@ -779,7 +779,9 @@ def _named(implementation: str) -> contextlib.AbstractContextManager:
     template's own for 'auto' and 'pallas' (`expert_projection`); any other name is refused."""
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
-    return generation.chosen(grouped_matmul='xla') if implementation == 'xla' else contextlib.nullcontext()
+    if implementation != 'xla':
+        return contextlib.nullcontext()
+    return generation.chosen(**{generation.Choice.GROUPED_MATMUL: 'xla'})
 
 
 

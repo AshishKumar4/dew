@@ -15,7 +15,7 @@ import numpy as np
 from dew._devices import deterministic_ops_requested
 
 from .kernels import decode_attention, generation
-from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_generation, gpu_placed
+from .kernels.generation import INHERENT, Choice, bf16_dot_runs, capability, device_generation, gpu_placed
 from .kernels.selection import Kernel, Op, Requirement
 from .kernels.templates import attention_quantized, attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
@@ -653,7 +653,7 @@ def _hosted(kernel: str) -> str:
     return 'xla' if kernel in ('cudnn', 'triton') and not gpu_placed() else kernel
 
 
-ATTENTION = Op[AttentionCase]('attention', (
+ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
     Kernel[AttentionCase]('flash', FLASH_SUPPORTS),
     Kernel[AttentionCase]('triton', TRITON_SUPPORTS),
     Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS)),
@@ -706,7 +706,7 @@ receipt. cuDNN declares none: faster at most 16-bit rows, it measured slower at 
 to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 
-DECODE = Op[AttentionCase]('decode', (
+DECODE = Op[AttentionCase](Choice.DECODE, (
     Kernel[AttentionCase]('decode', decode_attention.SUPPORTS),
     # A decode step takes no gradient, so its cuDNN forward runs under deterministic ops too.
     Kernel[AttentionCase]('cudnn', (*CUDNN_FORWARD_SUPPORTS, decode_attention.PRODUCTS)),

@@ -30,6 +30,7 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
+from .kernels.generation import Choice
 from .ngpt import NGPT, normed_hidden
 from .precision import at_least_fp32, compensated_sum, float32_dot_general, scaled, sqrt_or_zero
 from .protocols import ProjectionGroup
@@ -304,7 +305,7 @@ class GatedMLP(nn.Module):
             if self.packed_order[0] != 'gate_proj':
                 return None
             return self.gate_up_proj(x).reshape(*x.shape[:-1], 2, self.hidden_features)
-        if joins('gate_up', (self.gate_proj, self.up_proj)):
+        if joins(Choice.GATE_UP, (self.gate_proj, self.up_proj)):
             return joined_dense(x, (self.gate_proj, self.up_proj), axis=-2)
         return None
 
