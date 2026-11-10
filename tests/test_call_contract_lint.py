@@ -84,6 +84,88 @@ def test_a_call_that_drops_its_arguments_or_misdeclares_its_reads_is_reported(li
     assert any(True for _ in lint.calls(module)) is reported
 
 
+HELD = """
+def held_scan(x, *, coordinates):
+    return x if coordinates.forks is None else -x
+
+
+def plain_scan(x, *, coordinates):
+    return x if coordinates.segments is None else -x
+"""
+"""A package module of scans a mixer hands its coordinates to: one reads the call's forks, one never does."""
+
+HANDED = {
+    "its coordinates handed to a package function that reads the field": ("""
+        from dew.nn.scans import held_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                tokens = coordinates_of(call.metadata)
+                return held_scan(x, coordinates=tokens)
+        """, False),
+    "its coordinates handed to a package function that never reads the field": ("""
+        from dew.nn.scans import plain_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                tokens = coordinates_of(call.metadata)
+                return plain_scan(x, coordinates=tokens)
+        """, True),
+    "a package function that reads the field, handed only a receiver the call's field was stored on": ("""
+        from dew.nn.scans import held_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                self.decode = call.decode
+                return held_scan(self, x, coordinates=None)
+        """, True),
+    "a package function that reads the field, handed a name only a nested scope binds from the call": ("""
+        from dew.nn.scans import held_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                def unused():
+                    tokens = coordinates_of(call.metadata)
+                    return tokens
+                tokens = None
+                return held_scan(x, coordinates=tokens)
+        """, True),
+    "a package function that reads the field, handed nothing of the call": ("""
+        from dew.nn.scans import held_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                return held_scan(x, coordinates=None) if call.decode else x
+        """, True),
+}
+
+
+@pytest.mark.parametrize("case", list(HANDED))
+def test_a_field_counts_as_read_where_the_call_hands_it_to_a_package_function_that_reads_it(lint, case,
+                                                                                           tmp_path):
+    """A mixer that hands its call's coordinates to a function of its package reads what that function
+    reads of them (Mamba's `forks`, read by `held_scan`); handed to one that reads no such field, or a
+    function handed nothing of the call, it still declares a field it never reads."""
+    body, reported = HANDED[case]
+    (tmp_path / "src" / "dew" / "nn").mkdir(parents=True)
+    (tmp_path / "src" / "dew" / "nn" / "inputs.py").write_text('MIXING = ("forks", "admitted")\n')
+    (tmp_path / "src" / "dew" / "nn" / "scans.py").write_text(HELD)
+    (tmp_path / "src" / "dew" / "nn" / "layer.py").write_text(textwrap.dedent(body))
+    [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew")
+                if module.path.stem == "layer"]
+    assert any(True for _ in lint.calls(module)) is reported
+
+
 @pytest.mark.parametrize("body, reported", [
     ("assert step._cache_size() == 1\n", True),
     ("with Compiles('step') as compiled:\n    step()\nassert compiled.count == 1\n", False),
