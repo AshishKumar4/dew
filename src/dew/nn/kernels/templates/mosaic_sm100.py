@@ -80,6 +80,13 @@ class Topology:
 SINGLE = Topology()
 """A product on one CTA."""
 
+PAIRED = Topology(2)
+"""A product over a pair of CTAs, its leader issuing it."""
+
+PRODUCT_COLUMNS = 256
+"""tcgen05's widest product, its columns (N): one CTA's, or a pair's, each CTA reading its half of them (PTX
+ISA, tcgen05.mma's shapes)."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Tcgen05:
@@ -354,6 +361,28 @@ class CommittedRing(mosaic.Ring):
         plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)])
 
 
+@dataclasses.dataclass(frozen=True)
+class PairedRing(CommittedRing):
+    """A pair's ring (`Tcgen05Rings` over `PAIRED`): each step's block the pair's (`mosaic.Split`), each CTA
+    loading its half into its own slot, the leader's load barrier tracking both halves (`Topology.copied`),
+    which the leader's products read together; the leader's commit gives each slot back on both CTAs
+    (`Topology.issued`), so each CTA's load waits for its own slot's release."""
+
+    topology: Topology = PAIRED
+
+    def load(self, turn: mosaic.Turn, view) -> None:
+        if not isinstance(view, mosaic.Split):
+            raise ValueError(f"a pair's step is the pair's block (`mosaic.Paired` indices), not {view}")
+        slot = mosaic.opaque(turn.slot)
+        pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
+            self.consumed.at[slot], parity=turn.freed))
+        plgpu.copy_gmem_to_smem(view.ref, self.smem.at[slot], self.full.at[slot],
+                                **self.topology.copied(view.along))
+
+    def release(self, turn: mosaic.Turn) -> None:
+        plgpu.tcgen05_commit_arrive(self.consumed.at[mosaic.opaque(turn.slot)], **self.topology.issued())
+
+
 BLOCK_SCALED_COLUMNS = 128
 """The columns of one block-scale tile's rows (`SCALE_TILE`): a block-scaled product's tile is whole 128s."""
 
@@ -413,6 +442,10 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     operands_in_registers = False
 
     products_overlap = True
+
+    topology: Topology = SINGLE
+    """The CTAs its products span (`Topology`): one, or a pair's whose leader issues each (`Tcgen05Rings`'
+    pair)."""
 
     _HOME = "tcgen05's accumulators live in tensor memory, issued into by a walk's persist (`Tcgen05Rings`)"
 
@@ -520,7 +553,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         # The left operand from shared memory, or from tensor memory (an `Accumulator` a role wrote,
         # tcgen05's TS form: FlashAttention 4's P·V); the right from shared memory.
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
-        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False)
+        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False,
+                          **self.topology.issued())
         return dataclasses.replace(acc, accumulate=True)
 
     def scaled_products(self, acc: Accumulator, lhs, rhs, scales: tuple) -> Accumulator:
@@ -568,7 +602,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
     walks each tile's steps into one of two accumulator turns in tensor memory (`issue`), and the consumer
     warpgroup reads each finished tile's accumulators out in chunks and stores them (`finish`), freeing its
     turn for the tile after next, so a tile's epilogue runs while the next tile's products fill the other
-    (JAX's `blackwell_ragged_dot_mgpu.py`'s schedule, CUTLASS's sm100 persistent GEMM)."""
+    (JAX's `blackwell_ragged_dot_mgpu.py`'s schedule, CUTLASS's sm100 persistent GEMM). Over a pair of CTAs
+    (`Tcgen05PairRings`), CUTLASS's 2-SM UMMA."""
 
     consumers = 1
     gathers_rows = True  # its load warp's TMA four-row gathers (`gathered.Committed`, row 1376)
@@ -610,7 +645,11 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
         if multicast:
             raise NotImplementedError("tcgen05's pair of CTAs shares a product, not a multicast ring "
-                                      "(`Topology`; not yet a stream of this bundle's)")
+                                      "(`PAIR`: each CTA loads its half of a step's block)")
+        if self.topology.paired and (gathered or any(count > 1 for count in (copies or {}).values())
+                                     or any(tuple(shape[-2:]) == SCALE_TILE for shape, _ in blocks.values())):
+            raise NotImplementedError("a pair's streams are its blocks whole, each CTA's half "
+                                      "(`PairedRing`): no gathered rows, copies in pieces or block scales")
         # A gathered stream's rows are its load warp's four-row gathers (`gathered.Committed`).
         streams = {name: gathered_rows.ring(shape, dtype, stages, released_by_products=True)
                    if name in gathered else
@@ -629,6 +668,8 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         from dew.nn.kernels.templates import gathered  # it builds on `mosaic.Ring`
 
         del views
+        if self.topology.paired:
+            return {name: PairedRing(**scoped, topology=self.topology) for name, scoped in allocated.items()}
         # A gathered stream's load barriers are shared memory of its own (`gathered.ring`).
         return {name: ScaleRing(**scoped) if 'tmem' in scoped
                 else CommittedRing(**scoped) if isinstance(scoped['full'].dtype, plgpu_core.BarrierType)
@@ -643,7 +684,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         rewriting = (handoffs.Role("rewrite", 1),) if rewrites else ()
         roles = (handoffs.Role("epilogue", consumers), *rewriting, *ISSUING)
         return handoffs.Schedule(roles, (handoffs.HandOff(
-            "accumulators", Accumulators(self.turns, self.rows, width, running=summed), "mma",
+            "accumulators", Accumulators(self.turns, self.rows, width, self.topology, running=summed), "mma",
             ("epilogue",)),))
 
     def persist_scratch(self, consumers: int, rewrites: tuple[int, ...] = ()) -> tuple[tuple, int]:
@@ -672,6 +713,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         window run while the epilogue promotes the one before."""
         if not accumulators:
             raise ValueError(f"{self._HOME}: a persistent launch states their shapes (`accumulators`)")
+        if self.topology.paired and (summed or prepared is not None):
+            raise NotImplementedError("a pair's tiles are a plain product's: no exact sums or rewritten "
+                                      "steps")
         rows = {shape[0] for shape in accumulators}
         if rows != {self.rows}:
             raise ValueError(f"a tcgen05 accumulator is {self.rows} rows on one CTA, not {sorted(rows)}")
@@ -802,9 +846,13 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
                     return lax.fori_loop(0, (steps + summed - 1) // summed, window, start), running
 
-                issue(0, tile, walk, active=True)
-                if turn is not None:
-                    tensor.issued(turn)
+                # A pair's leader issues each product over both CTAs, its commit arriving at both; each CTA's
+                # product warp waits for its own turn's read, so both keep the read barrier's phases.
+                @pl.when(self.topology.leads())
+                def _():
+                    issue(0, tile, walk, active=True)
+                    if turn is not None:
+                        tensor.issued(turn)
 
         return products
 
@@ -846,8 +894,28 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         plgpu.commit_tmem()
         plgpu.wait_load_tmem()
 
+class Tcgen05PairRings(Tcgen05Rings):
+    """tcgen05's bundle over a pair of CTAs (`PAIRED`, CUTLASS's 2-SM UMMA): each step's blocks the pair's,
+    each CTA loading its half (`PairedRing`); the leader's product warp issuing each product over both CTAs'
+    rows into both's tensor memory, allocated together; each CTA's epilogue reading its own rows, a turn freed
+    once both have (`Accumulators`' cluster read barrier). Its tile is twice a CTA's rows and columns, each
+    CTA's columns half of tcgen05's widest product's; no block scales (a scale tile's tensor memory is one
+    CTA's) and no gathered rows (a pair's step block is copied partitioned, whole)."""
+
+    name = "tcgen05.pair"
+    topology = PAIRED
+    cluster = PAIRED.ctas
+    pairs_product = True
+    widest_product = PRODUCT_COLUMNS // PAIRED.ctas
+    takes_block_scales = False
+    gathers_rows = False
+
+
 RINGS = Tcgen05Rings()
 """The tcgen05 bundle (`bundles.of` on sm100 and sm103)."""
+
+PAIR = Tcgen05PairRings()
+"""The tcgen05 bundle over a pair of CTAs: a launch's config names it ('tcgen05.pair', `bundles`)."""
 
 
 def _published(ring: mosaic.Ring, masked) -> CommittedRing:
