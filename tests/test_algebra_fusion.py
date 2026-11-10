@@ -456,6 +456,28 @@ def test_a_plain_programs_masked_attention_compiles_under_a_sequence_axis():
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(written))
 
 
+def cast_attention(q, k, v):
+    """Attention as a half-precision program with float32 logits writes it: its queries and keys cast to
+    float32 for the product, its values in their own dtype."""
+    logits = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32)) * q.shape[-1] ** -0.5
+    weights = jax.nn.softmax(logits, axis=-1).astype(v.dtype)
+    return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
+
+
+def test_an_attention_whose_queries_and_keys_are_cast_for_its_logits_compiles_and_computes_as_written():
+    """A half-precision program that casts its queries and keys to float32 for the logits and leaves its
+    values half compiles through `dew.jit` and computes what it computes as written. Read with a cast
+    operand beside one that is not, the region is no call of Dew's attention, whose queries, keys and
+    values are of one dtype: asked to trace such a call, jax.nn's own check raised out of the compile (row
+    5438: a command-line decision run in a library process's arithmetic)."""
+    import dew
+
+    rng = np.random.default_rng(5438)
+    q, k, v = (jnp.asarray(rng.normal(size=(1, 16, 4, 32)), jnp.float16) for _ in range(3))
+    ours, written = dew.jit(cast_attention)(q, k, v), jax.jit(cast_attention)(q, k, v)
+    np.testing.assert_array_equal(np.asarray(ours), np.asarray(written))
+
+
 @pytest.mark.parametrize(("variant", "options"), [("attention", {}), ("finite fill", {"fill": 0.0}),
                                                   ("truncated logits", {"logits_cast": jnp.int32}),
                                                   ("initial above", {"initial": 1e30}),

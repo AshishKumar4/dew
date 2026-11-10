@@ -742,11 +742,16 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
 
 def _attended(q: jcore.Var, k: jcore.Var, v: jcore.Var) -> bool:
     """Whether Dew's attention takes `q`, `k` and `v` as its query `[B, S, H, D]`, keys `[B, T, K, D]` and
-    values `[B, T, K, E]`: one batch, keys and values of one length and head count, which divides the
-    queries' heads, and queries and keys of one width. A region over another layout (a model's `[B, H, S,
-    D]`) is no call of it: read so, a cross-attention's two query tokens over 127 keys were two heads over
-    127 (`dew.nn.attention_masks.repeat_kv_heads`' refusal)."""
+    values `[B, T, K, E]`: of one dtype, one batch, keys and values of one length and head count, which
+    divides the queries' heads, and queries and keys of one width. A region over another layout (a model's
+    `[B, H, S, D]`) is no call of it: read so, a cross-attention's two query tokens over 127 keys were two
+    heads over 127 (`dew.nn.attention_masks.repeat_kv_heads`' refusal). Nor is one read with an operand its
+    program cast for the logits beside one it did not (float32 queries over half-precision values): the
+    call's float32 softmax is its own option over operands of one dtype (`_attention_candidates`' `wide`),
+    which the operands before their casts are tried under."""
     if aval(q).ndim != 4 or aval(k).ndim != 4 or aval(v).ndim != 4:
+        return False
+    if not aval(q).dtype == aval(k).dtype == aval(v).dtype:
         return False
     (batch, _, heads, width), (_, length, shared, keyed), (_, valued, held, _) = (
         aval(q).shape, aval(k).shape, aval(v).shape)
