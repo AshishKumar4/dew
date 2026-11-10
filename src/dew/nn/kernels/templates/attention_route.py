@@ -73,11 +73,18 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
-    wide = generation.numerics().forms == 'accurate'
-    config = _Config(scale, NATURAL or wide if natural is None else natural,
-                     ACCURATE or wide if accurate is None else accurate,
+    config = _Config(scale, *run_forms(natural, accurate),
                      None if operand_dtype is None else jnp.dtype(operand_dtype).name)
     return _attend(config, query, key, value, spans, hooks)
+
+
+def run_forms(natural: bool | None = None, accurate: bool | None = None) -> tuple[bool, bool]:
+    """A call's form, `(natural, accurate)`: each where given, else the one the run's numerics name
+    (`generation.numerics().forms`, `FORMS`: 'accurate' takes both), else the default's (`NATURAL`,
+    `ACCURATE`)."""
+    wide = generation.numerics().forms == 'accurate'
+    return (NATURAL or wide if natural is None else natural,
+            ACCURATE or wide if accurate is None else accurate)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -235,8 +242,7 @@ def rounded(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     """A quantized call's forward (`Hooks.rounds`) at a logit scale of 1 on its mainloop (`_forward`): the
     anchored training walk's output, its residuals let go; its backward is its quantization's own
     (`attention_quantized`)."""
-    wide = generation.numerics().forms == 'accurate'
-    config = _Config(1.0, NATURAL or wide, ACCURATE or wide, None)
+    config = _Config(1.0, *run_forms(), None)
     return _forward(query, key, value, spans, hooks, config, residuals=True)[0]
 
 

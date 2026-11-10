@@ -22,6 +22,7 @@ from dew.nn.kernels.templates import (
 )
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    STATISTICS,
     BackwardTiles,
     TileWalk,
     _coords,
@@ -118,13 +119,6 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     transposed = transposed_swizzles(config, *(("logits",) if "logits" in blocks else ()), "douts")
     swizzles = transposed if swizzle is None else dict.fromkeys(blocks, swizzle)
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles), after
-
-STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32,
-                               "delta": jnp.float32, "chosen": jnp.int32})
-"""The per-query statistics a dK/dV step reads (`_scores`' `peak`, `total`, `anchor`, `delta` and `chosen`,
-the anchor key's index), in the order of their arrays, and their dtypes: a shared dQ's launch streams each
-beside its queries."""
-
 
 
 def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, store_tiles, shares, part,
@@ -423,7 +417,6 @@ def _graded(score_params: tuple, kinds: tuple, shares: tuple, shape: tuple, keys
     return graded, buffers, mosaic.stacked_groups(buffers)
 
 
-
 def _dkv_refs(refs, treedef, leaves: int, graded: list[Kind], groups: tuple, *, widths: bool, split: bool,
               fused: bool, after: bool) -> tuple:
     """The dK/dV program's refs by role: its nine inputs, its spans' and hook parameters' (`treedef` of
@@ -516,6 +509,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         approx_math=walk.approx_math,
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.reduces),
+        registers=walk.registers(dq=False),
         # The products this launch issues (`stated`): its `S` and `dP` recomputed, its share of dV's, and
         # each part of its share of dK's and of dQ's where it adds it (`part_count`); the model's of them it
         # owns (`modelled`): its shares of dK's and dV's, dP's in the first share's and dQ's where it adds it.

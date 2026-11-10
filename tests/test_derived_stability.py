@@ -32,7 +32,7 @@ from reference_error import widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_portable
+from dew.nn.kernels.templates import attention as template, attention_portable, attention_route
 
 
 @contextlib.contextmanager
@@ -67,7 +67,9 @@ def test_the_derived_attention_is_finite_where_the_truth_is_on_every_family(name
     truth = with_gradients(attention_suite._reference(family, anchored=True))
     label = f"portable derived {forms} {family.dtype} {name}"
     with derived(forms):
-        differentiated = jax.jit(with_gradients(attention_suite._mainloops(family, {})["portable"]))
+        natural, accurate = attention_route.run_forms()
+        mainloops = attention_suite._mainloops(family, {"natural": natural, "accurate": accurate})
+        differentiated = jax.jit(with_gradients(mainloops["portable"]))
         attention_suite.assert_finite(differentiated, truth, draw, label, seeds=attention_suite.SEEDS[name])
         attention_suite._held_empty(family, differentiated(*draw(0)), label)
 
@@ -140,11 +142,11 @@ def test_the_derived_attention_is_finite_where_the_reference_is_at_each_edge(nam
     out, pull = jax.vjp(reference, query, key, value)
     theirs = (out, *pull(dout))
     with derived(forms):
+        natural, accurate = attention_route.run_forms()
         made = attention_portable.backward(attention_portable.Tiles(**tiles), query, key, value, spans, hooks,
-                                           dout)
+                                           dout, natural=natural, accurate=accurate)
         mine = (attention_portable.xla_mainloop(attention_portable.Tiles(**tiles), query, key, value, spans,
-                                                hooks), made.query, made.key,
-                made.value)
+                                                hooks, natural=natural), made.query, made.key, made.value)
     for leaf, ours, exact in zip(("output", "dq", "dk", "dv"), mine, theirs, strict=True):
         finite = np.isfinite(np.asarray(exact, np.float32))
         assert np.isfinite(np.asarray(ours, np.float32))[finite].all(), f"{name} {dtype} {leaf}"

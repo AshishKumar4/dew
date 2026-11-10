@@ -45,6 +45,7 @@ from dew.nn.kernels.templates.attention import (
     prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    ForwardRegisters,
     Tiles,
     TileWalk,
     _block,
@@ -274,7 +275,8 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
                     out_dtype=None, masked: bool = False, splits: int = 1, table: jax.Array | None = None,
                     sources: jax.Array | None = None, subtracted: bool = False,
                     flagged: bool = False, scales: tuple[jax.Array, jax.Array] | None = None,
-                    parts: int = 1, scaled: bool = True, counts: bool = True):
+                    parts: int = 1, scaled: bool = True, counts: bool = True,
+                    registered: ForwardRegisters | None = None):
     """The inference walk's launches: its spec and `launch(form, live, into)` as `algebra.walked_launches`
     takes them and `finished`, its outputs from the walk's: `MosaicForward`'s launch without residuals, at
     `tiles`, under the fold's guard over whole launches (`algebra.walked_launches`), a `scaled` walk's rows'
@@ -293,7 +295,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     state its rows' rewalk flags (`_launch`'s `flags`, `_Flags`), which the masked rewalk reads as they are:
     no array operation between the two launches. An fp32 call's operands enter as their `parts`
     (`MosaicForward.parts`), stacked along the batch axis, each launch reading them so (`_launch`'s
-    `parts`)."""
+    `parts`). Its launches state their registers by `registered` (`_launch`'s)."""
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
@@ -316,8 +318,10 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # An in-place rewalk is of live rows (`algebra.walked_launches`).
         in_place = {"into": into, "keeping": flags.rows} if into is not None and flags is not None else {}
         stated = flagged and live is None and into is None
-        walk = _InferenceWalk(family, spec, call, hooks, hooked, k, v, interpret, rows, out_dtype, masked,
-                              splits, paged, sources, computed, parts, counts)
+        # The launch on the family arranged for its own tiles (`bundle_of`), as its derivation priced it: a
+        # natural rewalk's key tile its own (`Tiles.relaunch`).
+        walk = _InferenceWalk(bundle_of(at, query.dtype), spec, call, hooks, hooked, k, v, interpret, rows,
+                              out_dtype, masked, splits, paged, sources, computed, parts, counts, registered)
         return _plain_launches(walk, q, form, at, at_spans, flags, in_place, stated=stated, into=into)
 
     return (spec, launch, functools.partial(_walked_outputs, queries=call.queries, width=value.shape[3],
@@ -347,6 +351,8 @@ class _InferenceWalk(NamedTuple):
     parts: int = 1
     counts: bool = True
     """Whether its launches state their work to Dew's FLOP count (`_launch_flops`)."""
+    registered: ForwardRegisters | None = None
+    """The call's facts its launches' registers read (`_launch`'s `registered`)."""
 
 
 def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, at: Tiles, at_spans,
@@ -374,7 +380,7 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
                         spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                         family=family, training=False, interpret=interpret, parts=parts,
                         counted=walk.counts and form.natural == spec.natural, finishes=rows, columns=first,
-                        splits=splits,
+                        splits=splits, registered=walk.registered,
                         table=paged, sources=sources,
                         out_dtype=jnp.float32 if split else out_dtype, walks=walks,
                         shared_by=len(blocks),
@@ -465,7 +471,8 @@ def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
 
 def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                      scale: float, natural: bool, tiles: Tiles, interpret: bool, scaled: bool = False,
-                     counts: bool = True) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
+                     counts: bool = True, registered: ForwardRegisters | None = None
+                     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     """`MosaicForward`'s training launches at `tiles`, two a form: a walk of the logits alone for each row's
     anchor, its first key at the keys' largest logit (`_peak_consumer`), then the algebra's training step
     at that anchor and maximum (`algebra.anchored_step`) taken in place, the split sums `B` and the rows'
@@ -475,7 +482,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     launches, `MosaicForward.scaled`), the split sums and rows' weights of its column blocks joined at the
     largest of their rows' shifts. The fold's guard composes over whole launches (`algebra.walked_launches`):
     its rewalk is this kernel's natural launch. Its launches state their work to Dew's FLOP count where it
-    `counts`, the rewalk's none (`_inference_walk`'s)."""
+    `counts`, the rewalk's none (`_inference_walk`'s), and their registers by `registered` (`_launch`'s)."""
     family = bundle_of(tiles, query.dtype)
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
@@ -488,16 +495,21 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         counted = counts and form.natural == spec.natural
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
-        found = _launch(q, k, v, at_spans, hooked, spec=form, hooks=hooks, tiles=at, family=family,
-                        training=False, interpret=interpret, peaks=True, counted=counted)
+        # The launches on the family arranged for their own tiles (`bundle_of`), as their derivation priced
+        # them: a natural rewalk's key tile its own (`Tiles.relaunch`).
+        launching = bundle_of(at, query.dtype)
+        found = _launch(q, k, v, at_spans, hooked, spec=form, hooks=hooks, tiles=at, family=launching,
+                        training=False, interpret=interpret, peaks=True, counted=counted,
+                        registered=registered)
 
         # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`, row
         # 2526), each block's split sums side by side, their rows alike.
         # A scaled launch's keys' magnitudes the call's (`_largest`).
         launched = [_launch(q, k, values, at_spans,
                             held._replace(magnitudes=_magnitudes(values, held, 1)) if form.headroom else held,
-                            spec=form, hooks=hooks, tiles=at, family=family, training=True,
-                            interpret=interpret, anchors=found, counted=counted, columns=first)
+                            spec=form, hooks=hooks, tiles=at, family=launching, training=True,
+                            interpret=interpret, anchors=found, counted=counted, columns=first,
+                            registered=registered)
                     for first, values, held in _column_blocks(v, hooked, at.columns)]
         status, rows, anchors, _ = launched[0]
         if form.headroom and len(launched) > 1:
@@ -1079,7 +1091,8 @@ def _certified_step(family: mosaic.Family, certified: tuple, index, state: algeb
 
 
 def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
-                   scale: float, natural: bool, tiles: Tiles, interpret: bool, subtracted: bool = False):
+                   scale: float, natural: bool, tiles: Tiles, interpret: bool, subtracted: bool = False,
+                   registered: ForwardRegisters | None = None):
     """The forward's certify form (off in production; row 2084's native step witness): its plain launch at
     `tiles` alone, no fold's rewalk, whose walk stores its online-softmax state after each key tile j
     (`algebra.Partial`: the rows' running maxima and denominators in the walk's units, the sums before the
@@ -1090,7 +1103,8 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     sums zero, so no entry is left unwritten. The logits are in the walk's log2 units (`algebra.exponent`:
     the scale folded, or the raw products scaled after the subtraction where `subtracted`), their
     exponentials `ex2.approx` where the launch approximates (`approximate`). A call of one block of the value
-    columns (`Tiles.columns` None), one slice, no output hook."""
+    columns (`Tiles.columns` None), one slice, no output hook. Its launch states its registers by
+    `registered` (`_launch`'s)."""
     if tiles.columns is not None or hooks.output_mod is not None:
         raise ValueError("the certify form walks one block of the value columns, no output hook")
     family = bundle_of(tiles, query.dtype)
@@ -1106,7 +1120,7 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                    jnp.zeros((batch, heads, steps, padded), jnp.float32)])),
             jax.new_ref(jnp.zeros((batch, heads, steps, padded, value_width), jnp.float32)))
     _launch(q, k, v, at_spans, hooked, spec=form, hooks=hooks, tiles=at, family=family, training=False,
-            interpret=interpret, certified=True, into=held)
+            interpret=interpret, certified=True, into=held, registered=registered)
     out, rows, sums = (jax.freeze(ref) for ref in held)
     queries, width = call.queries, value.shape[3]
     return out[:, :queries, :, :width], rows[..., :queries], sums[:, :, :, :queries, :width]
@@ -1179,13 +1193,13 @@ def _parted_products(family: mosaic.Family, acc, scale, weights: jax.Array, valu
     """`acc` with an fp32 call's P·V issued into it in place, its factor `scale` first where given, or a
     fresh accumulator of `shape` where `acc` is None: the fp32 `weights`' bf16 parts (`product.bf16_parts`'),
     the largest first, each product with the values' parts (`values`) the pair's orders under their count
-    (`product.terms`'), all into the one accumulator (`issued_pairs`). Each part formed from the weights
-    alone as it is taken (`_part`), so a consumer holds the weights and one part beside the sums."""
+    (`product.terms`'), all into the one accumulator (`issued_pairs`). Each part formed as it is taken, from
+    the remainder past the last (`product.bf16_parts`; a weight is at most 1, no part of it saturating), so a
+    consumer holds that remainder and one part beside the sums."""
     count = len(values.refs)
 
     def pairs():
-        for i in range(count):
-            part = _part(weights, i)
+        for i, part in enumerate(product.bf16_parts(weights, count, saturating=0)):
             for j in range(count - i):
                 yield part, values.refs[j]
 
@@ -1194,15 +1208,6 @@ def _parted_products(family: mosaic.Family, acc, scale, weights: jax.Array, valu
     if scale is not None:
         acc = family.rescaled_products(acc, scale, (), None, interpret)
     return issued_pairs(family, acc, pairs(), interpret)
-
-
-def _part(weights: jax.Array, index: int) -> jax.Array:
-    """The `index`-th bf16 part of fp32 `weights` (`product.bf16_parts`'), each element's from its own weight:
-    its remainder past the parts before it, rounded. A weight is at most 1, no part of it saturating."""
-    rest = weights
-    for _ in range(index):
-        rest = rest - rest.astype(jnp.bfloat16).astype(jnp.float32)
-    return rest.astype(jnp.bfloat16)
 
 
 def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
@@ -1389,7 +1394,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
             walks: "_Flags | None" = None, sources: jax.Array | None = None, shared_by: int = 1,
             column_blocks: int = 1, certified: bool = False, into: tuple | None = None,
-            keeping: jax.Array | None = None, flags: bool = False, parts: int = 1):
+            keeping: jax.Array | None = None, flags: bool = False, parts: int = 1,
+            registered: ForwardRegisters | None = None):
     """The forward's launch in `spec`'s form: its rows' status `[1, B, H, Qp]` fp32, their maxima in the
     walk's units (`algebra.walked_launches`' fold guard), and its output `[B, Qp, H, Dv]` in `out_dtype`
     (the query's by default). In `training`, at the `anchors` a peak walk found, its status and residuals
@@ -1418,7 +1424,9 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     form's (`certified_walk`): its plain walk's state after each key tile beside its outputs. With `into`
     (refs holding its outputs but its status, `_Read.into`), it writes its rows `keeping` (every row where
     None) into them in place and gives nothing: a masked rewalk's rows, every other row the plain launch's
-    bits, no copy of the outputs and no select over them (`algebra.walked_launches`' `in_place`).
+    bits, no copy of the outputs and no select over them (`algebra.walked_launches`' `in_place`). Its kernel
+    states its consumer's registers at its own tiles as its derivation counts them (`registered`'s,
+    `ForwardRegisters.at`; none where None), its name and its register model one launch's facts.
     """
     if splits > 1 and (training or peaks or hooked.initial is not None):
         raise ValueError("a split launch walks an inference call, its initial state merged in XLA")
@@ -1450,7 +1458,9 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
                      page=None if table is None else table[1],
                      column_width=column_width, shared_by=shared_by, column_blocks=column_blocks,
                      certified=certified, flags=flags,
-                     walk_rows=None if walks is None else walks.granule, parts=parts)
+                     walk_rows=None if walks is None else walks.granule, parts=parts,
+                     registers=None if registered is None else registered.at(family, tiles, peaks=peaks,
+                                                                              columns=column_width))
 
 
 def _extents(query, key, value, read: _Read, *, page: int | None, column_width: int | None, parts: int
@@ -1509,18 +1519,20 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
-                      "column_blocks", "certified", "flags", "walk_rows", "parts"))
+                      "column_blocks", "certified", "flags", "walk_rows", "parts", "registers"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
               column_width: int | None = None, shared_by: int = 1, column_blocks: int = 1,
-              certified: bool = False, flags: bool = False, walk_rows: int | None = None, parts: int = 1):
+              certified: bool = False, flags: bool = False, walk_rows: int | None = None, parts: int = 1,
+              registers: int | None = None):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
     hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
     (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
     and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
-    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it)."""
+    `name` its kernel's (`mosaic.kernel` reports it as the launch tracing it names it) and `registers` its
+    consumer's, which it states with it (`Family.kernel`)."""
     leaves, treedef = jax.tree.flatten(read)
     batch, queries, heads, width, value_width, keys_count, kv_heads = _extents(
         query, key, value, read, page=page, column_width=column_width, parts=parts)
@@ -1619,6 +1631,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
                          approx_math=approx_math, name=name, cost=cost, model_flops=model,
+                         registers=registers,
                          reducing_warpgroups=reducing(family, consumers,
                                                       hook_reduces(hooks) or hooks.output_mod is not None,
                                                       flagged=flags,
