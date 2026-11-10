@@ -216,6 +216,31 @@ def test_an_immutable_put_reads_again_only_an_upload_that_reads_back_otherwise()
     assert (calls["writes"], calls["reads"]) == (1, 0)
 
 
+def test_an_immutable_put_to_a_store_that_reads_its_writes_back_at_once_refuses_other_bytes_at_once():
+    """A store that states a write is read back at once (`READ_AFTER_WRITE`: this process's memory here, S3
+    and GCS as their makers state it) holds what it took: an object it reads back otherwise was written
+    otherwise, refused on its first read whatever the retries."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    reads = []
+
+    class Garbling(MemoryFileSystem):
+        protocol = ("garbling", "memory")
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("garbling://", "memory://", 1))
+
+        def cat_file(self, path, *args, **kwargs):
+            reads.append(path)
+            return super().cat_file(path, *args, **kwargs)[::-1]
+
+    fsspec.register_implementation("garbling", Garbling, clobber=True)
+    with pytest.raises(OSError, match="did not verify"):
+        Store(f"garbling://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=5)
+    assert len(reads) == 1
+
+
 def test_two_finalizers_publish_only_one_snapshot(store):
     start = threading.Barrier(2)
 

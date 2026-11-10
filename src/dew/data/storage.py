@@ -48,6 +48,17 @@ class SourceChanged(OSError):
     digest a caller named (`source_snapshot`), or its store's version of it as the download began."""
 
 
+READ_AFTER_WRITE = frozenset({"s3", "gs", "gcs", "file", "memory"})
+"""The stores a successful write is read back from at once, as their makers state it, so an object that
+reads back otherwise was written otherwise, and is refused at once (`Store.put_immutable`): S3, "strong
+read-after-write consistency for PUT and DELETE requests of objects in your Amazon S3 bucket in all AWS
+Regions" (docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html, its data consistency model);
+GCS, "the object is immediately available for reading and metadata operations as soon as you receive a
+success response to your write request" (cloud.google.com/storage/docs/consistency; read through its API,
+not a public cache, as gcsfs reads); this host's disk and memory. The Hugging Face Hub's documentation
+states none, nor does a store of a `ConditionalWrites` of its own: their objects are read again
+(`retries`)."""
+
 STORED = {"s3": "etag", "gs": "generation", "gcs": "generation"}
 """The version each remote store names an object it holds by and changes as it is replaced
 (`Store.get_versioned`), which a read of a range of it can be held to (`dew.data.declared.ranged`): an S3
@@ -710,10 +721,12 @@ class Store:
         object an earlier attempt created, and return the stored version.
 
         Other bytes already at the URL are refused with a ValueError. An object
-        this call created that reads back otherwise is read again, up to
-        `retries` times, a longer wait before each, then an OSError: no
-        transport checks what a write left. A failed transfer raises at once,
-        after the transport's own retries (s3fs's, gcsfs's, huggingface_hub's).
+        this call created that reads back otherwise is an OSError: at once on a
+        store that states its writes are read back at once (`READ_AFTER_WRITE`),
+        and on any other after it is read again up to `retries` times, a longer
+        wait before each, as such a store states nothing of when a write is
+        read. A failed transfer raises at once, after the transport's own
+        retries (s3fs's, gcsfs's, huggingface_hub's).
         """
         try:
             self.put_if_absent(payload)
@@ -721,7 +734,8 @@ class Store:
             created = False
         else:
             created = True
-        for attempt in range(retries + 1):
+        _, _, scheme = self._backend()
+        for attempt in range(1 if scheme in READ_AFTER_WRITE else retries + 1):
             if attempt:
                 time.sleep(min(0.25 * 2 ** (attempt - 1), 10))
             found = self.get_versioned()

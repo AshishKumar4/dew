@@ -133,7 +133,9 @@ class Cache:
     writer that completes every input of the source it is given publishes
     that source's generation. Volatile prefixes run on every read and produce
     no completions. A shard a remote store took but reads back otherwise is
-    read again up to `retry` more times (`Store.put_immutable`); a failed
+    refused, at once where the store states it reads its writes back at once
+    (`dew.data.storage.READ_AFTER_WRITE`: S3, GCS), and on any other (the Hub)
+    after it is read again up to `retry` more times (`Store.put_immutable`); a failed
     transfer raises after its transport's own retries, and a write to this
     host's disk or memory fails at once.
     """
