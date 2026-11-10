@@ -233,9 +233,11 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
     landing = {"out": ((chunk, bv), out_dtype)}
     swizzle = None if call.per_key else _output_swizzle(call, bv, staging, landing)
     keys = None if swizzle is None else {f"keys{p}": swizzle for p in range(call.given.parts)}
+    # Its kernel named `recurrence_output` as the profiles and the gate know it (`launch_kernel` names a
+    # launch for the function its program is defined in, here `output_launch`).
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                         grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=chunk_liveness(8),
-                         work=work,
+                         name="recurrence_output", grid_names=("chunks", "heads"), blocks=blocks, stages=1,
+                         live=chunk_liveness(8), work=work,
                          held=_output_held(call, bv, swizzle), staging=staging, landing=landing,
                          # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes
                          # alone).
