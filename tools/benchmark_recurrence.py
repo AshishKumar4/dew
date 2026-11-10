@@ -178,7 +178,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
 
             # What the kernels take, whatever this GPU's row prefers.
             case = scan_case(x, B, shape.chunk)
-            refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').failed(case))
+            refusals['hand'] = '; '.join(refusal.detail for refusal in SCAN.kernel('pallas').refusals(case))
             cotangents = (given['dy'], given['dfinal'])
         else:
             # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
