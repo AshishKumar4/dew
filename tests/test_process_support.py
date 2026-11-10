@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 import pytest
-from process_support import ProcessGroup, run_pool, running, start_process, terminate
+from process_support import ProcessGroup, drained, output, run_pool, running, start_process, terminate
 
 
 def test_pool_reports_follow_rank_order_and_workers_own_sessions(tmp_path):
@@ -40,8 +40,7 @@ def test_finalizer_kills_descendants_after_the_session_leader_exits():
     with ProcessGroup() as pool:
         process = start_process([sys.executable, "-c", code], devices=1)
         pool.running.append(process)
-        assert process.stdout is not None
-        descendant = int(process.stdout.readline())
+        descendant = int(drained(process).line(0, timeout=60))
         process.wait(timeout=5)
         os.kill(descendant, 0)
     assert not running(descendant)
@@ -141,7 +140,7 @@ def test_a_worker_that_ends_by_itself_leaves_its_owner_nothing_running(tmp_path)
     kills nothing, as the group's id is then free for another process."""
     before = children()
     process = start_process([sys.executable, "-c", "print('done')"], devices=1)
-    assert process.communicate(timeout=60)[0].strip() == "done"
+    assert output(process, 60).strip() == "done"
     assert all(gone_within(pid, 30) for pid in children() - before), children() - before
 
 
@@ -225,3 +224,28 @@ def test_a_relayed_child_says_its_output_as_it_comes_and_its_stacks_when_it_runs
     assert len(arrived) > 1
     done = relayed([sys.executable, "-c", "print('ok')"], worker_env(1), timeout=60, sink=lambda line: None)
     assert (done.returncode, done.output) == (0, "ok\n")
+
+
+def test_a_pool_whose_rank_says_more_than_a_pipe_holds_before_its_peer_finishes_ends(tmp_path):
+    """A pool's rank that writes past a pipe's 64 KiB while its peer waits on it, as a rank logging a
+    compile's warnings beside a peer waiting in a collective, ends with its peer: each rank's output is read
+    as it comes (`owned`), never one rank's to its end before the next's (row 5434: rank 1 blocked mid-write
+    on its full pipe, rank 0 waiting on it for ever)."""
+    code = (
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "rank, out = int(sys.argv[1]), Path(sys.argv[2])\n"
+        "if rank == 1:\n"
+        "    print('x' * 262144, flush=True)\n"
+        "    out.with_suffix('.done').touch()\n"
+        "else:\n"
+        "    peer = out.parent / 'process1.done'\n"
+        "    while not peer.exists(): time.sleep(.01)\n"
+        "out.write_text(json.dumps(dict(rank=rank)))\n"
+    )
+
+    def start(mode, out, processes, process_id, coordinator):
+        return start_process([sys.executable, "-c", code, str(process_id), str(out)], devices=1)
+
+    reports = run_pool("said", tmp_path, 2, start=start, timeout=120)
+    assert [report["rank"] for report in reports] == [0, 1]

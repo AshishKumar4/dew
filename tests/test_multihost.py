@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 import test_multiprocess as single
-from process_support import relayed, report_of, spawn, terminate, worker_env
+from process_support import output, relayed, report_of, spawn, terminate, worker_env
 
 test_a_real_token_budget_agrees_across_processes_after_logging_ticks = (
     single.test_a_real_token_budget_agrees_across_processes_after_logging_ticks)
@@ -214,7 +214,7 @@ def lost_host(sequence: int, tmp_path: Path) -> list:
     outcome = None
     if RANK == 0:
         try:
-            process.communicate(timeout=600)
+            output(process, 600)
             outcome = process.returncode
         except subprocess.TimeoutExpired:
             terminate(process)
