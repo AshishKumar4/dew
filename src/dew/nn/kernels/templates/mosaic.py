@@ -2157,7 +2157,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         # TMA wrote them in the async proxy; the threads' loads read in the generic one (PTX's proxy fence).
         if interpret:
             return
-        plgpu.inline_mgpu()(lambda ctx: nvvm.fence_proxy(nvvm.ProxyKind.async_global))()
+
+        @plgpu.inline_mgpu()
+        def fenced(ctx) -> None:
+            # Its op unreturned: an inline body returns its results alone.
+            del ctx
+            nvvm.fence_proxy(nvvm.ProxyKind.async_global)
+
+        fenced()
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         if interpret:
