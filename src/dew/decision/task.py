@@ -1220,7 +1220,8 @@ class Decide(SavedRunTask, InItsForm):
         """Each answered question of `reader`'s rows, with its raw logits and its
         gold distribution in the order the row shows its options."""
         scored = []
-        segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
+        # The rows a window of the scoring objective's batches holds, as its reader packs them (`bounds`).
+        segments = self._scoring.bounds.segments
         for batch in reader(DataPartition()):
             inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context,
                               whole_blocks=whole_blocks_of(self.layout),
