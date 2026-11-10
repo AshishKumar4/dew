@@ -261,17 +261,23 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
 def test_the_search_takes_the_fewest_microbatches_that_fit_however_a_miss_elsewhere_corrects_them(
         monkeypatch, tmp_path):
     """In the program a user's process runs (its CPU's products as XLA sums them), with room for the step at
-    four microbatches as compiled and not at two, the search takes four: a miss at two, scaled to four,
-    judged four short and the search took eight, where four fits to the byte (row 5427)."""
+    the fewest microbatches its compiles measure fit, the search takes those, the step admitted with room to
+    spare: a miss at two, scaled to four, judged four short where four fit to the byte, and the search took
+    eight (row 5427)."""
     monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "0")
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
-    sizing = deep(split=4)
-    room = needs(monkeypatch, sizing, lambda: compiled(sizing))
+    need = {}
+    for split in (2, 4, 8):
+        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / f"sizing-{split}"))
+        sizing = deep(split=split)
+        need[split] = needs(monkeypatch, sizing, lambda sizing=sizing: compiled(sizing))
+    room = need[4]
+    fewest = min(split for split, needed in need.items() if needed <= room)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, room)
     trainer = deep(split=None)
     compiled(trainer)
-    assert trainer.plan["split"] == 4 and trainer.plan["probes"][-1]["fits"]
+    assert trainer.plan["split"] == fewest, need
+    assert trainer.plan["probes"][-1]["fits"] and trainer.plan["probes"][-1]["headroom"] >= 0
 
 
 def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():

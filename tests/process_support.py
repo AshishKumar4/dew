@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -132,34 +133,44 @@ class Drained:
 
     def __init__(self, process: subprocess.Popen[str], sink: Callable[[str], None] | None = None):
         self.lines: list[str] = []
+        self.closed = False
+        """Whether its output has closed: every process holding it has ended."""
+        self._process = process
         self._written = threading.Condition()
-        self._reader = threading.Thread(target=self._read, args=(process, sink), daemon=True)
+        self._reader = threading.Thread(target=self._read, args=(sink,), daemon=True)
         self._reader.start()
 
-    def _read(self, process: subprocess.Popen[str], sink: Callable[[str], None] | None) -> None:
-        for line in process.stdout or ():
-            if sink is not None:
-                sink(line)
+    def _read(self, sink: Callable[[str], None] | None) -> None:
+        try:
+            for line in self._process.stdout or ():
+                with self._written:
+                    self.lines.append(line)
+                    self._written.notify_all()
+                if sink is not None:
+                    sink(line)
+        finally:
             with self._written:
-                self.lines.append(line)
+                self.closed = True
                 self._written.notify_all()
-        with self._written:
-            self._written.notify_all()
 
     def line(self, index: int, timeout: float) -> str:
-        """The `index`th line it writes, once written; a TimeoutError where none is within `timeout`."""
+        """The `index`th line it writes, once written; a TimeoutError where none is within `timeout`, an
+        EOFError where its output closes first."""
         with self._written:
-            if not self._written.wait_for(
-                    lambda: len(self.lines) > index or not self._reader.is_alive(), timeout):
+            if not self._written.wait_for(lambda: len(self.lines) > index or self.closed, timeout):
                 raise TimeoutError(f"no line {index} within {timeout:.0f} s")
             if len(self.lines) <= index:
                 raise EOFError(f"the process ended after {len(self.lines)} lines")
             return self.lines[index]
 
-    def text(self) -> str:
-        """Everything it wrote, once its output has closed (its group ended)."""
-        self._reader.join()
-        return "".join(self.lines)
+    def text(self, timeout: float | None = None) -> str:
+        """Everything it wrote, once its output has closed (every process holding it ended, a descendant
+        that kept it included); `subprocess.TimeoutExpired` where it is still open after `timeout`, as
+        `Popen.communicate` raises it."""
+        with self._written:
+            if not self._written.wait_for(lambda: self.closed, timeout):
+                raise subprocess.TimeoutExpired(self._process.args, timeout or 0.0, "".join(self.lines))
+            return "".join(self.lines)
 
 
 _DRAINED: "weakref.WeakKeyDictionary[subprocess.Popen[str], Drained]" = weakref.WeakKeyDictionary()
@@ -182,10 +193,12 @@ def drained(process: subprocess.Popen[str]) -> Drained:
 
 
 def output(process: subprocess.Popen[str], timeout: float | None = None) -> str:
-    """An owned process's whole output once it exits; `subprocess.TimeoutExpired` where it runs past
-    `timeout`."""
+    """An owned process's whole output once it exits and its output closes, as `Popen.communicate` reads
+    it; `subprocess.TimeoutExpired` where either runs past `timeout`."""
+    started = time.monotonic()
     process.wait(timeout)
-    return drained(process).text()
+    left = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
+    return drained(process).text(left)
 
 
 class Relayed(NamedTuple):
@@ -209,7 +222,7 @@ def relayed(command: Sequence[str], environment: Mapping[str, str], *, timeout: 
     and the test failed with its output's tail."""
     process = owned(command, environment, sink)
     try:
-        process.wait(timeout)
+        written = output(process, timeout)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.kill(process.pid, signal.SIGABRT)
@@ -218,7 +231,7 @@ def relayed(command: Sequence[str], environment: Mapping[str, str], *, timeout: 
         terminate(process)
         tail = drained(process).text()[-12000:]
         pytest.fail(f"{' '.join(command)} did not end within {timeout:.0f} s\n{tail}")
-    return Relayed(process.returncode, drained(process).text())
+    return Relayed(process.returncode, written)
 
 
 def start_process(command: Sequence[str], devices: int, *,
