@@ -35,6 +35,7 @@ from common import (
     attach_xplane_profile,
     device_memory,
     host,
+    mfu,
     peak_flops,
     stated_peak_gib,
     throughput,
@@ -137,8 +138,7 @@ def main() -> None:
         "flops_per_token": flops_token,
         "work": dataclasses.asdict(work),
         "maxtext_tflops_per_device": [row.get("perf/per_device_tflops_per_sec") for row in timed],
-        "mfu": None if peak_rate is None else work.training_flops_per_step * len(seconds)
-            / sum(seconds) / (peak_rate * devices),
+        "mfu": mfu(work.training_flops_per_step, len(seconds), sum(seconds), peak_rate, devices),
         "memory": device_memory(stats),
     }
     if args.profile_steps:

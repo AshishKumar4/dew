@@ -8,7 +8,6 @@ import argparse
 import dataclasses
 import json
 from collections.abc import Callable
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,12 +18,14 @@ from common import (
     chrome_trace_kernels,
     host,
     kernel_summary,
+    mfu,
     peak_flops,
     run_arguments,
     sha256,
     stated_peak_gib,
     steps_for,
     throughput,
+    trace_directory,
     trim_trace,
     warmup_cosine,
     window_rows,
@@ -98,10 +99,6 @@ class Curves:
     timed_steps: int
     step_seconds: list
     traced: bool
-
-
-def trace_directory(args: argparse.Namespace) -> Path:
-    return Path(args.trace_dir or Path(args.out).with_suffix("")).resolve()
 
 
 def train(args: argparse.Namespace, place: Ranks, run: Split, optimizer,
@@ -187,8 +184,8 @@ def record(args: argparse.Namespace, place: Ranks, run: Split, curves: Curves, w
                                  curves.step_seconds),
         "flops_per_token": work.training_flops_per_step / work.tokens_per_step,
         "work": dataclasses.asdict(work),
-        "mfu": None if peak_rate is None else work.training_flops_per_step * curves.timed_steps
-            / curves.window_seconds / (peak_rate * place.world),
+        "mfu": mfu(work.training_flops_per_step, curves.timed_steps, curves.window_seconds, peak_rate,
+                   place.world),
         "memory": {"peak_allocated_bytes": [int(p[0]) for p in peaks],
                    "peak_reserved_bytes": [int(p[1]) for p in peaks]},
     }

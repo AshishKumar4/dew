@@ -48,6 +48,7 @@ from common import (
     attach_xplane_profile,
     device_memory,
     host,
+    mfu,
     peak_flops,
     sha256,
     source_version,
@@ -371,8 +372,7 @@ def main() -> None:
         "work": dataclasses.asdict(work),
         "hlo_flops_per_step": (None if trainer is None or trainer.step_flops is None
                                else trainer.step_flops.hardware),
-        "mfu": None if peak_rate is None else work.training_flops_per_step * window.timed_steps
-            / window_seconds / (peak_rate * devices),
+        "mfu": mfu(work.training_flops_per_step, window.timed_steps, window_seconds, peak_rate, devices),
         "memory": device_memory(stats),
     }
     if args.profile_steps:

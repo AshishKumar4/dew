@@ -340,13 +340,14 @@ def compile_model(model, smoke: bool):
 def optimizer_for(model, smoke: bool):
     """Qwen3.5-0.8B's AdamW hyperparameters and decay mask, with fusion on CUDA."""
     import torch
+    from qwen35 import OPTIMIZER
 
     decay, no_decay = [], []
     for name, parameter in model.named_parameters():
         (decay if parameter.ndim >= 2 and name.rsplit(".", 1)[-1] != "bias" else no_decay).append(parameter)
-    return torch.optim.AdamW([{"params": decay, "weight_decay": 1e-4},
+    return torch.optim.AdamW([{"params": decay, "weight_decay": OPTIMIZER["weight_decay"]},
                              {"params": no_decay, "weight_decay": 0.0}],
-                            lr=2.5e-5, betas=(0.9, 0.999), eps=1e-8, fused=not smoke)
+                            lr=OPTIMIZER["lr"], betas=OPTIMIZER["betas"], eps=OPTIMIZER["eps"], fused=not smoke)
 
 
 def training_window(args: argparse.Namespace, model, network, optimizer, device, batch: int, seq: int):
@@ -354,6 +355,7 @@ def training_window(args: argparse.Namespace, model, network, optimizer, device,
     import numpy as np
     import torch
     from common import TorchTracedWindow, warmup_cosine
+    from qwen35 import SCHEDULE
     from qwen35 import inputs
     from torch._dynamo.utils import counters
 
@@ -373,7 +375,7 @@ def training_window(args: argparse.Namespace, model, network, optimizer, device,
             if step in (args.warmup, window.profile_from):
                 snapshots[step] = dict(counters["stats"])
             window.before(step)
-            rate = warmup_cosine(step, init=0.0, peak=2.5e-5, warmup=10, decay_steps=220, end=0.0)
+            rate = warmup_cosine(step, **SCHEDULE)
             for group in optimizer.param_groups:
                 group["lr"] = rate
             profiled = step >= window.profile_from

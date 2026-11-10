@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from common import host, peak_flops, throughput, write_record
-from qwen35 import MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
+from qwen35 import MODEL, OPTIMIZER, REVISION, SCHEDULE, WHOLE_PEAK_SCOPE, inputs, workload
 from reference_source import git_head
 from work import measure
 
@@ -132,10 +132,12 @@ def compile_step(args, model, variables):
     objective = BackboneLoss(model, variables, projection, sequence)
     work = measure(objective, {"tokens": rows})
     work.write(args.work)
-    solver = OptimConfig(optimizer="adamw", b1=0.9, b2=0.999, optimizer_opts={"eps": 1e-8},
-                          weight_decay=1e-4, clip_grads=0.0, state_dtype="float32",
-                          learning_rate=Cosine(init_value=0.0, peak_value=2.5e-5, warmup_steps=10,
-                                               end_value=0.0)).build(220)
+    (b1, b2), schedule = OPTIMIZER["betas"], SCHEDULE
+    solver = OptimConfig(optimizer="adamw", b1=b1, b2=b2, optimizer_opts={"eps": OPTIMIZER["eps"]},
+                          weight_decay=OPTIMIZER["weight_decay"], clip_grads=0.0, state_dtype="float32",
+                          learning_rate=Cosine(init_value=schedule["init"], peak_value=schedule["peak"],
+                                               warmup_steps=schedule["warmup"], end_value=schedule["end"])
+                          ).build(schedule["decay_steps"])
     trainer = Trainer(objective, solver, key=jax.random.key(args.seed), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     placed = jax.device_put({"tokens": rows})

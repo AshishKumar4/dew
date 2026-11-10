@@ -39,12 +39,14 @@ from common import (
     device_memory,
     documents,
     host,
+    mfu,
     peak_flops,
     run_arguments,
     sha256,
     stated_peak_gib,
     steps_for,
     throughput,
+    trace_directory,
     window_rows,
     write_record,
 )
@@ -229,10 +231,6 @@ class Curves:
     timed_steps: int
 
 
-def trace_directory(args: argparse.Namespace) -> Path:
-    return Path(args.trace_dir or Path(args.out).with_suffix("")).resolve()
-
-
 def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tuple[Any, Curves]:
     """Every step in the recorded order: timed from `timing_warmup` to the
     profiled tail, which is traced, with the probes' time taken out."""
@@ -303,8 +301,8 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
         "flops_per_token": flops_token,
         "work": dataclasses.asdict(run.work),
         "hlo_flops_per_step": (run.trainer.step_flops and run.trainer.step_flops.hardware),
-        "mfu": None if peak_rate is None else run.work.training_flops_per_step * curves.timed_steps
-            / curves.window_seconds / (peak_rate * devices),
+        "mfu": mfu(run.work.training_flops_per_step, curves.timed_steps, curves.window_seconds, peak_rate,
+                   devices),
         "memory": device_memory(stats),
     }
     for name in (curves.extras[0] if curves.extras else {}):

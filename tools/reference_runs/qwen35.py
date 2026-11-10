@@ -48,6 +48,17 @@ def inputs(seed: int, vocab: int, hidden: int, batch: int, sequence: int):
     return tokens, projection
 
 
+OPTIMIZER = {"lr": 2.5e-5, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 1e-4}
+"""Qwen3.5-0.8B's AdamW, which both sides' optimizers take and the workload reports (`workload`)."""
+SCHEDULE = {"init": 0.0, "peak": OPTIMIZER["lr"], "warmup": 10, "decay_steps": 220, "end": 0.0}
+"""The learning rate's warmup-cosine schedule (common.warmup_cosine's arguments), both sides'."""
+
+
+def plain(number: float) -> str:
+    """`number` as the workload's schedule names it: shortest, an exponent unpadded (2.5e-5, 0, 220)."""
+    return format(number, "g").replace("e-0", "e-")
+
+
 def workload(seed: int, vocab: int, hidden: int, batch: int, sequence: int, smoke: bool,
              warmup: int, steps: int) -> dict:
     """Only matched arithmetic and input fields; implementations are recorded separately."""
@@ -60,10 +71,10 @@ def workload(seed: int, vocab: int, hidden: int, batch: int, sequence: int, smok
         "projection_sha256": hashlib.sha256(projection.tobytes()).hexdigest(),
         "loss": "squared fixed scalar hidden-state projection; no vocabulary projection",
         "parameters": "fp32", "compute": "fp32 CPU smoke" if smoke else "bf16 compute and residuals",
-        "optimizer": "AdamW", "optimizer_state": "fp32", "lr": 2.5e-5,
-        "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 1e-4,
+        "optimizer": "AdamW", "optimizer_state": "fp32", "lr": OPTIMIZER["lr"],
+        "betas": list(OPTIMIZER["betas"]), "eps": OPTIMIZER["eps"], "weight_decay": OPTIMIZER["weight_decay"],
         "decay_mask": "ndim >= 2 and leaf name != bias, as Qwen3.5-0.8B",
-        "schedule": "warmup_cosine(init=0,peak=2.5e-5,warmup=10,decay_steps=220,end=0)",
+        "schedule": f"warmup_cosine({','.join(f'{name}={plain(value)}' for name, value in SCHEDULE.items())})",
         "gradient_clipping": None, "gradient_checkpointing": False, "gradient_accumulation": 1,
         "ema": False, "full_finetune": True,
         "timing": "wall window synchronized only at both endpoints; no profiling or compilation",

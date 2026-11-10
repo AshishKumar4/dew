@@ -197,23 +197,34 @@ def sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def stored_kernel(kernel: tuple[str, int, int, int], origin: int) -> list:
+    """A kernel `(name, start_ns, end_ns, device)` as `trim_trace` stores it: `[name, start_ns, duration_ns,
+    device]`, its start from the window's `origin`."""
+    name, start, end, device = kernel
+    return [name, start - origin, end - start, device]
+
+
+def kernel_of(row: Sequence) -> tuple[str, int, int, int]:
+    """The kernel `(name, start_ns, end_ns, device)` a `stored_kernel` row holds, its start from the window's
+    origin."""
+    name, start, duration, device = row
+    return name, start, start + duration, device
+
+
 def trimmed_kernels(path: str | Path) -> list[tuple[str, int, int, int]]:
-    """Read back the kernel rows `trim_trace` wrote."""
+    """Read back the kernel rows `trim_trace` wrote (`kernel_of`)."""
     with gzip.open(path, "rt") as handle:
-        return [(name, start, start + duration, device)
-                for name, start, duration, device in json.load(handle)]
+        return [kernel_of(row) for row in json.load(handle)]
 
 
 def trim_trace(kernels: Sequence[tuple[str, int, int, int]], path: str | Path) -> Path:
-    """Keep a traced window as its device kernels alone, gzipped JSON rows of
-    `[name, start_ns, duration_ns, device]`, so the evidence holds the
-    timeline without the host events that make a raw trace large."""
+    """Keep a traced window as its device kernels alone, gzipped JSON rows (`stored_kernel`), so the evidence
+    holds the timeline without the host events that make a raw trace large."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     origin = min(start for _, start, _, _ in kernels)
-    rows = [[name, start - origin, end - start, device] for name, start, end, device in kernels]
     with gzip.open(path, "wt") as handle:
-        json.dump(rows, handle)
+        json.dump([stored_kernel(kernel, origin) for kernel in kernels], handle)
     return path
 
 
@@ -449,6 +460,20 @@ def _plain(value):
     if isinstance(value, np.ndarray):
         return value.tolist()
     raise TypeError(f"{type(value)} is not JSON")
+
+
+def mfu(flops_per_step: float, steps: int, seconds: float, peak_rate: float | None,
+        devices: int) -> float | None:
+    """The analytical model FLOPs utilization of a timed window: `flops_per_step` (the work's own count) over
+    its `steps`, per its synchronized `seconds`, of the `devices`' peak (`peak_rate` each); None where the
+    device's peak is unknown (`peak_flops`)."""
+    return None if peak_rate is None else flops_per_step * steps / seconds / (peak_rate * devices)
+
+
+def trace_directory(args: argparse.Namespace) -> Path:
+    """Where a run captures its trace and its profile reader finds it: --trace-dir, else --out without its
+    suffix."""
+    return Path(args.trace_dir or Path(args.out).with_suffix("")).resolve()
 
 
 def throughput(window_seconds: float, steps: int, tokens_per_step: int,
