@@ -62,6 +62,12 @@ def dropped_out(x, weight):
     return jnp.where(kept, x @ weight, 0)
 
 
+def turned(seed):
+    """Rows and the weight as complex numbers, each a float32 pair."""
+    x, weight = drawn(seed)
+    return x * jnp.complex64(1 + 2j), weight * jnp.complex64(3 - 1j)
+
+
 def with_a_dropped_value(x, weight):
     """The float64 product beside an fp32 one nothing reads."""
     jnp.tanh(x.astype(jnp.float32) @ weight.astype(jnp.float32))
@@ -108,6 +114,7 @@ NULL = {
     "a stated rounding's entries selected and negated": (selected, drawn, None),
     "a format's own division, declared": (dequantized, drawn, dequantized_declared),
     "a decision drawn in float32": (dropped_out, drawn, None),
+    "complex operands, widened to complex128": (product, turned, None),
     "an fp32 value no output reads": (product, drawn, with_a_dropped_value),
     "an integer leaf beside": (with_its_place, drawn, None),
     "a NumPy truth in float64": (product, drawn, as_given(in_numpy(np.float64))),
@@ -132,8 +139,8 @@ INJECTED = {
 def test_a_truth_that_computes_in_float64_is_judged(name):
     """The null control: a site whose truth is float64's (the reference on widened inputs, a formula of its
     own, parameters held in float64 or left float32 and read exactly, a stated rounding and what is selected
-    of it, a format's own division declared (`stored_as`), a float32 draw read only by a comparison, a dead
-    fp32 value, an integer leaf, a float32 leaf of no entries, a float64 NumPy truth) is judged as before,
+    of it, a format's own division declared (`stored_as`), a float32 draw read only by a comparison,
+    complex operands (widened to complex128), a dead fp32 value, an integer leaf, a float32 leaf of no entries, a float64 NumPy truth) is judged as before,
     its arm on par with itself."""
     arm, draw, truth = NULL[name]
     assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)

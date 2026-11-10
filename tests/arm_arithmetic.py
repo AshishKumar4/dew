@@ -14,16 +14,18 @@ from dew.nn.precision import FP32_SUMS
 
 
 def widened(tree):
-    """`tree` in float64, its integer leaves as they are: the inputs of a float64 truth. A leaf an
-    accelerator holds is widened where it lies, so its truth runs on that device's FP64 units with no host
-    round trip (a decode step's keys and values, a hundred megabytes a draw to the host and back); any other
-    is a host array."""
+    """`tree` in float64, its complex leaves in complex128 and its integer leaves as they are: the inputs
+    of a float64 truth. A leaf an accelerator holds is widened where it lies, so its truth runs on that
+    device's FP64 units with no host round trip (a decode step's keys and values, a hundred megabytes a
+    draw to the host and back); any other is a host array."""
     def wide(leaf):
-        if isinstance(leaf, jax.Array) and jnp.issubdtype(leaf.dtype, jnp.floating) and all(
+        to = (np.complex128 if jnp.issubdtype(leaf.dtype, jnp.complexfloating)
+              else np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype)
+        if isinstance(leaf, jax.Array) and to != leaf.dtype and all(
                 device.platform != "cpu" for device in leaf.devices()):
             with jax.enable_x64(new_val=True):
-                return leaf.astype(jnp.float64)
-        return np.asarray(leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype)
+                return leaf.astype(to)
+        return np.asarray(leaf, to)
 
     return jax.tree.map(wide, tree)
 
