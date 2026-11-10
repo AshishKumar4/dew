@@ -217,7 +217,7 @@ def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
-    if grouped_matmul.cutlass_built_for(here, grouped_matmul.cutlass_architectures()) is None:
+    if grouped_matmul.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
 
@@ -298,7 +298,7 @@ def cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen(shared):
     gradients through CUTLASS's launches chosen by name, each map one launch in turn (their FFI calls'
     sequential batching, row 4389), are as exact as XLA's ragged dot mapped, from float64."""
     here = generation.gpu_target().generation
-    if grouped_matmul.cutlass_built_for(here, grouped_matmul.cutlass_architectures()) is None:
+    if grouped_matmul.cutlass_built_for(here) is None:
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
     group_sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
 
@@ -1073,15 +1073,3 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
         assert_as_exact(on_the_template, jax.jit(with_gradients(on_xla())), draw, f"sm100 {sizes} into {out}",
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
-
-
-@pytest.mark.parametrize(("built", "expected"), [
-    (("sm80", "sm90"), {"sm80": "sm80", "sm86": "sm80", "sm89": "sm80", "sm90": "sm90", "sm100": None,
-                        "sm120": None}),
-    (("sm90",), {"sm80": None, "sm86": None, "sm90": "sm90", "sm100": None}),
-], ids=["ampere and hopper", "hopper alone"])
-def test_a_gpu_runs_the_cutlass_kernels_its_capability_runs(built, expected):
-    """The dew-cutlass kernels a GPU runs of those a build holds (`grouped_matmul.cutlass_built_for`, the
-    wheel's FFI dispatch): an sm80 build on every capability 8.x, Hopper's sm90a kernels on 9.0 alone, none
-    on a GPU the build holds nothing for, where a CUTLASS launch is then not eligible."""
-    assert {name: grouped_matmul.cutlass_built_for(name, built) for name in expected} == expected

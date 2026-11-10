@@ -10,6 +10,8 @@ from typing import NamedTuple
 
 _library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name("libdew_cutlass.so")))
 _library.dew_cutlass_kernels.restype = ctypes.c_char_p
+_library.dew_cutlass_architecture.restype = ctypes.c_char_p
+_library.dew_cutlass_architecture.argtypes = (ctypes.c_int, ctypes.c_int)
 
 
 class Kernel(NamedTuple):
@@ -38,6 +40,14 @@ KERNELS = dict(_described(entry) for entry in _library.dew_cutlass_kernels().dec
 
 ARCHITECTURES = tuple(dict.fromkeys(architecture for architecture, _ in KERNELS))
 """The GPU generations the library holds grouped kernels for (('sm80', 'sm90'))."""
+
+def architecture(major: int, minor: int) -> str | None:
+    """The generation of the library's kernels (a key of `KERNELS`) a GPU of compute capability
+    `major`.`minor` runs, as its targets dispatch on it: Ampere's 'sm80' on every 8.x, Hopper's 'sm90' on
+    9.0 alone; None on any other GPU, which its targets refuse."""
+    found = _library.dew_cutlass_architecture(major, minor)
+    return None if found is None else found.decode()
+
 
 TARGETS = ("dew_cutlass_grouped_gemm", "dew_cutlass_grouped_gemm_k")
 """The library's FFI targets: the grouped GEMM (its forward, and dx under `transpose_w`) and its weight

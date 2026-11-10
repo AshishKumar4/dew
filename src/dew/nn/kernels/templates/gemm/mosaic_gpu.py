@@ -1623,20 +1623,11 @@ def _e4m3_values(codes: jax.Array) -> jax.Array:
 
 def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
     """Dew: the eight codes of each of `words` (uint32), each code's E2M1 value in float32, code by code
-    (`bits.NVFP4_BFLOAT16_FORM`'s four bfloat16x2 registers, each split low half first): each lane's bits
-    as an fp32 pattern, its exponent restored by 2^126 (the form leaves each code times 2^-126, its
-    subnormal codes `0.5` as a bfloat16 subnormal, restored from its mantissa), so `0.0`, `0.5` and each
-    normal code come out exact."""
-    lanes = []
-    for register in bits.NVFP4_BFLOAT16_FORM.traced(words):
-        for half in (register << jnp.uint32(16), register & jnp.uint32(0xFFFF0000)):
-            sign = half & jnp.uint32(0x80000000)
-            normal = jax.lax.bitcast_convert_type(half + jnp.uint32(126 << 23), jnp.float32)
-            mantissa = (half >> jnp.uint32(16)) & jnp.uint32(0x7F)
-            subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** -7)
-            subnormal = jnp.where(sign != 0, -subnormal, subnormal)
-            lanes.append(jnp.where(half & jnp.uint32(0x7F800000) == 0, subnormal, normal))
-    return lanes
+    (`bits.NVFP4_BFLOAT16_FORM`'s four bfloat16x2 registers, each split low half first), each restored by
+    the form's one decoded-value rule (`bits.restored`), so `0.0`, `0.5` and each normal code come out
+    exact."""
+    return [bits.restored(half) for register in bits.NVFP4_BFLOAT16_FORM.traced(words)
+            for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
 
 def _transformed(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> jax.Array:

@@ -179,12 +179,6 @@ def _hooks_lower(ba, dtype, rules) -> bool:
                         tiles('epilogue_operands', hooks.epilogue_axes), rules))
 
 
-def _output_bytes(ba) -> int:
-    """The bytes of one output element of each of the launch's outputs, together."""
-    return sum(jnp.dtype(dtype).itemsize
-               for dtype in (ba.arguments['hooks'].out_dtypes or (ba.arguments['out_dtype'],)))
-
-
 def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
     """The bytes of one tile of each side operand at the block `extents` per launch axis, one group's of an
     operand by group (`axes.held`)."""
@@ -1581,13 +1575,6 @@ class MosaicTgmm(_Mosaic):
 
 
 @functools.cache
-def cutlass_architectures() -> tuple[str, ...]:
-    """The GPU generations the installed dew_cutlass holds code for, or none where it is not installed."""
-    if importlib.util.find_spec('dew_cutlass') is None:
-        return ()
-    return importlib.import_module('dew_cutlass').ARCHITECTURES
-
-
 @functools.cache
 def _cutlass_registered() -> None:
     """dew_cutlass's FFI targets, registered with jax once, at the first launch that runs one."""
@@ -1737,16 +1724,14 @@ def cutlass_tile(architecture: str, out_dtype) -> mosaic_gpu.Tiles:
                             family=kernel.instructions)
 
 
-def cutlass_built_for(generation_name: str, built: tuple[str, ...]) -> str | None:
-    """The architecture of the dew_cutlass kernels `built` (`cutlass_architectures`, the installed wheel's) a
-    GPU of `generation_name` runs (kernels/cutlass's ffi.cu dispatch): its own, or an sm80 build on any
-    capability 8.x, whose plain SASS every later minor of its major runs (CUDA's binary compatibility);
-    sm90a's kernels, of Hopper's arch-specific instructions, run on 9.0 alone. None where `built` holds none
-    it runs."""
-    if generation_name in built:
-        return generation_name
+def cutlass_built_for(generation_name: str) -> str | None:
+    """The generation of the installed dew_cutlass's kernels a GPU of `generation_name` runs, as the wheel
+    dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it); None where
+    the wheel is not installed or runs none there."""
     capability = generation.capability(generation_name)
-    return 'sm80' if capability is not None and capability[0] == 8 and 'sm80' in built else None
+    if capability is None or importlib.util.find_spec('dew_cutlass') is None:
+        return None
+    return importlib.import_module('dew_cutlass').architecture(*capability)
 
 
 class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
@@ -1760,12 +1745,12 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
 
     def eligible(self, ba, target) -> bool:
-        return cutlass_built_for(target.generation, cutlass_architectures()) is not None and self.takes(ba)
+        return cutlass_built_for(target.generation) is not None and self.takes(ba)
 
     def tile(self, ba) -> mosaic_gpu.Tiles | None:
         """The record of the kernel the build holds for the GPU being selected for (`generation.gpu_target`,
         `cutlass_built_for`) writing the call's output (`cutlass_tile`); None where it holds none."""
-        built = cutlass_built_for(generation.gpu_target().generation, cutlass_architectures())
+        built = cutlass_built_for(generation.gpu_target().generation)
         return None if built is None else cutlass_tile(built, ba.arguments['out_dtype'])
 
     @staticmethod
