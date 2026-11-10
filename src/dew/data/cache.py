@@ -787,8 +787,8 @@ class _Writer:
             self.pending_bytes = 0
         tasks = [*self.futures, *([self.seal_future] if self.seal_future is not None else [])]
         # The uploads in flight end as each transfer does, abandoned before what they would publish, or
-        # failed: a store gone fails a transfer by its transport's own timeouts, so none runs past its
-        # writer.
+        # failed, none left running past its writer: a silent read fails by its transport's bound
+        # (`dew.data.storage.IDLE_SECONDS`), and a body a peer stops reading waits on it (row 5402).
         wait(tasks)
         failed = sum(1 for task in tasks if not task.cancelled() and task.exception() is not None)
         with self.lock:
