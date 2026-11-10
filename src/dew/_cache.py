@@ -333,6 +333,12 @@ NUMERICS = jax.make_user_context(default_value=None)
 (`dew.nn.precision.Numerics`, None outside any), keyed on as `KERNEL_TUNES` is, so a program traced under one
 run's numerics, its outputs' dtype and its ops' forms, traces again under another's."""
 
+PROJECTION_ROLE = jax.make_user_context(default_value=None)
+"""The role of the projections a trace is in (`dew.nn.precision.projection_role`), None outside any, keyed on
+as `NUMERICS` is: the run's low-precision recipe reads it as a projection traces (`recipe_role`), so a
+projection jitted under one role (an MLP's, which the recipe takes) traces again under another's (a
+router's, which it keeps)."""
+
 QUANTIZED_TRACE = jax.make_user_context(default_value=None)
 """What a quantized model's methods trace under, its provider's kind and spec
 (`dew.quantization`), keyed on as `KERNEL_TUNES` is. Qwix intercepts
