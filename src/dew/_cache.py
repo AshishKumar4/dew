@@ -127,19 +127,14 @@ def default_compilation_cache_dir() -> str:
     older interpreter sharing the directory would read those bytes with the
     wrong codec. Hosts of every CPU class share it: Dew's JAX build keys a
     CPU program by the host's CPU (0.12.0.1.post13), which XLA:CPU compiles
-    for, so no host reads a program that does not link there. Each build of
-    the CUDA PJRT plugins installed has its own (`plugin_builds`): JAX keys
-    an executable by jax's, jaxlib's and CUDA's versions, not the plugin that
-    compiled it, so a plugin rebuilt under one jax read the executables its
-    earlier build's XLA compiled, a miscompile it fixed included (row 5275).
-    A directory a run names, or JAX_COMPILATION_CACHE_DIR, is its own to keep
-    apart across plugin builds. Explicit paths passed to
+    for, so no host reads a program that does not link there, and keys every
+    program by the PJRT plugin build that compiled it (0.12.0.1.post73), so a
+    rebuilt plugin reads none of an earlier build's. Explicit paths passed to
     enable_compilation_cache remain unchanged.
     """
     if jax.config.jax_compilation_cache_dir:
         return jax.config.jax_compilation_cache_dir
-    return os.path.join(dew_cache_dir(), 'xla',
-                        f"python{sys.version_info.major}.{sys.version_info.minor}{plugin_builds()}")
+    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
 
 
 def beside_compilation_cache(variable: str, name: str) -> Path | None:
