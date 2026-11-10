@@ -88,7 +88,7 @@ from arm_forms import (
     windows as windows,
 )
 from check1_wire import CENSUS, DRAWS, STAGES
-from float64_terms import evaluated_on, float64_terms
+from float64_terms import evaluated_on, float64_terms, lowered
 from jax.interpreters import partial_eval as pe
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
@@ -736,8 +736,8 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     wide = widened(jax.tree.map(lambda leaf: leaf[0], inputs) if windowed else inputs)
     # The branch of a platform's choice that the truth's run keeps: on the device its evaluation runs on.
     with jax.enable_x64(new_val=True), evaluated_on(jax.tree.leaves(wide)) as device:
-        closed = trace(*wide).jaxpr
-    program, lowering = getattr(closed, "jaxpr", closed), lowering_platform(device)
+        program = lowered(trace(*wide).jaxpr).jaxpr
+    lowering = lowering_platform(device)
     count = len(program.outvars)
 
     def narrow(used: list[bool]) -> list[str]:
