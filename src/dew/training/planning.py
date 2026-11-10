@@ -941,14 +941,14 @@ class FitSearch[LossT, EffectsT]:
             return under
         return under * temporaries // missed
 
-    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool, split: int,
+    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool,
                 temporaries: int | None) -> None:
-        """What a compile at the objective's remat at `split` teaches the derivation's next judgments there:
+        """What a compile at the objective's remat teaches the derivation's next judgments there:
         the headroom it `measured` short of the one `foreseen` corrects them (`under`), in proportion to the
-        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation, so
-        corrected, judged it short rules its refusals out (`overstated`)."""
+        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation
+        judged it short rules its refusals out (`overstated`)."""
         rung = self.remat_rung()
-        if foreseen is not None and fit and foreseen - self.shortfall(split) < 0:
+        if foreseen is not None and fit and foreseen < 0:
             self.overstated.add(rung)
         if foreseen is not None and measured is not None and foreseen - measured > self.under.get(rung, 0):
             self.under[rung] = foreseen - measured
@@ -958,15 +958,18 @@ class FitSearch[LossT, EffectsT]:
                 self.missed_at.pop(rung, None)
 
     def refused(self, split: int) -> bool:
-        """Whether the derivation judges the step at `split` short past a miss, corrected by what a compile
-        at the rung needed beyond it (`under`), which the halving below a split that fits does not compile
-        (`planned`): no split it cannot judge, and none at a remat where a compile it judged short fit
-        (`overstated`: a tiny model's derived peak, its fixed buffers, over-states the step many times)."""
+        """Whether the derivation judges the step at `split` short by its own footprint, which the halving
+        below a split that fits does not compile (`planned`): no split it cannot judge, and none at a remat
+        where a compile it judged short fit (`overstated`: a tiny model's derived peak, its fixed buffers,
+        over-states the step many times). What a compile at another split missed past the derivation
+        (`shortfall`) orders the compiles (`likely`) and rules none out: scaled from one split to another
+        it states no bound on this one's need (row 5427: a correction from two microbatches judged four
+        short by 658,639 bytes, and they fit to the byte, so the search took eight)."""
         rung = self.remat_rung()
         if rung in self.overstated:
             return False
         derived = self.judgment(split)
-        return derived is not None and derived - self.shortfall(split) < 0
+        return derived is not None and derived < 0
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -1077,7 +1080,7 @@ class FitSearch[LossT, EffectsT]:
         foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        self.learned(foreseen, pooled_headroom(headroom), fit=fit, split=split,
+        self.learned(foreseen, pooled_headroom(headroom), fit=fit,
                      temporaries=None if candidate.footprint is None else candidate.footprint.temporaries)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
