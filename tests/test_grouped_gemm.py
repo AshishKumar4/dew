@@ -645,6 +645,66 @@ def test_the_template_takes_an_fp32_cotangent_at_the_highest_precision_as_its_bf
                     seeds=8, truth_fn=with_gradients(product(jnp.float64)))
 
 
+@INTERPRETS
+def test_an_fp32_products_parts_keep_a_nonfinite_operand_whole():
+    """An fp32 grouped product at the highest precision with the template named, interpreted as an H100's,
+    runs as its operands' bf16 parts (`gemm._in_parts`): a row holding an infinity gives that row's
+    infinities, and an infinity times a zero column NaN, as XLA's whole fp32 product gives them, where the
+    parts saturated an infinity to finite values."""
+    group_sizes = jnp.asarray([64, 64], jnp.int32)
+    rows = jnp.ones((128, 128), jnp.float32).at[3, 5].set(jnp.inf)
+    matrices = jnp.full((2, 128, 128), 2.0 ** -100, jnp.float32).at[0, 5, 7].set(0.0)
+
+    def product(kernel):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+              jax.default_matmul_precision("highest")):
+            return np.asarray(jax.jit(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32,
+                                                             interpret_on_cpu=True))(rows, matrices))
+
+    parted, whole = product("mosaic"), product("xla")
+    np.testing.assert_array_equal(np.isinf(parted), np.isinf(whole))
+    np.testing.assert_array_equal(np.isnan(parted), np.isnan(whole))
+    assert np.isinf(parted[3]).sum() == 127 and np.isnan(parted[3, 7])
+
+
+@INTERPRETS
+def test_bf16_rows_multiply_an_fp16_matrix_rounded_to_bf16_at_the_highest_precision():
+    """A grouped product of bf16 rows and an fp16 matrix at the highest precision, the template named,
+    interpreted as an H100's: the matrix is rounded to the rows' bf16 as the product multiplies them (1 +
+    2^-10 to 1), as XLA's route rounds it, where splitting the fp16 matrix into parts kept its 2^-10."""
+    group_sizes = jnp.asarray([64, 64], jnp.int32)
+    rows = jnp.ones((128, 128), jnp.bfloat16)
+    matrices = jnp.full((2, 128, 128), 1 + 2.0 ** -10, jnp.float16)
+
+    def product(kernel):
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+              jax.default_matmul_precision("highest")):
+            return np.asarray(jax.jit(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32,
+                                                             interpret_on_cpu=True))(rows, matrices))
+
+    np.testing.assert_array_equal(product("mosaic"), np.full((128, 128), 128.0, np.float32))
+    np.testing.assert_array_equal(product("xla"), np.full((128, 128), 128.0, np.float32))
+
+
+@INTERPRETS
+def test_a_mixed_kernel_gradients_prologue_reads_and_rounds_the_rows_in_their_dtype():
+    """A kernel gradient of bf16 rows and fp32 cotangent rows (`gemm.gemm_t`, multiplied in fp32) whose
+    prologue adds 2^-8 to the rows, the template named and interpreted as an H100's: the prologue reads the
+    rows in their bf16 and rounds its result there (1 + 2^-8 to 1), as the portable program does, so the
+    gradient is the rows' 128 per entry, where the widened rows kept 1 + 2^-8 (128.5)."""
+    rows = jnp.ones((128, 128), jnp.bfloat16)
+    cotangent = jnp.ones((128, 128), jnp.float32)
+
+    def gradient(kernel):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel):
+            return np.asarray(jax.jit(lambda x, dy: gemm.gemm_t(
+                x, dy, None, prologue=lambda r: r + 2.0 ** -8, out_dtype=jnp.float32,
+                interpret_on_cpu=True))(rows, cotangent))
+
+    np.testing.assert_array_equal(gradient("mosaic"), np.full((1, 128, 128), 128.0, np.float32))
+    np.testing.assert_array_equal(gradient("xla"), np.full((1, 128, 128), 128.0, np.float32))
+
+
 def test_a_kernel_gradient_of_no_rows_on_a_hopper_is_its_groups_zeros():
     """A kernel gradient contracting no rows on an H100 (a step whose experts received no tokens): its
     selection derives no split of an empty contraction (`mosaic_gpu.split_count`, which took the least of
