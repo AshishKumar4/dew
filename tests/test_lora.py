@@ -780,6 +780,22 @@ def test_an_adapter_config_setting_a_field_the_loader_does_not_carry_is_refused(
         LoRA.load(decoder.model, decoder.variables, adapter, layouts=decoder.layouts)
 
 
+def test_an_adapter_config_recording_its_initialization_loads(decoder, loaded, tmp_path):
+    """An adapter whose config records how PEFT initialized it (EVA's, its ranks and scales in the patterns
+    the loader reads) loads as its saved factors compute, the same adapter as without the record."""
+    import json
+    import shutil
+
+    adapter = tmp_path / "adapter"
+    shutil.copytree(ADAPTER, adapter)
+    config = json.loads((adapter / "adapter_config.json").read_text())
+    recorded = {**config, "init_lora_weights": "eva", "eva_config": {"rho": 2.0, "tau": 0.99}}
+    (adapter / "adapter_config.json").write_text(json.dumps(recorded))
+    again = LoRA.load(decoder.model, decoder.variables, adapter, layouts=decoder.layouts)
+    assert jax.tree.all(jax.tree.map(lambda one, other: bool((one == other).all()), again.variables,
+                                     loaded.variables))
+
+
 @pytest.mark.parametrize("arithmetic", [False, True])
 def test_an_opaque_linear_override_is_refused_instead_of_training_unused_factors(arithmetic):
     from dew.nn.dense import Dense
