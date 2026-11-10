@@ -641,16 +641,17 @@ def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
             for one, other in zip(first, later, strict=True)]
 
 
-def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, program=None) -> Conditioning:
+def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> Conditioning:
     """Check 1's conditioning of `reference_fn` (dew.parity's `Conditioning`): its rounding scale at a draw as
-    its arm runs (`summed_as_run`, a window loop's by window), read from `program` where the reference is
-    recorded (`assert_as_exact`'s `conditioning_program`), its heavy elements over `seeds` as `ran`, its
+    its arm runs (`summed_as_run`, a window loop's by window), or `scale(inputs, seed)` where its program is
+    not one here (`assert_as_exact`'s `conditioning_scale`), its heavy elements over `seeds` as `ran`, its
     compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run."""
     from rounding_bound import rounding_scale
-    scaled = program if program is not None else (
-        reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn)
+    scaled = reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn
 
     def scale_of(inputs, seed):
+        if scale is not None:
+            return scale(inputs, seed)
         with summed_as_run():
             if not isinstance(reference_fn, _Windowed):
                 return rounding_scale(scaled, *inputs, seed=seed)[1]
@@ -945,7 +946,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
                     terms: bool | Callable | None = None, examples: bool = False,
-                    conditioning: int | None = None, conditioning_program: Callable | None = None) -> None:
+                    conditioning: int | None = None, conditioning_scale: Callable | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1025,10 +1026,10 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     `conditioning`, the weighed check's own declared seeds (`seeds_for(..., conditioning=True)`), judges
     the site weighed where it stays undecided with its budget spent (dew.parity's conditioning, ledger 1714),
     each verdict logged under the check that decided it, the weighed one's ", conditioned". Its scale is
-    the reference program's rounding; a recorded reference, which has no program here, names one
-    (`conditioning_program`): a transcription of the reference's own computation in JAX, op for op and cast
-    for cast (tests/ssd_support.py's `transformers_mixer`), never Dew's arm, whose own forms would weigh
-    its own amplified errors down.
+    the reference program's rounding; a reference whose program is not one here (a recorded one) gives its
+    own (`conditioning_scale(inputs, seed)`), its upstream computation's, read from its float64 twin with
+    every operation tapped (`_dew_torch.rounding.rounding_scale`) and recorded beside its outputs,
+    never Dew's arm's, whose own forms would weigh its own amplified errors down.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
@@ -1037,7 +1038,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
                   library_leaves=library_leaves, also=also, terms=terms, examples=examples,
-                  program=conditioning_program)
+                  scale=conditioning_scale)
         return
     # A map task draws no seed past the site's stages (`REDRAW`): a sharded test's cases each declare their
     # own, the shards cut at the most of them, and a recording holds no more.
@@ -1047,7 +1048,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
 
 def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditioning: int, truth_fn, orders,
-              library_fn, library_row, library_leaves, also, terms, examples: bool, program=None) -> None:
+              library_fn, library_row, library_leaves, also, terms, examples: bool, scale=None) -> None:
     """`assert_as_exact`'s site with `conditioning` (dew.parity's `Conditioning`): the unweighted check over
     its own `seeds`, whole, and where it stays undecided the weighed check over `conditioning` seeds, its
     heavy elements classed over the draws it takes, alike in every process that runs it. A sharded site's map
@@ -1059,7 +1060,7 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
         _site_judged(dew_fn, reference_fn, draw, f"{label}, conditioned", seeds=conditioning,
                      truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
                      library_leaves=library_leaves, also=also, terms=False, examples=examples,
-                     weighing=functools.partial(_conditioning, draw=draw, seeds=range(span), program=program),
+                     weighing=functools.partial(_conditioning, draw=draw, seeds=range(span), scale=scale),
                      upto=span,
                      offset=plain)
 
@@ -1078,8 +1079,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                  library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None,
                  offset: int = 0) -> None:
     """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (dew.parity's
-    `Conditioning`: built of the site's compiled reference and truth where it draws, never in its judge),
-    a map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
+    `Conditioning`: built of the site's compiled reference and truth where it draws, never in its judge), a
+    map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
     given = reference_fn
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
@@ -1239,7 +1240,7 @@ def recorded_pilots(reference_fn, draw, count: int):
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None, orders=None, examples: bool = False,
-              conditioning: bool = False, conditioning_program=None) -> int:
+              conditioning: bool = False, conditioning_scale=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -1281,7 +1282,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     # A weighed site (`assert_as_exact`'s `conditioning`) is sized as it is judged, weighed, its heavy
     # elements classed over its first stages' draws.
     weighing = (_conditioning(reference_fn, truth_fn, draw, range(staged_units(max(start, FEWEST_SEEDS))),
-                              program=conditioning_program) if conditioning else None)
+                              scale=conditioning_scale) if conditioning else None)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
     dew_fn = dew_fn if paired else None
     truth_fn = _truth_program(truth_fn)
@@ -1422,6 +1423,20 @@ def _of_leaves(stored, site: str, leaves) -> dict:
     if wanted - found:
         raise ValueError(f"{site}: the recording holds no leaves {sorted(wanted - found)}")
     return kept
+
+
+def recorded_weighing(stored, site: str) -> dict:
+    """The weighed check a recorded `site` declares (`assert_as_exact`'s `conditioning` and
+    `conditioning_scale`): its declared seeds, and each draw's rounding scale as recorded beside the
+    reference's outputs (`<site>.scale.<leaf>`, tools/recorded_references.py's `record_case(scale=...)`),
+    read at the draw's index, the first of the indexed inputs (`indexed_recording`)."""
+    scales = {name.removeprefix(f"{site}.scale."): value for name, value in stored.items()
+              if name.startswith(f"{site}.scale.")}
+
+    def scale(inputs, seed):
+        return {name: value[int(inputs[0])] for name, value in scales.items()}
+
+    return {"conditioning": int(stored[f"{site}.conditioning"]), "conditioning_scale": scale}
 
 
 def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None, leaves=None):
