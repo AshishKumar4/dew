@@ -1258,7 +1258,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
             pytest.skip(f"this host's ptxas builds for its {local} GPU and before, not {target}")
-    from kernel_compile import failures, mosaic_failures
+    from kernel_compile import failures, mosaic_failures, undercounts
 
     plans, refused, apart = {}, [], {}
     with report.refusals():
@@ -1266,8 +1266,9 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     # Every case compiles and reports; a refused tile's spill is the model's refusal, a required one's fails,
     # and a case whose launches are held apart fails as either does, launch by launch.
     failed = failures(found) + planned_failures(found, plans)
-    failed += mosaic_failures([record for case, record in zip(cases, found, strict=True)
-                               if case.required and case.name not in apart])
+    required = [record for case, record in zip(cases, found, strict=True)
+                if case.required and case.name not in apart]
+    failed += mosaic_failures(required) + undercounts(required)
     failed += apart_failures([record for record in found if record["name"] in apart], apart)
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
