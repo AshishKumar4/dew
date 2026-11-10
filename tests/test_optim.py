@@ -1158,9 +1158,10 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
 
         paired = np.stack((np.asarray(ids), (np.asarray(ids) + 3) % 32), axis=1)
         batch = pair_windows(paired, np.ones_like(paired), count=rows)
-        scoring_ids = jnp.asarray(batch["input_ids"])
-        packing = {"coordinates": window_coordinates(batch).along_tokens(lambda leaf: leaf[:, :-1],
-                                                                         prefix=True)}
+        finals = objective.finals
+        inputs = jnp.asarray(batch["input_ids"])[:, :-finals]
+        packing = {"coordinates": window_coordinates(batch, finals).along_tokens(
+            lambda leaf: leaf[:, :-finals], prefix=True)}
     else:
         mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
         batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
@@ -1168,7 +1169,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
                  "response_mask": mask, "advantages": mask,
                  "behavior_log_probs": jnp.full(ids.shape, -3.),
                  "old_values": jnp.zeros_like(mask), "returns": mask}
-        scoring_ids = ids
+        inputs = ids[:, :-1]
         packing = {"coordinates": coordinates(segments=batch["text_segment_ids"][:, :-1],
                                               positions=batch["text_positions"][:, :-1])}
     threshold = .01
@@ -1178,7 +1179,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     initial = trainer.initial_state()
     variables = initial.variables
     policy = part(variables, "policy") if kind == "ppo" else variables
-    _, sown = model.apply(policy, scoring_ids[:, :-1], method="hidden_states", mutable=["qk"], **packing)
+    _, sown = model.apply(policy, inputs, method="hidden_states", mutable=["qk"], **packing)
     expected = compact_qk(sown["qk"])
     peaks = expected["layers_0"]["self_attn"]["max_logits"][0]
     assert np.max(peaks) > threshold
