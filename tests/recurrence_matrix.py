@@ -353,7 +353,11 @@ def _on_par_recorded(named: dict[str, str], step, truth, upstream: str) -> None:
     a recording of another release than the tier's pin is stale, refused."""
     from tool_support import load
 
-    stored, site = recording(RECORDED[upstream]), "-".join(named.values())
+    site = "-".join(named.values())
+    # Only the recorded upstreams' cells are held here: another's is its GPU tier's alone.
+    assert upstream in RECORDED, (f"{site}: no recording of {upstream}; its cells run where "
+                                  f"{INTERPRETERS[upstream]} names its reference interpreter")
+    stored = recording(RECORDED[upstream])
     recorded = json.loads(str(stored["provenance"]))["revision"]
     pinned = load("reference_releases").RELEASES[upstream][f"{upstream}-core"]
     assert recorded == pinned, f"{site}: recorded on {upstream} {recorded}, the tier pins {pinned}: stale"
