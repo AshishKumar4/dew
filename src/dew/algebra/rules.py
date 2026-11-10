@@ -12,6 +12,7 @@ import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import (
@@ -160,7 +161,65 @@ def product_magnitude(left: tuple, right: tuple, length) -> tuple[list, i64]:
     return facts + more, power + other + length
 
 
-Instance = tuple[Callable, Callable, Callable]
+type Draw = Callable[[int], tuple[jax.Array, ...]]
+"""A rewrite's operands by seed."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Drawn:
+    """Draws of a rewrite's operands of `shapes` by seed: each element's magnitude across six decades, a large
+    and a small term together in every row, the same family each seed; `scale`'s draw instead where a rule's
+    operands lie in a domain of their own, each operand drawn after those before it, which it is given (a
+    fold's maximum and total are its logits'). Its adversarial families (`adversarial`) are the same draws
+    with the operands of its first's shape, its values, changed; an operand of another shape (a scale, a
+    maximum, a divisor) keeps its domain's draw."""
+
+    shapes: tuple[tuple[int, ...], ...]
+    scale: Callable[[np.random.Generator, tuple[int, ...], list[np.ndarray]], np.ndarray] | None = None
+
+    def _values(self, seed: int) -> list[np.ndarray]:
+        rng = np.random.default_rng(seed)
+        drawn: list[np.ndarray] = []
+        for shape in self.shapes:
+            drawn.append(np.asarray(rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape)
+                                    if self.scale is None else self.scale(rng, shape, drawn), np.float32))
+        return drawn
+
+    def __call__(self, seed: int) -> tuple[jax.Array, ...]:
+        return tuple(jnp.asarray(value) for value in self._values(seed))
+
+    def adversarial(self) -> Mapping[str, Draw]:
+        """Its adversarial families (docs/design/algebra.md §3), by name: every other row of its values an
+        exact zero; one element a row, the rest exact zeros; and, where it draws two values or more, each
+        later one the first's negation (their sum cancels exactly) and the first's next float (near-equal
+        operands)."""
+        values = [index for index, shape in enumerate(self.shapes) if shape == self.shapes[0]]
+
+        def changed(change: Callable[[int, np.ndarray, np.ndarray], np.ndarray]) -> Draw:
+            def drawn(seed: int) -> tuple[jax.Array, ...]:
+                operands = self._values(seed)
+                first = operands[values[0]]
+                for place, index in enumerate(values):
+                    operands[index] = change(place, operands[index], first)
+                return tuple(jnp.asarray(value) for value in operands)
+            return drawn
+
+        def zero_rows(place, value, first):
+            return np.where((np.arange(len(value)) % 2 == 0)[:, None], np.float32(0), value)
+
+        def one_a_row(place, value, first):
+            kept = np.arange(value.shape[-1])[None, :] == (np.arange(len(value)) % value.shape[-1])[:, None]
+            return np.where(kept, value, np.float32(0))
+
+        families = {"rows of zero": changed(zero_rows), "one element a row": changed(one_a_row)}
+        if len(values) > 1:
+            families["cancelling operands"] = changed(lambda place, value, first: -first if place else value)
+            families["near-equal operands"] = changed(
+                lambda place, value, first: np.nextafter(first, np.float32(np.inf)) if place else value)
+        return families
+
+
+Instance = tuple[Callable, Callable, Drawn]
 """A rewrite written as JAX: its left side, its right side, and draws of its operands by seed."""
 
 
@@ -243,32 +302,37 @@ def _facts() -> Ruleset:
         name="facts")
 
 
-def _drawn(*shapes, scale: Callable[[np.random.Generator, tuple[int, ...]], np.ndarray] | None = None):
-    """Draws of operands of `shapes` by seed: each element's magnitude across six decades, a large and a
-    small term together in every row, the same family each seed; `scale`'s draw instead where a rule's
-    operands lie in a domain of their own."""
-    def drawn(seed):
-        rng = np.random.default_rng(seed)
-        return tuple(jnp.asarray(rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape)
-                                 if scale is None else scale(rng, shape), jnp.float32) for shape in shapes)
-    return drawn
+_ROWS, _SCALED = Drawn(((64, 1024), (64, 1024), (64, 1024))), Drawn(((64, 1024), (64,)))
+_SMALL = Drawn(((64, 1024),), scale=lambda rng, shape, drawn: (rng.uniform(-0.5, 0.5, shape)
+                                                               * 10.0 ** rng.uniform(-6, 0, shape)))
 
 
-_ROWS, _SCALED = _drawn((64, 1024), (64, 1024), (64, 1024)), _drawn((64, 1024), (64,))
-_SMALL = _drawn((64, 1024), scale=lambda rng, shape: (rng.uniform(-0.5, 0.5, shape)
-                                                      * 10.0 ** rng.uniform(-6, 0, shape)))
-_FOLDED = _drawn((64, 1024), (64, 1), (64, 1), scale=lambda rng, shape: (
-    rng.standard_normal(shape) * 4.0 if shape[-1] > 1 else np.exp(rng.standard_normal(shape) * 2.0)))
-_POSITIVE = _drawn((64, 1024), (), scale=lambda rng, shape: (
+def _fold(rng: np.random.Generator, shape: tuple[int, ...], drawn: list[np.ndarray]) -> np.ndarray:
+    """A fold's operands in turn: its logits, their maximum along the row, and the total of their
+    exponentials less it, which holds the maximum's unit weight and so is at least one."""
+    if not drawn:
+        return rng.standard_normal(shape) * 4.0
+    peak = drawn[0].max(-1, keepdims=True)
+    return peak if len(drawn) == 1 else np.exp(drawn[0] - peak).sum(-1, keepdims=True)
+
+
+_FOLDED = Drawn(((64, 1024), (64, 1), (64, 1)), scale=_fold)
+"""A fold's logits with their own maximum and total (`_fold`), a softmax's. The unfolded quotient is the
+bounded form where the total is at least one: under a total below one `exp(x - m)` falls under float32's
+normal range where the folded exponent does not (at `x - m = -95` and `t = exp(-10)` the fold gives 1.2e-37
+and the quotient a flushed zero), which a declaration of such totals measures at dev time (§1.5) and
+refuses."""
+_POSITIVE = Drawn(((64, 1024), ()), scale=lambda rng, shape, drawn: (
     rng.standard_normal(shape) * 10.0 ** rng.uniform(-3, 3, shape) if shape
     else np.exp(rng.standard_normal(shape))))
-_ROW_SCALED = _drawn((64, 1024), (64,), (64, 1024))
+_ROW_SCALED = Drawn(((64, 1024), (64,), (64, 1024)))
 
 
 def _stable() -> tuple[RuleFamily, ...]:
     """Stable forms (docs/design/algebra.md §1.5): `exp(x - (m + log t))` as `exp(x - m) / t`, so the
     logarithm of a sum is never rounded into a value as large as the logits (a derived attention backward's
-    mapped dK and dQ came to 1.6-1.7 times the reference's error without it); `log(1 + x)` as `log1p(x)`
+    mapped dK and dQ came to 1.6-1.7 times the reference's error without it), bounded where the total is at
+    least one (`_FOLDED`); `log(1 + x)` as `log1p(x)`
     and `exp(x) - 1` as `expm1(x)`, which keep a small `x`'s digits. Each costs what it costs: the program
     pass never runs them, and dev time takes a form of theirs only where its measured error asks it."""
     x, m, t, one = vars_("x m t one", Term)

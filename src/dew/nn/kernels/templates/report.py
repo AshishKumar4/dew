@@ -335,7 +335,7 @@ def record_rewrite(made) -> None:
 
 
 def record_pass(seconds: float) -> None:
-    """Record one program's whole algebra pass, its seconds (`dew.algebra.program.rewritten_program`)."""
+    """Record one program's whole algebra pass, its seconds (`dew.algebra.program._passed`)."""
     with _GUARD:
         _registry().passes.append(seconds)
 
@@ -369,8 +369,8 @@ def refusals() -> Iterator[None]:
 @contextlib.contextmanager
 def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[_Registry]:
     """Refusals visible while deriving and compiling a replacement, without changing the kept program's
-    registry or its file; the scope's registry, whose rewrites the replacement's trace recorded. A successful
-    replacement commits both after this scope ends (`_commit`)."""
+    registry or its file; the scope's registry, whose rewrites and passes the replacement's trace recorded. A
+    successful replacement commits them after this scope ends (`_commit`)."""
     registry = _registry()
     with _GUARD:
         proposed = dict(registry.refused)
@@ -385,9 +385,12 @@ def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[_Reg
 
 
 def _commit(proposal: _Registry) -> None:
-    """A successful replacement's rewrites (`_proposing`'s scope) recorded as the kept program's."""
+    """A successful replacement's rewrites and its passes' seconds (`_proposing`'s scope) recorded as the
+    kept program's."""
     with _GUARD:
-        _registry().rewritten.extend(proposal.rewritten)
+        registry = _registry()
+        registry.rewritten.extend(proposal.rewritten)
+        registry.passes.extend(proposal.passes)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",

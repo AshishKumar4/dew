@@ -676,8 +676,9 @@ the stored layout's version: weights stored in it decode by this form alone."""
 
 NVFP4_OWED = 2.0 ** 8
 """The factor an NVFP4 tile's decode (`nvfp4_decoded`) owes its values, which the epilogue's fp32 scale takes:
-a GPU's prologue multiplies the form's decode (`code 2^-126`, `NVFP4_BFLOAT16`) by its block scale times
-2^118, each then in bfloat16's range, the product exact, so the tile is the values over 2^8."""
+a prologue restores each code to float32 from the form's decode (`code 2^-126`, `NVFP4_BFLOAT16`,
+`_restored`), multiplies it by its block scale over 2^8 and narrows the product to bfloat16, exact and
+within bfloat16's range, so the tile is the values over 2^8."""
 
 
 def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
