@@ -1,9 +1,9 @@
 {
- "bytes": 11259123,
+ "bytes": 18423323,
  "license": "Apache-2.0",
- "path": "recordings/633fd2fa43f21abcefb79dec9e26016a2be1d43c9cd0e1535b30159aa51cbfc7.npz",
+ "path": "recordings/b0f8fb6c8c1cd467195605759ae5aff3fd3b1ae532a88dce6d63f3fe4d83b15a.npz",
  "reference": "transformers 5.17.0",
  "repo": "dewml/fixtures",
- "revision": "8f8aaa79c655cf017a99aac37268e2be87d24e34",
- "sha256": "633fd2fa43f21abcefb79dec9e26016a2be1d43c9cd0e1535b30159aa51cbfc7"
+ "revision": "bab57de5efe20b214d392de31b9b257a5f0aee41",
+ "sha256": "b0f8fb6c8c1cd467195605759ae5aff3fd3b1ae532a88dce6d63f3fe4d83b15a"
 }

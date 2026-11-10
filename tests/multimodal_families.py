@@ -35,6 +35,12 @@ TEXT_IDS = (4, 200)
 """The ids a text draw's tokens are drawn from, its checkpoints' word tokens (`token4` on), short of their
 vision tokens (Qwen3.5's image token is 200)."""
 
+WEIGHED = frozenset({"qwen35/text"})
+"""The drawn sites judged weighed where they stay undecided (`assert_as_exact`'s `conditioning`), recorded
+with each draw's rounding scale, the reference's own (tools/venv_reference.py's `weighed`): Qwen3.5's step
+amplifies a GatedDeltaNet norm's rounding at a token unevenly, every arm's alike (ledger 5238: its forward
+displacement there reproduces the gradient's error whole, the norm's inverse root mean square 299 to 982)."""
+
 
 def text_rows(ids):
     """A text draw's `input_ids` and `attention_mask`, `ids` `[rows, most]` each row its `TEXT_LENGTHS`

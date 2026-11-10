@@ -17,6 +17,7 @@ summary writes. A reference whose recorder keeps each row's distance from its tr
 too large to keep over the seeds, is summarized from those by `record_distances`.
 """
 
+import concurrent.futures
 import dataclasses
 import json
 import sys
@@ -91,38 +92,87 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
     return written
 
 
+class _Records:
+    """A recording's draws (`record_case`), each seed drawn once, as the sizing reads it: a paired sizing
+    reads its pilots from SIZING_FROM, which a run of every seed below it would draw too. A pilot is read as
+    it is drawn and never again (`_drawn` reads each draw through before the next), so only the one being read
+    is held. With `ahead` above one, `evaluate` is asked that many seeds at a time on threads of its own,
+    which the caller says it may run on: a caller's context (x64, a matmul precision) is its thread's."""
+
+    def __init__(self, draw, evaluate, ahead: int):
+        self.draw, self.evaluate, self.ahead = draw, evaluate, ahead
+        self.records, self.pilot, self.replayed, self.pending = {}, {}, set(), {}
+        self.asking = concurrent.futures.ThreadPoolExecutor(ahead) if ahead > 1 else None
+
+    def evaluated(self, seed: int):
+        inputs = self.draw(seed)
+        return inputs, self.evaluate(inputs)
+
+    def record(self, seed: int):
+        """Seed `seed`'s inputs (with the leaves the reference made, `replayed`), reference and truth."""
+        held = self.pilot if seed >= SIZING_FROM else self.records
+        if seed not in held:
+            self.pilot.clear()
+            if self.asking is None:
+                inputs, (reference, truth, *made) = self.evaluated(seed)
+            else:
+                for further in range(seed, seed + self.ahead):
+                    if further not in self.pending and further not in held:
+                        self.pending[further] = self.asking.submit(self.evaluated, further)
+                inputs, (reference, truth, *made) = self.pending.pop(seed).result()
+            made = jax.tree.map(np.asarray, made[0] if made else {})
+            self.replayed.update(made)
+            held[seed] = ({**inputs, **made}, jax.tree.map(np.asarray, reference),
+                          jax.tree.map(np.asarray, truth))
+        return held[seed]
+
+    def ensure(self, count: int) -> None:
+        for seed in range(count):
+            self.record(seed)
+
+    def __enter__(self) -> "_Records":
+        return self
+
+    def __exit__(self, *_) -> None:
+        """Every draw asked ahead and not yet begun dropped, every one begun finished."""
+        if self.asking is not None:
+            self.asking.shutdown(cancel_futures=True)
+
+
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
-                examples: bool = False, conditioning_program=None) -> dict[str, np.ndarray]:
+                examples: bool = False, scale=None, ahead: int = 1) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
-    reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
-    function that can run here, which plans the count. With no proxy, the recorded reference alone
-    sizes the count, recording the draws its doublings take. The recorded reference then confirms it,
-    recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
-    draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can call
-    again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
-    hands `draw` to `indexed_recording` as `inputs_of`. Where `evaluate` gives a third dict, the leaves the
-    reference made that Dew replays (an engine's sampled ids, its kept support, its routes), the recording
-    keeps them whole as `<label>.replayed.<leaf>`, and Dew's run and the test's take them beside the draw's
-    inputs: the comparison is of the replay. With `summary`, the recording keeps no outputs
-    at all: per seed and leaf, the reference's evidence check 1 reads (`leaf_summary`: its mean squared
-    error from its truth, its worst sized row, its errors on the truth's rows of zero, finiteness) and
-    its truth's sketch
-    (`truth_sketch`), which the test's own float64 path is held to (`indexed_recording`'s `truth_fn`):
-    kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes. With `dew(inputs)`, Dew's
-    own outputs on a seed's inputs, the recorded reference confirms the count paired, as check 1's
-    verdict pairs it (`seeds_for`'s `dew_fn`), for a site whose errors are heavy-tailed across draws
-    alike in both arms (a lognormal training sigma), where the reference compared with itself on other
-    draws never resolves. A site whose GPU paired sizing needs more seeds than the recording CPU's
-    declares that count through `start`: the recording confirms it here and keeps its whole redraw. A site
-    whose leaves stack independent examples (`examples`) is sized as its verdict judges it. A site that
-    declares the weighed check (`assert_as_exact`'s `conditioning`) names `conditioning_program`, the
-    reference's computation transcribed in JAX that its rounding scale is read from: the weighed check's
-    seeds are sized on the recorded reference as that check judges them (`seeds_for(...,
+    reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a function
+    that can run here, which plans the count. With no proxy, the recorded reference alone sizes the count,
+    recording the draws its doublings take. The recorded reference then confirms it, recording further seeds
+    as `seeds_for` asks, and the recording keeps exactly the confirmed count's draws and their redraw, (1 +
+    REDRAW) times it. Where `draw` is a seeded function the test can call again, `store_inputs=False` records
+    the outputs alone and each draw's `input_digest`, and the test hands `draw` to `indexed_recording` as
+    `inputs_of`. Where `evaluate` gives a third dict, the leaves the reference made that Dew replays (an
+    engine's sampled ids, its kept support, its routes), the recording keeps them whole as
+    `<label>.replayed.<leaf>`, and Dew's run and the test's take them beside the draw's inputs: the comparison
+    is of the replay. With `summary`, the recording keeps no outputs at all: per seed and leaf, the
+    reference's evidence check 1 reads (`leaf_summary`: its mean squared error from its truth, its worst sized
+    row, its errors on the truth's rows of zero, finiteness) and its truth's sketch (`truth_sketch`), which
+    the test's own float64 path is held to (`indexed_recording`'s `truth_fn`): kilobytes where outputs over (1
+    + REDRAW) times the seeds are gigabytes. With `dew(inputs)`, Dew's own outputs on a seed's inputs, the
+    recorded reference confirms the count paired, as check 1's verdict pairs it (`seeds_for`'s `dew_fn`), for
+    a site whose errors are heavy-tailed across draws alike in both arms (a lognormal training sigma), where
+    the reference compared with itself on other draws never resolves. A site whose GPU paired sizing needs
+    more seeds than the recording CPU's declares that count through `start`: the recording confirms it here
+    and keeps its whole redraw. A site whose leaves stack independent examples (`examples`) is sized as its
+    verdict judges it. A site that declares the weighed check (`assert_as_exact`'s `conditioning`) gives
+    `scale(inputs, seed)`, its reference's own rounding scale at a draw (`_dew_torch.rounding.rounding_scale`
+    over its float64 twin, every operation tapped): each draw of the weighed check's stages has its own
+    recorded as `<label>.scale.<leaf>`, which the test's weighing reads (`conditioning_scale`); the weighed
+    check's seeds are sized on the recorded reference as that check judges them (`seeds_for(...,
     conditioning=True)`, paired where the unweighted check's are), recorded as far as its stages draw (from
     the first seed, as the unweighted check's do), and declared as `<label>.conditioning`; its outputs are
     kept whole, which the weighing reads. Its unweighted sizing that never resolves declares the cap,
-    MOST_SEEDS (docs/design/testing.md)."""
+    MOST_SEEDS (docs/design/testing.md). With `ahead`, an `evaluate` that may run on several threads at once
+    is asked that many seeds at a time, the next ones a draw's read reaches beside its own: every reading here
+    walks its seeds in order."""
     if proxy is None and truth_proxy is not None:
         raise ValueError("a planning truth requires its proxy")
     # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
@@ -130,56 +180,47 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
                seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label, start=start,
                          truth_fn=None if truth_proxy is None else jax.jit(truth_proxy)))
     print(f"{label}: starting with {planned} seeds", flush=True)
-    # Each seed drawn once, as the sizing reads it: a paired sizing reads its pilots from SIZING_FROM, which a
-    # run of every seed below it would draw too. A pilot is read as it is drawn and never again (`_drawn`
-    # reads each draw through before the next), so only the one being read is held.
-    records, pilot, replayed = {}, {}, set()
+    # The evaluations asked ahead are cancelled or finished on every exit, before the caller's workers close.
+    with _Records(draw, evaluate, ahead) as held:
+        record, ensure = held.record, held.ensure
+        records, replayed = held.records, held.replayed
 
-    def record(seed):
-        held = pilot if seed >= SIZING_FROM else records
-        if seed not in held:
-            pilot.clear()
-            inputs = draw(seed)
-            reference, truth, *made = evaluate(inputs)
-            made = jax.tree.map(np.asarray, made[0] if made else {})
-            replayed.update(made)
-            held[seed] = ({**inputs, **made}, jax.tree.map(np.asarray, reference),
-                          jax.tree.map(np.asarray, truth))
-        return held[seed]
+        def recorded_draw(seed):
+            return np.int32(seed), record(int(seed))[0]
 
-    def ensure(count):
-        for seed in range(count):
-            record(seed)
+        ensure(staged_units(planned))
+        # The recorded reference is read by index from the host's records, as given.
+        try:
+            confirmed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
+                                  start=start,
+                                  truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                                  dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
+                                  examples=examples)
+        except Inconclusive:
+            # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
+            if scale is None:
+                raise
+            confirmed = MOST_SEEDS
+        # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
+        # than the recorded reference confirms leaves draws the recording does not keep.
+        kept = staged_units(confirmed)
+        weighed, scales = 0, {}
 
-    def recorded_draw(seed):
-        return np.int32(seed), record(int(seed))[0]
+        def scaled(seed: int):
+            if seed not in scales:
+                scales[seed] = scale(record(seed)[0], seed)
+            return scales[seed]
 
-    ensure(staged_units(planned))
-    # The recorded reference is read by index from the host's records, as given.
-    try:
-        confirmed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
-                              start=start,
-                              truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                              dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
-                              examples=examples)
-    except Inconclusive:
-        # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
-        if conditioning_program is None:
-            raise
-        confirmed = MOST_SEEDS
-    # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
-    # than the recorded reference confirms leaves draws the recording does not keep.
-    kept = staged_units(confirmed)
-    weighed = 0
-    if conditioning_program is not None:
-        weighed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
-                            start=start, truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                            dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
-                            conditioning=True, conditioning_program=jax.jit(conditioning_program))
-        # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
-        kept = max(kept, staged_units(weighed))
-    ensure(kept)
-    kept_records = [records[seed] for seed in range(kept)]
+        if scale is not None:
+            weighed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
+                                start=start, truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                                dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
+                                conditioning=True,
+                                conditioning_scale=lambda inputs, seed: scaled(int(inputs[0])))
+            # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
+            kept = max(kept, staged_units(weighed))
+        ensure(kept)
+        kept_records = [records[seed] for seed in range(kept)]
     if summary:
         summarized = (_summarized(record, examples) for record in kept_records)
         result = _finished(label, _evidence(label, range(kept), summarized), confirmed)
@@ -199,8 +240,11 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
             input_digest({name: value for name, value in entry[0].items() if name not in replayed})
             for entry in kept_records])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
-    if conditioning_program is not None:
+    if scale is not None:
         result[f"{label}.conditioning"] = np.int32(weighed)
+        for name in scaled(0):
+            result[f"{label}.scale.{name}"] = np.stack([np.asarray(scaled(seed)[name], np.float32)
+                                                       for seed in range(staged_units(weighed))])
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
 
