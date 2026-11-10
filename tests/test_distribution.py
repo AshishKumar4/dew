@@ -928,6 +928,27 @@ def test_a_share_whose_calls_recorded_nothing_holds_the_records_its_peer_packed(
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_share_that_trains_nothing_holds_the_shared_prompts_parents_its_peer_packed(tmp_path):
+    """fsdp across two processes over the dense decoder, which scores a group's chains over their shared
+    prompt (`pack`'s `share`): the second share's tasks all truncate, so its calls train on nothing and
+    its rows share no prompt. It holds the parents' table at the documents' count the pool agrees
+    (`agreed_records`), so the pool hands the step one tree, and the pool trains on the rows and moves the
+    parameters one process does."""
+    pool, pooled = scheduled(tmp_path, {"fsdp": 2}, 2, "--truncate")
+    alone, single = scheduled(tmp_path, {"fsdp": 2}, 1, "--truncate")
+    assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
+    assert pool["shared"] and alone["shared"], "the decoder was meant to share its groups' prompts"
+    assert not handed(pool, 1)["response_mask"].any(), "the second share was meant to train on nothing"
+    together = {name: np.concatenate(value) for name, value in pool["rows"].items()}
+    reference = {name: np.concatenate(value) for name, value in alone["rows"].items()}
+    order, expected = (np.lexsort(rows["input_ids"].T[::-1]) for rows in (together, reference))
+    for name in ("input_ids", "response_mask", "behavior_log_probs"):
+        np.testing.assert_array_equal(together[name][order], reference[name][expected])
+    for name, value in single.items():
+        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+
+
+@pytest.mark.mesh(devices=2)
 def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp_path):
     """tensor across two processes: both read the one share, and their
     engines would draw differently (`--vary`). The first reader samples and

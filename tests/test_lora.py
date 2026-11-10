@@ -147,6 +147,29 @@ def test_a_fused_adapted_site_runs_as_the_branch_does(decoder, loaded, reference
     assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(fused_gradient))
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_a_fused_biased_site_adds_its_bias_in_the_layers_dtype(dtype):
+    """A biased Dense computing in a 16-bit dtype over its fp32 parameters, fused (`low_rank='fused'`),
+    promotes its bias with its operands as its unfused branch does: its output in the layer's dtype, its
+    bias rounded to it. Its kernel and update are zero, so each form's output is its bias as it adds it."""
+    from dew.nn.dense import Dense
+    from dew.nn.kernels import generation
+
+    inputs = jnp.asarray(np.random.default_rng(5).standard_normal((4, 6)), jnp.float32)
+    model = _BranchHost(Dense(5, dtype=dtype))
+    projection = nn.unbox(model.init(jax.random.key(3), inputs))["params"]["proj"]
+    bias = jnp.asarray(np.random.default_rng(6).standard_normal(5), jnp.float32)
+    adapter = LoRA(rank=2, modules=("proj",)).apply(
+        model, {"params": {"proj": {"kernel": jnp.zeros_like(projection["kernel"]), "bias": bias}}}, key=4)
+    forward = jax.jit(adapter.model.apply)
+    branch = forward(adapter.variables, inputs)
+    with generation.chosen(low_rank="fused"), generation.routes() as routes:
+        fused = jax.jit(adapter.model.apply)(adapter.variables, inputs)
+    assert {route.kernel for route in routes if route.choice == "low_rank"} == {"fused"}
+    assert fused.dtype == branch.dtype == dtype
+    np.testing.assert_array_equal(fused, branch)
+
+
 def test_eval_prediction_disables_adapter_dropout(loaded, reference):
     adapter = loaded
     ids = jnp.asarray(reference["input_ids"])
