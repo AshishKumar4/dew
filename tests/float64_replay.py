@@ -7,6 +7,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import FORMATTED
 from float64_terms import evaluated_on, walked
 from jax.extend.core import primitives
 from reference_error import _floating, as_given, equations
@@ -25,11 +26,6 @@ def _replayed(primitive) -> bool:
     return (programs.entrywise(primitive) or programs.rearranges(primitive) or programs.reduction(primitive)
             or programs.cumulative(primitive) or programs.scatter(primitive)
             or primitive in (primitives.dot_general_p, primitives.conv_general_dilated_p, primitives.iota_p))
-
-
-FORMATTED = frozenset({"bitcast_convert_type", "nextafter", "reduce_precision"})
-"""Operations whose meaning is a float format's: `float64_replay` runs them at the traced dtypes
-and widens a float they return."""
 
 
 def float64_replay(fn, *, compiled: bool = False):
@@ -134,7 +130,7 @@ class Replay:
         if next(equations(params), None) is not None:
             # A call the walk does not open may hold float arithmetic its integer boundary hides.
             raise NotImplementedError(f"float64_replay does not replay inside {name}")
-        if name in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
+        if equation.primitive in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
             traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
                       and _floating(variable.aval.dtype) else value
                       for value, variable in zip(values, equation.invars, strict=True)]

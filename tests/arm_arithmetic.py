@@ -26,6 +26,14 @@ def widened(tree):
     return jax.tree.map(wide, tree)
 
 
+FORMATTED = frozenset({jax.lax.bitcast_convert_type_p, jax.lax.nextafter_p, jax.lax.reduce_precision_p})
+"""The operations whose meaning is a float format's own, whatever width a program computes in: a value's
+bits read as another type, its neighbour on its format's grid, its rounding to a format's digits. JAX states
+no such fact of a primitive, so they are named here, once, by their objects: the float64 replay runs them at
+the traced dtypes (tests/float64_replay.py), and a float64 truth may hold their narrow results
+(`reference_error._narrow_values`)."""
+
+
 def float64_held(tree):
     """`tree` widened (`widened`) as arrays made under x64, so a program keeps them float64: the variables
     a float64 truth compiled once for every draw reads, where a layer that indexes a weight by its ids
@@ -80,16 +88,17 @@ class Unrewritten:
 
     def __getattr__(self, name):
         found = getattr(self.wrapped, name)
-        if name != "lower":
+        if name not in ("lower", "trace"):
             return found
 
-        # A compiled arm's lowering, under the switch its calls run under; an arm of no lowering has none.
-        def lower(*inputs, **options):
+        # A compiled arm's trace and lowering, under the switch its calls run under; an arm of neither has
+        # none.
+        def staged(*inputs, **options):
             from dew.algebra import passes
 
             with passes(on=False):
                 return found(*inputs, **options)
-        return lower
+        return staged
 
 
 class Truth:
@@ -105,3 +114,8 @@ class Truth:
 
     def __call__(self, *inputs):
         return self.run(*inputs)
+
+    @property
+    def trace(self):
+        """Its program's trace (JAX's `jit(...).trace`), the one its calls run."""
+        return self.run.trace

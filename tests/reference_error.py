@@ -66,14 +66,15 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 import dataclasses
 import functools
 import hashlib
+import itertools
 import os
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import Truth, summed_as_run, unrewritten, widened
+from arm_arithmetic import FORMATTED, Truth, summed_as_run, unrewritten, widened
 from arm_forms import (
     _layers,
     _one_draws_program,
@@ -88,6 +89,8 @@ from arm_forms import (
 )
 from check1_wire import CENSUS, DRAWS, STAGES
 from float64_terms import float64_terms
+from jax.extend import core as jcore
+from jax.interpreters import partial_eval as pe
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
@@ -130,6 +133,7 @@ from dew.parity import (
     heavy_masks,
 )
 from dew.parity_stages import REDRAW, staged_units
+from dew.training.compiled_program import lowering_platform
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
@@ -306,6 +310,12 @@ class _Paired:
 
     def __call__(self, *inputs, **options):
         return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
+
+    @property
+    def trace(self):
+        """The trace of the arm the site runs (JAX's `jit(...).trace`), where it is a compiled program's:
+        an arm of Dew's own programs has none."""
+        return (self.plain if self.pairing.with_ynn else self.without).trace
 
 
 def _paired_arms(arms) -> list[_Paired]:
@@ -635,6 +645,107 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
                            f"depends on more than them")
 
 
+class NarrowTruth(TypeError):
+    """A check-1 site whose truth is not float64's (`_of_float64`): `leaf`, the path of the first leaf that
+    is narrower than float64 or fed by a narrower value."""
+
+    def __init__(self, leaf: str, message: str):
+        self.leaf = leaf
+        super().__init__(message)
+
+
+def _below_float64(dtype) -> bool:
+    """Whether `dtype` is a float's or a complex number's format narrower than float64's; a value of no
+    dtype (None) is none."""
+    return dtype is not None and jnp.issubdtype(dtype, jnp.inexact) and jnp.finfo(dtype).bits < 64
+
+
+def _programs_within(equation, lowering: str) -> list:
+    """The programs `equation` runs within it, each with the constants it closes over: a call's, a loop's, a
+    checkpoint's, every branch of a conditional, and of a platform's choice the branch a program lowered for
+    `lowering` keeps (`programs.platform_branch`). A native kernel's body is none (`programs.opaque`)."""
+    if programs.opaque(equation):
+        return []
+    chosen = equation.params.get("branches_platforms")
+    if chosen is not None:
+        return [programs.branches(equation)[programs.platform_branch(chosen, lowering)]]
+    return [each for value in equation.params.values()
+            for each in (value if isinstance(value, tuple | list) else (value,))
+            if isinstance(each, jcore.ClosedJaxpr | jcore.Jaxpr)]
+
+
+def _narrow_values(program, lowering: str) -> Iterator[str]:
+    """Each value of `program`, a float64 truth's traced program with what no output reads removed, that is
+    narrower than float64 and no format's own: a constant it closes over that an equation or an output
+    reads, a literal, and a result an operation computes, in the program or in one within it
+    (`_programs_within`). A narrow result is a format's own where its operation rounds to a stated format
+    (a cast, FORMATTED) or only moves entries (`programs.rearranges`): a truth that states a rounding (a
+    quantized weight, a bf16 output) keeps it, and one that computes in fp32 does not."""
+    jaxpr = getattr(program, "jaxpr", program)
+    read = {atom for equation in jaxpr.eqns for atom in equation.invars if programs.computed(atom)}
+    read |= {atom for atom in jaxpr.outvars if programs.computed(atom)}
+    for var in jaxpr.constvars:
+        if var in read and _below_float64(getattr(var.aval, "dtype", None)):
+            yield f"a {var.aval.str_short()} constant it closes over"
+    for equation in jaxpr.eqns:
+        primitive = equation.primitive
+        for atom in equation.invars:
+            if isinstance(atom, jcore.Literal) and _below_float64(getattr(atom.aval, "dtype", None)):
+                yield f"a {atom.aval.str_short()} literal its `{primitive.name}` reads"
+        within = _programs_within(equation, lowering)
+        for inner in within:
+            yield from _narrow_values(inner, lowering)
+        made = [var.aval for var in equation.outvars if _below_float64(getattr(var.aval, "dtype", None))]
+        formats = (primitive is jax.lax.convert_element_type_p or primitive in FORMATTED
+                   or programs.rearranges(primitive))
+        if made and not within and not formats:
+            yield (f"`{primitive.name}` computed in {made[0].str_short()} in "
+                   f"{equation.source_info.name_stack or 'the truth itself'}")
+
+
+def _of_float64(label: str, truth_fn, inputs, truth) -> None:
+    """Raise unless a site's truth is float64's: `truth`, its value on the site's first draw, holds no float
+    leaf narrower than float64, and the program `truth_fn` traces on those `inputs` widened computes none
+    that feeds an output (`_narrow_values`, read by JAX's own dead-code pass and its primitives' facts): its
+    constants, its literals and its operations' results are float64, a stated rounding apart. A model of a
+    fixed float32 dtype run on widened inputs, or a float64 module over parameters left float32, is a second
+    fp32 run: it equals the reference bit for bit and judges Dew against a truth no better than itself (a
+    forked call's cells, row 5430). A truth the gate runs as given (NumPy, torch, a recording) or that runs
+    programs of its own traces none here, and is held by its leaves alone."""
+    paths = _leaf_paths(truth)
+    for path, leaf in zip(paths, jax.tree.leaves(truth), strict=True):
+        if _below_float64(jnp.result_type(leaf)):
+            raise NarrowTruth(path, f"{label}: the float64 truth's leaf {path or 'itself'} is "
+                              f"{jnp.result_type(leaf)}: a truth computes in float64 (a float64 clone of "
+                              f"the model over its variables widened, `float64_held`)")
+    windowed = any(isinstance(layer, _Windowed) for layer in _layers(truth_fn))
+    trace = None if _given(truth_fn) else getattr(next(
+        layer for layer in _layers(truth_fn) if not isinstance(layer, _RunToRun | _Windowed)), "trace", None)
+    if trace is None:
+        return
+    # A window loop's truth is traced on a window, as its loop calls it.
+    wide = widened(jax.tree.map(lambda leaf: leaf[0], inputs) if windowed else inputs)
+    with jax.enable_x64(new_val=True):
+        closed = trace(*wide).jaxpr
+    program, lowering = getattr(closed, "jaxpr", closed), lowering_platform(jax.devices()[0])
+    count = len(program.outvars)
+
+    def narrow(used: list[bool]) -> list[str]:
+        """The first few distinct narrow values the `used` outputs read."""
+        fed = pe.dce_jaxpr(program, used)[0]
+        return list(dict.fromkeys(itertools.islice(_narrow_values(fed, lowering), 64)))[:3]
+
+    if not narrow([True] * count):
+        return
+    # The first leaf a narrow value feeds, and what feeds it: each output's own program, read on the refusal.
+    at, found = next((index, "; ".join(found)) for index in range(count)
+                     if (found := narrow([index == other for other in range(count)])))
+    raise NarrowTruth(paths[at], f"{label}: the float64 truth's leaf {paths[at] or 'itself'} is fed by "
+                      f"{found}: no float64 truth, which computes in float64 from float64 constants (a "
+                      f"float64 clone of the model over its variables widened, `float64_held`; a stated "
+                      f"rounding, a cast, is kept)")
+
+
 def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
     """An arm's evidence on a draw (`_evidence`) over two of its orders: each leaf's errors and rows of
     float64 zero the first order's, its worst rows the worse of the two, each worst row's share
@@ -738,6 +849,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms = truth_and_terms(inputs)
+        if not at:
+            _of_float64(label, truth_fn or reference_fn, inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
         else:
@@ -806,11 +919,14 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
 
 STAGES_LOG = STAGES
 """The environment variable (`check1_wire.STAGES`) naming a file each check-1 judgement appends its stage, its
-verdict and its leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every
-site's stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
+verdict, its leaves of narrow rows (NARROW_FACTORS) and whether its reference equalled the truth on every
+first-stage seed (`exact`: a site that measures no rounding, or a truth that is its reference run again) to,
+one JSON line (`_logged`): what a train reads every site's stage-two rate from, every attempt counted, and
+which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None,
+            exact: bool | None = None) -> None:
     import json
 
     path = os.environ.get(STAGES_LOG)
@@ -818,7 +934,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn:
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
                                   "label": label, "stage": stage, "verdict": verdict,
-                                  "narrow_leaves": narrow_leaves, "ynn": ynn}) + "\n")
+                                  "narrow_leaves": narrow_leaves, "ynn": ynn, "exact": exact}) + "\n")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1159,7 +1275,9 @@ def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str]
     overs, unresolveds = [], []
     for index, named in enumerate(labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms))
+        # Whether the reference equals the truth bit for bit on every first-stage seed and leaf.
+        exact = not np.any(drawn_for(index)(0, seeds).theirs)
+        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms), exact)
         overs += over
         unresolveds += unresolved
     if overs:
