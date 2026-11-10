@@ -2,6 +2,7 @@
 node session's side of a measurement window."""
 
 import os
+import runpy
 import subprocess
 import sys
 import threading
@@ -11,10 +12,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 
-from tools.reference_source import loaded
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures"
+loaded: Callable[[str, Path | str], ModuleType] = runpy.run_path(
+    str(REPO_ROOT / "tools" / "reference_source.py"))["loaded"]
+"""tools/reference_source.py's file-as-module loader, which `load` uses, taken by its path: test workers
+import this module (process_support.py) in processes that see tests/ and src alone, never the checkout's
+root that holds `tools`."""
 
 
 def load(name: str, directory: str = "tools") -> ModuleType:
