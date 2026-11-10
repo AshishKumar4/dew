@@ -223,10 +223,16 @@ class Recorded(TypedDict):
     evaluated: jax.Array
 
 
+_RECORDED_VALUES = f"{RECORD}values/"
+"""Where a step's record keeps its named values among its metrics; each other field of `Recorded` sits
+under `RECORD` by its own name."""
+
+
 def recorded_metrics(record: Recorded) -> dict[str, jax.Array]:
-    """`record` as a step's metrics, one array each under `RECORD`, as a compiled step returns them."""
-    fields = {f"{RECORD}{name}": record[name] for name in ("example_index", "column_ok", "evaluated")}
-    return {**fields, **{f"{RECORD}values/{name}": value for name, value in record["values"].items()}}
+    """`record` as a step's metrics, one array each under `RECORD`, as a compiled step returns them: each
+    field `Recorded` declares by its name, its values under `_RECORDED_VALUES`."""
+    fields = {f"{RECORD}{name}": record[name] for name in Recorded.__annotations__ if name != "values"}
+    return {**fields, **{f"{_RECORDED_VALUES}{name}": value for name, value in record["values"].items()}}
 
 
 def taken_record(metrics: Mapping[str, jax.Array]) -> tuple[Recorded | None, dict[str, jax.Array]]:
@@ -235,10 +241,10 @@ def taken_record(metrics: Mapping[str, jax.Array]) -> tuple[Recorded | None, dic
     rest = {name: value for name, value in metrics.items() if not name.startswith(RECORD)}
     if f"{RECORD}evaluated" not in metrics:
         return None, rest
-    values = {name.removeprefix(f"{RECORD}values/"): value for name, value in metrics.items()
-              if name.startswith(f"{RECORD}values/")}
-    return Recorded(values=values, example_index=metrics[f"{RECORD}example_index"],
-                    column_ok=metrics[f"{RECORD}column_ok"], evaluated=metrics[f"{RECORD}evaluated"]), rest
+    values = {name.removeprefix(_RECORDED_VALUES): value for name, value in metrics.items()
+              if name.startswith(_RECORDED_VALUES)}
+    fields = {name: metrics[f"{RECORD}{name}"] for name in Recorded.__annotations__ if name != "values"}
+    return Recorded(values=values, **fields), rest
 
 
 @dataclass(eq=False)
