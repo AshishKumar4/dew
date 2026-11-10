@@ -24,6 +24,7 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew._devices import deterministic_ops_requested
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
+from dew.nn.residuals import Residual
 
 from .attention_kernels import (
     ATTENTION,
@@ -608,7 +609,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active dropout draws each weight
     from `dropout_rng` on the route the selector takes for it (`reference`, or `template` where named),
     at its global place on a sequence axis above one, and refuses explicit fused kernels. The
-    result carries the checkpoint name 'attention_output', so a remat policy
+    result carries the checkpoint name `Residual.ATTENTION_OUTPUT`, so a remat policy
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
@@ -661,7 +662,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                      key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                      image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
                      dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
-    return checkpoint_name(out, 'attention_output')
+    return checkpoint_name(out, Residual.ATTENTION_OUTPUT)
 
 
 def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:

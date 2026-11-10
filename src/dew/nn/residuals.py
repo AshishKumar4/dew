@@ -8,7 +8,10 @@ import enum
 class Residual(enum.StrEnum):
     """A value a block names as it runs (`checkpoint_name`), each after the projection that
     produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `output_gate` a gated attention's
-    gate (`gate_proj`) before it scales the context, `context`
+    gate (`gate_proj`) before it scales the context, `attention_output` the
+    attention call's result (`scaled_dot_product_attention`'s, local
+    attention's), which a remat policy saves rather than replay the kernel
+    (`dew.nn.dit`), `context`
     a mixer's output before `o_proj`, the attention kernel's or a recurrence's,
     `scan` a recurrence's (an SSM's or a delta rule's) alone, which a backward
     that drops it recomputes by running the scan again, `conv` a
@@ -28,6 +31,7 @@ class Residual(enum.StrEnum):
     KV_PROJ = 'kv_proj'
     O_PROJ = 'o_proj'
     OUTPUT_GATE = 'output_gate'
+    ATTENTION_OUTPUT = 'attention_output'
     CONTEXT = 'context'
     SCAN = 'scan'
     CONV = 'conv'
