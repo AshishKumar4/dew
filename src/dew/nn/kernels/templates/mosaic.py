@@ -777,22 +777,23 @@ class Ring:
                                         collective_axes=self.multicast)
 
     def parts(self, slot, start: int, piece) -> list[tuple]:
-        """A piece's copies into `slot`'s rows from `start` (`load`), each a source and its destination: the
-        slot's rows as its transforms index them, where they are whole tiles of rows (`TILE_ROWS`) or the slot
-        is plain; else (`split`), a row's alone (a gathered stream's, `Rows` of one row), each of its tiles'
-        columns into the slot's physical row at its swizzle (`piece_copies` of them). TMA swizzles a row by
-        its address (a 128-byte-aligned row swizzled as the pattern's row it lies at), so it lands as its
-        tile's row."""
+        """A piece's copies into `slot`'s rows from `start` (`load`), each a source and its destination, as
+        `piece_cells` lays them out: the slot's rows as its transforms index them, where they are whole tiles
+        of rows (`TILE_ROWS`) or the slot is plain; else (`split`), a row's alone (a gathered stream's, `Rows`
+        of one row), each of its tiles' columns into the slot's physical row at its swizzle. TMA swizzles a
+        row by its address (a 128-byte-aligned row swizzled as the pattern's row it lies at), so it lands as
+        its tile's row."""
         rows, smem = piece.shape[0], self.smem
-        match smem.transforms if isinstance(smem, state_types.TransformedRef) else ():
-            case (plgpu_core.UnswizzleRef() as unswizzled, plgpu_core.UntilingTransform(tiling=(tile, width)),
-                  ) if (isinstance(smem, state_types.TransformedRef)
-                        and split(unswizzled.swizzle, rows)):
-                physical = state_types.TransformedRef(smem.ref, (unswizzled,))
-                return [(piece.at[pl.ds(row, 1), pl.ds(column * width, width)],
-                         physical.at[slot, (start + row) // tile, column, pl.ds((start + row) % tile, 1)])
-                        for row in range(rows) for column in range(self.block[1] // width)]
-        return [(piece, self.smem.at[slot, pl.ds(start, rows)])]
+        cells = piece_cells(self.block, smem.dtype, swizzling.swizzle_of(smem), rows)
+        if cells is None:
+            return [(piece, smem.at[slot, pl.ds(start, rows)])]
+        unswizzled = next(transform for transform in smem.transforms
+                          if isinstance(transform, plgpu_core.UnswizzleRef))
+        physical, width = state_types.TransformedRef(smem.ref, (unswizzled,)), cells[0]
+        return [(piece.at[pl.ds(row, 1), pl.ds(column * width, width)],
+                 physical.at[slot, (start + row) // swizzling.TILE_ROWS, column,
+                             pl.ds((start + row) % swizzling.TILE_ROWS, 1)])
+                for row, column in cells[1]]
 
     def acquire(self, turn: Turn):
         """A consumer's wait for `turn`'s load: its slot. Each load is waited for by each consumer, as every
@@ -813,13 +814,23 @@ class Ring:
         drained(self.consumed, end, self.stages)
 
 
-def piece_copies(block: tuple, dtype, swizzle: int | None, rows: int) -> int:
-    """`Ring.parts`' copies of a piece of `rows` rows into a slot of `block` at `swizzle`, the arrivals its
-    load barrier takes of it (`ring`'s `copies`): a swizzled tile's columns of each row apart where `split`;
-    else once. Counted apart from `parts`, a 256-deep gathered step's barrier waited forever (row 4516)."""
+def piece_cells(block: tuple, dtype, swizzle: int | None, rows: int
+                ) -> tuple[int, tuple[tuple[int, int], ...]] | None:
+    """The one geometry of a piece of `rows` rows copied into a slot of `block` staged at `swizzle`, which
+    `Ring.parts` copies and `piece_copies` counts: None where it is copied once; where `split`, the columns of
+    one of the slot's swizzled tiles and each copy's `(row, column tile)`, a row's tiles apart. Counted apart
+    from its copies, a 256-deep gathered step's barrier waited forever (row 4516)."""
     if swizzle is None or not split(swizzle, rows):
-        return 1
-    return rows * (block[1] // swizzling.swizzle_columns(dtype, swizzle))
+        return None
+    width = swizzling.swizzle_columns(dtype, swizzle)
+    return width, tuple((row, column) for row in range(rows) for column in range(block[1] // width))
+
+
+def piece_copies(block: tuple, dtype, swizzle: int | None, rows: int) -> int:
+    """The copies of a piece of `rows` rows into a slot of `block` at `swizzle` (`piece_cells`), the
+    arrivals its load barrier takes of it (`ring`'s `copies`)."""
+    cells = piece_cells(block, dtype, swizzle, rows)
+    return 1 if cells is None else len(cells[1])
 
 
 def split(swizzle: int | None, rows: int) -> bool:
