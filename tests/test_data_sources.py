@@ -776,6 +776,55 @@ def test_a_listing_keeps_the_files_whose_names_end_in_its_suffixes_in_any_case(t
         assert names == ["a.MP4", "b.webm"]
 
 
+def test_a_suffix_of_several_parts_keeps_the_names_ending_in_all_of_it(tmp_path):
+    """A suffix names the whole end of a file's name, a compressed format's two parts included
+    (`jsonl.gz`): the files ending in it are kept, whatever case, and a file of the last part alone
+    (`.gz`) is not."""
+    for name in ("part-0.jsonl.gz", "part-1.JSONL.GZ", "notes.gz", "list.jsonl"):
+        (tmp_path / name).write_bytes(b"")
+    listing = Files(str(tmp_path), format="files", suffixes=("jsonl.gz",))
+    names = sorted(row["path"].rsplit("/", 1)[-1] for row in listing.records("memory"))
+    assert names == ["part-0.jsonl.gz", "part-1.JSONL.GZ"]
+
+
+def test_a_webdataset_sample_holds_every_member_of_its_key_whatever_its_extensions():
+    """WebDataset's member names split at their basename's first dot (`base_plus_ext`): `a.image.jpg`
+    and `a.txt` are one sample keyed `a`, its fields `image.jpg` and `txt`."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name in ("a.image.jpg", "a.txt", "b.image.jpg", "b.txt"):
+            data = name.encode()
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            archive.addfile(entry, io.BytesIO(data))
+    root = Store(f"memory://tar-{uuid4().hex}/data.tar")
+    root.write(buffer.getvalue())
+    files = Files(root.url)
+    rows = list(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0]))
+    assert rows == [{"__key__": "a", "image.jpg": b"a.image.jpg", "txt": b"a.txt"},
+                    {"__key__": "b", "image.jpg": b"b.image.jpg", "txt": b"b.txt"}]
+
+
+def test_a_torch_sample_holding_a_nested_tensor_that_requires_gradients_reads():
+    """A Torch dataset's sample whose tensor sits in a nested field, one that requires gradients: it is
+    read as a top-level one is, its values numpy in the same nesting."""
+    import torch
+
+    from dew.data import from_torch
+
+    class Nested(torch.utils.data.Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            return {"features": {"x": torch.full((3,), float(index), requires_grad=True)},
+                    "label": torch.tensor(index)}
+
+    rows = list(from_torch(Nested(), identity="nested@1").records("memory"))
+    assert [row["features"]["x"].tolist() for row in rows] == [[0.0] * 3, [1.0] * 3]
+    assert [int(row["label"]) for row in rows] == [0, 1]
+
+
 def test_a_token_export_reads_as_its_one_split_and_refuses_another(tmp_path):
     """An export holds one split: named "train", the default, it reads as itself; named another,
     it is refused rather than read as that split."""
