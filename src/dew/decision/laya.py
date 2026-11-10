@@ -24,6 +24,7 @@ from dew.decision.calibration import Calibration, Temperatures
 from dew.decision.formats import beyond_temperatures
 from dew.decision.head import DecisionHead
 from dew.decision.layout import Layout, MarkerLayout, QuestionLayout
+from dew.decision.questions import KINDS
 from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
 from dew.interop.releases import HeadFiles
 from dew.interop.safetensors_io import LazyTensors
@@ -89,8 +90,9 @@ LAYA_BUDGETS = {"head_max_len": 192, "option_tokens": 48}
 and options share, and the most one option keeps (`QuestionLayout.head_max_len`, `option_tokens`)."""
 
 
-TEMPERATURE_TYPES = ("choice", "score", "noul")
-"""The question types Laya's `temperature` list holds a temperature of, in its order."""
+TEMPERATURE_TYPES = tuple(question.kind for question in KINDS)
+"""The question types Laya's `temperature` list holds a temperature of, in its order: its QTYPES'
+(`dew.decision.questions.KINDS`), choice, score, noul."""
 
 
 def _temperature(value: object, key: str) -> tuple[float, ...] | float:
