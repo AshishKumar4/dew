@@ -318,6 +318,16 @@ def restore_position(source: Checkpointable, saved: bytes) -> None:
     source.set_state(saved if isinstance(source.get_state(), bytes) else json.loads(saved))
 
 
+SIGNAL_WAKE_SECONDS = 0.1
+"""How often a wait of the main thread on the prefetch worker (`DevicePrefetchIterator._waited`) wakes and
+waits again. CPython runs a signal's handler only when the main thread executes bytecode, and a signal that
+trips as that thread enters a native lock wait leaves the wait uninterrupted: a Ctrl-C during a source's
+restore, which the worker holds until fit unwinds and asks it to stop, was never delivered (6 of 200
+runs of tests/test_iterator_lifecycle.py's restore case, rows 5215 and 5229), as PyTorch's DataLoader
+waits on its workers for the same reason. A tenth of a second bounds how late a Ctrl-C is felt; the wait
+gives up nothing."""
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -541,7 +551,7 @@ class DevicePrefetchIterator:
         as ever."""
         with self._ready:
             self._holds += 1
-            self._ready.wait_for(lambda: not self._placing_now)
+            self._waited(lambda: not self._placing_now)
         try:
             yield
         finally:
@@ -562,7 +572,7 @@ class DevicePrefetchIterator:
         finally:
             with self._ready:
                 self._holds += 1
-                self._ready.wait_for(lambda: not self._placing_now)
+                self._waited(lambda: not self._placing_now)
 
     def _discard(self) -> None:
         """Drop every batch already queued, without waiting for more."""
@@ -630,8 +640,8 @@ class DevicePrefetchIterator:
         again."""
         self._start()
         with self._ready:
-            self._ready.wait_for(lambda: self._first is not None or self._placing or self._queued
-                                 or self._done.is_set() or self._stop.is_set())
+            self._waited(lambda: self._first is not None or self._placing or self._queued
+                         or self._done.is_set() or self._stop.is_set())
             if self._first is not None:
                 return self._first
             if self._placing or self._queued:
@@ -647,7 +657,7 @@ class DevicePrefetchIterator:
             self._ready.notify_all()
         self._start()
         with self._ready:
-            self._ready.wait_for(lambda: self._queued or self._done.is_set() or self._stop.is_set())
+            self._waited(lambda: self._queued or self._done.is_set() or self._stop.is_set())
             if self._stop.is_set():
                 raise StopIteration
             if self._queued:
@@ -657,6 +667,13 @@ class DevicePrefetchIterator:
                 return batch
         self._raise_ended()
         raise StopIteration
+
+    def _waited(self, ready: Callable[[], object]) -> None:
+        """Wait, holding `_ready`, until `ready()` holds: a consumer's wait on the worker, which the main
+        thread waits in, woken every `SIGNAL_WAKE_SECONDS` to run a signal's handler there and waiting
+        again. Nothing but `ready()` ends it."""
+        while not self._ready.wait_for(ready, timeout=SIGNAL_WAKE_SECONDS):
+            pass
 
     def _raise_ended(self) -> None:
         """Raise the worker's error, now it has ended with every batch it published read, if it had
