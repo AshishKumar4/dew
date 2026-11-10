@@ -232,14 +232,17 @@ def selected[C](op: Op[C], case: C, named: str | None = None, *, preference: tup
                 ) -> Kernel[C]:
     """The kernel `select` runs for `case`, reporting nothing: what a caller reads ahead of the dispatch
     that reports it (the kernel a call that built its mask names, a projection's choice between XLA's
-    program and the GEMM template's launches, which select their own), raising as `select` does."""
-    return _decided(op, case, named, preference)[0]
+    program and the GEMM template's launches, which select their own), raising as `select` does. A
+    declared cell's kernel is read without the kernel the op would prefer there, which only a report names
+    (`_old_route`): deriving that one's plan for no report cost a decode's trace a second a projection."""
+    return _decided(op, case, named, preference, reported=False)[0]
 
 
-def _decided[C](op: Op[C], case: C, named: str | None,
-                preference: tuple[str, ...]) -> tuple[Kernel[C], str, Refusal | None, str | None]:
+def _decided[C](op: Op[C], case: C, named: str | None, preference: tuple[str, ...], *,
+                reported: bool = True) -> tuple[Kernel[C], str, Refusal | None, str | None]:
     """`select`'s kernel for `case`, the kernel preferred, the preferred one's refusal and the kernel that
-    forced the choice (the call, its own `chosen`, then `named_from`), None where nothing did."""
+    forced the choice (the call, its own `chosen`, then `named_from`), None where nothing did; a declared
+    cell's preference only where `reported` (`selected` reads the kernel alone)."""
     insisted = _named(op, named)
     soft = insisted is None and bool(preference)
     if soft:
@@ -248,7 +251,7 @@ def _decided[C](op: Op[C], case: C, named: str | None,
         candidates = [op.kernel(name) for name in preference]
         first = candidates[0]
     else:
-        old = None if insisted is not None else _old_route(op, case)
+        old = None if insisted is not None else _old_route(op, case, reported=reported)
         if old is not None:
             return (*old, None)
         preferred = insisted or _preferred(op, case)
@@ -272,10 +275,12 @@ def _decided[C](op: Op[C], case: C, named: str | None,
     raise ValueError(f"no {op.choice} kernel takes this call ({refusal})")
 
 
-def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] | None:
+def _old_route[C](op: Op[C], case: C, *, reported: bool = True
+                  ) -> tuple[Kernel[C], str, Refusal | None] | None:
     """The kernel a declared cell runs (`Op.declared`): its kernel where it takes the call, the kernel the
-    op would prefer otherwise, and that one's refusal naming the receipt; None where the call's cell is
-    not declared or its kernel cannot run it."""
+    op would prefer otherwise, and that one's refusal naming the receipt (where `reported`: else the
+    declared kernel as its own preference); None where the call's cell is not declared or its kernel cannot
+    run it."""
     if not op.declared or not isinstance(case, Celled):
         return None
     cell = case.cell
@@ -285,7 +290,7 @@ def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] |
     kernel = op.kernel(name)
     if kernel.failed(case):
         return None
-    preferred = _preferred(op, case)
+    preferred = _preferred(op, case) if reported else name
     if preferred == name:
         return kernel, name, None
     return kernel, preferred, Refusal(
