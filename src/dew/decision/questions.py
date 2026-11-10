@@ -42,32 +42,34 @@ class Question(ABC):
         """Return this question's answer for `probabilities`, one per option."""
 
     @abstractmethod
+    def wire_criteria(self) -> JSON:
+        """The question's criteria as a Jev request writes them, None where it writes none."""
+
+    @classmethod
+    @abstractmethod
+    def from_criteria(cls, instructions: JSON, criteria: object) -> "Question":
+        """The question of this type with `instructions` and the `criteria` a Jev request gives it."""
+
     def wire(self) -> dict[str, JSON]:
-        """Return the question in a Jev request's format."""
+        """Return the question in a Jev request's format: its type (`kind`), instructions and criteria
+        (`wire_criteria`), which `from_wire` reads back."""
+        criteria = self.wire_criteria()
+        return {"type": self.kind, "instructions": self.instructions,
+                **({} if criteria is None else {"criteria": criteria})}
 
     @staticmethod
     def from_wire(request: Mapping[str, object]) -> "Question":
-        """Build the question from a Jev request's type, instructions and criteria."""
+        """Build the question from a Jev request's type, instructions and criteria (`wire`): its type the
+        kind of one of `KINDS`."""
         kind = request.get("type")
         unknown = set(request) - {"type", "instructions", "criteria"}
         if unknown:
             raise ValueError(f"a question has a type, instructions and criteria, not {sorted(unknown)}")
-        instructions = json_value(request.get("instructions"), "instructions")
-        criteria = request.get("criteria")
-        if kind == "noul":
-            return Noul(instructions, {} if criteria is None else {
-                key: json_value(value, f"criteria.{key}")
-                for key, value in record(criteria, "criteria").items()})
-        if kind == "choice":
-            if isinstance(criteria, (list, tuple)):
-                return Choice(instructions, strings(criteria, "criteria"))
-            return Choice(instructions, {key: json_value(value, f"criteria.{key}")
-                                         for key, value in record(criteria, "criteria").items()})
-        if kind == "score":
-            if not isinstance(criteria, (list, tuple)):
-                raise ValueError("a score's criteria are a list of level descriptions, lowest first")
-            return Score(instructions, [json_value(level, "criteria") for level in criteria])
-        raise ValueError(f"a question's type is noul, choice or score, got {kind!r}")
+        kinds = {question.kind: question for question in KINDS}
+        if kind not in kinds:
+            raise ValueError(f"a question's type is {', '.join(sorted(kinds))}, got {kind!r}")
+        return kinds[kind].from_criteria(json_value(request.get("instructions"), "instructions"),
+                                         request.get("criteria"))
 
     def index(self, label: object) -> int:
         """Return the position of the option that `label` names, given as its key or as an int index."""
@@ -112,11 +114,13 @@ class Noul(Question):
     def answer(self, probabilities: np.ndarray, confidence: "Confidence") -> "NoulAnswer":
         return NoulAnswer(_distribution(probabilities, 2), confidence(self, probabilities))
 
-    def wire(self) -> dict[str, JSON]:
-        request: dict[str, JSON] = {"type": self.kind, "instructions": self.instructions}
-        if self.criteria:
-            request["criteria"] = dict(self.criteria)
-        return request
+    def wire_criteria(self) -> JSON:
+        return dict(self.criteria) if self.criteria else None
+
+    @classmethod
+    def from_criteria(cls, instructions: JSON, criteria: object) -> "Noul":
+        return cls(instructions, {} if criteria is None else {
+            key: json_value(value, f"criteria.{key}") for key, value in record(criteria, "criteria").items()})
 
 
 @dataclass(frozen=True)
@@ -162,9 +166,15 @@ class Choice(Question):
         return ChoiceAnswer(self.options, _distribution(probabilities, len(self.options)),
                             confidence(self, probabilities))
 
-    def wire(self) -> dict[str, JSON]:
-        return {"type": self.kind, "instructions": self.instructions,
-                "criteria": dict(zip(self.options, self.descriptions, strict=True))}
+    def wire_criteria(self) -> JSON:
+        return dict(zip(self.options, self.descriptions, strict=True))
+
+    @classmethod
+    def from_criteria(cls, instructions: JSON, criteria: object) -> "Choice":
+        if isinstance(criteria, (list, tuple)):
+            return cls(instructions, strings(criteria, "criteria"))
+        return cls(instructions, {key: json_value(value, f"criteria.{key}")
+                                  for key, value in record(criteria, "criteria").items()})
 
 
 @dataclass(frozen=True)
@@ -202,8 +212,14 @@ class Score(Question):
         return ScoreAnswer(self.descriptions, _distribution(probabilities, len(self.options)),
                            confidence(self, probabilities))
 
-    def wire(self) -> dict[str, JSON]:
-        return {"type": self.kind, "instructions": self.instructions, "criteria": list(self.descriptions)}
+    def wire_criteria(self) -> JSON:
+        return list(self.descriptions)
+
+    @classmethod
+    def from_criteria(cls, instructions: JSON, criteria: object) -> "Score":
+        if not isinstance(criteria, (list, tuple)):
+            raise ValueError("a score's criteria are a list of level descriptions, lowest first")
+        return cls(instructions, [json_value(level, "criteria") for level in criteria])
 
 
 @dataclass(frozen=True)

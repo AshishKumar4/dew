@@ -63,7 +63,6 @@ from dew.decision.questions import (
     ChoiceAnswer,
     Confidence,
     JevConfidence,
-    Noul,
     NoulAnswer,
     Question,
     ScoreAnswer,
@@ -1785,24 +1784,25 @@ def _choice(answer: Answer) -> str:
 
 
 def _wire(question: Question, answer: Answer, *, details: bool, gated: bool) -> dict[str, JSON]:
+    """A question's answer in a Jev response: its type the question's (`Question.kind`), then the
+    answer's own fields."""
     probabilities = [round(float(value), 4) for value in answer.probabilities]
+    wire: dict[str, JSON] = {"type": question.kind}
     if isinstance(answer, NoulAnswer):
-        wire: dict[str, JSON] = {"type": "noul", "noul": round(answer.noul, 4)}
+        wire["noul"] = round(answer.noul, 4)
         if details:
             wire["confidence"] = round(answer.confidence, 4)
     elif isinstance(answer, ChoiceAnswer):
-        wire = {"type": "choice", "choice": answer.choice,
-                "probabilities": dict(zip(answer.options, probabilities, strict=True)),
-                "confidence": round(answer.confidence, 4)}
+        wire.update(choice=answer.choice, probabilities=dict(zip(answer.options, probabilities, strict=True)),
+                    confidence=round(answer.confidence, 4))
     else:
         assert isinstance(answer, ScoreAnswer)
-        wire = {"type": "score", "score": round(answer.score, 4),
-                "legend": {str(level): render(text) for level, text in enumerate(answer.legend)},
-                "probabilities": {str(level): value for level, value in enumerate(probabilities)},
-                "confidence": round(answer.confidence, 4)}
+        wire.update(score=round(answer.score, 4),
+                    legend={str(level): render(text) for level, text in enumerate(answer.legend)},
+                    probabilities={str(level): value for level, value in enumerate(probabilities)},
+                    confidence=round(answer.confidence, 4))
     if details and gated:
         wire["abstained"] = answer.abstained
-    assert isinstance(question, Noul) == isinstance(answer, NoulAnswer)
     return wire
 
 
