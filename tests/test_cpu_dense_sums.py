@@ -57,19 +57,30 @@ def test_a_pairwise_product_takes_every_dot_generals_axes_and_bounds_its_partial
         np.testing.assert_array_equal(np.asarray(pairwise._blocked(a, b, None)), np.asarray(whole))
 
 
-def test_a_rows_product_is_its_own_whatever_rows_share_its_call():
-    """`_summed` sums every row alike, blocked and pairwise (`_blocked`), so a row's product is the same bits
-    alone as among 255 others, as a decode step's row is its prefill's and a packed document's its own
-    row's; and the matrix's gradient over a call's rows the same bits split into two calls' shares as
-    whole, at 1024 deep."""
-    rng = np.random.default_rng(4863)
-    a = jnp.asarray(rng.standard_normal((1, 256, 1024)), jnp.float32)
-    b = jnp.asarray(rng.standard_normal((1, 1024, 512)), jnp.float32)
-    whole = np.asarray(pairwise._summed(a, b, None))
-    for row in (0, 7, 255):
-        np.testing.assert_array_equal(np.asarray(pairwise._summed(a[:, row:row + 1], b, None)),
-                                      whole[:, row:row + 1])
-    np.testing.assert_array_equal(np.asarray(pairwise._summed(a[:, :100], b, None)), whole[:, :100])
+def test_a_rows_product_alone_is_on_par_with_its_product_among_others():
+    """`_summed`'s product of a row alone (a decode step's) and of a call's first 100 rows, each on par (check
+    1) with the same rows' products in one call of 256 (a prefill's), and the matrix's gradient over those
+    rows likewise, at 1024 deep: two programs, whose bits XLA does not share (testing.md, row 3177), each
+    blocked and pairwise."""
+    def draw(seed):
+        rng = np.random.default_rng((4863, seed))
+        return (jnp.asarray(rng.standard_normal((1, 256, 1024)), jnp.float32),
+                jnp.asarray(rng.standard_normal((1, 1024, 512)), jnp.float32))
+
+    def apart(a, b):
+        return (*(pairwise._summed(a[:, row:row + 1], b, None) for row in (0, 7, 255)),
+                pairwise._summed(a[:, :100], b, None))
+
+    def together(a, b):
+        whole = pairwise._summed(a, b, None)
+        return (*(whole[:, row:row + 1] for row in (0, 7, 255)), whole[:, :100])
+
+    def truth(a, b):
+        whole = a @ b
+        return (*(whole[:, row:row + 1] for row in (0, 7, 255)), whole[:, :100])
+
+    assert_as_exact(jax.jit(apart), jax.jit(together), draw, "a row's CPU product alone and among others",
+                    seeds=8, truth_fn=truth)
 
 
 def test_a_layers_projection_and_every_accumulated_contraction_sum_as_a_vectorized_dot():
@@ -206,36 +217,40 @@ def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share():
         assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
 
 
-def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_product():
+@pytest.mark.parametrize("depth", [96, 1024])
+def test_a_grouped_gemms_float32_products_on_a_cpu_are_on_par_with_each_groups_dense_product(depth):
     """The grouped GEMM's portable products on a CPU in fixed float32 sums (`gemm.gemm` and `gemm.gemm_t`,
     their ragged dots through `precision.accumulated`, row 4863's GEMM remainder): each group's rows' product
-    and its input gradient's bitwise `pairwise_dot_general`'s of that group's rows alone, the depth blocked
-    and summed as a tree as a dense product's is, over groups of rows no block divides, one empty and one of a
-    single row, at 96 and 1024 deep; and the kernel gradient of one group of every row bitwise the dense
-    one's, its rows blocked from the group's first and the blocks' sums added as `_tree` adds them."""
+    and its input gradient, and the kernel gradient of one group of every row, each on par (check 1) with
+    `pairwise_dot_general`'s of that group's rows alone, over groups of rows no block divides, one empty and
+    one of a single row: two programs, whose bits XLA does not share (testing.md, row 3177; they differed by
+    1 to 4 ulp on an x86-64-v3 host and agreed on a v4 one)."""
     sizes = [70, 0, 1, 129, 37]
     starts = np.cumsum([0, *sizes])
-    rng = np.random.default_rng(4863)
     numbers = (((1,), (0,)), ((), ()))
-    for depth in (96, 1024):
-        x = jnp.asarray(rng.standard_normal((sum(sizes), depth)), jnp.float32)
-        w = jnp.asarray(rng.standard_normal((len(sizes), depth, 40)), jnp.float32)
-        dy = jnp.asarray(rng.standard_normal((sum(sizes), 40)), jnp.float32)
-        group_sizes = jnp.asarray(sizes, jnp.int32)
-        whole = jnp.asarray([sum(sizes)], jnp.int32)
+    group_sizes, whole = jnp.asarray(sizes, jnp.int32), jnp.asarray([sum(sizes)], jnp.int32)
+
+    def draw(seed):
+        rng = np.random.default_rng((depth, seed))
+        return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
+                     for shape in ((sum(sizes), depth), (len(sizes), depth, 40), (sum(sizes), 40)))
+
+    def grouped(x, w, dy):
         with jax.default_matmul_precision(precision.FP32_SUMS):
-            out = jax.jit(lambda x, w, s: gemm.gemm(x, w, s, out_dtype=jnp.float32))(x, w, group_sizes)
-            dx = jax.jit(lambda dy, w, s: gemm.gemm(dy, w, s, transpose_rhs=True,
-                                                    out_dtype=jnp.float32))(dy, w, group_sizes)
-            dw = jax.jit(lambda x, dy, s: gemm.gemm_t(x, dy, s, out_dtype=jnp.float32))(x, dy, whole)
-        for g, (start, end) in enumerate(itertools.pairwise(starts)):
-            rows, cotangent = x[start:end], dy[start:end]
-            np.testing.assert_array_equal(np.asarray(out[start:end]),
-                                          np.asarray(pairwise.pairwise_dot_general(rows, w[g], numbers)))
-            np.testing.assert_array_equal(np.asarray(dx[start:end]), np.asarray(
-                pairwise.pairwise_dot_general(cotangent, jnp.swapaxes(w[g], 0, 1), numbers)))
-        np.testing.assert_array_equal(np.asarray(dw[0]),
-                                      np.asarray(pairwise.pairwise_dot_general(x.T, dy, numbers)))
+            return (gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32),
+                    gemm.gemm(dy, w, group_sizes, transpose_rhs=True, out_dtype=jnp.float32),
+                    gemm.gemm_t(x, dy, whole, out_dtype=jnp.float32)[0])
+
+    def summed(x, w, dy, product):
+        out = [product(x[start:end], w[g]) for g, (start, end) in enumerate(itertools.pairwise(starts))]
+        dx = [product(dy[start:end], jnp.swapaxes(w[g], 0, 1))
+              for g, (start, end) in enumerate(itertools.pairwise(starts))]
+        return jnp.concatenate(out), jnp.concatenate(dx), product(x.T, dy)
+
+    dense = functools.partial(summed, product=functools.partial(pairwise.pairwise_dot_general,
+                                                                dimension_numbers=numbers))
+    assert_as_exact(jax.jit(grouped), jax.jit(dense), draw, f"a CPU grouped product {depth} deep", seeds=8,
+                    truth_fn=functools.partial(summed, product=lambda a, b: a @ b))
 
 
 def test_a_grouped_float32_product_of_no_rows_is_the_empty_product():
