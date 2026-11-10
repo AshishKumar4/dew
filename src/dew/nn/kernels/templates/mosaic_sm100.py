@@ -1149,8 +1149,17 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         return self.register_products(dataclasses.replace(acc, accumulate=True), parts, rhs)
 
     def settled(self, pending: int = 0) -> None:
-        # Every product is awaited where its accumulator is read (`summed`): nothing in flight past it.
+        # A product reads its shared-memory operands after its issue returns, until its commit arrives (PTX
+        # ISA, tcgen05.mma: an operand is not written before then), so a buffer staged again under it (a
+        # second value block's right operand, `operands._staged`) is read half overwritten: every product
+        # the role issued committed and awaited. tcgen05 commits all or none: `pending` (warpgroup MMA's
+        # groups left running) is none here. Outside its program's product scratch no product of it runs.
         del pending
+        if _PRODUCTS.get() is None:
+            return
+        done = self._scoped()["done"].at[mosaic.ROLE.get()]
+        plgpu.tcgen05_commit_arrive(done)
+        plgpu.barrier_wait(done)
 
 
 class Tcgen05Chunks(Tcgen05ChunksIssuer, mosaic.RingFamily):
