@@ -174,8 +174,9 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate, and the compute dtype otherwise; at least
     float32 of it in its accurate ones, TF32 products on a GPU
     at the default precision and IEEE float32 under the accurate preset (`precision="accurate"`);
-    complex64 for a complex update; and at least float32 of the iteration's dtype for a spectral
-    preconditioning, whose norm is an SVD of at least float32 operands (a float64 run's in float64).
+    complex64 for a complex update, or its own complex128; and at least float32 of the iteration's dtype for
+    a spectral preconditioning, whose norm is an SVD of at least float32 operands (a float64 run's in
+    float64).
 
     The fast forms' bfloat16, where optax iterates in its momentum's own float32: the quintic brings the
     singular values only near one, roughly within 0.7 to 1.2 (optax `orthogonalize_via_newton_schulz`), far
@@ -186,7 +187,7 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     microbatch takes 860 ms against 516 and the others about AdamW's: an update of 65,536 tokens 9.4% over
     AdamW's and one of 262,144 2.5% (`dew.optim.muon`; ledger 2685, 2752)."""
     if jnp.issubdtype(dtype, jnp.complexfloating):
-        return jnp.dtype(jnp.complex64)
+        return jnp.promote_types(dtype, jnp.complex64)
     if preconditioning == "spectral":
         return jnp.promote_types(iteration_dtype(), jnp.float32)
     if algorithm is not None and algorithm.supported_lhs_types:

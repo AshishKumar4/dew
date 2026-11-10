@@ -333,8 +333,10 @@ def _step_rate(rate: float, parts: tuple[str, ...], head: HeadTerms, level: Leve
     squares, inputs, crossed, lengths = (sums[:, index] for index in range(_SUMS))
     least, fed, longest, norm, after, bent = (sums[:, index] for index in range(_SUMS, _WIDTH))
     p1, p2, growth = level.p1, level.p2, level.up_growth
-    steps = {part: jnp.sqrt(jnp.sum(jnp.square(gradient[part]["kernel"].astype(jnp.float32)),
-                                    axis=tuple(range(1, gradient[part]["kernel"].ndim))))
+    # Each step's norm in float32 at least, its gradient's own width where wider (a float64 truth's).
+    steps = {part: jnp.sqrt(jnp.sum(jnp.square(gradient[part]["kernel"].astype(
+                 jnp.promote_types(gradient[part]["kernel"].dtype, jnp.float32))),
+                 axis=tuple(range(1, gradient[part]["kernel"].ndim))))
              for part in parts}
 
     def curvature_along(length: jax.Array) -> jax.Array:

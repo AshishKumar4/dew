@@ -52,19 +52,23 @@ def test_per_head_muonclip_clips_each_head_after_its_own_update():
     stats = qk_stats(values=[[200.0, 150.0, 10.0, 5.0], [10.0] * 4, [10.0] * 4])
     per_head = {"*q_proj/kernel": 8, "*k_proj/kernel": 8}
     applied = clip_step(muon_solver(optimizer="muonclip", optimizer_opts={"per_head": per_head}), stats)
-    muon = muon_solver(optimizer_opts={"per_head": per_head})
+    def paper(muon):
+        def clipped(params, grads):
+            updates, _ = muon.update(grads, muon.init(params), params)
+            # The sown maxima at the parameters' width: float32 as the run sows them, a truth's float64.
+            s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0],
+                                        params['layers_0']['self_attn']['q_proj']['kernel'].dtype), axis=0)
+            gamma = clip_scale(s_max, 100.0, guard=0.0)
+            return {'layers_0': {'self_attn': {projection: {'kernel': clip_qk_kernel(
+                params['layers_0']['self_attn'][projection]['kernel']
+                + node(updates, ('layers_0', 'self_attn', projection, 'kernel')), gamma, 4)}
+                for projection in ('q_proj', 'k_proj')}}}
+        return clipped
 
-    def paper(params, grads):
-        updates, _ = muon.update(grads, muon.init(params), params)
-        s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0]), axis=0)
-        gamma = clip_scale(s_max, 100.0, guard=0.0)
-        return {'layers_0': {'self_attn': {projection: {'kernel': clip_qk_kernel(
-            params['layers_0']['self_attn'][projection]['kernel']
-            + node(updates, ('layers_0', 'self_attn', projection, 'kernel')), gamma, 4)}
-            for projection in ('q_proj', 'k_proj')}}}
-
-    assert_as_exact(applied, paper, lambda seed: qk_tree(seed=seed), "MuonClip per head", seeds=CLIP_SEEDS,
-                    truth_fn=paper)
+    # The truth's Muon keeps its moments in the parameters' float64 and iterates in it.
+    assert_as_exact(applied, paper(muon_solver(optimizer_opts={"per_head": per_head})),
+                    lambda seed: qk_tree(seed=seed), "MuonClip per head", seeds=CLIP_SEEDS,
+                    truth_fn=paper(muon_solver(wide=True, optimizer_opts={"per_head": per_head})))
 
 
 def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():

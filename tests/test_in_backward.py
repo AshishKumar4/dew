@@ -75,7 +75,9 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
         return optax.apply_updates(weights, moved), {"mu": after[0].mu, "nu": after[0].nu}
 
     def loss(model, params, extra, tokens):
-        return jnp.mean(model.apply({"params": params, **extra}, tokens, train=True).astype(jnp.float32) ** 2)
+        # In float32 at least, a float64 truth's own float64.
+        logits = model.apply({"params": params, **extra}, tokens, train=True)
+        return jnp.mean(logits.astype(jnp.promote_types(logits.dtype, jnp.float32)) ** 2)
 
     def in_backward_step(tokens):
         zeros = jax.tree.map(jnp.zeros_like, layered)
