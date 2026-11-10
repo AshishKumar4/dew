@@ -803,7 +803,7 @@ class KVStore:
                          value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,
                          pool=pool.dtype, page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=1, softcap=softcap, arithmetic=False,
-                         named='auto')
+                         named='auto', rows=query.shape[0], queries=query.shape[1], keys=self._slots())
         return not next(kernel for kernel in PAGED.kernels if kernel.name == 'template').failed(case)
 
     def attend_rows(self, query: jax.Array, spans, sources: jax.Array, softcap: float | None,
@@ -863,7 +863,14 @@ class KVStore:
                          value_dim=value_dim, dtype=jnp.dtype(query.dtype), pool=jnp.dtype(self.dtype),
                          page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
-                         arithmetic=arithmetic, named=named, windowed=windowed, sinks=sinks)
+                         arithmetic=arithmetic, named=named, rows=query.shape[0], queries=1,
+                         keys=self._slots(), windowed=windowed, sinks=sinks)
+
+    def _slots(self) -> int:
+        """The keys each row reads: its table's slots of pages, or a compact cache's capacity."""
+        if self.layout.page_size is not None:
+            return self._get(TABLE).shape[1] * self.layout.page_size
+        return self._get(self.payloads[0][0]).shape[1]
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None,
                starts: jax.Array | None = None, sinks: jax.Array | None = None) -> jax.Array:
@@ -945,8 +952,10 @@ class PagedCase:
     query's `dtype` and the `pool`'s; its `page_size` (None for a compact cache), the format it is
     `quantized` in (None for none), its `groups`; how many ways a mesh splits the query heads
     (`head_shards`); the layer's `softcap`; whether its arithmetic is the reference path's alone
-    (`arithmetic`); the `AttentionImpl` it `named`; whether it reads each row from its window's first key
-    (`windowed`); and whether the layer has attention sinks (`sinks`)."""
+    (`arithmetic`); the `AttentionImpl` it `named`; its `rows`, each one's `queries` and the `keys` each
+    reads (its table's slots of pages, or a compact cache's capacity), which a kernel that plans the step
+    plans it over (`_template_tiles`); whether it reads each row from its window's first key (`windowed`);
+    and whether the layer has attention sinks (`sinks`)."""
 
     heads: int
     kv_heads: int
@@ -961,6 +970,9 @@ class PagedCase:
     softcap: float | None
     arithmetic: bool
     named: str
+    rows: int
+    queries: int
+    keys: int
     windowed: bool = False
     sinks: bool = False
 
@@ -1004,36 +1016,41 @@ are the gathered attention's, through the attention dispatch (`gpu_paged`), so n
 kernel nor forward mode limits it."""
 
 def _template_tiles(case: PagedCase) -> bool:
-    """Whether the attention template's decode reads `case`'s pool: its work list derives a launch for the
-    step on the GPU (`attention_decode.plan`), a key tile whole in a page or a page's keys whole in its
-    tiles where its family copies them in pieces, within its shared memory (a tile of 16-key pages an
-    A100's copies join, which no tile of its holds at width 128, dd-q5p4), at one row of 64 pages."""
+    """Whether the attention template's decode reads `case`'s pool: its work list derives a launch on the
+    GPU for the step itself (`attention_decode.planned`, as `attention_decode.attend` plans it), its rows,
+    queries, keys, value width, codes and hooks the case's, a key tile whole in a page or a page's keys
+    whole in its tiles where its family copies them in pieces, within its shared memory (a tile of 16-key
+    pages an A100's copies join, which no tile of its holds at width 128, dd-q5p4)."""
     from dew.nn.kernels.templates import attention as template, attention_decode
 
     if backend() != "gpu":
         return False
-    page = case.page_size or 16
-    keys, rows = 64 * page, 1
-    query = jax.ShapeDtypeStruct((rows, 1, case.heads, case.head_dim), case.dtype)
+    rows, keys, page = case.rows, case.keys, case.page_size
+    query = jax.ShapeDtypeStruct((rows, case.queries, case.heads, case.head_dim), case.dtype)
     stored = case.dtype if case.quantized is None else jnp.dtype(case.quantized)
-    if case.page_size is None:
-        key = jax.ShapeDtypeStruct((rows, keys, case.kv_heads, case.head_dim), stored)
+    if page is None:
+        pools = [jax.ShapeDtypeStruct((rows, keys, case.kv_heads, width), stored)
+                 for width in (case.head_dim, case.value_dim)]
         table = None
     else:
-        key = jax.ShapeDtypeStruct((case.kv_heads, keys // page, page, case.head_dim), stored)
+        pools = [jax.ShapeDtypeStruct((case.kv_heads, rows * keys // page, page, width), stored)
+                 for width in (case.head_dim, case.value_dim)]
         table = jax.ShapeDtypeStruct((rows, keys // page), jnp.int32)
     scale = jax.ShapeDtypeStruct((rows, case.kv_heads, keys), jnp.float32)
     scales = None if case.quantized is None else (scale, scale)
+    sinks = jax.ShapeDtypeStruct((case.heads,), jnp.float32) if case.sinks else None
     derived = []
 
-    def planned(query, key, table, scales):
-        spans = template.spans(1, keys, rows, lengths=jnp.full((rows,), keys, jnp.int32))
-        packed, row_spans, _ = attention_decode.packed(query, spans, case.kv_heads)
-        derived.append(attention_decode.plan(packed, key, key, row_spans, None, scale=None,
-                                             target=generation.gpu_target(), table=table, scales=scales))
+    def planned(query, key, value, table, scales, sinks):
+        spans = template.spans(case.queries, keys, rows, lengths=jnp.full((rows,), keys, jnp.int32))
+        initial = None if sinks is None else template.sinks(sinks, rows, case.queries, case.value_dim)
+        capped = None if case.softcap is None else template.Capped(case.softcap)
+        hooks = template.Hooks(capped, initial=initial)
+        derived.append(attention_decode.planned(query, key, value, spans, hooks, table=table,
+                                                scales=scales)[0])
         return query
 
-    jax.eval_shape(planned, query, key, table, scales)
+    jax.eval_shape(planned, query, *pools, table, scales, sinks)
     return derived[0] is not None
 
 
