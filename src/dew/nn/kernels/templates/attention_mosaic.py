@@ -714,7 +714,7 @@ class MosaicForward(_Mainloop[Tiles]):
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
         if self.parts > 1 and (family.feeds_itself or not family.copies_in_pieces):
-            # Its parts a copy each into a slot's rows (`mosaic.Pieces`), which a producer's loads take and
+            # Its parts a copy each into a slot's rows (`rings.Pieces`), which a producer's loads take and
             # neither a consumer's own ring nor cp.async's pipeline (`mosaic.Transport.copies_in_pieces`)
             # does.
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "

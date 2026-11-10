@@ -315,7 +315,7 @@ def stream_tile(slots, name: str, operand: Operand, rows=None, columns=None) -> 
 
 
 def stream_views(index_map=None, /, **parted) -> dict:
-    """A launch's streams' views by stream part name (`Family.opened`'s `(ref, index_map)`, `mosaic.viewed`),
+    """A launch's streams' views by stream part name (`Family.opened`'s `(ref, index_map)`, `rings.viewed`),
     `parted[name]` a list of an operand's parts' views: step `i` the `i`-th tile of the stream's rows down
     its view, as wide as the view (the whole view where the stream's tile is), or the tile `index_map(i)`
     names."""

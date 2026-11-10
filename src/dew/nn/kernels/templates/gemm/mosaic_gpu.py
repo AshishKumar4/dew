@@ -65,6 +65,7 @@ from dew.nn.kernels.templates import (
     cost as unit_cost,
     mosaic,
     resources,
+    rings,
     swizzling,
     tail as tail_of,
 )
@@ -907,7 +908,7 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
         _, column_tile = tail_of.planar_snake(lax.axis_index("programs"), grid, 1, tiles.grid_block_n)
         view = (_matrix_columns(matrix_gmem.at[0], column_tile, block_n=tiles.block_n,
                                 transpose_rhs=transpose_rhs), _rhs_index(transpose_rhs))
-        return [mosaic.viewed(view, block, step) for step in range(min(tiles.stages, steps))]
+        return [rings.viewed(view, block, step) for step in range(min(tiles.stages, steps))]
 
     return {'prefetched': prefetched}
 
@@ -1004,7 +1005,7 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
     with `splits`, its depth's run: the walk every tile's first run, then every
     tile's second (as many launches of a run each would walk them), each run a share of the steps, the
     last's the rest; `traced`,
-    its steps a count the compiler cannot see (`mosaic.opaque`), which a walk takes as a loop's bound (an
+    its steps a count the compiler cannot see (`rings.opaque`), which a walk takes as a loop's bound (an
     exactly summed walk's: cp.async's pipeline unrolled a static walk's drain, each drain step's fresh
     product its own, and at five stages the A100 forward's 128 x 128 x 64 tile spilled 40 bytes beside the
     running sum; an opaque count's drain, a loop, spilled none, and a merely traced constant left ptxas
@@ -1017,7 +1018,7 @@ def _gmm_scheduled(index, *, table_gmem, lhs_gmem, matrix_gmems: dict, prologue_
     if tail is not None:
         snaked, start, count, gathered = tail.segment(index, programs, grid[0] * grid[1])
     elif splits == 1:
-        snaked, start, count, gathered = index[0], 0, mosaic.opaque(steps) if traced else steps, None
+        snaked, start, count, gathered = index[0], 0, rings.opaque(steps) if traced else steps, None
     else:
         share = -(-steps // splits)
         split, snaked = index[0] // (grid[0] * grid[1]), index[0] % (grid[0] * grid[1])
@@ -1123,12 +1124,12 @@ def _scale_refs(refs: tuple, step_scales, mx_scales, gather, scatter) -> tuple:
 def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
     """Dew: a gathered product's rows stream (`family.streams`' arguments): its producer's gather
     (`gathered.Ring`), or interpreted, where no lane-level copy runs, each row's copies (`Ring.parts`, its
-    slot staged where layout inference lays it out, at no stated swizzle: `mosaic.piece_copies`), that many
+    slot staged where layout inference lays it out, at no stated swizzle: `rings.piece_copies`), that many
     arrivals at its load barrier; none ungathered."""
     if gather is None:
         return {}
     if interpret:
-        copies = mosaic.piece_copies((tiles.block_m, tiles.block_k), dtype, None, 1)
+        copies = rings.piece_copies((tiles.block_m, tiles.block_k), dtype, None, 1)
         return {'copies': {'rows': tiles.block_m * copies}}
     return {'gathered': ('rows',)}
 
@@ -1375,11 +1376,11 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
                groups: int, transpose_rhs: bool, axes_of: dict, first=0, transpose_lhs: bool = False,
                scale_gmems=None, scale_per: int = 1, mx_gmems=None, gather_gmem=None) -> dict:
     """Dew: `gmm`'s streams' views at a tile (`group`'s rows from `row_start`, `column_tile`;
-    `mosaic.viewed`): its rows', its group's matrix's (each of `matrix_gmems`, by stream: a paired
+    `rings.viewed`): its rows', its group's matrix's (each of `matrix_gmems`, by stream: a paired
     product's two), and each prologue side operand's that follows the depth (`axes_of`, by operand), step
     `j` each one's `first + j`-th depth block (`first` a balanced tail's program's first step); a
     `transpose_lhs` call's rows as `[depth, rows]` blocks. On a family whose products span a pair
-    (`mosaic.Transport.pairs_product`), the rows' and the matrix's views are the pair's (`mosaic.Paired`):
+    (`mosaic.Transport.pairs_product`), the rows' and the matrix's views are the pair's (`rings.Paired`):
     its two row tiles from the group's block and its columns (`tile_columns`), each multiprocessor loading
     its half."""
     rows = pl.ds(row_start, tiles.block_m)
@@ -1388,15 +1389,15 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
     if family.pairs_product:
         pair_rows = pl.ds(group.block_start, tiles.block_m * tiles.cluster)
         columns = tile_columns(tiles, family)
-        return {'rows': (lhs_gmem.at[pair_rows], lambda j: mosaic.Paired((0, first + j), 0)),
+        return {'rows': (lhs_gmem.at[pair_rows], lambda j: rings.Paired((0, first + j), 0)),
                 **{name: (_matrix_columns(gmem.at[_matrix_of(group, groups)], column_tile, block_n=columns,
                                           transpose_rhs=transpose_rhs),
-                          lambda j: mosaic.Paired(rhs_index(first + j), 0 if transpose_rhs else 1))
+                          lambda j: rings.Paired(rhs_index(first + j), 0 if transpose_rhs else 1))
                    for name, gmem in matrix_gmems.items()}}
     lhs_view = ((lhs_gmem.at[:, rows], lambda j: (first + j, 0)) if transpose_lhs
                 else (lhs_gmem.at[rows], lambda j: (0, first + j)) if gather_gmem is None
-                # A gathered product's rows each where its table says (`mosaic.Rows`, a row a run).
-                else (lhs_gmem, lambda j: mosaic.Rows(gather_gmem, row_start, (first + j,), 1)))
+                # A gathered product's rows each where its table says (`rings.Rows`, a row a run).
+                else (lhs_gmem, lambda j: rings.Rows(gather_gmem, row_start, (first + j,), 1)))
     matrix = _matrix_of(group, groups)
     # Each stream's view and its step's block index (`(row, column)` of a matrix, four of a scale tile's).
     matrices: dict[str, tuple[object, Callable[..., tuple]]] = {
@@ -2024,12 +2025,12 @@ def _tables_placed(tables: tuple, refs: tuple) -> tuple:
 def _tgmm_gathered(tables: tuple, blocks: dict, interpret: bool) -> dict:
     """Dew: a gathered kernel gradient's streams (`family.streams`' arguments, `_gathered`'s for `gmm`): each
     gathered operand's ring (`ring_0` the rows', `ring_1` the cotangent's) its producer's gather, or
-    interpreted each of a step's rows its copies (`mosaic.piece_copies`, at no stated swizzle)."""
+    interpreted each of a step's rows its copies (`rings.piece_copies`, at no stated swizzle)."""
     names = tuple(name for name, table in zip(('ring_0', 'ring_1'), tables, strict=True) if table is not None)
     if not names:
         return {}
     if interpret:
-        return {'copies': {name: blocks[name][0][0] * mosaic.piece_copies(blocks[name][0], blocks[name][1],
+        return {'copies': {name: blocks[name][0][0] * rings.piece_copies(blocks[name][0], blocks[name][1],
                                                                           None, 1) for name in names}}
     return {'gathered': names}
 
@@ -2044,7 +2045,7 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
     depth and columns, its group's steps, the program's first of them, its partials' gatherer (`walked`)
     and its program. `groups` are the group sizes', block counts', first blocks' and walking order's
     references, `operands` the rows', cotangent's and side operands', and `table_gmems` each operand's
-    gather table (a gathered operand's step its rows at the table's entries, `mosaic.Rows` of one row)."""
+    gather table (a gathered operand's step its rows at the table's entries, `rings.Rows` of one row)."""
     sizes_gmem, blocks_gmem, block_starts_gmem, order_gmem = groups
     lhs_gmem, rhs_gmem, side_gmems = operands
     index = tail_of.ordered(tail, index, programs, interpreted)
@@ -2063,7 +2064,7 @@ def _tgmm_scheduled(index, *, groups: tuple, operands: tuple, tail: tail_of.Tail
         return 0, first + j
 
     def gathered_rows(table, block):
-        return lambda j: mosaic.Rows(table, (first + j) * tiles.block_k, (block,), 1)
+        return lambda j: rings.Rows(table, (first + j) * tiles.block_k, (block,), 1)
 
     views = ({'ring_0': (lhs_gmem.at[depth], rows_block), 'ring_1': (rhs_gmem.at[columns], rows_block)}
              if k_major else

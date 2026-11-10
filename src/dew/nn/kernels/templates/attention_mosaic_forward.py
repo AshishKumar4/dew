@@ -32,7 +32,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, operands, product, swizzling
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, operands, product, rings, swizzling
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
@@ -191,7 +191,7 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     elif not interpret or family.gathers_interpreted:
         streams = family.streams(blocks, stages, consumers, swizzles=swizzles, gathered=tuple(blocks))
     else:
-        # A copy a row of each swizzled tile's columns (`mosaic.Ring.parts`), where no lane-level copy runs.
+        # A copy a row of each swizzled tile's columns (`rings.Ring.parts`), where no lane-level copy runs.
         unit = {name: swizzling.swizzle_columns(stored, swizzles.get(name, swizzling.SWIZZLE_BYTES))
                 for name in blocks}
         copies = {name: shape[0] * max(1, shape[1] // unit[name]) for name, (shape, _) in blocks.items()}
@@ -916,7 +916,7 @@ def _status_stored(family: mosaic.Family, spec: algebra.Forward, state: algebra.
 
 def _query_of(program: _Program, q_view, q_smem, q_loaded):
     """A consumer's query block loaded from `q_view` into its stage and held (`Family.held`), or an fp32
-    call's parts (`MosaicForward.parts`, `q_view` their `mosaic.Pieces`) one above the other, a copy and a
+    call's parts (`MosaicForward.parts`, `q_view` their `rings.Pieces`) one above the other, a copy and a
     barrier each, read where they lie (`_Program.parted`)."""
     family, block_q = program.family, program.tiles.block_q
     if program.parts == 1:
@@ -928,9 +928,9 @@ def _query_of(program: _Program, q_view, q_smem, q_loaded):
 
 
 def _stream_dtype(view: tuple):
-    """A stream's elements' dtype from its view (`mosaic.viewed`'s): its ref's, or its pieces' first's."""
+    """A stream's elements' dtype from its view (`rings.viewed`'s): its ref's, or its pieces' first's."""
     ref = view[0]
-    return (ref[0] if isinstance(ref, mosaic.Pieces) else ref).dtype
+    return (ref[0] if isinstance(ref, rings.Pieces) else ref).dtype
 
 
 def _dot(family: mosaic.Family, interpret: bool, lhs: jax.Array, rhs) -> jax.Array:
@@ -1363,9 +1363,9 @@ def _key_views(named: dict, row, head, sources, table, *, page: int | None, bloc
     block = column_block
 
     def at_columns(j):
-        # A paged tile's pages each at the column block (`mosaic.Rows`).
+        # A paged tile's pages each at the column block (`rings.Rows`).
         indices = tile(j)
-        if isinstance(indices, mosaic.Rows):
+        if isinstance(indices, rings.Rows):
             return dataclasses.replace(indices, rest=(block,))
         return indices[0], block
     return {**views, "values": (ref, at_columns)}
@@ -1375,13 +1375,13 @@ def _paged_views(refs: dict, table, row, head, page: int, block_k: int) -> dict:
     """A paged call's streams' views (`_views_of`): each pool `[KV, P·page, D]`'s `[P·page, D]` at key head
     `head`, step `j` its key tile `j` where row `row`'s table maps it: of a page of several tiles, the
     tile's page `table[row, j // per]` and its place in it `j % per` (`per` tiles a page); of a tile of
-    several pages (`count` a tile), each page's rows from its own (`mosaic.Rows`, a run a page)."""
+    several pages (`count` a tile), each page's rows from its own (`rings.Rows`, a run a page)."""
     per, count = max(1, page // block_k), max(1, block_k // page)
 
     def tile(j):
         if count == 1:
             return (table[row, lax.div(j, per)] * per + lax.rem(j, per), 0)
-        return mosaic.Rows(table.at[row], j * count, (0,), page)
+        return rings.Rows(table.at[row], j * count, (0,), page)
 
     return {name: (ref.at[head], tile) for name, ref in refs.items()}
 
@@ -1485,15 +1485,15 @@ def _query_barriers(barriers, index, parts: int):
 
 def _query_view(q, row, rows, head, *, batch: int, parts: int):
     """A consumer's query block's view (its batch `row`, `rows` and `head`), or an fp32 call's `parts`' views
-    from each part's batch rows (`mosaic.Pieces`, `MosaicForward.parts`)."""
+    from each part's batch rows (`rings.Pieces`, `MosaicForward.parts`)."""
     if parts == 1:
         return q.at[row, rows, head]
-    return mosaic.Pieces(q.at[part * batch + row, rows, head] for part in range(parts))
+    return rings.Pieces(q.at[part * batch + row, rows, head] for part in range(parts))
 
 def _parted_views(views: dict, named: dict, row, kv_head, *, batch: int, parts: int) -> dict:
     """An fp32 call's stream views (`MosaicForward.parts`): each tile its parts' rows, a copy each from its
-    part's batch rows (`mosaic.viewed`'s pieces of refs), at the views' own block indices."""
-    return {name: (mosaic.Pieces(ref.at[part * batch + row, :, kv_head] for part in range(parts)), index)
+    part's batch rows (`rings.viewed`'s pieces of refs), at the views' own block indices."""
+    return {name: (rings.Pieces(ref.at[part * batch + row, :, kv_head] for part in range(parts)), index)
             for (name, (_, index)), ref in zip(views.items(), named.values(), strict=True)}
 
 def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tuple, *refs,
