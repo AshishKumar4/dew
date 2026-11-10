@@ -204,14 +204,6 @@ def between(later, earlier):
     return _scaled(jnp.exp2(fraction - its_fraction), whole - other)
 
 
-def grown_from(hi, lo):
-    """`exp(hi + lo)` of a compensated exponent `(hi, lo)`, rounded about once: `exp(hi)` corrected by its
-    first-order term in `lo` (`|lo|` is under half an ulp of `hi`, so the second is far below fp32's
-    rounding)."""
-    grown = jnp.exp(hi)
-    return grown + grown * lo
-
-
 def _remembered(decayed, entered, issue: Issue = portable, name: str = "memory"):
     """A chunk's tokens reading through their decays, `decayed @ entered` (the product `name`): the memory the
     chunk entered read through its decayed queries ('memory'), or its corrected values through its scores

@@ -76,14 +76,6 @@ def _joining(halves: int, block: "_Block") -> tuple:
             plgpu.Barrier(num_arrivals=halves, num_barriers=3))
 
 
-def serves(hooks: recurrence.Hooks, operands: recurrence.Step) -> bool:
-    """Whether a token of `hooks` and `operands` steps here (`fits`); a one-tap conv's is taken before any
-    launch (`recurrence.step`)."""
-    if hooks.conv is not None and (operands.held is None or operands.held.shape[1] == 0):
-        return False
-    return fits(operands.state.shape, hooks.output is not None)
-
-
 @tuning.lowered_once(("hooks", "dtype", "family", "interpret"))
 def step(hooks: recurrence.Hooks, operands: recurrence.Step, *, dtype, family: mosaic.Family,
          interpret: bool = False):
@@ -549,7 +541,7 @@ def _tree_added(partials: tuple, index, term) -> tuple:
 
 def _epilogue(hooks, inputs, token: _Token, out, value, exchanged, *, interpret: bool):
     """The token's output past the update: its skip and its gated norm over the head's columns (a block of
-    one head a warpgroup wide, `serves`), as `recurrence.step_reference`'s epilogue (`recurrence.skipped`,
+    one head a warpgroup wide, `fits`), as `recurrence.step_reference`'s epilogue (`recurrence.skipped`,
     `recurrence.normed`)."""
     if hooks.skip:
         out = out + token.per_head([inputs['skip'][head].astype(jnp.float32) for head in token.heads]) * value
