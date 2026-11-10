@@ -13,7 +13,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._records import ADDED, integer, record
-from dew.batch import Batch, coordinates
+from dew.batch import Batch, coordinates, document_spans
 from dew.data.forked_rows import window_forks
 from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
@@ -813,10 +813,10 @@ def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
 
 def _row_starts(along: np.ndarray, owners: np.ndarray) -> np.ndarray:
     """Where the row each question of `owners` belongs to starts along a stream whose rows `along`
-    numbers in the order they stand (0 for padding), each padding question's 0."""
-    counts = np.bincount(along, minlength=int(owners.max(initial=0)) + 1)
-    starts = np.concatenate([[0], np.cumsum(counts[1:])]).astype(np.int32)
-    return np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
+    numbers (0 for padding): the row's first slot (`document_spans`), each padding question's 0."""
+    rows = int(max(along.max(initial=0), owners.max(initial=0)))
+    first, _ = document_spans(along[None], rows, xp=np)
+    return np.concatenate([[0], first[0]]).astype(np.int32)[owners]
 
 
 def forked_documents(layout: Layout, bounds: Bounds) -> int | None:
