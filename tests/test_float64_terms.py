@@ -8,7 +8,7 @@ import mpmath
 import numpy as np
 import pytest
 from attention_oracle import anchored_softmax
-from float64_terms import float64_terms
+from float64_terms import float64_magnitudes, float64_terms
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
 
@@ -65,6 +65,28 @@ def test_a_sum_of_one_sign_has_its_own_size_and_an_update_its_steps_terms():
     np.testing.assert_allclose(trace_terms, np.sqrt((0.81 + 1) * energy), rtol=1e-12)
     # The weight moved by 0.1 of each step's momentum; the value it started at carries none.
     np.testing.assert_allclose(moved_terms, np.sqrt(0.01 * (1 + 0.81 + 1) * energy), rtol=1e-12)
+
+
+def test_a_sums_magnitudes_are_its_terms_sizes_summed_beside_their_root_sum_of_squares():
+    """One program read both ways, each reading its own: a product of rows that cancel, scaled after its sum,
+    has for magnitudes the sizes of its products summed and scaled (the most any partial sum of them
+    reaches, far above the value where they cancel) and for terms their root sum of squares, read before
+    the magnitudes and again after them."""
+    rng = np.random.default_rng(5426)
+    rows, weights = rng.normal(size=(4, 16)), rng.normal(size=(16, 3))
+
+    def scaled(rows, weights):
+        return (rows @ weights) * 0.25
+
+    with jax.enable_x64(new_val=True):
+        value, terms = float64_terms(scaled, rows, weights)
+        _, magnitudes = float64_magnitudes(scaled, rows, weights)
+        _, again = float64_terms(scaled, rows, weights)
+    products = rows[:, :, None] * weights[None, :, :]
+    np.testing.assert_allclose(magnitudes, 0.25 * np.abs(products).sum(axis=1), rtol=1e-12)
+    np.testing.assert_allclose(terms, 0.25 * np.sqrt((products**2).sum(axis=1)), rtol=1e-12)
+    np.testing.assert_array_equal(again, terms)
+    assert np.all(np.abs(np.asarray(value)) <= terms) and np.all(terms <= magnitudes)
 
 
 def test_a_recomputed_body_sums_its_own_terms():

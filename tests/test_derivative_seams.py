@@ -29,3 +29,25 @@ def test_the_contract_refuses_a_bfloat16_formula_less_finite_than_the_plain_one(
     with pytest.raises(LessFinite):
         assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a bf16 squared root",
                         plain_fn=jnp.abs)
+
+
+def test_the_contract_holds_a_sum_only_where_no_order_of_it_can_overflow():
+    """A sum is held finite where the magnitudes of its terms sum inside float32's range, whatever their
+    order: a form that sums before the scale that brings it back overflows where the plain formula, scaling
+    each term first, does not, and is refused (row 1768's class). Where float32 overflows the terms in one
+    order and not another (terms near the largest that cancel), no order is held: a form that sums the
+    alternate terms first, which overflows where the plain formula's pairs cancel, holds the contract (row
+    5426, a blocked sum beside a chain)."""
+    direction, cotangent = (jnp.ones((8,), jnp.float32),), jnp.ones((), jnp.float32)
+
+    def scaled_first(x):
+        return jnp.sum(x * jnp.float32(2.0**-10))
+
+    alike = (jnp.full((8,), 2.0**126, jnp.float32),)
+    assert_contract(scaled_first, alike, direction, cotangent, "terms scaled first", plain_fn=scaled_first)
+    with pytest.raises(LessFinite):
+        assert_contract(lambda x: jnp.sum(x) * jnp.float32(2.0**-10), alike, direction, cotangent,
+                        "a sum scaled after", plain_fn=scaled_first)
+    cancelling = (jnp.asarray([2.0**127, -(2.0**127)] * 4, jnp.float32),)
+    assert_contract(lambda x: jnp.sum(x[::2]) + jnp.sum(x[1::2]), cancelling, direction, cotangent,
+                    "alternate terms first", plain_fn=lambda x: jnp.sum(jnp.sum(x.reshape(4, 2), axis=1)))

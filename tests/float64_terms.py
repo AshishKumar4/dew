@@ -101,15 +101,36 @@ def float64_terms(fn, *args):
     steps between its branches and loops is one (`_span`), the
     branches and loops walked as their values pick. The operations and their
     order are the walk's, compiled where the walk dispatched each alone."""
+    tree, values, squares = _termed(fn, args, power=2)
+    return tree.unflatten(values), tree.unflatten([np.sqrt(square) for square in squares])
+
+
+def float64_magnitudes(fn, *args):
+    """`fn(*args)` evaluated as `float64_terms` evaluates it, and the tree of each output leaf's terms'
+    magnitudes, summed: the same terms, of the same final sums, carried the same way, each by its size and
+    not its square. No partial sum of those terms, in any order, is larger: a leaf whose magnitudes lie
+    inside a format's range overflows in no order of its final sums, which the derivative contracts hold a
+    value finite by (tests/contract_support.py). A leaf no sum made is its own size."""
+    tree, values, sizes = _termed(fn, args, power=1)
+    return tree.unflatten(values), tree.unflatten(sizes)
+
+
+def _termed(fn, args, *, power: int):
+    """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
+    squares, or their magnitudes), the evaluation `float64_terms` describes."""
     closed, tree = _traced(fn, args)
     leaves = jax.tree.leaves(args)
-    with evaluated_on(leaves):
-        if _static(closed.jaxpr):
-            values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
-        else:
-            values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
-    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
-                                                   for energy, value in zip(energies, values, strict=True)])
+    token = POWER.set(power)
+    try:
+        with evaluated_on(leaves):
+            if _static(closed.jaxpr):
+                values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
+            else:
+                values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
+        return tree, values, [np.asarray(_or_size(energy, value))
+                              for energy, value in zip(energies, values, strict=True)]
+    finally:
+        POWER.reset(token)
 
 
 TRACES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -145,6 +166,11 @@ def _platform_picked(jaxpr) -> frozenset:
 
 PLACED: contextvars.ContextVar = contextvars.ContextVar("float64_terms_placed", default=None)
 """The device the evaluation in progress runs on (`evaluated_on`), None outside one."""
+
+POWER: contextvars.ContextVar = contextvars.ContextVar("float64_terms_power", default=2)
+"""The power of a term's size the evaluation in progress sums into an energy (`_termed`): 2, the terms'
+squares (`float64_terms`), or 1, their magnitudes (`float64_magnitudes`). Every compiled evaluation's key
+holds it."""
 
 
 @contextlib.contextmanager
@@ -217,7 +243,7 @@ def released() -> None:
 def _compiled(jaxpr):
     """The compiled evaluation (`_evaluated`) of `jaxpr`, a static program, taking its constants and
     its inputs, compiled once a program (`_traced`)."""
-    key = (jaxpr, _target())
+    key = (jaxpr, _target(), POWER.get())
     if key not in COMPILED:
         COMPILED[key] = jax.jit(lambda consts, given: _evaluated(jaxpr, consts, given))
     return COMPILED[key]
@@ -257,11 +283,10 @@ def walked(jaxpr, consts, args, rule: Rule, *, compiling: bool = False) -> list:
 
 
 def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=None, used=None):
-    """`jaxpr`'s outputs and their terms' energies, the sums of their squares
-    (`float64_terms`), from `args` and the energies `given` for them (none for
-    a computation's own inputs). A value no sum made has none. `compiling`
-    evaluates each run of static steps between a branch and a loop
-    (`_runs`) as one compiled program (`_span`).
+    """`jaxpr`'s outputs and their terms' energies, the sums of their squares (`float64_terms`; of their
+    magnitudes under `float64_magnitudes`, `POWER`), from `args` and the energies `given` for them (none
+    for a computation's own inputs). A value no sum made has none. `compiling` evaluates each run of
+    static steps between a branch and a loop (`_runs`) as one compiled program (`_span`).
 
     `rule`, where given, evaluates every primitive in place of the terms
     arithmetic (`Rule`): the walk, its calls' bodies, scans, loops, branches
@@ -404,7 +429,7 @@ def _span(jaxpr, start: int, stop: int):
     rule (`_evaluated`'s, None for none) to the kept ones'."""
     from jax.extend.core import Literal
 
-    key = (jaxpr, start, stop, _target())
+    key = (jaxpr, start, stop, _target(), POWER.get())
     if key not in RUNS:
         wanted, last, _ = _layout(jaxpr)
         run = jaxpr.eqns[start:stop]
@@ -487,8 +512,14 @@ def _body(equation):
     return None if body is None else (body, body.consts)
 
 
-def _squared(value):
-    return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
+def _sized(value):
+    """`value`'s size at the evaluation's power (`POWER`): its square, or its magnitude."""
+    return jnp.square(jnp.abs(value)) if POWER.get() == 2 else jnp.abs(value)
+
+
+def _measured(value):
+    """A term's energy (`_sized`), none for a value that is no float."""
+    return _sized(value) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
 
 
 def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rule=None, used=None):
@@ -524,7 +555,7 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
         return outputs, [None] * len(outputs)
     carried = _carried(equation)
     if primitive in SUMS and not carried and all(_real(var) for var in equation.outvars):
-        squares = [_squared(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
+        squares = [_measured(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
                    else value for var, value in zip(equation.invars, inputs, strict=True)]
         return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
     if not carried:
@@ -534,7 +565,7 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
         if len(summed) != 1 or (primitive is not jax.lax.mul_p and summed != [0]):
             return outputs, [None] * len(outputs)
         (index,) = summed
-        scale = jnp.square(jnp.abs(inputs[1 - index]))
+        scale = _sized(inputs[1 - index])
         return outputs, [given[index] * scale if primitive is jax.lax.mul_p else given[index] / scale]
     if all(given[index] is None for index in carried):
         return outputs, [None] * len(outputs)
@@ -728,7 +759,7 @@ def _or_zero(energy, value):
 
 
 def _or_size(energy, value):
-    """An output's energy: the one its sums carried, else its own size's square."""
+    """An output's energy: the one its sums carried, else its own size's (`_sized`)."""
     if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
         return np.zeros(np.shape(value))
-    return _squared(value) if energy is None else energy
+    return _measured(value) if energy is None else energy
