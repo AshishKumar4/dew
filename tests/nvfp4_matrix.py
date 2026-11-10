@@ -78,9 +78,9 @@ def _step(matrix: gemm.NvFp4, out_dtype: str, kernel: str):
 
 
 def _truth(values: np.ndarray):
-    """The plain product's training step in float64: the rows times the matrix's values."""
-    wide = jnp.asarray(values, jnp.float64)
-    return with_gradients(lambda rows: rows @ wide)
+    """The plain product's training step in float64: the rows times the matrix's values, formed within the
+    truth's x64 scope (`assert_as_exact`), where float64 exists."""
+    return with_gradients(lambda rows: rows @ jnp.asarray(values, jnp.float64))
 
 
 @cell("nvfp4", covers=lambda case: dict(zip(AXES["nvfp4"], case, strict=True)))
