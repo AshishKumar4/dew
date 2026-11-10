@@ -140,7 +140,10 @@ def an_adapted_projections_training_step_is_on_par(case: tuple[str, ...]) -> Non
     projection in float64. The routes it records run `low_rank` `fused` and every other choice at XLA."""
     combination = dict(zip(AXES["low_rank"], case, strict=True))
     model, variables = _adapted(combination)
-    wide_model, wide_variables = _adapted(combination, jnp.float64)
+    # The truth is the same projection in float64: the measured arms' frozen base weights and bias widened,
+    # not another projection initialised in float64.
+    wide_model, _ = _adapted(combination, jnp.float64)
+    wide_variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), variables)
     draw = _drawn(combination, variables)
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_step(model, variables, "fused")), jax.jit(_step(model, variables, "xla")),

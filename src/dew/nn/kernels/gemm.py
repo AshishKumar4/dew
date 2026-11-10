@@ -48,7 +48,7 @@ from dew.nn.kernels import generation, grouped_matmul, selection
 from dew.nn.kernels.templates import axes as side_axes_of, swizzling
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
-from dew.nn.kernels.templates.product import declared
+from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed
 from dew.nn.precision import accumulated, at_least_fp32, projected, refuse_recipe
 from dew.nn.sharding import explicit_spec, seen_whole
 
@@ -536,19 +536,18 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
         # The stack's every layer's matrices as one axis, the call's groups the layer's, from its first.
         words, scales = (field.reshape(-1, *field.shape[2:]) for field in (words, scales))
         first = jnp.asarray(layer, jnp.int32) * sizes.shape[0]
-    matrices, width, depth = words.shape[0], words.shape[1], 8 * words.shape[2]
-    spec = jax.ShapeDtypeStruct
-    bound = launch.bind(spec(rows.shape, rows.dtype), spec((matrices, width, depth), jnp.bfloat16),
-                        spec(sizes.shape, jnp.int32), (), (), None,
-                        None if first is None else spec((), jnp.int32),
-                        None if gather is None else spec(gather.shape, jnp.int32), out_dtype='float32',
-                        trans_rhs=True, interpret=interpret_on_cpu, dense=group_sizes is None,
-                        exact_sums=True)
-    target = generation.gpu_target()
-    tile = launch.derived(bound, target) if launch.eligible(bound, target) else None
+    def spec(array):
+        return None if array is None else jax.ShapeDtypeStruct(jnp.shape(array), jnp.result_type(array))
+
+    # The launch's matrix is the bank as it lies (`NvFp4`, each matrix's factor deferred to the epilogue):
+    # its words and block scales, its shape and dtype the bfloat16 matrices it decodes to.
+    bound = launch.bind(spec(rows), jax.tree.map(spec, _undeferred(words, scales)), spec(sizes), (), (), None,
+                        spec(first), spec(gather), out_dtype='float32', trans_rhs=False,
+                        interpret=interpret_on_cpu, dense=group_sizes is None, exact_sums=True)
+    tile = _planned(launch, bound)
     if selection.select(NVFP4, PackedCase(tile, count)).kernel == 'packed':
         assert tile is not None, "the selector names the packed kernel where it plans a tile"
-        summed = _packed(rows, words, scales, sizes, gather, first, tile, interpret_on_cpu,
+        summed = _packed(rows, words, scales, sizes, gather, first, launch, interpret_on_cpu,
                          dense=group_sizes is None)
     else:
         # Each product of two bfloat16 values is exact in fp32, so the default precision is the exact
@@ -561,16 +560,22 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     return (summed * factor).astype(out_dtype)
 
 
+def _undeferred(words, scales) -> NvFp4:
+    """A bank's words and block scales (`NvFp4`'s, led by their group axis) as an `NvFp4` of unit tensor
+    scales: the matrices the packed kernel decodes, each one's factor deferred to its product's epilogue."""
+    return NvFp4(words, scales, jnp.ones((words.shape[0],), jnp.float32))
+
+
 def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Array, gather, first,
-            tile: mosaic_gpu.Tiles, interpret: bool, *, dense: bool) -> jax.Array:
+            launch: grouped_matmul.MosaicPackedGmm, interpret: bool, *, dense: bool) -> jax.Array:
     """The packed matrices' product in fp32 (`nvfp4_product`'s packed kernel, `words` and `scales` led by
     their group axis, `sizes` each group's rows, `gather` the rows of `rows` they are where given, `first`
     the matrix of a stack the first group reads where given, `gmm`'s): the
     template's mainloop, each stage of `words` and `scales` decoded in place (`mosaic_gpu.gmm`'s `scales`),
     differentiable at every order as `gemm` is (`generation.linear_tangent`): its tangent the decoded
     product's in XLA, its reverse mode the rows' gradient through the decoded values, summed back into the
-    rows a gather read (the frozen words, scales, sizes and table taking none)."""
-    launch = grouped_matmul.MosaicPackedGmm()
+    rows a gather read (the frozen words, scales, sizes and table taking none). It runs through `launch`
+    (`grouped_matmul.MosaicPackedGmm`), whose config a pin or a stored pick may name."""
 
     def decoded(words, scales, first):
         # The bank's matrices, a dense call's one alone (`gemm`'s dense matrix is `[depth, width]`), a stack's
@@ -578,28 +583,25 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
         if first is not None:
             words, scales = (jax.lax.dynamic_slice_in_dim(field, first, sizes.shape[0])
                              for field in (words, scales))
-        matrices = NvFp4(words, scales, jnp.ones((words.shape[0],), jnp.float32)).decoded()
+        matrices = _undeferred(words, scales).decoded()
         return matrices[0] if dense else matrices
 
     def forward(rows, words, scales, sizes, gather, first):
-        out = mosaic_gpu.gmm(rows, words, sizes, tiles=tile, transpose_rhs=True, out_dtype=jnp.float32,
-                             multiprocessors=launch._launched(tile, interpret),
-                             interpret=grouped_matmul.INTERPRETED if interpret else False, dense=dense,
-                             exact_sums=True, scales=scales, gather=gather, first=first)
+        out = launch(rows, _undeferred(words, scales), sizes, (), (), None, first, gather,
+                     out_dtype='float32', trans_rhs=False, interpret=interpret, dense=dense, exact_sums=True)
         return out, ()
 
     def backward(saved, operands, cotangent, live):
         # The cotangent at its own precision times the decoded values' transpose, rounded once to the rows',
-        # each gathered row's summed back into the row it read: the fp32 cotangent as three bfloat16 parts
-        # (their sum it, exactly), each part's product with the bfloat16 values exact and summed in fp32,
-        # the parts' sums added in fp32 (narrowed to bfloat16 first, 1 - 511/512 summed to 0, audit A2).
+        # each gathered row's summed back into the row it read: the fp32 cotangent as its bfloat16 parts
+        # (`templates.product.formed`: their sum it exactly, a finite value past bfloat16's largest
+        # saturating into the parts, not rounding to infinity), each part's product with the bfloat16
+        # values exact and summed in fp32, the parts' sums added in fp32 (narrowed to bfloat16 first,
+        # 1 - 511/512 summed to 0, audit A2).
         del saved
         rows, words, scales, sizes, gather, first = operands
-        matrices, remainder = decoded(words, scales, first), cotangent.astype(jnp.float32)
-        parts = []
-        for _ in range(3):
-            parts.append(remainder.astype(jnp.bfloat16))
-            remainder = remainder - parts[-1].astype(jnp.float32)
+        matrices = decoded(words, scales, first)
+        parts = formed(cotangent.astype(jnp.float32), EXACT_PARTS)
         d_rows = functools.reduce(jnp.add, [
             gemm(part, matrices, None if dense else sizes, transpose_rhs=True, out_dtype=jnp.float32,
                  precision=jax.lax.Precision.DEFAULT, interpret_on_cpu=interpret) for part in parts])
@@ -662,21 +664,17 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     a recipe's gradients are their own FP8 products of requantized operands (row 2513). Its selector
     (`BLOCKWISE_FP8`) runs the template's exactly summed walk where named, else XLA's."""
     launch = grouped_matmul.MosaicStepScaledGmm()
-    abstract = jax.ShapeDtypeStruct
-    bound = launch.bind(abstract(lhs.shape, lhs.dtype), abstract(kernel.shape, kernel.dtype),
-                        abstract(group_sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
-                        interpret=interpret_on_cpu, exact_sums=True)
+    sizes = group_sizes.astype(jnp.int32)
+    call = functools.partial(launch, out_dtype='float32', trans_rhs=True, interpret=interpret_on_cpu,
+                             exact_sums=True)
     per = kernel.shape[1] // column_scales.shape[-1]
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
-    tile = _planned(launch, bound) if per == 1 or per % mosaic_gpu.STEP_SCALE_DEPTH == 0 else None
+    tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel, sizes), **call.keywords,
+                                         step_scales=_abstract(row_scales, column_scales)))
+            if per == 1 or per % SCALE_DEPTH == 0 else None)
     if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
-        summed = mosaic_gpu.gmm(lhs, kernel, group_sizes.astype(jnp.int32), tiles=tile, transpose_rhs=True,
-                                out_dtype=jnp.float32,
-                                multiprocessors=launch._launched(tile, interpret_on_cpu),
-                                interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
-                                exact_sums=True, step_scales=(row_scales, column_scales))
-        assert isinstance(summed, jax.Array), "an unpaired product has one output"
+        summed = call(lhs, kernel, sizes, step_scales=(row_scales, column_scales))
     else:
         # Each product of two FP8 values is exact in bfloat16's range and in fp32.
         matrices = jnp.swapaxes(kernel, 1, 2).astype(jnp.bfloat16)
@@ -696,22 +694,17 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
     `group_blocks[g]` whole 128-row blocks, in order (a recipe pads each group's rows to them, DeepGEMM's
     contiguous layout), so no block straddles groups. Its selector (`BLOCKWISE_FP8`) runs the template's
     rows-contiguous kernel gradient where named (`mosaic_gpu.tgmm`'s `k_major`), else XLA's."""
-    sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
+    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicStepScaledTgmm()
-    rows = lhs_t.shape[1]
-    # Bound as the call it is, its operands' rows first as a kernel gradient states them (`k_major` lays
-    # them out rows-contiguous).
-    tile = _planned(launch, launch.bind(jax.ShapeDtypeStruct((rows, lhs_t.shape[0]), lhs_t.dtype),
-                                        jax.ShapeDtypeStruct((rows, rhs_t.shape[0]), rhs_t.dtype),
-                                        jax.ShapeDtypeStruct(sizes.shape, jnp.int32), out_dtype='float32',
-                                        interpret=interpret_on_cpu, exact_sums=True))
+    # Bound as the call it is, its operands' rows first as a kernel gradient states them: the rows-contiguous
+    # operands' transposes, which XLA folds into the kernel's operands (`MosaicStepScaledTgmm`).
+    call = functools.partial(launch, lhs_t.T, rhs_t.T, sizes, out_dtype='float32', interpret=interpret_on_cpu,
+                             exact_sums=True, step_scales=(row_scales, column_scales))
+    tile = _planned(launch, launch.bind(*_abstract(*call.args), **{
+        **call.keywords, 'step_scales': _abstract(row_scales, column_scales)}))
     if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
-        launched = launch._launched(tile, interpret_on_cpu)
-        summed = mosaic_gpu.tgmm(lhs_t, rhs_t, sizes, tiles=tile, out_dtype=jnp.float32,
-                                 multiprocessors=launched,
-                                 interpret=grouped_matmul.INTERPRETED if interpret_on_cpu else False,
-                                 exact_sums=True, k_major=True, step_scales=(row_scales, column_scales))
+        summed = call()
     else:
         summed = _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales)
     return summed.astype(out_dtype)
@@ -747,7 +740,7 @@ def recipe_projection(rows: jax.Array, matrix: jax.Array, group_sizes: jax.Array
     if held is None:
         return None
     recipe, role = held
-    edge = grouped_matmul.SCALE_DEPTH
+    edge = SCALE_DEPTH
     depth, width = matrix.shape[-2:]
     refusal = (None if role in recipe.roles else
                selection.Refusal("kept_role", f"a {role or 'role-less'} projection keeps the run's dtypes "
@@ -828,7 +821,7 @@ def rows_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     power-of-two scale (`[..., n / 128]` fp32)."""
     from dew.nn import fake_quant
 
-    blocks, scale = fake_quant.fp8_scaled_blocks(x, grouped_matmul.SCALE_DEPTH)
+    blocks, scale = fake_quant.fp8_scaled_blocks(x, SCALE_DEPTH)
     return fake_quant.fp8_codes(blocks / scale).reshape(x.shape).astype(jnp.float8_e4m3fn), scale[..., 0]
 
 
@@ -838,7 +831,7 @@ def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
     from dew.nn import fake_quant
 
     groups, depth, width = w.shape
-    edge = grouped_matmul.SCALE_DEPTH
+    edge = SCALE_DEPTH
     tiled = w.reshape(groups, depth // edge, edge, width // edge, edge).transpose(0, 1, 3, 2, 4)
     blocks, scale = fake_quant.fp8_scaled_blocks(tiled.reshape(groups, depth // edge, width // edge, -1),
                                                  edge * edge)
@@ -849,7 +842,7 @@ def blocks_quantized(w: jax.Array) -> tuple[jax.Array, jax.Array]:
 def _projection_value(x, w, group_blocks, out_dtype, interpret):
     rows, rows_scales = rows_quantized(x)
     blocks, blocks_scales = blocks_quantized(w)
-    sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
+    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     return blockwise_fp8_product(rows, jnp.swapaxes(blocks, 1, 2), sizes, rows_scales.T, blocks_scales,
                                  out_dtype=out_dtype, interpret_on_cpu=interpret)
 
@@ -860,7 +853,7 @@ def _projection_forward(x, w, group_blocks, out_dtype, interpret):
 
 def _projection_backward(out_dtype, interpret, residuals, cotangent):
     x, w, group_blocks = residuals
-    sizes = (group_blocks * grouped_matmul.SCALE_DEPTH).astype(jnp.int32)
+    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     dy, dy_scales = rows_quantized(cotangent)
     blocks, blocks_scales = blocks_quantized(w)
     d_x = blockwise_fp8_product(dy, blocks, sizes, dy_scales.T, jnp.swapaxes(blocks_scales, 1, 2),
@@ -878,6 +871,11 @@ _blockwise_projection = contracted("test_a_blockwise_fp8_projection_holds_every_
                         nondiff_argnums=(3, 4)))
 
 
+def _abstract(*arrays) -> tuple:
+    """Each of `arrays` as its shape and dtype, as a launch's planning binds them (`_planned`)."""
+    return tuple(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in arrays)
+
+
 def _planned(launch, bound) -> mosaic_gpu.Tiles | None:
     """The tile `launch` plans for the call it is `bound` to on the target (its derived tile, its allocations
     its kernel's), None where it takes none."""
@@ -893,10 +891,10 @@ def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax
     owner = jnp.repeat(jnp.arange(groups), group_blocks, total_repeat_length=blocks)
 
     def block(index, total):
-        rows = jax.lax.dynamic_slice_in_dim(lhs_t, index * grouped_matmul.SCALE_DEPTH,
-                                            grouped_matmul.SCALE_DEPTH, axis=1)
-        columns = jax.lax.dynamic_slice_in_dim(rhs_t, index * grouped_matmul.SCALE_DEPTH,
-                                               grouped_matmul.SCALE_DEPTH, axis=1)
+        rows = jax.lax.dynamic_slice_in_dim(lhs_t, index * SCALE_DEPTH,
+                                            SCALE_DEPTH, axis=1)
+        columns = jax.lax.dynamic_slice_in_dim(rhs_t, index * SCALE_DEPTH,
+                                               SCALE_DEPTH, axis=1)
         partial = jax.lax.dot_general(rows.astype(jnp.bfloat16), columns.astype(jnp.bfloat16),
                                       (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
         scaled = partial * row_scales[index][:, None] * column_scales[index][None, :]
@@ -998,27 +996,24 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
     as every call's scales are laid out anew for the products (`_scales_tiled`), a sixteenth or a
     thirty-second of the rows' bytes (row 4851)."""
-    sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
+    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
-    abstract = jax.ShapeDtypeStruct
-    rows = (lhs.codes.shape[0] if gather is None else gather.shape[0], lhs.codes.shape[1])
-    tile = _planned(launch, launch.bind(abstract(rows, lhs.codes.dtype),
-                                        abstract(matrices.codes.shape, matrices.codes.dtype),
-                                        abstract(sizes.shape, jnp.int32), out_dtype='float32', trans_rhs=True,
-                                        interpret=interpret))
+    tables = (() if gather is None else (gather,))
+    # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products.
+    scales = (_scales_tiled(lhs.scales if gather is None else lhs.scales[gather]),
+              _scales_tiled(matrices.scales))
+    call = functools.partial(launch, lhs.codes, matrices.codes, sizes, (), (), None, None, *tables,
+                             out_dtype='float32', trans_rhs=True, interpret=interpret, mx_scales=scales)
+    tile = _planned(launch, launch.bind(*_abstract(*call.args[:3]), (), (), None, None,
+                                        *_abstract(*tables), **{**call.keywords,
+                                                                'mx_scales': _abstract(*scales)}))
     if selection.select(op, MxCase(tile)).kernel != 'mosaic':
         values = lhs.decoded() if gather is None else lhs.decoded()[gather]
         return grouped_matmul.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
     assert tile is not None, "the selector names the template where it plans a tile"
-    scales = lhs.scales if gather is None else lhs.scales[gather]
-    summed = mosaic_gpu.gmm(lhs.codes, matrices.codes, sizes, tiles=tile, transpose_rhs=True,
-                            out_dtype=jnp.float32, multiprocessors=launch._launched(tile, interpret),
-                            interpret=grouped_matmul.INTERPRETED if interpret else False, gather=gather,
-                            mx_scales=(_scales_tiled(scales), _scales_tiled(matrices.scales)))
-    assert isinstance(summed, jax.Array), "an unpaired product has one output"
-    return summed
+    return call()
 
 
 def mxfp8_projection(x: jax.Array, w: jax.Array, group_blocks: jax.Array, *, out_dtype,
@@ -1059,7 +1054,7 @@ def _mx_backward(out_dtype, interpret, residuals, cotangent):
     x, w, group_blocks = residuals
     d_x = mxfp8_product(MxFp8.quantized(cotangent), MxFp8.quantized(w), group_blocks, out_dtype=x.dtype,
                         interpret_on_cpu=interpret)
-    sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
+    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 32 of them a
     # scale: a 128-row group's blocks hold whole 32s.
     rows = MxFp8.quantized(x.T).decoded().T.astype(jnp.bfloat16)
@@ -1160,8 +1155,8 @@ def nvfp4_quantized_product(lhs: jax.Array, matrix: NvFp4, *, out_dtype,
     as one group. Unlike `nvfp4_product` (the rows in bfloat16), the rows round to E2M1 under their own
     block scales: a run opts in by calling it."""
     rows = lhs.reshape(-1, lhs.shape[-1])
-    padded = jnp.pad(rows, ((0, -rows.shape[0] % mosaic_gpu.STEP_SCALE_DEPTH), (0, 0)))
-    blocks = jnp.asarray([padded.shape[0] // mosaic_gpu.STEP_SCALE_DEPTH], jnp.int32)
+    padded = jnp.pad(rows, ((0, -rows.shape[0] % SCALE_DEPTH), (0, 0)))
+    blocks = jnp.asarray([padded.shape[0] // SCALE_DEPTH], jnp.int32)
     out = nvfp4_block_product(NvFp4Block.quantized(padded), NvFp4Block.of(matrix), blocks,
                               out_dtype=out_dtype, interpret_on_cpu=interpret_on_cpu)
     return out[:rows.shape[0]].reshape(*lhs.shape[:-1], out.shape[-1])
@@ -1192,7 +1187,7 @@ def _nvfp4_backward(out_dtype, interpret, residuals, cotangent):
     x, w, group_blocks = residuals
     d_x = nvfp4_block_product(NvFp4Block.quantized(cotangent), NvFp4Block.quantized(w), group_blocks,
                               out_dtype=x.dtype, interpret_on_cpu=interpret)
-    sizes = (group_blocks * mosaic_gpu.STEP_SCALE_DEPTH).astype(jnp.int32)
+    sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     # Each group's tokens quantized along the tokens (the kernel gradient's contraction), every 16 a scale,
     # the tensor scales applied: a 128-row group's blocks hold whole 16s.
     rows, cotangents = (NvFp4Block.quantized(operand.T) for operand in (x, cotangent))
@@ -1234,11 +1229,12 @@ def _rank_product(lhs: jax.Array, factor: jax.Array, scale: jax.Array, precision
     return scale.astype(wide) * summed
 
 
-def _appended(base: jax.Array, rank_part: jax.Array, axis: int) -> jax.Array:
+def _appended(base: jax.Array, rank_part: jax.Array, axis: int, compute) -> jax.Array:
     """`base` with `rank_part` after it along `axis`, the rank padded with zeros to whole steps of the widest
-    depth the template's families take on its dtype (a 128-byte swizzle's row, `swizzling.SWIZZLE_BYTES`), so
-    the extended depth divides into the base's own steps."""
-    step = swizzling.swizzle_columns(base.dtype, swizzling.SWIZZLE_BYTES)
+    depth the template's families take on the product's `compute` dtype (its rows', which its matrix is
+    multiplied in: a 128-byte swizzle's row, `swizzling.SWIZZLE_BYTES`), so the extended depth divides into
+    the base's own steps and both operands extend alike, an fp32 master matrix's as its rows'."""
+    step = swizzling.swizzle_columns(compute, swizzling.SWIZZLE_BYTES)
     rank_part = rows_padded(rank_part.astype(base.dtype), axis, step)
     return jnp.concatenate([base, rank_part], axis=axis)
 
@@ -1246,8 +1242,8 @@ def _appended(base: jax.Array, rank_part: jax.Array, axis: int) -> jax.Array:
 def _extended(lhs, kernel, a, b, scale, out_dtype, precision, interpret_on_cpu):
     """`low_rank`'s value and its appended operand `t`, in at least fp32."""
     t = _rank_product(lhs, a, scale, precision)
-    out = gemm(_appended(lhs, t, 1), _appended(kernel, b, 0), out_dtype=out_dtype, precision=precision,
-               interpret_on_cpu=interpret_on_cpu)
+    out = gemm(_appended(lhs, t, 1, lhs.dtype), _appended(kernel, b, 0, lhs.dtype), out_dtype=out_dtype,
+               precision=precision, interpret_on_cpu=interpret_on_cpu)
     return out, t
 
 
@@ -1269,19 +1265,26 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
     del out_dtype
     lhs, kernel, a, b, scale, t, perturbed = residuals
     wants_lhs, wants_kernel, wants_a, wants_b, wants_scale = map(bool, perturbed.shape)
-    dy = cotangent.astype(lhs.dtype)
+    # The input gradient's product takes the cotangent in the rows' dtype, as the forward's operands; the
+    # wide gradients (the kernel's, the factors' and the scale's) take it at its own precision where it is
+    # wider (an fp32 output's), the rows widened to it, as the plain product's kernel gradient
+    # (`_kernel_gradient`'s `work`).
+    work = jnp.promote_types(cotangent.dtype, lhs.dtype)
+    dy, wide_dy = cotangent.astype(lhs.dtype), cotangent.astype(work)
     wide = at_least_fp32(lhs.dtype)
-    # The cotangent of `t` before its scale, dy · bᵀ, summed wide, and after it: the scale taken before any
-    # product with it, as the adapter's own program takes it (a product near float32's largest that the
-    # scale brings back in range never overflows first).
-    through = jnp.dot(dy, b.astype(lhs.dtype).T, precision=precision, preferred_element_type=wide)
+    # The cotangent of `t` before its scale, dy · bᵀ (b as the forward multiplied it, in the rows' dtype),
+    # summed wide, and after it: the scale taken before any product with it, as the adapter's own program
+    # takes it (a product near float32's largest that the scale brings back in range never overflows first).
+    through = jnp.dot(wide_dy, b.astype(lhs.dtype).astype(work).T, precision=precision,
+                      preferred_element_type=wide)
     scaled = scale.astype(wide) * through
     d_lhs = d_kernel = d_a = d_b = d_scale = None
     if wants_lhs:
-        d_lhs = gemm(_appended(dy, scaled.astype(lhs.dtype), 1), _appended(kernel, a, 1), transpose_rhs=True,
-                     out_dtype=lhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
+        d_lhs = gemm(_appended(dy, scaled.astype(lhs.dtype), 1, lhs.dtype),
+                     _appended(kernel, a, 1, lhs.dtype), transpose_rhs=True, out_dtype=lhs.dtype,
+                     precision=precision, interpret_on_cpu=interpret_on_cpu)
     if wants_kernel:
-        d_kernel = gemm_t(lhs, dy, None, out_dtype=kernel.dtype, precision=precision,
+        d_kernel = gemm_t(lhs.astype(work), wide_dy, None, out_dtype=kernel.dtype, precision=precision,
                           interpret_on_cpu=interpret_on_cpu)[0]
     # The factors' gradients from the wide `scaled` and `t` (the rank-wide products' sums, unrounded), as
     # the adapter's own program differentiates its fp32 low-rank products.
@@ -1290,7 +1293,8 @@ def _low_rank_backward(out_dtype, precision, interpret_on_cpu, residuals, cotang
                       preferred_element_type=wide).astype(a.dtype)
     if wants_b:
         # `t` holds the scale already: tᵀ · dy is the factor's gradient whole.
-        d_b = jnp.dot(t.T, dy.astype(wide), precision=precision, preferred_element_type=wide).astype(b.dtype)
+        d_b = jnp.dot(t.T, wide_dy.astype(wide), precision=precision,
+                      preferred_element_type=wide).astype(b.dtype)
     if wants_scale:
         unscaled = jnp.dot(lhs, a.astype(lhs.dtype), precision=precision, preferred_element_type=wide)
         d_scale = jnp.sum(through * unscaled).astype(scale.dtype)

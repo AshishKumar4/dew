@@ -199,21 +199,17 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
     return fused_seconds, unfused_seconds
 
 
-TRANSCENDENTAL = frozenset({'exp', 'exp2', 'log', 'log1p', 'tanh', 'logistic', 'erf', 'sin', 'cos', 'pow',
-                            'rsqrt', 'sqrt'})
-"""The consumers' operations the special-function units take (`_chain`)."""
-
-
 def _chain(consumer, values, acc) -> cost.Work:
     """The consumers' elementwise work on the whole product: each equation of their program an operation an
-    element of its result, a transcendental's on the special-function units, a conversion's apart."""
+    element of its result, a special function's on the special-function units (the algebra's one
+    classification of them, `dew.algebra.cost.EXPONENTIALS`), a conversion's apart."""
     closed = jax.make_jaxpr(consumer)(values, acc)
     work = cost.Work()
     for eqn in closed.jaxpr.eqns:
         elements = float(sum(math.prod(shape) for var in eqn.outvars
                              if (shape := getattr(var.aval, 'shape', None)) is not None))
         name = eqn.primitive.name
-        work = work + (cost.Work(exponentials=elements) if name in TRANSCENDENTAL
+        work = work + (cost.Work(exponentials=elements) if name in algebra_cost.EXPONENTIALS
                        else cost.Work(conversions=elements) if name == 'convert_element_type'
                        else cost.Work(operations=elements))
     return work
