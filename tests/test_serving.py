@@ -744,7 +744,8 @@ DELTA_NET = {"linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key
 THIN_DELTA_NET = {"linear_num_key_heads": 1, "linear_num_value_heads": 1, "linear_key_head_dim": 4,
                   "linear_value_head_dim": 4, "linear_conv_kernel_dim": 2}
 """A delta net of one 4-by-4 value head and a two-tap convolution: a row state of 224 bytes, under half
-a page of four tokens' keys (512 bytes), so a host tier holds more states than pages."""
+a page of four tokens' keys (512 bytes, beside their values' bounds), so a host tier holds more states than
+pages."""
 
 
 def hybrid_model(vocab_size: int = VOCAB, width: int = 16, delta_net: dict = DELTA_NET) -> CausalTransformer:
@@ -952,7 +953,8 @@ def test_a_hybrid_servers_host_states_fit_the_bytes_of_its_host_pages(host_pages
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
     """A hybrid stack whose row state is smaller than a page keeps more states on the host than pages
-    (`THIN_DELTA_NET`: four states in two pages' bytes), each in its own slot: three prompts send
+    (`THIN_DELTA_NET`: five states in two pages' bytes, a page's keys, values and their bounds), each in
+    its own slot: three prompts send
     their states there as a store of one entry gives way, the third to the slot past the pages' count,
     and their repeats read each back with its own prefix (ledger 4602's review), each request drawing
     what it draws alone and scoring it as a full forward does (check 1)."""
@@ -965,7 +967,7 @@ def test_a_host_tier_of_more_states_than_pages_reads_each_state_back():
     serving = {**HYBRID_SHARED, "slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8),
                "host_pages": 2, "prefix_states": 1}
     server = Server.from_task(task, **serving)
-    assert server.rows.pages[0].states.host.slots == 4
+    assert server.rows.pages[0].states.host.slots == 5
     assert_served_as_exact(task, requests, "thin hybrid host states", serving=serving,
                            rounds=(1,) * len(requests), budget=8, seeds=(256, 256))
 

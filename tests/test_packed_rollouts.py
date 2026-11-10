@@ -255,3 +255,23 @@ def test_groups_planned_apart_count_the_rows_their_batch_packs_in():
     plans = [planned(first, 10, truncation="mask", share=True)]
     plans.append(planned(second, 10, truncation="mask", share=True, first=len(plans[0].lengths)))
     assert planned_rows(plans, 10) == packed_rows([*first, *second], 10, truncation="mask", share=True) == 3
+
+
+def test_every_shared_pack_holds_its_rows_parents_whatever_they_share():
+    """Packs that share their groups' prompts (`pack`'s `share`) hold the parents' table
+    (`FORK_PARENTS_KEY`) whatever their rows share: a group whose chains share their prompt names its
+    parents, and one whose chains share none and one that trains no session hold parents of none, so a
+    rollout's shares pack one tree, whose documents' count the pool agrees (`agreed_records`)."""
+    from dew.objectives.rl.sessions import FORK_PARENTS_KEY
+
+    def session(group, sample, prompt, sampled, status=Status.COMPLETED, reward=1.0):
+        call = Call(prompt, sampled, tuple(-0.1 for _ in sampled), "stop", 0)
+        return Session("t", group, sample, 0, (call,), status, reward)
+
+    shared = [session("g", sample, (1, 2, 3, 4), (5 + sample, 6)) for sample in range(2)]
+    apart = [session("h", sample, (7 + sample, 8), (9, 10)) for sample in range(2)]
+    untrained = [session("u", 0, (1, 2, 3, 4), (5,), Status.TRUNCATED, None)]
+    packs = [pack(sessions, 16, rows=2, share=True) for sessions in (shared, apart, untrained)]
+    assert [sorted(batch) for batch in packs[1:]] == [sorted(packs[0])] * 2
+    assert [batch[FORK_PARENTS_KEY].shape[0] for batch in packs] == [2, 2, 2]
+    assert [bool(np.any(batch[FORK_PARENTS_KEY] > 0)) for batch in packs] == [True, False, False]
