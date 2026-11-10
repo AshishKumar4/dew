@@ -1314,8 +1314,8 @@ def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: d
 @COMPILES_ON_CPU
 @pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
 def test_each_launchs_producer_lowers_its_registers_as_its_model_states_on_a_b200_spilling_none(training):
-    """The gated delta rule's 16-bit forward and training pass on a B200's tcgen05 bundle, compiled by Mosaic on
-    this CPU (`compiled_cases`): each launch's producer warpgroup lowers its registers in its PTX
+    """The gated delta rule's 16-bit forward and training pass on a B200's tcgen05 bundle, compiled by Mosaic
+    on this CPU (`compiled_cases`): each launch's producer warpgroup lowers its registers in its PTX
     (`setmaxnreg.dec`) to what its register model states (`RegisterModel.producer`, its plan's
     `Launch.producer`), a launch's plan and its schedule one fact, and no kernel spills: the states, solve,
     reverse walk's and the forward's one walk's producers spilled at the default 24 (52, 164, 40 and 52 bytes;
