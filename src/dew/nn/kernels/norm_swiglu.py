@@ -98,6 +98,7 @@ from ..sharding import automatic_axes, manual_map, on_shards, varying_like
 from . import generation, tuning
 from .generation import INHERENT, Choice, device_generation
 from .selection import Kernel, Op, Requirement, select
+from .templates import layout
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
@@ -267,20 +268,16 @@ def _dtype_requirements[C: _Typed](name: str, case_type: type[C]) -> tuple[Requi
     )
 
 
-_POSITIONAL = frozenset({'iota', 'cumsum', 'cumprod', 'cummax', 'cummin', 'cumlogsumexp', 'sort', 'rev',
-                         'program_id', 'num_programs', 'axis_index', 'get', 'masked_load', 'masked_swap',
-                         'addupdate', 'debug_print'})
-"""Primitives that keep their operand's shape but read or write by position, not value: no epilogue's."""
-
-
 def elementwise(function, shape: tuple[int, ...]) -> bool:
     """Whether `function`, applied to an fp32 array of the call's logical `shape`, maps each element alone, as
     the kernels' rows apply it to a tile of a row's columns padded past its width (`_rms_forward`'s
     epilogue, row 821), read off its graph traced at that shape (`_Logical`): every equation, nested ones
-    too, reads and writes only that shape or scalars, none of them positional (`_POSITIONAL`), each one
-    Pallas's Triton lowering takes (an exact gelu's erfc it takes none of), and every array it closes over
-    a scalar. A value it derives from the shape (`y / y.shape[-1]`) is a literal of the logical shape in
-    that graph, which the tile then reads. A callable that does not trace on an array (TypeError,
+    too, reads and writes only that shape or scalars, each one entrywise (`templates.layout.entrywise`: what
+    JAX states of its operation, or a scalar's broadcast) or a call or a conditional over programs so
+    (`programs.called`, `programs.branches`), none a custom reverse derivative, each one Pallas's Triton
+    lowering takes (an exact gelu's erfc it takes none of), and every array it closes over a scalar. A
+    value it derives from the shape (`y / y.shape[-1]`) is a literal of the logical shape in that graph,
+    which the tile then reads. A callable that does not trace on an array (TypeError,
     ValueError) is none."""
     from jax._src.pallas.triton import lowering
 
@@ -298,13 +295,18 @@ def elementwise(function, shape: tuple[int, ...]) -> bool:
         for equation in jaxpr.eqns:
             avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
             # A custom reverse derivative has no forward one to state the tile's (`_tangents`).
-            if (equation.primitive.name in _POSITIONAL or equation.primitive not in lowered
-                    or equation.primitive.name.startswith("custom_vjp")
+            if (equation.primitive not in lowered or equation.primitive is core.primitives.custom_vjp_call_p
                     or any(not isinstance(aval, ShapedArray) or aval.shape not in (tuple(shape), ())
                            for aval in avals)):
                 return False
-            # Every program it runs within it, a call's or a branch's (`programs.bodies`), mapped too.
-            if not all(mapped(inner) for inner in programs.bodies(equation)):
+            # A call's program, or each branch of a conditional, mapped too; any other operation entrywise.
+            called = programs.called(equation)
+            inner = ((called,) if called is not None
+                     else programs.branches(equation) if equation.primitive is jax.lax.cond_p else None)
+            if inner is not None:
+                if not all(mapped(each) for each in inner):
+                    return False
+            elif not layout.entrywise(equation):
                 return False
         return True
 
@@ -462,12 +464,19 @@ class NormCase:
     activation: str | None
 
     @property
-    def cell(self) -> tuple[str, str]:
-        """The cell a receipt measures (`selection.Celled`): the device's generation and the rows' dtype, a
-        row past the register tile (`NARROW_WIDTH`) a cell of its own: it walks its columns in steps, which
-        no receipt of a narrow row's measured (row 820), so it takes XLA's until one does."""
-        dtype = self.dtypes[0].name
-        return device_generation(), dtype if self.width <= NARROW_WIDTH else f"{dtype} past {NARROW_WIDTH}"
+    def cell(self) -> tuple[str, "NormRows"]:
+        """The cell a receipt measures (`selection.Celled`): the device's generation and its rows
+        (`NormRows`)."""
+        return device_generation(), NormRows(jnp.dtype(self.dtypes[0]), self.width <= NARROW_WIDTH)
+
+
+class NormRows(NamedTuple):
+    """A norm's rows as its receipts measure them (`NormCase.cell`): their dtype, and whether they fit the
+    register tile (`NARROW_WIDTH`): a row past it is a cell of its own, walking its columns in steps, which no
+    receipt of a narrow row's measured (row 820), so it takes XLA's until one does."""
+
+    dtype: np.dtype
+    narrow: bool
 
 
 def norm_case(x, scale, dtype, axes, *, branch=None, gate=None, epilogue=None, fp32_statistics=True,
@@ -529,17 +538,20 @@ FP16_NORM_FASTER = ("FSNORM16 (base/kernels 4d31032c6, CUPTI, arms rotated): Qwe
                     "74.5 and 227.8)")
 """The receipt behind the fused norm's fp16 cells."""
 
-NORM_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('sm80', 'bfloat16'): ('pallas', FUSED_FASTER),
-    ('sm90', 'bfloat16'): ('pallas', FUSED_FASTER),
-    ('sm80', 'float16'): ('pallas', FP16_NORM_FASTER),
-    ('sm90', 'float16'): ('pallas', FP16_NORM_FASTER),
+FUSED_NORM = Kernel[NormCase]('pallas', NORM_SUPPORTS)
+"""The fused norm's kernel."""
+
+NORM_CELLS: dict[tuple[str | None, NormRows], tuple[Kernel[NormCase], str]] = {
+    ('sm80', NormRows(jnp.dtype(jnp.bfloat16), narrow=True)): (FUSED_NORM, FUSED_FASTER),
+    ('sm90', NormRows(jnp.dtype(jnp.bfloat16), narrow=True)): (FUSED_NORM, FUSED_FASTER),
+    ('sm80', NormRows(jnp.dtype(jnp.float16), narrow=True)): (FUSED_NORM, FP16_NORM_FASTER),
+    ('sm90', NormRows(jnp.dtype(jnp.float16), narrow=True)): (FUSED_NORM, FP16_NORM_FASTER),
 }
-"""The fused norm's declared cells (`selection.Op.declared`), (device generation, dtype) to the old route
+"""The fused norm's declared cells (`selection.Op.declared`), (device generation, rows) to the fused kernel
 and its receipt: a literal of them, which the selector reads and thresh's declared-set seam registers
 (.thresh/thresh.cue, row 3209)."""
 
-NORM: Op[NormCase] = Op(Choice.RMS_NORM, (Kernel('pallas', NORM_SUPPORTS), Kernel('xla', (), generic=True)),
+NORM: Op[NormCase] = Op(Choice.RMS_NORM, (FUSED_NORM, Kernel('xla', (), generic=True)),
                         lambda case: 'xla', declared=NORM_CELLS)
 """The norm selector: XLA's arithmetic, but the fused kernel where it measured faster (bf16 rows on an
 A100 and an H100: the seam 76/187 against 103/200 us and 36/81 against 44/89, the gated norm's 118;224
@@ -576,10 +588,10 @@ class SwigluCase:
     placed: bool
 
     @property
-    def cell(self) -> tuple[str, str]:
+    def cell(self) -> tuple[str, np.dtype]:
         """The cell a receipt measures (`selection.Celled`): the device's generation and the product's
         dtype."""
-        return device_generation(), self.promotes.name
+        return device_generation(), jnp.dtype(self.promotes)
 
 
 SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
@@ -599,14 +611,16 @@ SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
 as the kernel reads them."""
 
 
-SWIGLU_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('sm80', 'bfloat16'): ('pallas', FUSED_FASTER),
-    ('sm90', 'bfloat16'): ('pallas', FUSED_FASTER),
+FUSED_SWIGLU = Kernel[SwigluCase]('pallas', SWIGLU_SUPPORTS)
+"""The fused SiLU product's kernel."""
+
+SWIGLU_CELLS: dict[tuple[str | None, np.dtype], tuple[Kernel[SwigluCase], str]] = {
+    ('sm80', jnp.dtype(jnp.bfloat16)): (FUSED_SWIGLU, FUSED_FASTER),
+    ('sm90', jnp.dtype(jnp.bfloat16)): (FUSED_SWIGLU, FUSED_FASTER),
 }
 """The fused SiLU product's declared cells (`selection.Op.declared`), as `NORM_CELLS` holds the norm's."""
 
-SWIGLU: Op[SwigluCase] = Op(Choice.SWIGLU,
-                            (Kernel('pallas', SWIGLU_SUPPORTS), Kernel('xla', (), generic=True)),
+SWIGLU: Op[SwigluCase] = Op(Choice.SWIGLU, (FUSED_SWIGLU, Kernel('xla', (), generic=True)),
                             lambda case: 'xla', declared=SWIGLU_CELLS)
 """The SwiGLU selector: XLA's arithmetic, but the fused product where it measured faster (a bf16 product
 on an A100 and an H100: 193;320 against 235;361 us and 87;147 against 113;171) and its requirements hold.

@@ -23,12 +23,13 @@ against 8.4).
 
 import abc
 import dataclasses
+import enum
 import functools
 import importlib
 import importlib.util
 import math
 from collections.abc import Callable, Hashable
-from typing import ClassVar, Protocol
+from typing import ClassVar, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -51,7 +52,7 @@ from .generation import INHERENT
 from .templates import across, base, bundles, mosaic, report, resources, swizzling
 from .templates.axes import held as held_axes
 from .templates.gemm import mosaic_gpu
-from .templates.product import EIGHT, SCALE_DEPTH, Product
+from .templates.product import SCALE_DEPTH, Product, eight
 
 
 @dataclasses.dataclass(frozen=True)
@@ -780,10 +781,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return bool(ba.arguments.get('trans_rhs'))
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
-        """Whether an FP8 call (`product.EIGHT`) runs here: a forward product on warpgroup MMA, its matrix
+        """Whether an FP8 call (`product.eight`) runs here: a forward product on warpgroup MMA, its matrix
         K-major (`trans_rhs`, as Hopper's FP8 tensor cores read both operands; an N-major FP8 matrix is
         refused, row 3620), with no hook, its running sum promoted every step (`exact_sums`)."""
-        return (jnp.dtype(dtype) in EIGHT and self.FP8 and family.takes_fp8
+        return (jnp.dtype(dtype) in family.fp8_formats and self.FP8
                 and ba.arguments['trans_rhs']
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
                 and bool(ba.arguments.get('exact_sums')))
@@ -1091,7 +1092,7 @@ the same 96 programs, 4.2x XLA's (W50-a100-1-M-NS-19-a100)."""
 @dataclasses.dataclass(frozen=True)
 class MosaicGmm(_Mosaic):
     """`Gmm` through the template's mainloop (`mosaic_gpu.gmm`) on a GPU family's bundle or a TPU core's,
-    exact sums too: an FP8 product's running sum promoted into fp32 every step (`product.EIGHT`)."""
+    exact sums too: an FP8 product's running sum promoted into fp32 every step (`product.eight`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     EXACT_SUMS: ClassVar[bool] = True
@@ -1639,7 +1640,7 @@ class MosaicMxGmm(MosaicGmm):
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted. Its
         # operands FP8 (MXFP8) or E2M1 (NVFP4), `mosaic_gpu.block_format`'s.
-        return (jnp.dtype(dtype) in (*EIGHT, jnp.dtype(jnp.float4_e2m1fn)) and family.takes_block_scales
+        return (jnp.dtype(dtype) in family.block_formats
                 and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
                 and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
 
@@ -1680,7 +1681,7 @@ class MosaicStepScaledTgmm(MosaicTgmm):
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its operands lie rows-contiguous, as Hopper's FP8 tensor cores read both.
-        return (jnp.dtype(dtype) in EIGHT and family.takes_fp8
+        return (jnp.dtype(dtype) in family.fp8_formats
                 and ba.arguments['hooks'] == NO_HOOKS and bool(ba.arguments.get('exact_sums')))
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
@@ -1703,10 +1704,12 @@ def _column_scale_registers(ba, config: mosaic_gpu.Tiles) -> int:
     return family.column_registers(config.block_n, jnp.float32)
 
 
-def _cutlass_call(target: str, out: jax.ShapeDtypeStruct) -> Callable:
-    """dew_cutlass's FFI call `target` giving `out`, a mapped call running its maps in turn, one launch
-    each (row 4389: JAX's FFI batching refuses a call that states no rule)."""
-    return jax.ffi.ffi_call(target, out, vmap_method='sequential')
+def _cutlass_call(target: int, out: jax.ShapeDtypeStruct) -> Callable:
+    """dew_cutlass's FFI call giving `out` of the `target`-th of the targets the wheel names
+    (`dew_cutlass.TARGETS`: its grouped GEMM, then its weight gradient), a mapped call running its maps in
+    turn, one launch each (row 4389: JAX's FFI batching refuses a call that states no rule)."""
+    name = importlib.import_module('dew_cutlass').TARGETS[target]
+    return jax.ffi.ffi_call(name, out, vmap_method='sequential')
 
 
 def cutlass_tile(architecture: str, out_dtype) -> mosaic_gpu.Tiles:
@@ -1778,7 +1781,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
 
 @dataclasses.dataclass(frozen=True)
 class CutlassGmm(_Cutlass):
-    """`Gmm` through CUTLASS (`dew_cutlass_grouped_gemm`)."""
+    """`Gmm` through CUTLASS (the wheel's grouped GEMM target, `dew_cutlass.TARGETS`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
 
@@ -1795,14 +1798,14 @@ class CutlassGmm(_Cutlass):
         _cutlass_registered()
         width = kernel.shape[1] if trans_rhs else kernel.shape[2]
         out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
-        call = _cutlass_call('dew_cutlass_grouped_gemm', out)
+        call = _cutlass_call(0, out)
         return call(tokens, kernel, sizes, transpose_w=trans_rhs), None
 
 
 @dataclasses.dataclass(frozen=True)
 class CutlassTgmm(_Cutlass):
-    """`Tgmm` through CUTLASS (`dew_cutlass_grouped_gemm_k`): each group's gradient a GEMM over its rows,
-    an empty group's zero, its pair splitting the gradient's rows."""
+    """`Tgmm` through CUTLASS (the wheel's weight-gradient target, `dew_cutlass.TARGETS`): each group's
+    gradient a GEMM over its rows, an empty group's zero, its pair splitting the gradient's rows."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
 
@@ -1821,7 +1824,7 @@ class CutlassTgmm(_Cutlass):
         _cutlass_registered()
         out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
                                    jnp.dtype(out_dtype))
-        return _cutlass_call('dew_cutlass_grouped_gemm_k', out)(tokens, cotangent, sizes), None
+        return _cutlass_call(1, out)(tokens, cotangent, sizes), None
 
 
 def _grown(value, dims: dict | tuple, extents: dict):
@@ -1851,31 +1854,63 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
     return target.multiprocessors
 
 
+class Made(enum.Enum):
+    """What a grouped call makes (`Kind`): a forward product, its input gradient (the matrix read transposed),
+    or the matrices' kernel gradient, summed by the tensor cores or exactly (`exact_sums`)."""
+
+    FORWARD = 'forward'
+    INPUT_GRADIENT = 'input_gradient'
+    KERNEL_GRADIENT = 'kernel_gradient'
+    EXACT_KERNEL_GRADIENT = 'kernel_gradient exact'
+
+
+class Kind(NamedTuple):
+    """The kind of call a grouped product is (`GroupedCase.kind`), which with the device's instruction family
+    is its cell (`DECLARED`): dense (one matrix, every row) or grouped, what it makes, and the operands no
+    receipt of a 16-bit call times: FP8 ones (XLA's dot of them sums narrower than the FP8 contract holds,
+    row 1625), rows gathered through a table or stored through one (no old route reads them)."""
+
+    dense: bool
+    made: Made
+    fp8: bool = False
+    gathered: bool = False
+    scattered: bool = False
+
+    def __str__(self) -> str:
+        parts = ('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
+        return ' '.join(('dense' if self.dense else 'grouped', self.made.value, *parts))
+
+
 @dataclasses.dataclass(frozen=True)
 class GroupedCase:
     """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
     target (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform
     places), whether they see its operands whole (`whole`,
     `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
-    (`call`) and the `kind` of call it is ('grouped forward', 'dense input_gradient', 'grouped
-    kernel_gradient exact', as `gmm_call` and `tgmm_call` state it), which with the device's instruction
-    family is its cell (`DECLARED`), an FP8 call's kind its own (' fp8')."""
+    (`call`) and the `kind` of call it is (`Kind`, as `gmm_call` and `tgmm_call` state it), which with the
+    device's instruction family is its cell (`DECLARED`)."""
 
     placed: bool
     whole: bool
     product: Product
     rows: int
     call: base.Call
-    kind: str
+    kind: Kind
     paired: bool = False
     """Whether it multiplies its rows by a second matrix beside the first (`gmm_call`'s `paired`)."""
-    gathered: bool = False
-    """Whether its rows are gathered from the tokens by a table (`gmm_call`'s `gather`)."""
-    scattered: bool = False
-    """Whether its rows land where a table says (`gmm_call`'s `scatter`)."""
 
     @property
-    def cell(self) -> tuple[str | None, str]:
+    def gathered(self) -> bool:
+        """Whether its rows are gathered from the tokens by a table (`gmm_call`'s `gather`)."""
+        return self.kind.gathered
+
+    @property
+    def scattered(self) -> bool:
+        """Whether its rows land where a table says (`gmm_call`'s `scatter`)."""
+        return self.kind.scattered
+
+    @property
+    def cell(self) -> tuple[str | None, Kind]:
         return generation.family(self.call.target.generation), self.kind
 
 
@@ -1917,42 +1952,14 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
                      "scatters them", row='ledger 1376'), *measured))
 
 
-DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'dense forward'):
-        ('xla', "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
-                "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),
-    ('mma.sync', 'dense input_gradient'):
-        ('xla', "DENSE1 (A100, one program a multiprocessor): Mosaic 2.881x, Triton 1.839x XLA's dot"),
-    ('mma.sync', 'dense kernel_gradient'):
-        ('xla', "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot"),
-    ('wgmma', 'grouped forward'):
-        ('cutlass', "PAIR1-h100 (c771912a6, H100 SXM, a pair of multiprocessors a cluster multicasting each "
-                    "group's matrix): the template 1.019x CUTLASS's time, geomean of 7 grouped MoE rows "
-                    "(worst 1.18x, deepseek-v3 down; 0.951x its unpaired time)"),
-    ('wgmma', 'grouped input_gradient'):
-        ('cutlass', "PAIR1-h100: 1.018x CUTLASS's time, geomean of 7 grouped rows (worst 1.05x; 0.918x "
-                    "its unpaired time)"),
-    ('wgmma', 'dense forward'):
-        ('xla', "DENSE1 (H100, a55c8ffb2): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
-                "10 projections at 8192 tokens"),
-    ('wgmma', 'dense input_gradient'): ('xla', "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
-    ('wgmma', 'dense kernel_gradient'): ('xla', "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
-}
-"""The grouped GEMM's declared cells (`selection.Op.declared`), where an old route measured faster than the
-template, each with its receipt (owner, bible da64ae5): (instruction family, kind of call) to (the old
-route, the receipt). The template is the default on every other cell; a cell leaves the list once the
-template measures at least as fast on it (geomean over the receipt's rows). Nothing is ranked at runtime. A
-call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
-this list."""
-
-DECLARED_ONLY = _Need('declared', lambda case: DECLARED.get(case.cell, ('',))[0] == 'cutlass',
+DECLARED_ONLY = _Need('declared', lambda case: DECLARED.get(case.cell, (None,))[0] is CUTLASS,
                       "CUTLASS's launches run on the cells where they measured faster than the template "
                       "(`DECLARED`), and where a call names them", row='bible da64ae5', kind='measured')
 """What keeps CUTLASS's launches, a vendored production route where they win (bible §6, as FA3), off every
 other cell: the template, then Triton by legality, run those."""
 
 
-DENSE_MEASURED = _Need('dense', lambda case: not case.kind.startswith('dense'),
+DENSE_MEASURED = _Need('dense', lambda case: not case.kind.dense,
                       "Triton's dense launches measured slower than XLA's dot on every generation timed "
                       "(DENSE1, 10 projections at 8192 tokens: A100 1.735x to 1.947x, H100 1.149x to 1.738x)",
                       row='bible da64ae5', kind='measured')
@@ -1968,9 +1975,6 @@ of a kernel gradient, one name for both."""
 _GMMS = tuple(product for product, _ in IMPLEMENTATIONS)
 _TGMMS = tuple(gradient for _, gradient in IMPLEMENTATIONS)
 
-_NEEDS = {'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}
-"""Each old route's requirements beyond its launch's own: CUTLASS on its declared cells alone, Triton off the
-dense products the template's launches cannot run."""
 
 def _takes_pair(name: str, case: GroupedCase) -> bool:
     """Whether the launches `name` take the paired product `case` whole: Mosaic GPU's where a bundle takes it
@@ -2004,11 +2008,48 @@ class Apart:
 
 APART = Apart()
 
+MOSAIC = _launch_kernel(MosaicGmm.name)
+TRITON = _launch_kernel(Gmm.name, DENSE_MEASURED)
+"""Triton's launches, off the dense products the template's launches cannot run (`DENSE_MEASURED`)."""
+CUTLASS = _launch_kernel(CutlassGmm.name, DECLARED_ONLY)
+"""CUTLASS's launches, on their declared cells alone (`DECLARED_ONLY`)."""
+XLA = selection.Kernel[GroupedCase]('xla', (), generic=True)
+
+DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
+    ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
+        (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
+             "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),
+    ('mma.sync', Kind(dense=True, made=Made.INPUT_GRADIENT)):
+        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 2.881x, Triton 1.839x XLA's dot"),
+    ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
+        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot"),
+    ('wgmma', Kind(dense=False, made=Made.FORWARD)):
+        (CUTLASS, "PAIR1-h100 (c771912a6, H100 SXM, a pair of multiprocessors a cluster multicasting each "
+                 "group's matrix): the template 1.019x CUTLASS's time, geomean of 7 grouped MoE rows "
+                 "(worst 1.18x, deepseek-v3 down; 0.951x its unpaired time)"),
+    ('wgmma', Kind(dense=False, made=Made.INPUT_GRADIENT)):
+        (CUTLASS, "PAIR1-h100: 1.018x CUTLASS's time, geomean of 7 grouped rows (worst 1.05x; 0.918x "
+                 "its unpaired time)"),
+    ('wgmma', Kind(dense=True, made=Made.FORWARD)):
+        (XLA, "DENSE1 (H100, a55c8ffb2): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
+             "10 projections at 8192 tokens"),
+    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT)):
+        (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
+        (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
+}
+"""The grouped GEMM's declared cells (`selection.Op.declared`), where an old route measured faster than the
+template, each with its receipt (owner, bible da64ae5): (instruction family, kind of call) to (the old
+route's kernel, the receipt). The template is the default on every other cell; a cell leaves the list once the
+template measures at least as fast on it (geomean over the receipt's rows). Nothing is ranked at runtime. A
+call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
+this list."""
+
 GROUPED: selection.Op[GroupedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
-    *(_launch_kernel(launch.name, *_NEEDS.get(launch.name, ())) for launch in _GMMS),
+    MOSAIC, TRITON, CUTLASS,
     selection.Kernel[GroupedCase](APART.name, (_Need('single', lambda case: case.paired,
                                                 "the call is one product", row=INHERENT),), generic=True),
-    selection.Kernel[GroupedCase]('xla', (), generic=True)), declared=DECLARED)
+    XLA), declared=DECLARED)
 """The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
 where it takes the call, the TPU's launch on a TPU, Triton's where they refuse, else XLA's program, but a
 declared cell runs its old route (`DECLARED`); CUTLASS's launches on their declared cells and by name
@@ -2024,27 +2065,25 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     (`generation.BF16_GPU`, JAX's bound for its Pallas lowerings: a T4 fails to compile them), never a
     CPU's (a CPU process interprets a GPU's only as the GPU it states, `generation.assumed`)."""
     if launches is _TGMMS:
-        made = 'kernel_gradient exact' if options['exact_sums'] else 'kernel_gradient'
+        made = Made.EXACT_KERNEL_GRADIENT if options['exact_sums'] else Made.KERNEL_GRADIENT
     else:
-        made = 'input_gradient' if options['trans_rhs'] else 'forward'
+        made = Made.INPUT_GRADIENT if options['trans_rhs'] else Made.FORWARD
     # An FP8 call's cells are its own: `DECLARED`'s receipts timed 16-bit products, and XLA's dot of FP8
     # operands sums narrower than the FP8 contract holds (row 1625), so the template takes them by default.
-    eight = ' fp8' if any(jnp.dtype(argument.dtype) in EIGHT for argument in arguments[:2]) else ''
+    fp8 = any(eight(argument.dtype) for argument in arguments[:2])
     # A gathered call's cells are its own: no old route reads gathered rows, nor did a receipt time one. A
     # kernel gradient's tables (`tgmm_call`'s) are its fifth argument, a product's (`gmm_call`'s) its eighth.
     tabled = 4 if launches is _TGMMS else 7
     gathered = len(arguments) > tabled and arguments[tabled] is not None
     scattered = launches is not _TGMMS and len(arguments) > 8 and arguments[8] is not None
-    tables = f"{' gathered' if gathered else ''}{' scattered' if scattered else ''}"
-    kind = f"{'dense' if options['dense'] else 'grouped'} {made}{eight}{tables}"
+    kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered)
     call = base.call(launches, *arguments, **options)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
     paired = any(bound.arguments.get('paired') is not None for _, bound in call.bound.values())
     rows = _rows_of(launches, arguments)
-    return GroupedCase(placed, whole, product, rows, call, kind, paired=paired, gathered=gathered,
-                       scattered=scattered)
+    return GroupedCase(placed, whole, product, rows, call, kind, paired=paired)
 
 
 def _rows_of(launches, arguments) -> int:
@@ -2131,7 +2170,7 @@ def _on_platform(kernel, fallback, interpret_on_cpu: bool):
 def _as_multiplied(tokens: jax.Array, kernel: jax.Array, precision: PrecisionLike) -> tuple:
     """`tokens` and `kernel` as XLA's portable product multiplies them, and its precision (`xla_ragged_dot`,
     `xla_dot`)."""
-    if any(operand.dtype in EIGHT for operand in (tokens, kernel)):
+    if any(eight(operand.dtype) for operand in (tokens, kernel)):
         # FP8 codes are each exact in bfloat16: the product is theirs there, summed in the preferred type
         # (the FP8 contract's reference arm, testing.md, FP8 products). XLA's GPU compiler rewrites no
         # ragged dot of widened FP8 codes into its narrower-summing FP8 GEMM (sm90's lowering of this

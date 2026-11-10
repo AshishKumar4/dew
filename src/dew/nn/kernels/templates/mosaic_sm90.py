@@ -75,7 +75,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
 
     name = "wgmma"
     takes_tf32 = True
-    takes_fp8 = True
+    fp8_formats = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))
     rows = 64
     role_rows = 64
     widest_product = 256

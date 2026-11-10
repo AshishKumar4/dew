@@ -202,7 +202,7 @@ def _cutlass_takes(case: dict[str, str]) -> bool:
     installs the library a selection would ask for."""
     family = generation.family(case["generation"])
     declared = grouped_matmul.DECLARED.items()
-    if not any(cell[0] == family and kernel == "cutlass" for cell, (kernel, _) in declared):
+    if not any(cell[0] == family and kernel is grouped_matmul.CUTLASS for cell, (kernel, _) in declared):
         return False
     if case["form"] != "grouped":
         return False

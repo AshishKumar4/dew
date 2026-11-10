@@ -1140,17 +1140,19 @@ class Issuer[Accumulator](abc.ABC):
     fp32 shared-memory operands so; mma.sync's m16n8k8.tf32, the fork's from 0.12.0.1.post42); where not, a
     template splits fp32 operands into bf16 parts instead."""
 
-    takes_fp8: bool = False
-    """Whether its products take FP8 operands (`product.EIGHT`: E4M3, E5M2), both read K-major as Hopper's
-    warpgroup MMA reads them ('Only f16 WGMMA supports transposes'); mma.sync's FP8 forms are Ada's and
-    consumer Blackwell's, which no bundle of Dew's runs yet (row 3620)."""
+    fp8_formats: tuple = ()
+    """The 8-bit float formats its products take (`product.eight`), both operands read K-major as Hopper's
+    warpgroup MMA reads them ('Only f16 WGMMA supports transposes'): PTX's e4m3 and e5m2 on warpgroup MMA
+    and tcgen05; none on mma.sync, whose FP8 forms are Ada's and consumer Blackwell's, which no bundle of
+    Dew's runs yet (row 3620)."""
 
-    takes_block_scales: bool = False
-    """Whether its products scale each 32 depths of their operands by an E8M0 scale in the instruction (an MX
-    product's, `scaled_products`): tcgen05's block-scaled MMA; no other family's products do (row 4519)."""
+    block_formats: tuple = ()
+    """The operand formats its block-scaled products take, each block of their depth scaled in the
+    instruction (an MX or NVFP4 product's, `scaled_products`): tcgen05's (kind::mxf8f6f4's e4m3 and e5m2,
+    kind::mxf4nvf4's e2m1); none on any other family (row 4519)."""
 
     def scaled_products(self, acc, lhs, rhs, scales: tuple):
-        """`products` of block-scaled operands (`takes_block_scales`), `scales` the step's two scale slots."""
+        """`products` of block-scaled operands (`block_formats`), `scales` the step's two scale slots."""
         raise NotImplementedError(f"{self.name}'s products take no block scales")
 
     transposes_tf32: bool = False

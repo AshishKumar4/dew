@@ -348,8 +348,8 @@ def test_every_pallas_kernel_a_measured_cell_runs_has_a_lowering_probe():
     GPU session's compile."""
     from dew.nn.kernels import grouped_matmul, norm_swiglu
 
-    named = {(op.choice, kernel) for op in (norm_swiglu.NORM, norm_swiglu.SWIGLU, grouped_matmul.GROUPED)
-             for kernel, _ in op.declared.values() if kernel in PALLAS_CHOICES}
+    named = {(op.choice, kernel.name) for op in (norm_swiglu.NORM, norm_swiglu.SWIGLU, grouped_matmul.GROUPED)
+             for kernel, _ in op.declared.values() if kernel.name in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
 
 

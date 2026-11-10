@@ -323,7 +323,7 @@ itself; and keys wider than the port takes in their dtype. Packed documents take
 stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {}
+PORT_CELLS: dict[tuple[str | None, str], tuple[Kernel[PortCase], str]] = {}
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows Dew's port
 of fla's kernels (`fla_rule`; "the port" below) faster than the recurrence template, each its old route's
 kernel and that receipt; every time below sets the template against that port, not against upstream fla's
@@ -1375,13 +1375,16 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     return select(SCAN, case).kernel
 
 
-SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS)
+"""Dew's port of mamba_ssm's SSD kernels (`mamba_ssd.ssd_scan`)."""
+
+SCAN_CELLS: dict[tuple[str | None, str], tuple[Kernel[ScanCase], str]] = {
     ('wgmma', 'training'): (
-        'pallas', "on an H100 80GB HBM3, the port's forward and gradient 1.592 ms against the template's "
+        SSD_PORT, "on an H100 80GB HBM3, the port's forward and gradient 1.592 ms against the template's "
                   "1.877 on Nemotron-H 4B's SSD and 0.660 against 0.820 on 30B's, its query/key launch "
                   "0.385 and 0.160 of them (window-h100-c70aaa8-b8109ee)"),
     ('mma.sync', 'training'): (
-        'pallas', "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
+        SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
                   "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
 }
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
@@ -1399,7 +1402,7 @@ the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones
 the template's refusal, not a cell."""
 
 SCAN: Op[ScanCase] = Op(Choice.SSD, (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
-                               Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
+                               SSD_PORT, Kernel('tpu', TPU_SCAN_SUPPORTS),
                                Kernel('xla', (), generic=True)), declared=SCAN_CELLS)
 """The rated scan's selector: on a declared port cell (`SCAN_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the

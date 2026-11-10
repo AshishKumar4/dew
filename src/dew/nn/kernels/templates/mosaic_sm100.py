@@ -372,7 +372,7 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
 
     takes_register_left = False
 
-    takes_block_scales = True
+    block_formats = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2), jnp.dtype(jnp.float4_e2m1fn))
 
     operands_in_registers = False
 
@@ -842,7 +842,7 @@ class Tcgen05PairRings(Tcgen05Rings):
     cluster = PAIRED.ctas
     pairs_product = True
     widest_product = PRODUCT_COLUMNS // PAIRED.ctas
-    takes_block_scales = False
+    block_formats = ()
     gathers_rows = False
 
 
@@ -903,7 +903,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
     name = "tcgen05.chunks"
     # Mosaic GPU's tcgen05 lowering takes no TF32 operand ("Unsupported input element type: tf32",
     # jsf-gate100b): an fp32 product takes bf16 parts.
-    takes_fp8 = True
+    fp8_formats = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))
     takes_register_left = False
     # A B200's training forward on three consumers at 64 x 64, width 64, priced 158 of 160 registers with
     # its products read back twice and spilled 20 bytes (et-h1gate3): its products' addresses and phase.

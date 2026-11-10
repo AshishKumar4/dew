@@ -31,6 +31,7 @@ accumulator only where the epilogue's VJP reads it.
 """
 
 import dataclasses
+import enum
 import functools
 import math
 
@@ -452,6 +453,14 @@ NVFP4_ROW = 'ledger 3621'
 """The NVFP4 product's in-stage decode (K51)."""
 
 
+class PackedRows(enum.Enum):
+    """An NVFP4 call's size as its receipts measure it (`PackedCase.cell`): decode-sized (at most
+    `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
+
+    DECODE = 'decode'
+    PREFILL = 'prefill'
+
+
 @dataclasses.dataclass(frozen=True)
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
@@ -461,11 +470,11 @@ class PackedCase:
     rows: int
 
     @property
-    def cell(self) -> tuple[str, str]:
-        """The cell a receipt measures (`selection.Celled`): the device's generation and whether the call is
-        decode-sized (at most `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
+    def cell(self) -> tuple[str, PackedRows]:
+        """The cell a receipt measures (`selection.Celled`): the device's generation and the call's size
+        (`PackedRows`)."""
         return (generation.device_generation(),
-                'decode' if self.rows <= NVFP4_DECODE_ROWS else 'prefill')
+                PackedRows.DECODE if self.rows <= NVFP4_DECODE_ROWS else PackedRows.PREFILL)
 
 
 NVFP4_DECODE_ROWS = 64
@@ -484,9 +493,17 @@ PACKED_FASTER_SM90 = (
     "against 71-250 MB; at 4096 rows 5.2-5.3x slower, its stage decode unhidden under the products")
 """The receipt behind the packed NVFP4 kernel's declared H100 cell (`NVFP4_CELLS`)."""
 
-NVFP4_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('sm80', 'decode'): ('packed', PACKED_FASTER),
-    ('sm90', 'decode'): ('packed', PACKED_FASTER_SM90),
+PACKED = selection.Kernel[PackedCase]('packed', (
+    selection.Requirement(
+        'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
+        "product here: a Mosaic GPU family's, its depth whole 256s and its width whole 64-column tiles",
+        NVFP4_ROW),
+))
+"""The packed kernel: the template's mainloop decoding each stage of the packed matrix in place."""
+
+NVFP4_CELLS: dict[tuple[str | None, PackedRows], tuple[selection.Kernel[PackedCase], str]] = {
+    ('sm80', PackedRows.DECODE): (PACKED, PACKED_FASTER),
+    ('sm90', PackedRows.DECODE): (PACKED, PACKED_FASTER_SM90),
 }
 """The NVFP4 product's declared cells (`selection.Op.declared`), (device generation, call size) to the
 packed kernel and its receipt: a literal of them, which the selector reads and thresh's declared-set seam
@@ -494,13 +511,7 @@ registers (.thresh/thresh.cue)."""
 
 
 NVFP4: selection.Op[PackedCase] = selection.Op(generation.Choice.NVFP4, (
-    selection.Kernel('packed', (
-        selection.Requirement(
-            'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
-            "product here: a Mosaic GPU family's, its depth whole 256s and its width whole 64-column tiles",
-            NVFP4_ROW),
-        )),
-    selection.Kernel('xla', (), generic=True)), lambda case: 'xla', declared=NVFP4_CELLS)
+    PACKED, selection.Kernel('xla', (), generic=True)), lambda case: 'xla', declared=NVFP4_CELLS)
 """An NVFP4 product's selector (`nvfp4_product`): the matrix decoded once a call and its product (`gemm`),
 but the template's mainloop decoding each stage of the packed matrix in place (`mosaic_gpu.gmm`'s `scales`)
 where a receipt measured it faster (a decode-sized call on an A100 or an H100: `NVFP4_CELLS`) or it is

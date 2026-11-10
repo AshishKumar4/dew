@@ -545,26 +545,34 @@ attention at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100); a longer fp32
 (`AttentionCase.cell`)."""
 
 
-DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
+FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS)
+XLA = Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
+INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
+    'spans_only', lambda case: not case.spans_only,
+    "the call's visibility is spans alone, which a differentiated call's xla attention would build "
+    "densely: the template takes it", row=INHERENT), _FITS))
+"""The template for a call no derivative is taken of and xla's attention for one differentiated."""
+
+DECLARED: dict[tuple[str | None, str], tuple[Kernel[AttentionCase], str]] = {
     ('wgmma', 'attention'): (
-        'flash', "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
+        FLASH, "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
                  "2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): forward 0.588 "
                  "against 0.761 ms causal and 1.094 against 1.296 full, training forward and backward 2.53 "
                  "against 11.45 causal and 4.49 against 16.48 full (receipts DERIVED-benchx-h100, "
                  "BWDSTAGES-h100); a training step's attention at Qwen3-8B's widths, 2 x 4096 bf16, 2.44 "
                  "against 11.38 ms causal and 4.26 against 15.61 full (CELLS-h100)"),
     ('wgmma', 'float32 attention'): (
-        'inference', "jax.nn's xla attention measured faster than the template's fp32 route on an H100 for a "
+        INFERENCE, "jax.nn's xla attention measured faster than the template's fp32 route on an H100 for a "
                      "training step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms "
                      "causal and 2.19 against 46.21 full (CELLS-h100); the template's fp32 forward as bf16 "
                      "parts faster than xla's for a call no derivative is taken of where `template_infers` "
                      "(M-ET-16, W18-gh200-1)"),
     ('mma.sync', 'attention'): (
-        'flash', "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
+        FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
                  "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
     ('mma.sync', 'float32 attention'): (
-        'xla', "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, did not compile on an "
+        XLA, "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, did not compile on an "
                "A100 (its Triton launch asked 182272 bytes of shared memory, past the 166912 a block holds: "
                "CELLS-a100), where jax.nn's xla attention runs; it compiles since (147456 bytes, causal and "
                "full, et-fp32a100 at 4f10564940), and its time against xla's is M-ET-28's to measure, as "
@@ -654,17 +662,14 @@ def _hosted(kernel: str) -> str:
 
 
 ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
-    Kernel[AttentionCase]('flash', FLASH_SUPPORTS),
+    FLASH,
     Kernel[AttentionCase]('triton', TRITON_SUPPORTS),
     Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS)),
     Kernel[AttentionCase]('tpu', TPU_SUPPORTS),
-    Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True),
+    XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
-    Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
-        'spans_only', lambda case: not case.spans_only,
-        "the call's visibility is spans alone, which a differentiated call's xla attention would build "
-        "densely: the template takes it", row=INHERENT), _FITS)),
+    INFERENCE,
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
@@ -689,12 +694,15 @@ _FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel a
                 "decode at every fp32 decode shape timed, its products IEEE fp32 as theirs (`highest`; wall "
                 "a step over 50 steps in one loop, interleaved rounds, 1 to 128 rows over 4096 and 32768 "
                 "keys, 32 or 16 query heads over 8, 128 or 64 wide): {}")
-DECODE_DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('sm80', 'float32 decode'): ('xla', _FP32_DECODE.format(
+DECODE_XLA = Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True)
+"""A decode step's xla attention (the folded attention, `folded_attention`)."""
+
+DECODE_DECLARED: dict[tuple[str | None, str], tuple[Kernel[AttentionCase], str]] = {
+    ('sm80', 'float32 decode'): (DECODE_XLA, _FP32_DECODE.format(
         "on an A100 2.63 to 3.64 times the decode kernel's speed, 51.2 against 140.5 us at one row over "
         "4096 keys (ET-DFP32B-a100), and 25 to 161 times the template's, 52.5 against 5215.5 us there "
         "(ET-4312-a100)")),
-    ('sm90', 'float32 decode'): ('xla', _FP32_DECODE.format(
+    ('sm90', 'float32 decode'): (DECODE_XLA, _FP32_DECODE.format(
         "on an H100 2.75 to 3.60 times the decode kernel's speed, 23.8 against 72.4 us at one row over "
         "4096 keys (ET-DFP32B-h100), and 31 to 250 times the template's, 23.6 against 3669.2 us there "
         "(ET-4312-h100)")),
@@ -710,7 +718,7 @@ DECODE = Op[AttentionCase](Choice.DECODE, (
     Kernel[AttentionCase]('decode', decode_attention.SUPPORTS),
     # A decode step takes no gradient, so its cuDNN forward runs under deterministic ops too.
     Kernel[AttentionCase]('cudnn', (*CUDNN_FORWARD_SUPPORTS, decode_attention.PRODUCTS)),
-    Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
+    DECODE_XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
 ), _decode_preferred, _hosted, DECODE_DECLARED)

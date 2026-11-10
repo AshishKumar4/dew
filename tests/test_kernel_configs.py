@@ -411,7 +411,7 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
 gradient, its stages read as loaded (`mosaic_gpu.rows_unstaged`)."""
 
 FP8_FORMS = ("forward fp8",)
-"""The FP8 forms a family whose products take FP8 operands emits (`Family.takes_fp8`)."""
+"""The FP8 forms a family whose products take FP8 operands emits (`Family.fp8_formats`)."""
 
 EXACT_FORMS = ("kernel gradient exact fp32", "forward exact fp32", "input gradient exact fp32",
                "dense kernel gradient exact fp32")
@@ -618,7 +618,7 @@ def _emitted_forms(family) -> set[str]:
     none without a bundle, the exactly summed ones (every family's model counts a running sum), the hooked
     ones where it counts what they hold (`Family.counts_hooks`), the
     paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
-    take FP8 (`Family.takes_fp8`); where its consumers do not issue their products, none whose step prepares
+    take FP8 (`Family.fp8_formats`); where its consumers do not issue their products, none whose step prepares
     them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
     first, an exactly summed step takes its product apart); at every projection, its widths padded to whole
     tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
@@ -627,7 +627,7 @@ def _emitted_forms(family) -> set[str]:
     paired = family.takes_pairs and (family.counts_hooks or not family.feeds_itself)
     forms = {*PLAIN_FORMS, *(PAIRED_FORMS if paired else ()), *EXACT_FORMS,
              *(HOOKED_FORMS if family.counts_hooks else ()),
-             *(FP8_FORMS if family.takes_fp8 else ())}
+             *(FP8_FORMS if family.fp8_formats else ())}
     if not family.issues_in_consumers:
         # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`).
         forms = {form for form in forms
