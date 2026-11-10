@@ -5,7 +5,9 @@ the frozen references are the batches the old loaders read. Images pin the publi
 batches pin host Coordinates; packed text pins documents cut into pieces that share their boundary
 token, where 7ad0d4079 lost each piece's first next-token target. The other cases pin 7ad0d4079. A
 host batch's documents' firsts (`Coordinates.firsts`, row 1923), which no old loader built, are Dew's
-own, recorded beside the frozen fields they derive from (its starts), every other field unchanged.
+own, recorded beside the frozen fields they derive from (its starts), every other field unchanged. So
+are its finals (`Coordinates.finals`: the trailing slots of a row that hold targets alone), recorded as
+the 1 every old loader's rows had (its last id alone a target).
 """
 
 import functools
