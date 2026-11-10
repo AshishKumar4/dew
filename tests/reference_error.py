@@ -1516,11 +1516,22 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
         return np.int32(seed), {**drawn, **{name: value[seed] for name, value in replayed.items()}}
 
     def lookup(values):
-        looked = jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
-                                              for name, value in values.items()})
+        # A draw's recorded leaves are read from the host at the draw's index, in the dtypes the caller's
+        # context holds them in. A recording is never a program's constants, which exhaust a host's memory
+        # where a weighed recording keeps thousands of draws whole. An arm that wraps this one and is traced
+        # reads at run time (`jax.pure_callback`); JAX keeps a callback as long as its program, so the
+        # gate's own read, its index in hand, goes through none.
+        def read(at):
+            return {name: value[int(at)] for name, value in values.items()}
 
         def recorded(index, inputs):
-            return looked(index, inputs)
+            if not isinstance(index, jax.core.Tracer):
+                return {name: jnp.asarray(value) for name, value in read(index).items()}
+            kept = {name: jax.ShapeDtypeStruct(value.shape[1:], jax.dtypes.canonicalize_dtype(value.dtype))
+                    for name, value in values.items()}
+            return jax.pure_callback(
+                lambda at: {name: np.asarray(value, kept[name].dtype) for name, value in read(at).items()},
+                kept, index, vmap_method="sequential")
         recorded.recorded = True
         return recorded
 
