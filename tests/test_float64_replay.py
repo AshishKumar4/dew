@@ -178,7 +178,8 @@ def test_what_a_programs_results_do_not_read_is_not_replayed():
 
 
 REFUSED = {
-    "float": lambda x: jnp.tan(x),
+    # A decomposition: no operation whose arithmetic JAX states entry by entry.
+    "float": lambda x: jnp.linalg.cholesky(jnp.diag(x)),
     "complex": lambda x: jnp.cos(x.astype(jnp.complex64)).real,
     # A call whose integer boundary hides float arithmetic inside.
     "hidden": lambda x: jax.lax.while_loop(lambda carry: carry[0] < 2, lambda carry: (
@@ -193,6 +194,20 @@ def test_a_float_operation_without_a_float64_rule_refuses(name):
     with pytest.raises(NotImplementedError):
         float64_replay(REFUSED[name])(np.ones(3, np.float32))
 
+
+
+def test_a_padded_product_replays_in_float64():
+    """A program that pads a float before it multiplies and sums, as Dew's blocked CPU product pads a depth
+    to whole blocks in a library process's arithmetic, replays in float64: what the program computes on
+    float64 inputs. The replay named the operations it knew and `pad` was not among them, so a model's
+    initial parameters could not be replayed in a user's arithmetic (tests/test_parallelism_matrix.py)."""
+    def padded(x):
+        return jnp.sum(jnp.pad(x, (0, 5)).reshape(2, -1) ** 2, axis=0)
+
+    x = np.random.default_rng(0).normal(size=11).astype(np.float32)
+    with jax.enable_x64(new_val=True):
+        wide = padded(jnp.asarray(x, jnp.float64))
+    np.testing.assert_array_equal(np.asarray(float64_replay(padded)(x)), np.asarray(wide))
 
 
 @pytest.mark.parametrize("name", sorted(DRAWS))
