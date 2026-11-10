@@ -235,8 +235,9 @@ class TrialFinished:
     @classmethod
     def read(cls, row: Mapping[str, object]) -> TrialFinished:
         """The trial a ledger's row holds as `tracker_json` wrote it, each field read as it declares: its
-        score a number or a nonfinite one's spelling (`reported_number`)."""
-        readers = {int: integer, str: text, float: reported_number}
+        score any value `float` reads, a JSON number, a nonfinite one's spelling (`_NONFINITE`'s are
+        Python's own) or a number's string."""
+        readers = {int: integer, str: text, float: lambda value, key: float(value)}
         hints = typing.get_type_hints(cls)
         return cls(**{field.name: readers.get(hints[field.name], record)(row[field.name], field.name)
                       for field in dataclasses.fields(cls)})

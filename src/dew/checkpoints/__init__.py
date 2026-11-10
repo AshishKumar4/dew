@@ -759,7 +759,8 @@ def _from_tree_record(recorded: JSON):
         listed = entry["list"]
         assert isinstance(listed, list), "a list record holds a list"
         return [_from_tree_record(value) for value in listed]
-    facts = from_record(_ArrayFacts, entry)
+    # Its dtype is the spelling a step's metadata holds ("key" a key's), read as written.
+    facts = from_record(_ArrayFacts, entry, dtypes=False)
     return jax.ShapeDtypeStruct(facts.shape,
                                 jax.random.key(0).dtype if facts.dtype == "key" else np.dtype(facts.dtype))
 
