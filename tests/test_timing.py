@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tool_support import StandInSession, git, load
+from tool_support import StandInSession, git, load, run_from
 
 TIMING = Path(__file__).resolve().parents[1] / "tools/timing.py"
 
@@ -111,7 +111,8 @@ def test_a_windows_verdict_pairs_each_arms_round_with_the_references_and_leaves_
     rounds past the warm-up judged against the A/A's by `dew.telemetry.benchmark.judged` at 0.95 (its least
     and greatest round, rank 1): here a fast warm-up round of the arm, which judged would hold 1, decides
     nothing, and the arm's rounds lie apart from 1 and from the A/A's."""
-    timing = load("timing")
+    with run_from("timing", "tools") as timing:
+        pass
     # Values a binary float holds exactly, so every ratio is its literal: the reference 8 ms each round, the
     # A/A about it, the arm about 10, its warm-up round (index 0) at 4.
     measured = {"ref": [8.0] * 7, "ref~aa": [8.0, 8.0, 7.5, 8.5, 8.0, 9.0, 7.0],
@@ -135,11 +136,7 @@ def test_a_windows_verdict_pairs_each_arms_round_with_the_references_and_leaves_
 def test_the_dense_cells_build_every_product_for_each_implementation_on_the_cpu():
     """The dense builder's cells compile on the CPU through XLA's dot (a GPU's own launches are its window's),
     and every product's draw meets its call."""
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("timing_cases", TIMING.with_name("timing_cases.py"))
-    cases = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cases)
+    cases = load("timing_cases")
     cases.TOKENS = 16
     cases.DENSE = {"tiny": (32, 48)}
     shapes = {"forward": (16, 48), "input_gradient": (16, 32), "kernel_gradient": (32, 48)}

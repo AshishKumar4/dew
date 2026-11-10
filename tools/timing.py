@@ -36,7 +36,6 @@ import contextlib
 import functools
 import hashlib
 import importlib
-import importlib.util
 import json
 import math
 import os
@@ -45,6 +44,8 @@ import sys
 import time
 from pathlib import Path
 from typing import TextIO
+
+from reference_source import loaded
 
 TOOLS = Path(__file__).resolve().parent
 INSTRUMENT = TOOLS.parent / "src/dew/telemetry/benchmark.py"
@@ -81,9 +82,7 @@ def built(case: dict, cell: dict, arm: dict) -> tuple:
     tree)."""
     source, _, function = case["builder"].partition(":")
     if source.endswith(".py"):
-        spec = importlib.util.spec_from_file_location(f"_timing_builder_{Path(source).stem}", source)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = loaded(f"_timing_builder_{Path(source).stem}", source)
     else:
         module = importlib.import_module(source)
     return getattr(module, function)(cell, arm.get("implementation"))
@@ -94,12 +93,7 @@ def instrument():
     """dew.telemetry.benchmark as the window holds it, loaded once from its file under a name of its own (it
     imports only jax, numpy and the standard library), so an arm's tree's own copy is never read, and Dew
     itself is not imported by a process that has opened a backend (its numerical policy would warn)."""
-    spec = importlib.util.spec_from_file_location("_timing_instrument",
-                                                  os.environ.get("DEW_TIMING_INSTRUMENT", INSTRUMENT))
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return loaded("_timing_instrument", os.environ.get("DEW_TIMING_INSTRUMENT", INSTRUMENT))
 
 
 def worker(clock: str) -> int:

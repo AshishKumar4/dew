@@ -9,9 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from tool_support import REPO_ROOT, load
+from tool_support import REPO_ROOT, run_from
 
-environments = load("environments")
+with run_from("environments", "tools") as environments:
+    pass
 
 UV = """#!/bin/sh
 echo "$*" >> {asked}

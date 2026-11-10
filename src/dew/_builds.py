@@ -5,6 +5,7 @@ file by its path to choose a checkout's lock before any environment exists to
 import Dew from, and `dew._devices` asks it at `import dew`.
 """
 
+import os
 import re
 
 CUDA_BUILDS = (("cuda13", 580, (7, 5), 13000), ("cuda12", 525, (5, 2), 12000))
@@ -58,3 +59,11 @@ def newest_build(gpus: tuple[str, tuple[int, int]] | None, cuda: int | None = No
     if gpus is None:
         return None
     return next((name for name, _, _, _ in CUDA_BUILDS if runs_on(name, *gpus, cuda)), None)
+
+
+def dew_cache_dir() -> str:
+    """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew. Dew's caches (`dew._cache`) and
+    tools/environments.py's environments, which cannot import Dew, keep under it."""
+    return os.path.expanduser(
+        os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
+    )

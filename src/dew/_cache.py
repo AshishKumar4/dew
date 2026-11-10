@@ -18,15 +18,8 @@ from pathlib import Path
 
 import jax
 
+from dew._builds import dew_cache_dir
 from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
-
-
-def dew_cache_dir() -> str:
-    """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew."""
-    return os.path.expanduser(
-        os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
-    )
-
 
 VERSION_FILE = "_version.py"
 """The release's version (`dew._version`), which no code of Dew's computes from: no part of its

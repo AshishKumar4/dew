@@ -21,8 +21,8 @@ yet: tools/perf_gate.py builds each tree's with it, and so do GPU sessions.
 
 import argparse
 import fcntl
+import functools
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -33,23 +33,22 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "dew" / "environments"
-"""Where the environments are kept by default, beside Dew's other caches (`dew._cache.dew_cache_dir`)."""
+from reference_source import loaded
+
+
+@functools.cache
+def _builds():
+    """dew._builds, this checkout's own, loaded by its path: Dew's
+    package imports JAX, which no environment holds yet."""
+    return loaded("dew_builds", Path(__file__).resolve().parents[1] / "src" / "dew" / "_builds.py")
+
+
+CACHE = Path(_builds().dew_cache_dir()) / "environments"
+"""Where the environments are kept by default, beside Dew's other caches (`dew._builds.dew_cache_dir`)."""
 
 
 class Unlocked(Exception):
     """A checkout without the files its environment is built from: one older than the locks."""
-
-
-def _builds():
-    """dew._builds, this checkout's own, loaded by its path: Dew's
-    package imports JAX, which no environment holds yet."""
-    path = Path(__file__).resolve().parents[1] / "src" / "dew" / "_builds.py"
-    spec = importlib.util.spec_from_file_location("dew_builds", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def machine_lock() -> str:
