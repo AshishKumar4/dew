@@ -2,7 +2,7 @@
 weights, in float32 and float64: the reference arm of tools/venv_reference.py's `laya` site (its protocol
 tools/reference_worker.py), run in an environment holding Laya, transformers 5.16.1 and torch, on the CPU.
 
-    PYTHONPATH=tools python tools/laya_worker.py laya    `IN OUT` lines on stdin, each `done`
+    PYTHONPATH=src:tools python tools/laya_worker.py laya    `IN OUT` lines on stdin, each `done`
 
 IN holds each case's weights, `<case>.param.<name>` under their names in Laya's `model.safetensors`; the
 tiny checkpoint's encoder, tokenizer and config (tests/fixtures/laya/tiny) give the rest. OUT gets each

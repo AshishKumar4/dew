@@ -26,7 +26,6 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
-import sys
 from pathlib import Path
 
 import jax
@@ -34,11 +33,9 @@ import jax.numpy as jnp
 import numpy as np
 import torch
 
+from _dew_torch.precision import float64
 from tools import flax_precision
 from tools.diffusers_reference_helpers import restore_transformers_names
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from _dew_torch.precision import float64
 
 # Diffusers' own classes read what Dew wrote, through its pipeline modules.
 restore_transformers_names()

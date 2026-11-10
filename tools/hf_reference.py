@@ -70,7 +70,6 @@ What lands in tests/fixtures/hf:
 import argparse
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -157,8 +156,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 )
 
 from dew.interop.verify import BATCH, probe_ids, reference_logits, scatter_weights
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 REAL_MODEL = "Qwen/Qwen3-0.6B"

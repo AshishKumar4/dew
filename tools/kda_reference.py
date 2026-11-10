@@ -18,8 +18,6 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 REVISION = "93c8b7b485963a10800c91f55304db6be211c2bd"
 SOURCE = f"https://raw.githubusercontent.com/huggingface/transformers/{REVISION}/src/transformers/models/glm5_next/modeling_glm5_next.py"
 RECORDED = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "kda" / "recorded_rules.npz"

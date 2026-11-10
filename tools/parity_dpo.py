@@ -16,7 +16,7 @@ in float64, the exact values both are measured from
 
 Run with trl 1.12.0 and Torch 2.14.0 CPU (see tools/parity_grpo.py for the
 environment):
-  /tmp/rlref/bin/python tools/parity_dpo.py
+  PYTHONPATH=src /tmp/rlref/bin/python tools/parity_dpo.py
 """
 
 from __future__ import annotations

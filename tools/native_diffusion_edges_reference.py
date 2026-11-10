@@ -28,7 +28,6 @@ from diffusers import (
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import require
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64, float64_twin
 
 

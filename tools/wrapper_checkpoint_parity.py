@@ -9,7 +9,6 @@ import argparse
 import dataclasses
 import functools
 import json
-import sys
 from pathlib import Path
 
 import jax
@@ -20,8 +19,6 @@ from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 from dew._accuracy import distance
 from dew.interop import Pretrained
 from dew.sampling.text import Sampling
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 CONTINUATION = 3
 """Greedy tokens each batch continues by, Dew's and the reference's."""

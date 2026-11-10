@@ -28,8 +28,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save

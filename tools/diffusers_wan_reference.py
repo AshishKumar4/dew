@@ -48,7 +48,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from diffusers_reference_helpers import recording, restore_transformers_names
 from reference_releases import RELEASES
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import default_dtype, float64, float64_twin, widened
 
 COHORT = "diffusers-wan"

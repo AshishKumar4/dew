@@ -13,7 +13,6 @@ whether each ended on EOS (`ended_<i>`), in float32 and in float64 (the float64 
 
 import contextlib
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -21,7 +20,6 @@ from beam_reference import SETTINGS, searched
 from numerics_reference import FIXTURES, decoder
 from reference_worker import drawn, serve
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64, float64_twin
 
 
