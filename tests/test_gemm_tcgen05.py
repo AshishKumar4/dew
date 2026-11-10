@@ -1,26 +1,42 @@
 """The GEMM template's shared mainloop (`mosaic_gpu.gmm`) on Blackwell's tcgen05 (`mosaic_sm100.RINGS`, the
-fold of the old Blackwell GEMM mainloop into it, template push piece 7): interpreted as an sm100 on a CPU, and
-run on a B200 or a B300 itself (tests/test_gpu_gemm.py's cell)."""
+fold of the old Blackwell GEMM mainloop into it, template push piece 7, and its two-CTA pair,
+`mosaic_sm100.PAIR`): interpreted as an sm100 on a CPU, compiled for a compile-only B200, and run on a B200 or
+a B300 itself (tests/test_gpu_gemm.py's cells)."""
 
+import dataclasses
+
+import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from generation_support import INTERPRETS
+from reference_error import assert_as_exact
 
-from dew.nn.kernels import gemm, generation, grouped_matmul
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+TILE = mosaic_gpu.Tiles(128, 128, 64, 4, 1, family='tcgen05')
+"""A legal tcgen05 tile of every product `_on_tcgen05` pins (`tuning.pinned`): a CTA's 128 rows by 128
+columns, four 64-deep stages."""
+TILES = (mosaic_gpu.Tiles(128, 128, 64, 2, 1, family='tcgen05'),
+         mosaic_gpu.Tiles(128, 256, 64, 3, 2, family='tcgen05'))
+"""A tile of each accumulator width, its accumulators within the 512 columns of tensor memory, its ring within
+a B200's shared memory beside two outputs' staging (four stages asked 245,900 of its 232,448 bytes,
+gate-2738-gemm-b200, row 4449)."""
+PAIRED = mosaic_gpu.Tiles(128, 128, 64, 4, 1, cluster=2, family='tcgen05.pair')
+"""A pair of CTAs' tile (`mosaic_sm100.PAIR`: 256 x 256, each CTA's accumulators its 128 rows by the pair's
+256 columns). Mosaic GPU's interpreter models no collective tcgen05 product, so it is compiled here and run
+on a B200 (and in nvgpu-lean's simulator) alone."""
 
 
 def _on_tcgen05(*, interpret: bool) -> None:
-    """The shared GEMM mainloop (`mosaic_gpu.gmm`) on tcgen05's bundle (`mosaic_sm100.RINGS`), over integers
-    from -1 to 1 at a depth of 256 (every sum at most 256, which a bf16 output holds exactly): a grouped
-    forward, a grouped
-    input gradient (its matrix read transposed) and a dense forward, each exactly numpy's, routed to the
-    template on a 128-row tile of tcgen05's; a grouped kernel gradient, its stages rewritten by a role of
-    their own, and a dense one into bf16 and into fp32, its stages read as loaded (row 5209), each routed to
-    the template and exactly numpy's too. Interpreted as an sm100 on a CPU, or run on the Blackwell GPU
-    itself."""
+    """The shared GEMM mainloop (`mosaic_gpu.gmm`) on tcgen05's bundle (`mosaic_sm100.RINGS`), the template's
+    launch named and tcgen05's tile pinned (`TILE`), over integers from -1 to 1 at a depth of 256 (every sum
+    at most 256, which a bf16 output holds exactly): a grouped forward, a grouped input gradient (its matrix
+    read transposed) and a dense forward, each exactly numpy's; a grouped kernel gradient, its stages
+    rewritten by a role of their own, and a dense one into bf16 and into fp32, its stages read as loaded (row
+    5209), each exactly numpy's too. Interpreted as an sm100 on a CPU, or run on the Blackwell GPU itself."""
     sizes = jnp.asarray([128, 200, 56], jnp.int32)
     starts = np.cumsum([0, *np.asarray(sizes)])
 
@@ -44,38 +60,25 @@ def _on_tcgen05(*, interpret: bool) -> None:
         "dense forward": (lambda: summed(x, w[0], None),
                           np.asarray(x, np.float32) @ np.asarray(w[0], np.float32)),
     }
-    derived = []
-    original = mosaic_gpu.gmm
-
-    def recorded(*args, tiles, **options):
-        derived.append(tiles)
-        return original(*args, tiles=tiles, **options)
-
-    for name, (call, expected) in calls.items():
-        derived.clear()
-        with generation.routes() as routes, pytest.MonkeyPatch.context() as patched:
-            patched.setattr(mosaic_gpu, "gmm", recorded)
-            got = np.asarray(jax.jit(call)(), np.float32)
-        assert {route.kernel for route in routes} == {"mosaic"}, name
-        assert {(tile.family, tile.block_m // tile.warpgroups) for tile in derived} == {("tcgen05", 128)}
-        np.testing.assert_array_equal(got, expected, err_msg=name)
-    with generation.routes() as routes:
+    # tcgen05's tile named for every launch (`tuning.pinned`, a pin its legality checks), the template's
+    # launch named for the product.
+    pinned = {grouped_matmul.MosaicGmm: TILE, grouped_matmul.MosaicTgmm: TILE}
+    with generation.chosen(grouped_matmul="mosaic"), tuning.pinned(pinned):
+        for name, (call, expected) in calls.items():
+            np.testing.assert_array_equal(np.asarray(jax.jit(call)(), np.float32), expected, err_msg=name)
         got = np.asarray(jax.jit(lambda: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="default",
                                                      interpret_on_cpu=interpret))())
-    assert {route.kernel for route in routes} == {"mosaic"}
-    expected = np.stack([np.asarray(x[starts[g]:starts[g + 1]], np.float32).T
-                         @ np.asarray(dy[starts[g]:starts[g + 1]], np.float32) for g in range(3)])
-    np.testing.assert_array_equal(got, expected, err_msg="kernel gradient")
-    # 256 rows: every sum at most 256, which a bf16 output holds exactly.
-    rows = 256
-    for out_dtype in (jnp.bfloat16, jnp.float32):
-        with generation.routes() as routes:
+        expected = np.stack([np.asarray(x[starts[g]:starts[g + 1]], np.float32).T
+                             @ np.asarray(dy[starts[g]:starts[g + 1]], np.float32) for g in range(3)])
+        np.testing.assert_array_equal(got, expected, err_msg="kernel gradient")
+        # 256 rows: every sum at most 256, which a bf16 output holds exactly.
+        rows = 256
+        for out_dtype in (jnp.bfloat16, jnp.float32):
             got = np.asarray(jax.jit(lambda out_dtype=out_dtype: gemm.gemm_t(
                 x[:rows], dy[:rows], None, out_dtype=out_dtype, precision="default",
                 interpret_on_cpu=interpret)[0])(), np.float32)
-        assert {route.kernel for route in routes} == {"mosaic"}, out_dtype
-        expected = np.asarray(x[:rows], np.float32).T @ np.asarray(dy[:rows], np.float32)
-        np.testing.assert_array_equal(got, expected, err_msg=f"dense kernel gradient into {out_dtype}")
+            expected = np.asarray(x[:rows], np.float32).T @ np.asarray(dy[:rows], np.float32)
+            np.testing.assert_array_equal(got, expected, err_msg=f"dense kernel gradient into {out_dtype}")
 
 
 @INTERPRETS
@@ -108,3 +111,145 @@ def test_a_blackwell_tiles_sum_holds_every_step_however_its_rotations_fall(depth
                              out_dtype=jnp.float32, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
                              dense=True)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(x, np.float32) @ np.asarray(w, np.float32))
+
+
+def biased(acc, bias):
+    return acc + bias[None, :]
+
+
+def scaled_rows(acc, scale):
+    return acc * scale[:, None]
+
+
+def doubled(acc):
+    return acc, acc * 2
+
+
+EPILOGUES = {
+    "plain": ((), None, (jnp.bfloat16,)),
+    "transposed": ((), None, (jnp.bfloat16,)),
+    "bias": ((("bias", ("columns",)),), biased, (jnp.bfloat16,)),
+    "row scale": ((("scale", ("rows",)),), scaled_rows, (jnp.float32,)),
+    "two outputs": ((), doubled, (jnp.bfloat16, jnp.float32)),
+}
+"""Each case's epilogue side operands (drawn by name, with their launch axes), its epilogue and its output
+dtypes: a column bias, a per-row scale and a mixed-dtype pair of outputs, which the fold's old Blackwell
+mainloop's tests held."""
+SIZES = (0, 70, 1, 129, 100, 0)
+ROWS, DEPTH, WIDTH = 307, 128, 512
+DRAWN = ("x", "w", "bias", "scale")
+SEEDS = 8
+"""Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
+
+
+def _draw(seed):
+    rng = np.random.default_rng(seed)
+    return (jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16),
+            jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)) / np.sqrt(DEPTH), jnp.bfloat16),
+            jnp.asarray(rng.normal(size=(WIDTH,)), jnp.float32),
+            jnp.asarray(rng.uniform(0.5, 2.0, size=(ROWS,)), jnp.float32))
+
+
+def _epilogued(case: str, tiles: mosaic_gpu.Tiles, *, interpret: bool):
+    """The shared mainloop at `tiles` running `case`'s epilogue (`EPILOGUES`), over every multiprocessor of
+    the GPU (one, interpreted)."""
+    sides, epilogue, dtypes = EPILOGUES[case]
+    programs = tiles.cluster if interpret else generation.gpu_target().multiprocessors
+
+    def run(*inputs):
+        drawn = dict(zip(DRAWN, inputs, strict=True))
+        w = jnp.swapaxes(drawn["w"], 1, 2) if case == "transposed" else drawn["w"]
+        outs = mosaic_gpu.gmm(drawn["x"], w, jnp.asarray(SIZES, jnp.int32), tiles=tiles,
+                              transpose_rhs=case == "transposed", out_dtype=dtypes[0],
+                              multiprocessors=programs,
+                              interpret=grouped_matmul.INTERPRETED if interpret else False, epilogue=epilogue,
+                              epilogue_operands=tuple(drawn[name] for name, _ in sides),
+                              epilogue_axes=tuple(axes for _, axes in sides),
+                              out_dtypes=dtypes if len(dtypes) > 1 else None)
+        return outs if isinstance(outs, tuple) else (outs,)
+    return run
+
+
+def _plain(case: str, *, truth: bool = False):
+    """The program the mainloop stands for: each group's rows times its matrix summed wide, the rows past the
+    routed ones zero, the epilogue, each output rounded once (in float64 as truth)."""
+    sides, epilogue, dtypes = EPILOGUES[case]
+
+    def run(*inputs):
+        drawn = dict(zip(DRAWN, inputs, strict=True))
+        wide = jnp.promote_types(drawn["x"].dtype, jnp.float32)
+        acc = jax.lax.ragged_dot(drawn["x"], drawn["w"].astype(drawn["x"].dtype), jnp.asarray(SIZES),
+                                 preferred_element_type=wide)
+        acc = jnp.where((jnp.arange(ROWS) < sum(SIZES))[:, None], acc, 0)
+        if epilogue is not None:
+            acc = epilogue(acc, *(drawn[name] for name, _ in sides))
+        outs = acc if isinstance(acc, tuple) else (acc,)
+        return tuple(out.astype(jnp.float64 if truth else dtype)
+                     for out, dtype in zip(outs, dtypes, strict=True))
+    return run
+
+
+@INTERPRETS
+@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}")
+@pytest.mark.parametrize("case", list(EPILOGUES))
+def test_tcgen05s_epilogues_hold_check_1(case, tiles):
+    """Each epilogue case through the shared mainloop on tcgen05's bundle at each accumulator width,
+    interpreted as an sm100: as exact as the plain program from float64 truth, the empty groups, the group of
+    one row and the rows past the routed ones included."""
+    with generation.assumed("sm100"):
+        assert_as_exact(_epilogued(case, tiles, interpret=True), jax.jit(_plain(case)), _draw,
+                        f"{case} at {tiles}", seeds=SEEDS, truth_fn=_plain(case, truth=True))
+
+
+def tcgen05s_epilogues_hold_check_1_on_blackwell(case, tiles):
+    """Each epilogue case compiled and run on a B200 or a B300 at `tiles`, a CTA's or a pair's (`PAIRED`),
+    over every multiprocessor, where the interpreter's synchronization is the hardware's: as exact as the
+    plain program from float64 truth (tests/test_gpu_gemm.py's cells)."""
+    assert_as_exact(jax.jit(_epilogued(case, tiles, interpret=False)), jax.jit(_plain(case)), _draw,
+                    f"{case} at {tiles} on Blackwell", seeds=SEEDS, truth_fn=_plain(case, truth=True))
+
+
+def test_tcgen05s_mainloop_compiles_for_a_b200_within_its_resources():
+    """The shared mainloop at each tcgen05 tile and at a pair's (`PAIRED`, each CTA's accumulators 256
+    columns), with a bias epilogue, compiled by Mosaic for a compile-only B200 on this CPU through ptxas
+    (tests/kernel_compile.py): within the multiprocessor's shared memory and its 512 columns of tensor
+    memory, no register spilled, its epilogue reading each tensor-memory chunk as it takes it (read all at
+    once, the 256-column accumulators spilled 24 and 36 bytes, row 5358)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    def case(tiles):
+        def call():
+            def product(lhs, rhs, sizes, bias):
+                return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False,
+                                      out_dtype=jnp.bfloat16,
+                                      multiprocessors=generation.gpu_target("sm100").multiprocessors,
+                                      epilogue=biased, epilogue_operands=(bias,),
+                                      epilogue_axes=(("columns",),))
+
+            return product, (jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                             jax.ShapeDtypeStruct((4, 512, 1024), jnp.bfloat16),
+                             jax.ShapeDtypeStruct((4,), jnp.int32),
+                             jax.ShapeDtypeStruct((1024,), jnp.float32))
+
+        return support.KernelCase(f"tcgen05 gmm {tiles}", call)
+
+    found = compile_mosaic_kernels([case(tiles) for tiles in (*TILES, PAIRED)], "sm100")
+    assert len(found) == len(TILES) + 1 and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_a_pairs_tile_is_twice_a_ctas_and_takes_only_what_its_views_read():
+    """A pair's tile (`PAIRED`, `mosaic.Transport.pairs_product`): its accumulators hold both CTAs' columns
+    (`mosaic_gpu.tile_columns`); a tile of 256 columns a CTA, past its half of one product, or of one CTA is
+    none of the pair's (`mosaic_gpu.pair_takes`); and its product takes no prologue (its step views are its
+    rows' and matrix's alone)."""
+    family = mosaic_gpu.family_of(PAIRED, jnp.bfloat16)
+    assert mosaic_gpu.tile_columns(PAIRED, family) == 2 * PAIRED.block_n
+    assert mosaic_gpu.pair_takes(PAIRED, family)
+    for refused in (dataclasses.replace(PAIRED, block_n=256), dataclasses.replace(PAIRED, cluster=1)):
+        assert not mosaic_gpu.pair_takes(refused, family), refused
+    x, w = jnp.ones((256, 128), jnp.bfloat16), jnp.ones((1, 128, 512), jnp.bfloat16)
+    with generation.assumed("sm100"), pytest.raises(ValueError):
+        mosaic_gpu.gmm(x, w, jnp.asarray([256], jnp.int32), tiles=PAIRED, transpose_rhs=False,
+                       out_dtype=jnp.bfloat16, multiprocessors=2, dense=True, prologue=lambda rows: rows)
+

@@ -25,6 +25,7 @@ from blockwise_matrix import grouped
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
+from low_precision_support import spread
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation
@@ -53,13 +54,7 @@ def _operands(case: dict[str, str], seed: int) -> tuple:
     block = FORMATS[case["format"]][3]
     rows = 128 * int(jnp.sum(_blocks(groups)))
     rng = np.random.default_rng(seed)
-
-    def drawn(shape):
-        spread = np.exp2(rng.integers(-6, 7, size=(*shape[:-1], shape[-1] // block, 1)))
-        values = rng.normal(size=(*shape[:-1], shape[-1] // block, block)) * spread
-        return jnp.asarray(values.reshape(shape), jnp.float32)
-
-    return drawn((rows, DEPTH)), drawn((groups, width, DEPTH))
+    return spread(rng, (rows, DEPTH), block), spread(rng, (groups, width, DEPTH), block)
 
 
 def supported(case: dict[str, str]) -> bool:

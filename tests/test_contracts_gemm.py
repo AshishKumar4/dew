@@ -332,6 +332,32 @@ def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
                     truth_fn=plain, plain_fn=plain)
 
 
+def test_an_nvfp4_products_cotangent_past_bf16s_largest_keeps_its_input_gradient_finite():
+    """The NVFP4 product's packed kernel (its mainloop decoding each stage in place, interpreted as an H100's
+    on a CPU) pulled back by a finite fp32 cotangent past bfloat16's largest, 3.4e38, through a matrix whose
+    every value is 2^-9: its input gradient is the cotangent times the decoded values, finite as float32
+    holds it (the cotangent taken as its saturating bf16 parts, `templates.product.formed`), where its own
+    three-part split rounded the first part to infinity and its remainder to NaN."""
+    # A tensor scale of 2^-8, so the factor the decode defers (`NvFp4.factor`, its owed 2^8 times the scale)
+    # is one and the cotangent reaches the packed kernel's reverse as it is.
+    matrix = gemm.NvFp4.of(jnp.full((256, 64), 0.5, jnp.float32), jnp.ones((16, 64), jnp.float8_e4m3fn),
+                           2.0 ** -8)
+    rows = jnp.ones((8, 256), jnp.bfloat16)
+    cotangent = jnp.zeros((8, 64), jnp.float32).at[0, 0].set(3.4e38)
+
+    def product(rows):
+        return gemm.nvfp4_product(rows, matrix, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    with generation.assumed("sm90"), generation.chosen(nvfp4="packed"):
+        (d_rows,) = jax.vjp(product, rows)[1](cotangent)
+    # Every value 2^-9, each part's product exact, their sum the cotangent's times it, rounded once to the
+    # rows' bfloat16.
+    values = np.asarray(matrix.decoded(), np.float64) * float(matrix.factor)
+    expected = jnp.asarray(np.asarray(cotangent, np.float64) @ values.T, jnp.float32).astype(rows.dtype)
+    assert bool(jnp.all(jnp.isfinite(expected))) and float(jnp.max(jnp.abs(expected))) > 1e35
+    np.testing.assert_array_equal(np.asarray(d_rows, np.float32), np.asarray(expected, np.float32))
+
+
 GROUPS = jnp.asarray([3, 0, 5], jnp.int32)
 """A grouped product's sizes: eight rows, an empty middle expert."""
 
