@@ -1593,7 +1593,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     branch = dataclasses.replace(branch, stages=branch.stages[:at])
     branch = _objective_records(branch, steps[random:])
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
-    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in branch.stages):
+    if not branch.batched:
         # A held chain measured before its run's batch is known takes the objective's batch steps where
         # it is batched (`_batch_steps_after`, `held`).
         return branch
@@ -1934,7 +1934,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     chain = _held_batched(dataset._chain().at(plan_version), batch)
     if measured is None:
         measured = _held_measure(chain, objective)
-    elif not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in measured.branches[0].stages):
+    elif not measured.branches[0].batched:
         # Measured before its run's batch was known (`fitted`): batched now, the objective's batch steps
         # after its batch.
         def batched(branch: Pipeline) -> Pipeline:
@@ -1953,7 +1953,7 @@ def _held_batched(chain: Pipeline, batch: int | None, *, unbatched: bool = False
     that states neither is refused, or left as it is where it may be (`unbatched`, a batch not yet
     known). It is batched before it is measured (`_held_measure`), so an objective's batch steps follow
     its batch as they do in training."""
-    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
+    if not chain.batched:
         if batch is None and unbatched:
             return chain
         if batch is None:
