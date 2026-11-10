@@ -361,10 +361,11 @@ def test_parquet_without_sides_is_refused(tmp_path):
 
 def test_a_preference_pair_marks_each_halfs_real_tokens():
     """A window marks its pairs' ids as real (`REAL_KEY`) and its padding as not, whatever their completion
-    marks: a chosen half ending in an unmarked token, a rejected half of no completion."""
+    marks: a chosen half ending in an unmarked token, a rejected half of no completion, and a window of
+    padding alone that a batch of more windows than its pairs need holds."""
     laid = windows([{"chosen": [1, 2, 3, 4], "rejected": [1, 2], "chosen_mask": [0, 0, 1, 0],
-                     "rejected_mask": [0, 0]}, {"chosen": [7], "rejected": [8]}], 5)
-    assert laid[REAL_KEY].tolist() == [[1, 1, 1, 1, 1], [0, 0, 0, 1, 1]]
+                     "rejected_mask": [0, 0]}, {"chosen": [7], "rejected": [8]}], 5, count=3)
+    assert laid[REAL_KEY].tolist() == [[1, 1, 1, 1, 1], [0, 0, 0, 1, 1], [0, 0, 0, 0, 0]]
 
 
 @pytest.mark.parametrize("share", [True, False], ids=["shared", "whole"])
