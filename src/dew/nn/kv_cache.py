@@ -51,7 +51,7 @@ from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, select, selected
-from dew.nn.precision import float32_einsum
+from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
 
@@ -242,9 +242,10 @@ def dequantize(stored: jax.Array, scale: jax.Array, dtype: jnp.dtype) -> jax.Arr
 
 
 def bound_dtype(storage: jax.typing.DTypeLike) -> jnp.dtype:
-    """The dtype a cache of `storage` keeps its values' bound in (`BOUND`): float32 at least, a float64
-    cache's own (a float64 truth's)."""
-    return jnp.promote_types(storage, jnp.float32)
+    """The dtype a cache of `storage` keeps its values' bound in (`BOUND`): float32 for every narrower
+    storage, a quantized cache's codes included, and a float64 cache's own (a float64 truth's,
+    `at_least_fp32`)."""
+    return at_least_fp32(storage)
 
 
 def value_bound(stored: jax.Array, scale: jax.Array | None) -> jax.Array:
