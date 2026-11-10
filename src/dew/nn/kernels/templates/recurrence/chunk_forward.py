@@ -17,9 +17,7 @@ from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as alg
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.mainloop import (
-    FAST_PARTS,
     PARTS,
-    Between,
     Call,
     Operand,
     Tiles,
@@ -120,8 +118,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False,
-            rounded: bool = False, ranged: bool = False, skip=None, forked: ForkedTable | None = None,
-            between: Between = Between.WIDE):
+            rounded: bool = False, ranged: bool = False, skip=None, forked: ForkedTable | None = None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -136,10 +133,10 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     any width whose launches the device holds (the template's legality, `template.planned`'s shared memory and
     registers a launch). Its states and output launches take `tiles` (the template's config,
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
-    where None), interpreted where `interpret`. A `rounded` call takes the run's fast forms' numbers: an fp32
-    call's products take its operands as TF32 where its family's products take them transposed (mma.sync's),
-    else in `FAST_PARTS` bf16 parts (`prepared`, `_parts`). Its launches pass their values between them as
-    `between` declares (`mainloop.Between`). A `ranged`
+    where None), interpreted where `interpret`. A `rounded` call takes the run's fast forms' numbers: without
+    the delta rule (Mamba2's SSD, whose 16-bit numbers are mamba_ssm's) it passes its values between launches
+    in the operands' dtype, and an fp32 call's products take its operands as TF32 where its family's products
+    take them transposed (mma.sync's), else in `FAST_PARTS` bf16 parts (`prepared`, `_parts`). A `ranged`
     16-bit delta rule, whose form proves no bound on its chunk inverse, solves it at fp32's range (`_merged`).
     A `skip` `[HV]` adds `D v` to the output of a call whose write gate takes the keys' side
     (`Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it. A `forked` call's documents,
@@ -147,7 +144,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, keeps=False,
-                                 rounded=rounded, ranged=ranged, skip=skip, forked=forked, between=between)
+                                 rounded=rounded, ranged=ranged, skip=skip, forked=forked)
     return out, final
 
 
@@ -157,8 +154,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  family: mosaic.Family | None = None, interpret: bool = False,
                  keeps: bool = True,
                  rounded: bool = False, ranged: bool = False,
-                 skip=None, forked: ForkedTable | None = None,
-                 between: Between = Between.WIDE) -> tuple[jax.Array, jax.Array, tuple]:
+                 skip=None, forked: ForkedTable | None = None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
@@ -177,7 +173,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
              and not reads.operands_in_registers)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
-                   rounded=rounded, ranged=ranged, states=not scans, forked=forked, between=between)
+                   rounded=rounded, ranged=ranged, states=not scans, forked=forked)
     call, tiles = run.call, run.tiles
     out_dtype = jnp.float32 if wide else run.dtype
     if scans:
@@ -252,8 +248,7 @@ def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool) -> t
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
              inverse=None, kept=None, keeps: bool = True,
-             rounded: bool = False, ranged: bool = False, states: bool = True, forked=None,
-             between: Between = Between.WIDE) -> _Run:
+             rounded: bool = False, ranged: bool = False, states: bool = True, forked=None) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None), or but the
@@ -294,16 +289,16 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
                                                      chunk=tiles.chunk)
     rows = chunks * tiles.chunk
     given = Operand(rows, _parts(dtype, family, rounded), dtype)
-    # What the launches pass between them (`between`, `Between`): the delta rule's in the operands' dtype, as
-    # fla's rounds it (the port is its reference). Without it, the SSD's under the run's fast forms (its
-    # route's declaration) in the operands' dtype too, as mamba_ssm rounds its scores and entered memories
-    # for its products (`_chunk_scan_fwd`'s `cb` and `prev_states`), its memory summed and passed in fp32: on
-    # an H100 Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three parts' 2.031 and the port's
-    # 0.606, 30B's 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c). Else fp32 in the run's forms'
-    # parts, as the portable math holds them (a 16-bit call's rounded put the output 1.7 times and the final
-    # memory up to 540 times the portable math's distance from float64).
-    held = (given if delta or between is Between.GIVEN
-            else Operand(rows, FAST_PARTS if rounded else PARTS, jnp.dtype(jnp.float32)))
+    # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
+    # port is its reference). Without it, a `rounded` call's (the SSD's under the run's fast forms, which its
+    # route resolves, `recurrence_chunk.fast_rounding`) in the operands' dtype too, as mamba_ssm rounds its
+    # scores and entered memories for its products (`_chunk_scan_fwd`'s `cb` and `prev_states`), its memory
+    # summed and passed in fp32: on an H100 Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three
+    # parts' 2.031 and the port's 0.606, 30B's 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c). Else,
+    # and under the accurate forms, fp32's three parts, as the portable math holds them (a 16-bit call's
+    # rounded put the output 1.7 times and the final memory up to 540 times the portable math's distance from
+    # float64).
+    held = given if delta or rounded else Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged)
     beta = laid(beta).reshape(rows, heads).T

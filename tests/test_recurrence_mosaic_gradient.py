@@ -64,12 +64,6 @@ def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]
     return dataclasses.replace(operands, starts=None), cotangents(operands, seed)
 
 
-def passed(hooks) -> mainloop.Between:
-    """How a rounded call's launches pass their values under `hooks`, as its route declares it
-    (`mainloop.Between`): as given for the delta rule's and the rated scan's, whose upstreams round them."""
-    return mainloop.Between.GIVEN if hooks.delta or hooks.rated else mainloop.Between.WIDE
-
-
 def restarted(fn, case: str):
     """`fn` on operands whose documents start as the case's draws' do (`draw`'s, the same each seed)."""
     (operands,) = draw(jnp.float32, 0, **geometry(case))
@@ -209,7 +203,7 @@ def test_tcgen05s_chunks_train_as_wgmma_does_interpreted(case):
             return template.mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta,
                                         given.state, tiles=tiles, family=family, delta=hooks.delta,
                                         scale=given.key.shape[-1] ** -0.5, bound=hooks.inverse_bound,
-                                        rounded=True, between=passed(hooks))
+                                        rounded=True)
         return jax.jit(with_gradients(rule))
 
     assert_as_exact(on(mosaic_sm100.CHUNKS), on(mosaic_sm90.WGMMA), functools.partial(drawn, dtype,
@@ -236,7 +230,7 @@ def test_a_128_token_chunk_trains_as_64_does_interpreted(case, family):
 
     def at(chunk):
         common = {'tiles': dataclasses.replace(tiles, chunk=chunk), 'family': bundle, 'interpret': True,
-                  'delta': hooks.delta, 'rounded': True, 'between': passed(hooks)}
+                  'delta': hooks.delta, 'rounded': True}
 
         def trained(given, cotangent):
             operands = (given.query, given.key, given.value, given.log_decay, given.beta, given.state)

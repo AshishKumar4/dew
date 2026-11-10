@@ -545,14 +545,6 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
-def passed(delta: bool, rounded: bool):
-    """How a witnessed call's launches pass their values (`mainloop.Between`): as given for the delta rule's
-    and, rounded, the rated scan's the template is called at directly (`route_rounding`), else wide."""
-    from dew.nn.kernels.templates.recurrence import mainloop
-
-    return mainloop.Between.GIVEN if delta or rounded else mainloop.Between.WIDE
-
-
 def route_rounding(delta: bool, dtype) -> bool:
     """The rounding a witnessed call's route resolves at JAX's own default precision, as a model trains and
     the witnessed routes run (an fp32 call's rounds by the precision, `recurrence_chunk.fast_rounding`): the
@@ -629,8 +621,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     def route(*x):
         if not delta:
             return recurrence_chunk.template_rule(*x, starts, max_segments=max_segments, scale=scale,
-                                                  delta=False, wide=False, rounded=rounded,
-                                                  between=passed(delta, rounded))
+                                                  delta=False, wide=False, rounded=rounded)
         # The draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as layers declare.
         return recurrence_chunk.chunk_gated_delta_rule(*x, starts=starts, max_segments=max_segments,
                                                        write_bound=1.0)
@@ -647,7 +638,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         def kept(*x, starts=starts):
             return jax.jit(lambda *x: chunk_forward.kept_forward(
                 *x, tiles=tiles, starts=starts, max_segments=max_segments, scale=scale,
-                delta=delta, rounded=rounded, between=passed(delta, rounded), family=family, keeps=not walked,
+                delta=delta, rounded=rounded, family=family, keeps=not walked,
                 interpret=generation.backend() != "gpu"))(*x)
 
         kept_o, kept_final, (a, (w, h, c)) = kept(*operands)
@@ -1231,7 +1222,7 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
     def route(*x):
         if not delta:
             return recurrence_chunk.template_rule(*x, None, scale=scale, delta=False, wide=False,
-                                                  rounded=rounded, between=passed(delta, rounded))
+                                                  rounded=rounded)
         return recurrence_chunk.chunk_gated_delta_rule(*x, write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
@@ -1242,12 +1233,10 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
 
         def kept(*x):
             _, _, (inverse, held) = chunk_forward.kept_forward(*x, tiles=tiles, scale=scale, rounded=rounded,
-                                                         delta=delta, family=family, interpret=interpret,
-                                                         between=passed(delta, rounded))
+                                                         delta=delta, family=family, interpret=interpret)
             grads, saved = mainloop_backward.kept_backward(*x, do, dfinal, tiles=tiles, scale=scale,
                                                            rounded=rounded, delta=delta, family=family,
-                                                           interpret=interpret, inverse=inverse, kept=held,
-                                                           between=passed(delta, rounded))
+                                                           interpret=interpret, inverse=inverse, kept=held)
             # The prepared run stays inside the program; the witness reads its records from `Run`.
             return grads, saved._replace(run=None), extras(saved.run)
 
