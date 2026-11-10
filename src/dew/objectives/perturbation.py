@@ -59,6 +59,7 @@ from collections.abc import Mapping
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.linen import linear
 from jax.custom_derivatives import zero_from_primal
 
 from dew._distributions import counter_key
@@ -169,11 +170,11 @@ def _site(context, args, kwargs, output) -> Site | None:
     inputs = args[0] if args else next(iter(kwargs.values()))
     contracted: tuple[int, ...] = ()
     if kind == "dense":
-        rank = jnp.ndim(inputs)
-        axes = (-1,) if isinstance(module, nn.Dense) else (
-            tuple(module.axis) if isinstance(module.axis, tuple | list) else (module.axis,))
-        # Flax sorts the axes it contracts (`_normalize_axes`), and its kernel takes them in that order.
-        contracted = tuple(sorted(axis % rank for axis in axes))
+        # The axes the layer contracts as Flax reads them (`flax.linen.linear`): its axis canonicalized
+        # (`_canonicalize_tuple`, any sequence of ints or one) and normalized (`_normalize_axes`, sorted and
+        # non-negative), the order its kernel takes them in.
+        axes = (-1,) if isinstance(module, nn.Dense) else linear._canonicalize_tuple(module.axis)
+        contracted = linear._normalize_axes(axes, jnp.ndim(inputs))
     return Site(tuple(module.path), kind, inputs, tuple(jnp.shape(output)), jnp.result_type(output),
                 contracted)
 
