@@ -1,5 +1,7 @@
 # Working on Dew
 
+This codebase is yours: what it's for and how it's built are your call, and you'll keep building on it, as per the direction of the bible, various specs, roadmap and the ledger, and user directions. Whenever in real dilemma or doubt and the best answer isn't obvious as per project direction and bible (and clean, elegant, performant), you may ask user directly IF they are not afk.
+
 For repository implementation rules, read `CONTRIBUTING.md`: it owns the design, reference parity, code, test-authoring and writing rules, and this file does not restate them; [testing](docs/design/testing.md) owns the scenario inventory, numerical contracts and native qualification. This file adds what an agent working in the repository does. The maintainers' own process (lanes and worktrees, commit identity, the land queue and its trains, review and approval by kind of work, CI scope) is set by their operating rules (the bible, §4 for review and approval), and only security paths (`.github`'s secrets, the installers, credentials) wait on a maintainer's approval. Follow the user's current scope and approval boundaries.
 
 ## Scope and implementation
