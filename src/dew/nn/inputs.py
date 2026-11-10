@@ -87,6 +87,22 @@ def sequence_blocks(x: jax.Array, block: int, blocks: int | None = None, *,
     return jnp.moveaxis(x, 1, 0) if leading else x
 
 
+MEDIA_INDEX_FIELDS = ("image_indices", "audio_indices")
+"""The token fields naming the media feature each token reads, -1 for none: the placeholders media fill."""
+
+
+def media_slots(fields: Mapping[str, object], shape: tuple[int, ...], *, xp=jnp):
+    """Which of a request's `shape` `[B, S]` slots media fill: those any media index field it holds
+    (`MEDIA_INDEX_FIELDS`) points at a feature from (>= 0); none where it holds none. A filled slot reads
+    no embedding row of its id. `xp` is the array module."""
+    filled = xp.zeros(shape, bool)
+    for name in MEDIA_INDEX_FIELDS:
+        indices = fields.get(name)
+        if indices is not None:
+            filled = filled | (xp.asarray(indices) >= 0)
+    return filled
+
+
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
                    fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None,

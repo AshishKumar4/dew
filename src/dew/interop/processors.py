@@ -19,7 +19,7 @@ from dew._records import JSON
 from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD
 from dew.interop.sources import SourceReference
 from dew.nn import audio as audio_nn
-from dew.nn.inputs import Media, ModelInputs, pad_token_rows
+from dew.nn.inputs import Media, ModelInputs, media_slots, pad_token_rows
 from dew.nn.mimo_audio import MiMoAudio
 from dew.registry import towers
 
@@ -590,11 +590,7 @@ class Processor:
             conditioning = {**conditioning, **audio_conditioning}
         # A placeholder its media fill reads no embedding row, so it may lie past the text vocabulary (Kimi
         # K2.5's video placeholder), as its model zeroes it before the lookup.
-        filled = np.zeros(tokens.shape, bool)
-        for field in ("image_indices", "audio_indices"):
-            if field in token_fields:
-                filled |= np.asarray(token_fields[field]) >= 0
-        text = tokens[~filled]
+        text = tokens[~media_slots(token_fields, tokens.shape, xp=np)]
         if np.any(text < 0) or np.any(text >= self.vocab_size):
             raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges, "
                              "save the placeholders media fill")
