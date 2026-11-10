@@ -1378,19 +1378,16 @@ def _component(components: frozenset[str], module: str) -> tuple[str, str]:
 # PEFT configuration
 # --------------------------------------------------------------------------
 
-_READ_FIELDS = frozenset({"peft_type", "r", "lora_alpha", "rank_pattern", "alpha_pattern", "use_rslora",
-                          "lora_dropout", "bias", "base_model_name_or_path", "revision"})
-"""The PEFT `LoraConfig` fields `_Config.read` reads."""
-
 _INERT_FIELDS = frozenset({"task_type", "inference_mode", "auto_mapping", "peft_version", "init_lora_weights",
-                           "target_modules", "exclude_modules", "layers_to_transform", "layers_pattern",
-                           "runtime_config", "megatron_core", "qalora_group_size"})
+                           "eva_config", "target_modules", "exclude_modules", "layers_to_transform",
+                           "layers_pattern", "runtime_config", "megatron_core", "qalora_group_size"})
 """The PEFT `LoraConfig` fields (peft 0.21.2's) that change nothing a loaded adapter computes, so their values
 need not be read: the config's record (its task, mode, auto classes and release), its initialization, which
-its weights replace, the modules it adapts, which its weights state, how a run offloads it, Megatron's
-module path, and QA-LoRA's group size, which only `use_qalora` reads. Every other field set to a value is
-one this loader does not carry: an activated LoRA's invocation tokens, QA-LoRA, DoRA, a layer replication,
-Arrow's or KaSA's routing, a bias, saved modules, trainable tokens or parameters, and any PEFT adds."""
+its saved factors replace (EVA's records its ranks and scales in the patterns read), the modules it adapts,
+which its weights state, how a run offloads it, Megatron's module path, and QA-LoRA's group size, which
+only `use_qalora` reads. Every other field set to a value, beside those `_Config.read` reads, is one this
+loader does not carry: an activated LoRA's invocation tokens, QA-LoRA, DoRA, a layer replication, Arrow's
+or KaSA's routing, saved modules, trainable tokens or parameters, and any PEFT adds."""
 
 
 @dataclass(frozen=True)
@@ -1407,23 +1404,27 @@ class _Config:
 
     @classmethod
     def read(cls, config: Mapping[str, object], where: str) -> _Config:
-        if config.get("peft_type", "LORA") != "LORA":
-            raise ValueError(f"{where} is a {config['peft_type']} adapter, not LoRA")
+        # Each field read is taken from what is left, so what remains is every field it does not read.
+        left = dict(config)
+        peft_type = left.pop("peft_type", "LORA")
+        if peft_type != "LORA":
+            raise ValueError(f"{where} is a {peft_type} adapter, not LoRA")
+        bias = left.pop("bias", "none")
+        rank, alpha = left.pop("r", None), left.pop("lora_alpha", None)
+        rank_pattern, alpha_pattern = left.pop("rank_pattern", {}), left.pop("alpha_pattern", {})
+        rslora, dropout = left.pop("use_rslora", False), left.pop("lora_dropout", 0.0)
+        name, revision = left.pop("base_model_name_or_path", None), left.pop("revision", None)
         # A field unset is absent, null, false, zero or empty, as PEFT writes every field it leaves at rest.
         unset = (None, False, 0, "", [], {})
-        refused = sorted(name for name, value in config.items()
-                         if name not in _READ_FIELDS | _INERT_FIELDS and value not in unset)
-        if config.get("bias", "none") != "none":
+        refused = sorted(field for field, value in left.items()
+                         if field not in _INERT_FIELDS and value not in unset)
+        if bias != "none":
             refused.append("bias")
         if refused:
             raise ValueError(f"{where} sets {', '.join(refused)}, which this loader does not carry")
-        rank, alpha = config.get("r"), config.get("lora_alpha")
-        rank_pattern, alpha_pattern = config.get("rank_pattern", {}), config.get("alpha_pattern", {})
-        rslora, dropout = config.get("use_rslora", False), config.get("lora_dropout", 0.0)
         if (not isinstance(rank_pattern, Mapping) or not isinstance(alpha_pattern, Mapping)
                 or not isinstance(rslora, bool)):
             raise ValueError(f"{where} needs per-module patterns and a boolean use_rslora")
-        name, revision = config.get("base_model_name_or_path"), config.get("revision")
         if not isinstance(name, str | None) or not isinstance(revision, str | None):
             raise ValueError(f"{where} names its base model and revision as strings or not at all")
         return cls(_rank(where, rank), finite(alpha, f"{where}: alpha"),
