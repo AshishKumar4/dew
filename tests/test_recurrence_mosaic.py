@@ -1364,14 +1364,14 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
                                  given, forked)
     formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
     cotangents = [jax.ShapeDtypeStruct(laid[2].shape, jnp.bfloat16), h0] if training else []
-    tabled = [leaf for leaf in table if leaf is not None]
+    tabled, laid_table = jax.tree.flatten(table)
 
     def call():
         def fn(*operands):
-            (q, k, v, g, beta), table, rest = (operands[:5], operands[5:5 + len(tabled)],
-                                               operands[5 + len(tabled):])
+            (q, k, v, g, beta), leaves, rest = (operands[:5], operands[5:5 + len(tabled)],
+                                                operands[5 + len(tabled):])
             *rest, fused = rest if skip else (*rest, None)
-            forked = chunk_forward.ForkedTable(*table, *[None] * (4 - len(table)), 2)
+            forked = jax.tree.unflatten(laid_table, leaves)
             if training:
                 return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
                                                    forked=forked, skip=fused, **formed)

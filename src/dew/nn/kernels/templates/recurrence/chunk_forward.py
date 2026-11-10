@@ -6,7 +6,6 @@ backward reads kept (`kept_forward`)."""
 import dataclasses
 import math
 from collections.abc import Callable
-from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -90,18 +89,20 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
     return chunks, taken, sequences, laid, unlaid
 
 
-class ForkedTable(NamedTuple):
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class ForkedTable:
     """A forked call's table as the template takes it, its documents laid from chunks' edges
-    (`chunked_launch.AlignedDocuments`): each row's given memories `given` `[B, S', HV, Dk, Dv]`, the slot
-    each aligned chunk takes up and stores its memory in, `loads` and `stores` `[B, NC]`
-    (`table.Table`), its entry write `entries` `[B, NC, HV, Dk, Dv]` where the call gives one, and the
-    stored slots a row holds, `held`."""
+    (`chunked_launch.AlignedDocuments`): each row's given memories `given` `[B, S', HV, Dk, Dv]` fp32, the
+    slot each aligned chunk takes up and stores its memory in, `loads` and `stores` `[B, NC]`
+    (`table.Table`), its entry write `entries` `[B, NC, HV, Dk, Dv]` fp32 where the call gives one, and the
+    stored slots a row holds, `held` (static: its walks' outputs are shaped by it)."""
 
     given: jax.Array
     loads: jax.Array
     stores: jax.Array
     entries: jax.Array | None
-    held: int
+    held: int = dataclasses.field(metadata={'static': True})
 
 
 def tabled(forked: ForkedTable, width: int, columns: int) -> Table:
@@ -158,7 +159,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
-    `A`, and the launches' weighted keys, memories and corrected values, `(w, h, corrected)`, which the port
+    `A`, and the launches' weighted keys, memories, corrected values and a forked call's stored slots,
+    `(w, h, corrected, stored)`, which the port
     keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     # A forward keeping nothing for a backward under a decay a head runs its states and output in one walk
     # (`_scan`), no memory kept for a backward to take, where its family's products read their operands from
@@ -187,7 +189,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
         final = run.final
     o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
     assert final is not None, "a forward runs its states launch"
-    return o, final, (run.a, (run.w, run.h, run.corrected))
+    return o, final, (run.a, (run.w, run.h, run.corrected, run.stored))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,6 +229,9 @@ class _Run:
     """Each row's entering memory `[B * HV * Dk, Dv]` fp32, as the states launch takes it."""
     table: Table | None = None
     """A forked call's table, as its walks take it (`tabled`)."""
+    stored: jax.Array | None = None
+    """A forked call's stored slots, the finals its storing documents left `[B * held * HV * Dk, Dv]` fp32
+    (`mainloop._states`'), where its table holds any."""
 
     def shaped(self, memory: jax.Array) -> jax.Array:
         """Memories `[B * HV * Dk, Dv]` as the call's `[B, HV, Dk, Dv]`."""
@@ -251,7 +256,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
              rounded: bool = False, ranged: bool = False, states: bool = True, forked=None) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
-    `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None), or but the
+    `kept` values, `(w, h, corrected, stored)`, are (`kept_forward`'s; its final memory then None), or but the
     states launch's where not `states` (a walk forming the output too, `_scan`, runs it; its memories,
     corrected values and final memory then None). The solve stores its inverse where the call `keeps` it
     (`_solved`). A forked call's documents laid from chunks' edges (`chunked_launch.AlignedDocuments`) give
@@ -351,9 +356,10 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
                table=None if forked is None else tabled(forked, width, columns))
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
-        (w, h, corrected) = kept
-        return dataclasses.replace(run, w=w, h=h, corrected=corrected)
+        (w, h, corrected, stored) = kept
+        return dataclasses.replace(run, w=w, h=h, corrected=corrected, stored=stored)
     if not states:
         return run
-    h, corrected, final = _states(keys, w, u, hi, lo, beta, h0, sequences, taken, call, tiles, run.table)
-    return dataclasses.replace(run, h=h, corrected=corrected, final=run.shaped(final))
+    h, corrected, final, stored = _states(keys, w, u, hi, lo, beta, h0, sequences, taken, call, tiles,
+                                          run.table)
+    return dataclasses.replace(run, h=h, corrected=corrected, final=run.shaped(final), stored=stored)

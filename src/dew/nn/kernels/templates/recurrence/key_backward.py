@@ -509,8 +509,9 @@ def _first_decays(dg, run, dh0, taken=None):
     starts from no memory. Cumulated from its chunk's end, that token's gradient is every term of its chunk,
     which cancel to fp32's residue where the memory is zero: rows of float64 zero 1.5e-7 from it against fla's
     3.3e-9 (row 5194, M-JS-26-a100). A forked call's documents each take theirs up at a chunk's first token
-    (`table.Table.loads`): `<h, taken>` there, the memory the chunk entered and its gradient (`taken`,
-    the reverse walk's)."""
+    (`table.Table.loads`): `<h, taken>` there, the memory the chunk took up in fp32 (`_taken_memories`, as
+    the walk took it, not its 16-bit copy the states launch stored) and its gradient (`taken`, the reverse
+    walk's)."""
     call = run.call
     shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.batch, -1)
     first, sizes, row, begins = (run.sequences[:, i] for i in range(4))
@@ -519,10 +520,32 @@ def _first_decays(dg, run, dh0, taken=None):
     dg = dg.at[index].set(value.astype(dg.dtype), mode="drop")
     if taken is None:
         return dg
-    entered = jnp.sum(run.h * jnp.where((run.table.loads >= 0).repeat(call.heads * call.width)[:, None],
-                                        taken, 0.0), axis=-1).reshape(call.chunks, -1)
+    entered = jnp.sum(_taken_memories(run) * taken, axis=-1).reshape(call.chunks, -1)
     index = jnp.where(run.table.loads >= 0, jnp.arange(call.chunks) * call.chunk, call.rows)
     return dg.at[index].set(entered.astype(dg.dtype), mode="drop")
+
+
+def _taken_memories(run) -> jax.Array:
+    """The memory each chunk of a forked call took up `[chunks * HV * Dk, Dv]` fp32, as its walk formed it
+    (`table.Taking`): its given or stored slot's (`table.Table.loads`; the forward's stored finals,
+    `run.stored`), its entry write added; zero at a chunk that took none up."""
+    call, table = run.call, run.table
+    slots = call.heads * call.width
+    per_row = call.chunks // run.batch
+
+    def by_row(memories):
+        return memories.reshape(run.batch, -1, slots, memories.shape[-1])
+
+    held = [] if run.stored is None else [by_row(run.stored)]
+    given = by_row(table.given)
+    # Slot zero a zero memory, then the given slots and the stored ones, one-based as `loads` counts them.
+    slotted = jnp.concatenate([jnp.zeros_like(given[:, :1]), given, *held], axis=1)
+    loads = table.loads.reshape(run.batch, per_row)
+    memories = jnp.take_along_axis(slotted, jnp.maximum(loads, 0)[..., None, None], axis=1)
+    memories = memories.reshape(-1, memories.shape[-1])
+    if table.entries is not None:
+        memories = memories + table.entries
+    return jnp.where((table.loads >= 0).repeat(slots)[:, None], memories, 0.0)
 
 
 def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:

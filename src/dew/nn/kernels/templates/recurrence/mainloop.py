@@ -1968,20 +1968,21 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
 @lowered_once
 def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tiles,
             table: Table | None = None):
-    """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv])`: the memory each chunk
-    enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's chunks
-    in order over a value block (`algebra.corrected`, `carried`). Under the delta rule `u` is the weighted
-    values and `w` the weighted keys (`_weighted`); without it (`w` None) `u` is the values, each chunk's
-    write gated by `beta` (`algebra.weighted`'s identity inverse; on the keys' rows where `Call.gated_keys`,
-    `algebra.keys_gated_carried`, the values themselves its corrected values, `u` returned for them, no copy
-    stored) and nothing corrected. A decay a
-    head gates each chunk's write to its end (`algebra.scalar_write`); under one a key dimension `k` is the
-    keys decayed so (`_weighted`'s third) and the memory's rows take their own decays. `sequences` `[N, 5]` is
-    each sequence's first chunk, its chunks, its row and whether it begins and ends its row; `h0` `[B * HV *
-    Dk, Dv]` fp32 each row's initial memory. A program walks `tiles.walkers` value blocks of its sequence and
-    head, one a consumer role, its keys and weighted keys streamed once for all of them. A forked call's
-    `table` gives each chunk that takes a document up its memory and keeps each storing document's (`Taking`),
-    its stored slots an output no caller reads."""
+    """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv], stored)`: the memory each
+    chunk enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's
+    chunks in order over a value block (`algebra.corrected`, `carried`). Under the delta rule `u` is the
+    weighted values and `w` the weighted keys (`_weighted`); without it (`w` None) `u` is the values, each
+    chunk's write gated by `beta` (`algebra.weighted`'s identity inverse; on the keys' rows where
+    `Call.gated_keys`, `algebra.keys_gated_carried`, the values themselves its corrected values, `u` returned
+    for them, no copy stored) and nothing corrected. A decay a head gates each chunk's write to its end
+    (`algebra.scalar_write`); under one a key dimension `k` is the keys decayed so (`_weighted`'s third) and
+    the memory's rows take their own decays. `sequences` `[N, 5]` is each sequence's first chunk, its chunks,
+    its row and whether it begins and ends its row; `h0` `[B * HV * Dk, Dv]` fp32 each row's initial memory. A
+    program walks `tiles.walkers` value blocks of its sequence and head, one a consumer role, its keys and
+    weighted keys streamed once for all of them. A forked call's `table` gives each chunk that takes a
+    document up its memory and keeps each storing document's (`Taking`): its stored slots `[B * held * HV *
+    Dk, Dv]` fp32 (`stored`, None for another call), which the backward reads where it takes up a stored final
+    (`key_backward._first_decays`)."""
     chunk = call.chunk
     width, value_width, bv, family = call.width, call.value_width, tiles.block_v, call.family
     slices, walkers = width // call.block, tiles.walkers
@@ -2079,13 +2080,14 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                                 stores_corrected, table, producer)(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
         *(() if table is None else table.operands))
-    if table is not None and table.held:
-        launched = launched[:-1]
+    # A forked call's stored slots, the finals its storing documents left, fp32 (`table.Taking`).
+    stored = launched[-1] if table is not None and table.held else None
+    launched = launched[:len(launched) - (stored is not None)]
     if stores_corrected:
-        return launched
+        return (*launched, stored)
     assert jnp.dtype(u.dtype) == held.dtype, "the values as given are held so (`Call.gated_keys`)"
     h, final = launched
-    return h, u, final
+    return h, u, final, stored
 
 
 def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Operand, values: Operand,
