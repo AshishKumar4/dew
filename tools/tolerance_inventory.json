@@ -513,10 +513,6 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_qwen_image_source.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_qwen_image_vae.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
