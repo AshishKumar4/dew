@@ -760,13 +760,22 @@ class _ServedTurns:
         row, each holding the cohort's whole allowed context and draw, its pool's pages the layout's."""
         from dataclasses import replace
 
-        from dew.inference.serving import Server
+        from dew.inference.serving import Server, row_groups
         from dew.inference.tasks import TextGeneration
+        from dew.sampling.text import with_ids_of
 
         if not isinstance(policy, TextGeneration):
             raise TypeError(f"a served cohort serves a TextGeneration policy, not a {type(policy).__name__}")
-        task = replace(policy, sampling=collector.sampling)
-        server = Server.from_task(task, slots=rows, capacity=collector.max_prompt_tokens
+        # The task as a call under the collector's sampling runs it (`TextGeneration._controls`): its ids
+        # filled from the task's policy, and no logits chain of the task's, which an overriding call drops.
+        task = replace(policy, sampling=with_ids_of(collector.sampling, policy.sampling), logits=None)
+        # A slot a row of every process the weights' mesh spans (one pool's), as many as its row groups
+        # divide.
+        mesh = mesh_of(task.variables)
+        processes = 1 if mesh is None else len({device.process_index for device in mesh.devices.flat})
+        groups = row_groups(mesh)
+        slots = -(-rows * processes // groups) * groups
+        server = Server.from_task(task, slots=slots, capacity=collector.max_prompt_tokens
                                   + collector.max_new_tokens, kv_cache=collector.kv_cache)
         # A pool's rows fold by their global row, this process's from its rank's first on.
         first = jax.process_index() * rows if server.pooled else 0
@@ -795,7 +804,10 @@ class _ServedTurns:
             if history is not None and not continues and not standing:
                 _log.warning("served episode row %d's context does not continue its last turn's history; "
                              "it is prefilled whole", row)
-            shared.append(len(history) if continues and history is not None else None)
+            # A segment declared only where the server reuses prefixes, which it does where serving one
+            # computes what the model computes (`Server.reuses_prefixes`).
+            reused = continues and history is not None and self.server.reuses_prefixes
+            shared.append(len(history) if reused and history is not None else None)
         drawn = self.server(held, max_new_tokens, key=key, first=self.first, shared=shared)
         out = np.full((len(drawn), max_new_tokens), sampling.pad, np.int32)
         behavior = np.zeros((len(drawn), max_new_tokens), np.float32)

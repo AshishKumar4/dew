@@ -148,6 +148,10 @@ class States:
         self._pinned: set[int] = set()
         """Entries a seated row restores from, an owed upload writes or an owed capture writes, kept from
         giving way until the step's moves are made (`drained`)."""
+        self._transient: set[int] = set()
+        """Entries holding a finished request's state at its history's end (`take`'s `transient`): such a
+        state takes a free entry or another history's, never a prompt's, and goes to no host slot; a
+        prompt that reads it makes it a prefix's."""
         self.spills: list[tuple[int, int]] = []
         """The (entry, host slot) moves owed: an entry giving way, out to its slot."""
         self.uploads: list[tuple[int, int]] = []
@@ -167,6 +171,7 @@ class States:
         if digest in self._by_hash:
             self._by_hash.move_to_end(digest)
             entry = self._by_hash[digest]
+            self._transient.discard(entry)
         else:
             slot = self.host.read(digest)
             entry = self._vacated()
@@ -175,25 +180,35 @@ class States:
         self._pinned.add(entry)
         return entry
 
-    def take(self, digest: bytes) -> int | None:
+    def take(self, digest: bytes, *, transient: bool = False) -> int | None:
         """An entry to write the state after `digest`'s page into: a free one, or the least recently used
         one's, which goes to the host first; None where a state after that page is held already, the store
-        holds none, or every entry is kept for the step."""
+        holds none, or every entry is kept for the step. A `transient` state (a finished request's,
+        `_transient`) takes a free entry or the least recently used history's alone."""
         if digest in self._by_hash or digest in self.host or not self.count or not self._vacant():
             return None
-        entry = self._vacated()
+        if transient and not self._free and not any(
+                entry in self._transient and entry not in self._pinned for entry in self._by_hash.values()):
+            return None
+        entry = self._vacated(transient)
+        if transient:
+            self._transient.add(entry)
         self._by_hash[digest] = entry
         # Its capture is owed: no other state takes the entry, nor sends it to the host, before it.
         self._pinned.add(entry)
         return entry
 
-    def _vacated(self) -> int:
-        """A free entry, or the least recently used one not kept, its state out to a host slot where one
-        can take it (`spills`)."""
+    def _vacated(self, transient: bool = False) -> int:
+        """A free entry, or the least recently used one not kept (a history's alone, for a `transient`
+        state), its state out to a host slot where one can take it (`spills`) unless it is a history's."""
         if self._free:
             return self._free.popleft()
-        digest = next(held for held, entry in self._by_hash.items() if entry not in self._pinned)
+        digest = next(held for held, entry in self._by_hash.items()
+                      if entry not in self._pinned and (not transient or entry in self._transient))
         entry = self._by_hash.pop(digest)
+        if entry in self._transient:
+            self._transient.discard(entry)
+            return entry
         slot = self.host.kept(digest)
         if slot is not None:
             self.spills.append((entry, slot))
@@ -203,6 +218,7 @@ class States:
         """Forget the state after `digest`'s page, whose page is reclaimed."""
         entry = self._by_hash.pop(digest, None)
         if entry is not None:
+            self._transient.discard(entry)
             self._free.append(entry)
         self.host.drop(digest)
 
@@ -221,6 +237,7 @@ class States:
         self._by_hash.clear()
         self.host.forget()
         self._pinned.clear()
+        self._transient.clear()
 
 
 @dataclass
@@ -270,6 +287,10 @@ class Pages:
         self._writing: Counter[bytes] = Counter()
         """The prefix hashes of full prompt pages rows hold and have not yet published: a prompt that
         shares one waits for it (`waits`), so it reads those keys where it would write them again."""
+        self._transient: set[int] = set()
+        """Pages a finished request's history named past what its prompt did (`publish`'s `transient`):
+        released, they are the first reclaimed, and reclaimed they are freed, never kept on the host, so a
+        history gives way to every prompt's prefix; a later prompt that reads one makes it a prefix's."""
 
     @property
     def available(self) -> int:
@@ -415,9 +436,10 @@ class Pages:
         self._writing = +self._writing
 
     def publish(self, prompt: np.ndarray, pages: Sequence[int], salt: bytes = b"",
-                segment: int | None = None) -> None:
+                segment: int | None = None, *, transient: bool = False) -> None:
         """Name the row's full prompt pages by their prefix hash under `salt`, and the page its declared
-        shared `segment` ends inside by the segment's (`segment_hash`), once their keys are written."""
+        shared `segment` ends inside by the segment's (`segment_hash`), once their keys are written; the
+        pages a `transient` call names (a finished request's history, `_transient`) give way first."""
         if not self.prefix_cache:
             return
         for digest, page in zip(prefix_hashes(prompt, self.size, len(prompt) // self.size, salt), pages,
@@ -425,6 +447,8 @@ class Pages:
             if digest not in self._by_hash and page not in self._hash_of:
                 self._by_hash[digest] = page
                 self._hash_of[page] = digest
+                if transient:
+                    self._transient.add(page)
         if segment is None or not segment % self.size:
             return
         digest, page = segment_hash(prompt, self.size, segment, salt), pages[segment // self.size]
@@ -436,6 +460,8 @@ class Pages:
             self._segments[page] = digest
         else:
             self._hash_of[page] = digest
+            if transient:
+                self._transient.add(page)
 
     def release(self, pages: Sequence[int]) -> None:
         """A row gives its pages back; a page nobody holds is cached or freed.
@@ -450,6 +476,9 @@ class Pages:
                 continue
             if page in self._hash_of:
                 self._cached[page] = None
+                if page in self._transient:
+                    # A history's page is the first reclaimed.
+                    self._cached.move_to_end(page, last=False)
             else:
                 self._free.append(page)
 
@@ -464,6 +493,7 @@ class Pages:
         self._by_hash.clear()
         self._hash_of.clear()
         self._segments.clear()
+        self._transient.clear()
         self._on_host.forget()
         self._landing.clear()
         if self.states is not None:
@@ -471,6 +501,8 @@ class Pages:
 
     def _hold(self, page: int) -> None:
         self._cached.pop(page, None)
+        # A prompt reads it: a prefix's page now.
+        self._transient.discard(page)
         self._holders[page] += 1
 
     def _take(self) -> int:
@@ -492,8 +524,9 @@ class Pages:
                 slot, _ = landing
                 self.transfers.uploads.remove((slot, page))
                 self._on_host.unread(digest, slot)
-            elif not self._spilled(page, digest) and self.states is not None:
+            elif (page in self._transient or not self._spilled(page, digest)) and self.states is not None:
                 self.states.drop(digest)
+            self._transient.discard(page)
         self._holders[page] += 1
         return page
 
