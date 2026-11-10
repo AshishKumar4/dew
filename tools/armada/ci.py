@@ -1582,7 +1582,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     # (`watched`): each is the input of every file the task runs; and every file of the checkout as it stood
     # then, so a file the run wrote is told from one it read alone (`watched.changed`, `record`).
     before = watched.stamps(os.getcwd(), followed.HIDDEN_INPUTS)
-    opens = watched.Opens(os.getcwd())
+    opens = watched.Opens(os.getcwd(), frozenset({str(session.DURATIONS)}))
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=dict(environment))
 

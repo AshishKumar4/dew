@@ -30,17 +30,14 @@ EVENT = struct.Struct("iIII")
 DRAIN_SECONDS = 0.2
 """How often the watch's events are read while the task runs: the kernel holds fs.inotify.max_queued_events
 (16384 by default) before it overflows, which a task's opens could pass between two reads seconds apart."""
-SKIPPED = ("tests/test_durations.json",)
-"""The durations record is split.py's, which cuts a split file from it: the file's own entries are its
-groups' input (`ci.py`'s `cache_key`), and no other file's."""
-
-
 class Opens:
     """The watch of every directory under `root`'s tests/ and src/, but hidden ones and __pycache__, read by a
     thread of its own until it is `closed`."""
 
-    def __init__(self, root: str) -> None:
-        self.root = root
+    def __init__(self, root: str, skipped: frozenset[str] = frozenset()) -> None:
+        # The files no open of which is any test's input (ci.py's: the durations record, which split.py cuts a
+        # split file from, its own entries its groups' input, `cache_key`, and no other file's).
+        self.root, self.skipped = root, skipped
         self.blind = False
         self.opened: set[str] = set()
         self.watched: dict[int, str] = {}
@@ -77,7 +74,7 @@ class Opens:
             elif mask & OPEN and watch in self.watched and name and not mask & DIRECTORY \
                     and not name.endswith((".py", ".pyc")):
                 path = os.path.join(self.watched[watch], name)
-                if path not in SKIPPED:
+                if path not in self.skipped:
                     self.opened.add(path)
 
     def closed(self) -> set[str] | None:

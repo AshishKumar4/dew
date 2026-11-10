@@ -102,11 +102,15 @@ def arms(answer: Mapping[str, np.ndarray], prefix: str = "") -> tuple[dict[str, 
     return arm("reference"), arm("truth")
 
 
+FRAME = struct.Struct("<Q")
+"""A frame's size, its header: what `send` writes before the frame's bytes and `received` reads first."""
+
+
 def send(stream: BinaryIO, arrays: Mapping[str, np.ndarray]) -> None:
     """`arrays` as one frame to the other end of a pipe (`received`)."""
     buffer = io.BytesIO()
     np.savez(buffer, **arrays)
-    stream.write(struct.pack("<Q", buffer.getbuffer().nbytes))
+    stream.write(FRAME.pack(buffer.getbuffer().nbytes))
     stream.write(buffer.getvalue())
     stream.flush()
 
@@ -114,12 +118,12 @@ def send(stream: BinaryIO, arrays: Mapping[str, np.ndarray]) -> None:
 def received(stream: BinaryIO) -> dict[str, np.ndarray] | None:
     """The arrays of the next frame the other end sent (`send`), or None where it closed the pipe between
     frames. A frame cut short, in its size or its bytes, is an EOFError."""
-    header = stream.read(8)
+    header = stream.read(FRAME.size)
     if not header:
         return None
-    if len(header) < 8:
-        raise EOFError(f"the pipe closed {len(header)} bytes into a frame's 8-byte size")
-    (size,) = struct.unpack("<Q", header)
+    if len(header) < FRAME.size:
+        raise EOFError(f"the pipe closed {len(header)} bytes into a frame's {FRAME.size}-byte size")
+    (size,) = FRAME.unpack(header)
     payload = stream.read(size)
     if len(payload) < size:
         raise EOFError(f"the pipe closed {len(payload)} bytes into a frame of {size}")
