@@ -615,6 +615,36 @@ def test_a_call_of_no_rows_gives_its_empty_value():
     assert y.shape == (0, 16)
 
 
+@INTERPRETS
+def test_the_template_takes_an_fp32_cotangent_at_the_highest_precision_as_its_bf16_parts():
+    """A grouped product of bf16 rows and matrices into fp32 with the template named (`mosaic_gpu`),
+    interpreted as an H100's at the highest precision: its input gradient multiplies the fp32 cotangent by the
+    bf16 matrix and its kernel gradient the rows by it, each an fp32 product the tensor cores multiply only in
+    TF32, so each runs as the cotangent's bf16 parts (`gemm._in_parts`), each part's product exact, on par
+    with XLA's whole fp32 product from float64 (check 1), where the template refused them (row 5405)."""
+    group_sizes = jnp.asarray([70, 66], jnp.int32)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        return (jax.random.normal(keys[0], (136, 128)).astype(jnp.bfloat16),
+                (jax.random.normal(keys[1], (2, 128, 256)) / np.sqrt(128)).astype(jnp.bfloat16),
+                jax.random.normal(keys[2], (136, 256)).astype(jnp.float32))
+
+    def product(dtype, **options):
+        out = jnp.promote_types(dtype, jnp.float32)
+        return lambda x, w: gemm.gemm(x.astype(dtype), w.astype(dtype), group_sizes, out_dtype=out, **options)
+
+    def step(kernel):
+        def run(x, w, dy):
+            with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+                  jax.default_matmul_precision("highest")):
+                return with_gradients(product(jnp.bfloat16, interpret_on_cpu=True))(x, w, dy)
+        return run
+
+    assert_as_exact(jax.jit(step("mosaic")), jax.jit(step("xla")), draw, "an fp32 cotangent's bf16 parts",
+                    seeds=8, truth_fn=with_gradients(product(jnp.float64)))
+
+
 def test_a_kernel_gradient_of_no_rows_on_a_hopper_is_its_groups_zeros():
     """A kernel gradient contracting no rows on an H100 (a step whose experts received no tokens): its
     selection derives no split of an empty contraction (`mosaic_gpu.split_count`, which took the least of

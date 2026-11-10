@@ -88,15 +88,17 @@ def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
 
 @INTERPRETS
 def test_a_regions_analysis_reports_what_fusing_it_would_raise():
-    """Where the call names a kernel that refuses the region (the template, which multiplies 16-bit operands
-    alone, named for fp32 ones under `generation.chosen`), `fused_gemm.analysis` reports the refusal `fused`
-    raises, so a pass never takes a region whose fusion fails."""
+    """Where the call names a kernel that refuses the region (the template, which multiplies its operands
+    whole, named under `generation.chosen` for a declared dot algorithm that narrows fp32 operands to
+    TF32's), `fused_gemm.analysis` reports the refusal `fused` raises, so a pass never takes a region whose
+    fusion fails."""
     sizes = jnp.asarray([100, 156], jnp.int32)
     x, w = jnp.ones((256, 512), jnp.float32), jnp.ones((2, 512, 256), jnp.float32)
     bias = jnp.ones((256,), jnp.float32)
 
     def region(x, w, sizes, bias):
-        return fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True) + bias
+        return fused_gemm.product(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True,
+                                  precision=jax.lax.DotAlgorithmPreset.TF32_TF32_F32) + bias
 
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic"):
         found = fused_gemm.analysis(region, x, w, sizes, bias)
