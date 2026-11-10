@@ -7,7 +7,9 @@ source that answers every sample of a task with a completion the task fixes;
 with `--vary`, the answer also depends on the process, as independent draws
 from engines do. With `--records`, the model is a mixture and every call
 records its routing and its sampler's support, and the second half of the
-tasks truncate, so the share that holds them packs no record at all. With
+tasks truncate, so the share that holds them packs no record at all; with
+`--truncate`, they truncate over the dense decoder, packed sharing a group's
+prompt (`pack`'s `share`), so that share packs no shared prompt. With
 `--estimator global`, each task's rewards are its samples' indices times its
 id, so the shares' returns spread apart. The pool fits one update on
 `--mesh`, and process 0 writes the rows each process handed the step and the
@@ -41,6 +43,7 @@ def main() -> None:
     parser.add_argument("--vary", action="store_true", help="each process's draws depend on the process")
     parser.add_argument("--records", action="store_true",
                         help="calls record routing and supports, and the second half of the tasks truncate")
+    parser.add_argument("--truncate", action="store_true", help="the second half of the tasks truncate")
     parser.add_argument("--estimator", default="group",
                         help="the advantage estimator; under global, each task's rewards scale with its id")
     args = parser.parse_args()
@@ -60,7 +63,7 @@ def main() -> None:
     from dew.nn.backbones.decoder_block import Mixture
     from dew.objectives.rl import GRPOObjective
     from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
-    from dew.objectives.rl.sessions import Call, Session, Status
+    from dew.objectives.rl.sessions import FORK_PARENTS_KEY, Call, Session, Status
     from dew.training import Layout, MeshSpec, Trainer
 
     process = jax.process_index()
@@ -77,7 +80,8 @@ def main() -> None:
                     "support": tuple((token, 11) for token in sampled)} if args.records else {}
         call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), sampled,
                     (-0.5 - 0.01 * sample, -0.25), "stop", version, **recorded)
-        status = Status.TRUNCATED if args.records and int(task.id) > TASKS // 2 else Status.COMPLETED
+        truncating = args.records or args.truncate
+        status = Status.TRUNCATED if truncating and int(task.id) > TASKS // 2 else Status.COMPLETED
         return Session(str(task.id), "", 0, 0, (call,), status, reward(int(task.id), sample, args.estimator),
                        {}, "")
 
@@ -107,7 +111,8 @@ def main() -> None:
     scheduler = RolloutScheduler(
         Asynchronous(ScriptedSource(drawn), Published(), objective, width=8, rows=partition.rows(TASKS),
                      max_lag=1, ahead=1),
-        groups=2, support_capacity=16 if args.records else None, estimator=args.estimator)
+        groups=2, support_capacity=16 if args.records else None, estimator=args.estimator,
+        share=args.truncate and objective.shares_prefixes(train=True))
     data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})
@@ -117,6 +122,7 @@ def main() -> None:
         np.savez(args.out.with_suffix(".npz"), **leaves)
         args.out.write_text(json.dumps({
             "processes": jax.process_count(), "step": int(final.step),
+            "shared": FORK_PARENTS_KEY in trained[0],
             "partition": {"count": partition.count, "readers": partition.readers},
             "rows": {name: np.asarray(rows[name]).tolist() for name in PACKED}}))
 

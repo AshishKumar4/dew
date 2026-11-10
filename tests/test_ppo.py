@@ -596,3 +596,43 @@ def test_a_value_head_takes_packed_rows_as_flat_fields_or_coordinates():
                                   head.apply(variables, tokens, coordinates=laid))
     with pytest.raises(ValueError):
         head.apply(variables, tokens, segment_ids=segments, coordinates=laid)
+
+
+def test_a_shared_prompts_branches_read_the_critics_value_after_their_own_prefix():
+    """A group packed with its prompt laid once (`pack`'s `share`, each branch continuing the prompt) reads
+    each action's critic value after the prefix it follows, as the group packed whole reads it: a later
+    branch's first action the value after the shared prompt, not after the branch packed before it (check
+    1 over drawn critics, float64 truth)."""
+    from model_support import TINY_DECODER, float64_twin
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl.sessions import SESSION_INDEX_KEY, Call, Session, Status, pack
+
+    rng = np.random.default_rng(5)
+    prompt = tuple(int(token) for token in rng.integers(1, VOCAB, 5))
+    sessions = []
+    for sample in range(3):
+        sampled = tuple(int(token) for token in rng.integers(1, VOCAB, 3))
+        call = Call(prompt, sampled, tuple(-0.5 for _ in sampled), "stop", 0)
+        sessions.append(Session("t", "g", sample, 0, (call,), Status.COMPLETED, float(sample)))
+    width = TINY_DECODER["max_seq_len"]
+    shared, whole = pack(sessions, width, share=True), pack(sessions, width)
+    assert shared[RESPONSE_MASK_KEY].shape[0] < whole[RESPONSE_MASK_KEY].shape[0]
+
+    def built(model):
+        return PPOObjective(model, width - 1, critic=ValueHead(model))
+
+    def values(objective, batch):
+        # Each action's value, by its session and its place in the row.
+        rows, columns = np.nonzero(batch[RESPONSE_MASK_KEY] > 0)
+        order = np.lexsort((columns, rows, batch[SESSION_INDEX_KEY][rows, columns]))
+        return jax.jit(lambda variables: objective.values(variables, batch)[rows[order], columns[order]])
+
+    model = CausalTransformer(vocab_size=VOCAB, **TINY_DECODER)
+    objective = built(model)
+    initialized = jax.jit(objective.init)
+    # The forked calls' draws (test_forked_calls' FORK_SEEDS).
+    assert_as_exact(values(objective, shared), values(objective, whole),
+                    lambda seed: (nn.unbox(initialized(jax.random.key(seed))),),
+                    "critic over a shared prompt", seeds=64,
+                    truth_fn=values(built(float64_twin(model)), whole))
