@@ -675,23 +675,15 @@ def _programs_within(equation, lowering: str) -> list:
 
 
 def _narrow_values(program, lowering: str) -> Iterator[str]:
-    """Each value of `program`, a float64 truth's traced program with what no output reads removed, that is
-    narrower than float64 and no format's own: a constant it closes over that an equation or an output
-    reads, a literal, and a result an operation computes, in the program or in one within it
-    (`_programs_within`). A narrow result is a format's own where its operation rounds to a stated format
-    (a cast, FORMATTED) or only moves entries (`programs.rearranges`): a truth that states a rounding (a
-    quantized weight, a bf16 output) keeps it, and one that computes in fp32 does not."""
-    jaxpr = getattr(program, "jaxpr", program)
-    read = {atom for equation in jaxpr.eqns for atom in equation.invars if programs.computed(atom)}
-    read |= {atom for atom in jaxpr.outvars if programs.computed(atom)}
-    for var in jaxpr.constvars:
-        if var in read and _below_float64(getattr(var.aval, "dtype", None)):
-            yield f"a {var.aval.str_short()} constant it closes over"
-    for equation in jaxpr.eqns:
+    """Each result of `program`, a float64 truth's traced program with what no output reads removed, that an
+    operation computes narrower than float64, in the program or in one within it (`_programs_within`). A
+    narrow result is a format's own, and kept, where its operation rounds to a stated format (a cast,
+    FORMATTED) or only moves entries (`programs.rearranges`): a truth that states a rounding (a quantized
+    weight, a bf16 output) keeps it, and one that computes in fp32 does not. A constant or a literal is its
+    exact value whatever its format, as JAX promotes it where a float64 operation reads it: a parameter
+    left float32 under a float64 run is no rounding."""
+    for equation in getattr(program, "jaxpr", program).eqns:
         primitive = equation.primitive
-        for atom in equation.invars:
-            if isinstance(atom, jcore.Literal) and _below_float64(getattr(atom.aval, "dtype", None)):
-                yield f"a {atom.aval.str_short()} literal its `{primitive.name}` reads"
         within = _programs_within(equation, lowering)
         for inner in within:
             yield from _narrow_values(inner, lowering)
@@ -705,21 +697,24 @@ def _narrow_values(program, lowering: str) -> Iterator[str]:
 
 def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     """Raise unless a site's truth is float64's: `truth`, its value on the site's first draw, holds no float
-    leaf narrower than float64, and the program `truth_fn` traces on those `inputs` widened computes none
-    that feeds an output (`_narrow_values`, read by JAX's own dead-code pass and its primitives' facts): its
-    constants, its literals and its operations' results are float64, a stated rounding apart. A model of a
-    fixed float32 dtype run on widened inputs, or a float64 module over parameters left float32, is a second
-    fp32 run: it equals the reference bit for bit and judges Dew against a truth no better than itself (a
-    forked call's cells, row 5430). A truth the gate runs as given (NumPy, torch, a recording) or that runs
-    programs of its own traces none here, and is held by its leaves alone."""
-    paths = _leaf_paths(truth)
-    for path, leaf in zip(paths, jax.tree.leaves(truth), strict=True):
+    leaf narrower than float64, and the program `truth_fn`'s own calls trace on those `inputs` widened
+    computes no narrower result that an output reads (`_narrow_values`, by JAX's dead-code pass and its
+    primitives' facts), a stated rounding apart. A model of a fixed float32 dtype run on widened inputs
+    computes in fp32, or rounds its answer to it: a second fp32 run, which equals the reference bit for bit
+    and judges Dew against a truth no better than itself (a forked call's cells; row 5430). A leaf of no
+    entries holds no value and is not read. A truth the gate runs as given (NumPy, torch, a recording) or
+    that runs programs of its own traces none here, and is held by its leaves alone. The gate cannot tell a
+    cast the arms share (a bf16 output's rounding) from one the truth alone takes (a round trip through
+    float32 with no operation between): both are kept."""
+    paths, leaves = _leaf_paths(truth), jax.tree.leaves(truth)
+    held = [bool(np.size(leaf)) for leaf in leaves]
+    for path, leaf, read in zip(paths, leaves, held, strict=True):
         # The leaf's own dtype: JAX's reading of a host float64 outside x64 would narrow it.
         dtype = np.asarray(leaf).dtype if not hasattr(leaf, "dtype") else leaf.dtype
-        if _below_float64(dtype):
+        if read and _below_float64(dtype):
             raise NarrowTruth(path, f"{label}: the float64 truth's leaf {path or 'itself'} is {dtype}: a "
-                              f"truth computes in float64 (a float64 clone of the model over its variables "
-                              f"widened, `float64_held`)")
+                              f"truth computes in float64 (a float64 clone of the model, `float64_held` "
+                              f"variables)")
     windowed = any(isinstance(layer, _Windowed) for layer in _layers(truth_fn))
     trace = None if _given(truth_fn) else getattr(next(
         layer for layer in _layers(truth_fn) if not isinstance(layer, _RunToRun | _Windowed)), "trace", None)
@@ -737,15 +732,14 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
         fed = pe.dce_jaxpr(program, used)[0]
         return list(dict.fromkeys(itertools.islice(_narrow_values(fed, lowering), 64)))[:3]
 
-    if not narrow([True] * count):
+    if not narrow(held):
         return
-    # The first leaf a narrow value feeds, and what feeds it: each output's own program, read on the refusal.
+    # The first leaf a narrow result feeds, and what feeds it: each output's own program, read on the refusal.
     at, found = next((index, "; ".join(found)) for index in range(count)
-                     if (found := narrow([index == other for other in range(count)])))
+                     if held[index] and (found := narrow([index == other for other in range(count)])))
     raise NarrowTruth(paths[at], f"{label}: the float64 truth's leaf {paths[at] or 'itself'} is fed by "
-                      f"{found}: no float64 truth, which computes in float64 from float64 constants (a "
-                      f"float64 clone of the model over its variables widened, `float64_held`; a stated "
-                      f"rounding, a cast, is kept)")
+                      f"{found}: no float64 truth, which computes in float64 (a float64 clone of the "
+                      f"model; a stated rounding, a cast, is kept)")
 
 
 def _over_orders(first: list[tuple], later: list[tuple]) -> list[tuple]:
