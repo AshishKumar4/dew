@@ -178,14 +178,19 @@ def _rows_read(tree, index: jax.Array):
 
 
 def _rows_recomputed(remat: RematPolicy | None) -> Callable[..., bool]:
-    """What a scanned run's body that reads rows keeps for the backward: what its layer's own remat keeps
-    (`remat`: everything where it runs no remat, which a block that recomputes named residuals alone does
-    too, recomputing them itself (`RematPolicy.recompute`, `DecoderBlock.__call__`);
-    `RematPolicy.checkpoint_policy` otherwise, nothing where that is None, the full rung), but never the rows
-    it read (`_rows_read`, named `LAYER_ROWS`), which the backward reads again from the iteration's index.
-    JAX 0.12's `save_anything_except_these_names` saves every value, the names it is given among them, which
-    kept each iteration's rows among the scan's residuals (row 4751)."""
-    layer = ((lambda *_, **__: True) if remat is None or remat.recompute
+    """What a scanned run's body that reads rows keeps for the backward: where it names no rung (`remat`
+    None), every product's result (`dots_saveable`), what its layers would hold unscanned, each other value
+    (a row's cast to the compute dtype, an elementwise step) recomputed in the backward as XLA's fusions
+    recompute it in an unscanned program, where saving every value stacked each of them beside the products
+    (row 4751: a frozen base read where it lies in bf16, 318,296 bytes of temporaries against its unscanned
+    program's 169,616; 129,456 so); a block recomputing named residuals itself everything else
+    (`RematPolicy.recompute`, `DecoderBlock.__call__`); `RematPolicy.checkpoint_policy` otherwise, nothing
+    where that is None, the full rung; and never the rows it read (`_rows_read`, named `LAYER_ROWS`), which
+    the backward reads again from the iteration's index. JAX 0.12's `save_anything_except_these_names`
+    saves every value, the names it is given among them, which kept each iteration's rows among the scan's
+    residuals."""
+    layer = (jax.checkpoint_policies.dots_saveable if remat is None
+             else (lambda *_, **__: True) if remat.recompute
              else remat.checkpoint_policy() or jax.checkpoint_policies.nothing_saveable)
 
     def policy(primitive: jax.extend.core.Primitive, *avals, **params) -> bool:
