@@ -1204,12 +1204,67 @@ def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL,
     return (_pooled(a, b), *_interval(a, b, tails=tails))
 
 
+def _at_parity(draws: _Draws, index: int, leaf: str, tails: tuple[float, float], *, contained: bool,
+               typical: bool) -> Finding | None:
+    """Check 1's rule for a leaf's pooled ratio (`_judgement`'s `ratio_rule`): its finding where the leaf
+    is over PARITY (`_status`) or its draws leave it inconclusive, none where it passes; with `typical` (a
+    final verdict), a leaf its pooled ratio leaves inconclusive passed by its typical draw where that
+    decides (`_typical_status`)."""
+    a, b, count = draws.mine[:, index], draws.theirs[:, index], len(draws.mine)
+    ratio, low, high = _judged(draws, index, tails)
+    status = _status(ratio, low, high, contained=contained)
+    # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
+    measure = (_log_sum(a) - _log_sum(b)) / 2
+    found = None
+    if status == "inconclusive" and contained and typical:
+        # The pooled ratio's sums unresolved: its draws' paired ratios pass it where they qualify.
+        found = _typical_status(a, b, tails, draws.of_examples(index), draws.scalar(index))
+        status = found[0]
+    if status == "inconclusive":
+        return Finding(
+            leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
+            f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}"
+            + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s "
+               f"[{found[2]:.3f}, {found[3]:.3f}]: {found[4]}")
+            + "; give the site larger inputs or more seeds (`seeds_for`)")
+    if status == "over":
+        return Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
+                       f"{ratio:.3f} times the reference's over {count} seeds, interval "
+                       f"[{low:.3f}, {high:.3f}] (allowed {PARITY})")
+    return None
+
+
+def _below_one(draws: _Draws, index: int, leaf: str, tails: tuple[float, float], *, contained: bool,
+               typical: bool) -> Finding | None:
+    """The FP8 products' rule for a leaf's pooled ratio against a named arm (`_judgement`'s `ratio_rule`,
+    docs/design/testing.md, "FP8 products"): none where Dew's error is below the arm's, its ratio's interval
+    (`_judged`, taken to hold the ratio) wholly under one; a "pooled" finding where it lies wholly at or over
+    one; else the leaf is inconclusive, as a ratio or an end that is not a number is. Below is certified by
+    the whole interval at either stage: no interval is resolved by its width and no typical draw passes a
+    leaf, as check 1's parity allows (`contained`, `typical`)."""
+    a, b, count = draws.mine[:, index], draws.theirs[:, index], len(draws.mine)
+    ratio, low, high = _judged(draws, index, tails)
+    measure = (_log_sum(a) - _log_sum(b)) / 2
+    found = (f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the named arm's over {count} seeds, "
+             f"interval [{low:.3f}, {high:.3f}]")
+    if not all(np.isfinite(value) for value in (ratio, low, high)):
+        return Finding(leaf, "inconclusive", measure, f"{found}: inconclusive, not a number")
+    low, high = min(low, ratio), max(high, ratio)
+    if high < 1:
+        return None
+    if low >= 1:
+        return Finding(leaf, "pooled", measure, f"{found} (it must be below one)")
+    return Finding(leaf, "inconclusive", measure, f"{found}: inconclusive, the interval reaches one; give "
+                   f"the site more seeds")
+
+
 def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
-               contained: bool = True, typical: bool = False) -> tuple[list[Finding], list[Finding]]:
-    """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY (`_status`), a row or
-    a value it fails, and each leaf its draws leave inconclusive; with `typical` (a final verdict), a
-    leaf its pooled ratio leaves inconclusive passed by its typical draw where that decides
-    (`_typical_status`)."""
+               contained: bool = True, typical: bool = False,
+               ratio_rule=_at_parity) -> tuple[list[Finding], list[Finding]]:
+    """Check 1's findings over `draws` (`assert_as_exact`): each leaf its pooled ratio fails (`ratio_rule`:
+    over PARITY, `_at_parity`; under the FP8 products' contract not below a named arm, `_below_one`), a
+    row or a value it fails, and each leaf its draws leave inconclusive; with `typical` (a final verdict),
+    a leaf its pooled ratio leaves inconclusive passed by its typical draw where that decides."""
     over, unresolved = [], []
     for index, name in enumerate(draws.names):
         leaf, count = label + name, len(draws.mine)
@@ -1226,26 +1281,9 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(Finding(leaf, "exact reference", _root_mean(a),
                                     f"{leaf}: the reference equals float64 on every seed and dew does not"))
         else:
-            ratio, low, high = _judged(draws, index, tails)
-            status = _status(ratio, low, high, contained=contained)
-            # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
-            measure = (_log_sum(a) - _log_sum(b)) / 2
-            found = None
-            if status == "inconclusive" and contained and typical:
-                # The pooled ratio's sums unresolved: its draws' paired ratios pass it where they qualify.
-                found = _typical_status(a, b, tails, draws.of_examples(index), draws.scalar(index))
-                status = found[0]
-            if status == "inconclusive":
-                unresolved.append(Finding(
-                    leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
-                    f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}"
-                    + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s "
-                       f"[{found[2]:.3f}, {found[3]:.3f}]: {found[4]}")
-                    + "; give the site larger inputs or more seeds (`seeds_for`)"))
-            elif status == "over":
-                over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
-                                    f"{ratio:.3f} times the reference's over {count} seeds, interval "
-                                    f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
+            found = ratio_rule(draws, index, leaf, tails, contained=contained, typical=typical)
+            if found is not None:
+                (unresolved if found.rule == "inconclusive" else over).append(found)
         # The paired examples' test keeps its width's factor (its null is exchangeability, whatever a row's
         # error is); the maximum's takes a row one value rules at one value's (`_Draws.factor`).
         factor = row_factor(draws.widths[index])
@@ -1276,18 +1314,18 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
     return over, unresolved
 
 
-def _staged(drawn, seeds: int, label: str, *,
-            two_stage: bool = True) -> tuple[list[Finding], list[Finding], int]:
+def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True,
+            ratio_rule=_at_parity) -> tuple[list[Finding], list[Finding], int]:
     """Check 1's two pre-declared stages over `drawn(start, stop)`, the draws of seeds start to stop: at
-    `seeds`, a site whose every leaf passes (`_judgement`: its ratio, rows and values) passes; any leaf
-    that does not draws the second stage, REDRAW times as many further seeds, and every leaf is judged
-    again over all of them, that verdict final. Its findings, the leaves left inconclusive and the stage
-    reached. With `two_stage` false, the procedure before it, for comparison: tails
+    `seeds`, a site whose every leaf passes (`_judgement`: its ratio by `ratio_rule`, its rows and values)
+    passes; any leaf that does not draws the second stage, REDRAW times as many further seeds, and every
+    leaf is judged again over all of them, that verdict final. Its findings, the leaves left inconclusive
+    and the stage reached. With `two_stage` false, the procedure before it, for comparison: tails
     PREVIOUS_TAILS, the interval as it is, only a leaf whose ratio is over PARITY drawing again."""
     tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
     if two_stage:
-        further = any(_judgement(draws, label, tails))
+        further = any(_judgement(draws, label, tails, ratio_rule=ratio_rule))
     else:
         further = any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index, tails)[0] > PARITY
                       for index in range(len(draws.names)))
@@ -1295,7 +1333,8 @@ def _staged(drawn, seeds: int, label: str, *,
         draws = draws.joined(drawn(seeds, staged_units(seeds)))
     # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
     # their typical draw (`_judgement`'s `typical`).
-    return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
+    return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage, ratio_rule=ratio_rule),
+            2 if further else 1)
 
 
 # Check 1's conditioning (ledger 1714): a site declares the weighed check's own seeds beside its `seeds`;

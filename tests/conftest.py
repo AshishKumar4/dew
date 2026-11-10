@@ -164,6 +164,13 @@ def pytest_runtest_makereport(item, call):
         gate.SWITCHED.clear()
         outcome.get_result().user_properties.append(switched)
         item.user_properties.append(switched)
+    # What the FP8 sites this test judged below a named arm measured (`reference_error.BELOW`), the JUnit
+    # property `fp8_below`: each form's ratio to that arm and to the dequantized reference, of a pass too.
+    if call.when == "call" and gate is not None and gate.BELOW:
+        below = ("fp8_below", json.dumps(gate.BELOW))
+        gate.BELOW.clear()
+        outcome.get_result().user_properties.append(below)
+        item.user_properties.append(below)
 
 
 def pytest_sessionfinish(session, exitstatus):
