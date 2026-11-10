@@ -4,7 +4,6 @@ inverse and the weighted keys and values, the states, the output or the fused sc
 backward reads kept (`kept_forward`)."""
 
 import dataclasses
-import math
 from collections.abc import Callable
 
 import jax
@@ -29,10 +28,9 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _states,
     _weighted,
     _weighted_values,
-    block_of,
     family_of,
+    padded_widths,
     per_key_refusal,
-    values_unit,
 )
 from dew.nn.kernels.templates.recurrence.output import output_launch
 from dew.nn.kernels.templates.recurrence.table import Table
@@ -278,11 +276,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     if per_key and (refused := per_key_refusal(dtype)):
         raise NotImplementedError(refused)
     scale = key_width ** -0.5 if scale is None else scale
-    block = block_of(family)
-    # The values padded to whole steps (`values_unit`) its walks' and output's blocks divide.
-    unit = math.lcm(values_unit(family, kept=keeps, per_key=per_key), tiles.block_v * tiles.walkers,
-                    tiles.block_o or tiles.block_v)
-    width, columns = -(-key_width // block) * block, -(-value_width // unit) * unit
+    width, columns = padded_widths(family, key_width, value_width, kept=keeps, per_key=per_key, tiles=tiles)
     q, k = (zero_padded(x.astype(dtype), 3, width) for x in (q, k))
     v = zero_padded(v.astype(dtype), 3, columns)
     g = zero_padded(g.astype(jnp.float32), 3, width) if per_key else g.astype(jnp.float32)

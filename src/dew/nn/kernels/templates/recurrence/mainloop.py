@@ -115,6 +115,19 @@ def values_unit(family: mosaic.Family, *, kept: bool, per_key: bool) -> int:
     return block_of(family) if kept and whole else value_unit(family)
 
 
+def padded_widths(family: mosaic.Family, key_width: int, value_width: int, *, kept: bool, per_key: bool,
+                  tiles: "Tiles | None" = None) -> tuple[int, int]:
+    """A call's keys' width padded to whole tiles of `family`'s bundle (`block_of`) and its values' to whole
+    steps (`values_unit`), and, at chosen `tiles`, to the steps its walks' and output's blocks divide: the
+    one derivation a plan's costing (`template._widths`) and the operands its launches allocate
+    (`chunk_forward.prepared`) both read."""
+    unit = values_unit(family, kept=kept, per_key=per_key)
+    if tiles is not None:
+        unit = math.lcm(unit, tiles.block_v * tiles.walkers, tiles.block_o or tiles.block_v)
+    block = block_of(family)
+    return -(-key_width // block) * block, -(-value_width // unit) * unit
+
+
 def block_of(family: mosaic.Family) -> int:
     """A tile's width on `family`'s bundle: the keys' and values' column blocks and the memory's key slices,
     the widest depth its products step over in 16-bit operands (`Family.depths`), whose bf16 parts an fp32

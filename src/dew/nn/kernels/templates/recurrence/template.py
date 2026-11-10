@@ -33,16 +33,14 @@ from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloo
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
             ) -> tuple[int, int, jnp.dtype]:
-    """The call's keys' widths padded to whole tiles of `family`'s bundle (`mainloop.block_of`), its values'
-    to whole value tiles (`mainloop.value_unit`) but a training call's under a decay a key dimension, to
-    whole tiles (`mainloop.values_unit`), and the dtype its tiles hold (the operands', fp32 in an fp32
-    call)."""
+    """The call's keys' and values' widths padded as its launches pad them (`mainloop.padded_widths`), a
+    training call's values as its fast backward reads them, and the dtype its tiles hold (the operands',
+    fp32 in an fp32 call)."""
     arguments = ba.arguments
     dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
-    pad = mainloop.block_of(family)
-    unit = mainloop.values_unit(family, kept=training, per_key=arguments["g"].ndim == 4)
-    return (-(-arguments["key"].shape[-1] // pad) * pad, -(-arguments["value"].shape[-1] // unit) * unit,
-            jnp.dtype(dtype))
+    widths = mainloop.padded_widths(family, arguments["key"].shape[-1], arguments["value"].shape[-1],
+                                    kept=training, per_key=arguments["g"].ndim == 4)
+    return (*widths, jnp.dtype(dtype))
 
 
 def chunk_of(ba: tokamax.BoundArguments, family: mosaic.Family, target: generation.GpuTarget) -> int:
