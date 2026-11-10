@@ -65,7 +65,12 @@ IDLE_SECONDS = 60
 store that is gone produces, so a close that waits out its transfers ends (`dew.data.cache`). It is the
 bound botocore already holds every S3 transfer to (its connect and read timeouts, 60 s each, botocore's
 `Config`), so every store fails a silent peer alike: gcsfs, which bounds no request of its own
-(`requests_timeout=None`), is opened with it (`Store.resolve`). The Hub is a boundary of its library
+(`requests_timeout=None`), is opened with it (`Store.resolve`). What that bounds, on GCS: a silent peer on a
+read fails at `IDLE_SECONDS`; a request body written to a host that is gone fails by the kernel's TCP
+retransmission limit (aiohttp starts its read bound only once a body is written, `ClientRequest.write_bytes`);
+a live peer that stops reading a body is the stalled-alive case a pool's execution watchdog bounds (row 5402).
+S3 has no such gap: urllib3 sends a body under the socket timeout of botocore's connect bound, 60 s of no
+progress (`HTTPConnectionPool._make_request`). The Hub is a boundary of its library
 (row 5402): huggingface_hub's JSON calls go through one process-wide client with no timeout, which no call
 or client of it bounds, and hf_xet, which carries the bytes, bounds its transfers (60 s connect, 300 s idle
 read) but not its shard upload's read."""
