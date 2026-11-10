@@ -45,8 +45,9 @@ EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, j
 """Operations whose float results are their operands' values selected, or exact: no rounding. An operation
 that only moves entries is exact too (`dew.nn.programs.rearranges`, read beside these, `rounds_nothing`).
 An integer result rounds nothing either, nor does an array made to be written over (`empty2`); a collective
-that moves blocks between devices (a gather, an all-to-all, a permutation) is a move too. The rounding
-model reads it (tests/rounding_bound.py)."""
+that moves blocks between devices (a gather, an all-to-all, a permutation) is a move too. The one list of
+them: the rounding model reads it (tests/rounding_bound.py), and the truth rule
+(`reference_error._narrow_values`)."""
 
 
 def rounds_nothing(primitive) -> bool:
@@ -58,7 +59,21 @@ FORMATTED = frozenset({jax.lax.bitcast_convert_type_p, jax.lax.nextafter_p, jax.
 """The operations whose meaning is a float format's own, whatever width a program computes in: a value's
 bits read as another type, its neighbour on its format's grid, its rounding to a format's digits. JAX states
 no such fact of a primitive, so they are named here, once, by their objects: the float64 replay runs them at
-the traced dtypes (tests/float64_replay.py)."""
+the traced dtypes (tests/float64_replay.py), and a float64 truth may hold their narrow results
+(`reference_error._narrow_values`)."""
+
+
+def stored_as(value, dtype):
+    """`value`, computed in a truth's float64, as the format `dtype` stores it: rounded once to it and read
+    back at its own width. A truth's declaration that a value is a format's own (a dequantized weight, a
+    decoded code, a quotient the format defines in its own arithmetic): the truth computes it in float64
+    and states the format's rounding here, a cast, which the truth rule keeps
+    (`reference_error._narrow_values`), where the same arithmetic run in the format is refused as a
+    second fp32 run. One sum, difference, product, quotient or square root of the format's values so
+    declared is the format's own result bit for bit: float64's 53 bits round twice to float32's 24, or to
+    fewer, as once."""
+    wide = jnp.result_type(value)
+    return jnp.asarray(value).astype(dtype).astype(wide)
 
 
 def float64_held(tree):
@@ -115,16 +130,17 @@ class Unrewritten:
 
     def __getattr__(self, name):
         found = getattr(self.wrapped, name)
-        if name != "lower":
+        if name not in ("lower", "trace"):
             return found
 
-        # A compiled arm's lowering, under the switch its calls run under; an arm of no lowering has none.
-        def lower(*inputs, **options):
+        # A compiled arm's trace and lowering, under the switch its calls run under; an arm of neither has
+        # none.
+        def staged(*inputs, **options):
             from dew.algebra import passes
 
             with passes(on=False):
                 return found(*inputs, **options)
-        return lower
+        return staged
 
 
 class Truth:
@@ -140,3 +156,8 @@ class Truth:
 
     def __call__(self, *inputs):
         return self.run(*inputs)
+
+    @property
+    def trace(self):
+        """Its program's trace (JAX's `jit(...).trace`), the one its calls run."""
+        return self.run.trace
