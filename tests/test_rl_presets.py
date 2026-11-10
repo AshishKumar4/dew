@@ -25,7 +25,7 @@ def test_the_preferences_preset_lays_out_pairs_as_its_step_written_out():
                      "chosen_mask": [0, 0, 1, 1][: 2 + index % 3],
                      "rejected_mask": [0, 0, 1][: 2 + index % 2]}
                     for index in range(12)])
-    steps = pairs.shuffle(0).repeat().map(PreferencePair(6))._then(pack_of(10, 2))
+    steps = pairs.shuffle(0).repeat().map(PreferencePair(6, packed=True))._then(pack_of(10, 2))
     written = compile(steps.map(PreferenceWindows(10, 2, 3)).batch(4),
                       read="indexed", loading=LOADING)
     chain = pairs.shuffle(0).repeat().pipe(presets.preferences, seq_len=6, batch=4)

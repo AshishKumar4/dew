@@ -279,15 +279,20 @@ def test_an_incomplete_row_is_refused():
 
 
 def test_unread_preference_fields_pass_through_the_pair_step():
-    """The pair step keeps a record's fields it does not read beside the pair's document: its shared prompt
-    once, then each half's rest."""
+    """The pair step keeps a record's fields it does not read beside its pair: a pair a row, its halves two
+    rows padded with `pad_id`, or the pair's document its windows pack, its shared prompt once, then each
+    half's rest."""
     from dew.data.preferences import PreferencePair
 
-    row = PreferencePair(4).map(dict(PAIR, reward=1.0))
+    row = PreferencePair(4, pad_id=9).map(dict(PAIR, reward=1.0))
     assert row["reward"] == 1.0
-    np.testing.assert_array_equal(row["text"], [1, 2, 3, 4, 5])
-    np.testing.assert_array_equal(row[MASK_KEY], [0, 0, 1, 1, 1])
-    np.testing.assert_array_equal(row[HALVES_KEY], [0, 0, 1, 1, 2])
+    np.testing.assert_array_equal(row[IDS_KEY], [[1, 2, 3, 4], [1, 2, 5, 9]])
+    np.testing.assert_array_equal(row[REAL_KEY], [[1, 1, 1, 1], [1, 1, 1, 0]])
+    document = PreferencePair(4, packed=True).map(dict(PAIR, reward=1.0))
+    assert document["reward"] == 1.0
+    np.testing.assert_array_equal(document["text"], [1, 2, 3, 4, 5])
+    np.testing.assert_array_equal(document[MASK_KEY], [0, 0, 1, 1, 1])
+    np.testing.assert_array_equal(document[HALVES_KEY], [0, 0, 1, 1, 2])
 
 
 def test_parquet_pairs_batch_in_pairs(tmp_path):
@@ -557,14 +562,69 @@ def test_pairs_are_numbered_across_the_windows_a_step_reads_whatever_numbers_the
 
     rows = [{"chosen": [1, 2, 3], "rejected": [1, 2, 4], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1, 1]}
             for _ in range(4)]
-    halved = windows(rows, 3, segments=1)[PAIRS_KEY]
-    assert halved.shape == (4, 2, 3)
+    halved = windows(rows, 3, segments=1)
+    assert halved[IDS_KEY].shape == (4, 2, 3)
+    reading = DPOObjective(TinyHead(vocab_size=VOCAB), 2, segments=1)
 
-    def numbered(pairs):
-        flat = {PAIRS_KEY: pairs.reshape(-1, pairs.shape[-1])}
-        return np.asarray(pair_numbers(flat, halved=pairs.ndim == 3)[0]).max(axis=1)
+    def numbered(batch, halved=True):
+        laid = reading.windows(batch) if halved else batch
+        return np.asarray(pair_numbers(laid, halved=halved)[0]).max(axis=1)
 
     assert numbered(halved).tolist() == [1, 1, 2, 2, 3, 3, 4, 4]
-    assert numbered(np.concatenate([halved, halved])).tolist() == [*np.repeat(np.arange(1, 9), 2)]
-    shared = windows(rows, 3)[PAIRS_KEY]
-    assert numbered(np.concatenate([shared, shared])).tolist() == list(range(1, 2 * len(shared) + 1))
+    twice = {key: np.concatenate([value, value]) for key, value in halved.items()}
+    assert numbered(twice).tolist() == [*np.repeat(np.arange(1, 9), 2)]
+    shared = windows(rows, 3)
+    assert numbered({PAIRS_KEY: np.concatenate([shared[PAIRS_KEY]] * 2)}, halved=False).tolist() == list(
+        range(1, 2 * len(shared[PAIRS_KEY]) + 1))
+
+
+def test_a_padded_pair_before_real_ones_leaves_each_real_pair_its_own_loss():
+    """Batches of a pair a row (`segments=1`) stacked, each filled with a padded pair after its real one, or
+    the padded pairs first, give the DPO loss and gradient the two real pairs alone give: a padded pair
+    numbers no pair, so the real pair after it is a pair of its own, its sums apart and its weight its own."""
+    from dew.objectives.rl.preference import pair_numbers
+
+    first = {"chosen": [1, 2, 3], "rejected": [1, 2, 4], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1, 1]}
+    second = {"chosen": [5, 6, 7], "rejected": [5, 3], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1]}
+    stacked = {key: np.concatenate([one, other]) for (key, one), other in zip(
+        windows([first], 3, segments=1, count=2).items(), windows([second], 3, segments=1, count=2).values(),
+        strict=True)}
+    objective = DPOObjective(TinyHead(vocab_size=VOCAB), 2, segments=1)
+    numbers = np.asarray(pair_numbers(objective.windows(stacked), halved=True)[0])
+    assert len({int(numbers[row].max()) for row in (0, 1)} | {int(numbers[row].max()) for row in (4, 5)}) == 2
+    params = objective.init(jax.random.key(0))
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=objective.init(jax.random.key(2)))
+
+    def loss(batch):
+        return jax.value_and_grad(lambda tree: objective.scalar_loss(tree, batch, step)[0])(params)
+
+    alone = loss(windows([first, second], 3, segments=1))
+    # The padded pairs first: each real pair still a pair of its own.
+    ahead = {key: np.concatenate([value[1::2], value[0::2]]) for key, value in stacked.items()}
+    for batch in (stacked, ahead):
+        for found, expected in zip(jax.tree.leaves(loss(batch)), jax.tree.leaves(alone), strict=True):
+            np.testing.assert_allclose(found, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_two_window_geometries_trace_apart():
+    """Two DPO objectives of one model and `seq_len` whose windows hold different pairs (`pairs`) or lay a
+    pair a row (`segments=1`) forward different inputs and finals, so their trace keys differ (`traced`),
+    and a fit of one never steps on the other's lowered program."""
+    model = TinyHead(vocab_size=VOCAB)
+    keys = [DPOObjective(model, 5, **options).trace_key() for options in ({}, {"pairs": 2}, {"segments": 1})]
+    assert None not in keys and len(set(keys)) == 3
+
+
+@pytest.mark.parametrize("segments", [None, 1], ids=["packed", "a pair a row"])
+def test_a_windows_padding_holds_the_pad_id(segments):
+    """Every window's padding is `pad_id` (main's `presets.preferences(..., pad_id=)`), the id a model reads
+    past a pair, packed or a pair a row, its real ids as they were."""
+    pair = {"chosen": [1, 2, 3], "rejected": [1, 2, 4], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1, 1]}
+    plain, padded = (windows([pair], 5, segments=segments, count=2, pad_id=pad_id) for pad_id in (0, 7))
+    real = plain[REAL_KEY] > 0
+    assert (~real).any()
+    np.testing.assert_array_equal(padded[IDS_KEY], np.where(real, plain[IDS_KEY], 7))
+    chain = Memory([pair]).pipe(presets.preferences, seq_len=5, batch=1, segments=segments, pad_id=7)
+    (batch,) = list(chain)
+    held = np.asarray(batch[REAL_KEY]) > 0
+    assert np.all(np.asarray(batch[IDS_KEY])[~held] == 7)

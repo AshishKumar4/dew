@@ -49,10 +49,6 @@ from .linear import (
     RMSNormGated,
     decode_delta_rule,
     decode_kernel,
-    fork_cache,
-    fork_start,
-    forked_conv,
-    forked_scan,
     fused_token,
     held_scan,
     over_sequence,
@@ -208,17 +204,21 @@ class KimiDeltaAttention(nn.Module):
         def split(part):
             return part.reshape(B, S, self.num_heads, self.head_dim)
 
-        def scan(convolved, *, starts, valid, held):
-            del valid
+        def scan(convolved, *, starts, valid, held, entered=None):
             query, key, value = (split(part) for part in convolved)
-            if S == 1:
+            if S == 1 and entered is None:
                 return decode_delta_rule(query, key, value, g, beta, held, starts=starts)
             # A held history can make the convolved operands vary where the projections did not, so the
-            # route is asked again of them.
-            # The batch's documents' firsts, built once with it (`Coordinates.firsts`).
-            return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
-                                          starts=starts, max_segments=tokens.max_segments,
-                                          write_bound=1.0, firsts=tokens.firsts)
+            # route is asked again of them. The batch's documents' firsts, built once with it
+            # (`Coordinates.firsts`); documents each from a memory of their own (a call over forks,
+            # `held_scan`) name theirs (`entered`), a call's other tokens keeping its memory, as padding does
+            # (exp(0) = 1, beta = 0).
+            kept = None if entered is None else valid
+            return chunk_gated_delta_rule(
+                query, key, value, g if kept is None else jnp.where(kept[:, :, None, None], g, 0.0),
+                beta if kept is None else jnp.where(kept[:, :, None], beta, 0.0), held, self.chunk_size,
+                starts=starts, max_segments=tokens.max_segments, write_bound=1.0,
+                firsts=tokens.firsts if entered is None else None, entered=entered)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
@@ -230,26 +230,7 @@ class KimiDeltaAttention(nn.Module):
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         shards = sequence_shards()
-        if forked:
-            if shards > 1:
-                raise LayoutRefused("documents that continue another are read whole in their rows; a "
-                                    "sequence axis splits them")
-
-            def forked_rule(convolved, *, valid, starts, state, entered):
-                query, key, value = (split(part) for part in convolved)
-                # A call's other tokens keep its memory, as padding does (exp(0) = 1, beta = 0).
-                kept_g = jnp.where(valid[:, :, None, None], g, 0.0)
-                kept_beta = jnp.where(valid[:, :, None], beta, 0.0)
-                return chunk_gated_delta_rule(query, key, value, kept_g, kept_beta, state, self.chunk_size,
-                                              starts=starts, max_segments=tokens.max_segments,
-                                              write_bound=1.0, entered=entered)
-
-            history, held = fork_cache(self, 'recurrent_state') if decode else (None, None)
-            convolved = forked_conv(projected, taps, tokens, history=history, parts=heads,
-                                    dtype=projected.dtype if ported else wide)
-            out = forked_scan(convolved, forked_rule, tokens,
-                              fork_start(held, (B, self.num_heads, self.head_dim, self.head_dim), wide))
-        elif shards > 1:
+        if shards > 1 and not forked:
             if decode:
                 raise LayoutRefused(f"Kimi delta attention under a sequence axis of {shards} runs whole "
                                     f"training sequences; a decode step holds one state per row. Decode on a "
