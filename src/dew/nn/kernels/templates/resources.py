@@ -9,6 +9,7 @@ estimates (`report`)."""
 import contextlib
 import contextvars
 import dataclasses
+import functools
 import math
 from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING
@@ -239,6 +240,15 @@ def raised_registers(consumers: int, programs: int = 1, producer: int | None = N
 
 
 def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | None = None) -> tuple[int, ...]:
+    """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg: `_role_registers`
+    on the multiprocessor the launches derive for (`facts`), the floor a producer lowers to `producer_floor`
+    where none is given."""
+    return _role_registers(weights, programs, producer_floor() if floor is None else floor, facts())
+
+
+@functools.lru_cache(maxsize=1024)
+def _role_registers(weights: tuple[int, ...], programs: int, floor: int,
+                    multiprocessor: generation.Multiprocessor) -> tuple[int, ...]:
     """The registers a thread of each of a program's warpgroups is moved to by setmaxnreg
     (`handoffs.Schedule`'s roles), `programs` programs held by a multiprocessor at once: a warpgroup of weight
     0 lowers to `floor` (`producer_floor`), and the rest of the program's launch pool is shared among the
@@ -248,8 +258,9 @@ def role_registers(weights: tuple[int, ...], programs: int = 1, floor: int | Non
     cannot exceed the initial CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a
     thread, so they hold 104, where the multiprocessor's share would ask 112 and wait for registers no warp
     gives back."""
-    floor = producer_floor() if floor is None else floor
-    step, ceiling = facts().raises().step, raise_ceiling()
+    # The facts `role_registers` keys this call on are the context's (`facts`), which `raise_ceiling` and
+    # `entry_registers` read.
+    step, ceiling = multiprocessor.raises().step, raise_ceiling()
     pool = (entry_registers(len(weights), programs) * len(weights) - floor * weights.count(0)) * THREADS
     raised = {index: weight for index, weight in enumerate(weights) if weight}
     held = {}
