@@ -423,13 +423,21 @@ HOOKED_FORMS = ("normed biased forward", "normed biased input gradient",
                 "cast forward", "gated forward", "gated kernel gradient", "residual forward",
                 "two bf16 outputs forward", "scaled forward", "row scaled forward")
 """The hooked and exactly summed forms a family whose model counts what they hold emits
-(`Family.counts_hooks`): prologues (a norm, a cast, SwiGLU's gate tile), epilogues over side vectors and a
+(every family's model counts them): prologues (a norm, a cast, SwiGLU's gate tile, where its kernels lower a
+prologue over a side tile, `Family.takes_prologue_tiles`), epilogues over side vectors and a
 side tile, a second output, and the running sum, each priced by what it materializes
 (`grouped_matmul._Mosaic.registers`)."""
 
+PROLOGUE_FORMS = ("normed biased forward", "normed biased input gradient", "normed kernel gradient",
+                  "exact normed kernel gradient", "fp16 normed biased forward", "cast forward",
+                  "gated forward", "gated kernel gradient")
+"""The hooked forms with a prologue, which prepares a consumer's step (`Family.issues_in_consumers`)."""
+
+PROLOGUE_TILED_FORMS = ("gated forward", "gated kernel gradient")
+"""The hooked forms whose prologue reads a side operand's tile (SwiGLU's gate)."""
+
 PAIRED_FORMS = ("paired swiglu forward", "paired forward")
-"""The paired products a family whose consumers issue no ring's loads emits beside those counting hooks,
-their only hook the epilogue over their two accumulators (`grouped_matmul._pair_alone`, row 2100)."""
+"""The paired products a family whose launches take a pair whole emits (`Family.takes_pairs`, row 2100)."""
 
 
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
@@ -616,7 +624,7 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 def _emitted_forms(family) -> set[str]:
     """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `EXACT_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`):
     none without a bundle, the exactly summed ones (every family's model counts a running sum), the hooked
-    ones where it counts what they hold (`Family.counts_hooks`), the
+    ones (a prologue over a side tile where its kernels lower one, `Family.takes_prologue_tiles`), the
     paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
     take FP8 (`Family.takes_fp8`); where its consumers do not issue their products, none whose step prepares
     them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
@@ -624,14 +632,15 @@ def _emitted_forms(family) -> set[str]:
     tiles where they are not (`grouped_matmul._Mosaic._aligned`)."""
     if family is None:
         return set()
-    paired = family.takes_pairs and (family.counts_hooks or not family.feeds_itself)
-    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if paired else ()), *EXACT_FORMS,
-             *(HOOKED_FORMS if family.counts_hooks else ()),
+    tiled = () if family.takes_prologue_tiles else PROLOGUE_TILED_FORMS
+    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if family.takes_pairs else ()), *EXACT_FORMS,
+             *(set(HOOKED_FORMS) - set(tiled)),
              *(FP8_FORMS if family.takes_fp8 else ())}
     if not family.issues_in_consumers:
-        # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`).
+        # A dense kernel gradient's step prepares nothing (`mosaic_gpu.rows_unstaged`); a prologue's does.
         forms = {form for form in forms
-                 if form.startswith("dense") or ("kernel gradient" not in form and form not in EXACT_FORMS)}
+                 if (form.startswith("dense") or ("kernel gradient" not in form and form not in EXACT_FORMS))
+                 and form not in PROLOGUE_FORMS}
     return forms
 
 

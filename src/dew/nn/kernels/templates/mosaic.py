@@ -1158,9 +1158,10 @@ class Issuer[Accumulator](abc.ABC):
     load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so
     a product of transposed fp32 operands there takes bf16 parts."""
 
-    counts_hooks: bool = True
-    """Whether its register model counts what a template's hooks hold (side operands' tiles), so a hooked
-    call derives a tile that spills nothing; where not (mma.sync's), such a call is not its launch's."""
+    takes_prologue_tiles: bool = True
+    """Whether its kernels lower a prologue over a side operand's tile (a SwiGLU gate's): mma.sync's do not
+    (a kernel gradient's 'layout casts are unsatisfiable', and a forward's 64 x 192 x 32 spilled 24 bytes at
+    its launch's cap where it held none at 168, EM-a1g4), such a call not its launch's."""
 
     accumulator_rows: int | None = None
     """The rows of a consumer's accumulator its products issue into, where the family fixes them (tcgen05's
@@ -1168,6 +1169,12 @@ class Issuer[Accumulator](abc.ABC):
 
     operand_dtypes: tuple | None = None
     """The 16-bit dtypes its products multiply where not every one (a v5e's MXU, bf16 alone)."""
+
+    def side_tile(self, ref, held_axes: tuple):
+        """A side operand's staged tile or vector (`ref`, along `held_axes`) read for an epilogue beside its
+        accumulator: as its loads lay it out (a warpgroup's inferred from the accumulator's use)."""
+        del held_axes
+        return ref[...]
 
     def held_area(self, consumers: int) -> int | None:
         """The fp32 accumulator elements `consumers` consumers hold where scratch memory rather than registers
@@ -1646,6 +1653,9 @@ class Transport[Allocated, Opened](abc.ABC):
     walks_scoped: bool = False
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
+
+    most_stages: int | None = None
+    """The deepest ring its launches take where ptxas spills past it (tcgen05's), None where unbounded."""
 
     ring_slots: int | None = None
     """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
