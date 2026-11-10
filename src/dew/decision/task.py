@@ -450,7 +450,12 @@ class Decide(SavedRunTask, InItsForm):
         # Its passes pad to the options the run trained at, so a server compiles their programs up front.
         budget = Budget(options=settings.options)
         # Its rows laid out as the run recorded them: a layout that states no sharing, from a run saved
-        # before rows shared a state (`dew.data.plan.SHARED_STATE`), a question a row as it trained.
+        # before rows shared a state (`dew.data.plan.SHARED_STATE`), a question a row as it trained. One
+        # that states its sharing, saved under such a plan, trained its rows in streams
+        # (`QuestionLayout.streamed`, which the plan's version states and no record holds) and is laid
+        # here as documents continuing the shared part: the same tokens at the same positions, each
+        # question reading the shared part and itself (with siblings, the questions before it), so the
+        # same function, each held to its questions' own rows (tests/test_decision_state_once.py).
         return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget,
                    derives_sharing=False)

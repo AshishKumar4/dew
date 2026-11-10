@@ -41,7 +41,7 @@ from dew.decision.rows import (
     packing,
 )
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.shared_state import fork_depth, joint, shared_for
+from dew.decision.shared_state import asked_over, fork_depth, joint, shared_for
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
 from dew.inference.projections import declared_groups
 from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
@@ -459,14 +459,26 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         a question row's question."""
         return self.layout.spans_in_context
 
+    @functools.cached_property
+    def _written(self) -> Layout:
+        """The stated layout as a data plan before 12 laid it out (`dew.data.plan.SHARED_STATE`): one that
+        states its `shared_state`, its rows in streams (`QuestionLayout.streamed`), which neither its
+        record nor a step that holds it states, so a run saved under such a plan rebuilds the steps it
+        saved and reads on as it trained; any other, as it stands."""
+        stated = self.stated
+        if isinstance(stated, QuestionLayout) and stated.shared_state is not None:
+            return dataclasses.replace(stated, streamed=True)
+        return stated
+
     @property
     def layout(self) -> Layout:
         """The layout its rows are laid out by: a request's questions over one copy of its state where the
         backbone and head read each question as its own row (`shared_for`), and the layout as it was
-        stated under a data plan from before rows shared a state (`bind_plan`,
-        `dew.data.plan.SHARED_STATE`), so everything the objective reads of its rows, their bounds, the
-        widths it records and the task its steps declare, is the rows' its run trains on."""
-        return self.stated if self._plan < SHARED_STATE else self._shared
+        stated, read as such a plan read it (`_written`), under a data plan from before rows shared a
+        state (`bind_plan`, `dew.data.plan.SHARED_STATE`), so everything the objective reads of its rows,
+        their bounds, the widths it records and the task its steps declare, is the rows' its run trains
+        on."""
+        return self._written if self._plan < SHARED_STATE else self._shared
 
     def bind_plan(self, version: int) -> None:
         """Read its rows as data plan `version` lays them out (`layout`): the version the run's data was
@@ -484,7 +496,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     @functools.cached_property
     def _stated_bounds(self) -> Bounds:
-        return self._shared_bounds if self.stated is self._shared else self._bounds(self.stated)
+        return self._shared_bounds if self._written is self._shared else self._bounds(self._written)
 
     @property
     def bounds(self) -> Bounds:
@@ -538,11 +550,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         their places counted along it, and each token after a row's first is scored as the next token of
         the one before it, through the backbone's vocabulary head a tile at a time; its `Ratio` over
         those tokens, apart from the questions'. The layout's other reads (blocks read both ways, option
-        slots, streams) and the row's context are not this pass's."""
+        slots, streams) and the row's context are not this pass's.
+
+        Rows asking a request's questions over one copy of its state (`DecisionInputs.documents`) score
+        what each question's own row scores (`_forked_input_terms`)."""
         from dew.batch import coordinates
         from dew.nn.progress import progressed
         from dew.objectives.lm.chunked import chunked_tile, final_read, head_cross_entropy
 
+        if batch_inputs.documents is not None:
+            return self._forked_input_terms(variables, batch_inputs, batch, step)
         backbone, held = self._causal_backbone(), thaw(part(variables, "backbone"))
         tokens, segments = batch_inputs.tokens, batch_inputs.segments
         # The tokens that precede another, as a language model reads its inputs: all but the last.
@@ -554,6 +571,35 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         # A token's successor in its own row: none after a row's last token or on the padding.
         scored = ((segments[:, 1:] == segments[:, :-1]) & (segments[:, :-1] > 0)).astype(jnp.float32)
         losses, _, _ = head_cross_entropy(backbone, held, read, tokens[:, 1:], 4, tile=chunked_tile(),
+                                          predict=False)
+        return self.row_mean(losses, batch, weights=scored)
+
+    def _forked_input_terms(self, variables: Variables, batch_inputs: DecisionInputs, batch: Batch,
+                            step: Step) -> Ratio:
+        """`input_terms` over rows whose questions share one copy of their state: the term each question's
+        own row gives, summed. The backbone reads each window's documents causally, each question's
+        continuing its row's shared part (`DecisionInputs.coordinates`), so a question's token reads the
+        shared part and its own part before it, and no other question's; each token is scored from the
+        state of the token before it in its own row (`Coordinates.predecessors`: a question's first token
+        from the shared part's last), and a document's tokens count once for each question whose own row
+        holds them (`asked_over`): the shared part's once a question it is asked, where one merged row
+        scored them once and each question after its row's first from the question before it."""
+        from dew.nn.progress import progressed
+        from dew.objectives.lm.chunked import chunked_tile, final_read, head_cross_entropy
+
+        backbone, held = self._causal_backbone(), thaw(part(variables, "backbone"))
+        tokens, documents, parents = batch_inputs.tokens, batch_inputs.documents, batch_inputs.parents
+        assert documents is not None and parents is not None, "a window's documents and what each continues"
+        laid = batch_inputs.coordinates()
+        read = final_read(backbone, held, tokens, train=step.training, coordinates=laid,
+                          rngs=model_rngs(step.key, training=step.training),
+                          **progressed(backbone, self.progress(step)))
+        before = laid.predecessors()
+        states = jnp.take_along_axis(read, jnp.maximum(before, 0)[:, :, None], axis=1)
+        rows = jnp.take_along_axis(asked_over(documents, parents, batch_inputs.fork_depth),
+                                   jnp.maximum(documents - 1, 0), axis=1)
+        scored = jnp.where((before >= 0) & (documents > 0), rows, 0.0)
+        losses, _, _ = head_cross_entropy(backbone, held, states, tokens, 4, tile=chunked_tile(),
                                           predict=False)
         return self.row_mean(losses, batch, weights=scored)
 
@@ -637,13 +683,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         """The longest chain of documents its batches hold, laid out as it states its layout or as it
         derives it (`data`, by the plan's version): the longer of the two (`fork_depth`), a chain past
         which a document reads nothing more."""
-        return max(fork_depth(self._shared), fork_depth(self.stated))
+        return max(fork_depth(self._shared), fork_depth(self._written))
 
     @property
     def _joint_forks(self) -> bool:
         """Whether its batches' rows read their documents together, as siblings do (`joint`), laid out as
         it states its layout or as it derives it (`_fork_depth`)."""
-        return joint(self._shared) or joint(self.stated)
+        return joint(self._shared) or joint(self._written)
 
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
         """Fit rows before mixing, augment training layouts, and pack training
@@ -656,9 +702,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             raise ValueError("a decision objective lays its rows out with its own tokenizer; "
                              "pass tokenizer= when building it")
         shared = self._data(self._shared, self._shared_bounds)
-        if self.stated is self._shared or not isinstance(self.stated, QuestionLayout):
+        if self._written is self._shared or not isinstance(self._written, QuestionLayout):
             return shared
-        return dataclasses.replace(shared, earlier=self._data(self.stated, self._stated_bounds))
+        return dataclasses.replace(shared, earlier=self._data(self._written, self._stated_bounds))
 
     def _data(self, layout: Layout, bounds: Bounds) -> ObjectiveData:
         """`data` as `layout` lays rows out within `bounds`."""
