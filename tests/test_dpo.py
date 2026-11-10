@@ -580,30 +580,36 @@ def test_pairs_are_numbered_across_the_windows_a_step_reads_whatever_numbers_the
 
 def test_a_padded_pair_before_real_ones_leaves_each_real_pair_its_own_loss():
     """Batches of a pair a row (`segments=1`) stacked, each filled with a padded pair after its real one, or
-    the padded pairs first, give the DPO loss and gradient the two real pairs alone give: a padded pair
-    numbers no pair, so the real pair after it is a pair of its own, its sums apart and its weight its own."""
-    from dew.objectives.rl.preference import pair_numbers
+    the padded pairs first, reduce each real pair's halves to the sums and weight the two real pairs alone
+    give (`_halves` over the same per-target values): a padded pair numbers no pair, weighs nothing, and
+    leaves the real pair after it a pair of its own."""
+    from dew.objectives.rl.preference import _halves
 
     first = {"chosen": [1, 2, 3], "rejected": [1, 2, 4], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1, 1]}
     second = {"chosen": [5, 6, 7], "rejected": [5, 3], "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1]}
-    stacked = {key: np.concatenate([one, other]) for (key, one), other in zip(
-        windows([first], 3, segments=1, count=2).items(), windows([second], 3, segments=1, count=2).values(),
-        strict=True)}
     objective = DPOObjective(TinyHead(vocab_size=VOCAB), 2, segments=1)
-    numbers = np.asarray(pair_numbers(objective.windows(stacked), halved=True)[0])
-    assert len({int(numbers[row].max()) for row in (0, 1)} | {int(numbers[row].max()) for row in (4, 5)}) == 2
-    params = objective.init(jax.random.key(0))
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=objective.init(jax.random.key(2)))
+    alone = windows([first, second], 3, segments=1)
+    padded = {key: np.zeros_like(value) for key, value in alone.items()}
+    rng = np.random.default_rng(5)
+    # Each real pair's per-target values, the same wherever its rows stand; a padded pair's, noise.
+    held = rng.standard_normal((2, 2, 2)).astype(np.float32)
 
-    def loss(batch):
-        return jax.value_and_grad(lambda tree: objective.scalar_loss(tree, batch, step)[0])(params)
+    def reduced(pairs):
+        batch = {key: np.stack([alone[key][at] if at is not None else padded[key][0] for at in pairs])
+                 for key in alone}
+        values = np.stack([held[at] if at is not None else rng.standard_normal((2, 2)).astype(np.float32)
+                           for at in pairs]).reshape(-1, 2)
+        laid = objective.windows(batch)
+        return [np.asarray(part) for part in _halves(jnp.asarray(values), laid,
+                                                     jnp.asarray(laid[REAL_KEY])[:, 1:], halved=True)]
 
-    alone = loss(windows([first, second], 3, segments=1))
-    # The padded pairs first: each real pair still a pair of its own.
-    ahead = {key: np.concatenate([value[1::2], value[0::2]]) for key, value in stacked.items()}
-    for batch in (stacked, ahead):
-        for found, expected in zip(jax.tree.leaves(loss(batch)), jax.tree.leaves(alone), strict=True):
-            np.testing.assert_allclose(found, expected, rtol=1e-6, atol=1e-7)
+    expected = reduced([0, 1])
+    for pairs in ([0, None, 1, None], [None, None, 0, 1]):
+        found = reduced(pairs)
+        real = [number for number, at in enumerate(pairs) if at is not None]
+        for part, wanted in zip(found, expected, strict=True):
+            np.testing.assert_array_equal(part[real], wanted[:2])
+        assert np.all(found[2][[number for number, at in enumerate(pairs) if at is None]] == 0)
 
 
 def test_two_window_geometries_trace_apart():
