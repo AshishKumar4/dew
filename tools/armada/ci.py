@@ -123,6 +123,7 @@ import os
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -1069,16 +1070,15 @@ def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]],
              if (seconds := measured.get(site_task(python, name, test, (start, stop))))]
     if not timed:
         return None
-    units, seconds = sum(count for count, _ in timed), sum(taken for _, taken in timed)
-    mean_units, mean_seconds = units / len(timed), seconds / len(timed)
-    spread = sum((count - mean_units) ** 2 for count, _ in timed)
-    if not spread:
-        return Cost(0.0, seconds / units)
-    unit = max(0.0, sum((count - mean_units) * (taken - mean_seconds) for count, taken in timed) / spread)
-    setup = mean_seconds - unit * mean_units
+    sizes, seconds = [count for count, _ in timed], [taken for _, taken in timed]
+    if len(set(sizes)) < 2:
+        return Cost(0.0, sum(seconds) / sum(sizes))
+    unit, setup = statistics.linear_regression(sizes, seconds)
+    if unit < 0:
+        return Cost(statistics.fmean(seconds), 0.0)
     # A line through the origin where the fit's setup falls below zero: no task pays less than its draws.
-    return Cost(setup, unit) if setup >= 0 else Cost(0.0, sum(count * taken for count, taken in timed)
-                                                     / sum(count * count for count, _ in timed))
+    return Cost(setup, unit) if setup >= 0 else Cost(
+        0.0, statistics.linear_regression(sizes, seconds, proportional=True).slope)
 
 
 def site_rate(python: str, name: str, test: str, mark: Mark, measured: Mapping[str, float], *,
