@@ -643,9 +643,10 @@ class _Measured:
 
 @dataclasses.dataclass(frozen=True)
 class _TrainingMeasured(_Measured):
-    """A run's training read measured (`_training_measure`), with the mirror counters its run counts from:
+    """A training read measured (`_training_measure`), with the mirror counters its statistics count from:
     taken before it read anything, as a memory read downloads its corpus as it is measured, before any
-    reader is built (rows 5220, 5258)."""
+    reader is built (rows 5220, 5258). A phase's read is measured as its phase is staged, and counts from
+    there; a held split's reads are its own read's, not the training read's."""
 
     mirrored: Mirrored = dataclasses.field(kw_only=True)
 
@@ -828,15 +829,15 @@ def _bound_ends(pipeline: Pipeline) -> bool:
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
                       read: Read, provision: bool, loading: Loading, examples: int | None,
-                      epochs: int | None = None, since: Mirrored | None = None) -> _TrainingMeasured:
+                      epochs: int | None = None) -> _TrainingMeasured:
     """A compile's training branch, and its `validation`, prepared through their source's own steps as
     the compile reads them (`_measure`): bounded to `examples`, a chain's own layout as written, before
     preparation could plan it into its source, and the objective's with its preparation; each corpus's
-    leading deterministic steps cached where the read is no stream; their counts filled. Its mirror counters
-    count from `since`, the start of the run that measures it (`fitted`), or from before it reads."""
+    leading deterministic steps cached where the read is no stream; their counts filled, and its mirror
+    counters taken before it reads (`_TrainingMeasured.mirrored`)."""
     from dew.data.cache import automatic_root
 
-    since = Mirrored.now() if since is None else since
+    since = Mirrored.now()
     written = None if examples is None or not _lays_out(train) else examples
     if written is not None:
         train = _bounded(train, written)
@@ -1856,8 +1857,6 @@ def fitted[Entry](
     # training states its batch ahead; a token budget's rows are counted as it compiles.
     trained = (next((stage.size for stage in dataset._chain().stages if isinstance(stage, BatchStage)), None)
                if isinstance(dataset, Dataset) else dataset.batch)
-    # The run's mirror reads count from here, its held splits' measures among them (`_TrainingMeasured`).
-    since = Mirrored.now()
     held_chains = {name: _held_batched(entry._chain(), trained, unbatched=trained is None)
                    for name, entry in (named or {}).items() if isinstance(entry, Dataset)}
     scored = {name: _held_measure(chain, objective) for name, chain in held_chains.items()}
@@ -1871,7 +1870,7 @@ def fitted[Entry](
         measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
                     _training_measure(trained, None, objective=objective, read=read, provision=True,
                                       loading=trained._loading or _DEFAULT_LOADING, examples=examples,
-                                      epochs=epochs if examples is None else None, since=since))
+                                      epochs=epochs if examples is None else None))
         widths = (run_widths([*([measured] if measured else []), *scored.values()], objective)
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
