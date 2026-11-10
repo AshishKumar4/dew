@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import numpy as np
+import numpy.lib.format as npy_format
 
 from dew._records import JSON
 
@@ -62,11 +63,15 @@ Python (`ast.literal_eval`), a tenth of a millisecond each."""
 def _saved(encoded: bytes) -> np.ndarray:
     """The array `np.save` wrote as `encoded`: one of a plain dtype read straight from its bytes, any
     other (a structured dtype's header names its fields) by `np.load`."""
-    if encoded[:6] == b"\x93NUMPY" and encoded[6] in (1, 2, 3):
-        width = 2 if encoded[6] == 1 else 4
-        size = int.from_bytes(encoded[8:8 + width], "little")
-        start = 8 + width + size
-        header = _NPY_HEADER.fullmatch(encoded[8 + width:start].rstrip())
+    prefix = len(npy_format.MAGIC_PREFIX)
+    if encoded.startswith(npy_format.MAGIC_PREFIX) and encoded[prefix] in (1, 2, 3):
+        # The format's framing as NumPy states it (`numpy.lib.format`): its magic and version, then a
+        # header length of 2 bytes in version 1 and 4 after. NumPy reads the header itself only by
+        # evaluating it (`read_array_header_1_0`), the cost this reader keeps off every array.
+        width = 2 if encoded[prefix] == 1 else 4
+        size = int.from_bytes(encoded[npy_format.MAGIC_LEN:npy_format.MAGIC_LEN + width], "little")
+        start = npy_format.MAGIC_LEN + width + size
+        header = _NPY_HEADER.fullmatch(encoded[npy_format.MAGIC_LEN + width:start].rstrip())
         # A dtype of no width (`|V0`, `|S0`) has no bytes to read, which `np.load` allocates for.
         if header is not None and np.dtype(header.group(1).decode()).itemsize:
             descr, order, dims = header.groups()
@@ -85,13 +90,18 @@ def _array(node: dict, leaves: Mapping[str, bytes], kind: str) -> np.ndarray:
     return value
 
 
+_LENGTH = struct.Struct("<I")
+"""The length before each key and value of a byte map, an unsigned little-endian 32-bit count, which its
+writer (`pack_dict_of_byte_arrays`) and its reader (`unpack_dict_of_byte_arrays`) both read."""
+
+
 def pack_dict_of_byte_arrays(values: Mapping[str, bytes]) -> bytes:
     packed = bytearray()
     for key, value in values.items():
         encoded = key.encode()
-        packed.extend(struct.pack("<I", len(encoded)))
+        packed.extend(_LENGTH.pack(len(encoded)))
         packed.extend(encoded)
-        packed.extend(struct.pack("<I", len(value)))
+        packed.extend(_LENGTH.pack(len(value)))
         packed.extend(value)
     return bytes(packed)
 
@@ -100,16 +110,16 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
     values = {}
     offset = 0
     while offset < len(payload):
-        if offset + 4 > len(payload):
+        if offset + _LENGTH.size > len(payload):
             raise ValueError("truncated ArrayRecord key length")
-        length = struct.unpack_from("<I", payload, offset)[0]
-        offset += 4
+        (length,) = _LENGTH.unpack_from(payload, offset)
+        offset += _LENGTH.size
         key = payload[offset : offset + length].decode()
         offset += length
-        if offset + 4 > len(payload):
+        if offset + _LENGTH.size > len(payload):
             raise ValueError(f"truncated ArrayRecord value length for {key!r}")
-        length = struct.unpack_from("<I", payload, offset)[0]
-        offset += 4
+        (length,) = _LENGTH.unpack_from(payload, offset)
+        offset += _LENGTH.size
         if offset + length > len(payload) or key in values:
             raise ValueError(f"invalid ArrayRecord value for {key!r}")
         values[key] = payload[offset : offset + length]
