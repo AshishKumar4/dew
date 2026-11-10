@@ -65,11 +65,11 @@ def test_a_rows_product_is_its_own_whatever_rows_share_its_call():
     rng = np.random.default_rng(4863)
     a = jnp.asarray(rng.standard_normal((1, 256, 1024)), jnp.float32)
     b = jnp.asarray(rng.standard_normal((1, 1024, 512)), jnp.float32)
-    whole = np.asarray(pairwise._blocked(a, b, None))
+    whole = np.asarray(pairwise._summed(a, b, None))
     for row in (0, 7, 255):
-        np.testing.assert_array_equal(np.asarray(pairwise._blocked(a[:, row:row + 1], b, None)),
+        np.testing.assert_array_equal(np.asarray(pairwise._summed(a[:, row:row + 1], b, None)),
                                       whole[:, row:row + 1])
-    np.testing.assert_array_equal(np.asarray(pairwise._blocked(a[:, :100], b, None)), whole[:, :100])
+    np.testing.assert_array_equal(np.asarray(pairwise._summed(a[:, :100], b, None)), whole[:, :100])
 
 
 def test_a_layers_projection_and_every_accumulated_contraction_sum_as_a_vectorized_dot():
@@ -180,25 +180,30 @@ def vectorized(a: jax.Array, b: jax.Array) -> jax.Array:
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("axis_type", [jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Auto],
-                         ids=["explicit", "auto"])
-def test_a_projection_under_a_multi_device_mesh_is_jaxs_own_product(axis_type):
-    """A float32 projection under a mesh of two devices, Explicit or Auto, is JAX's own `dot_general`: no
-    blocked product (`projection_product` declines it, `_whole_on_one_device`), so the partitioner places it
-    as any dot (row 5427: the blocked form's layout and its blocks' axis moved the placement a dot keeps);
-    on one device the CPU's blocked pairwise sum takes it (row 4863, this file's other sites)."""
+def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share():
+    """A projection's pairwise product (`pairwise_dot_general`) on a mesh whose Explicit data axis splits its
+    rows over two devices: its value and both gradients, the matrix's contracting the split rows a device's
+    share at a time (`_summed`), each the dot's own where every sum is exact (small integers) and placed as
+    XLA's product and gradients place them, each share summed in two-row blocks."""
     rng = np.random.default_rng(4863)
-    rows, matrix = (jnp.asarray(rng.standard_normal(shape), jnp.float32) for shape in ((12, 64), (64, 3)))
-    numbers = (((1,), (0,)), ((), ()))
+    rows, matrix = (jnp.asarray(rng.integers(-3, 4, size=shape), jnp.float32)
+                    for shape in ((12, 4), (4, 3)))
+    product = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=(((1,), (0,)), ((), ())))
 
-    def taken(rows, matrix):
-        return precision.projection_product(jax.lax.dot_general, rows, matrix, numbers, None, jnp.float32)
+    def gradients(product, rows, matrix):
+        value, pull = jax.vjp(product, rows, matrix)
+        return value, *pull(jnp.round(4 * jnp.cos(value)))
 
-    mesh = jax.make_mesh((2,), ("data",), (axis_type,), devices=jax.devices()[:2])
-    with jax.set_mesh(mesh):
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with pytest.MonkeyPatch.context() as patched, jax.set_mesh(mesh):
+        # Two-row blocks: a device's six rows its matrix's gradient sums as three blocks.
+        patched.setattr(pairwise, "contraction_block", lambda depth, lanes=None: min(depth, 2))
         split = jax.device_put(rows, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
-        assert jax.jit(lambda rows, matrix: jnp.zeros(()) if taken(rows, matrix) is None else jnp.ones(()))(
-            split, matrix) == 0
+        summed = jax.jit(functools.partial(gradients, product))(split, matrix)
+        plain = jax.jit(functools.partial(gradients, jnp.matmul))(split, matrix)
+    for got, want in zip(summed, plain, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
 
 
 def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_product():
