@@ -89,6 +89,27 @@ def test_a_sums_magnitudes_are_its_terms_sizes_summed_beside_their_root_sum_of_s
     assert np.all(np.abs(np.asarray(value)) <= magnitudes) and np.all(terms <= magnitudes)
 
 
+def test_a_sum_behind_a_sum_carries_its_magnitudes_and_not_its_squares():
+    """A product selected by a mask, each row's product with its own group's matrix written as a sum over
+    the groups of a one-hot weight times each group's product: its magnitudes are those of the row's own
+    products, summed, the contraction behind the mask measured as written apart; its terms are the final
+    sum's alone, the selected product's own size, as before."""
+    rng = np.random.default_rng(5426)
+    rows, matrices = rng.normal(size=(6, 16)), rng.normal(size=(3, 16, 4))
+    groups = np.asarray([0, 0, 2, 1, 2, 2])
+
+    def masked(rows, matrices):
+        return jnp.einsum("rg,rgn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype),
+                          jnp.einsum("rk,gkn->rgn", rows, matrices))
+
+    with jax.enable_x64(new_val=True):
+        value, magnitudes = float64_magnitudes(masked, rows, matrices)
+        _, terms = float64_terms(masked, rows, matrices)
+    products = rows[:, :, None] * matrices[groups]
+    np.testing.assert_allclose(magnitudes, np.abs(products).sum(axis=1), rtol=1e-12)
+    np.testing.assert_allclose(terms, np.abs(np.asarray(value)), rtol=1e-12)
+
+
 def test_a_recomputed_body_sums_its_own_terms():
     """A body under jax.checkpoint, as a recomputed norm's, is the computation's own: a key bias's
     gradient computed inside one sums the same cancelling terms as outside it, not its own near-zero

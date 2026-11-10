@@ -107,10 +107,14 @@ def float64_terms(fn, *args):
 
 def float64_magnitudes(fn, *args):
     """`fn(*args)` evaluated as `float64_terms` evaluates it, and the tree of each output leaf's terms'
-    magnitudes, summed: the same terms, of the same final sums, carried the same way, each by its size and
-    not its square. No partial sum of those terms, in any order, is larger: a leaf whose magnitudes lie
-    inside a format's range overflows in no order of its final sums, which the derivative contracts hold a
-    value finite by (tests/contract_support.py). A leaf no sum made is its own size."""
+    magnitudes, summed: the terms its sums add, each by its size and not its square, carried as the terms
+    are, and through the sums behind a sum too: a sum's operand that sums made is taken at its own
+    magnitudes, and a product of two sums at the product of theirs, so a contraction selected by a mask
+    or nested in another is measured by what it multiplies and adds, however its formula is written. No
+    partial sum reaching the leaf through sums, products, scalings and moves is larger, in any order: a
+    leaf whose magnitudes lie inside a format's range overflows in no order of those sums, which the
+    derivative contracts hold a value finite by (tests/contract_support.py). A value any other operation
+    makes is its own size."""
     tree, values, sizes = _termed(fn, args, power=1)
     return tree.unflatten(values), tree.unflatten(sizes)
 
@@ -377,19 +381,21 @@ every draw, its bodies' too."""
 
 
 def _layout(jaxpr):
-    """What the walk reads of `jaxpr`'s structure alone, once a jaxpr: the variables whose terms reach an
-    output (`_carrying`), the step that reads each variable last, after which it goes as an execution
-    frees it (a chunked scan's float64 intermediates would otherwise all stay), and its spans (`_runs`)."""
+    """What the walk reads of `jaxpr`'s structure alone, once a jaxpr and measure (`POWER`): the variables
+    whose terms reach an output (`_carrying`), the step that reads each variable last, after which it goes
+    as an execution frees it (a chunked scan's float64 intermediates would otherwise all stay), and its
+    spans (`_runs`)."""
     from jax.extend.core import Literal
 
-    if jaxpr not in LAYOUTS:
+    key = (jaxpr, POWER.get())
+    if key not in LAYOUTS:
         last = {var: index for index, equation in enumerate(jaxpr.eqns)
                 for var in equation.invars if not isinstance(var, Literal)}
         for var in jaxpr.outvars:
             if not isinstance(var, Literal):
                 last.pop(var, None)
-        LAYOUTS[jaxpr] = (_carrying(jaxpr), last, tuple(_runs(jaxpr)))
-    return LAYOUTS[jaxpr]
+        LAYOUTS[key] = (_carrying(jaxpr), last, tuple(_runs(jaxpr)))
+    return LAYOUTS[key]
 
 
 def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
@@ -487,7 +493,8 @@ def _real(var) -> bool:
 
 def _carried(equation) -> list[int]:
     """The operands whose terms `equation` carries to its outputs: real floats
-    alone, as a complex value's terms have no order to sum in."""
+    alone, as a complex value's terms have no order to sum in. A sum carries
+    none of its operands' squares, and their magnitudes (`float64_magnitudes`)."""
     primitive, operands = equation.primitive, equation.invars
     if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
         return []
@@ -495,12 +502,17 @@ def _carried(equation) -> list[int]:
     if (primitive in CARRIES or _body(equation) is not None or programs.control_flow(primitive)
             or primitive is primitives.shard_map_p):
         return floats
-    if primitive is jax.lax.reduce_sum_p:
-        # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
-        return floats if all(operands[0].aval.shape[axis] == 1 for axis in equation.params["axes"]) else []
-    if primitive in SCALING:
+    if _moved(equation) or primitive in SCALING:
         return floats
-    return []
+    # A sum's operands that sums made carry their magnitudes into it; their squares end at it.
+    return floats if primitive in SUMS and POWER.get() == 1 else []
+
+
+def _moved(equation) -> bool:
+    """Whether `equation`, a sum, adds nothing: one over unit axes, which moves its operand as a broadcast's
+    transpose does and carries its terms as a move (`_carried`)."""
+    return equation.primitive is jax.lax.reduce_sum_p and all(
+        equation.invars[0].aval.shape[axis] == 1 for axis in equation.params["axes"])
 
 
 def _body(equation):
@@ -554,14 +566,21 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     if not wanted:
         return outputs, [None] * len(outputs)
     carried = _carried(equation)
-    if primitive in SUMS and not carried and all(_real(var) for var in equation.outvars):
-        squares = [_measured(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
-                   else value for var, value in zip(equation.invars, inputs, strict=True)]
-        return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
+    summing = primitive in SUMS and all(_real(var) for var in equation.outvars)
+    if summing and (not carried or POWER.get() == 1) and not _moved(equation):
+        # Each operand at its own size, or at the magnitudes the sums behind it carried (`_carried`).
+        nested = POWER.get() == 1
+        sizes = [energy if nested and energy is not None else _measured(value)
+                 if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating) else value
+                 for var, value, energy in zip(equation.invars, inputs, given, strict=True)]
+        return outputs, [equation.primitive.bind(*sizes, **equation.primitive.get_bind_params(params))]
     if not carried:
         return outputs, [None] * len(outputs)
     if primitive in SCALING:
         summed = [index for index in carried if given[index] is not None]
+        if len(summed) == 2 and primitive is jax.lax.mul_p and POWER.get() == 1:
+            # A product of two sums is within the product of their magnitudes; its squares end here.
+            return outputs, [given[0] * given[1]]
         if len(summed) != 1 or (primitive is not jax.lax.mul_p and summed != [0]):
             return outputs, [None] * len(outputs)
         (index,) = summed

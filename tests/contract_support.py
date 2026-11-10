@@ -121,8 +121,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
-    can overflow, the magnitudes of the terms the float64 run's final sums add (`float64_magnitudes`)
-    summing inside float32's range. So a form that overflows where the plain formula's own operations stay
+    can overflow, the magnitudes of the terms the float64 run's sums add (`float64_magnitudes`, a sum behind
+    a sum at its own) summing inside float32's range. So a form that overflows where the plain formula's own operations stay
     in range fails (row 1768, a contraction Dew summed before the division that brought it back), and a
     sum whose terms float32 can overflow in one order and not another is held to neither order (row 5426:
     Dew's blocked sum and XLA's chain each overflow partials the other does not). The float64 run is

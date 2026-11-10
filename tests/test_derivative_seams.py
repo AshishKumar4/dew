@@ -2,7 +2,9 @@
 derivative of Dew's declares the contract that holds it at its seam (`dew.nn.derivatives.contracted`, which
 tools/lint_slop.py's SLOP028 checks), each one of tests/test_contracts_*.py."""
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from contract_support import LessFinite, assert_contract
 
@@ -51,3 +53,26 @@ def test_the_contract_holds_a_sum_only_where_no_order_of_it_can_overflow():
     cancelling = (jnp.asarray([2.0**127, -(2.0**127)] * 4, jnp.float32),)
     assert_contract(lambda x: jnp.sum(x[::2]) + jnp.sum(x[1::2]), cancelling, direction, cotangent,
                     "alternate terms first", plain_fn=lambda x: jnp.sum(jnp.sum(x.reshape(4, 2), axis=1)))
+
+
+def test_the_contract_reads_a_contraction_behind_a_mask_by_its_own_terms():
+    """A plain formula that selects each row's product by a mask sums its groups last, the contraction
+    behind that sum: the position is held by the contraction's own terms. Where they cancel past float32's
+    range, a form that sums them in another order than the formula's and overflows is held to neither (a
+    grouped GEMM's second derivative near float32's largest, row 5426)."""
+    groups = np.asarray([0, 1])
+    rows = (jnp.asarray([[2.0**64, -(2.0**64)] * 4] * 2, jnp.float32),)
+    weights = jnp.full((2, 8, 1), 2.0**63, jnp.float32)
+    direction, cotangent = (jnp.zeros((2, 8), jnp.float32),), jnp.ones((2, 1), jnp.float32)
+
+    def masked(rows):
+        pairs = jnp.einsum("rpk,gpkn->rgpn", rows.reshape(2, 4, 2), weights.reshape(2, 4, 2, 1))
+        return jnp.einsum("rg,rgn->rn", jax.nn.one_hot(groups, 2, dtype=rows.dtype), pairs.sum(axis=2))
+
+    def alternate_first(rows):
+        chosen = weights[groups]
+        return (jnp.einsum("rk,rkn->rn", rows[:, ::2], chosen[:, ::2])
+                + jnp.einsum("rk,rkn->rn", rows[:, 1::2], chosen[:, 1::2]))
+
+    assert_contract(alternate_first, rows, direction, cotangent, "alternate terms of a selected product",
+                    truth_fn=masked, plain_fn=masked)
