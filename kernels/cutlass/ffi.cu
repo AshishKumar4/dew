@@ -121,19 +121,40 @@ extern "C" const char* dew_cutlass_architecture(int major, int minor) {
   return dew_cutlass::architecture_for(10 * major + minor);
 }
 
+namespace {
+
+// The numeric fields of a kernel's description (`Instantiated`), by name and member: the one schema the
+// description's header (`dew_cutlass_kernel_fields`) and every entry (`dew_cutlass_kernels`) are written from,
+// and dew_cutlass.KERNELS reads by name.
+constexpr std::pair<const char*, int dew_cutlass::Instantiated::*> kNumbers[] = {
+    {"rows", &dew_cutlass::Instantiated::rows},       {"columns", &dew_cutlass::Instantiated::columns},
+    {"depth", &dew_cutlass::Instantiated::depth},     {"stages", &dew_cutlass::Instantiated::stages},
+    {"consumers", &dew_cutlass::Instantiated::consumers}, {"cluster", &dew_cutlass::Instantiated::cluster}};
+
+}  // namespace
+
+// The fields of each entry of `dew_cutlass_kernels`, in order, joined by commas: the kernel's architecture
+// and output dtype, `kNumbers`' names, then its instruction family.
+extern "C" const char* dew_cutlass_kernel_fields() {
+  static const std::string fields = [] {
+    std::string joined = "architecture,dtype";
+    for (const auto& [name, member] : kNumbers) joined += std::string(",") + name;
+    return joined + ",instructions";
+  }();
+  return fields.c_str();
+}
+
 // The kernels the library instantiates, one an architecture and output dtype (dew_cutlass.KERNELS), each as
-// its file's instantiated types state it (`Instantiated`): "architecture,dtype,rows,columns,depth,stages,
-// consumers,cluster,instructions" entries joined by semicolons.
+// its file's instantiated types state it (`Instantiated`): entries of `dew_cutlass_kernel_fields`' fields,
+// joined by semicolons.
 extern "C" const char* dew_cutlass_kernels() {
   static const std::string described = [] {
     std::string entries;
     const auto add = [&entries](const char* architecture, const char* dtype,
                                 const dew_cutlass::Instantiated& kernel) {
-      entries += std::string(entries.empty() ? "" : ";") + architecture + "," + dtype + "," +
-                 std::to_string(kernel.rows) + "," + std::to_string(kernel.columns) + "," +
-                 std::to_string(kernel.depth) + "," + std::to_string(kernel.stages) + "," +
-                 std::to_string(kernel.consumers) + "," + std::to_string(kernel.cluster) + "," +
-                 kernel.instructions;
+      std::string entry = std::string(architecture) + "," + dtype;
+      for (const auto& [name, member] : kNumbers) entry += "," + std::to_string(kernel.*member);
+      entries += std::string(entries.empty() ? "" : ";") + entry + "," + kernel.instructions;
     };
     for (const auto& [result, dtype] : {std::pair{dew_cutlass::Dtype::kBF16, "bfloat16"},
                                         std::pair{dew_cutlass::Dtype::kF32, "float32"}}) {

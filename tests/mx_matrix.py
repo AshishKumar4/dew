@@ -8,7 +8,7 @@ operands (row 2513). It is held to the product with the selector's other kernel 
 (`generation.chosen`, check 1), from the decoded operands' product in float64.
 
 The kernel under test is the template, named where the cells run it (no receipt yet qualifies it, so its
-selectors, `gemm.MXFP8` and `gemm.NVFP4_BLOCK_OP`, take it by name alone): the cells' `CHOICES` are `mxfp8`
+selectors, `gemm.MXFP8` and `product.NVFP4.depth_OP`, take it by name alone): the cells' `CHOICES` are `mxfp8`
 and `nvfp4_block`, a cell's its format's (`FORMATS`).
 
 What the route serves is read from the product's own selector: the product traced for its shapes as the
@@ -29,6 +29,7 @@ from low_precision_support import spread
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.templates import product
 
 DEPTH = 256
 """The product's depth: eight 32-deep scale blocks."""
@@ -38,8 +39,8 @@ CHOICES = frozenset({"mxfp8", "nvfp4_block"})
 format's choice `mosaic_gpu` and every choice outside `CHOICES` at XLA."""
 KERNELS = {"mxfp8": frozenset({"mosaic"}), "nvfp4_block": frozenset({"mosaic"})}
 """The kernels under test of each choice the cells run: the template's block-scaled products."""
-FORMATS = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product, gemm.MX_BLOCK),
-           "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product, gemm.NVFP4_BLOCK)}
+FORMATS = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product, product.MXFP8.depth),
+           "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product, product.NVFP4.depth)}
 """Each format's choice, operand form, product and the depths a scale covers."""
 
 

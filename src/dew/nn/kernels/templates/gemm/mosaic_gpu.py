@@ -64,12 +64,13 @@ from dew.nn.kernels.templates import (
     bundles,
     cost as unit_cost,
     mosaic,
+    product as product_formats,
     resources,
     swizzling,
     tail as tail_of,
 )
 from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, scattered, sides_extended, sides_padded
-from dew.nn.kernels.templates.product import SCALE_DEPTH
+from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -499,7 +500,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **(_scale_blocks(block_m, block_n) if step_scaled else {}),
               # A block-scaled product's rows' and matrix's scales, a step's tiles of each (`gmm`'s
-              # `mx_scales`), four scales a tile's row (`block_format`).
+              # `mx_scales`), four scales a tile's row (`product.block_format`).
               **(_scale_tiles(block_m, block_n, block_k, dtype) if block_scaled else {}),
               **{f'side_{i}': (axes.named(axes.held(prologue_axes[i]), extent), prologue_dtypes[i])
                  for i in stepped}}
@@ -517,20 +518,11 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                        tuple((part, jnp.dtype(out)) for out in dtypes))
 
 
-def block_format(dtype) -> tuple[jnp.dtype, int]:
-    """Dew: a block-scaled product's scale dtype and the depths one scale covers, by its operands' `dtype`
-    (`gmm`'s `mx_scales`): NVFP4's (E2M1 operands) an E4M3 scale every 16 (tcgen05's `scale_vec::4X`,
-    `kind::mxf4nvf4`); MXFP8's (FP8 operands) an E8M0 scale every 32 (OCP MX, `scale_vec::1X`)."""
-    if jnp.dtype(dtype) == jnp.dtype(jnp.float4_e2m1fn):
-        return jnp.dtype(jnp.float8_e4m3fn), 16
-    return jnp.dtype(jnp.float8_e8m0fnu), 32
-
-
 def _scale_tiles(block_m: int, block_n: int, block_k: int, dtype) -> dict:
     """Dew: a block-scaled step's scale streams (`gmm_allocations`'): its rows' and its matrix's columns'
     scales in `tcgen05.scales_layout`'s tiles, `[128-row tiles, scale tiles, 32, 16]`, a tile four scales of
     each of 128 rows, so a step of `block_k` depths takes `block_k` over four blocks' depths of them
-    (`block_format`)."""
+    (`product.block_format`)."""
     scale, per = block_format(dtype)
     depth_tiles = block_k // (4 * per)
     return {'a_scales': ((block_m // 128, depth_tiles, 32, 16), scale),
@@ -703,6 +695,19 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         outs = tuple(total.astype(dtype) for dtype in dtypes)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
+
+
+NVFP4_GROUP = 128
+"""Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
+decode, code by code, into its eight sixteen-depth slices."""
+
+
+def nvfp4_staged_depth(group, word, code):
+    """Dew: the depth the staged order (`gemm.staged_rows`, the stage decode's `_stage_decoded`) gives word
+    `word`'s code `code` of group `group`: each code's sixteen-depth slice (an NVFP4 block's,
+    `product.NVFP4`) holds the group's words in order, the one layout the packer writes and the decode
+    reads."""
+    return NVFP4_GROUP * group + product_formats.NVFP4.depth * code + word
 
 
 NVFP4_STEP = 256
@@ -1075,15 +1080,14 @@ def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: 
 
 def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs: bool, plain: bool) -> None:
     """Dew: `gmm`'s refusal of a block-scaled product (`mx_scales`: the rows' and the matrices' scales, one
-    every block of depths, `block_format`'s, tiled as `tcgen05.scales_layout` lays them out, `[rows / 128,
-    scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`, the rows' in the product's row
-    order, a gathered product's its tokens' at the table (the caller's gather, `gemm._block_scaled`, row
-    4851); FP8 or E2M1 rows times a K-major
-    matrix of theirs, each block of each scaled in the products, `mosaic.Issuer.scaled_products`) it does
-    not take: but on a family whose
-    products take block scales, its matrix K-major, with no hook, pair, packed matrix, step scales,
-    transposed rows, exact sums or split, its tile whole 128s of rows, columns and depth (the scales'
-    tiles), each group's rows whole 128-row tiles (the caller's)."""
+    every block of depths, `product.block_format`'s, tiled as `tcgen05.scales_layout` lays them out, `[rows /
+    128, scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`, the rows' in the product's
+    row order, a gathered product's its tokens' at the table (the caller's gather, `gemm._block_scaled`, row
+    4851); FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled in the products,
+    `mosaic.Issuer.scaled_products`) it does not take: but on a family whose products take block scales, its
+    matrix K-major, with no hook, pair, packed matrix, step scales, transposed rows, exact sums or split, its
+    tile whole 128s of rows, columns and depth (the scales' tiles), each group's rows whole 128-row tiles (the
+    caller's)."""
     if mx_scales is None:
         return
     if not (family.takes_block_scales and transpose_rhs and plain and tiles.splits == 1
@@ -1570,7 +1574,7 @@ class _Decoding:
         """The consumers' meeting once each has decoded and published its share: a named barrier of all
         their threads (`DECODE_BARRIER`), none where one consumer decodes its own."""
         if self.consumers > 1:
-            threads = self.consumers * WARPGROUP_THREADS
+            threads = self.consumers * resources.THREADS
             plgpu.inline_mgpu()(lambda ctx: mgpu_utils.inline_ptx(
                 f"bar.sync {DECODE_BARRIER}, {threads};", has_side_effects=True))()
 
@@ -1578,9 +1582,6 @@ class _Decoding:
 DECODE_BARRIER = 15
 """Dew: the named barrier a packed matrix's consumers meet at (`_Decoding.met`): the last of a block's 16,
 past Mosaic GPU's own (0, the block's; 1 on, a warpgroup's)."""
-
-WARPGROUP_THREADS = 128
-"""Dew: a warpgroup's threads."""
 
 
 def _stage_decoded(words, scales, out, interpret: bool) -> None:
@@ -1603,22 +1604,15 @@ def _stage_decoded(words, scales, out, interpret: bool) -> None:
             # The block's scale a column: its group's code-th, picked from the loaded row by a mask (a
             # column slice of a register tile has no layout).
             scale = jnp.sum(jnp.where(which == 8 * group + code, owed, 0.0), axis=1)
-            out[:, pl.ds(128 * group + 16 * code, 16)] = (lane * scale[:, None]).astype(jnp.bfloat16)
+            depths = pl.ds(nvfp4_staged_depth(group, 0, code), product_formats.NVFP4.depth)
+            out[:, depths] = (lane * scale[:, None]).astype(jnp.bfloat16)
 
 
 def _e4m3_values(codes: jax.Array) -> jax.Array:
-    """Dew: E4M3 codes (float8_e4m3fn) as float32 by integer arithmetic, exactly: a normal code's exponent
-    (rebiased, 7 to 127) and mantissa moved into an fp32 pattern, a subnormal code's mantissa times 2^-9,
-    its sign kept. No FP8 conversion, which takes sm89's `cvt ... .e4m3x2`: an A100's ptxas refused the
-    packed NVFP4 kernel's scales cast so (W8-a100, M-NS-8). The NaN code (no block scale holds it) reads
-    as 480."""
-    word = jax.lax.bitcast_convert_type(codes, jnp.uint8).astype(jnp.uint32)
-    exponent, mantissa = (word >> jnp.uint32(3)) & jnp.uint32(0xF), word & jnp.uint32(0x7)
-    sign = (word & jnp.uint32(0x80)) << jnp.uint32(24)
-    normal = jax.lax.bitcast_convert_type(
-        sign | ((exponent + jnp.uint32(120)) << jnp.uint32(23)) | (mantissa << jnp.uint32(20)), jnp.float32)
-    subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** -9)
-    return jnp.where(exponent == 0, jnp.where(sign != 0, -subnormal, subnormal), normal)
+    """Dew: E4M3 codes (float8_e4m3fn) as float32 by the format's integer decode (`bits.decoded`), exactly,
+    with no FP8 conversion: an A100's ptxas refused the packed NVFP4 kernel's scales cast so (W8-a100,
+    M-NS-8). The NaN code (no block scale holds it) reads as 480."""
+    return bits.decoded(jax.lax.bitcast_convert_type(codes, jnp.uint8).astype(jnp.uint32), bits.E4M3)
 
 
 def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
@@ -1781,10 +1775,11 @@ def rows_unstaged(*, dense: bool, prologue, tabled: bool) -> bool:
     return dense and prologue is None and not tabled
 
 
-def _rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool) -> bool:
+def rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool) -> bool:
     """Dew: whether `tgmm`'s stage is rewritten by its family's own role (`mosaic.Family.rewrites_in_persist`,
     a role beside its consumers): its loads' rows, never rows its tables gather, a k-major launch's whole
-    steps of one group, nor a stage read as loaded (`rows_unstaged`; `grouped_matmul._Mosaic.rewritten`)."""
+    steps of one group, nor a stage read as loaded (`rows_unstaged`). The one decision: the kernel's role
+    and its planning's (`grouped_matmul._Mosaic.rewritten`)."""
     return (family.rewrites_in_persist and not k_major and all(table is None for table in tables)
             and not unstaged)
 
@@ -1810,7 +1805,7 @@ def _whole_stages(slots: dict, mine_depth) -> tuple:
 
 
 def _stage_rewrite(rewrites: bool, family: mosaic.Family, starts_gmem, ends_gmem, block_k: int) -> dict:
-    """Dew: `tgmm`'s persist argument where its family rewrites its stage (`_rewrites`): each step's
+    """Dew: `tgmm`'s persist argument where its family rewrites its stage (`rewrites`): each step's
     neighbouring groups' rows zeroed by the family's own role (`_rewritten_stage`); none elsewhere."""
     if not rewrites:
         return {}
@@ -1861,7 +1856,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
     lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
-    rewrites = _rewrites(family, k_major, tables, unstaged)
+    rewritten = rewrites(family, k_major, tables, unstaged)
     k, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers = tiles.warpgroups
@@ -1917,8 +1912,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 def staged_at(index, slots):
                     # The step of its group's the program walks, from its first (`start`).
                     index = index + start
-                    if rewrites or k_major:
-                        return _whole_stages(slots, None if rewrites else mine_depth)
+                    if rewritten or k_major:
+                        return _whole_stages(slots, None if rewritten else mine_depth)
                     if unstaged:
                         return slots['ring_0'].at[:, mine_depth].transpose((1, 0)), slots['ring_1']
                     # A vector read from global memory at the step's row block (`read`).
@@ -1940,7 +1935,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=unrolled, accumulators=(part,),
                            **_summed(family, tiles, exact_sums),
-                           **_stage_rewrite(rewrites, family, starts_gmem, ends_gmem, block_k))
+                           **_stage_rewrite(rewritten, family, starts_gmem, ends_gmem, block_k))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
@@ -1950,7 +1945,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
-                           consumers=consumers + rewrites, interpret=interpret, approx_math=False,
+                           consumers=consumers + rewritten, interpret=interpret, approx_math=False,
                            name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))

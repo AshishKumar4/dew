@@ -10,14 +10,15 @@ from typing import NamedTuple
 
 _library = ctypes.cdll.LoadLibrary(str(Path(__file__).with_name("libdew_cutlass.so")))
 _library.dew_cutlass_kernels.restype = ctypes.c_char_p
+_library.dew_cutlass_kernel_fields.restype = ctypes.c_char_p
 _library.dew_cutlass_architecture.restype = ctypes.c_char_p
 _library.dew_cutlass_architecture.argtypes = (ctypes.c_int, ctypes.c_int)
 
 
 class Kernel(NamedTuple):
-    """One instantiated kernel: its tile (rows, columns, depth), its ring's stages, its consumer threads (those
-    issuing its products), the multiprocessors of its cluster along the rows, and its instruction family
-    ("mma.sync": cp.async and Ampere's mma.sync; "wgmma": TMA and Hopper's warpgroup MMA)."""
+    """One instantiated kernel: its tile (rows, columns, depth), its ring's stages, its consumer threads
+    (those issuing its products), the multiprocessors of its cluster along the rows, and its instruction
+    family ("mma.sync": cp.async and Ampere's mma.sync; "wgmma": TMA and Hopper's warpgroup MMA)."""
 
     tile: tuple[int, int, int]
     stages: int
@@ -26,12 +27,19 @@ class Kernel(NamedTuple):
     instructions: str
 
 
+_FIELDS = _library.dew_cutlass_kernel_fields().decode().split(",")
+"""The fields of each of the library's kernel entries, in its order (ffi.cu's `kNumbers`, its one schema)."""
+
+
 def _described(entry: str) -> tuple[tuple[str, str], Kernel]:
-    """One of the library's entries ("architecture,dtype,rows,columns,depth,stages,consumers,cluster,
-    instructions", ffi.cu's `dew_cutlass_kernels`) as its key and kernel."""
-    architecture, dtype, *extents, instructions = entry.split(",")
-    rows, columns, depth, stages, consumers, cluster = (int(extent) for extent in extents)
-    return (architecture, dtype), Kernel((rows, columns, depth), stages, consumers, cluster, instructions)
+    """One of the library's entries (ffi.cu's `dew_cutlass_kernels`) as its key and kernel, each field read
+    by its name (`_FIELDS`)."""
+    field = dict(zip(_FIELDS, entry.split(","), strict=True))
+    number = {name: int(value) for name, value in field.items()
+              if name not in ("architecture", "dtype", "instructions")}
+    kernel = Kernel((number["rows"], number["columns"], number["depth"]), number["stages"],
+                    number["consumers"], number["cluster"], field["instructions"])
+    return (field["architecture"], field["dtype"]), kernel
 
 
 KERNELS = dict(_described(entry) for entry in _library.dew_cutlass_kernels().decode().split(";"))

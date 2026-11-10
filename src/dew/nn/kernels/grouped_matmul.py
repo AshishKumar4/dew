@@ -947,9 +947,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
         own loads' rows, never rows its tables gather (`mosaic_gpu.tgmm`'s `gather`, which a consumer's
         cp.async gather stages: the fed rings'), nor rows read as loaded (`unstaged`)."""
-        tabled = ba.arguments.get('gather') is not None or ba.arguments.get('scatter') is not None
-        return (self.STAGED_ROWS and not self.K_MAJOR and family.rewrites_in_persist and not tabled
-                and not self.unstaged(ba))
+        tables = (ba.arguments.get('gather'), ba.arguments.get('scatter'))
+        return self.STAGED_ROWS and mosaic_gpu.rewrites(family, self.K_MAJOR, tables, self.unstaged(ba))
 
     def unstaged(self, ba) -> bool:
         """Whether a kernel gradient's rows stage is read as loaded (`mosaic_gpu.rows_unstaged`): a dense call
@@ -1631,7 +1630,7 @@ class MosaicStepScaledGmm(_ScaledGmm):
 class MosaicMxGmm(_ScaledGmm):
     """`MosaicGmm` of a block-scaled product (`gemm.mxfp8_product`, `gemm.nvfp4_block_product`, row 4519),
     planned on the call it is: FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled
-    by its scale in the products (`mosaic_gpu.block_format`)
+    by its scale in the products (`product.block_format`)
     (`mosaic_gpu.gmm`'s `mx_scales`, `mosaic.Issuer.scaled_products`), its block scales streamed beside its
     rings (`gmm_allocations`' `block_scaled`) on a family whose products take them (tcgen05's), its tiles
     whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
@@ -1641,7 +1640,7 @@ class MosaicMxGmm(_ScaledGmm):
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted. Its
-        # operands FP8 (MXFP8) or E2M1 (NVFP4), `mosaic_gpu.block_format`'s.
+        # operands FP8 (MXFP8) or E2M1 (NVFP4), `product.block_format`'s.
         return (jnp.dtype(dtype) in (*EIGHT, jnp.dtype(jnp.float4_e2m1fn)) and family.takes_block_scales
                 and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
                 and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))

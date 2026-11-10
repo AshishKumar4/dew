@@ -746,6 +746,23 @@ E2M1 = Minifloat(exponent=2, mantissa=1, bias=1, largest=0x7, nan=None)
 """FP4 e2m1 (NVFP4's code): its largest 6 (0x7), no NaN."""
 
 
+def decoded(codes: jax.Array, minifloat: Minifloat) -> jax.Array:
+    """`minifloat` codes (uint32 a code) as float32, exactly, by integer arithmetic: a normal code's exponent
+    (rebiased to fp32's) and mantissa moved into an fp32 pattern, a subnormal code's mantissa times its
+    place (2^(1 - bias - mantissa bits)), its sign kept, each field read from the format. No conversion
+    instruction, which an older family lacks (an A100's ptxas refused the FP8 cvt, sm89's
+    `cvt ... .e4m3x2`). A NaN code reads as the largest exponent's value it spells (e4m3fn's 0x7F as 480)."""
+    word = jnp.uint32
+    exponent = (codes >> word(minifloat.mantissa)) & word((1 << minifloat.exponent) - 1)
+    mantissa = codes & word((1 << minifloat.mantissa) - 1)
+    sign = (codes >> word(minifloat.exponent + minifloat.mantissa)) << word(31)
+    raised = (exponent + word(127 - minifloat.bias)) << word(23)
+    normal = jax.lax.bitcast_convert_type(sign | raised | (mantissa << word(23 - minifloat.mantissa)),
+                                          jnp.float32)
+    subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** (1 - minifloat.bias - minifloat.mantissa))
+    return jnp.where(exponent == 0, jnp.where(sign != 0, -subnormal, subnormal), normal)
+
+
 def encoded[Words: (np.ndarray, jax.Array)](x: Words, minifloat: Minifloat, xp=jnp) -> Words:
     """fp32 `x` (as uint32 bits) rounded to `minifloat`'s codes, uint32 a code: to nearest, ties to even,
     saturating finite (an infinity, or a value past the largest, as the largest), a NaN as its NaN code

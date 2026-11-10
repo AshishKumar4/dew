@@ -45,7 +45,7 @@ from dew import _cache
 from dew.algebra import bits
 from dew.nn.derivatives import KernelGlue, Surrogate, contracted, declared_derivative, declared_tangent
 from dew.nn.kernels import generation, grouped_matmul, selection
-from dew.nn.kernels.templates import axes as side_axes_of, swizzling
+from dew.nn.kernels.templates import axes as side_axes_of, product as formats_of, swizzling
 from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed, parts, terms
@@ -266,8 +266,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         parted = declared(jnp.bfloat16, precision, outputs=(jnp.float32,))
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         # A prologue rewrites the rows as they are, so the rows run whole, one part: their own 16 bits.
-        hooked = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast,
-                                      prologue_dtypes=_dtypes(prologue, lhs.astype(jnp.bfloat16), sides))
+        hooked = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
         if (counts is not None and (prologue is None or counts[0] == 1) and _parts_launched(
                 grouped_matmul.tgmm_call(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes,
                                          sides, tables if tabled else None, out_dtype=jnp.float32,
@@ -292,8 +291,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # (as the portable program's: `prologue(lhs).astype(lhs.dtype)`, then the product).
         rewrite = (prologue if prologue is None or compute == jnp.dtype(lhs.dtype)
                    else functools.partial(_in_dtype, prologue, jnp.dtype(lhs.dtype)))
-        hooks = grouped_matmul.Hooks(rewrite, axes, prologue_broadcast=broadcast,
-                                     prologue_dtypes=_dtypes(rewrite, lhs.astype(compute), sides))
+        hooks = grouped_matmul.Hooks(rewrite, axes, prologue_broadcast=broadcast)
         product = declared(compute, precision, outputs=(out_dtype,), operands=(lhs.dtype, rhs.dtype))
         call = grouped_matmul.tgmm_call(lhs.astype(compute), rhs.astype(compute), group_sizes, sides,
                                         tables if tabled else None, out_dtype=out_dtype,
@@ -447,23 +445,21 @@ class NvFp4:
         return jnp.float32(bits.NVFP4_OWED) * jax.lax.stop_gradient(jnp.asarray(self.scale, jnp.float32))
 
 
-NVFP4_GROUP = 128
-"""The depths an NVFP4 matrix's staged order groups (`staged_rows`): a group's sixteen word rows decode, code
-by code, into its eight sixteen-row depth slices."""
 NVFP4_STAGE = mosaic_gpu.NVFP4_STEP
 """The depths a stage of the mainloop's NVFP4 decode reads: two groups, so each column's scales are a
 16-byte row (a TMA copy's least)."""
 
 
 def staged_rows(depth: int) -> np.ndarray:
-    """The depth each code of the staged order holds (`NvFp4`): within each `NVFP4_GROUP`-deep group, packed
-    row `8w + j` (word `w`'s code `j`) holds depth `16j + w`, so a stage's word rows decode, code by code,
-    into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
-    if depth % NVFP4_GROUP:
-        raise ValueError(f"an NVFP4 matrix's depth is whole {NVFP4_GROUP}-deep groups, not {depth}")
-    word, code = np.divmod(np.arange(NVFP4_GROUP), 8)
-    within = 16 * code + word
-    return (np.arange(0, depth, NVFP4_GROUP)[:, None] + within[None]).reshape(-1)
+    """The depth each code of the staged order holds (`NvFp4`): packed row `8w + j` of a group (word `w`'s
+    code `j`) holds the depth `mosaic_gpu.nvfp4_staged_depth` gives it, so a stage's word rows decode, code by
+    code, into its sixteen-row depth slices, the block of one scale each (the mainloop's stage decode)."""
+    group = mosaic_gpu.NVFP4_GROUP
+    if depth % group:
+        raise ValueError(f"an NVFP4 matrix's depth is whole {group}-deep groups, not {depth}")
+    groups, within = np.divmod(np.arange(depth), group)
+    word, code = np.divmod(within, 32 // bits.E2M1.width)
+    return mosaic_gpu.nvfp4_staged_depth(groups, word, code)
 
 
 def _codes(words: jax.Array, *, staged: bool = False) -> jax.Array:
@@ -949,13 +945,9 @@ def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax
 
 
 
-MX_BLOCK = 32
-"""The depths one MXFP8 scale covers (OCP MX, tcgen05's block-scaled MMA's `scale_vec::1X`)."""
-
-
 @dataclasses.dataclass(frozen=True)
 class MxFp8:
-    """An MXFP8 operand (OCP MX: E4M3 codes, a power-of-two E8M0 scale every `MX_BLOCK` depths; row 4519):
+    """An MXFP8 operand (OCP MX: E4M3 codes, a power-of-two E8M0 scale every 32 depths, `product.MXFP8`):
     `codes` float8_e4m3fn `[..., depth]`, the depth K-major (last), and `scales` float8_e8m0fnu
     `[..., depth / 32]`, each value its code times its block's scale. Rows `[rows, depth]` or a grouped
     product's matrices `[groups, width, depth]`, as Blackwell's block-scaled tensor cores read both."""
@@ -973,16 +965,17 @@ class MxFp8:
         from dew.nn import fake_quant
 
         x = jnp.asarray(x, jnp.float32)
-        blocks = x.reshape(*x.shape[:-1], x.shape[-1] // MX_BLOCK, MX_BLOCK)
+        per = formats_of.MXFP8.depth
+        blocks = x.reshape(*x.shape[:-1], x.shape[-1] // per, per)
         largest = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)
         exponent = jnp.where(largest > 0, jnp.floor(jnp.log2(jnp.where(largest > 0, largest, 1.0))), -119.0)
         scale = jnp.exp2(jnp.clip(exponent - 8, -127, 127))
         codes = fake_quant.fp8_codes(blocks / scale).reshape(x.shape)
-        return cls(codes.astype(jnp.float8_e4m3fn), scale[..., 0].astype(jnp.float8_e8m0fnu))
+        return cls(codes.astype(jnp.float8_e4m3fn), scale[..., 0].astype(formats_of.MXFP8.scale))
 
     def decoded(self) -> jax.Array:
         """Its values, exactly, in float32 (`[..., depth]`): each code times its block's scale."""
-        return _block_values(self.codes, self.scales, MX_BLOCK)
+        return _block_values(self.codes, self.scales, formats_of.MXFP8.depth)
 
 
 def _block_values(codes: jax.Array, scales: jax.Array, block: int) -> jax.Array:
@@ -1034,7 +1027,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
                   gather: jax.Array | None = None) -> jax.Array:
     """A block-scaled grouped product summed in fp32 (`mxfp8_product`'s, `nvfp4_block_product`'s): `op`
     selects the template on Blackwell's block-scaled tensor cores (`mosaic_gpu.gmm`'s `mx_scales`, the
-    operands' `codes` and their block `scales`, `mosaic_gpu.block_format`'s) where named and planned, else
+    operands' `codes` and their block `scales`, `product.block_format`'s) where named and planned, else
     the operands' block-scaled values (`decoded`: each exact in bfloat16 and in TF32, so DEFAULT's products
     are exact) summed as XLA sums fp32 products. Gathered rows (`gather`) are the template's gather
     (tcgen05's load warp's, row 1376) and their block scales the same table's rows of `lhs.scales`, gathered
@@ -1124,10 +1117,6 @@ def _scales_tiled(scales: jax.Array) -> jax.Array:
     return tiled.reshape(*lead, rows // 128, columns // 4, 32, 16)
 
 
-NVFP4_BLOCK = 16
-"""The depths one NVFP4 block scale covers (tcgen05's block-scaled MMA's `scale_vec::4X`)."""
-
-
 @dataclasses.dataclass(frozen=True)
 class NvFp4Block:
     """An NVFP4 operand as Blackwell's block-scaled tensor cores read it (row 4519's NVFP4 arm): `codes`
@@ -1160,7 +1149,7 @@ class NvFp4Block:
     def decoded(self) -> jax.Array:
         """Its block-scaled values, exactly, in float32 (`[..., depth]`): each code times its block's scale,
         the tensor's apart (`scale`)."""
-        return _block_values(self.codes, self.scales, NVFP4_BLOCK)
+        return _block_values(self.codes, self.scales, formats_of.NVFP4.depth)
 
 
 NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op(generation.Choice.NVFP4_BLOCK, (
@@ -1464,16 +1453,6 @@ _CONTRACTED_ROWS = jax.lax.RaggedDotDimensionNumbers(
 """A ragged dot over its rows, each group's rows of both operands contracted into the group's matrix: a
 grouped GEMM's weight gradient, `[rows, depth]` and `[rows, width]` to `[groups, depth, width]`."""
 
-_ACCUMULATOR = jax.ShapeDtypeStruct((), jnp.float32)
-"""An epilogue's tile: the fp32 accumulator's."""
-
-
-def _dtypes(hook, tile, sides: tuple) -> tuple[str, ...]:
-    """The dtypes a kernel traces `hook` at: its tile's (`tile`'s), then each side operand's; none without
-    a hook."""
-    return () if hook is None else tuple(jnp.dtype(array.dtype).name for array in (tile, *sides))
-
-
 def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
           epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret_on_cpu: bool,
           precision: PrecisionLike, dense: bool = False, paired: jax.Array | None = None,
@@ -1552,9 +1531,7 @@ def _gemm_call(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, 
     after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
     hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
                                  tuple(dtype.name for dtype in dtypes) if several else None,
-                                 prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast,
-                                 prologue_dtypes=_dtypes(prologue, lhs, before_sides),
-                                 epilogue_dtypes=_dtypes(epilogue, _ACCUMULATOR, after_sides))
+                                 prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
     product = declared(lhs.dtype, precision, outputs=summed_as or dtypes, operands=(lhs.dtype, rhs.dtype))
     call = grouped_matmul.gmm_call(lhs, rhs.astype(lhs.dtype), group_sizes, before_sides, after_sides,
                                    None if paired is None else paired.astype(lhs.dtype), first, gather,
