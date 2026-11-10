@@ -122,15 +122,15 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
     can overflow, the magnitudes of the terms the float64 run's sums add (`float64_magnitudes`, a sum behind
-    a sum at its own) summing inside float32's range. So a form that overflows where the plain formula's own operations stay
-    in range fails (row 1768, a contraction Dew summed before the division that brought it back), and a
-    sum whose terms float32 can overflow in one order and not another is held to neither order (row 5426:
-    Dew's blocked sum and XLA's chain each overflow partials the other does not). The float64 run is
-    `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed precision
-    whatever its inputs' (a declared dot algorithm). `held`, where given, names the orders a decision its
-    caller cites holds the call to: each order it drops must break, so the exemption ends when the call
-    holds it. `without` names orders the contract does not take yet, each joining with its row's fix (a
-    row's head brings its own test)."""
+    a sum at its own) summing inside float32's range. So a form that overflows where the plain formula's
+    own operations stay in range fails (row 1768, a contraction Dew summed before the division that brought
+    it back), and a sum whose terms float32 can overflow in one order and not another is held to neither
+    order (row 5426: Dew's blocked sum and XLA's chain each overflow partials the other does not). The
+    float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed
+    precision whatever its inputs' (a declared dot algorithm). `held`, where given, names the orders a
+    decision its caller cites holds the call to: each order it drops must break, so the exemption ends when
+    the call holds it. `without` names orders the contract does not take yet, each joining with its row's
+    fix (a row's head brings its own test)."""
 
     def orders_of(f, *drawn):
         return {name: order for name, order in orders(f, *drawn).items() if name not in without}

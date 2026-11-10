@@ -15,12 +15,12 @@ WEIGHT = np.random.default_rng(5430).normal(size=(64, 8)).astype(np.float32)
 
 def held(seed):
     """Rows alone, the weight closed over."""
-    return (np.random.default_rng([5430, seed]).normal(size=(16, 64)).astype(np.float32),)
+    return (jnp.asarray(np.random.default_rng([5430, seed]).normal(size=(16, 64)), jnp.float32),)
 
 
 def drawn(seed):
     """Rows and the weight, both drawn."""
-    return (*held(seed), WEIGHT)
+    return (*held(seed), jnp.asarray(WEIGHT))
 
 
 def product(x, weight):
@@ -120,7 +120,7 @@ def test_a_judgement_logs_whether_its_reference_equalled_the_truth(tmp_path, mon
 
     def whole(seed):
         rng = np.random.default_rng(seed)
-        return tuple(rng.integers(-8, 9, shape).astype(np.float32) for shape in ((16, 64), (64, 8)))
+        return tuple(jnp.asarray(rng.integers(-8, 9, shape), jnp.float32) for shape in ((16, 64), (64, 8)))
 
     assert_as_exact(product, product, whole, "whole numbers", seeds=8)
     assert_as_exact(product, product, drawn, "a product that rounds", seeds=8)
