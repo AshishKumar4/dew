@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.artifacts import pixel_levels
 from dew.batch import Variables, coordinates
 from dew.inputs.condition import ConditionEncoder
 from dew.nn.blocks import torch_nearest_resize
@@ -784,7 +785,8 @@ class ImageSafety:
     transform: CLIPImageTransform
 
     def __call__(self, variables, images):
-        pixels = jnp.clip(jnp.round((images + 1) * 127.5), 0, 255)
+        # The levels its preprocessing reads, as every decoded image is converted (`pixel_levels`).
+        pixels = pixel_levels(images, jnp)
         flagged = self.model.apply({"params": variables["encoders"]["safety"]}, self.transform(pixels))
         assert isinstance(flagged, jax.Array)
         return jnp.where(flagged[:, None, None, None], -jnp.ones_like(images), images)

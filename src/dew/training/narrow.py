@@ -33,7 +33,6 @@ The gradients are the cast's on split meshes as partitioned for the CPU
 (tests/test_narrow.py); a multi-GPU run over NCCL has not been measured, so
 its first should compare a few steps against copies off.
 """
-import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -41,31 +40,31 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.batch import FROZEN, Variables, merge, select
-from dew.nn.programs import CALLS, named
+from dew.nn.programs import called, named
 
-_PASSED_THROUGH = CALLS - {"custom_jvp_call", "custom_vjp_call"}
-"""The calls whose program a narrowed operand reaches as it is (`_inner`): every call (`CALLS`) but a custom
-derivative's, whose derivative rule, not its primal's program, makes its operand's cotangent, so a cast
-folded into its primal leaves its cotangent the rule's."""
+_DERIVED = frozenset({"custom_jvp_call", "custom_vjp_call"})
+"""The calls whose program a narrowed operand does not reach as it is (`_inner`): a custom derivative's,
+whose derivative rule, not its primal's program, makes its operand's cotangent, so a cast folded into its
+primal leaves its cotangent the rule's."""
 
 
 def _inner(eqn, index: int):
-    """The callee jaxpr of `eqn` and the variable it binds the `index`th
-    operand to, where the callee sees each iteration's own slice or the
-    operand itself; else None."""
+    """The callee jaxpr of `eqn` and the variable it binds the `index`th operand to, where the callee sees
+    each iteration's own slice or the operand itself; else None. A call's program is the one it runs on its
+    operands one for one (`called`); a scan's, its body, which slices its stacked operands."""
     name = named(eqn.primitive)
-    inner = eqn.params.get("jaxpr", eqn.params.get("call_jaxpr"))
-    if inner is None or name not in (*_PASSED_THROUGH, "scan") or index >= len(inner.invars):
-        return None
-    # A scan's constants and carries are read by every iteration, whose
-    # cotangents it sums in the operand's dtype; only its stacked operands
-    # are sliced, one slice an iteration, the leading axis gone.
     if name == "scan":
+        # A scan's constants and carries are read by every iteration, whose cotangents it sums in the
+        # operand's dtype; only its stacked operands are sliced, one slice an iteration, the leading axis
+        # gone.
+        inner = eqn.params["jaxpr"].jaxpr
         outer, bound = eqn.invars[index].aval, inner.invars[index].aval
         if not (isinstance(outer, ShapedArray) and isinstance(bound, ShapedArray)
                 and outer.shape == (eqn.params["length"], *bound.shape)):
             return None
-    return inner, inner.invars[index]
+        return inner, inner.invars[index]
+    inner = None if name in _DERIVED else called(eqn)
+    return None if inner is None else (inner, inner.invars[index])
 
 
 _STACKING = ("stack", "reshape", "expand_dims", "squeeze", "broadcast_in_dim", "concatenate")
@@ -112,15 +111,15 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
         if stacked.aval.size != sum(aval.size for aval in sized):
             return None
         return _cast_once(stacked, jaxpr, weights | {stacked})
-    called = _inner(eqn, index)
-    if called is None:
+    callee = _inner(eqn, index)
+    if callee is None:
         return None
     # The weights the callee binds: each of the call's operands that is a weight read by the call
     # alone, where it is passed on unchanged.
     inner = frozenset(bound[1] for position, operand in enumerate(eqn.invars)
                       if isinstance(operand, core.Var) and operand in weights and _read_once(operand, jaxpr)
                       and (bound := _inner(eqn, position)) is not None)
-    return _cast_once(called[1], called[0], inner)
+    return _cast_once(callee[1], callee[0], inner)
 
 
 def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.dtype]:
@@ -162,37 +161,18 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
     return variables if compute is None else merge(variables, compute)
 
 
-def narrow_copies(objective, state, batch, model_batch, *, composed: bool, window: int = 1,
-                  split: int = 1, traced: core.Jaxpr | None = None) -> dict:
-    """The parameters a step reads through narrow copies, by path under `params` (`narrowed_paths`):
-    on every GPU but one whose row measured them off, for a step the trainer composes (`composed`),
-    without a loss scale, whose state holds no frozen collection. `model_batch` is the trainer's
-    batch as the model reads it; the loss is the one its first attempt reads (`attempt_step`), its
-    update a `window` of microbatches, each step read in `split`, its committed updates among its
-    inputs, so a parameter the step computes on before its cast (a DEX lambda's anneal) is not
-    copied. `traced` is that loss as the trainer traced it for its shapes (`footprint.traced_loss`, the
-    state's variables its first inputs), whose casts are read in place of a trace of its own: a trace of
-    a Qwen3.5-4B step's loss is seconds of its compile (row 4260)."""
+def narrow_copies(state, traced: core.ClosedJaxpr) -> dict:
+    """The parameters a step the trainer composes reads through narrow copies, by path under `params`
+    (`cast_paths`): on every GPU but one whose row measured them off, for a state that holds no frozen
+    collection. `traced` is the loss its first attempt reads as the trainer traced it for its shapes
+    (`footprint.traced_loss`: its update a window of microbatches, each step read in its split, its
+    committed updates among its inputs, the state's variables its first inputs), whose casts are read in
+    place of a trace of its own, so a parameter the step computes on before its cast (a DEX lambda's
+    anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its compile (row 4260)."""
     from dew.nn.kernels.generation import Choice, backend, chosen_kernel
-    from dew.training.transaction import attempt_step
 
     if (chosen_kernel(Choice.NARROW_COPIES, 'on' if backend() == 'gpu' else 'off') == 'off'
-            or not composed or FROZEN in state.variables):
+            or FROZEN in state.variables):
         return {}
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
-    if traced is not None:
-        return cast_paths(traced, variables, ("params",))
-
-    def loss(params, rest, batch, microstep, key, step, ema, updates):
-        # As the trainer's loss shape traces it, the averaged weights the step hands the objective
-        # included: a parameter read there is used twice.
-        variables = {**rest, "params": params}
-        current = dataclasses.replace(state, microstep=microstep, key=key, step=step, updates=updates)
-        read = model_batch(batch)
-        return objective._loss(variables, read, attempt_step(
-            current, variables, ema, read, split=split, slots=window, attempt=step * split, part=0,
-            slot=microstep % window))
-
-    rest = {name: tree for name, tree in variables.items() if name != "params"}
-    return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
-                          state.ema, state.updates)
+    return cast_paths(traced, variables, ("params",))

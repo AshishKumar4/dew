@@ -1329,7 +1329,7 @@ class Transaction:
                                                      masters=state.compute is not None)
             if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
-            # Otherwise no loss scale divides it (`Trainer._narrow_copies`),
+            # Otherwise no loss scale divides it (`dew.training._candidates.prepared_for`),
             # and a copied parameter's gradient stays bf16 until the update
             # widens it as it reads it. A window of several microbatches
             # widens it as it pools it, so the window sums in fp32.

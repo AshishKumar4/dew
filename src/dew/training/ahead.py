@@ -88,27 +88,32 @@ _log = logging.getLogger(__name__)
 def target_config(target: GpuTarget, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the GPU `target` a build states (`built_target`: its
     CUDA generation's, its multiprocessors its own where stated): its compute capability, the shared memory
-    a block may opt into, its multiprocessors, clock and bandwidth; CUDA's per-capability limits for the
-    rest. The fields past
-    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code. From
-    Hopper on, its capability states the architecture-specific features (sm_90a, sm_100a, sm_120a), which
-    Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain sm_120 and refused its own
-    PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    a block may opt into, its multiprocessors, clock and bandwidth, its multiprocessor's and a block's
+    limits (`Multiprocessor`) and its fp32 lanes (`Architecture.tensor_rates`); CUDA's grid limits for the
+    rest. The fields past the capability and shared memory only steer XLA's own fusions, never a Triton
+    kernel's code. From Hopper on, its capability states the architecture-specific features (sm_90a,
+    sm_100a, sm_120a), which Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain
+    sm_120 and refused its own PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
     generation = target.generation
     version = capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
-    if version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None:
+    # Its fp32 lanes, two FLOPs a clock each (a fused multiply-add), as its architecture states them.
+    fp32 = target.tensor_rates.get("fp32")
+    if (version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None
+            or fp32 is None):
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
+    # The multiprocessor's and a block's limits, as the target states them.
+    resources = target.multiprocessor
     return f"""gpu_device_info {{
-  threads_per_block_limit: 1024
-  threads_per_warp: 32
-  shared_memory_per_block: 49152
-  shared_memory_per_core: {shared + 1024}
-  threads_per_core_limit: {target.multiprocessor.resident_threads}
+  threads_per_block_limit: {resources.block_threads}
+  threads_per_warp: {resources.warp_threads}
+  shared_memory_per_block: {resources.block_shared}
+  shared_memory_per_core: {shared + resources.reserved_shared}
+  threads_per_core_limit: {resources.resident_threads}
   core_count: {multiprocessors}
-  fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
+  fpus_per_core: {fp32 // 2}
   block_dim_limit_x: 2147483647
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
@@ -121,8 +126,8 @@ def target_config(target: GpuTarget, capacity: int | None = None) -> str:
     minor: {minor}
     feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
   }}
-  registers_per_core_limit: 65536
-  registers_per_block_limit: 65536
+  registers_per_core_limit: {resources.registers}
+  registers_per_block_limit: {resources.block_registers}
 }}
 platform_name: "CUDA"
 device_description_str: "{target.device_kind}"
