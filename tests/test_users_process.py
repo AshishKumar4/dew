@@ -5,9 +5,9 @@ The suite's processes sum a CPU's float32 products in float64 (Dew's test settin
 Every program a test builds outside check 1's arms is the wide one: a training step's shapes and placements,
 a plan's footprint, a partitioning, the regions the algebra pass reads. Each flow here is a test of another
 file, run whole by pytest in a child process on the CPU with the suite's devices and none of its arithmetic,
-so a crash, a refusal or a wrong partitioning on the path a library process takes fails a train. They are
-the tests that first showed each class (rows 5422, 5427, 5432, 5434, 5438), one a class; a class whose fix
-is not in yet adds its flow with it."""
+so a crash or a refusal on the path a library process takes fails a train. Each is the test that first
+showed a class the whole suite run without the setting found (row 5438 and its kin, rows 5422 to 5442); a
+class whose fix is not in yet adds its flow with it."""
 
 import json
 import os
@@ -18,24 +18,11 @@ from xml.etree import ElementTree
 import jax
 import pytest
 import test_codec_checkpoints
-import test_decode_attention
-import test_device_image_augmentation
-import test_host_placement
-import test_jepa
-import test_mesh_axes
 import test_run_options
 from lane_environment import users_process
 from process_support import relayed
 
 FLOWS = (
-    # A training step on an Explicit data axis, through a video encoder and through a device's own steps.
-    test_jepa.test_a_video_objective_steps_on_an_explicit_data_axis,
-    test_device_image_augmentation.test_a_device_steps_rows_keep_their_explicit_axis_where_the_run_reads_them,
-    # The communication and the work of the program a user's process partitions over a mesh, and a pool of
-    # processes over a host-resident bank.
-    test_mesh_axes.test_tensor_parallelism_computes_latent_attentions_down_projections_once,
-    test_decode_attention.test_a_grouped_query_keeps_the_tensor_axis_split,
-    test_host_placement.test_a_pool_reads_its_own_shards_of_a_host_resident_bank,
     # A command-line run of each kind: the algebra pass reads the programs a library process builds.
     test_run_options.test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set,
     # A quantized checkpoint's products against its author's own forward.
