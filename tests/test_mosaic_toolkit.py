@@ -367,6 +367,8 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
     assert pair in bundles.groups("sm100", jnp.bfloat16, stated=True)[0]
     assert pair not in [family for group in bundles.groups("sm90", jnp.bfloat16, stated=True)
                         for family in group]
+
+
 def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
     """A kernel named with its register model (`report.named`'s `model`) records it on the launch tracing it
     (`report.Launch.kernels`), by its name less the launch's suffix, where the compile point reads it before a
