@@ -845,10 +845,12 @@ def drain(rings: Iterable[Ring], end) -> None:
 def drained(barriers: Sequence, end, stages: int) -> None:
     """The completions of the last `stages` of `end` turns round each of `barriers` (`stages` a ring each), a
     slot's each (`Turn`), which no later turn of the slot waited for: each barrier ends at the phase its
-    waiters saw. A slot's turn is every ring's, waited for under its one guard: drained a ring after another,
-    ptxas held each slot's guard from the first ring's wait to the last's, a predicate a slot live at once,
-    and a thread holds `resources.PREDICATES` (an eight-stage tcgen05 kernel gradient's two rings spilled
-    16 bytes of predicates at every raise but 232, FS-TGMM-PRED3)."""
+    waiters saw. A slot's turn is every ring's, waited for under its one guard, so the guards live at once
+    are one, whatever the depth: drained a ring after another, ptxas held each slot's guard from the first
+    ring's wait to the last's, a predicate a slot, and a thread holds seven (P0 to P6), so an eight-stage
+    tcgen05 kernel gradient's two rings spilled 16 bytes of predicates at every raise but 232
+    (FS-TGMM-PRED3). With no depth-bound count left, no resource states predicates: the compile gate's
+    deepest rings hold it (their spilled bytes)."""
     for back in range(1, stages + 1):
         turn = Turn.of(end - back, stages)
 
