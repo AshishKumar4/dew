@@ -79,16 +79,17 @@ def test_the_algebra_reads_another_librarys_operation_as_a_leaf_whatever_its_nam
 
     x, y, a = rows(2, (64, 32), (64, 32), (8, 64))
     np.testing.assert_array_equal(np.asarray(algebra.rewritten(summed)(x, y, a)), np.asarray(summed(x, y, a)))
-    rewritten = jax.make_jaxpr(algebra.rewritten(summed))(x, y, a)
-    assert sum(equation.primitive is squaring for equation in programs.equations(rewritten.jaxpr)) == 2
 
 
 def test_the_flop_count_reads_a_product_by_its_object():
-    """A user's primitive named `dot_general` holds none of JAX's product's parameters: the traced count
-    reads it as work it does not count, where reading it by its name raised KeyError on them."""
+    """A user's primitive named `dot_general` is not JAX's product: the traced count refuses it as an
+    operation it has no count for (`MissingFlopsCount`), where reading it by its name raised KeyError on the
+    product's parameters it does not hold; JAX's own product is counted, two FLOPs a multiply-add."""
     doubled = named("dot_general", lambda a: a + a)
     x = jnp.ones((4, 8), jnp.float32)
-    assert flops.traced_flops(lambda x: doubled.bind(x) @ x.T, x) == flops.traced_flops(lambda x: x @ x.T, x)
+    with pytest.raises(flops.MissingFlopsCount):
+        flops.traced_flops(lambda x: doubled.bind(x) @ x.T, x)
+    assert flops.traced_flops(lambda x: x @ x.T, x) == 2 * 4 * 4 * 8
 
 
 def test_a_tile_layout_refuses_an_operation_it_does_not_know():

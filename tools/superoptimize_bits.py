@@ -36,10 +36,13 @@ MASK = bits.MASK
 
 # --- the reference traced into a form ---------------------------------------------------------------------
 
-_PREDICATES = {name: code for code, name in enumerate(bits.COMPARISONS)}
-_FLIPPED = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
-_COMPARED = (jax.lax.lt_p, jax.lax.le_p, jax.lax.gt_p, jax.lax.ge_p, jax.lax.eq_p, jax.lax.ne_p)
-"""JAX's comparisons, each the bit vocabulary's predicate of its own name (`bits.COMPARISONS`)."""
+_FLIPS = {jax.lax.lt_p: jax.lax.gt_p, jax.lax.le_p: jax.lax.ge_p, jax.lax.gt_p: jax.lax.lt_p,
+          jax.lax.ge_p: jax.lax.le_p, jax.lax.eq_p: jax.lax.eq_p, jax.lax.ne_p: jax.lax.ne_p}
+"""JAX's comparisons, each with the one that holds of its operands exchanged."""
+
+_PREDICATES = {primitive: bits.COMPARISONS.index(primitive.name) for primitive in _FLIPS}
+"""Each comparison's code in the bit vocabulary, whose predicates carry JAX's own names
+(`bits.COMPARISONS`): a comparison the vocabulary lacks fails here, where the tool is loaded."""
 
 
 class _Seeded:
@@ -136,13 +139,13 @@ def _seeded(form: _Seeded, primitive, args, signed: bool, equation):
         constants = [arg for arg in args if not isinstance(arg, _Place)]
         return _Place(form.step(BitOp.MINMAX, places, constants[0] if constants else 0,
                                 int(signed) | (2 if primitive is jax.lax.max_p else 0)))
-    if primitive in _COMPARED:
-        # The comparison's symbol in the bit vocabulary is its JAX primitive's own name.
-        predicate = primitive.name if not constant[0] else _FLIPPED[primitive.name]
+    if primitive in _PREDICATES:
+        # A constant on the left is the comparison with its operands exchanged.
+        predicate = _PREDICATES[_FLIPS[primitive] if constant[0] else primitive]
         places = [arg for arg in args if isinstance(arg, _Place)]
         constants = [arg for arg in args if not isinstance(arg, _Place)]
         return _Place(form.step(BitOp.CMP, places, constants[0] if constants else 0,
-                                _PREDICATES[predicate] | (8 if signed else 0)))
+                                predicate | (8 if signed else 0)))
     if primitive is jax.lax.select_n_p:
         predicate, false, true = args
         return _Place(form.step(BitOp.SEL, (form.held(predicate), form.held(true), form.held(false))))
