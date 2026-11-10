@@ -1976,10 +1976,10 @@ class DecoderFamily:
     before this, by `Pretrained.load`, which records what it undid for the
     export."""
     spelling: Callable[[str], str] = field(default=lambda name: name)
-    """The name the family reads a stored tensor under and its encoder writes it
-    under, where a checkpoint may store it as another: a bare GPT2Model leaves
-    out GPT-2's `transformer.`. `prepare` renames by it, and a quantized source
-    is written back under its own names (`Pretrained.export`)."""
+    """The name the family's encoder writes a stored tensor under, where a checkpoint may store it as
+    another its `routes` read too: a bare GPT2Model leaves out GPT-2's `transformer.` (`Spelled.leading`
+    of the routes' own respelling). A quantized source whose `prepare` rewrites its tensors, so binds
+    none, is written back under its own names by it (`Pretrained.export`)."""
     packed: tuple[Packed, ...] = ()
     """Source tensors that hold several the path map reads, split on load and
     packed again on export: fused experts and GPT-2's Conv1D projections."""

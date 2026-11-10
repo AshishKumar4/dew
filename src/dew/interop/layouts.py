@@ -371,6 +371,15 @@ class Spelled:
         for name, path in self.routes.copies(config):
             yield renamed(name, self.renames, export=True), path
 
+    def leading(self, name: str) -> str:
+        """`name` as `routes` read it where its first dotted parts are a pair's source (a bare GPT2Model's
+        `h.0.attn` its causal LM's `transformer.h.0.attn`), as stored where they are none's: the family's
+        `spelling` of a bare model's names, which leaves a name its LM spells as it is."""
+        for source, shared in self.renames:
+            if name == source or name.startswith(source + '.'):
+                return shared + name[len(source):]
+        return name
+
 
 @dataclass(frozen=True, eq=False)
 class Prefixed:

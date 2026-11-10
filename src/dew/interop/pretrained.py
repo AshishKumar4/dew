@@ -1859,9 +1859,10 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
         # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
         # through too. A quantized source keeps its packed format by going back
         # over its source names (`weight_layouts`) where it binds them; a family
-        # whose `prepare` rewrites its tensors first (GPT-2, GPT-J, GPT-NeoX,
-        # ModernBERT) binds none, and its encoder undoes that rewrite, under the
-        # source's own names, before the format encodes the weights again (`export`).
+        # whose `prepare` rewrites its tensors first (GPT-2, GPT-J, GPT-NeoX)
+        # binds none, and its encoder undoes that rewrite, under the source's own
+        # names (`DecoderFamily.spelling`), before the format encodes the weights
+        # again (`export`).
         if not quantized:
             export_adapter = decoders.export_decoder_weights
         elif not layouts:
