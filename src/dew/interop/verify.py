@@ -68,7 +68,7 @@ from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
 from dew.objectives.base import Variables
 from dew.parity import _scaled_rms
-from dew.registry import models
+from dew.registry import from_record, models, record_fields
 
 if TYPE_CHECKING:
     import torch
@@ -564,8 +564,9 @@ class VerifiedMapping:
     """The config fields the convention does not read, which changed nothing on the probe's shrunken
     instance: a field whose effect starts past a context the probe never reaches (one `shrink` does not
     know to shrink below it) is not shown inert by it."""
-    source: ModelSource | None = None
-    """Where the type's classes came from, where not transformers' own (remote code, opted into)."""
+    source: ModelSource | None = field(default=None, metadata={"record": False})
+    """Where the type's classes came from, where not transformers' own (remote code, opted into): the load's,
+    attached after the verdict is read or recorded, never part of it (`_recorded`)."""
 
     def entry(self, hf_config: Mapping[str, object],
               inventory: Collection[str] | None = None) -> decoder_parts.DecoderFamily:
@@ -1117,11 +1118,8 @@ def _recorded(key: str) -> VerifiedMapping | None:
     path = Path(dew_cache_dir()) / _VERIFIED / key / 'mapping.json'
     if not path.is_file():
         return None
-    record = _records.record(json.loads(path.read_text()), 'verified mapping')
-    return VerifiedMapping(
-        _records.text(record['model_type'], 'model_type'), _records.text(record['family'], 'family'),
-        _records.text(record['reference'], 'reference'), _records.integer(record['draws'], 'draws'),
-        tuple(_records.strings(record['inert'], 'inert')))
+    return from_record(VerifiedMapping, _records.record(json.loads(path.read_text()), 'verified mapping'),
+                       dtypes=False)
 
 
 def _record(key: str, verified: VerifiedMapping) -> None:
@@ -1130,9 +1128,7 @@ def _record(key: str, verified: VerifiedMapping) -> None:
 
     directory = Path(dew_cache_dir()) / _VERIFIED / key
     with _files.staged(directory) as staging:
-        (staging / 'mapping.json').write_text(json.dumps({
-            'model_type': verified.model_type, 'family': verified.family, 'reference': verified.reference,
-            'draws': verified.draws, 'inert': list(verified.inert)}))
+        (staging / 'mapping.json').write_text(json.dumps(record_fields(verified, VerifiedMapping)))
 
 
 def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedMapping | Unmapped:
