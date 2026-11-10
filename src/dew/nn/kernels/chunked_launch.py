@@ -115,6 +115,14 @@ def _wide() -> bool:
     return (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
 
 
+def zero_padded(x, axis: int, size: int):
+    """`x` padded with zeros on the end of `axis` to `size` (as it is where `axis` is that long already):
+    the recurrence's routes' and its template's operands widened to whole tiles."""
+    if x.shape[axis] == size:
+        return x
+    return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
+
+
 class Span(NamedTuple):
     """A sequence's row of `Sequences.spans`, its one declaration: its first token and count, the slot its
     second chunk enters less one (`base`), the slots its first chunk enters and its last leaves, the call's

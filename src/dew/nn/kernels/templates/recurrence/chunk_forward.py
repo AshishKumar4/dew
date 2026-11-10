@@ -12,6 +12,7 @@ import numpy as np
 
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
+from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -34,11 +35,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 )
 from dew.nn.kernels.templates.recurrence.output import output_launch
 from dew.nn.kernels.templates.recurrence.table import Table
-
-
-def zero_padded(x, axis: int, size: int):
-    """`x` padded with zeros on the end of `axis` to `size`."""
-    return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
 def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int):

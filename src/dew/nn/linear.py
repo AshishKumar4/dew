@@ -1197,11 +1197,17 @@ class GatedDeltaNet(nn.Module):
                                      self._stored(operand)[0])
         return decode_kernel(state, groups=self.num_k_heads, fuses=True)
 
+    @property
+    def _gates(self) -> recurrence.Gates:
+        """The layer's gates from their pre-activations, the fused token's and the sequence's alike: a
+        sigmoid write gate and the softplus step's log decay (`recurrence.gated`)."""
+        return recurrence.Gates()
+
     def _fused_hooks(self) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
         keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm."""
         return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
-                                gates=recurrence.Gates(),
+                                gates=self._gates,
                                 output=recurrence.OutputNorm(self.norm_eps, self.gate_activation))
 
     def _fused_token(self, z, b, a, valid):
@@ -1236,8 +1242,8 @@ class GatedDeltaNet(nn.Module):
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
         # so a float64 model's stays float64 (`at_least_fp32`).
         wide = at_least_fp32(operand)
-        beta = nn.sigmoid(b.astype(wide))
-        g = -jnp.exp(self.A_log.astype(wide)) * nn.softplus(a.astype(wide) + self.dt_bias.astype(wide))
+        g, beta = recurrence.gated(self._gates, a.astype(wide), self.A_log.astype(wide),
+                                   self.dt_bias.astype(wide), b.astype(wide))
         if valid is not None:
             # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
             beta = jnp.where(valid[:, :, None], beta, 0.0)

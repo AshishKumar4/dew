@@ -14,11 +14,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
+from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product, resources
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
-from dew.nn.kernels.templates.recurrence.chunk_forward import ForkedTable, prepared, zero_padded
+from dew.nn.kernels.templates.recurrence.chunk_forward import ForkedTable, prepared
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,

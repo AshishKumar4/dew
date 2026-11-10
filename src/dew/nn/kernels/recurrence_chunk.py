@@ -43,7 +43,7 @@ from dew.nn.precision import asks_default_precision, at_least_fp32, exact_produc
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
-from .chunked_launch import AlignedDocuments, Forked
+from .chunked_launch import AlignedDocuments, Forked, zero_padded
 from .generation import INHERENT, Choice, triton_runs
 from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
@@ -1101,16 +1101,16 @@ def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, seg
     split = -(-Dv // fla_gdn.WIDEST)
     width = -(-Dv // split)
     if split > 1:
-        value = _padded(value, 3, split * width).reshape(B, S, Hv * split, width)
+        value = zero_padded(value, 3, split * width).reshape(B, S, Hv * split, width)
         g, beta = (jnp.repeat(x, split, axis=2) for x in (g, beta))
-        state = jnp.moveaxis(_padded(state, 3, split * width).reshape(B, Hv, Dk, split, width),
+        state = jnp.moveaxis(zero_padded(state, 3, split * width).reshape(B, Hv, Dk, split, width),
                              3, 2).reshape(B, Hv * split, Dk, width)
     blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
-    query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
+    query, key = (zero_padded(x, 3, blocks[0]) for x in (query, key))
     per_key = g.ndim == 4
-    g = _padded(g, 3, blocks[0]) if per_key else g
-    value = _padded(value, 3, blocks[1])
-    state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
+    g = zero_padded(g, 3, blocks[0]) if per_key else g
+    value = zero_padded(value, 3, blocks[1])
+    state = zero_padded(zero_padded(state, 2, blocks[0]), 3, blocks[1])
     # A row's padding after its documents runs as one more sequence of its own.
     spans = None if segments is None else cu_seqlens(starts, B * (segments + 1), firsts)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
@@ -1120,13 +1120,6 @@ def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, seg
     final = final[:, :, :Dk, :width]
     final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
     return out, final[..., :Dv]
-
-
-def _padded(x, axis: int, size: int):
-    """`x` padded with zeros on the end of `axis` to `size`."""
-    if x.shape[axis] == size:
-        return x
-    return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
 
 
 def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
@@ -1232,8 +1225,9 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             else:
                 carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x)
                            if state is None else jnp.swapaxes(state, -1, -2).astype(work))
-            wide_x, wide_B, wide_C = _padded(x, 3, columns), _padded(B, 3, rows), _padded(C, 3, rows)
-            wide_state = _padded(_padded(carried, 2, columns), 3, rows)
+            wide_x = zero_padded(x, 3, columns)
+            wide_B, wide_C = zero_padded(B, 3, rows), zero_padded(C, 3, rows)
+            wide_state = zero_padded(zero_padded(carried, 2, columns), 3, rows)
             held = 0 if forked is None else forked.held
             if kernel == 'pallas':
                 out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
@@ -1496,7 +1490,7 @@ def _ported_documents(state, forked: Forked, length: int, chunk_size: int, work,
     entries = aligned.entries(forked, transposed=True)
 
     def wide(memory):
-        return _padded(_padded(memory.astype(work), 3, widths[0]), 4, widths[1]).astype(jnp.float32)
+        return zero_padded(zero_padded(memory.astype(work), 3, widths[0]), 4, widths[1]).astype(jnp.float32)
 
     return aligned, (wide(jnp.swapaxes(state, -1, -2)), aligned.loads, aligned.stores,
                      None if entries is None else wide(entries))
