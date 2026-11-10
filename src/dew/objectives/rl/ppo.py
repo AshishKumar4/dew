@@ -41,6 +41,7 @@ from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
 from dew.state import TrainState
 
+from ..lm.objective import _predicted, _target_predecessors
 from .episodes import EpisodeCollector, EpisodeInference
 from .grpo import GRPOObjective, onto_ids
 from .scheduler import RolloutScheduler, SchedulerRecord, Synchronous, task_ids
@@ -236,9 +237,10 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
 
     def values(self, variables: Variables, batch: Mapping[str, object],
                progress: Progress = END) -> jax.Array:
-        """Return the critic's value of each packed id's prefix, at least float32, placed by `onto_ids`, at
-        the run's `progress` where the critic reads it: a rollout's baseline at the updates the run
-        committed (`PPORollout`), as the loss scores it at the step's, and `END` outside a run.
+        """Return the critic's value of each packed id's prefix, at least float32, each read at its
+        predecessor's slot where a pack shares a group's prompt (`_target_predecessors`), placed by
+        `onto_ids`, at the run's `progress` where the critic reads it: a rollout's baseline at the updates
+        the run committed (`PPORollout`), as the loss scores it at the step's, and `END` outside a run.
 
         A critic that does not return one value per input position raises
         `ValueError`.
@@ -261,6 +263,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
             qk = gathered.get("qk", {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
+        # Each action's value its prefix's, read at its predecessor's slot as a token's score is
+        # (`_target_predecessors`): a branch's first action follows its shared prompt's last token, not the
+        # branch packed before it.
+        before = _target_predecessors(packed_coordinates(batch))
+        values = values if before is None else _predicted(values, before)
         return onto_ids(batch, values.astype(at_least_fp32(values.dtype))), qk
 
     def trace_key(self) -> Hashable | None:

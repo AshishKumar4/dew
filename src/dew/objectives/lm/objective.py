@@ -284,6 +284,15 @@ def _predicted(states: jax.Array, before: jax.Array) -> jax.Array:
     return jnp.take_along_axis(states, at, axis=1)
 
 
+def _target_predecessors(laid: Coordinates | None) -> jax.Array | None:
+    """Each target's predecessor's slot among the inputs `[B, S - 1]` of the rows `laid` lays out where they
+    carry forks or a tail of finals (`_predicted_by_slot`, `Coordinates.predecessors`: a document's first
+    target its parent's last), read from its states by `_predicted`; None where the ids shift by one."""
+    if laid is None or not _predicted_by_slot(laid):
+        return None
+    return laid.predecessors()[:, 1:]
+
+
 def _finals(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]) -> int:
     """The trailing slots of the rows `fields` lay out that hold targets alone (`Coordinates.finals`): 1
     for rows whose ids shift by one. Every slot before them is an input, every slot after the first a
@@ -995,14 +1004,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def _predecessors(self, prepared, depths: bool) -> jax.Array | None:
         """Each target's predecessor's slot among the inputs where the rows' coordinates carry forks or a
         tail of finals (`Coordinates.predecessors`), None where the ids shift by one."""
-        laid = laid_coordinates(prepared.token_fields)
-        if not _predicted_by_slot(laid):
-            return None
-        assert laid is not None
-        if depths or self.adaptation is not None or prepared.token_fields.get(BLOCKS_FIELD) is not None:
+        before = _target_predecessors(laid_coordinates(prepared.token_fields))
+        if before is not None and (depths or self.adaptation is not None
+                                   or prepared.token_fields.get(BLOCKS_FIELD) is not None):
             raise ValueError("prediction depths, blocks and in-context steps read a row's tokens in its "
                              "order, which forks and a tail of finals do not lay out; lay the rows whole")
-        return laid.predecessors()[:, 1:]
+        return before
 
     def _exit_scores(self, params, gathered, targets, losses, before=None):
         """A looped decoder's per-pass losses, each earlier pass's states as its forward gathered them
