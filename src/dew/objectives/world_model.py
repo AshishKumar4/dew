@@ -42,14 +42,24 @@ RMS_EPSILON = 1e-6
 were drawn with)."""
 
 
-def _block(width: int, heads: int, tokens: int, name: str, *,
-           rotary_axes: tuple[int, ...] | None = None) -> DecoderBlock:
+def _block(width: int, heads: int, tokens: int, name: str, *, rotary: bool = False) -> DecoderBlock:
     """A pre-RMSNorm tower layer (`dew.nn.text_encoders.clip_layer`) of `width` features over `tokens`
     tokens: attention of `heads` biased heads, each head's queries and keys RMS-normed, under the
     call's pairwise mask (`AttentionMetadata.pairwise_mask`), its logits formed in at least float32
-    (`wide_logits`), as TSSM's blocks attend; then a biased SwiGLU of four times the width."""
+    (`wide_logits`), as TSSM's blocks attend; then a biased SwiGLU of four times the width. Under
+    `rotary`, its positions turn each head over two axes: the first's channels a whole number of pairs and
+    the second's the rest, as near halves as they split; an odd head's last channel is turned by neither
+    (`dew.nn.rope.rotate`)."""
+    axes = None
+    if rotary:
+        head = width // heads
+        if head < 4:
+            raise ValueError(f"a two-axis rotary turns a pair of channels or more for each axis, and the "
+                             f"{name} heads are {head} wide; make width // heads at least 4")
+        first = 2 * ((head + 2) // 4)
+        axes = (first, head - first)
     return clip_layer(width, heads, 4 * width, tokens, activation="swiglu", eps=RMS_EPSILON, norm_type="rms",
-                      norm_bias=False, qk_norm=True, wide_logits=True, name=name, rotary_axes=rotary_axes)
+                      norm_bias=False, qk_norm=True, wide_logits=True, name=name, rotary_axes=axes)
 
 
 def _attended(blocks: Sequence[DecoderBlock], tokens: jax.Array, mask: jax.Array, *,
@@ -132,17 +142,10 @@ class CausalTokenizer(nn.Module):
                                         (self.latents, self.width))
         self.patch_positions = self.param("patch_positions", nn.initializers.normal(0.02),
                                           (self.patches, self.width))
-        head = self.width // self.heads
-        if self.positions == "rotary" and head < 4:
-            raise ValueError(f"a tokenizer's two-axis rotary turns a pair of channels or more for each axis, "
-                             f"and its heads are {head} wide; make width // heads at least 4")
-        # The rows' channels, a whole number of pairs, and the columns' the rest, as near halves as they
-        # split; an odd head's last channel is turned by neither (`dew.nn.rope.rotate`).
-        rows = 2 * ((head + 2) // 4)
-        axes = (rows, head - rows) if self.positions == "rotary" else None
         tokens = self.patches + self.latents
-        self.encoder = [_block(self.width, self.heads, tokens, f"encoder_{index}", rotary_axes=axes)
-                        for index in range(self.depth)]
+        # Under rotary, the rows' channels first and the columns' second (`_block`).
+        self.encoder = [_block(self.width, self.heads, tokens, f"encoder_{index}",
+                               rotary=self.positions == "rotary") for index in range(self.depth)]
         self.squeeze = nn.Dense(self.bottleneck)
         # A rotary tokenizer's latents RMS-normalized before the squeeze: no parameter, so either `positions`
         # keeps its checkpoints.
@@ -150,8 +153,8 @@ class CausalTokenizer(nn.Module):
         self.unsqueeze = nn.Dense(self.width)
         self.readout_tokens = self.param("readout_tokens", nn.initializers.normal(0.02),
                                          (self.patches, self.width))
-        self.decoder = [_block(self.width, self.heads, tokens, f"decoder_{index}", rotary_axes=axes)
-                        for index in range(self.depth)]
+        self.decoder = [_block(self.width, self.heads, tokens, f"decoder_{index}",
+                               rotary=self.positions == "rotary") for index in range(self.depth)]
         self.pixels = nn.Dense(self.patch * self.patch * self.frame[2])
 
     def __call__(self, frames: jax.Array) -> jax.Array:
@@ -300,15 +303,8 @@ class Dynamics(nn.Module):
         tokens = tokens.reshape(batch, frames * per_frame, self.width)
         time = jnp.repeat(jnp.arange(frames), per_frame)
         rotary = self.positions == "rotary"
-        head = self.width // self.heads
-        if rotary and head < 4:
-            raise ValueError(f"a dynamics model's two-axis rotary turns a pair of channels or more for each "
-                             f"axis, and its heads are {head} wide; make width // heads at least 4")
-        # The frames' channels, a whole number of pairs, and the places' the rest, as near halves as they
-        # split (`CausalTokenizer`'s).
-        channels = 2 * ((head + 2) // 4)
-        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}",
-                         rotary_axes=(channels, head - channels) if rotary else None)
+        # Under rotary, the frames' channels first and the places' second (`_block`).
+        blocks = [_block(self.width, self.heads, self.frames * per_frame, f"block_{index}", rotary=rotary)
                   for index in range(self.depth)]
         places = jnp.stack([time, jnp.tile(jnp.arange(per_frame), frames)], -1).astype(jnp.float32)
         tokens = _attended(blocks, tokens, time[:, None] >= time[None, :],
