@@ -212,6 +212,22 @@ def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     return None
 
 
+PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call", "custom_vmap_call",
+                      "marked_call"}
+"""The calls (`CALLS`) that run a program on their operands and do nothing else, which a reader may run in
+their caller (`purely_called`): an optax helper's `jit` over a whole tree, `jnp.einsum`'s. A checkpoint's, a
+custom derivative's and a custom batching rule's call do more than their program, a rule of their own, and a
+marked span is a boundary the algebra pass reads (`dew.nn.derivatives.marked`: a protected span's inside no
+rule touches), so each stays a call."""
+
+
+def purely_called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
+    """The program `equation` runs (`called`) where its call does nothing else (`PURE_CALLS`), else None:
+    what a reader that runs a call in its caller reads (staging's `flattened`, the pairwise sums'
+    `dew.nn.precision._paired`). A call that does more keeps its rule only as a call."""
+    return called(equation) if equation.primitive.name in PURE_CALLS else None
+
+
 def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | None:
     """`primitive`'s outputs over concrete `operands`, computed as this host computes a constant: at compile
     time, on its CPU, outside any mesh a program traces under and without the outputs' stated shardings

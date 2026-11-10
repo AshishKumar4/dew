@@ -171,6 +171,21 @@ def test_a_fixed_layouts_form_reads_the_input_as_stored():
         bits.proven(transform, swapped)
 
 
+def test_a_forms_depth_counts_a_constant_as_the_start_of_a_chain():
+    """A form's depth is its dependent instructions' longest chain, and an instruction of no operand (a
+    constant) starts one. The word shifted and a constant, joined, is two deep. Each minifloat's encoding
+    form (`encode_form`, whose constants are such instructions) has a depth within its steps."""
+    alu = bits.Unit.ALU
+    form = bits.BitForm((bits.BitStep(bits.BitOp.IADD3, (), 3, alu),
+                         bits.BitStep(bits.BitOp.SHR, (0,), 1, alu),
+                         bits.BitStep(bits.BitOp.LOGIC, (1, 2), 0, alu, 0xFC)), (3,), (1, 2))
+    assert form.depth == 2
+    assert dataclasses.replace(form, outputs=(1,)).depth == 1
+    for minifloat in (bits.E4M3, bits.E5M2, bits.E2M1):
+        encoding = bits.encode_form(minifloat)
+        assert 1 < encoding.depth <= len(encoding.steps)
+
+
 def test_a_transform_kept_off_the_fma_pipe_takes_its_shifts_on_the_alu():
     """The NVFP4 decode declared for a consumer whose FMA pipe is its own (`units`): its form's every shift
     issues on the ALU, its price the ALU's, and it is proven."""
