@@ -303,9 +303,8 @@ class Session:
                 raise ValueError(f"session {name} must be a nonnegative integer")
         for name in ("task", "group", "detail", "source"):
             text(getattr(self, name), f"session {name}")
-        object.__setattr__(self, "components", MappingProxyType({
-            text(name, "a session component's name"): finite(value, f"session component {name}")
-            for name, value in self.components.items()}))
+        for name, value in self.components.items():
+            finite(value, f"session component {text(name, 'a session component name')}")
 
 
 @dataclass(frozen=True)

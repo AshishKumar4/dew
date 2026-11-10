@@ -1274,6 +1274,12 @@ def wrapper_layers(model_type: type) -> tuple[type, tuple[WrapperClass, ...]]:
     return model_type, tuple(layers)
 
 
+def recorded_names(owner: type) -> tuple[str, ...]:
+    """The fields a record of the dataclass `owner` holds (`record_fields` writes them, `from_record`
+    reads them): its constructor's, none marked unrecorded (`_recorded`)."""
+    return tuple(field.name for field in dataclasses.fields(owner) if _recorded(field))
+
+
 def _recorded(field: dataclasses.Field) -> bool:
     """Return whether a field is part of a record: one the constructor takes,
     not marked `metadata={"record": False}`."""

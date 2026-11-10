@@ -615,7 +615,7 @@ def test_a_prompt_sessions_source_is_its_data_source_and_the_metrics_report_each
     assert [trajectory.session for trajectory in from_verl(exported)] == sessions
     # The source is a session's, which every export names.
     del exported[0]["extra_fields"]["dew"]["session"]["source"]
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError):
         from_verl(exported)
 
 

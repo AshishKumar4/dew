@@ -70,6 +70,25 @@ def test_dews_record_of_a_verl_row_is_its_sessions_and_its_calls_own():
     assert [trajectory.session for trajectory in from_verl(rows)] == [session]
 
 
+def test_a_dew_row_writes_scores_as_they_are_and_reads_calls_that_leave_their_nullable_fields_out():
+    """A session's integer component score is written as the integer it is, and a Dew row whose calls
+    leave out their nullable metadata (raw likelihoods, support, reward, transcript), as an earlier Dew wrote
+    them, reads back with each of those None, as the hand reader read it."""
+    trainer, collector = build()
+    session = replace(rollouts_of(collect(collector, trainer.initial_state()))[0], components={"score": 1})
+    rows = json.loads(json.dumps(to_verl([session])))
+    assert rows[0]["extra_fields"]["dew"]["session"]["components"] == {"score": 1}
+    assert type(rows[0]["extra_fields"]["dew"]["session"]["components"]["score"]) is int
+    nullable = ("raw_log_probs", "support", "reward", "transcript")
+    for row in rows:
+        for call in row["extra_fields"]["dew"]["calls"]:
+            for name in nullable:
+                del call[name]
+    (restored,) = [trajectory.session for trajectory in from_verl(rows)]
+    assert restored == replace(session, calls=tuple(
+        replace(call, **dict.fromkeys(nullable)) for call in session.calls))
+
+
 def test_an_episode_record_reads_back_every_sampling_control():
     """A recorded episode's sampling policy comes back whole, its penalties and stop strings
     included, and an unset pad id stays the task's to fill."""

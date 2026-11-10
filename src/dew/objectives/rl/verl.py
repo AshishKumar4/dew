@@ -36,7 +36,7 @@ from typing import TypedDict
 from dew._records import JSON, finite, integer, integers, record as section
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import routing_head, routing_json, routing_record, routing_rows
-from dew.registry import from_record, record_fields
+from dew.registry import from_record, record_fields, recorded_names
 
 from .records import reals
 from .rollout import Reward
@@ -208,22 +208,30 @@ def _calls(row: Mapping[str, object], version: int | None,
         carried = {"prompt": tuple(full[:begin]), "tokens": tuple(full[begin:begin + length]),
                    "behavior_log_probs": tuple(logprobs[offset:offset + length]),
                    "routed_experts": None if record is None else routing_head(record, forwarded)}
+        # A call that states no finish (a native row's, an earlier Dew row's): the chain's last stopped it and
+        # every other ended on a tool call.
+        finished = "stop" if number == len(runs) - 1 else "tool_calls"
         if described is not None:
             own = {name: value for name, value in described[number].items() if name not in ("start", "count")}
-            calls.append(from_record(Call, {**own, **carried}, dtypes=False))
+            calls.append(from_record(Call, {"finish_reason": finished, **own, **carried}, dtypes=False))
         elif version is None:
             raise ValueError("a native verl row names its policy version in extra_fields.min_global_steps; "
                              "this one has none, so pass version=")
         else:
-            calls.append(Call(**carried, finish_reason="stop" if number == len(runs) - 1 else "tool_calls",
-                              version=version))
+            calls.append(Call(**carried, finish_reason=finished, version=version))
     return tuple(calls)
 
 
 def _dew(row: Mapping[str, object]) -> DewRow:
-    """Dew's record of a row it wrote (`DewRow`)."""
-    return from_record(DewRow, section(section(row["extra_fields"], "extra_fields")["dew"], "dew"),
-                       dtypes=False)
+    """Dew's record of a row it wrote (`DewRow`), its session's and each call's record whole, as Dew writes
+    them (`_whole`)."""
+    dew = from_record(DewRow, section(section(row["extra_fields"], "extra_fields")["dew"], "dew"),
+                      dtypes=False)
+    missing = sorted(set(recorded_names(Session)) - set(_SESSION_IN_ROWS) - set(dew.session))
+    if missing:
+        # A session's identity a default would read as another session's (its source, its group).
+        raise ValueError(f"a session's record Dew wrote states each of its fields; this one lacks {missing}")
+    return dew
 
 
 def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
