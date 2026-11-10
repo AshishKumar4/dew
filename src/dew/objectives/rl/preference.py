@@ -72,18 +72,20 @@ def pair_numbers(batch, halved: bool = False) -> tuple[jax.Array, int]:
     """Each token's pair among the batch's windows `[R, W]`, from 1, 0 on padding, and the most pairs a
     batch of its shape holds: each window's own pairs (`PAIRS_KEY`, numbered from 1 in the window, its
     tail's finals by their pair's number) after the windows' before it; where `halved`, each odd window
-    the rejected half of the pair the one before it opened (`DPOObjective.windows`, a pair's halves a
-    window each). Numbered from the windows a step reads alone, so rows stacked from several batches or
-    repeated to fill one stay pairs of their own."""
+    the rejected half of the pair the one before it holds the chosen of (`DPOObjective.windows`, a pair's
+    halves a window each), the pair its two windows' own whether or not they hold one. Numbered from the
+    windows a step reads alone, so rows stacked from several batches or repeated to fill one stay pairs of
+    their own."""
     local = jnp.asarray(batch[PAIRS_KEY], jnp.int32)
     rows, width = local.shape
     count = rows * max(width // 2, 1)
     real = local > 0
-    continued = (jnp.arange(rows, dtype=jnp.int32) % 2 if halved else jnp.zeros(rows, jnp.int32))
-    # The pairs a window opens, and the last number before it: its first pair the one before it continues.
-    opened = jnp.max(local, axis=1) - continued
-    base = jnp.cumsum(opened) - opened - continued
-    return jnp.where(real, base[:, None] + local, 0), count
+    if halved:
+        # A pair's two windows its own number, a pair a row as the batch held it.
+        return jnp.where(real, (jnp.arange(rows, dtype=jnp.int32) // 2 + 1)[:, None], 0), count
+    # The pairs a window opens, and the last number before it.
+    opened = jnp.max(local, axis=1)
+    return jnp.where(real, (jnp.cumsum(opened) - opened)[:, None] + local, 0), count
 
 
 def _halves(values: jax.Array, batch, scored: jax.Array, halved: bool) -> tuple[jax.Array, jax.Array,
@@ -120,7 +122,7 @@ class DPOObjective(TokenScorer):
     one less than a half's longest; a window holds two halves' tokens, several
     pairs packed (`dew.data.preferences.windows`), or with `segments=1`, for a
     model that reads one document a row, a pair a row, its halves each a
-    window on an axis of the pair's (`[B, 2, W]`, `PairWindows`), so whatever
+    window on an axis of the pair's (`[B, 2, W]`, `PreferencePair`), so whatever
     deals the rows deals whole pairs. The loss reads both as windows `[R, W]`
     (`windows`) and reduces each pair's halves by its number across them
     (`pair_numbers`), one path. The completion mask says which targets
@@ -181,21 +183,29 @@ class DPOObjective(TokenScorer):
             shape = "batch, 2, W" if self.halved else "batch, W"
             raise ValueError(f"a DPO batch holds windows of packed pairs [{IDS_KEY} shape ({shape}), W past "
                              f"its {self.finals} finals] (dew.data.preferences), got {tuple(ids.shape)}")
-        keys = (IDS_KEY, MASK_KEY, REAL_KEY, PAIRS_KEY, HALVES_KEY, POSITIONS_KEY,
-                *((DOCUMENTS_KEY,) if DOCUMENTS_KEY in batch else ()))
-        for key in keys:
+        # A pair a row holds its halves' ids and marks alone (`PreferencePair`); its pair, halves and places
+        # are its axes'.
+        held = ((IDS_KEY, MASK_KEY, REAL_KEY) if self.halved else
+                (IDS_KEY, MASK_KEY, REAL_KEY, PAIRS_KEY, HALVES_KEY, POSITIONS_KEY,
+                 *((DOCUMENTS_KEY,) if DOCUMENTS_KEY in batch else ())))
+        for key in held:
             if jnp.shape(batch[key]) != ids.shape:
                 raise ValueError(f"{key} has shape {tuple(jnp.shape(batch[key]))} for {tuple(ids.shape)} "
                                  f"{IDS_KEY}; a window's fields hold one entry a token")
         if not self.halved:
             return batch
         rows = ids.shape[0]
-        laid = {key: jnp.reshape(jnp.asarray(batch[key]), (2 * rows, -1)) for key in keys}
+        real = jnp.asarray(batch[REAL_KEY]) > 0
+        axes = {PAIRS_KEY: real.astype(jnp.int32),
+                HALVES_KEY: jnp.where(real, jnp.arange(1, 3, dtype=jnp.int32)[None, :, None], 0),
+                POSITIONS_KEY: jnp.where(real, jnp.arange(ids.shape[-1], dtype=jnp.int32), 0)}
+        laid = {key: jnp.reshape(value, (2 * rows, -1))
+                for key, value in {**{key: jnp.asarray(batch[key]) for key in held}, **axes}.items()}
         if VALID_ROWS in batch:
             laid[VALID_ROWS] = jnp.repeat(jnp.asarray(batch[VALID_ROWS]).reshape(rows), 2)
         return {**batch, **laid}
 
-    traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "beta")
+    traced = ("seq_len", "segments", "pairs", "balance", "head_chunks", "head_tile", "head_fused", "beta")
     """Its window, balance, head policy and its beta; its reference is the step's EMA, an argument."""
 
     def loss(self, variables, batch, step):

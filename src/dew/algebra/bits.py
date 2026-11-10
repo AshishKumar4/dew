@@ -309,10 +309,11 @@ class BitForm:
 
     @property
     def depth(self) -> int:
-        """Its dependent instructions' longest chain."""
+        """Its dependent instructions' longest chain. An instruction of no operand (a constant, `IADD3` of
+        its immediate alone) starts one."""
         depths = [0]
         for step in self.steps:
-            depths.append(1 + max(depths[arg] for arg in step.args))
+            depths.append(1 + max((depths[arg] for arg in step.args), default=0))
         return max(depths[index] for index in self.outputs)
 
     def traced(self, words: jax.Array) -> tuple[jax.Array, ...]:

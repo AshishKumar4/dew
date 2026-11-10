@@ -104,6 +104,20 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
 
 
 
+def with_bodies(params: Mapping, rebuilt: Callable[[jcore.Jaxpr], jcore.Jaxpr]) -> dict:
+    """`params` with each program within them (`bodies`' finder's: a parameter that is a program, or a tuple
+    holding them, a branch's) replaced by `rebuilt(program)`, every other parameter as it is: what a
+    program's equation retraced at other shapes binds."""
+    def replaced(value):
+        if isinstance(value, jcore.Jaxpr):
+            return rebuilt(value)
+        if isinstance(value, tuple) and any(isinstance(each, jcore.Jaxpr) for each in value):
+            return tuple(rebuilt(each) if isinstance(each, jcore.Jaxpr) else each for each in value)
+        return value
+
+    return {key: replaced(value) for key, value in params.items()}
+
+
 def equations(jaxpr: jcore.Jaxpr) -> Iterator[jcore.JaxprEqn]:
     """Every equation of `jaxpr` and of every program within it, at any depth (`jax.extend.core.subjaxprs`):
     a call's, a loop's, a branch's, a custom derivative's, a kernel's."""
@@ -210,6 +224,22 @@ def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
             len(equation.invars), len(equation.outvars)):
         return found[0]
     return None
+
+
+PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call", "custom_vmap_call",
+                      "marked_call"}
+"""The calls (`CALLS`) that run a program on their operands and do nothing else, which a reader may run in
+their caller (`purely_called`): an optax helper's `jit` over a whole tree, `jnp.einsum`'s. A checkpoint's, a
+custom derivative's and a custom batching rule's call do more than their program, a rule of their own, and a
+marked span is a boundary the algebra pass reads (`dew.nn.derivatives.marked`: a protected span's inside no
+rule touches), so each stays a call."""
+
+
+def purely_called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
+    """The program `equation` runs (`called`) where its call does nothing else (`PURE_CALLS`), else None:
+    what a reader that runs a call in its caller reads (staging's `flattened`, the pairwise sums'
+    `dew.nn.precision._paired`). A call that does more keeps its rule only as a call."""
+    return called(equation) if equation.primitive.name in PURE_CALLS else None
 
 
 def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | None:

@@ -237,16 +237,19 @@ def _groups_blocked(rows: jax.Array, cotangent: jax.Array, group_sizes: jax.Arra
     partial sums at a time, so the steps are the largest group's blocks and the sums held a level of the tree
     each (a group of no rows zero). The steps walk to the most blocks any group may hold, a static count
     reverse mode differentiates, each past the largest group's blocks skipped (`lax.cond`): adding a zero
-    block to the counter changes no sum."""
+    block to the counter changes no sum. Of no rows at all, every group's contraction is the empty sum, zero,
+    as XLA's own empty product is, and there is no row to gather."""
+    total, depth, width = rows.shape[0], rows.shape[1], cotangent.shape[1]
+    groups = group_sizes.shape[0]
+    if total == 0:
+        return jnp.zeros((groups, depth, width), jnp.float32)
     # Each group's rows gathered from the whole rows: a gather along a dimension a mesh's Explicit axis splits
     # takes no placement JAX infers, so the rows are first made whole on the device (`_whole_rows`).
     rows, cotangent = _whole_rows(rows), _whole_rows(cotangent)
-    total, depth, width = rows.shape[0], rows.shape[1], cotangent.shape[1]
-    groups = group_sizes.shape[0]
     block = contraction_block(total)
     starts = jnp.cumsum(group_sizes) - group_sizes
     steps = (jnp.max(group_sizes, initial=0) + block - 1) // block
-    most = max(1, -(-total // block))
+    most = -(-total // block)
     levels = most.bit_length()
     offsets = jnp.arange(block)
 

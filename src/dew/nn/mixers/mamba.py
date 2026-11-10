@@ -45,7 +45,7 @@ from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.kernels import recurrence_algebra, recurrence_chunk
-from dew.nn.linear import DepthwiseConv1d, fork_cache, fork_start, forked_conv, forked_scan, held_scan
+from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
@@ -236,18 +236,8 @@ class Mamba(nn.Module):
         # casts them, or in the model's own dtype where it is wider.
         wide = at_least_fp32(mixed.dtype)
         taps, bias = self.conv1d()
-        if tokens.forks is not None:
-            def forked_rule(convolved, *, valid, starts, state, entered):
-                return self._scan(convolved, starts=starts, valid=valid, held=state, entered=entered)
-
-            history, held = fork_cache(self, 'ssm_state') if decode else (None, None)
-            convolved = forked_conv(mixed, taps, tokens, history=history, bias=bias, dtype=wide)
-            out = forked_scan(convolved, forked_rule, tokens,
-                              fork_start(held, (batch, self.intermediate_size, self.state_size), wide))
-        else:
-            out = held_scan(self, mixed, taps, bias, self._scan,
-                            (self.intermediate_size, self.state_size),
-                            decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
+        out = held_scan(self, mixed, taps, bias, self._scan, (self.intermediate_size, self.state_size),
+                        decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide, dtype=wide)
         if out is None:
             # Allocation only: init_cache's dummy token must not consume a
             # position or leave state behind.

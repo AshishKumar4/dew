@@ -11,8 +11,9 @@ one process (`gpu_flow`), each cell its own file's property:
 - A ring streams tiles of their own trip counts, consumers feeding their own ring split a step, and every
   read path of a warpgroup accumulator lands its products under a sign op on them (row 4346), on an H100
   (test_mosaic_toolkit).
-- The shared GEMM mainloop runs on Blackwell's tcgen05, exactly, on a B200 or a B300, sm100 and sm103 alike
-  (test_gemm_tcgen05).
+- The shared GEMM mainloop runs on Blackwell's tcgen05, exactly, on a B200 or a B300, sm100 and sm103 alike,
+  and its epilogues (a column bias, a per-row scale, two outputs of two dtypes) hold check 1 at each
+  accumulator width and on a two-CTA pair (test_gemm_tcgen05).
 - The NVFP4 product's packed kernel (its mainloop decoding each stage in place) holds every order on an
   H100 and an A100 (test_contracts_gemm).
 - A grouped product whose producer gathers its rows from the tokens by a table (cp.async, row 1376) holds
@@ -175,6 +176,10 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
         Cell("the shared GEMM mainloop runs on Blackwell's tcgen05",
              gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100"),
+        *(Cell(f"tcgen05's epilogues hold check 1: {case} at {tiles.family} {tiles.block_n}x{tiles.stages}",
+               functools.partial(gemm_tcgen05.tcgen05s_epilogues_hold_check_1_on_blackwell, case, tiles),
+               "sm100")
+          for tiles in (*gemm_tcgen05.TILES, gemm_tcgen05.PAIRED) for case in gemm_tcgen05.EPILOGUES),
         *(Cell(f"the NVFP4 product's packed kernel holds every order: {name} {edge}",
                functools.partial(contracts_gemm.test_an_nvfp4_products_kernels_hold_every_order, edge,
                                  "packed"), name)

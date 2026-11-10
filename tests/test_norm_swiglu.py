@@ -215,15 +215,9 @@ def test_a_wide_rows_norm_walks_its_columns_and_holds_the_float64_gate(dtype, st
     `WIDE_COLUMNS` the last a partial one, 25 rows over three programs of the reverse (each walking several
     row blocks into its partial row), normed by the fused kernels interpreted on a CPU: the mean square
     summed a step at a time, the input's cotangent from the whole row's reduction, the weight's partial
-    sums each program's row in memory; with a residual stream too. The selector takes the call where the
-    kernel is chosen (a cell no receipt declares yet); its output and every gradient on par with XLA's
-    (check 1)."""
-    with generation.assumed("sm90"):
-        # A cell of its own, which no receipt declares yet: XLA's by default, the kernel's where chosen.
-        wide = (jnp.ones((25, 9000), dtype), jnp.ones((9000,)), dtype)
-        assert norm_swiglu.rms_kernel("auto", *wide, fp32_statistics=True) == "xla"
-        with generation.chosen(rms_norm="pallas"):
-            assert norm_swiglu.rms_kernel("auto", *wide, fp32_statistics=True) == "pallas"
+    sums each program's row in memory; with a residual stream too. The fused seam called itself
+    (`fused_seam`), whatever route the selector derives for the cell: its output and every gradient on par
+    with XLA's (check 1)."""
     seam = fused_seam(1e-5, dtype, offset=False, after_cast=False)
 
     def xla(output_dtype, x, branch, scale):
@@ -302,6 +296,22 @@ def test_a_norms_activation_reading_its_width_divides_by_the_rows_not_a_padded_t
     tile divides (9 columns, a 16-wide tile): its output and its input's and weight's gradients on par with
     XLA's (check 1), which reads the row's 9 columns, as the kernel reads the activation's graph traced at
     the call's shape, where a tile's 16 put every output off by 9/16."""
+    fused, plain = _fused_norm(activation)
+    compare((functools.partial(plain, jnp.float32), fused, functools.partial(plain, jnp.float64)),
+            lambda draw: norm_operands((2, 3, 9), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),
+            SEEDS[(2, 3, 31)])
+
+
+@pytest.mark.parametrize("taken", [True, False])
+def test_a_norms_activation_choosing_a_branch_runs_on_the_tile(taken):
+    """An activation choosing between two elementwise branches by a scalar it closes over (`lax.cond`, whose
+    branch programs JAX keeps in a tuple), interpreted on a CPU at a width no tile divides: the kernel takes
+    it (`norm_swiglu.elementwise`) and runs each branch's program on its tile, its output and gradients on
+    par with XLA's (check 1), where the branches kept the call's shape and failed on the tile."""
+    def activation(y):
+        return jax.lax.cond(jnp.asarray(taken), lambda v: v * 2, lambda v: v + 1, y)
+
+    assert norm_swiglu.elementwise(activation, (2, 3, 9))
     fused, plain = _fused_norm(activation)
     compare((functools.partial(plain, jnp.float32), fused, functools.partial(plain, jnp.float64)),
             lambda draw: norm_operands((2, 3, 9), jnp.float32, jnp.float32, draw), ("y", "x", "weight"),

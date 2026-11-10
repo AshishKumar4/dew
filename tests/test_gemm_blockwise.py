@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
 @pytest.mark.parametrize("groups", ["1", "4"])
@@ -35,6 +36,25 @@ def test_a_blockwise_fp8_product_through_the_template_is_on_par(columns, groups)
                         lambda seed: blockwise_matrix._operands(case, seed), f"blockwise {columns} {groups}",
                         seeds=blockwise_matrix.SEEDS, truth_fn=blockwise_matrix.truth(sizes))
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+
+
+def test_a_blockwise_fp8_products_launch_reads_its_pin():
+    """The blockwise FP8 product through the template named on an H100 launches through its launch
+    (`grouped_matmul.MosaicStepScaledGmm`, `tuning.KernelOp.__call__`): a pin of its kind is read, one it
+    cannot take refused by name (`tuning.Unpinnable`: an mma.sync tile, which no FP8 product of an H100
+    takes), where the product called its mainloop beside the launch and ignored the pin."""
+    case = {"columns": "128", "groups": "1"}
+    sizes = blockwise_matrix._sizes(1)
+    operands = blockwise_matrix._operands(case, 0)
+    untakeable = mosaic_gpu.Tiles(128, 128, 128, 2, 1, family='mma.sync')
+
+    def product(*operands):
+        return gemm.blockwise_fp8_product(*operands[:2], sizes, *operands[2:], out_dtype=jnp.float32,
+                                          interpret_on_cpu=True)
+
+    with (generation.assumed("sm90"), generation.chosen(blockwise_fp8="mosaic"),
+          tuning.pinned({grouped_matmul.MosaicStepScaledGmm: untakeable}), pytest.raises(tuning.Unpinnable)):
+        jax.eval_shape(product, *operands)
 
 
 def test_a_blockwise_fp8_kernel_gradient_through_the_template_is_on_par():

@@ -618,6 +618,18 @@ def test_a_call_of_no_rows_gives_its_empty_value():
         y = expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
     assert y.shape == (0, 16)
 
+
+def test_a_kernel_gradient_of_no_rows_on_a_hopper_is_its_groups_zeros():
+    """A kernel gradient contracting no rows on an H100 (a step whose experts received no tokens): its
+    selection derives no split of an empty contraction (`mosaic_gpu.split_count`, which took the least of
+    no counts) and the gradient is its group's zero block."""
+    lhs, rhs = jnp.ones((0, 128), jnp.bfloat16), jnp.ones((0, 128), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        gradient = jax.jit(lambda lhs, rhs: gemm.gemm_t(lhs, rhs, jnp.zeros((1,), jnp.int32),
+                                                        out_dtype=jnp.bfloat16))(lhs, rhs)
+    np.testing.assert_array_equal(np.asarray(gradient, np.float32), np.zeros((1, 128, 128), np.float32))
+
+
 def test_a_mig_slice_keeps_its_generations_tensor_rate():
     """A SKU's catalogued peak lowers its generation's rate where its multiprocessors and clock would
     exceed it (a GeForce part's half-rate accumulation) and never raises it: an A100, whose catalogue
