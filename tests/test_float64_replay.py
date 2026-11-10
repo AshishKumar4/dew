@@ -177,13 +177,17 @@ def test_what_a_programs_results_do_not_read_is_not_replayed():
     np.testing.assert_array_equal(rows.view(np.uint64), summed.view(np.uint64))
 
 
+def decomposed(x):
+    """A decomposition's first row: no operation whose arithmetic JAX states entry by entry."""
+    return jnp.linalg.cholesky(jnp.diag(x))[0]
+
+
 REFUSED = {
-    # A decomposition: no operation whose arithmetic JAX states entry by entry.
-    "float": lambda x: jnp.linalg.cholesky(jnp.diag(x)),
+    "float": decomposed,
     "complex": lambda x: jnp.cos(x.astype(jnp.complex64)).real,
     # A call whose integer boundary hides float arithmetic inside.
     "hidden": lambda x: jax.lax.while_loop(lambda carry: carry[0] < 2, lambda carry: (
-        carry[0] + 1, carry[1] + jnp.tan(x).astype(jnp.int32)), (0, x.astype(jnp.int32)))[1],
+        carry[0] + 1, carry[1] + decomposed(x).astype(jnp.int32)), (0, x.astype(jnp.int32)))[1],
 }
 
 
