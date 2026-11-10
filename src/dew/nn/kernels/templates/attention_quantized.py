@@ -65,13 +65,18 @@ BOUND = 127.5
 """Qwix's symmetric bound of int8 (`qwix/_src/core/numerics.py`'s `get_symmetric_bound`): an operand's
 scale is its channel's largest over it, so its codes round to [-128, 127]."""
 
+PER_BOUND = 1 / BOUND
+"""The bound's reciprocal, rounded to float32 where it scales: XLA computes Qwix's division of a scale by the
+bound as the product with it (rows 1402, 1403), so a scale, and the codes it rounds to, are Qwix's written as
+that product."""
+
 
 def codes(x: jax.Array, axis: int) -> tuple[jax.Array, jax.Array]:
     """`x`'s int8 codes in its own dtype, which holds them exactly, and their fp32 scales, by the largest
     magnitude along `axis` (kept), as Qwix's absmax calibration takes an operand's channels; a channel of
     nothing but zeros (below fp32's smallest normal's root) at scale 1, as Qwix's."""
     wide = x.astype(jnp.float32)
-    scale = jnp.max(jnp.abs(wide), axis=axis, keepdims=True) / BOUND
+    scale = jnp.max(jnp.abs(wide), axis=axis, keepdims=True) * PER_BOUND
     scale = jnp.where(scale < jnp.sqrt(jnp.finfo(jnp.float32).tiny), 1.0, scale)
     return jnp.clip(jnp.round(wide / scale), -128, 127).astype(x.dtype), scale
 
@@ -102,7 +107,7 @@ def _operands(query: jax.Array, key: jax.Array, value: jax.Array) -> tuple:
     key_codes, key_scale = codes(key, -1)
     value_codes, value_scale = codes(value, 1)
     by_head = jnp.repeat(jnp.swapaxes(key_scale[..., 0], 1, 2), group, axis=1)
-    columns = jnp.repeat(value_scale, group, axis=2) / BOUND
+    columns = jnp.repeat(value_scale, group, axis=2) * PER_BOUND
     return (query_codes, key_codes, value_codes, jnp.swapaxes(query_scale[..., 0], 1, 2), by_head, columns)
 
 

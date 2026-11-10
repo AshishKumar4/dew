@@ -1053,6 +1053,9 @@ def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tu
 
 
 LOG2E = 1.4426950408889634
+LN2 = math.log(2)
+"""ln 2, log2(e)'s reciprocal: a base-2 quantity taken to natural units is multiplied by it, one rounding (a
+division by LOG2E is folded into a product with its rounded reciprocal, the same float32 constant)."""
 """log2(e): a natural exponent times it is a base-2 one."""
 
 

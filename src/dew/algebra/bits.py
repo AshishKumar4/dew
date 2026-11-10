@@ -19,6 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.precision import correctly_rounded_divide
+
 WORD = 32
 """A register's bits: every value a form computes is one 32-bit register."""
 
@@ -838,9 +840,10 @@ def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     magnitude = jnp.abs(x)
     largest = jnp.max(magnitude)
     least_normal = np.float32(np.finfo(np.float32).tiny)
-    tensor = jnp.where(largest > 0, jnp.maximum(largest / np.float32(6 * 448), least_normal), np.float32(1))
+    tensor = jnp.where(largest > 0, jnp.maximum(correctly_rounded_divide(largest, np.float32(6 * 448)),
+                                                least_normal), np.float32(1))
     blocks = jnp.max(magnitude.reshape(-1, 16, x.shape[-1]), axis=1)
-    ratio = blocks / tensor / np.float32(6)
+    ratio = correctly_rounded_divide(blocks / tensor, np.float32(6))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 
     def value(codes: jax.Array) -> jax.Array:

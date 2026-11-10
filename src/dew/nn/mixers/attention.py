@@ -70,7 +70,7 @@ from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
+from dew.nn.precision import at_least_fp32, divided, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
@@ -330,7 +330,7 @@ GATE_ACTIVATIONS = {
     'sigmoid': jax.nn.sigmoid,
     'silu': jax.nn.silu,
     # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
-    'softplus2': lambda gate: jax.nn.softplus(gate * math.log(2)) / math.log(2),
+    'softplus2': lambda gate: divided(jax.nn.softplus(gate * math.log(2)), math.log(2)),
     # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
     # product casts back (modeling_laguna.py:410).
     'softplus': lambda gate: jax.nn.softplus(gate.astype(at_least_fp32(gate.dtype))),
