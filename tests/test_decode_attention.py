@@ -783,7 +783,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
                          page_size=page_size, quantized=None, groups=1, head_shards=1, softcap=None,
                          arithmetic=False, named="auto", rows=query.shape[0], queries=1,
                          keys=table.shape[1] * page_size, windowed=windowed)
-        assert PAGED.kernel("triton").failed(case) == []
+        assert PAGED.kernel("triton").refused(case) is None
     config = decode_attention.Split(splits)
 
     def attend(query, key_pages, value_pages):

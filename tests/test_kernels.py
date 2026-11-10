@@ -1100,24 +1100,23 @@ def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_s
 def a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, call,
                                                                       without_deterministic_ops):
     """Each GPU kernel's declared requirements (`attention_kernels.ATTENTION`) hold against the kernel
-    itself on this GPU: a call whose capability requirements all hold runs forced on that kernel to a
-    finite output, and one that fails a capability raises `KernelRefused` naming it; measured
-    requirements, which a forced kernel overrides, never stop it."""
+    itself on this GPU: a call whose first refusal is no capability's runs forced on that kernel to a
+    finite output, and one whose first is raises `KernelRefused` naming it; measured requirements, which
+    a forced kernel overrides, never stop it."""
     from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION
     from dew.nn.kernels.selection import KernelRefused
 
     operands, arguments = eligibility_call(**call)
     case = attention_case(operands[0], operands[1], **arguments)
-    failed = [requirement for requirement in ATTENTION.kernel(kernel).failed(case, forced=True)
-              if requirement.kind == 'capability']
+    refused = ATTENTION.kernel(kernel).refused(case, forced=True)
 
     def run():
         out = jax.jit(lambda *operands: scaled_dot_product_attention(
             *operands, implementation=kernel, **arguments))(*operands)
         return np.asarray(out, np.float32)
 
-    if failed:
+    if refused is not None and refused.kind == 'capability':
         with pytest.raises(KernelRefused):
             run()
     else:

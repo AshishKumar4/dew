@@ -11,8 +11,9 @@ one mechanism under both:
   `dew.nn.attention.scaled_dot_product_attention(..., implementation="cudnn")`): that call's own kernel,
   which a block's choice for its op overrides.
 
-A kernel named for a call it does not take raises `KernelRefused`, a `ValueError` listing every
-requirement the call fails, rather than running another kernel in silence. `choices` are the ops a block
+A kernel named for a call it does not take raises `KernelRefused`, a `ValueError` naming the first
+requirement the call fails (and every one it fails, `KernelRefused.refusals`), rather than running another
+kernel in silence. `choices` are the ops a block
 names; `dew.gpu_facts()` tells what the device issues.
 """
 

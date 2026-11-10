@@ -804,7 +804,7 @@ class KVStore:
                          pool=pool.dtype, page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=1, softcap=softcap, arithmetic=False,
                          named='auto', rows=query.shape[0], queries=query.shape[1], keys=self._slots())
-        return not next(kernel for kernel in PAGED.kernels if kernel.name == 'template').failed(case)
+        return PAGED.kernel('template').refused(case) is None
 
     def attend_rows(self, query: jax.Array, spans, sources: jax.Array, softcap: float | None,
                     sinks: jax.Array | None = None) -> jax.Array:
