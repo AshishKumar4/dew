@@ -824,6 +824,48 @@ def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their
     assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
 
 
+def test_a_tier_cut_group_is_admitted_on_its_files_whole_measure_and_no_need_is_cut_to_the_lane(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A group the tier cut by its own seconds (DEW_SPLIT_DURATIONS) holds tests another cut's group of
+    that name did not, so its admission reads the file's whole measured run, which holds any group of it,
+    never the group's own record (2026-11-10: a recurrence file's group 1/3, measured when it held forward
+    and decode alone at 0.29 GiB, was given a 1.36 GiB pool when it held port training too, which asked
+    1.52 GiB). And a file whose measured need passes the lane's share is given the whole share and said to
+    be, never cut to it without a word (the same day: a 5.9 GiB need cut to a 4 GiB lane)."""
+    url, stored, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    (tmp_path / "tests/test_long.py").write_text(LANE_TEST.replace("def test_runs", "def test_a") + "\n"
+                                                  + LANE_TEST.replace("def test_runs", "def test_b"))
+    weights = tmp_path / "gpu-seconds.json"
+    weights.write_text(json.dumps({"tests/test_long.py::test_a": 30.0, "tests/test_long.py::test_b": 30.0}))
+    monkeypatch.setenv("DEW_SPLIT_DURATIONS", str(weights))
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    gib, total = 2 ** 30, 81920 * 2 ** 20
+    common = ci.lane_inputs("3.12")
+
+    def measured(row_name: str, peak: int) -> None:
+        for inputs in (None, common):
+            at = "/" + ci.record_key("3.12", row_name, ci.device_class(), inputs)
+            stored[at] = json.dumps({"key": None, "depends": ["tests/test_long.py"], "row": {}, "reads": [],
+                                     "peak": peak, "shares": 0, "pools": 0}).encode()
+
+    # Its group 1/2 measured small under an earlier cut; the whole file at 8 GiB.
+    measured("3.12:tests/test_long.py#1/2", gib // 4)
+    measured("3.12:tests/test_long.py", 8 * gib)
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="on", processes=1, deadline=600.0) == 0
+    [[share, *_]] = lane_runs(tmp_path, "test_long")[:1]
+    assert float(share) * total == 8 * gib * 1.25 + gib, "the file's whole measure, not the group's"
+    # Measured past the lane's 40 GiB: given all 40, its row saying its need was more.
+    measured("3.12:tests/test_long.py", 48 * gib)
+    assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="on", processes=1, deadline=600.0) == 0
+    [row] = json.loads(out.read_text())["rows"]
+    share = lane_runs(tmp_path, "test_long")[-1][0]
+    assert float(share) == 0.5
+    assert "admitted at 40.0 GiB, below its measured need of 61.0 GiB" in row["output"]
+
+
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
     """`coverage items` runs the floor's tasks with the test cache off, each writing its data among
     its artifacts; `coverage report` combines them, so a branch one task took and its other branch
