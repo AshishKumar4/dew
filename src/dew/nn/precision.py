@@ -20,11 +20,11 @@ block's products one FMA chain, the blocks' sums added as a pairwise tree (`dew.
 `accumulated`), where XLA:CPU's one chain an output grew its error with the contraction (row 4863). The
 block is the longest whose rounding path is no longer than a vectorized dot's on the host, read from
 its float32 vector lanes (16 with AVX-512, 8 with AVX or AVX2 or an x86 CPU stating no flags, 4
-otherwise), so a product's bits are the host's vector width's, as a BLAS dot's are; every row of a call
-sums alike, whatever rows share it. A precision that narrows the operands (TF32, bf16 parts) or widens
-them (F64), a quantized module's product and a library's product that states its own derivative keep
-XLA's sum; a GPU's and a TPU's products are their backend's. Dew's test processes run wide CPU
-arithmetic instead (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py sets): a CPU sums those
+otherwise), so a product's bits are the host's, as a BLAS dot's are, and the program's (`dew.nn.pairwise`:
+two programs summing one row agree by check 1, testing.md's row 3177). A precision that narrows the operands
+(TF32, bf16 parts) or widens them (F64), a quantized module's product and a library's product that states its
+own derivative keep XLA's sum; a GPU's and a TPU's products are their backend's. Dew's test processes run wide
+CPU arithmetic instead (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py sets): a CPU sums those
 products in float64 and rounds once, outside a scope stating `FP32_SUMS`, which sums them as every
 process's CPU does.
 Convolutions, depthwise ones included, keep XLA's fp32 sum on a CPU: no convolution's check 1
