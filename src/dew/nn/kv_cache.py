@@ -40,6 +40,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import scipy.linalg
 from flax import linen as nn, struct
 from jax.sharding import PartitionSpec as P
@@ -218,19 +219,26 @@ def quantize(values: jax.Array, dtype: KVDtype) -> tuple[jax.Array, jax.Array]:
     values themselves, zeros, and it dequantizes to them: a subnormal scale
     divides to codes no dequantize recovers, or flushes to zero where the
     device flushes subnormals.
+
+    The format's scale is a float32 and its codes round a float32 quotient: each computed at the values'
+    width (float32 for 16-bit ones, a float64 model's in float64) and rounded to float32 as the format
+    states, a float32 run's own quotient bit for bit.
     """
-    wide = values.astype(jnp.float32)
+    wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     amax = jnp.max(jnp.abs(wide), axis=-1)
-    scaled_amax = amax / _LIMITS[dtype]
+    scaled_amax = (amax / _LIMITS[dtype]).astype(jnp.float32)
     scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, 1.0)
-    scaled = wide / scale[..., None]
+    scaled = (wide / scale[..., None]).astype(jnp.float32)
     if dtype == "int8":
         return jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8), scale
     return scaled.astype(jnp.dtype(dtype)), scale
 
 
 def dequantize(stored: jax.Array, scale: jax.Array, dtype: jnp.dtype) -> jax.Array:
-    return (stored.astype(jnp.float32) * scale[..., None]).astype(dtype)
+    """`stored` codes times their `scale`, in `dtype`: their product in float32, a float64 reader's in
+    float64, where a code times its scale is exact."""
+    wide = jnp.promote_types(dtype, jnp.float32)
+    return (stored.astype(wide) * scale[..., None].astype(wide)).astype(dtype)
 
 
 def value_bound(stored: jax.Array, scale: jax.Array | None) -> jax.Array:
@@ -242,17 +250,19 @@ def value_bound(stored: jax.Array, scale: jax.Array | None) -> jax.Array:
 
 
 def hadamard(size: int) -> jax.Array:
-    """Sylvester's Hadamard matrix of order `size`, scaled to be orthonormal and symmetric."""
+    """Sylvester's Hadamard matrix of order `size`, scaled to be orthonormal and symmetric: a float32
+    constant formed on the host, each entry ±1 over float32's sqrt(size), as XLA's float32 quotient is."""
     if size < 1 or size & (size - 1):
         raise ValueError(f"an int8 KV cache rotates keys by a Hadamard matrix, which needs a "
                          f"power-of-two head_dim; got {size}. quantized='float8_e4m3fn' takes any width")
-    return jnp.asarray(scipy.linalg.hadamard(size), jnp.float32) / math.sqrt(size)
+    return jnp.asarray(scipy.linalg.hadamard(size).astype(np.float32) / np.float32(math.sqrt(size)))
 
 
 def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
-    """`values` `[..., head_dim]` times the rotation, computed in float32, in `values`' dtype."""
-    product = float32_einsum("...d,de->...e", values.astype(jnp.float32), rotation,
-                             precision=jax.lax.Precision.HIGHEST)
+    """`values` `[..., head_dim]` times the rotation, computed in float32 (a float64 value's in float64), in
+    `values`' dtype."""
+    product = float32_einsum("...d,de->...e", values.astype(jnp.promote_types(values.dtype, jnp.float32)),
+                             rotation, precision=jax.lax.Precision.HIGHEST)
     return product.astype(values.dtype)
 
 

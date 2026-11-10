@@ -404,7 +404,10 @@ def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpret
     """An int8 or FP8 cache (`KVCache.quantized`), paged or dense, decoded on an H100 by the attention
     template's decode (`PAGED`'s template kernel), its codes read as they lie and dequantized in the walk by
     their scales (`template_quantized`, ledger 3624): on par with the reference path over the keys and
-    values the cache dequantizes to, an int8 cache's keys and the query in its rotation (check 1)."""
+    values the cache dequantizes to, an int8 cache's keys and the query in its rotation (check 1). The codes
+    and scales the cache writes are drawn beside its keys and values, the format's own (`quantize`, of the
+    rotated keys where it rotates them): the truth reads them as they lie, each value its code times its
+    scale."""
     from dew.nn.kernels.templates import attention as template
     from dew.nn.kv_cache import dequantize, quantize, rotated
 
@@ -415,7 +418,7 @@ def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpret
     positions = jnp.broadcast_to(jnp.arange(capacity), (rows, capacity))
     rotation = layout.key_rotation(width)
 
-    def ours(key, value, query):
+    def ours(key, value, query, *_):
         with generation.assumed("sm90"):
             cache = decoder.init(jax.random.key(0), key, value, positions, query, lengths)["cache"]
             # The query in the keys' rotation, as the layer takes it into the store's (`KVStore.rotation`).
@@ -423,15 +426,21 @@ def test_a_quantized_pools_decode_reads_its_codes_through_the_template_interpret
             return decoder.apply({"cache": cache}, key, value, positions, turned, lengths,
                                  mutable=["cache"])[0]
 
-    def reference(key, value, query):
+    def reference(key, value, query, k_codes, k_scale, v_codes, v_scale):
+        del key, value
         if rotation is not None:
-            key, query = rotated(key, rotation), rotated(query, rotation)
-        key, value = (dequantize(*quantize(array, stored), query.dtype) for array in (key, value))
+            query = rotated(query, rotation)
         spans = template.spans(1, capacity, rows, lengths=lengths)
-        return template.reference(query[:, None], key, value, spans)[:, 0]
+        return template.reference(query[:, None], dequantize(k_codes, k_scale, query.dtype),
+                                  dequantize(v_codes, v_scale, query.dtype), spans)[:, 0]
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), _decode_drawn(rows, capacity, kv_heads, width),
-                    f"{stored} {page} cache's template decode", seeds=8)
+    def draw(seed: int):
+        key, value, query = _decode_drawn(rows, capacity, kv_heads, width)(seed)
+        stored_keys = key if rotation is None else rotated(key, rotation)
+        return key, value, query, *quantize(stored_keys, stored), *quantize(value, stored)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"{stored} {page} cache's template decode",
+                    seeds=8)
 
 @pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
 def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):
