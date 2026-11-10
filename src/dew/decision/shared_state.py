@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.batch import Forks
+from dew.data.forked_rows import over_prefix
 from dew.decision.layout import (
     HOWS,
     AnswerCue,
@@ -98,18 +99,27 @@ def merged(rows: Sequence[Encoded], *, chained: bool = False, streamed: bool = F
         alone = (0,) * len(row.tokens)
         return dataclasses.replace(row, positions=tuple(range(len(row.tokens))),
                                    forked=(1,) * len(row.tokens), forked_parents=alone if chained else None)
-    tokens, positions, documents = list(rows[0].tokens[:shared]), list(range(shared)), [1] * shared
+    # The physical layout over the shared prefix (`over_prefix`): its tokens once, then each row's own,
+    # each token at its row's position; the prefix document 1 and each row's documents 2 on.
+    tokens: list[int] = []
+    positions: list[int] = []
+    documents: list[int] = []
     questions = []
-    for document, row in enumerate(rows, start=2):
-        moved = len(tokens) - shared
-        [laid] = row.questions
-        questions.append(dataclasses.replace(
-            laid, span=(laid.span[0] + moved, laid.span[1] + moved),
-            options=tuple((start + moved, end + moved) for start, end in laid.options),
-            readout=None if laid.readout is None else laid.readout + moved))
-        tokens += row.tokens[shared:]
-        positions += range(shared, len(row.tokens))
-        documents += [document] * (len(row.tokens) - shared)
+    for member, begin, end, parent in over_prefix(shared, [len(row.tokens) for row in rows]):
+        row = rows[member]
+        if shared and not parent:
+            document = 1
+        else:
+            moved = len(tokens) - shared
+            [laid] = row.questions
+            questions.append(dataclasses.replace(
+                laid, span=(laid.span[0] + moved, laid.span[1] + moved),
+                options=tuple((start + moved, end + moved) for start, end in laid.options),
+                readout=None if laid.readout is None else laid.readout + moved))
+            document = member + 2
+        tokens += row.tokens[begin:end]
+        positions += range(begin, end)
+        documents += [document] * (end - begin)
     first = rows[0]
     row = Encoded(tuple(tokens), tuple(questions), tuple(positions), None, first.state_tokens,
                   first.state_kept, instructions_cut=sum(row.instructions_cut for row in rows),
