@@ -210,11 +210,16 @@ def test_a_sites_map_tasks_are_cut_by_their_setup_and_draws_apart_never_task_sec
     def task(span: tuple[int, int]) -> str:
         return ci.site_task("3.12", "tests/test_site.py", "test_site", span)
 
+    def maps(measured: dict[str, float]) -> list[tuple[str, float]]:
+        return [(entry["split"], entry["weight"]) for entry in ci.plan(256.0, {"rows": measured})
+                if entry["python"] == "3.12" and ".draws-" in entry["split"]]
+
     # 480 s of setup and 5 s a draw: 500 s for 4 draws, 520 s for 8.
-    measured = {task((0, 4)): 500.0, task((4, 12)): 520.0}
-    assert [(entry["split"], entry["weight"]) for entry in ci.plan(256.0, {"rows": measured})
-            if entry["python"] == "3.12" and ".draws-" in entry["split"]] == [
+    assert maps({task((0, 4)): 500.0, task((4, 12)): 520.0}) == [
         ("test_site.draws-0-4", 500.0), ("test_site.draws-4-12", 520.0), ("test_site.draws-12-20", 520.0)]
+    # 480 s of setup and 60 s a draw: draws alone would fill the target at 4, but each task pays its setup.
+    assert maps({task((0, 4)): 720.0, task((4, 12)): 960.0}) == [
+        ("test_site.draws-0-4", 720.0), ("test_site.draws-4-12", 960.0), ("test_site.draws-12-20", 960.0)]
 
 
 def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
