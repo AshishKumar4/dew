@@ -623,15 +623,40 @@ def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus
             ("grouped_matmul", "mosaic")} <= kernels, kernels
 
 
-@pytest.mark.parametrize("implementation", ["auto", "template", "triton"])
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_tokamaxs_triton_attention_compiles_ahead_for_a_gpu_with_none_attached(generation):
+    """tokamax's Triton attention, named, its forward and gradient traced for a compile-only GPU of
+    `generation` on this host, which has no GPU attached: lowered and compiled as the GPU runs it, its route
+    the kernel itself, not XLA's attention in its place; tokamax's check of the device a kernel runs on is
+    the assumed GPU's (`generation.assumed`), where it read this host's ("Not supported on cpu")."""
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels.generation import assumed, routes
+    from dew.training.ahead import compile_only_gpus
+
+    mesh = jax.sharding.Mesh(np.asarray(compile_only_gpus(generation, 1)), ("devices",))
+    placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    shapes = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=placed)
+              for shape in ((2, 256, 4, 64), (2, 256, 2, 64), (2, 256, 2, 64))]
+
+    def loss(query, key, value):
+        return jnp.sum(scaled_dot_product_attention(query, key, value, causal=True, implementation="triton")
+                       .astype(jnp.float32))
+
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh), routes() as taken:
+        lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(*shapes).lower()
+    assert {(route.kernel, route.ran) for route in taken} == {("triton", "triton")}
+    assert 'custom_call_target="__gpu$xla.gpu.triton"' in lowered.as_text("hlo")
+    lowered.compile()
+
+
+@pytest.mark.parametrize("implementation", ["auto", "template"])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs(generation,
                                                                                     implementation):
     """A training step compiled ahead for a compile-only GPU of `generation` on this host, which has no GPU
     attached: its attention the route the GPU takes ('auto': FlashAttention where the cell declares it, its
-    FFI targets lowered for the target the wheel is told, `attention_kernels.flash_target`; the template or
-    tokamax's Triton kernel where named, the latter's check of this host's device set aside,
-    `generation.assumed`), so no kernel lowers in another's place (`AheadOfTime.substituted`, row 4616: every
+    FFI targets lowered for the target the wheel is told, `attention_kernels.flash_target`; the template
+    where named), so no kernel lowers in another's place (`AheadOfTime.substituted`, row 4616: every
     compile ahead's attention ran as XLA's, and each GPU job compiled its own step at run time)."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
