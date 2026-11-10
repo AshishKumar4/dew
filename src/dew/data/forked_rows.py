@@ -325,9 +325,10 @@ class _Layout:
         laid = coordinates(segments=self.segments, valid=self.segments > 0, positions=self.positions,
                            max_segments=self.documents, xp=np)
         depth = Forks.depth_of(self.parents)
-        # Windows of whole rows alone are plain packed rows, which every model reads.
+        # Windows of whole rows alone are plain packed rows, which every model reads. A window's real tokens
+        # are its first (`right_padded`), so each document's is a run its conv reads in place (`forked_conv`).
         if depth:
-            laid = dataclasses.replace(laid, forks=Forks(self.parents, depth=depth))
+            laid = dataclasses.replace(laid, forks=Forks(self.parents, depth=depth), right_padded=True)
         if xp is not np:
             laid = jax.tree.map(xp.asarray, laid)
         return ForkedRows(xp.asarray(self.tokens), laid, xp.asarray(self.index),

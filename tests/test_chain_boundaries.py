@@ -156,12 +156,13 @@ def test_prompt_encoding_passes_unread_catalog_fields_through(read):
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_preference_pair_passes_unread_catalog_fields_through(read):
-    """The pair step consumes only the completion ids and their masks, laying the pair out as one document:
-    the prompt its halves share once, then each half's rest."""
+    """The pair step consumes only the completion ids and their masks, laying the pair out as one document
+    its windows pack (`packed`): the prompt its halves share once, then each half's rest."""
     originals = [{"id": index, "chosen": [1, 2, index + 3], "rejected": [1, index + 4],
                   "chosen_mask": [0, 1, 1], "rejected_mask": [0, 1],
                   "catalog": {"tags": [str(index)]}} for index in range(3)]
-    rows = list(iterate(Memory(originals).map(preferences.PreferencePair(4)), read=read, loading=READ))
+    rows = list(iterate(Memory(originals).map(preferences.PreferencePair(4, packed=True)), read=read,
+                        loading=READ))
     assert len(rows) == len(originals)
     for row, original in zip(rows, originals, strict=True):
         assert row["id"] == original["id"] and row["catalog"] == original["catalog"]
@@ -181,7 +182,7 @@ def test_prompt_and_preference_encodings_read_token_arrays_as_they_read_lists(re
 
     def first(rows):
         chain = Memory(rows).filter_map(prompts.encode("byte", max_prompt_len=4))
-        chain = chain.map(preferences.PreferencePair(4))
+        chain = chain.map(preferences.PreferencePair(4, packed=True))
         return next(iter(iterate(chain, read=read, loading=READ)))
 
     encoded = [first(rows) for rows in (lists, native)]
