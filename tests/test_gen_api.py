@@ -152,8 +152,8 @@ def test_a_module_listed_in_two_groups_is_refused(gen_api, tmp_path):
         gen_api.Package("example", tmp_path, "https://example.org/",
                         [("A", ["example.twice", "example.twice"])])
     # Listed once each, it is a package.
-    once = gen_api.Package("example", tmp_path, "https://example.org/", [("A", ["example"]), ("B", ["example.twice"])])
-    assert once.pages == ["example", "example.twice"]
+    groups = [("A", ["example"]), ("B", ["example.twice"])]
+    assert gen_api.Package("example", tmp_path, "https://example.org/", groups).pages == ["example", "example.twice"]
 
 
 @pytest.fixture
