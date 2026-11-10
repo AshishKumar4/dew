@@ -189,8 +189,8 @@ def _rows_recomputed(remat: RematPolicy | None) -> Callable[..., bool]:
              else remat.checkpoint_policy() or jax.checkpoint_policies.nothing_saveable)
 
     def policy(primitive: jax.extend.core.Primitive, *avals, **params) -> bool:
-        return not (primitive.name == 'name' and params.get('name') == LAYER_ROWS) and layer(
-            primitive, *avals, **params)
+        named = primitive is jax.extend.core.primitives.name_p and params.get('name') == LAYER_ROWS
+        return not named and layer(primitive, *avals, **params)
     return policy
 
 

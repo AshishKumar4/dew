@@ -475,10 +475,10 @@ def _carried(equation) -> list[int]:
 
 
 def _body(equation):
-    """The jaxpr and constants a call runs (`dew.nn.programs.CALLS`: a jit, a remat, a custom rule's primal, a
-    marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device program
-    is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas kernel, is
-    one operation, its outputs their own size."""
+    """The jaxpr and constants a call runs (`dew.nn.programs.called`: a jit, a remat, a custom rule's primal,
+    a marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device
+    program is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas
+    kernel, is one operation, its outputs their own size."""
     body = programs.called(equation)
     return None if body is None else (body, body.consts)
 

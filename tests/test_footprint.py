@@ -23,7 +23,7 @@ def test_resident_device_bytes_do_not_include_host_state():
 
 def test_a_marked_spans_peak_is_its_bodys_as_xla_inlines_it():
     """A marked span (`dew.nn.derivatives.marked`, an error-free transform's `Protected` among them:
-    `precision.two_sum`) lowers to its body in the caller, as a call does (`dew.nn.programs.CALLS`): its
+    `precision.two_sum`) lowers to its body in the caller, as a call does (`dew.nn.programs.called`): its
     derived peak and residuals are the inline body's (`two_sum.__wrapped__`), its sum and its
     compensation fused into their reader, where read as an opaque op each held a buffer of its own (row
     3830)."""

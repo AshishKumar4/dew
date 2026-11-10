@@ -13,12 +13,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self
 
+import jax
 import numpy as np
 from flax import linen as nn
 from jax.core import ShapedArray
 from jax.extend import core as jaxpr_core
 
-from .programs import platform_branch
+from .programs import branches, platform_branch, scan_body
 from .protocols import Counted, CountedParameters
 
 
@@ -247,8 +248,6 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     platform's choice (`jax.lax.platform_dependent`) the accelerator's branch counts, the model's own
     products (a CPU's sums them wide, `dew.nn.precision`). Refused, as a trace does not tell what runs: a
     while loop's trips, and an operation holding several programs (a linear solve's)."""
-    import jax
-
     from dew.nn.kernels.generation import assumed
 
     with assumed("cpu"):
@@ -260,31 +259,32 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
     """`traced_flops` of a program."""
     total = 0.0
     for equation in program.eqns:
-        name = equation.primitive.name
-        if name == "dot_general":
+        primitive = equation.primitive
+        if primitive is jax.lax.dot_general_p:
             (contracted, _), _ = equation.params["dimension_numbers"]
             left = _shape(equation.invars[0])
             products = math.prod(left[axis] for axis in contracted)
             total += 2 * math.prod(_shape(equation.outvars[0])) * products
-        elif name == "conv_general_dilated":
+        elif primitive is jax.lax.conv_general_dilated_p:
             kernel = _shape(equation.invars[1])
             outputs = kernel[equation.params["dimension_numbers"].rhs_spec[0]]
             total += 2 * math.prod(_shape(equation.outvars[0])) * math.prod(kernel) / outputs
-        elif name == "scan":
-            total += equation.params["length"] * _program_flops(equation.params["jaxpr"])
-        elif name == "cond":
-            branches = equation.params["branches"]
+        elif primitive is jax.lax.scan_p:
+            total += equation.params["length"] * _program_flops(scan_body(equation))
+        elif primitive is jax.lax.cond_p:
+            chosen = branches(equation)
             platforms = equation.params.get("branches_platforms")
             if platforms is not None:
-                branches = [branches[platform_branch(platforms, "cuda")]]
-            total += max(_program_flops(branch) for branch in branches)
-        elif name == "while":
+                chosen = (chosen[platform_branch(platforms, "cuda")],)
+            total += max(_program_flops(branch) for branch in chosen)
+        elif primitive is jax.lax.while_p:
             raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         else:
+            # Every program it holds, an interpreted kernel's among them, whose products a CPU runs.
             nested = list(jaxpr_core.jaxprs_in_params(equation.params))
             if len(nested) > 1:
-                raise MissingFlopsCount(f"{name} holds {len(nested)} programs, which of them run a trace "
-                                        "does not tell")
+                raise MissingFlopsCount(f"{primitive.name} holds {len(nested)} programs, which of them run "
+                                        "a trace does not tell")
             total += sum(_program_flops(program) for program in nested)
     return total
 

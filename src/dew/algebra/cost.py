@@ -21,16 +21,12 @@ from egglog import DagCostModel, EGraph, get_callable_args
 from dew._cache import ALGEBRA
 from dew.algebra.extract import Level
 from dew.algebra.rules import CONTRACTED, shape
-from dew.algebra.terms import RESCALE, Region, Term, integer, key, text
+from dew.algebra.terms import EXPONENTIALS, RESCALE, Region, Term, integer, key, text
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import cost as kernel_cost
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.product import EIGHT
 from dew.nn.precision import asks_default_precision, precision_names
-
-EXPONENTIALS = frozenset({"exp", "exp2", "log", "log2", "log1p", "expm1", "tanh", "logistic", "sin", "cos",
-                          "erf", "rsqrt", "sqrt", "pow"})
-"""The language's functions the special-function units evaluate."""
 
 
 def target(named: str | None = None) -> generation.GpuTarget:

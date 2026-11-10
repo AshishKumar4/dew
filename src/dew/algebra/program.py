@@ -32,7 +32,7 @@ from dew.algebra.extract import Linear
 from dew.nn.derivatives import Algebra, KernelGlue, Surrogate, marked_call_p
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import report as kernel_report
-from dew.nn.programs import CALLS, inlined
+from dew.nn.programs import called, control_flow, inlined, with_bodies
 
 
 @dataclasses.dataclass(frozen=True)
@@ -366,8 +366,9 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
         return equation if equation is not None and terms.spoken(equation) else None
 
     heads = [equation for equation in jaxpr.eqns if terms.spoken(equation) and rules.heads(
-        equation.primitive.name,
-        [None if (operand := maker(atom)) is None else operand.primitive.name for atom in equation.invars])]
+        terms.symbol(equation.primitive),
+        [None if (operand := maker(atom)) is None else terms.symbol(operand.primitive)
+         for atom in equation.invars])]
     if not heads:
         return []
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
@@ -603,30 +604,35 @@ def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostMo
     return list(forms[0].value), price
 
 
-BODIES = (CALLS - {"marked_call"}) | {"scan", "while", "cond"}
-"""The primitives whose bodies the pass rewrites in place, each a region of its own (§1.2): every call
-(`dew.nn.programs.CALLS`: a nested program, a checkpoint, a custom derivative's or batching rule's primal
-call, its rules kept), a scan, a loop and a conditional. A marked span is read by its kind (`WITHIN`)."""
+def _holds_regions(equation: jcore.JaxprEqn) -> bool:
+    """Whether the pass rewrites `equation`'s bodies in place, each a region of its own (§1.2): a call's
+    program (`Primitive.inlined_call`, `dew.nn.programs.called`'s: a nested program, a checkpoint, a custom
+    derivative's or batching rule's primal call, its rules kept) and control flow's
+    (`dew.nn.programs.control_flow`: a scan's, a loop's predicate and body, a conditional's branches; nothing
+    moves across a body's boundary or a loop's carry). A marked span is read by its kind (`WITHIN`); any
+    other holder of a program (a manual mesh's, a native kernel's) is an opaque leaf."""
+    primitive = equation.primitive
+    return (primitive.inlined_call and primitive is not marked_call_p) or control_flow(primitive)
 
 
 def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
-    """`jaxpr`, its constants kept, with each body (`BODIES`) of its equations rewritten, the equation itself
-    kept: `jaxpr` itself, and each equation itself, where no body changes. A program's identity is what
+    """`jaxpr`, its constants kept, with each body (`_holds_regions`) of its equations rewritten, the equation
+    itself kept: `jaxpr` itself, and each equation itself, where no body changes. A program's identity is what
     JAX shares its lowering by: every call site of one jitted function holds one body, lowered once (one
-    function of the module, its kernels compiled once), so a pass that rebuilt an unchanged body at each
-    call site lowered and compiled every layer's apart (a Qwen3.5-4B training step's compile 52 to 487
-    seconds on an H100, nothing rewritten)."""
+    function of the module, its kernels compiled once), so a pass that rebuilt an unchanged body at each call
+    site lowered and compiled every layer's apart (a Qwen3.5-4B training step's compile 52 to 487 seconds on
+    an H100, nothing rewritten)."""
     changed = False
     equations = []
     for equation in jaxpr.eqns:
-        if equation.primitive.name in BODIES or _marked(equation, WITHIN) or (
+        if _holds_regions(equation) or _marked(equation, WITHIN) or (
                 _marked(equation, (Algebra,)) and not _opens(equation)):
-            params = {name: _body(value, accurate, saturation, kernels)
-                      for name, value in equation.params.items()}
+            params = with_bodies(equation.params,
+                                 lambda body: _closed(body, accurate, saturation, kernels))
         elif _opens(equation):
             # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
-            params = {**equation.params, "call_jaxpr": _within(equation.params["call_jaxpr"], accurate,
-                                                               saturation, kernels)}
+            params = with_bodies(equation.params,
+                                 lambda body: _within(body, accurate, saturation, kernels))
         else:
             params = equation.params
         if any(params[name] is not value for name, value in equation.params.items()):
@@ -638,7 +644,8 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
 
 WITHIN = (Surrogate, KernelGlue)
 """The marked spans' kinds (`dew.nn.derivatives.marked`) whose body the pass rewrites within its call, as it
-rewrites a body (`BODIES`): a surrogate's bodies and a kernel derivative's glue (docs/design/algebra.md §1.2).
+rewrites a body (`_holds_regions`): a surrogate's bodies and a kernel derivative's glue
+(docs/design/algebra.md §1.2).
 A protected span is an opaque leaf, its body untouched; an Algebra span opens into the region around it
 (`_opened`)."""
 
@@ -690,7 +697,7 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
         if not _opens(equation):
             equations.append(equation)
             continue
-        body = _opened(equation.params["call_jaxpr"])
+        body = _opened(called(equation))
         # The body's constants the program's own, each a fresh variable of it (`inlined`).
         fresh = [jcore.Var(var.aval) for var in body.constvars]
         constvars += fresh
@@ -702,23 +709,13 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
                          outvars=[outer(atom) for atom in jaxpr.outvars])
 
 
-def _body(value, accurate: bool, saturation: Saturation, kernels: bool):
-    """A body parameter rewritten: a jaxpr's program, each of a conditional's branches (the tuple itself
-    where none changes); any other parameter, and a body whose constants it does not hold, as it is."""
-    if isinstance(value, jcore.Jaxpr):
-        return _closed(value, accurate, saturation, kernels)
-    if isinstance(value, tuple) and value and all(isinstance(branch, jcore.Jaxpr) for branch in value):
-        branches = tuple(_closed(branch, accurate, saturation, kernels) for branch in value)
-        return value if all(new is old for new, old in zip(branches, value, strict=True)) else branches
-    return value
-
-
 _REWRITTEN: weakref.WeakKeyDictionary[jcore.Jaxpr, dict[Hashable, jcore.Jaxpr | None]] = (
     weakref.WeakKeyDictionary())
 """Each body's rewrites (`_closed`) by what a rewrite read (the numerics' forms, the saturation, the
 switch's target), held while the body lives: every call site of one body, and every retrace that holds it
 (JAX's tracing cache gives a function's one body), takes one rewritten object, which JAX lowers once. A body
 nothing changes holds None, not itself, which would keep it alive."""
+
 
 
 def _closed(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:

@@ -20,6 +20,7 @@ from test_algebra import rows, two_sums
 
 from dew import algebra
 from dew.algebra import cost, program, terms
+from dew.nn import programs
 from dew.nn.kernels import generation, options
 from dew.nn.kernels.templates import cost as kernel_cost, report
 from dew.nn.precision import FP32_SUMS
@@ -64,8 +65,7 @@ def test_a_bodys_math_is_rewritten_in_place(kind):
     assert (reductions(before), reductions(after)) == (2 * branches, branches)
 
     def bodies(closed) -> list[str]:
-        return sorted(equation.primitive.name for equation in closed.jaxpr.eqns
-                      if equation.primitive.name in algebra.program.BODIES)
+        return sorted(equation.primitive.name for equation in closed.jaxpr.eqns if programs.bodies(equation))
 
     assert bodies(after) == bodies(before) and len(bodies(after)) == 1
 

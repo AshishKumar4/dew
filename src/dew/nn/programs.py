@@ -10,7 +10,6 @@ which branch a platform runs and which bodies XLA sees.
 from __future__ import annotations
 
 import contextlib
-import functools
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TypeGuard
 
@@ -18,47 +17,9 @@ import jax
 import jax.extend.core as jcore
 import jax.numpy as jnp
 from jax._src import mesh as mesh_lib
+from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
-from jax.interpreters import ad
 
-CALLS = frozenset({"pjit", "jit", "closed_call", "core_call", "remat2", "checkpoint", "custom_jvp_call",
-                   "custom_vjp_call", "custom_vmap_call", "marked_call"})
-"""The primitives that run a program on their operands, one for one, and return its results. A `jit`
-lowers to a call that XLA's `CallInliner` inlines (`_pjit_lowering`, jax/_src/pjit.py;
-`GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), and a checkpoint
-(`_remat_lowering`, jax/_src/ad_checkpoint.py), a custom derivative's primal
-(`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py), a custom batching rule's (its `call`,
-`custom_vmap_p`'s lowering, jax/_src/custom_batching.py) and a marked span
-(`dew.nn.derivatives.marked_call_p`, its body inlined) lower to their program in the caller, so XLA sees no
-call. A result that is the program's own parameter is its operand's buffer, and one that is a
-cheap value of another is recomputed where it is read, as it would be without the call."""
-
-
-ENTRYWISE = frozenset({
-    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "bessel_i0e",
-    "bessel_i1e", "cbrt", "ceil", "clamp", "clz", "complex", "conj", "convert_element_type", "copy", "copy_p",
-    "cos", "cosh", "digamma", "div", "eq", "erf", "erf_inv", "erfc", "exp", "exp2", "expm1", "floor", "ge",
-    "gt", "igamma", "igammac", "imag", "integer_pow", "is_finite", "le", "lgamma", "log", "log1p", "log2",
-    "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or", "polygamma",
-    "population_count", "pow", "real", "reduce_precision", "rem", "round", "rsqrt", "select_n", "shift_left",
-    "shift_right_arithmetic", "shift_right_logical", "sign", "sin", "sinh", "sqrt", "square", "stop_gradient",
-    "sub", "tan", "tanh", "threefry2x32", "xor", "zeta",
-})
-"""The operations whose every output entry reads its operands' entries at its own index (each operand of
-the output's shape, or a scalar) and nothing else, by JAX's name (`jax_name`): the one vocabulary the
-analyses of a program's entries read (`templates.layout`, `dew.interop.sequence_causality`)."""
-
-KEYS = frozenset({"random_bits", "random_fold_in", "random_split", "random_unwrap", "random_wrap"})
-"""The operations on PRNG keys, each output entry its own key's: entrywise over a key array's positions,
-but not over a value's (a key's data extends its shape, and `random_bits` takes the shape it fills), so an
-analysis of positions takes them beside `ENTRYWISE` and one of values' entries does not."""
-
-REDUCTIONS = frozenset({"argmax", "argmin", "reduce_and", "reduce_max", "reduce_min", "reduce_or",
-                        "reduce_prod", "reduce_sum", "reduce_xor"})
-"""The operations that reduce the axes their `axes` parameter names."""
-
-CUMULATIVE = frozenset({"cumlogsumexp", "cummax", "cummin", "cumprod", "cumsum"})
-"""The operations that scan along the axis their `axis` parameter names."""
 
 def holes[Tree, Leaf](tree: Tree, selected: Callable[[Leaf], bool],
                       is_leaf: Callable[[Leaf], bool] | None = None
@@ -92,7 +53,7 @@ def opaque(equation: jcore.JaxprEqn) -> bool:
     Triton's (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py). A program
     `dew.training.compiled_program.compiled` reads holds no interpreted one: it is its interpreter's
     program (`dew.training.compiled_program.interpreter`)."""
-    return equation.primitive.name == "pallas_call"
+    return equation.primitive is pallas_call_p
 
 
 def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
@@ -106,13 +67,16 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
 
 def with_bodies(params: Mapping, rebuilt: Callable[[jcore.Jaxpr], jcore.Jaxpr]) -> dict:
     """`params` with each program within them (`bodies`' finder's: a parameter that is a program, or a tuple
-    holding them, a branch's) replaced by `rebuilt(program)`, every other parameter as it is: what a
-    program's equation retraced at other shapes binds."""
+    holding them, a branch's) replaced by `rebuilt(program)`, every other parameter as it is, and a tuple
+    itself where `rebuilt` returns each of its programs as it was: what a program's equation retraced at
+    other shapes binds, and what a pass that rewrites bodies keeps where it changes none (a program's
+    identity is what JAX shares its lowering by)."""
     def replaced(value):
         if isinstance(value, jcore.Jaxpr):
             return rebuilt(value)
         if isinstance(value, tuple) and any(isinstance(each, jcore.Jaxpr) for each in value):
-            return tuple(rebuilt(each) if isinstance(each, jcore.Jaxpr) else each for each in value)
+            made = tuple(rebuilt(each) if isinstance(each, jcore.Jaxpr) else each for each in value)
+            return value if all(new is old for new, old in zip(made, value, strict=True)) else made
         return value
 
     return {key: replaced(value) for key, value in params.items()}
@@ -124,66 +88,6 @@ def equations(jaxpr: jcore.Jaxpr) -> Iterator[jcore.JaxprEqn]:
     yield from jaxpr.eqns
     for inner in jcore.subjaxprs(jaxpr):
         yield from equations(inner)
-
-
-@functools.cache
-def _jax_own() -> Mapping[jcore.Primitive, str]:
-    """JAX's own operations by their objects: every primitive `jax.lax`, `jax.lax.linalg` and
-    `jax.extend.core.primitives` export (the random operations' `random_seed`, `random_split`,
-    `random_fold_in`, `random_bits` and `random_gamma` among them, and the sum JAX's derivatives add with,
-    `add_any`), and those its public functions bind that no module of JAX's exports, read off a trace of
-    them once asked: its random functions' `random_wrap`, `random_unwrap` and `random_clone`, a ragged
-    product's `ragged_dot_general`, a copy's `copy_p`, and its callbacks' and foreign calls'
-    `pure_callback`, `io_callback`, `debug_callback` and `ffi_call`."""
-    def keyed(seed_words):
-        # A key of its own implementation, whichever the process's default is (`jax_default_prng_impl`).
-        key = jax.random.wrap_key_data(seed_words, impl="threefry2x32")
-        return jax.random.key_data(jax.random.clone(key))
-
-    def bound(rows, groups):
-        shape = jax.ShapeDtypeStruct((), jax.numpy.float32)
-        products = jax.lax.ragged_dot(rows, rows.T[None], groups)
-        jax.debug.callback(lambda value: None, products)
-        called = jax.pure_callback(lambda value: value, shape, products.sum())
-        written = io_callback(lambda value: value, shape, called)
-        foreign = jax.ffi.ffi_call("dew_named", shape)(written)
-        return jax.numpy.copy(foreign)
-
-    from jax.experimental import io_callback
-
-    float32 = jax.numpy.float32
-    traced = jax.make_jaxpr(keyed)(jax.ShapeDtypeStruct((2,), jax.numpy.uint32)).jaxpr
-    held = jax.make_jaxpr(bound)(jax.ShapeDtypeStruct((2, 2), float32),
-                                 jax.ShapeDtypeStruct((1,), jax.numpy.int32)).jaxpr
-    exported = (primitive for module in (jax.lax, jax.lax.linalg, jcore.primitives)
-                for primitive in vars(module).values() if isinstance(primitive, jcore.Primitive))
-    return {primitive: primitive.name
-            for primitive in (*exported, *(equation.primitive for equation in (*traced.eqns, *held.eqns)),
-                              ad.add_jaxvals_p)}
-
-
-def jax_name(primitive) -> str | None:
-    """`primitive`'s name where it is JAX's own operation (`_jax_own`), None for any other: a primitive
-    of another library or of a user's takes any name, whatever it computes, so a reader that knows an
-    operation by its name knows it by its object. A call (`CALLS`) runs the program it holds, read as
-    such by its name."""
-    return _jax_own().get(primitive)
-
-
-HOLDERS = CALLS | {"pallas_call", "shard_map"}
-"""The primitives a reader knows by their names though no module of JAX's exports them: the calls
-(`CALLS`), a Pallas kernel's (`opaque`) and a manual mesh's, each running a program it holds."""
-
-
-def named(primitive) -> str:
-    """The name a reader of a program knows `primitive` by: JAX's own operation's (`jax_name`), a
-    program holder's (`HOLDERS`), else none (""): a primitive of another library or of a user's takes any
-    name, whatever it computes, so no reader reads one as the JAX operation its name spells (row 4094: a
-    user's `convert_element_type` read as a cast raised KeyError on its params)."""
-    own = jax_name(primitive)
-    if own is not None:
-        return own
-    return primitive.name if primitive.name in HOLDERS else ""
 
 
 def computed(value) -> TypeGuard[jcore.Var]:
@@ -214,32 +118,130 @@ def inlined(body: jcore.Jaxpr, operands: Sequence[jcore.Var | jcore.Literal],
 
 
 def called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
-    """The program a call (`CALLS`) runs on `equation`'s operands one for one, returning its results, else
-    None: every reader of a call through its program reads it here (`dew.training.compiled_program`'s
-    `compiled` and `gradients_read`, staging's flattening, the kernel split's `_inlined`, the float64
-    terms, the algebra's normal forms). Its constants are its own (`consts`); a custom rule's leading
-    constants (`num_consts`) are among the operands its program reads, one for one."""
-    found = bodies(equation) if equation.primitive.name in CALLS else []
-    if len(found) == 1 and (len(found[0].invars), len(found[0].outvars)) == (
+    """The program `equation` runs on its operands one for one, returning its results, else None: every
+    reader of a call through its program reads it here (`dew.training.compiled_program`'s `compiled` and
+    `gradients_read`, the kernel split's `_inlined`, the float64 terms, the algebra's normal forms). A call
+    is a primitive JAX lowers to its program in the caller, which JAX states where it defines one
+    (`Primitive.inlined_call`): a `jit`'s, which XLA's `CallInliner` inlines (`_pjit_lowering`,
+    jax/_src/pjit.py; `GpuCompiler::RunPreSPMDPartitionerPasses`, xla/service/gpu/gpu_compiler.cc), an
+    evaluated jaxpr's, a checkpoint's (`_remat_lowering`, jax/_src/ad_checkpoint.py), a custom derivative's
+    primal (`_custom_jvp_vjp_call_lowering`, jax/_src/custom_derivatives.py), a custom batching rule's
+    (`custom_vmap_p`'s lowering, jax/_src/custom_batching.py) and a marked span
+    (`dew.nn.derivatives.marked_call_p`). XLA sees no call: a result that is the program's own parameter is
+    its operand's buffer, and one that is a cheap value of another is recomputed where it is read, as it
+    would be without the call. Its constants are its own (`consts`); a custom rule's leading constants
+    (`num_consts`) are among the operands its program reads, one for one. A loop's body runs as many times as
+    it steps and a branch's only where it is taken, so neither is a call."""
+    body = _program(equation.primitive, equation.params)
+    if body is not None and (len(body.invars), len(body.outvars)) == (
             len(equation.invars), len(equation.outvars)):
-        return found[0]
+        return body
     return None
 
 
-PURE_CALLS = CALLS - {"remat2", "checkpoint", "custom_jvp_call", "custom_vjp_call", "custom_vmap_call",
-                      "marked_call"}
-"""The calls (`CALLS`) that run a program on their operands and do nothing else, which a reader may run in
-their caller (`purely_called`): an optax helper's `jit` over a whole tree, `jnp.einsum`'s. A checkpoint's, a
-custom derivative's and a custom batching rule's call do more than their program, a rule of their own, and a
-marked span is a boundary the algebra pass reads (`dew.nn.derivatives.marked`: a protected span's inside no
-rule touches), so each stays a call."""
+def _program(primitive: jcore.Primitive, params: Mapping) -> jcore.Jaxpr | None:
+    """The one program a call's primitive (`Primitive.inlined_call`) holds in `params`, None for any other
+    primitive."""
+    if not primitive.inlined_call:
+        return None
+    found = list(jcore.jaxprs_in_params(params))
+    return found[0] if len(found) == 1 else None
 
 
 def purely_called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
-    """The program `equation` runs (`called`) where its call does nothing else (`PURE_CALLS`), else None:
-    what a reader that runs a call in its caller reads (staging's `flattened`, the pairwise sums'
-    `dew.nn.precision._paired`). A call that does more keeps its rule only as a call."""
-    return called(equation) if equation.primitive.name in PURE_CALLS else None
+    """The program `equation` runs (`called`) where its call does nothing else, else None: what a reader that
+    runs a call in its caller reads (staging's `flattened`, the pairwise sums' `dew.nn.precision._paired`).
+    JAX states which calls are pure where it defines them (`Primitive.transparent_call`: a `jit`'s and an
+    evaluated jaxpr's; an optax helper's `jit` over a whole tree, `jnp.einsum`'s). A checkpoint's, a custom
+    derivative's and a custom batching rule's call do more than their program, a rule of their own, and a
+    marked span is a boundary the algebra pass reads (`dew.nn.derivatives.marked`: a protected span's inside
+    no rule touches), so each keeps its rule only as a call."""
+    return called(equation) if equation.primitive.transparent_call else None
+
+
+def own_derivative(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` is a call whose derivative is a rule of its own (`jax.custom_jvp`'s,
+    `jax.custom_vjp`'s): its cotangents and tangents are the rule's, not its program's."""
+    return primitive in (jcore.primitives.custom_jvp_call_p, jcore.primitives.custom_vjp_call_p)
+
+
+def _of(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> Mapping:
+    """`equation`'s parameters, where it binds `primitive`: a reader of one control-flow operation's programs
+    is asked of that operation alone, and another's equation is refused by its name."""
+    if equation.primitive is not primitive:
+        raise TypeError(f"{equation.primitive.name} is not {primitive.name}, whose programs were asked of it")
+    return equation.params
+
+
+def scan_body(equation: jcore.JaxprEqn) -> jcore.Jaxpr:
+    """The program a scan's equation (`jax.lax.scan_p`) runs each step."""
+    return _of(equation, jax.lax.scan_p)["jaxpr"]
+
+
+def loop_programs(equation: jcore.JaxprEqn) -> tuple[jcore.Jaxpr, jcore.Jaxpr]:
+    """A while loop's equation's (`jax.lax.while_p`) predicate and body."""
+    params = _of(equation, jax.lax.while_p)
+    return params["cond_jaxpr"], params["body_jaxpr"]
+
+
+def branches(equation: jcore.JaxprEqn) -> tuple[jcore.Jaxpr, ...]:
+    """A conditional's equation's (`jax.lax.cond_p`: `cond`, `switch`, a platform choice) branches, in the
+    order its index picks them."""
+    return tuple(_of(equation, jax.lax.cond_p)["branches"])
+
+
+def control_flow(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` is JAX's control flow (a scan, a while loop, a conditional): its programs run a
+    step at a time or where they are taken (`scan_body`, `loop_programs`, `branches`), never as a call's."""
+    return primitive in (jax.lax.scan_p, jax.lax.while_p, jax.lax.cond_p)
+
+
+def entrywise(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive`'s every output entry reads its operands' entries at its own index (each operand of
+    the output's shape, or a scalar) and nothing else: what JAX states where it defines an operation
+    (`Primitive.elementwise`: its unary and n-ary operations, a cast, a selection, a clamp, the sum its
+    derivatives add with). The one vocabulary the analyses of a program's entries read (`templates.layout`,
+    `dew.interop.sequence_causality`, the algebra's fusion). A primitive of another library's or a user's
+    states nothing and is none, whatever its name."""
+    return primitive.elementwise
+
+
+def positionwise(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` maps over its operands' positions, each output position reading its operands' at
+    that position and nothing else, whatever it does within one: an entrywise operation (`entrywise`), and
+    one JAX batches by leaving the mapped axis where it found it, which it states where it registers that
+    rule (`Primitive.positionwise`), so an added axis anywhere changes nothing of it. The operations on PRNG
+    keys are such (a key's data extends its shape, and `random_bits` takes the shape it fills past the
+    keys'), which are entrywise over a key array's positions and not over a value's."""
+    return primitive.elementwise or primitive.positionwise
+
+
+def rearranges(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` only moves entries, each output entry one operand's entry or a fill, with no
+    arithmetic and no rounding (a reshape, a squeeze, a broadcast, a transpose, a reversal, a slice, a
+    gather, a concatenation, a padding, a split): JAX states it where it defines each
+    (`Primitive.rearranges`)."""
+    return primitive.rearranges
+
+
+def reduction(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` reduces the axes its `axes` parameter names (a sum, a product, an extremum or its
+    place, a bitwise fold): JAX states it where it registers a reducer (`Primitive.reduces`)."""
+    return primitive.reduces
+
+
+def scatter(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` writes updates into its first operand at indices, replacing or combining (a
+    scatter, and its add, subtract, multiply, minimum and maximum): JAX states it where it registers the
+    scatters' batching (`Primitive.scatters`)."""
+    return primitive.scatters
+
+
+def cumulative(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` scans along the axis its `axis` parameter names (a cumulative sum, product,
+    extremum or log-sum-exp): JAX states it where it defines the cumulative reductions
+    (`Primitive.cumulative`)."""
+    return primitive.cumulative
 
 
 def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | None:
@@ -248,17 +250,17 @@ def host_evaluated(primitive, operands: Sequence, params: Mapping) -> list | Non
     (`on_host`); None where an operand is an array this process cannot read whole (one laid across another
     process's devices), or an operand or output is of an extended dtype (a PRNG key, which no host array
     holds), or the primitive runs per device of a mesh it names (a shard_map's body sees one shard, and the
-    host holds no mesh to run it over), none a constant of this host. A call with a derivative rule of its own
-    (custom_jvp_call, custom_vjp_call) is its primal body, interpreted: a constant has no derivative, and its
-    bind takes its rules as functions, not the equation's jaxprs. The one evaluator of a program's constants,
-    the compile point's and a compiled program's plan alike."""
+    host holds no mesh to run it over), none a constant of this host. A call is its program, interpreted
+    (`called`'s): a constant has no derivative, and a custom derivative's bind takes its rules as functions,
+    not the equation's jaxprs. The one evaluator of a program's constants, the compile point's and a compiled
+    program's plan alike."""
     if "mesh" in params or any((isinstance(value, jax.Array) and not value.is_fully_addressable)
                                or _extended(value) for value in operands):
         return None
     params = {name: None if name in ("sharding", "out_sharding") else value for name, value in params.items()}
-    body = params.get("call_jaxpr")
+    body = _program(primitive, params)
     with on_host():
-        if isinstance(body, jcore.Jaxpr):
+        if body is not None:
             made = jcore.jaxpr_as_fun(body)(*operands)
         else:
             made = primitive.bind(*operands, **params)

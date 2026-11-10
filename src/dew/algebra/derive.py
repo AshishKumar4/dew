@@ -903,28 +903,28 @@ def _register(graph: EGraph, region: terms.Region, closed, names, walked_axes) -
     """The facts the rules read that each parameter's own values state (the engine's, `program.stated`, and
     the derivation's own), and each input's walked axis."""
     program.stated(graph, region)
-    elementwise = terms.BINARY | terms.COMPARISONS | terms.UNARY | {"convert_element_type"}
     _least(graph, region)
     for index, (primitive, params) in enumerate(region.params):
-        name = primitive.name
-        if name in elementwise:
+        declared = terms.OPERATIONS.get(primitive)
+        kind = None if declared is None else declared.kind
+        if kind in ("binary", "unary", "comparison", "cast"):
             graph.register(keeps(i64(index)))
-        elif name == "broadcast_in_dim":
+        elif primitive is jax.lax.broadcast_in_dim_p:
             for axis, to in enumerate(params["broadcast_dimensions"]):
                 graph.register(lays(i64(index), i64(axis), i64(int(to))))
-        elif name == "transpose":
+        elif primitive is jax.lax.transpose_p:
             permutation = list(params["permutation"])
             for axis in range(len(permutation)):
                 graph.register(lays(i64(index), i64(axis), i64(permutation.index(axis))))
-        elif name in ("squeeze", "expand_dims", "reshape"):
+        elif primitive in (jax.lax.squeeze_p, jax.lax.reshape_p):
             for axis, to in _moved(primitive, params, region, index):
                 graph.register(lays(i64(index), i64(axis), i64(to)))
-        elif name in terms.REDUCTIONS:
+        elif kind == "reduction":
             reduced = {int(axis) for axis in params["axes"]}
             for axis in range(_rank_before(region, index, reduced)):
                 if axis not in reduced:
                     graph.register(reduces(i64(index), i64(axis), i64(axis - sum(r < axis for r in reduced))))
-        elif name == "dot_general":
+        elif kind == "product":
             (left_contracted, right_contracted), (left_batch, right_batch) = params["dimension_numbers"]
             left_rank, right_rank = _dot_ranks(region, index)
             left_free = [axis for axis in range(left_rank) if axis not in left_contracted and
@@ -984,7 +984,7 @@ def _least(graph: EGraph, region: terms.Region) -> None:
 
 
 def _moved(primitive, params, region: terms.Region, index: int) -> list[tuple[int, int]]:
-    """A squeeze's, an expand_dims' or a reshape's moves of its operand's axes, where each axis of extent
+    """A squeeze's or a reshape's moves of its operand's axes, where each axis of extent
     other than one keeps its order: each such axis's place before and after."""
     before, after = _operand_and_result_shapes(region, index)
     if before is None or after is None:

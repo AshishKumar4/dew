@@ -36,13 +36,9 @@ from jax.extend import core as jcore
 
 from dew.nn.kernels import generation
 from dew.nn.nested import nested
-from dew.nn.programs import ENTRYWISE, jax_name
+from dew.nn.programs import entrywise
 
-CONSUMERS = ENTRYWISE | {"convert_element_type"}
-"""The equations a product's epilogue takes: each entry of its output from the same entry of its inputs
-(`dew.nn.programs.ENTRYWISE`) or a cast."""
-
-CAPTURED = frozenset({"broadcast_in_dim", "reshape"})
+CAPTURED = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p)
 """The layout equations a region takes of a captured operand only it reads (a bias broadcast over rows), so
 the epilogue captures the operand itself."""
 
@@ -155,13 +151,13 @@ def _form(equation: jcore.JaxprEqn) -> Form | None:
     dy @ Wᵀ, xᵀ @ dy) or a `ragged_dot_general` of rows ragged by group (`GROUPED_FORMS`), each of floating
     operands, no batch axes; None for any other equation (an integer product is XLA's own,
     `fused_gemm.product`)."""
-    name = jax_name(equation.primitive)
-    if name not in ("dot_general", "ragged_dot_general"):
+    primitive = equation.primitive
+    if primitive not in (jax.lax.dot_general_p, jcore.primitives.ragged_dot_general_p):
         return None
     if not all(jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.invars[:2]
                if isinstance(var.aval, ShapedArray)):
         return None
-    if name == "dot_general":
+    if primitive is jax.lax.dot_general_p:
         (left, right), batch = equation.params["dimension_numbers"]
         if batch != ((), ()) or any(len(_shape(var)) != 2 for var in equation.invars):
             return None
@@ -190,9 +186,9 @@ def _follows(operand: tuple[int, ...], shape: tuple[int, ...]) -> bool:
 
 
 def _regions(index: Index) -> list[Region]:
-    """Each product of `jaxpr` (`_form`) and the elementwise equations after it that read its values,
-    each of the product's shape over operands that follow its tiles (`_follows`, `CONSUMERS`), up to the
-    first equation outside them that reads one of their values, with the layout equations of its captured
+    """Each product of `jaxpr` (`_form`) and the elementwise equations after it that read its values, each of
+    the product's shape over operands that follow its tiles (`_follows`, `dew.nn.programs.entrywise`), up to
+    the first equation outside them that reads one of their values, with the layout equations of its captured
     operands that no other equation reads (`CAPTURED`)."""
     jaxpr, readers, escaping, producer = index.jaxpr, index.readers, index.escaping, index.producer
     found: list[Region] = []
@@ -206,7 +202,8 @@ def _regions(index: Index) -> list[Region]:
             later = jaxpr.eqns[place]
             if not any(isinstance(var, jcore.Var) and var in made for var in later.invars):
                 continue
-            if not (jax_name(later.primitive) in CONSUMERS and not later.effects and place not in claimed
+            # A product's epilogue takes each entry of its output from the same entry of its inputs.
+            if not (entrywise(later.primitive) and not later.effects and place not in claimed
                     and all(_shape(var) == shape for var in later.outvars)
                     and all(_follows(_shape(var), shape) for var in later.invars)):
                 at = place
@@ -220,7 +217,7 @@ def _regions(index: Index) -> list[Region]:
                     continue
                 source = producer.get(var)
                 if (source is not None and source not in members and source not in claimed
-                        and jax_name(jaxpr.eqns[source].primitive) in CAPTURED
+                        and jaxpr.eqns[source].primitive in CAPTURED
                         and readers[var] <= members and var not in escaping):
                     members.add(source)
                     made.update(jaxpr.eqns[source].outvars)

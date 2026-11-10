@@ -69,6 +69,7 @@ from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
+from dew.nn.programs import purely_called
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import parameter_path
 from dew.registry import resolve_dtype
@@ -1198,8 +1199,7 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
             for var in equation.invars:
                 if not isinstance(var, Literal) and last[var] == index and var not in kept:
                     held.pop(var, None)
-            if equation.primitive is primitives.jit_p:
-                inner = equation.params["jaxpr"]
+            if (inner := purely_called(equation)) is not None:
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
             elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
                 outputs = [broadcast_summed(inputs[0], tuple(equation.params["shape"]),

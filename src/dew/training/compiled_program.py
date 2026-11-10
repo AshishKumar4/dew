@@ -20,12 +20,25 @@ import jax
 import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
+from jax.experimental.pallas import pallas_call_p
+from jax.extend.core import primitives
 
 from dew._devices import xla_flag
 from dew.algebra.terms import parameter_key, parameters_key
-from dew.nn.programs import bodies, called, computed, host_evaluated, inlined, named, opaque, platform_branch
+from dew.nn.programs import (
+    bodies,
+    branches,
+    called,
+    computed,
+    control_flow,
+    host_evaluated,
+    inlined,
+    opaque,
+    platform_branch,
+    scan_body,
+)
 
-VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
+VIEWS = (jax.lax.reshape_p, jax.lax.squeeze_p)
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
 under default layouts)."""
 
@@ -37,17 +50,17 @@ def bitcast(equation: jcore.JaxprEqn) -> bool:
     loop reads its weight gradient's carry by unstacking it and writes it back by stacking, each a view of
     the carry's buffer, which the derivation counted twice over (Qwen3.5-4B's fused tiled head, 2 x 2.37
     GiB, row 4089)."""
-    name = named(equation.primitive)
-    if name in VIEWS:
+    primitive = equation.primitive
+    if primitive in VIEWS:
         return True
-    if name == "stack":
+    if primitive is jax.lax.stack_p:
         return len(equation.invars) == 1
-    if name == "unstack":
+    if primitive is jax.lax.unstack_p:
         return len(equation.outvars) == 1
     return False
 
-UNEVALUATED = frozenset({"pure_callback", "io_callback", "debug_callback", "ffi_call", "pallas_call",
-                         "axis_index"})
+UNEVALUATED = (primitives.pure_callback_p, primitives.io_callback_p, primitives.debug_callback_p,
+               primitives.ffi_call_p, pallas_call_p, jax.lax.axis_index_p)
 """Primitives XLA's evaluator computes no offset through: those JAX lowers to a custom call, and the
 device's index, a partition or replica id (`GetLeafDependencies`, dynamic_slice_analysis.cc)."""
 
@@ -98,20 +111,20 @@ def compiled(program: jcore.Jaxpr, lowering: str,
         return renamed.get(value, value) if computed(value) else value
 
     for equation in program.eqns:
-        name, params = named(equation.primitive), dict(equation.params)
+        primitive, params = equation.primitive, dict(equation.params)
         operands = [read(value) for value in equation.invars]
         body, consts, reading = None, (), operands
-        if name == "shard_map" and math.prod(params["mesh"].shape[axis]
+        if primitive is primitives.shard_map_p and math.prod(params["mesh"].shape[axis]
                                              for axis in params["newly_manual_axes"]) == 1:
-            body = params["jaxpr"]
-        elif name == "pallas_call" and params["interpret"]:
+            (body,) = bodies(equation)
+        elif primitive is pallas_call_p and params["interpret"]:
             run = functools.partial(interpreter(params.pop("interpret")), **params)
             traced = jax.make_jaxpr(run)(*(value.aval for value in equation.invars))
             body, consts = traced.jaxpr, traced.consts
-        elif name == "cond" and params.get("branches_platforms") is not None:
-            branch = params["branches"][platform_branch(params["branches_platforms"], lowering)]
+        elif primitive is jax.lax.cond_p and params.get("branches_platforms") is not None:
+            branch = branches(equation)[platform_branch(params["branches_platforms"], lowering)]
             body, consts, reading = branch.jaxpr, branch.consts, operands[1:]
-        elif name == "scan" and params["length"] == 1 and not params["jaxpr"].jaxpr.effects:
+        elif primitive is jax.lax.scan_p and params["length"] == 1 and not scan_body(equation).jaxpr.effects:
             inner, returned = once(equation, operands, lowering, made)
             equations.extend(inner)
             renamed.update(zip(equation.outvars, returned, strict=True))
@@ -150,7 +163,7 @@ def once(equation: jcore.JaxprEqn, operands: Sequence[jcore.Var | jcore.Literal]
     reading = list(operands)
     for at, value in zip(stacked, sliced, strict=True):
         reading[at] = value
-    body = params["jaxpr"]
+    body = scan_body(equation)
     inner, returned = inlined(compiled(body.jaxpr, lowering, made), reading, body.consts)
     _, turned = params["ft_out"].update(range(len(returned))).unpack()
     restacked, stacks = reshaped([returned[at] for at in turned],
@@ -232,7 +245,7 @@ def gradients_read(program: jcore.Jaxpr, read: Sequence[frozenset[int]]) -> list
 def evaluable(equation: jcore.JaxprEqn) -> bool:
     """Whether XLA's evaluator computes `equation` to find an offset: no side effect, no custom call and
     no device index, in it or any program it runs (`UNEVALUATED`)."""
-    return (not equation.effects and named(equation.primitive) not in UNEVALUATED
+    return (not equation.effects and equation.primitive not in UNEVALUATED
             and all(evaluable(inner) for body in bodies(equation) for inner in body.eqns))
 
 
@@ -280,27 +293,28 @@ class Slicing:
         counting: list[jcore.JaxprEqn] = []
         counted = {self.counter} if self.counter is not None else set()
         for equation in program.eqns:
-            name = named(equation.primitive)
+            primitive = equation.primitive
             reads = [value for value in equation.invars if computed(value)]
-            if name == "slice" and _static_slice(equation):
+            if primitive is jax.lax.slice_p and _static_slice(equation):
                 sliced.update(equation.outvars)
-            elif name in ("dynamic_slice", "dynamic_update_slice") and self._annotated(equation, counting):
-                if name == "dynamic_slice":
+            elif (primitive in (jax.lax.dynamic_slice_p, jax.lax.dynamic_update_slice_p)
+                  and self._annotated(equation, counting)):
+                if primitive is jax.lax.dynamic_slice_p:
                     sliced.update(equation.outvars)
                 elif equation.outvars[0] in program.outvars and computed(equation.invars[1]):
                     updated.update(_bitcast_sources(equation.invars[1], producers, readers))
             elif bitcast(equation) and reads and reads[0] in sliced:
                 sliced.update(equation.outvars)
-            elif (reads and all(read in counted for read in reads) and name not in ("scan", "while", "cond")
+            elif (reads and all(read in counted for read in reads) and not control_flow(primitive)
                   and evaluable(equation)):
                 counted.update(equation.outvars)
                 counting.append(equation)
         # A transpose a matmul reads is folded into its dimensions (`TransposeFolding`,
         # xla/service/transpose_folding.cc, which folds a dot's operand that is itself a transpose).
-        folded = {out for equation in program.eqns if named(equation.primitive) == "transpose"
+        folded = {out for equation in program.eqns if equation.primitive is jax.lax.transpose_p
                   and computed(equation.invars[0]) and equation.invars[0] in sliced
                   for out in equation.outvars
-                  if all(named(reader.primitive) == "dot_general" for reader in readers.get(out, ()))}
+                  if all(reader.primitive is jax.lax.dot_general_p for reader in readers.get(out, ()))}
         return dataclasses.replace(self, sliced=frozenset(sliced | folded), updated=frozenset(updated))
 
     def _annotated(self, equation: jcore.JaxprEqn, counting: Sequence[jcore.JaxprEqn]) -> bool:
@@ -308,7 +322,7 @@ class Slicing:
         and aligned, its offsets literals or computed from the loop's counter alone, whose byte offsets
         over the loop's turns, clamped as the slice clamps them or not, step evenly."""
         whole = dimensions(equation.invars[0])
-        updating = named(equation.primitive) == "dynamic_update_slice"
+        updating = equation.primitive is jax.lax.dynamic_update_slice_p
         part = dimensions(equation.invars[1] if updating else equation.outvars[0])
         itemsize = _itemsize(equation.invars[0])
         if not contiguous_aligned(whole, part, itemsize):
@@ -342,7 +356,7 @@ class Slicing:
         of its stacked inputs, the update of each stacked output into the buffer the loop returns, and
         its first carry where its turns count it by one from a literal (the counter a `fori_loop` over
         fixed bounds carries), over its turns; nothing for any other program."""
-        if named(equation.primitive) != "scan":
+        if equation.primitive is not jax.lax.scan_p:
             return Slicing()
         _, carried, stacked = equation.params["ft_in"].update(body.invars).unpack()
         _, started, _ = equation.params["ft_in"].update(equation.invars).unpack()
@@ -355,7 +369,7 @@ class Slicing:
         counter, turns = None, ()
         counting = carried and returned and carried[0].aval.dtype == np.int32
         if counting and isinstance(started[0], jcore.Literal):
-            stepped = any(step.outvars == [returned[0]] and named(step.primitive) == "add"
+            stepped = any(step.outvars == [returned[0]] and step.primitive is jax.lax.add_p
                           and step.invars[0] is carried[0] and isinstance(step.invars[1], jcore.Literal)
                           and step.invars[1].val == 1 for step in body.eqns)
             if stepped:
@@ -449,11 +463,11 @@ def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, t
         operands = list(map(read, equation.invars))
         # A product with its bias, as the derivation reads a sum XLA's GEMM computes (`biased`): the
         # product of the first two, plus the third.
-        biased = named(equation.primitive) == "dot_general" and len(operands) == 3
+        biased = equation.primitive is jax.lax.dot_general_p and len(operands) == 3
         out = host_evaluated(equation.primitive, operands[:2] if biased else operands, equation.params)
         if out is None:
             # A counter's arithmetic over integers and literals is this host's constant on every program.
-            raise ValueError(f"a loop's offset reads {named(equation.primitive)}, no constant of this host")
+            raise ValueError(f"a loop's offset reads {equation.primitive.name}, no constant of this host")
         values.update(zip(equation.outvars, [out[0] + operands[2]] if biased else out, strict=True))
     return [int(read(offset)) for offset in offsets]
 
@@ -532,7 +546,7 @@ def biased(program: jcore.Jaxpr) -> jcore.Jaxpr:
     dropped: set[int] = set()
     replaced: dict[int, jcore.JaxprEqn] = {}
     for equation in program.eqns:
-        if named(equation.primitive) not in ("add", "add_any") or len(equation.invars) != 2:
+        if equation.primitive not in (jax.lax.add_p, primitives.add_jaxvals_p) or len(equation.invars) != 2:
             continue
         out = equation.outvars[0]
         first, second = equation.invars
@@ -571,14 +585,14 @@ def folded(program: jcore.Jaxpr) -> jcore.Jaxpr:
     dropped: set[int] = set()
     replaced: dict[int, list[jcore.JaxprEqn]] = {}
     for equation in program.eqns:
-        if named(equation.primitive) not in ("add", "add_any") or len(equation.invars) != 2:
+        if equation.primitive not in (jax.lax.add_p, primitives.add_jaxvals_p) or len(equation.invars) != 2:
             continue
         first, second = equation.invars
         for scattered, other in ((first, second), (second, first)):
             if not isinstance(scattered, jcore.Var):
                 continue
             scatter = producers.get(scattered)
-            if (scatter is None or named(scatter.primitive) != "scatter-add" or readers[scattered] != 1
+            if (scatter is None or scatter.primitive is not jax.lax.scatter_add_p or readers[scattered] != 1
                     or scattered.aval != equation.outvars[0].aval or id(scatter) in dropped):
                 continue
             base, *rest = scatter.invars
@@ -603,7 +617,8 @@ def zero(value: jcore.Var | jcore.Literal, producers: Mapping) -> bool:
     unstacked."""
     producer = producers.get(value) if isinstance(value, jcore.Var) else None
     while producer is not None and producer.invars and (
-            named(producer.primitive) in ("broadcast_in_dim", "convert_element_type") or bitcast(producer)):
+            producer.primitive in (jax.lax.broadcast_in_dim_p, jax.lax.convert_element_type_p)
+            or bitcast(producer)):
         value = producer.invars[0]
         producer = producers.get(value) if isinstance(value, jcore.Var) else None
     return isinstance(value, jcore.Literal) and not np.any(np.asarray(value.val))
@@ -619,7 +634,7 @@ def zeros_added(program: jcore.Jaxpr) -> jcore.Jaxpr:
     for equation in program.eqns:
         operands = [renamed.get(value, value) if isinstance(value, jcore.Var) else value
                     for value in equation.invars]
-        if named(equation.primitive) in ("add", "add_any") and len(operands) == 2:
+        if equation.primitive in (jax.lax.add_p, primitives.add_jaxvals_p) and len(operands) == 2:
             first, second = operands
             out = equation.outvars[0]
             for added, other in ((first, second), (second, first)):
@@ -659,7 +674,7 @@ def deduplicated(program: jcore.Jaxpr) -> jcore.Jaxpr:
     kept = []
     for equation in program.eqns:
         operands = [renamed.get(value, value) if computed(value) else value for value in equation.invars]
-        own = (equation.effects or named(equation.primitive) == "optimization_barrier"
+        own = (equation.effects or equation.primitive is jax.lax.optimization_barrier_p
                or any(map(callable, equation.params.values())))
         key = None if own else (parameters_key(equation.primitive, equation.params),
                                 tuple(map(operand_key, operands)))
@@ -683,7 +698,7 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
     `--xla_gpu_gemm_rewrite_size_threshold`; `IsDotSupportedByClassicalEmitters`, matmul_utils.cc). A
     product XLA's Triton GEMM fusions take instead takes none, which this does not tell apart: it
     holds the workspace."""
-    if named(equation.primitive) != "dot_general":
+    if equation.primitive is not jax.lax.dot_general_p:
         return False
     (left_contracting, right_contracting), (left_batch, right_batch) = equation.params["dimension_numbers"]
     left, right = dimensions(equation.invars[0]), dimensions(equation.invars[1])

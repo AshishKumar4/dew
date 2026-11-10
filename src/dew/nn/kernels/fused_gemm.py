@@ -202,16 +202,16 @@ def priced(region: Region, target: generation.GpuTarget) -> tuple[float | None, 
 
 def _chain(consumer, values, acc) -> cost.Work:
     """The consumers' elementwise work on the whole product: each equation of their program an operation an
-    element of its result, a special function's on the special-function units (the algebra's one
-    classification of them, `dew.algebra.cost.EXPONENTIALS`), a conversion's apart."""
+    element of its result, one the special-function units evaluate on them (the algebra's declaration of
+    it, `dew.algebra.terms.Operation.exponential`), a conversion's apart."""
     closed = jax.make_jaxpr(consumer)(values, acc)
     work = cost.Work()
     for eqn in closed.jaxpr.eqns:
         elements = float(sum(math.prod(shape) for var in eqn.outvars
                              if (shape := getattr(var.aval, 'shape', None)) is not None))
-        name = eqn.primitive.name
-        work = work + (cost.Work(exponentials=elements) if name in algebra_cost.EXPONENTIALS
-                       else cost.Work(conversions=elements) if name == 'convert_element_type'
+        spoken = algebra.terms.OPERATIONS.get(eqn.primitive)
+        work = work + (cost.Work(exponentials=elements) if spoken is not None and spoken.exponential
+                       else cost.Work(conversions=elements) if eqn.primitive is jax.lax.convert_element_type_p
                        else cost.Work(operations=elements))
     return work
 
@@ -393,7 +393,7 @@ def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):
 
 
 def _inlined(closed, *args):
-    """`closed` evaluated with every call (`dew.nn.programs.CALLS`: a jitted, checkpointed or
+    """`closed` evaluated with every call (`dew.nn.programs.called`: a jitted, checkpointed or
     custom-derivative call, as Dew's own norms are) read through to its body, so the split sees a norm's
     statistics however its producer wraps them: their values are their bodies'; their derivatives stay the
     producer's (`_whole_jvp`)."""
@@ -435,7 +435,7 @@ def _staged(closed, *arrays):
     return jax_core.jaxpr_as_fun(closed)(*arrays)[0]
 
 
-VIEWS = frozenset({'broadcast_in_dim', 'reshape', 'squeeze', 'expand_dims', 'convert_element_type'})
+VIEWS = (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.convert_element_type_p)
 """The equations that only reshape, broadcast or cast one array: an input viewed through them is the
 stage's to read (a norm's weight broadcast to a row), not a computed value."""
 
@@ -454,7 +454,7 @@ def _tile_stage(jaxpr, out, shape: tuple) -> tuple[list, list]:
         chain = []
         while var not in given:
             eqn = producers.get(var)
-            if eqn is None or eqn.primitive.name not in VIEWS or not isinstance(eqn.invars[0], jax_core.Var):
+            if eqn is None or eqn.primitive not in VIEWS or not isinstance(eqn.invars[0], jax_core.Var):
                 return None
             chain.append(eqn)
             var = eqn.invars[0]

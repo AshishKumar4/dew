@@ -1768,7 +1768,7 @@ def _passes_cotangent(epilogue, count: int, at: int, acc: jax.ShapeDtypeStruct, 
     closed, cotangents = _epilogue_vjp(epilogue, count, acc, sides)
     var = closed.jaxpr.outvars[at]
     producers = {out: equation for equation in closed.jaxpr.eqns for out in equation.outvars}
-    while var in producers and producers[var].primitive.name == 'convert_element_type':
+    while var in producers and producers[var].primitive is jax.lax.convert_element_type_p:
         var = producers[var].invars[0]
     if var not in cotangents:
         return False

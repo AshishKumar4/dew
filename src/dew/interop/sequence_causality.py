@@ -8,16 +8,16 @@ position each entry of each value may read: a value the tokens reach holds an ax
 entries read up to their own latest positions (`Reads`), or reads up to one everywhere. Every rule joins
 what its operands read, and the latest of a join is the largest of theirs, so the latest alone decides
 causality as the whole set of positions read would. Slices, concatenations, pads, reversals, gathers by
-indices the program computes without the tokens, reshapes, broadcasts, cumulative operations,
-convolutions and scans (step by step, their carries and initial state included) each move those
-positions as they move the entries; a contraction, reduction, sort or selection across the positions'
-axis gives every entry the latest of all, as does any operation the walk holds no rule for (`_RULES`,
-`_ENTRYWISE`). Dew's causal attention (`CAUSAL_ATTENTION`) gives each query its own position's latest
-and its keys' up to its own; attention under a visibility its caller states (`STATED_ATTENTION`) gives
-each position its own query's, key's and value's, the caller's visibility being the call's and not the
-source's; a computation Dew states is token by token (`TOKENWISE`) gives each token its own. Each of
-these three holds for a call of a program Dew's own code bound under it (`attested`), identified as that
-very program and never by a name; a call of any other program is walked inside (`dew.nn.programs.CALLS`).
+indices the program computes without the tokens, reshapes, broadcasts, cumulative operations, convolutions and
+scans (step by step, their carries and initial state included) each move those positions as they move the
+entries; a contraction, reduction, sort or selection across the positions' axis gives every entry the latest
+of all, as does any operation the walk holds no rule for (`_RULES`, `dew.nn.programs.positionwise`). Dew's
+causal attention (`CAUSAL_ATTENTION`) gives each query its own position's latest and its keys' up to its own;
+attention under a visibility its caller states (`STATED_ATTENTION`) gives each position its own query's, key's
+and value's, the caller's visibility being the call's and not the source's; a computation Dew states is token
+by token (`TOKENWISE`) gives each token its own. Each of these three holds for a call of a program Dew's own
+code bound under it (`attested`), identified as that very program and never by a name; a call of any other
+program is walked inside (`dew.nn.programs.called`).
 Every position is an over-approximation: the walk may refuse a causal program, never admit a later
 read. A program is causal where every positional output's entry at a
 position reads no later one; another length's or another call's program may differ (a branch taken on
@@ -28,15 +28,27 @@ from __future__ import annotations
 import dataclasses
 import math
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core
+from jax.extend.core import primitives
 
 from dew.nn.nested import nested
-from dew.nn.programs import CALLS, CUMULATIVE, ENTRYWISE, KEYS, REDUCTIONS, bodies, jax_name, on_host
+from dew.nn.programs import (
+    bodies,
+    branches,
+    called,
+    cumulative,
+    loop_programs,
+    on_host,
+    positionwise,
+    reduction,
+    scan_body,
+    scatter,
+)
 
 CAUSAL_ATTENTION = "causal attention"
 """The rule of a program tier 3's attention runs (`torchax_fallback._dew_attention`, `attested`), causal
@@ -165,6 +177,24 @@ def _small_integer(value) -> bool:
             and math.prod(value.shape) <= CONCRETE)
 
 
+type _Rule = Callable[[_Walk, core.JaxprEqn, list[Held], list[np.ndarray | None]], list[Held]]
+
+_RULES: dict[core.Primitive, _Rule] = {}
+"""The walk's rule for each operation it knows, by JAX's primitive object: what each of its results' entries
+reads of its operands'. The reductions, the cumulative ones and the scatters take their classes' rules
+(`dew.nn.programs.reduction`, `cumulative`, `scatter`); an operation that maps over its operands' positions
+(`positionwise`, a key's among them) keeps their positions' axis; any other gives every entry the latest of
+what its operands read."""
+
+
+def _rule(*operations: core.Primitive) -> Callable[[_Rule], _Rule]:
+    """Registers a walk's rule for `operations`."""
+    def registered(rule: _Rule) -> _Rule:
+        _RULES.update(dict.fromkeys(operations, rule))
+        return rule
+    return registered
+
+
 class _Walk:
     def __init__(self, length: int):
         self.length = length
@@ -196,18 +226,19 @@ class _Walk:
 
     def equation(self, eqn: core.JaxprEqn, given: list[Held],
                  operands: list[np.ndarray | None]) -> tuple[list[Held], list[np.ndarray | None]]:
-        name = eqn.primitive.name
-        if name in CALLS:
+        primitive = eqn.primitive
+        if primitive.inlined_call:
             return _call(self, eqn, given, operands)
         if not any(isinstance(value, Reads) for value in given):
             return [None] * len(eqn.outvars), self.evaluated(eqn, operands)
-        # Any operation but a call by its object: another's of a lax name reads its operands whole.
-        known = jax_name(eqn.primitive)
-        rule = None if known is None else _RULES.get(known)
+        # An operation is known by its object: one of another library's reads its operands whole, whatever
+        # its name.
+        rule = _RULES.get(primitive) or (_reduce if reduction(primitive) else _cumulative if cumulative(
+            primitive) else _scatter if scatter(primitive) else None)
         if rule is not None:
             return rule(self, eqn, given, operands), [None] * len(eqn.outvars)
         shape = _shape(eqn.outvars[0])
-        if known in _ENTRYWISE and all(_shape(var) == shape for var in eqn.outvars) and all(
+        if positionwise(primitive) and all(_shape(var) == shape for var in eqn.outvars) and all(
                 _fits(_shape(var), shape) for var, value in zip(eqn.invars, given, strict=True)
                 if isinstance(value, Reads)):
             return [_combined(given, shape)] * len(eqn.outvars), [None] * len(eqn.outvars)
@@ -271,9 +302,8 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
           operands: list[np.ndarray | None]) -> tuple[list[Held], list[np.ndarray | None]]:
     """A call of a program of its own: a jit of a program Dew's code bound under a rule (`attested`) by
     that rule, any other walked inside."""
-    program = eqn.params.get("jaxpr")
-    rule = (_ATTESTED.get(program) if eqn.primitive.name in ("jit", "pjit")
-            and isinstance(program, core.Jaxpr) else None)
+    program = called(eqn)
+    rule = _ATTESTED.get(program) if eqn.primitive is primitives.jit_p and program is not None else None
     if rule in (CAUSAL_ATTENTION, STATED_ATTENTION) and any(isinstance(value, Reads) for value in given):
         return _attended(eqn, given, causal=rule == CAUSAL_ATTENTION), [None] * len(eqn.outvars)
     if rule == TOKENWISE and any(isinstance(value, Reads) for value in given):
@@ -283,13 +313,10 @@ def _call(walk: _Walk, eqn: core.JaxprEqn, given: list[Held],
             latest = np.maximum.reduce([value.latest for value in aligned])
             return [Reads(0, latest)] * len(eqn.outvars), [None] * len(eqn.outvars)
         return [_flat(given)] * len(eqn.outvars), [None] * len(eqn.outvars)
-    inner = next(iter(bodies(eqn)), None)
-    if inner is None:
+    if program is None:
         return [_flat(given) if any(given) else None] * len(eqn.outvars), [None] * len(eqn.outvars)
-    closed = next((value for value in eqn.params.values() if isinstance(value, core.Jaxpr)), None)
-    consts = [] if closed is None else [np.asarray(const) if _small_integer(const) else None
-                                        for const in closed.consts]
-    return walk.run(inner, given, operands, consts)
+    consts = [np.asarray(const) if _small_integer(const) else None for const in program.consts]
+    return walk.run(program, given, operands, consts)
 
 
 def _attended(eqn: core.JaxprEqn, given: list[Held], *, causal: bool) -> list[Held]:
@@ -315,6 +342,7 @@ def _attended(eqn: core.JaxprEqn, given: list[Held], *, causal: bool) -> list[He
             for var in eqn.outvars]
 
 
+@_rule(jax.lax.broadcast_in_dim_p)
 def _broadcast_in_dim(walk: _Walk, eqn, given, operands) -> list[Held]:
     value, dims, out = given[0], eqn.params["broadcast_dimensions"], _shape(eqn.outvars[0])
     assert isinstance(value, Reads)
@@ -325,6 +353,7 @@ def _broadcast_in_dim(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(axis, latest)]
 
 
+@_rule(jax.lax.reshape_p)
 def _reshape(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
     assert isinstance(value, Reads)
@@ -400,6 +429,7 @@ class _RangeMax:
         return np.where(whole, self.last, out)
 
 
+@_rule(jax.lax.squeeze_p)
 def _squeeze(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
     assert isinstance(value, Reads)
@@ -411,6 +441,7 @@ def _squeeze(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(value.axis - sum(1 for dim in dims if dim < value.axis), value.latest)]
 
 
+@_rule(jax.lax.transpose_p)
 def _transpose(walk: _Walk, eqn, given, operands) -> list[Held]:
     value, order = given[0], tuple(eqn.params["permutation"])
     assert isinstance(value, Reads)
@@ -434,6 +465,7 @@ def _cumulative(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(value.axis, np.maximum.accumulate(value.latest))]
 
 
+@_rule(jax.lax.dot_general_p)
 def _dot_general(walk: _Walk, eqn, given, operands) -> list[Held]:
     (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params["dimension_numbers"]
     ranks = len(_shape(eqn.invars[0])), len(_shape(eqn.invars[1]))
@@ -463,6 +495,7 @@ def _dot_general(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(base.axis, np.maximum(base.latest, extra))]
 
 
+@_rule(jax.lax.conv_general_dilated_p)
 def _conv(walk: _Walk, eqn, given, operands) -> list[Held]:
     lhs, rhs = given[0], given[1]
     if isinstance(rhs, Reads) or not isinstance(lhs, Reads) or lhs.axis is None:
@@ -489,6 +522,7 @@ def _conv(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(out_spec[2 + spatial], rows)]
 
 
+@_rule(jax.lax.slice_p)
 def _slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
     assert isinstance(value, Reads)
@@ -500,6 +534,7 @@ def _slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(value.axis, value.latest[start:limit:step])]
 
 
+@_rule(jax.lax.rev_p)
 def _rev(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
     assert isinstance(value, Reads)
@@ -508,6 +543,7 @@ def _rev(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(value.axis, value.latest[::-1])]
 
 
+@_rule(jax.lax.pad_p)
 def _pad(walk: _Walk, eqn, given, operands) -> list[Held]:
     value, padding = given[0], given[1]
     if isinstance(padding, Reads) or not isinstance(value, Reads) or value.axis is None:
@@ -521,6 +557,7 @@ def _pad(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(value.axis, rows)]
 
 
+@_rule(jax.lax.concatenate_p)
 def _concatenate(walk: _Walk, eqn, given, operands) -> list[Held]:
     dimension = eqn.params["dimension"]
     axes = {value.axis for value in given if isinstance(value, Reads)}
@@ -535,6 +572,7 @@ def _concatenate(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(dimension, np.concatenate(rows))]
 
 
+@_rule(jax.lax.dynamic_slice_p)
 def _dynamic_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
     if not isinstance(value, Reads) or any(isinstance(start, Reads) for start in given[1:]):
@@ -549,6 +587,7 @@ def _dynamic_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(value.axis, value.latest[first:first + size])]
 
 
+@_rule(jax.lax.dynamic_update_slice_p)
 def _dynamic_update_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     base, update = given[0], given[1]
     if any(isinstance(start, Reads) for start in given[2:]):
@@ -574,6 +613,7 @@ def _dynamic_update_slice(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [Reads(axis, rows)]
 
 
+@_rule(jax.lax.gather_p)
 def _gather(walk: _Walk, eqn, given, operands) -> list[Held]:
     """A gather: by indices the walk holds, each output entry reads the operand rows it takes, moved
     to the output's axis that decides them; by indices the tokens reach (an embedding's lookup), each
@@ -615,6 +655,7 @@ def _decided(ids: np.ndarray, latest: np.ndarray) -> Reads:
     return _everywhere(int(read.max(initial=NONE))) if best is None else best
 
 
+@_rule(jax.lax.sort_p)
 def _sort(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = _combined(given, _shape(eqn.invars[0]))
     if value.axis == eqn.params["dimension"]:
@@ -622,6 +663,7 @@ def _sort(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [value] * len(eqn.outvars)
 
 
+@_rule(jax.lax.top_k_p)
 def _top_k(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
     assert isinstance(value, Reads)
@@ -630,6 +672,7 @@ def _top_k(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [value] * len(eqn.outvars)
 
 
+@_rule(jax.lax.split_p)
 def _split(walk: _Walk, eqn, given, operands) -> list[Held]:
     value = given[0]
     assert isinstance(value, Reads)
@@ -684,13 +727,14 @@ def _same(first: Held, second: Held) -> bool:
     return first.axis == second.axis and np.array_equal(first.latest, second.latest)
 
 
+@_rule(jax.lax.scan_p)
 def _scan(walk: _Walk, eqn, given, operands) -> list[Held]:
     """A scan: over the positions (a scanned input the tokens reach on its axis 0), step by step in its
     order, each step's output reading its carry, which holds its initial state's reads and every earlier
     step's, and that step's inputs; over any other axis, its body walked until its carried reads settle."""
     params = eqn.params
     consts, carries = _scan_groups(eqn)
-    body = params["jaxpr"].jaxpr
+    body = scan_body(eqn).jaxpr
     fixed, carried = list(given[:consts]), list(given[consts:consts + carries])
     xs = list(given[consts + carries:])
     length = params["length"]
@@ -726,25 +770,25 @@ def _scan(walk: _Walk, eqn, given, operands) -> list[Held]:
     return [*final, *ys]
 
 
+@_rule(jax.lax.while_p)
 def _while(walk: _Walk, eqn, given, operands) -> list[Held]:
     params = eqn.params
     cond_consts, body_consts = params["cond_nconsts"], params["body_nconsts"]
     carried = list(given[cond_consts + body_consts:])
-    body = params["body_jaxpr"].jaxpr
+    predicate, body = (program.jaxpr for program in loop_programs(eqn))
     # Its state on exit, after any number of passes, none included.
     out, _ = _settled(walk, body, list(given[cond_consts:cond_consts + body_consts]), carried, [],
                       [None] * len(body.invars))
-    cond, _ = walk.run(params["cond_jaxpr"].jaxpr, [*given[:cond_consts], *out],
-                       [None] * len(params["cond_jaxpr"].jaxpr.invars))
+    cond, _ = walk.run(predicate, [*given[:cond_consts], *out], [None] * len(predicate.invars))
     if any(isinstance(value, Reads) for value in [*cond, *given[:cond_consts]]):
         # How many passes run is the tokens' to decide: every carried entry may read every one.
         return [_flat([*given, *out])] * len(out)
     return out
 
 
+@_rule(jax.lax.cond_p)
 def _cond(walk: _Walk, eqn, given, operands) -> list[Held]:
-    branches = eqn.params["branches"]
-    outs = [walk.run(branch.jaxpr, given[1:], operands[1:])[0] for branch in branches]
+    outs = [walk.run(branch.jaxpr, given[1:], operands[1:])[0] for branch in branches(eqn)]
     merged = []
     for values in zip(*outs, strict=True):
         held: Held = None
@@ -755,22 +799,3 @@ def _cond(walk: _Walk, eqn, given, operands) -> list[Held]:
         # The branch is the tokens' to choose: every entry may read what chose it.
         return [_flat([value, given[0]]) for value in merged]
     return merged
-
-
-_ENTRYWISE = ENTRYWISE | KEYS
-"""The operations whose every output entry reads its operands' entries at its own index (over operands
-broadcast to its shape) and nothing else, a key's among them: the walk keeps their positions' axis. Any
-operation it holds no rule for gives every entry the latest of what its operands read."""
-
-type _Rule = Callable[[_Walk, core.JaxprEqn, list[Held], list[np.ndarray | None]], list[Held]]
-
-_RULES: Mapping[str, _Rule] = {
-    "broadcast_in_dim": _broadcast_in_dim, "reshape": _reshape, "squeeze": _squeeze, "transpose": _transpose,
-    **dict.fromkeys(REDUCTIONS, _reduce), **dict.fromkeys(CUMULATIVE, _cumulative),
-    "dot_general": _dot_general, "conv_general_dilated": _conv, "gather": _gather, "sort": _sort,
-    "top_k": _top_k, "slice": _slice, "rev": _rev, "pad": _pad, "concatenate": _concatenate,
-    "dynamic_slice": _dynamic_slice, "dynamic_update_slice": _dynamic_update_slice, "split": _split,
-    **dict.fromkeys(("scatter", "scatter-add", "scatter_add", "scatter-mul", "scatter_mul", "scatter-min",
-                     "scatter_min", "scatter-max", "scatter_max", "scatter_apply"), _scatter),
-    "scan": _scan, "while": _while, "cond": _cond,
-}

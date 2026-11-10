@@ -760,7 +760,8 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
         if equation.primitive is jax.lax.dot_general_p:
             made = projection_product(product, given[0], given[1], params["dimension_numbers"],
                                       params["precision"], params["preferred_element_type"])
-        elif equation.primitive.name == "ragged_dot_general" and params.get("group_offset") is None:
+        elif (equation.primitive is core.primitives.ragged_dot_general_p
+              and params.get("group_offset") is None):
             made = projection_product(
                 functools.partial(jax.lax.ragged_dot_general, out_sharding=params.get("out_sharding")),
                 given[0], given[1], params["ragged_dot_dimension_numbers"], params["precision"],
