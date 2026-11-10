@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import sys
 import types
 from pathlib import Path
 
@@ -40,7 +39,6 @@ import numpy as np
 import torch
 from reference_source import fetched, ran, selected, stub_torch_utils
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import replaced
 
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"

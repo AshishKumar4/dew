@@ -31,7 +31,7 @@ under their Diffusers pipelines' `load_lora_weights`.
         > ~/.cache/dew/reference-venvs/peft/lib/python3.12/site-packages/dew-env.pth
     uv pip install --python ~/.cache/dew/reference-venvs/peft/bin/python --no-deps peft==0.21.2
     JAX_PLATFORMS=cpu PYTHONPATH=src python tools/lora_export_reference.py export
-    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_export_reference.py consume
+    PYTHONPATH=src ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_export_reference.py consume
 """
 
 from __future__ import annotations

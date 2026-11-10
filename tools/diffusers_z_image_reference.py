@@ -38,7 +38,6 @@ from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import RELEASES
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]

@@ -15,7 +15,6 @@ src/_dew_torch/precision.py's `float64`, so every float32 pin of the published c
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +22,6 @@ import torch
 from reference_source import definitions
 from torch.nn.utils.spectral_norm import SpectralNorm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64
 
 ROOT = "https://raw.githubusercontent.com/autonomousvision/stylegan-t/36ab80ce76237fefe03e65e9b3161c040ae888e3/"

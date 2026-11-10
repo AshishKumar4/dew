@@ -36,8 +36,6 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 ROOT = Path(__file__).resolve().parents[1]
 ARCHIVE = ROOT / "tests" / "fixtures" / "qwen_image_source.tar.xz"
 GRID = (4, 6)

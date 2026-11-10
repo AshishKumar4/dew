@@ -18,8 +18,6 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.inputs import DenoisingCondition
 from dew.sampling.walks import sample
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 ROWS = 256
 """Each walk's independent rows, so its distance from float64 is an RMS over many roundings."""
 STEPS = 4

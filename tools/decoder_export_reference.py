@@ -42,8 +42,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.state import TrainState
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2
 SEED = 3

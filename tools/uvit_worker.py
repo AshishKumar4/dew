@@ -22,14 +22,11 @@ from __future__ import annotations
 
 import importlib
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import package, published_files
 from reference_worker import drawn, serve
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO, COMMIT = "baofff/U-ViT", "ce551708dc9cde9818d2af7d84dfadfeb7bd9034"
 FILES = {

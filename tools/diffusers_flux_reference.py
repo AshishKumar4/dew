@@ -35,7 +35,6 @@ import torch
 from diffusers_reference_helpers import recording, restore_transformers_names, saved_pipeline
 from diffusers_sd3_reference import bundle, clip_tokenizers, t5_tokenizer
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64
 
 BASE = dict(patch_size=1, in_channels=16, num_layers=2, num_single_layers=2,

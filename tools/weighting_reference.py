@@ -31,13 +31,10 @@ Run with Torch 2.14.0 CPU and NumPy:
 
 import argparse
 import importlib
-import sys
 from functools import partial
 from pathlib import Path
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 RECORDED = FIXTURES / "weighting" / "recorded_weights.npz"

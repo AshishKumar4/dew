@@ -76,8 +76,6 @@ from kimi_k3_reference import (
 )
 from reference_source import config_lookups, hub_modules, record_padding
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 REVISION = "e1df551a447157d4658b573f9a695d57658590e9"
 REMOTE = ("configuration_kimi.py", "modeling_kimi.py")

@@ -35,8 +35,6 @@ import numpy as np
 import torch
 import transformers
 from hf_reference import FIXTURES, transformers_record, write_tiny
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers.models.mamba2.configuration_mamba2 import Mamba2Config
 from transformers.models.mamba2.modeling_mamba2 import (
     Mamba2ForCausalLM,
