@@ -23,7 +23,7 @@ import threading
 from collections.abc import Callable, Hashable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import overload
+from typing import TYPE_CHECKING, overload
 
 import jax
 import tokamax
@@ -34,6 +34,10 @@ from jax.extend.mlir import ir
 
 from dew import communicators
 from dew.nn.kernels import generation
+
+if TYPE_CHECKING:
+    from dew.nn.kernels.templates.resources import RegisterModel
+
 
 SHARED_REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a program one of whose Triton kernels asks more shared memory than a block holds,
@@ -91,6 +95,10 @@ class Launch:
     op: str
     config: Hashable
     padded: float | None = None
+    kernels: dict[str, "RegisterModel"] = dataclasses.field(default_factory=dict, compare=False)
+    """Each kernel the launch traced that stated its register model as it was named (`named`'s `model`), by
+    its name less the launch's suffix (`kernel_of`'s): the decision the compile point checks the kernel's
+    registers against."""
 
 
 @dataclasses.dataclass
@@ -212,18 +220,24 @@ def relaunched(digest: str | None) -> Iterator[None]:
 
 
 @overload
-def named(name: str) -> str: ...
+def named(name: str, *, model: "RegisterModel | None" = None) -> str: ...
 
 
 @overload
-def named(name: None) -> str | None: ...
+def named(name: None, *, model: "RegisterModel | None" = None) -> str | None: ...
 
 
-def named(name: str | None) -> str | None:
+def named(name: str | None, *, model: "RegisterModel | None" = None) -> str | None:
     """A kernel's name carrying the launch tracing it (`launching`; `kernel` for an unnamed one), as is
-    where none is."""
+    where none is; its register `model`, where given, recorded on that launch (`Launch.kernels`)."""
     digest = launch_digest()
-    return name if digest is None else launch_name(name or "kernel", digest)
+    if digest is None:
+        return name
+    kernel = name or "kernel"
+    if model is not None:
+        with _GUARD:
+            _LAUNCHES[digest].kernels[kernel] = model
+    return launch_name(kernel, digest)
 
 
 def launch_name(kernel: str, launch: str | None) -> str:

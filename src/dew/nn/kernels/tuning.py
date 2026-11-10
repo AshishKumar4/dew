@@ -705,7 +705,10 @@ class KernelOp(tokamax.Op):
                                                         for leaf, array in zip(leaves, held, strict=True)])
             if "interpret" in kwargs:
                 kwargs = {**kwargs, "interpret": False}
-            return self._fwd(*args, config=config, **kwargs)[0]
+            # Traced as a call of it is (`__call__`): its kernels carry the launch's digest, and the register
+            # models they state are the launch's (`report.Launch.kernels`).
+            with report.launching(self, ba, config):
+                return self._fwd(*args, config=config, **kwargs)[0]
 
         return fn, tuple(jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
                          for leaf, array in zip(leaves, held, strict=True) if array)

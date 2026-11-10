@@ -751,11 +751,12 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
             _compiled(case, generation, record, directory)
             kernels = mosaic_kernels(record)
             lowered_models = _lowered_models(record, kernels, generation, models)
-            # Each kernel's model: its lowered launch's, else the case's declared one for its name.
+            # Each kernel's model: its lowered launch's, else the one its launch stated as it traced, else the
+            # case's declared one for its name (`_declared`).
             modelled = {}
             for kernel in kernels:
                 name = report.launch_name(kernel["kernel"], kernel["launch"])
-                if (model := lowered_models.get(name, models.get(kernel["kernel"]))) is not None:
+                if (model := lowered_models.get(name, _declared(kernel, models))) is not None:
                     modelled[name] = model
             needs = _needs(directory, generation, modelled)
             compiled = _compiled_reports(directory, generation)
@@ -777,6 +778,14 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
     return found
 
 
+def _declared(kernel: dict, models: dict[str, resources.RegisterModel]) -> resources.RegisterModel | None:
+    """A compiled kernel's register model: the one its launch stated as this process traced it
+    (`report.Launch.kernels`), else the case's for its name (`case.models`: launches that state none)."""
+    launch = None if kernel["launch"] is None else report.traced(kernel["launch"])
+    stated = None if launch is None else launch.kernels.get(kernel["kernel"])
+    return stated if stated is not None else models.get(kernel["kernel"])
+
+
 def _lowered_models(record: dict, kernels: list[dict], generation: str,
                     declared: dict[str, resources.RegisterModel]) -> dict[str, resources.RegisterModel]:
     target = gpu_target(generation)
@@ -788,7 +797,7 @@ def _lowered_models(record: dict, kernels: list[dict], generation: str,
             continue
         if len(launches) != 1:
             raise ValueError(f"{name} has {len(launches)} launches but one compiled report")
-        stated = declared.get(kernel["kernel"])
+        stated = _declared(kernel, declared)
         if stated is None or stated.family is None:
             continue
         launch = LoweredRegisters(**launches[0])
