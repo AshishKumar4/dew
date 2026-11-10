@@ -12,8 +12,8 @@ read them alike.
 """
 
 import dataclasses
-from collections.abc import Mapping
-from typing import ClassVar, NamedTuple
+from collections.abc import Callable, Mapping
+from typing import Any, ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -63,15 +63,16 @@ class _Launch(tuning.KernelOp):
         rows = {spec.shape[-1]: spec.shape[0] for spec in specs if spec.dtype == jnp.int32 and spec.ndim == 2}
         if not rows:
             return arrays
-        # A launch reads chunk descriptors `[NT, 4]`, sequence ones `[N, 5]` or both: a packed call's
-        # NT is the tokens' chunks and one more for each of its N sequences (`sequences`).
-        chunks, count = rows.get(4), rows.get(5)
+        # A launch reads chunk descriptors `[NT, 4]` (`ChunkSpan`), sequence ones `[N, 8]` (`Span`) or both:
+        # a packed call's NT is the tokens' chunks and one more for each of its N sequences (`sequences`).
+        chunk_width, span_width = len(ChunkSpan._fields), len(Span._fields)
+        chunks, count = rows.get(chunk_width), rows.get(span_width)
         if chunks in (None, batch * -(-length // 64)) and count in (None, batch):
             drawn = sequences(batch, length)
         else:
             count = chunks - -(-batch * length // 64) if count is None else count
             drawn = sequences(batch, length, _even(batch, length, count))
-        return [jnp.asarray(drawn.chunks if spec.shape[-1] == 4 else drawn.spans)
+        return [jnp.asarray(drawn.chunks if spec.shape[-1] == chunk_width else drawn.spans)
                 if spec.dtype == jnp.int32 and spec.ndim == 2 else array
                 for spec, array in zip(specs, arrays, strict=True)]
     NAME: ClassVar[str]
@@ -114,14 +115,58 @@ def _wide() -> bool:
     return (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
 
 
+class Span(NamedTuple):
+    """A sequence's row of `Sequences.spans`, its one declaration: its first token and count, the slot its
+    second chunk enters less one (`base`), the slots its first chunk enters and its last leaves, the call's
+    memory it takes and gives back (`h0`'s and the final's index), and whether it takes it and gives it
+    back (1 or 0)."""
+
+    first: Any
+    count: Any
+    base: Any
+    entered: Any
+    left: Any
+    memory: Any
+    takes: Any
+    gives: Any
+
+
+class ChunkSpan(NamedTuple):
+    """A chunk's row of `Sequences.chunks`, its one declaration: its first token and count (`taken`), and
+    the slots of the stored memories it enters and leaves."""
+
+    start: Any
+    taken: Any
+    entered: Any
+    left: Any
+
+
+def packed(record: NamedTuple, xp=jnp):
+    """`record`'s fields, each `[N]`, as an int32 table `[N, F]` in its declaration's order (`Span`,
+    `ChunkSpan`, ...): the one statement a table's writer (`packed`) and its readers (`unpacked`,
+    `column`) derive its layout from."""
+    return xp.stack(record, axis=1).astype(np.int32)
+
+
+def unpacked(declared: type, at: Callable[[int], Any]):
+    """A table's row as its declaration `declared` (a `NamedTuple` of its columns, `packed`), each field
+    read by `at(column)`: a ref's row's scalar loads in a kernel, or an array's columns."""
+    return declared(*(at(i) for i in range(len(declared._fields))))
+
+
+def column(declared: type, name: str) -> int:
+    """Field `name`'s column in a table `declared` lays out (`packed`)."""
+    return declared._fields.index(name)
+
+
 class Sequences(NamedTuple):
     """The token spans fla's varlen kernels read (its `cu_seqlens`, `chunk_indices` and `chunk_offsets`,
-    fla/ops/utils/index.py) over the `[B * T]` tokens of a call's rows. `chunks` `[NT, 4]` is each
-    chunk's first token and count, in order, a chunk never crossing a sequence and those past the
-    last empty, then the slots of the stored memories (`slots`) it enters and leaves; `spans`
-    `[N, SPAN]` is each sequence's first token and count, the slot its second chunk enters less one,
-    the slots its first chunk enters and its last leaves, the call's memory it takes and gives back
-    (`h0`'s and the final's index), and whether it takes it and gives it back. Sequences never cross
+    fla/ops/utils/index.py) over the `[B * T]` tokens of a call's rows. `chunks` `[NT, 4]`
+    (`ChunkSpan`) is each chunk's first token and count, in order, a chunk never crossing a sequence and
+    those past the last empty, then the slots of the stored memories (`slots`) it enters and leaves;
+    `spans` `[N, 8]` (`Span`) is each sequence's first token and count, the slot its second chunk enters
+    less one, the slots its first chunk enters and its last leaves, the call's memory it takes and gives
+    back (`h0`'s and the final's index), and whether it takes it and gives it back. Sequences never cross
     rows, so a row's first sequence takes its initial memory and its last gives its final one.
 
     The memories are stored by where they pass, not by chunk: one slot for each that passes between
@@ -138,10 +183,6 @@ def _passing(batch: int, length: int, chunk: int, packed: bool) -> int:
     """The slots of the memories passing between two chunks of a sequence (`Sequences`): each row's
     chunks less its first where the sequences are the rows, else at most every token's chunks."""
     return -(-batch * length // chunk) if packed else batch * (-(-length // chunk) - 1)
-
-
-SPAN = 8
-"""The columns of a sequence's span (`Sequences.spans`)."""
 
 
 def slots(spans: Sequences, batch: int, length: int, chunk: int = 64) -> int:
@@ -185,9 +226,8 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
     taken = xp.where(real, xp.minimum(chunk, first[owner] + lengths[owner] - start), 0)
     entering = xp.where(within > 0, base[owner] + within, entered[owner])
     leaving = xp.where(within + 1 < sizes[owner], base[owner] + within + 1, left[owner])
-    return Sequences(xp.stack([start, taken, entering, leaving], axis=1).astype(np.int32),
-                     xp.stack([first, lengths, base, entered, left, memory, takes, gives],
-                              axis=1).astype(np.int32))
+    return Sequences(packed(ChunkSpan(start, taken, entering, leaving), xp),
+                     packed(Span(first, lengths, base, entered, left, memory, takes, gives), xp))
 
 
 def spanned(launch, *operands, chunk: int, spans: Sequences | None, **options):
@@ -235,7 +275,7 @@ def _chunk_of(chunk_ref, chunk: int, aligned: bool):
     starts on a multiple of `chunk`, as fla's fixed-length chunks do: the count is the constant
     `chunk`, so its loads and stores take no mask (`read_rows`), and Triton is told the alignment. A
     packed document's chunks start anywhere and end where it does, as fla's varlen ones."""
-    start, taken = chunk_ref[0], chunk_ref[1]
+    start, taken = chunk_ref[column(ChunkSpan, "start")], chunk_ref[column(ChunkSpan, "taken")]
     return (pl.multiple_of(start, chunk), chunk) if aligned else (start, taken)
 
 
@@ -300,16 +340,15 @@ def _flat(*arrays):
     return tuple(x.reshape(x.shape[0] * x.shape[1], *x.shape[2:]) for x in arrays)
 
 
-def _span(span_ref, length: int, chunk: int, aligned: bool):
-    """A sequence's first token, count, base slot and the slots its first chunk enters and its last
-    leaves (`Sequences.spans`), the call's memory it takes and gives back, and whether it takes it (its
-    row's initial memory, or its document's) and gives it back (its row's final memory, or its
-    document's). `aligned` as `_chunk_of`."""
-    start, count, base, entered, left, memory, takes, gives = (span_ref[i] for i in range(SPAN))
+def _span(span_ref, length: int, chunk: int, aligned: bool) -> Span:
+    """A sequence's row of `Sequences.spans` (`Span`), whether it takes its memory (its row's initial one,
+    or its document's) and gives it back (its row's final one, or its document's) as booleans. `aligned`
+    as `_chunk_of`."""
+    span = unpacked(Span, span_ref.__getitem__)
     if aligned:
         # The rows' own spans: each `length` long, whole chunks from a multiple of `chunk`.
-        start, count = pl.multiple_of(start, chunk), length
-    return start, count, base, entered, left, memory, takes == 1, gives == 1
+        span = span._replace(first=pl.multiple_of(span.first, chunk), count=length)
+    return span._replace(takes=span.takes == 1, gives=span.gives == 1)
 
 
 @jax.tree_util.register_dataclass

@@ -33,8 +33,9 @@ from dew.nn import derivatives
 from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
-    SPAN,
+    ChunkSpan,
     Sequences,
+    Span,
     Tiles,
     _aligned,
     _chunk_of,
@@ -46,6 +47,7 @@ from dew.nn.kernels.chunked_launch import (
     _row,
     _rows,
     _span,
+    column,
     laid,
     read_rows,
     sequences,
@@ -309,7 +311,9 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, gl_ref, h_ref, corre
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
-    start, count, base, entered, _, memory, takes, gives = _span(span_ref, length, chunk, aligned)
+    span = _span(span_ref, length, chunk, aligned)
+    start, count, base, entered = span.first, span.count, span.base, span.entered
+    memory, takes, gives = span.memory, span.takes, span.gives
     slices = k_ref.shape[-1] // 64
 
     @pl.when(count > 0)
@@ -386,7 +390,7 @@ class ChunkFwdH(_Launch):
             functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, SPAN), lambda i_v, sh: (sh // value_heads, 0)),
+            in_specs=[pl.BlockSpec((None, len(Span._fields)), lambda i_v, sh: (sh // value_heads, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0)),
                       pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
@@ -434,7 +438,9 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, g
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
-    start, count, base, _, left, memory, takes, gives = _span(span_ref, length, chunk, aligned)
+    span = _span(span_ref, length, chunk, aligned)
+    start, count, base, left = span.first, span.count, span.base, span.left
+    memory, takes, gives = span.memory, span.takes, span.gives
     slices = k_ref.shape[-1] // 64
     chunks = -(-count // chunk)
 
@@ -552,8 +558,8 @@ class ChunkBwdDhu(_Launch):
                               exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, SPAN), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
-                      pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
+            in_specs=[pl.BlockSpec((None, len(Span._fields)), lambda i_v, sh: (sh // value_heads, 0)), keys,
+                      keys, pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
                       gated, rows, values, values, gated],
             out_specs=[pl.BlockSpec((held, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v)),
                        rows,
@@ -699,7 +705,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
     are a loop, not unrolled, so a program holds one head's accumulators at a time. The memory the
     chunk enters and its gradient where it leaves are read at their slots (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered, left = chunk_ref[2], chunk_ref[3]
+    entered, left = chunk_ref[column(ChunkSpan, "entered")], chunk_ref[column(ChunkSpan, "left")]
 
     @pl.when(taken > 0)
     def _():
@@ -1021,7 +1027,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, gl_ref, o_ref, *, ch
     hybrid's fp32 scores on an H100 sat 2.03 times their fp32 reference's distance from float64, 1.17
     at IEEE. The memory the chunk enters is read at its slot (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered = chunk_ref[2]
+    entered = chunk_ref[column(ChunkSpan, "entered")]
 
     @pl.when(taken > 0)
     def _():

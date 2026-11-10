@@ -16,6 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
+from dew.nn.kernels.chunked_launch import unpacked
 from dew.nn.kernels.templates import mosaic, product, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
@@ -25,6 +26,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
     Operand,
+    Walked,
     chunk_liveness,
     column_sums,
     column_sums_scratch,
@@ -514,7 +516,8 @@ def _first_decays(dg, run, dh0, taken=None):
     walk's)."""
     call = run.call
     shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.batch, -1)
-    first, sizes, row, begins = (run.sequences[:, i] for i in range(4))
+    walked = unpacked(Walked, lambda i: run.sequences[:, i])
+    first, sizes, row, begins = walked.first, walked.count, walked.row, walked.takes
     value = jnp.where((begins == 1)[:, None], shared[row], 0.0)
     index = jnp.where(sizes > 0, first * call.chunk, call.rows)
     dg = dg.at[index].set(value.astype(dg.dtype), mode="drop")

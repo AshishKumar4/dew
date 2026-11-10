@@ -49,6 +49,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Sequence
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -57,6 +58,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tuning
+from dew.nn.kernels.chunked_launch import column, unpacked
 from dew.nn.kernels.templates import bundles, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work, estimate
 from dew.nn.kernels.templates.operands import Issuer, Parts
@@ -1419,6 +1421,19 @@ def product_results(call: Call) -> str:
     return "tensor" if call.family.tensor_columns(call.chunk, 1) else "registers"
 
 
+class Walked(NamedTuple):
+    """A sequence's row of the template's walks' table `[N, 5]` (`chunk_forward._layout`), its one
+    declaration: its first chunk and its chunks, the row whose memory it enters and leaves, and whether it
+    takes that memory and gives it back (1 or 0; `chunked_launch.Span`'s `takes` and `gives`, its row's
+    where it begins and ends its row)."""
+
+    first: Any
+    count: Any
+    row: Any
+    takes: Any
+    gives: Any
+
+
 def fp32_operand(call: Call) -> Operand:
     """The form of the launches' fp32 gradients between them: one fp32 part, a row a token."""
     return Operand(call.rows, 1, jnp.dtype(jnp.float32))
@@ -2027,7 +2042,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
         table_refs, (h_ref, *outputs), stored_ref = program_refs(table, refs)
         corrected_ref, final_ref = outputs if stores_corrected else (None, *outputs)
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
+        sequence = unpacked(Walked, lambda i: seq_ref[s, i])
+        first, count, row = sequence.first, sequence.count, sequence.row
+        begins, ends = sequence.takes, sequence.gives
         roled = role_tiles(staging, landing, walkers)
 
         def memory(base, i):
@@ -2141,7 +2158,7 @@ def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Opera
     return launch_kernel(program, call, out_type=out_type, grid=(value_width // walked_width, sequences,
                                                                  call.heads),
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                         live=lambda at, refs: refs[7][at["sequences"], 1] > 0,
+                         live=lambda at, refs: refs[7][at["sequences"], column(Walked, "count")] > 0,
                          work=Work(flops=4 * chunk * width * walked_width * steps, span=steps),
                          consumers=tiles.walkers, staging=staging,
                          held=table_held(_states_held(call, values, keys, bv), call, table, bv),
@@ -2219,7 +2236,9 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
         skip_ref = refs[:skipped]
         table_refs, (o_ref, final_ref), stored_ref = program_refs(table, refs[skipped:])
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
+        sequence = unpacked(Walked, lambda i: seq_ref[s, i])
+        first, count, row = sequence.first, sequence.count, sequence.row
+        begins, ends = sequence.takes, sequence.gives
         roled = role_tiles(staging, landing, walkers)
 
         def memory(base, i):
@@ -2356,7 +2375,8 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
     return launch_kernel(program, call, out_type=out_type,
                          grid=(call.value_width // walked_width, sequences, call.heads),
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                         live=lambda at, refs: refs[8][at["sequences"], 1] > 0, work=work,
+                         live=lambda at, refs: refs[8][at["sequences"], column(Walked, "count")] > 0,
+                         work=work,
                          consumers=walkers, staging=staging,
                          held=table_held(_scan_held(call, keys, keys, bv), call, table, bv),
                          once=initials, landing=landing, after=after, reduces=held.parts > 1,

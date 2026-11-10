@@ -601,8 +601,9 @@ def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np
         documents = length if max_segments is None else max_segments
         table = chunked_launch.sequences(1, length, np.asarray(cu_seqlens(starts, documents + 1)),
                                          chunk=chunk).chunks
-    table = np.asarray(table)[:, :2]
-    return table[table[:, 1] > 0]
+    chunks = chunked_launch.unpacked(chunked_launch.ChunkSpan, lambda i: np.asarray(table)[:, i])
+    kept = chunks.taken > 0
+    return np.stack([chunks.start[kept], chunks.taken[kept]], axis=1)
 
 
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,

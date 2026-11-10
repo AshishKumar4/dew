@@ -38,7 +38,9 @@ from dew.nn import derivatives
 from dew.nn.kernels import fla_gdn, launches, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
+    ChunkSpan,
     Sequences,
+    Span,
     Tiles,
     _aligned,
     _chunk_of,
@@ -49,10 +51,12 @@ from dew.nn.kernels.chunked_launch import (
     _picks,
     _row,
     _rows,
+    column,
     laid,
     read_rows,
     sequences,
     spanned,
+    unpacked,
     write_rows,
 )
 from dew.nn.kernels.fla_gdn import _dot, _weighted_values
@@ -349,7 +353,7 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, lo_ref, o_ref, *, ch
     them (`fla_gdn._o_kernel`), the memory the chunk enters read at its slot (`Sequences`); the queries'
     decay of the separated prefix (`algebra.raised`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered = chunk_ref[2]
+    entered = chunk_ref[column(ChunkSpan, "entered")]
 
     @pl.when(taken > 0)
     def _():
@@ -507,7 +511,7 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
     and `last`, each token's term through the range from it to the chunk's last (the keys' write into the
     memory leaving), which `bwd_intra` sums token by token with the chunk's pairs (row 551)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered, left = chunk_ref[2], chunk_ref[3]
+    entered, left = chunk_ref[column(ChunkSpan, "entered")], chunk_ref[column(ChunkSpan, "left")]
 
     @pl.when(taken > 0)
     def _():
@@ -950,7 +954,8 @@ def first_decay_grad(dg, h0, dh0, spans: Sequences):
     exactly). The gated delta rule's port sums each token's own terms instead
     (`fla_gdn._summed_back`), which give it exactly."""
     batch, length = dg.shape[:2]
-    first, count, memory, takes = (spans.spans[:, i] for i in (0, 1, 5, 6))
+    span = unpacked(Span, lambda i: spans.spans[:, i])
+    first, count, memory, takes = span.first, span.count, span.memory, span.takes
     shared = jnp.sum(h0.astype(jnp.float32) * dh0, axis=-1)
     value = jnp.where((takes == 1)[:, None, None], shared[memory], 0.0)
     flat = dg.reshape(batch * length, *dg.shape[2:])

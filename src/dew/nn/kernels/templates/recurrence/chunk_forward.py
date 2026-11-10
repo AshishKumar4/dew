@@ -19,6 +19,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Operand,
     Tiles,
+    Walked,
     _intra,
     _intra_solve,
     _parts,
@@ -44,17 +45,17 @@ def zero_padded(x, axis: int, size: int):
 
 def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=None, *, chunk: int):
     """A call's tokens `chunk` at a time: `(chunks, taken [chunks], sequences [N, 5], laid, unlaid)`, each
-    chunk's tokens, each sequence's first chunk, chunks, the memory it enters and leaves and whether it
-    takes that memory and gives it back (`chunked_launch.Sequences`' spans: its row's where it begins and
-    ends its row; `_states`), and the maps from `[B, T, ...]` to the chunks' rows
+    chunk's tokens, each sequence's walk (`Walked`; `_states`), and the maps from `[B, T, ...]` to the
+    chunks' rows
     `[chunks * C, ...]` (a chunk's rows past its tokens zero) and back. An aligned call's chunks are its
     rows' own, unmoved."""
     tokens = batch * length
     if starts is None and length % chunk == 0:
         chunks = tokens // chunk
         # Each row one sequence, entering its memory and leaving it.
-        sequences = np.stack([np.arange(batch) * (length // chunk), np.full(batch, length // chunk),
-                              np.arange(batch), np.ones(batch), np.ones(batch)], 1)
+        sequences = chunked_launch.packed(Walked(np.arange(batch) * (length // chunk),
+                                                 np.full(batch, length // chunk), np.arange(batch),
+                                                 np.ones(batch), np.ones(batch)), np)
 
         return (chunks, jnp.full((chunks,), chunk, jnp.int32), jnp.asarray(sequences, jnp.int32),
                 lambda x: x.reshape(tokens, *x.shape[2:]), lambda x: x.reshape(batch, length, *x.shape[1:]))
@@ -64,16 +65,16 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
         most = length if max_segments is None else max_segments
         spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (most + 1), firsts),
                                          chunk=chunk)
-    table, seqs = jnp.asarray(spans.chunks), jnp.asarray(spans.spans)
-    chunks, taken = table.shape[0], table[:, 1]
-    count = seqs[:, 1]
-    sizes = -(-count // chunk)
-    live = count > 0
-    memory, takes, gives = seqs[:, 5], live & (seqs[:, 6] == 1), live & (seqs[:, 7] == 1)
-    sequences = jnp.stack([jnp.cumsum(sizes) - sizes, sizes, memory, takes, gives], 1).astype(jnp.int32)
+    table = chunked_launch.unpacked(chunked_launch.ChunkSpan, lambda i: jnp.asarray(spans.chunks)[:, i])
+    span = chunked_launch.unpacked(chunked_launch.Span, lambda i: jnp.asarray(spans.spans)[:, i])
+    chunks, taken = table.taken.shape[0], table.taken
+    sizes = -(-span.count // chunk)
+    live = span.count > 0
+    sequences = chunked_launch.packed(Walked(jnp.cumsum(sizes) - sizes, sizes, span.memory,
+                                             live & (span.takes == 1), live & (span.gives == 1)))
     place = jnp.arange(chunk)
     real = (place[None, :] < taken[:, None]).reshape(-1)
-    index = jnp.where(real, (table[:, :1] + place[None, :]).reshape(-1), tokens)
+    index = jnp.where(real, (table.start[:, None] + place[None, :]).reshape(-1), tokens)
     rows = jnp.zeros((tokens,), jnp.int32).at[index].set(jnp.arange(chunks * chunk, dtype=jnp.int32),
                                                          mode="drop")
 
