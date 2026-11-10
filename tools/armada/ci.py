@@ -2080,17 +2080,30 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # Each test's file and group (`<file>#G/N`; none, a whole file).
     parts = {name: name.partition("#")[::2] for name in tests}
 
+    # A group the tier cut by its own seconds holds tests another cut's group of its name did not: its
+    # file's whole measured run, which holds any group of it, is its measure (2026-11-10: a group measured
+    # holding two tests was given their pool when it held five, one asking more than the pool).
+    cut = bool(os.environ.get("DEW_SPLIT_DURATIONS"))
+
     def needs(name: str) -> dict | None:
-        return recorded(record_key(python, row(python, *parts[name]), held), token)
+        file, group = parts[name]
+        return recorded(record_key(python, row(python, file, "" if cut else group), held), token)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(tests, pool.map(needs, tests), strict=True))
     # A group no run on this class measured borrows its whole file's measure, which holds at least its own.
     borrowed = borrowed_records(sorted({parts[name][0] for name, found in records.items() if found is None}),
                                 python, held, token)
-    needed = {name: gpu_needs(records[name] or borrowed.get(parts[name][0]), budget) for name in tests}
+    measures = {name: records[name] or borrowed.get(parts[name][0]) for name in tests}
+    needed = {name: gpu_needs(measures[name], budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
+    # A file measured holding more than the lane's share is given all of it, and its row says so: what it
+    # was admitted at is the lane's reservation, not its need (2026-11-10: a 5.9 GiB need given a 4 GiB lane
+    # without a word, and its run out of memory read as the test's).
+    short = {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below its measured need of "
+                   f"{need / 2 ** 30:.1f} GiB"
+             for name in tests if (need := gpu_needs(measures[name], math.inf)[1]) > budget}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
@@ -2120,7 +2133,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
             for future in done:
                 future.result()
                 del running[future]
-    rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
+    rows = [{**verdict, "output": f"{short[name]}\n{verdict.get('output', '')}"} if name in short else verdict
+            for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
     return 0
 
