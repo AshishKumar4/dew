@@ -8,7 +8,7 @@ into an accumulator's column vector (`rows_read`)."""
 import math
 from collections.abc import Callable
 
-from jax import numpy as jnp
+from jax import dtypes, numpy as jnp
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
@@ -30,7 +30,7 @@ row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU inde
 def swizzle_columns(dtype, swizzle: int) -> int:
     """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
     slice a load of a block swizzled along that axis takes (a packed dtype's two a byte)."""
-    return swizzle * 8 // resources.element_bits(dtype)
+    return swizzle * 8 // dtypes.itemsize_bits(dtype)
 
 
 def swizzle_for(dtype, *contractions: int) -> int:

@@ -1082,7 +1082,8 @@ def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows():
     ("sm80", False), ("sm86", False), ("sm89", True), ("sm90", True), ("sm100", True), ("sm120", True),
     ("v6e", False), ("cpu", False)])
 def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores):
-    """Capability 8.9 and later multiplies FP8, whether or not the target table names the generation."""
+    """Capability 8.9 and later multiplies FP8 (its architecture states an 8-bit rate), whether or not the
+    target table names the generation."""
     assert fp8_tensor_cores(generation) is cores
 
 

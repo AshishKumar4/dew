@@ -287,6 +287,12 @@ class Architecture:
         """Whether the device issues Hopper's warpgroup MMA."""
         return 'wgmma' in self.issuers
 
+    @property
+    def fp8(self) -> bool:
+        """Whether its tensor instructions multiply FP8 operands: it states an '8bit' rate (Ada's, Hopper's,
+        Blackwell's), as PTX's e4m3 and e5m2 conversions require too."""
+        return '8bit' in self.tensor_rates
+
 
 # Tensor FLOPs per clock per multiprocessor are a datasheet's dense peak over SMs x boost clock: A100 312 TF
 # bf16 -> 2048, TF32 156 -> 1024; A10 125/62.5 -> 1024/512; L4 121/60 -> 1024/512; H100 SXM 989/495 ->
@@ -912,9 +918,10 @@ def shared_budget(target: GpuTarget) -> int:
 
 
 def fp8_tensor_cores(generation: str) -> bool:
-    """Whether a CUDA generation's tensor cores multiply FP8: compute capability 8.9 (Ada) and later."""
-    found = capability(generation)
-    return found is not None and found >= (8, 9)
+    """Whether `generation`'s tensor cores multiply FP8 (`Architecture.fp8`); none outside every family Dew
+    knows."""
+    found = architecture(generation)
+    return found is not None and found.fp8
 
 
 def device_generation() -> str:

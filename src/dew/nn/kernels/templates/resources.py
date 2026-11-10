@@ -327,20 +327,9 @@ def _semaphore(leaf) -> bool:
     return jnp.issubdtype(leaf.dtype, jax.dtypes.extended)
 
 
-PACKED_BITS = {jnp.dtype(jnp.float4_e2m1fn): 4, jnp.dtype(jnp.int4): 4, jnp.dtype(jnp.uint4): 4}
-"""The dtypes Mosaic GPU stores two to a byte (their `itemsize` reads 1), by their bits: an E2M1 operand of
-Blackwell's block-scaled products' (row 4519's NVFP4 arm)."""
-
-
-def element_bits(dtype) -> int:
-    """The bits an element of `dtype` takes in memory: its itemsize's, but a packed dtype's
-    (`PACKED_BITS`)."""
-    return PACKED_BITS.get(jnp.dtype(dtype), jnp.dtype(dtype).itemsize * 8)
-
-
 def stored_bytes(shape: tuple, dtype) -> int:
     """The bytes an array of `shape` and `dtype` takes in memory, a packed dtype's two elements a byte."""
-    return math.prod(shape) * element_bits(dtype) // 8
+    return math.prod(shape) * jax.dtypes.itemsize_bits(dtype) // 8
 
 
 def scratch_bytes(family: "Family", scope: Scope) -> int:
@@ -622,7 +611,7 @@ def _planned(launches, family: "Family", target, programs: int | None) -> tuple[
 def widest_swizzle(dtype, columns: int) -> int:
     """The widest swizzle, in bytes, a row of `columns` elements of `dtype` fills (`plgpu.find_swizzle`): the
     one a block staged at its rows' width takes, as layout inference and jax's Ampere examples stage it."""
-    return plgpu.find_swizzle(columns * element_bits(dtype))
+    return plgpu.find_swizzle(columns * jax.dtypes.itemsize_bits(dtype))
 
 
 def addresses(tiles) -> int:
