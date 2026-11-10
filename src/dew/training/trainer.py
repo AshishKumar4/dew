@@ -94,7 +94,7 @@ from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
 from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
-from dew.training._candidates import Stepping, candidate_for, lowered_for, prepared_for
+from dew.training._candidates import Stepping, StepSettings, candidate_for, lowered_for, prepared_for
 from dew.training._fit import (
     Emptied,
     FitArguments,
@@ -187,6 +187,7 @@ from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorde
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
+from dew.training.staging import fetched_state
 from dew.training.startup import Startup, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
@@ -376,9 +377,16 @@ class Trainer(Generic[Loss, Effects]):
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
-        if self._optimizer is None:
-            raise ValueError("an OptimConfig is built over the run's length, which only fit(steps=...) gives")
-        return self._optimizer
+        """The optimizer the run's steps commit with, once built over its length
+        (`StepSettings.optimizer`)."""
+        return self._settings().optimizer
+
+    def _settings(self) -> StepSettings[Loss, Effects]:
+        """What this trainer states of the step it compiles, as it stands (`StepSettings`): the one place a
+        compile reads them from."""
+        return StepSettings(self.objective, self._optimizer, self.layout, self.device_mesh, self.accumulation,
+                            self.step, self.dynamic_scale, self.diloco, self.tune_kernels, self.inspection,
+                            self.microbatches, self.record)
 
     # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
@@ -527,8 +535,10 @@ class Trainer(Generic[Loss, Effects]):
     def _stepping(self) -> Stepping[Loss, Effects]:
         """What a fit search's candidates read of this trainer beside its public fields, as it stands
         (`dew.training._candidates.Stepping`)."""
-        return Stepping(self, self._loss_shape, self._staging, self._initialize_accumulation,
-                        self._model_batch, self._model_shapes, self._step_body, self._fetched, self._prefetch,
+        return Stepping(self._settings(), self._step_key(), self.shardings, self._loss_shape, self._staging,
+                        self._initialize_accumulation,
+                        self._model_batch, self._model_shapes, self._step_body,
+                        functools.partial(fetched_state, layout=self.layout), self._prefetch,
                         self._examples, self._traced_on, self._rows, self._split)
 
     @functools.cached_property

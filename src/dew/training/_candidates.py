@@ -41,20 +41,63 @@ from dew.training.stages import StageLocal
 from dew.training.transaction import COMMIT_FIELDS, consumed_where_made, outcome, pooled_by_mean
 
 if TYPE_CHECKING:
-    from dew.training.trainer import Trainer
+    import optax
+
+    from dew.distributed.placement import Layout, Placement
+    from dew.objectives.base import Objective
+    from dew.training.diloco import DiLoCo
+    from dew.training.inspection import Inspection
+
+
+@dataclasses.dataclass(frozen=True)
+class StepSettings[LossT, EffectsT]:
+    """What a run states of the step it compiles, as its trainer holds it when it compiles
+    (`Trainer._settings`): its objective, its optimizer once built (`optimizer`), its layout and device
+    mesh, the steps a commit pools (`accumulation`), a custom step, its loss scaler, DiLoCo, whether it
+    tunes its kernels, its inspection, the microbatches a pipelined step feeds and whether its steps record
+    what they read."""
+
+    objective: Objective[LossT, EffectsT]
+    built_optimizer: optax.GradientTransformation | None
+    layout: Layout
+    device_mesh: Mesh
+    accumulation: int
+    step: Callable | None
+    dynamic_scale: bool
+    diloco: DiLoCo | None
+    tune_kernels: bool
+    inspection: Inspection | None
+    microbatches: int
+    record: bool
+
+    @property
+    def optimizer(self) -> optax.GradientTransformation:
+        """The optimizer a step commits with, once the run built it over its length."""
+        if self.built_optimizer is None:
+            raise ValueError("an OptimConfig is built over the run's length, which only fit(steps=...) gives")
+        return self.built_optimizer
+
+    @property
+    def host_master(self) -> bool:
+        """Whether the host holds the variables themselves (a CPU-owned run)."""
+        return "variables" in self.layout.host
 
 
 @dataclasses.dataclass(frozen=True)
 class Stepping[LossT, EffectsT]:
-    """What a fit search's candidates read of the run beside its trainer's public fields, as the trainer
-    stands as it plans (`Trainer._stepping`): its loss's traced shapes (`loss_shape`), where its step keeps
+    """What a fit search's candidates read of the run, as it stands as it plans (`Trainer._stepping`): the
+    run's settings (`StepSettings`), the value its step traces from beside its arguments (`step_key`,
+    `Trainer._step_key`), where it places a state (`shardings`), its loss's traced shapes (`loss_shape`),
+    where its step keeps
     a pipelined run (`staging`), its window's accumulation (`initialize_accumulation`), its model's batch
     and its shapes (`model_batch`, `model_shapes`), its step's body (`step_body`) and the fields it fetches
     (`fetched`), the batches it prefetches (`prefetch`), the examples clock it runs on (`examples`), the
     mesh it traces on (`traced_on`), and the rows and split its batches are cut in (`rows`, `split`): read
-    here, none off the trainer's private members (row 4555)."""
+    here, none off the trainer itself (row 4555)."""
 
-    trainer: Trainer[LossT, EffectsT]
+    settings: StepSettings[LossT, EffectsT]
+    step_key: Hashable | None
+    shardings: Callable[[TrainState], Placement[TrainState]]
     loss_shape: Callable[..., tuple]
     staging: StageLocal
     initialize_accumulation: Callable[..., TrainState]
@@ -116,7 +159,7 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
     (`Trainer._step_key`; row 3873: each fit of a resumed run traced its step again, 6.5 to 12.9 s, and
     lowered it, 9 s), its pipeline's schedule the one its microbatches make; a trainer whose step no value
     states traces its own."""
-    stated = stepping.trainer._step_key()
+    stated = stepping.step_key
     # What the step traces from beside its arguments and the trainer's settings: the compiles' refusals
     # its kernels' derivation reads (a relowering after a spill reads its proposal's), and the context.
     key = None if stated is None else (
@@ -149,7 +192,7 @@ def _sampled[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], candidate: Ca
                               ) -> Callable[[], jax.stages.Lowered] | None:
     """The sampled step `candidate`'s reader lowers (`Candidate.sampled`), its own trainer's, as the step
     lowers, over the same arguments, for the same platforms: none without an inspection."""
-    if stepping.trainer.inspection is None:
+    if stepping.settings.inspection is None:
         return None
     watched = step_program(stepping, candidate.shapes, candidate.copies, candidate.shardings, placement,
                            replicated, split, sampled=True)
@@ -174,10 +217,10 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     `footprint`, the one its derivation traced, which it keeps (`FitSearch.footprints`). One whose
     executable is a step compiled ahead derives none (not `derived`): its compile judged the
     derivation where it was compiled, and a run handed it does none of that work on its devices."""
-    trainer = stepping.trainer
+    settings = stepping.settings
     micro = microbatch_shapes(batch, split)
     shapes, copies, prepared = prepared_for(stepping, state, micro, schedule, split, narrow)
-    shardings = trainer.shardings(prepared)
+    shardings = stepping.shardings(prepared)
     if mesh is not None:
         shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
                                  shardings)
@@ -204,10 +247,10 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
         *apart(prepared), given, part))
     # The bytes its host-resident commit fields hold at once are its own staged cut's
     # (`staging.measured`): read as the step is traced, by its lowering or, lowering none, a trace alone.
-    staging_measured = (trainer.step is None and mesh is None
-                        and bool(set(COMMIT_FIELDS) & set(trainer.layout.host)))
+    staging_measured = (settings.step is None and mesh is None
+                        and bool(set(COMMIT_FIELDS) & set(settings.layout.host)))
     with staging.measured() as cuts:
-        if trainer.tune_kernels and lowering and platforms is None:
+        if settings.tune_kernels and lowering and platforms is None:
             # The configs it measures are not the ones a derivation traced: its footprint is traced again.
             lowered, launches, footprint = *tuning.tune(lower, measure=True), None
         else:
@@ -215,11 +258,11 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
             lowered, launches = lower() if lowering else None, launches or "[]"
         if staging_measured and not lowering:
             jitted.trace(*apart(prepared), given, part)
-    window = split * trainer.accumulation
+    window = split * settings.accumulation
     if derived and footprint is None and shapes is not None and mesh is None:
         footprint = candidate_footprint(
-            trainer.objective, stepping.model_shapes(micro), window, prepared, held,
-            (local_devices(trainer.device_mesh) or [*trainer.device_mesh.devices.flat])[0], split,
+            settings.objective, stepping.model_shapes(micro), window, prepared, held,
+            (local_devices(settings.device_mesh) or [*settings.device_mesh.devices.flat])[0], split,
             functools.partial(consumes_where_made, stepping, prepared, micro, window, shapes),
             max(cuts, default=0), capacity)
     candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
@@ -233,9 +276,9 @@ def consumes_where_made[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], pr
     """Whether the step over `prepared` consumes each gradient where it is made
     (`transaction.consumed_where_made`), over the state its commit reads: under DiLoCo a group's own
     (`group_of`), not the outer optimizer's."""
-    trainer = stepping.trainer
+    settings = stepping.settings
     with group_of(prepared, micro) as (view, _):
-        return consumed_where_made(trainer.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
+        return consumed_where_made(settings.optimizer, view, window, shared=pooled_by_mean(shapes[0]),
                                    progressed=stepping.examples is not None)
 
 
@@ -245,19 +288,19 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
     the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
     `narrow` is off."""
-    trainer = stepping.trainer
-    window = split * trainer.accumulation
+    settings = stepping.settings
+    window = split * settings.accumulation
     with group_of(state, batch) as (view, rows):
-        traced, shapes = (None, None) if trainer.step is not None else stepping.loss_shape(
+        traced, shapes = (None, None) if settings.step is not None else stepping.loss_shape(
             view, rows, window, split)
     if shapes is not None:
-        stepping.staging.refuse_unpipelined(schedule, trainer.objective)
+        stepping.staging.refuse_unpipelined(schedule, settings.objective)
     prepared = windowed(lambda state, rows, *, shape_only: stepping.initialize_accumulation(
         state, rows, shapes, window=window, shape_only=shape_only), state, batch)
     # DiLoCo's groups read their own parameters, which no narrow copy shadows.
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
     # None), and a scaled loss's copies none.
-    narrows = narrow and traced is not None and not trainer.dynamic_scale and trainer.diloco is None
+    narrows = narrow and traced is not None and not settings.dynamic_scale and settings.diloco is None
     copies = narrow_copies(state, traced) if narrows else {}
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
@@ -272,14 +315,14 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
     (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
     it reads and neither donates nor returns, so the frozen arrays stay the ones the run (and the
     objective's held tree) holds, and no output copies them."""
-    trainer = stepping.trainer
+    settings = stepping.settings
     # The transaction brings the optimizer state and the EMA the layout keeps on the host to the device
     # once its gradient is ready (`Transaction.past`); a custom step, and every other field, reads them
     # from its start.
-    late = () if trainer.step is not None else tuple(set(COMMIT_FIELDS) & set(trainer.layout.host))
+    late = () if settings.step is not None else tuple(set(COMMIT_FIELDS) & set(settings.layout.host))
     body = stepping.step_body(shapes, copies, split, {field: getattr(shardings, field) for field in late},
                               sampled, shardings.variables["params"])
-    body = body if trainer.diloco is None else trainer.diloco.step(body, trainer.device_mesh, split)
+    body = body if settings.diloco is None else settings.diloco.step(body, settings.device_mesh, split)
     moving, frozen = apart(shardings)
 
     def step(current, held, batch, part):
@@ -287,7 +330,7 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
         # return the host-resident ones to pinned host memory.
         current = together(current, held)
         micro = microbatch(batch, part, split)
-        early = [field for field in trainer.layout.host if field not in late]
+        early = [field for field in settings.layout.host if field not in late]
         advanced, loss, aux, committed = body(stepping.fetched(current, shardings, early),
                                               stepping.model_batch(micro), part, batch_tokens(micro),
                                               micro.get(CLOSES_WINDOW))
@@ -308,14 +351,14 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tra
     objective at (`Trainer._at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
     the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
     A CPU-owned state's step realizes its parameters on the host as it runs, and is not lowered."""
-    trainer = stepping.trainer
-    if trainer.host_master:
+    settings = stepping.settings
+    if settings.host_master:
         raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                          "the variables on the host")
-    mesh = gpu_mesh(trainer.device_mesh, generation)
+    mesh = gpu_mesh(settings.device_mesh, generation)
     with assumed(generation), stepping.traced_on(mesh) as schedule:
         state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
-        split = splits(stepping.rows, batch, mesh, trainer.microbatches, stepping.split)[0]
+        split = splits(stepping.rows, batch, mesh, settings.microbatches, stepping.split)[0]
         placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
         return candidate_for(stepping, state, batch, schedule, placement, replicated, split, narrow, None,
                                mesh=mesh, platforms=('cuda',)).lowered

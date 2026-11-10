@@ -161,14 +161,14 @@ def fetched(tree, placement):
     return jax.device_put(tree, on_device(placement))
 
 
-def fetched_state(state, shardings, layout):
-    """`state` with the layout's host-resident fields brought to the device (`fetched`), where a step or an
-    evaluation reads them; as it is where the host holds the variables themselves (a CPU-owned run), whose
-    every read stays there."""
+def fetched_state(state, shardings, fields=None, *, layout):
+    """`state` with the layout's host-resident fields, or those of them among `fields`, brought to the device
+    (`fetched`), where a step or an evaluation reads them; as it is where the host holds the variables
+    themselves (a CPU-owned run), whose every read stays there."""
     if "variables" in layout.host:
         return state
     return dataclasses.replace(state, **{field: fetched(getattr(state, field), getattr(shardings, field))
-                                         for field in layout.host})
+                                         for field in layout.host if fields is None or field in fields})
 
 
 def staged(fn: Callable, resting, shardings, arguments: tuple, after) -> tuple:

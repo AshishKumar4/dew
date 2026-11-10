@@ -1152,7 +1152,7 @@ class Evaluator:
             return
         # A warming pass writes nothing; an evaluation writes what it scores where the run says where.
         kinds = {*((False,) if plan.evaluates_midway else ()), plan.scored_to is not None}
-        averaged = with_ema(state.variables, fetched_state(state, shardings, self.layout).ema)
+        averaged = with_ema(state.variables, fetched_state(state, shardings, layout=self.layout).ema)
         # The step the objective's schedules read, of the dtype `schedule_step` reads it in.
         counters = {name: np.ones(getattr(state, name).shape, getattr(state, name).dtype)
                     for name in ("microstep", "window_size")}
@@ -1231,7 +1231,7 @@ class Evaluator:
         if not warm:
             self.display.status("evaluating")
         mesh, params = self.mesh, state.variables
-        averaged = with_ema(state.variables, fetched_state(state, shardings, self.layout).ema)
+        averaged = with_ema(state.variables, fetched_state(state, shardings, layout=self.layout).ema)
         key = state.key
         if "variables" in self.layout.host:
             from dew.training.execution import HostExecution, stack_sites
