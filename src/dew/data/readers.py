@@ -350,13 +350,14 @@ class _PerShare(Forwarding):
 
 
 class _Statistics:
-    def __init__(self, counts: Mapping[str, CorpusCounts]):
+    def __init__(self, counts: Mapping[str, CorpusCounts], since: Mirrored):
         self._counts = counts
         self._published: list[_PublishedCounts] = []
         # A global-order read's positions, read for its loading workers' mirrors alone (`mirrored`).
         self._mirrored: list[_PublishedCounts] = []
-        # What this process's mirrors do from the run's start, not an earlier reader's (rows 5220, 5221).
-        self._own = Mirrored.now()
+        # What this process's mirrors do from the run's start, its measure's reads among them, not an
+        # earlier reader's (`since`, rows 5220, 5221, 5258).
+        self._own = since
 
     def observe(self, stream: _PerShare) -> None:
         self._published.append(stream._statistics)

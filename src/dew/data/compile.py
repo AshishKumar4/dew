@@ -152,6 +152,7 @@ from dew.data.sources.base import (
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
+from dew.data.storage import Mirrored
 
 _DEFAULT_LOADING = Loading()
 _TRAINING_LOADING = Loading(workers="auto")
@@ -640,6 +641,15 @@ class _Measured:
     held with it, its passes counted as it holds them (`Limit.passes`); None for neither."""
 
 
+@dataclasses.dataclass(frozen=True)
+class _TrainingMeasured(_Measured):
+    """A run's training read measured (`_training_measure`), with the mirror counters its run counts from:
+    taken before it read anything, as a memory read downloads its corpus as it is measured, before any
+    reader is built (rows 5220, 5258)."""
+
+    mirrored: Mirrored = dataclasses.field(kw_only=True)
+
+
 def _measure(
     branches: Sequence[Pipeline],
     read: Read,
@@ -754,7 +764,7 @@ def compile(
     resume: Literal["exact", "non-exact"] = "exact",
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
-    measured: _Measured | None = None,
+    measured: _TrainingMeasured | None = None,
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
@@ -818,19 +828,21 @@ def _bound_ends(pipeline: Pipeline) -> bool:
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
                       read: Read, provision: bool, loading: Loading, examples: int | None,
-                      epochs: int | None = None) -> _Measured:
+                      epochs: int | None = None, since: Mirrored | None = None) -> _TrainingMeasured:
     """A compile's training branch, and its `validation`, prepared through their source's own steps as
     the compile reads them (`_measure`): bounded to `examples`, a chain's own layout as written, before
     preparation could plan it into its source, and the objective's with its preparation; each corpus's
-    leading deterministic steps cached where the read is no stream; their counts filled."""
+    leading deterministic steps cached where the read is no stream; their counts filled. Its mirror counters
+    count from `since`, the start of the run that measures it (`fitted`), or from before it reads."""
     from dew.data.cache import automatic_root
 
+    since = Mirrored.now() if since is None else since
     written = None if examples is None or not _lays_out(train) else examples
     if written is not None:
         train = _bounded(train, written)
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
-    return _measure(
+    measured = _measure(
         (train,) if validation is None else (train, validation),
         read,
         provision=provision,
@@ -841,6 +853,8 @@ def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective
         examples=examples if written is None else None,
         epochs=epochs,
     )
+    return _TrainingMeasured(**{field.name: getattr(measured, field.name)
+                                for field in dataclasses.fields(measured)}, mirrored=since)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -859,6 +873,8 @@ class _Staged:
     passes: int | None = None
     """The source examples one pass of a training read bounded to its epochs holds (`_staged`); None for
     one not bounded so."""
+    mirrored: Mirrored = dataclasses.field(kw_only=True)
+    """The mirror counters its run counts from (`_TrainingMeasured.mirrored`)."""
 
 
 def _staged(
@@ -873,7 +889,7 @@ def _staged(
     rejections: Literal["drop", "mask"],
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
-    measured: _Measured | None = None,
+    measured: _TrainingMeasured | None = None,
     epochs: int | None = None,
     version: int = PLAN_VERSIONS[-1],
 ) -> _Staged:
@@ -923,7 +939,8 @@ def _staged(
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
                    version=version)
-    return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes)
+    return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens, passes,
+                   mirrored=measured.mirrored)
 
 
 _UNCOUNTED = 1 << 62
@@ -1101,7 +1118,7 @@ def _compiled(
     build = tuned.pooled(train)
     train_host, device = _batch_steps(train)
     train_host = packed + train_host + host
-    statistics = _Statistics(counts)
+    statistics = _Statistics(counts, staged.mirrored)
     training = functools.partial(
         _training_reader,
         pipeline=train,
@@ -1839,6 +1856,8 @@ def fitted[Entry](
     # training states its batch ahead; a token budget's rows are counted as it compiles.
     trained = (next((stage.size for stage in dataset._chain().stages if isinstance(stage, BatchStage)), None)
                if isinstance(dataset, Dataset) else dataset.batch)
+    # The run's mirror reads count from here, its held splits' measures among them (`_TrainingMeasured`).
+    since = Mirrored.now()
     held_chains = {name: _held_batched(entry._chain(), trained, unbatched=trained is None)
                    for name, entry in (named or {}).items() if isinstance(entry, Dataset)}
     scored = {name: _held_measure(chain, objective) for name, chain in held_chains.items()}
@@ -1852,7 +1871,7 @@ def fitted[Entry](
         measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
                     _training_measure(trained, None, objective=objective, read=read, provision=True,
                                       loading=trained._loading or _DEFAULT_LOADING, examples=examples,
-                                      epochs=epochs if examples is None else None))
+                                      epochs=epochs if examples is None else None, since=since))
         widths = (run_widths([*([measured] if measured else []), *scored.values()], objective)
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,

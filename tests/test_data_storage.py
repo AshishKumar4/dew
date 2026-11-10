@@ -714,6 +714,35 @@ def test_a_run_counts_its_own_mirror_reads_never_an_earlier_readers_of_its_proce
     assert not any(name.startswith("data/mirror/") for name in statistics)
 
 
+def test_a_memory_read_counts_the_mirror_reads_its_compile_made(tmp_path):
+    """A memory read downloads its corpus through the mirror as its compile measures and holds it, before
+    any reader is built: its run counts those reads, its own, and nothing an earlier reader of its process
+    read (rows 5220, 5258)."""
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.storage import Mirrored
+
+    (tmp_path / "observed").mkdir()
+    earlier = Store(f"dewcache::memory://earlier-{uuid4().hex}/object",
+                    {"dewcache": {"cache_storage": str(tmp_path / "earlier"), "max_bytes": 1024}})
+    earlier.put_if_absent(b"read before the run")
+    assert earlier.read() == b"read before the run"
+    since = Mirrored.now()
+    loader = compile(_mirrored_store(tmp_path).repeat(1).batch(1), read="memory",
+                     loading=Loading(workers=0, cache=False))
+    compiled = since.metrics()
+    reader = loader.train(DataPartition())
+    try:
+        assert len(list(reader)) == 40
+        statistics = dict(loader.statistics())
+    finally:
+        reader.close()
+    assert compiled["data/mirror/misses"] > 0
+    assert {name: statistics[name] for name in COUNTED} == {name: since.metrics().get(name, 0.0)
+                                                            for name in COUNTED}
+
+
 def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tmp_path):
     """A read restored from a position saved mid-read counts what its own workers' mirrors do, not what
     the saving read's workers did, which the position carries (row 4339)."""
