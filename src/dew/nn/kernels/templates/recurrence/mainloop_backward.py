@@ -13,7 +13,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
+from dew.nn.kernels import generation, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product, resources
 from dew.nn.kernels.templates.cost import Work
@@ -549,9 +549,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
         refs, returned_refs = refs[:len(refs) - returns], refs[len(refs) - returns:]
         dh_ref, dv_ref, dh0_ref, *gated_ref = refs
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        sequence = chunked_launch.unpacked(Walked, lambda i: seq_ref[s, i])
-        first, count, row = sequence.first, sequence.count, sequence.row
-        begins, ends = sequence.takes, sequence.gives
+        sequence = tables.unpacked(Walked, lambda i: seq_ref[s, i])
+        row = sequence.row
         roled = role_tiles(staging, landing, walkers)
         walked = j * walked_width
 
@@ -604,8 +603,11 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
                         smem=lands["corrected"], wait=False)
             return grad, accumulators
 
-        sequence_walk(call, final, "final", (leaving, final_views), (walked_streams, views), step,
-                      chunks - first - count, count, ends, begins,
+        # The sequence walked from its last chunk: its gradient the final's where it gives one, the initial
+        # memory's where it takes one.
+        backward = sequence._replace(first=chunks - sequence.first - sequence.count, takes=sequence.gives,
+                                     gives=sequence.takes)
+        sequence_walk(call, final, "final", (leaving, final_views), (walked_streams, views), step, backward,
                       lambda role, i: dh0_ref.at[pl.ds(memory(row, i), call.block),
                                                  pl.ds(walked + role * bv, bv)], bv,
                       landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer,

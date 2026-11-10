@@ -30,7 +30,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn import derivatives
-from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra
+from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     ChunkSpan,
@@ -47,7 +47,6 @@ from dew.nn.kernels.chunked_launch import (
     _row,
     _rows,
     _span,
-    column,
     laid,
     read_rows,
     sequences,
@@ -705,7 +704,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
     are a loop, not unrolled, so a program holds one head's accumulators at a time. The memory the
     chunk enters and its gradient where it leaves are read at their slots (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered, left = chunk_ref[column(ChunkSpan, "entered")], chunk_ref[column(ChunkSpan, "left")]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
+    left = chunk_ref[tables.column(ChunkSpan, "left")]
 
     @pl.when(taken > 0)
     def _():
@@ -1027,7 +1027,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, gl_ref, o_ref, *, ch
     hybrid's fp32 scores on an H100 sat 2.03 times their fp32 reference's distance from float64, 1.17
     at IEEE. The memory the chunk enters is read at its slot (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered = chunk_ref[column(ChunkSpan, "entered")]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
 
     @pl.when(taken > 0)
     def _():

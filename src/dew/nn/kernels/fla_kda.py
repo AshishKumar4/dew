@@ -35,7 +35,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn import derivatives
-from dew.nn.kernels import fla_gdn, launches, recurrence, recurrence_algebra as algebra
+from dew.nn.kernels import fla_gdn, launches, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     ChunkSpan,
@@ -51,12 +51,10 @@ from dew.nn.kernels.chunked_launch import (
     _picks,
     _row,
     _rows,
-    column,
     laid,
     read_rows,
     sequences,
     spanned,
-    unpacked,
     write_rows,
 )
 from dew.nn.kernels.fla_gdn import _dot, _weighted_values
@@ -353,7 +351,7 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, lo_ref, o_ref, *, ch
     them (`fla_gdn._o_kernel`), the memory the chunk enters read at its slot (`Sequences`); the queries'
     decay of the separated prefix (`algebra.raised`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered = chunk_ref[column(ChunkSpan, "entered")]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
 
     @pl.when(taken > 0)
     def _():
@@ -511,7 +509,8 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
     and `last`, each token's term through the range from it to the chunk's last (the keys' write into the
     memory leaving), which `bwd_intra` sums token by token with the chunk's pairs (row 551)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered, left = chunk_ref[column(ChunkSpan, "entered")], chunk_ref[column(ChunkSpan, "left")]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
+    left = chunk_ref[tables.column(ChunkSpan, "left")]
 
     @pl.when(taken > 0)
     def _():
@@ -951,7 +950,7 @@ def first_decay_grad(dg, h0, dh0, spans: Sequences):
     `Sequences`), exactly zero for any other. The gated delta rule's port sums each token's own terms
     instead (`fla_gdn._summed_back`), which give it exactly."""
     batch, length = dg.shape[:2]
-    span = unpacked(Span, lambda i: spans.spans[:, i])
+    span = tables.unpacked(Span, lambda i: spans.spans[:, i])
     flat = dg.reshape(batch * length, *dg.shape[2:])
     return algebra.first_decays(flat, h0, dh0, span.first, span.memory, span.takes == 1,
                                 span.count > 0).reshape(dg.shape)

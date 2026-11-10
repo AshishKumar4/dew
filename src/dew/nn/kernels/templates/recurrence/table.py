@@ -223,6 +223,14 @@ def returned_by(table: Table | None, refs: Sequence, returned: Sequence, call: "
                                   call.chunks, landing(role))
 
 
+def stored_split(table: Table | None, launched: Sequence) -> tuple[tuple, jax.Array | None]:
+    """A walk's launch's outputs, and its table's stored slots, the finals its storing documents left
+    (`table_stored`, its last output) where the table holds any, else None."""
+    if table is None or not table.held:
+        return tuple(launched), None
+    return tuple(launched[:-1]), launched[-1]
+
+
 def table_returned(call: "Call", table: Table, batch: int) -> tuple:
     """A reverse walk's table outputs (`Returning`): the gradient of the memory each chunk takes up
     `[chunks * HV * Dk, Dv]` fp32 (a chunk that takes nothing up written by none), and its stored slots'

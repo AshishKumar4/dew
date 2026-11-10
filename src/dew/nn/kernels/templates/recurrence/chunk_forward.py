@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.inputs import cu_seqlens
-from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
+from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import zero_padded
 from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence import own_pairs
@@ -47,7 +47,7 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
     if starts is None and length % chunk == 0:
         chunks = tokens // chunk
         # Each row one sequence, entering its memory and leaving it.
-        sequences = chunked_launch.packed(Walked(np.arange(batch) * (length // chunk),
+        sequences = tables.packed(Walked(np.arange(batch) * (length // chunk),
                                                  np.full(batch, length // chunk), np.arange(batch),
                                                  np.ones(batch), np.ones(batch)), np)
 
@@ -59,12 +59,12 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
         most = length if max_segments is None else max_segments
         spans = chunked_launch.sequences(batch, length, cu_seqlens(starts, batch * (most + 1), firsts),
                                          chunk=chunk)
-    table = chunked_launch.unpacked(chunked_launch.ChunkSpan, lambda i: jnp.asarray(spans.chunks)[:, i])
-    span = chunked_launch.unpacked(chunked_launch.Span, lambda i: jnp.asarray(spans.spans)[:, i])
+    table = tables.unpacked(chunked_launch.ChunkSpan, lambda i: jnp.asarray(spans.chunks)[:, i])
+    span = tables.unpacked(chunked_launch.Span, lambda i: jnp.asarray(spans.spans)[:, i])
     chunks, taken = table.taken.shape[0], table.taken
     sizes = -(-span.count // chunk)
     live = span.count > 0
-    sequences = chunked_launch.packed(Walked(jnp.cumsum(sizes) - sizes, sizes, span.memory,
+    sequences = tables.packed(Walked(jnp.cumsum(sizes) - sizes, sizes, span.memory,
                                              live & (span.takes == 1), live & (span.gives == 1)))
     place = jnp.arange(chunk)
     real = (place[None, :] < taken[:, None]).reshape(-1)

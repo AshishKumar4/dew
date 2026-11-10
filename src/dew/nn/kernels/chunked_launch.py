@@ -12,8 +12,8 @@ read them alike.
 """
 
 import dataclasses
-from collections.abc import Callable, Mapping
-from typing import Any, ClassVar, NamedTuple
+from collections.abc import Mapping
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 
 from dew.batch import document_firsts
 from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.tables import Column, column, packed, unpacked
 from dew.nn.scatter import gather_positions
 
 
@@ -129,42 +130,24 @@ class Span(NamedTuple):
     memory it takes and gives back (`h0`'s and the final's index), and whether it takes it and gives it
     back (1 or 0)."""
 
-    first: Any
-    count: Any
-    base: Any
-    entered: Any
-    left: Any
-    memory: Any
-    takes: Any
-    gives: Any
+    first: Column
+    count: Column
+    base: Column
+    entered: Column
+    left: Column
+    memory: Column
+    takes: Column
+    gives: Column
 
 
 class ChunkSpan(NamedTuple):
     """A chunk's row of `Sequences.chunks`, its one declaration: its first token and count (`taken`), and
     the slots of the stored memories it enters and leaves."""
 
-    start: Any
-    taken: Any
-    entered: Any
-    left: Any
-
-
-def packed(record: NamedTuple, xp=jnp):
-    """`record`'s fields, each `[N]`, as an int32 table `[N, F]` in its declaration's order (`Span`,
-    `ChunkSpan`, ...): the one statement a table's writer (`packed`) and its readers (`unpacked`,
-    `column`) derive its layout from."""
-    return xp.stack(record, axis=1).astype(np.int32)
-
-
-def unpacked(declared: type, at: Callable[[int], Any]):
-    """A table's row as its declaration `declared` (a `NamedTuple` of its columns, `packed`), each field
-    read by `at(column)`: a ref's row's scalar loads in a kernel, or an array's columns."""
-    return declared(*(at(i) for i in range(len(declared._fields))))
-
-
-def column(declared: type, name: str) -> int:
-    """Field `name`'s column in a table `declared` lays out (`packed`)."""
-    return declared._fields.index(name)
+    start: Column
+    taken: Column
+    entered: Column
+    left: Column
 
 
 class Sequences(NamedTuple):

@@ -49,7 +49,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Sequence
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -57,13 +57,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
+from dew.nn.kernels import generation, recurrence_algebra as algebra, tables, tuning
 from dew.nn.kernels.templates import bundles, mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work, estimate
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.table import (
     Table,
     program_refs,
+    stored_split,
     table_landing,
     table_stored,
     taken_by,
@@ -1439,17 +1440,17 @@ class Walked(NamedTuple):
     takes that memory and gives it back (1 or 0; `chunked_launch.Span`'s `takes` and `gives`, its row's
     where it begins and ends its row)."""
 
-    first: Any
-    count: Any
-    row: Any
-    takes: Any
-    gives: Any
+    first: tables.Column
+    count: tables.Column
+    row: tables.Column
+    takes: tables.Column
+    gives: tables.Column
 
 
 def sequence_live(table: int) -> Callable:
     """A walk's program's liveness (`launch_kernel`'s `live`): its sequence's chunks past zero
     (`Walked.count`), its walks' table its launch's `table`-th operand."""
-    count = chunked_launch.column(Walked, "count")
+    count = tables.column(Walked, "count")
     return lambda at, refs: refs[table][at["sequences"], count] > 0
 
 
@@ -1791,15 +1792,15 @@ def table_held(held: Held, call: Call, table: Table | None, bv: int) -> Held:
     return dataclasses.replace(held, phases=(*held.phases, [f32(call.block, bv)] * 2))
 
 
-def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step, start,
-                  count, kept, written, out, bv: int, *, landing, prefetch: Callable | None = None,
+def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step,
+                  sequence: Walked, out, bv: int, *, landing, prefetch: Callable | None = None,
                   walkers: int = 1, producer: int | None = None, table: Callable | None = None) -> None:
     """A sequence's memory over `walkers` value blocks `bv` wide, one a consumer role beside one producer
     (`Tiles.walkers`): the memory each role takes, its columns of each key slice's tile `{name}{i}` of
-    `memory` (`entering`, the opened streams and their views), zero where `kept` is 0; the role's
-    `step(role)` over its chunks `[start, start + count)` of `walked` (the same, its value streams the roles'
-    columns side by side); and the memory it gives written to each slice's view `out(role, i)` where
-    `written` is nonzero, through `landing(role)` (a slice's shared tile, `_landed`, or where None one scoped
+    `memory` (`entering`, the opened streams and their views), zero where the `sequence` (`Walked`) takes
+    none; the role's `step(role)` over its chunks of `walked` (the same, its value streams the roles'
+    columns side by side); and the memory it gives written to each slice's view `out(role, i)` where it
+    gives one, through `landing(role)` (a slice's shared tile, `_landed`, or where None one scoped
     after the walk, `final_memory_landing`) (`_states`', and `_reverse`'s from its last chunk). Where
     `prefetch(n)` is given, it loads chunk `n`'s own values from global memory (its prefix), a step ahead:
     each step issues the next chunk's loads before its own work and takes the ones the step before issued
@@ -1810,6 +1811,7 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
     keeps it, and at the walk's start the table opened where it opens."""
     family, slices = call.family, call.width // call.block
     (entered, entered_views), (chunks, views) = entering, walked
+    start, count, kept, written = sequence.first, sequence.count, sequence.takes, sequence.gives
 
     def consumer(wg):
         # Each role's columns and tiles at static offsets (`mosaic.per_role`).
@@ -2061,9 +2063,8 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
         table_refs, (h_ref, *outputs), stored_ref = program_refs(table, refs)
         corrected_ref, final_ref = outputs if stores_corrected else (None, *outputs)
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        sequence = chunked_launch.unpacked(Walked, lambda i: seq_ref[s, i])
-        first, count, row = sequence.first, sequence.count, sequence.row
-        begins, ends = sequence.takes, sequence.gives
+        sequence = tables.unpacked(Walked, lambda i: seq_ref[s, i])
+        row = sequence.row
         roled = role_tiles(staging, landing, walkers)
 
         def memory(base, i):
@@ -2123,8 +2124,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                 gated, decay, held.dtype, issue, last=separate)
             return state, accumulators
 
-        sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, first,
-                      count, begins, ends,
+        sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, sequence,
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
                       prefetch=None if call.per_key else prefetch,
@@ -2132,13 +2132,10 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                       table=taken_by(table, table_refs, stored_ref, call, h, lambda role: walked + role * bv,
                                      bv, row, lambda role: roled(role)[1].get("table")))
 
-    launched = _states_launched(program, call, tiles, delta, keys, values, batch, sequences.shape[0],
-                                stores_corrected, table, producer)(
-        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
-        *(() if table is None else table.operands))
-    # A forked call's stored slots, the finals its storing documents left, fp32 (`table.Taking`).
-    stored = launched[-1] if table is not None and table.held else None
-    launched = launched[:len(launched) - (stored is not None)]
+    launched, stored = stored_split(table, _states_launched(
+        program, call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected, table,
+        producer)(k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
+                  *(() if table is None else table.operands)))
     if stores_corrected:
         return (*launched, stored)
     assert jnp.dtype(u.dtype) == held.dtype, "the values as given are held so (`Call.gated_keys`)"
@@ -2255,9 +2252,8 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
         skip_ref = refs[:skipped]
         table_refs, (o_ref, final_ref), stored_ref = program_refs(table, refs[skipped:])
         j, s, h = at["blocks"], at["sequences"], at["heads"]
-        sequence = chunked_launch.unpacked(Walked, lambda i: seq_ref[s, i])
-        first, count, row = sequence.first, sequence.count, sequence.row
-        begins, ends = sequence.takes, sequence.gives
+        sequence = tables.unpacked(Walked, lambda i: seq_ref[s, i])
+        row = sequence.row
         roled = role_tiles(staging, landing, walkers)
 
         def memory(base, i):
@@ -2322,8 +2318,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                                     held.dtype, issue, last=separate)
             return state, accumulators
 
-        sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, first,
-                      count, begins, ends,
+        sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, sequence,
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
                       prefetch=prefetch, landing=lambda role: roled(role)[1].get("final"), walkers=walkers,

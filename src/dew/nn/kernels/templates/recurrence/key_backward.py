@@ -15,7 +15,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import chunked_launch, recurrence_algebra as algebra
+from dew.nn.kernels import recurrence_algebra as algebra, tables
 from dew.nn.kernels.templates import mosaic, product, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
@@ -511,7 +511,7 @@ def _first_decays(dg, run, dh0, taken=None):
     (`_taken_memories`, as the walk took it, not its 16-bit copy the states launch stored) and its gradient
     (`taken`, the reverse walk's)."""
     call = run.call
-    walked = chunked_launch.unpacked(Walked, lambda i: run.sequences[:, i])
+    walked = tables.unpacked(Walked, lambda i: run.sequences[:, i])
     dg = algebra.first_decays(dg, run.h0, dh0, walked.first * call.chunk, walked.row, walked.takes == 1,
                               walked.count > 0)
     if taken is None:

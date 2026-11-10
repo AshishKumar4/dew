@@ -62,7 +62,7 @@ from interval_certificates import (
 from native_certificates import TRUNCATING, truncating_underflow
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 
-from dew.nn.kernels import recurrence_algebra
+from dew.nn.kernels import recurrence_algebra, tables
 from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, template
 
@@ -601,7 +601,7 @@ def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np
         documents = length if max_segments is None else max_segments
         table = chunked_launch.sequences(1, length, np.asarray(cu_seqlens(starts, documents + 1)),
                                          chunk=chunk).chunks
-    chunks = chunked_launch.unpacked(chunked_launch.ChunkSpan, lambda i: np.asarray(table)[:, i])
+    chunks = tables.unpacked(chunked_launch.ChunkSpan, lambda i: np.asarray(table)[:, i])
     kept = chunks.taken > 0
     return np.stack([chunks.start[kept], chunks.taken[kept]], axis=1)
 
