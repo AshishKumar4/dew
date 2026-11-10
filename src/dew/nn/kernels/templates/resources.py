@@ -93,14 +93,15 @@ def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
     of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
     32-bit words spread over a role's threads, and what it holds beside them: its scalars and its
     addresses into the shared tiles it reads and writes itself (`addressed`, each `(shape, dtype)`:
-    `Family.scalar_registers`).
+    `Family.scalar_registers`) and the issuer's product state (`Family.product_control`).
     The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
     a legal config holds within a thread's budget (`base.Template.legal`)."""
     def words(tiles) -> float:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
     phase = max((words(tiles) for tiles in phases), default=0.0)
-    return family.scalar_registers(addressed) + int(-(-(words(carried) + phase) // THREADS))
+    return (family.scalar_registers(addressed) + family.product_control
+            + int(-(-(words(carried) + phase) // THREADS)))
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,

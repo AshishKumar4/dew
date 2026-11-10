@@ -111,7 +111,11 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     # A write gate on the keys' side scales the scores' columns (`chunk_scores`' `column_scale`): its vector
     # across a thread's columns, 16 fragments on a 64-wide tile (the lowered liveness of Nemotron-H 4B's SSD
     # output, ssd-evidence5 at 97a10a66b; row 2943).
-    scores = ([f32(chunk, chunk)] * 3 + masks(chunk, chunk)
+    # Accurate three-part products use `Issuer.apart`: a register family can overlap every term's fresh
+    # sum. Pricing one accepted an unrounded fp32 write gate whose output ptxas serialized (C7512).
+    sums = (len(product.terms(given.parts, given.parts))
+            if family.products_overlap and given.parts > 2 else 1)
+    scores = ([f32(chunk, chunk)] * (2 + sums) + masks(chunk, chunk)
               + (held_tile(held, chunk, chunk) if held.parts > 1 else [])
               + ([f32(chunk, chunk // 2)] if call.gated_keys else []))
     # The keys staged as they arrive, a token a row: `Kᵀ`'s depth its stage's columns, a whole swizzle of it

@@ -1511,8 +1511,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         phases += _converted(block_k, value_width if width is None else width, value_width)
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
-    walked = max(resources.live_registers(family, carried, *phases, *products), scored) + rows + (
-        family.product_control)
+    # The issuer's product state is the live set's (`resources.live_registers`), counted once.
+    walked = max(resources.live_registers(family, carried, *phases, *products), scored) + rows
     return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
 
 

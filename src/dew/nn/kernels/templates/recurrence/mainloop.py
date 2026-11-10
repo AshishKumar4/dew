@@ -2192,15 +2192,19 @@ def stated_producer(call: Call, registers: int) -> int | None:
 
 def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     """What `_scan`'s consumer thread holds: `_states`' memory and prefix vectors carried (`_states_held`),
-    beside the chunk's prefix as a column's vectors and its write gates; its step's phase; and the output's
-    phase beside the memory: the corrected values and the output's fp32 sum, the chunk's own pairs' scores,
-    their decays' two terms and their masks (an fp32 call's split into parts), and one product's fragments
-    at a time, the scores', the memory's and the local one's issuing in turn."""
+    beside its additional write-gate row vector; its step's phase; the scores' two decay terms, masks and
+    column vectors; and their saturated bf16 parts, after the decays and masks are dead. The values and
+    output remain beside those phases: their loads can precede the scores' products. A family whose
+    products overlap also holds the local product's parts' sums together."""
     chunk = call.chunk
     held, given = call.held, call.given
     states = _states_held(call, values, keys, bv)
-    scores = ([f32(chunk, chunk)] * 3 + masks(chunk, chunk)
-              + (held_tile(held, chunk, chunk) if held.parts > 1 else []))
+    # A WGMMA column vector repeats over 32 rows, a row vector over four columns. The write gate on the
+    # keys' side adds a third column vector to the two prefix halves.
+    columns = [f32(32, chunk)] * (2 + int(call.gated_keys))
+    scores = [f32(chunk, chunk)] * 2 + masks(chunk, chunk) + columns
+    narrowed = ([f32(chunk, chunk)] * 2 + held_tile(held, chunk, chunk) + columns
+                if held.parts > 1 else [])
     products = widest(
         product_fragments(call, (given, chunk, call.block), (given, call.block, chunk), rhs_transposed=True),
         product_fragments(call, (given, chunk, call.block), (call.memories, call.block, bv)),
@@ -2208,8 +2212,14 @@ def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     # The delta rule's values corrected in the walk: the predicted values and their gated difference beside
     # the inverse's product.
     applied = [f32(chunk, bv)] * 2 + products if call.delta else []
-    return Held(carried=[*states.carried, f32(chunk, 1)],
-                phases=(*states.phases, applied, [f32(chunk, bv)] * 2 + scores + products))
+    # `Issuer.apart`'s local products each take a fresh sum. Where they overlap in registers, those sums
+    # sit beside the output, corrected values and their split's remainder and narrowed parts.
+    local = ([f32(chunk, bv)] * (3 + len(product.terms(held.parts, held.parts)))
+             + held_tile(held, chunk, bv) + columns
+             if held.parts > 1 and call.family.products_overlap else [])
+    return Held(carried=[*states.carried, f32(chunk, 4)],
+                phases=(*states.phases, applied, [f32(chunk, bv)] * 2 + scores + products,
+                        [f32(chunk, bv)] * 2 + narrowed + products, local + products))
 
 
 @lowered_once
