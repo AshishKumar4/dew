@@ -750,8 +750,9 @@ def read_otherwise_at_11(saved: Mapping[str, object]) -> str | None:
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
     position's one translation, where a reader's `set_state` decodes it. A plan of version 7 reads as 8, one
-    of 8 as 9 and one of 9 as 10, where the later reads its order alike (`read_otherwise_at_8`,
-    `read_otherwise_at_9`, `read_otherwise_at_10`, `read_otherwise_at_11`). A
+    of 8 as 9, one of 9 as 10 and one of 10 as 11, where the later reads its order alike
+    (`read_otherwise_at_8`, `read_otherwise_at_9`, `read_otherwise_at_10`, `read_otherwise_at_11`), and one
+    of 11 as 12, which reads every plan as 11 does (`SHARED_STATE`). A
     token store a Dew before row 3028
     named without saying how its documents are read is named as today's names it where that Dew read the
     same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
@@ -767,6 +768,10 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     if (saved.get("version") == FILE_SHARDS and plan.version >= IN_ORDER
             and read_otherwise_at_11(saved) is None):
         saved = {**saved, "version": IN_ORDER}
+    # 12 reads every plan as 11 does: what it changed is the steps a decision objective hands a plan
+    # (`SHARED_STATE`), and a plan of other steps is another plan, refused by its steps (`Plan.check`).
+    if saved.get("version") == IN_ORDER and plan.version >= SHARED_STATE:
+        saved = {**saved, "version": SHARED_STATE}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved
@@ -952,7 +957,10 @@ and batched its own, so its batches and its position were its count's (row 4862)
 SHARED_STATE = 12
 """The plan version from which a decision run's requests ask their questions over one copy of their state,
 where its backbone and head read each question as its own row does (`dew.decision.shared_state.shared_for`):
-11's runs asked a row a question, and resume so (row 14d24faa6's forks)."""
+11's runs asked a row a question, and resume so (row 14d24faa6's forks). It changes the steps such a run's
+objective hands its plan and no reading of a plan: a position 11 saved of any other chain goes on under 12
+(`earlier_plan`), and one of a decision chain whose steps 12 lays out otherwise is another plan's
+(`Plan.check`), which a run config's resume reads by 11."""
 
 PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
