@@ -334,31 +334,58 @@ def masked_attention(mask):
     return attend
 
 
+def jax_nn_written(*, mask=None, bias=None, scale=1, causal=False, window=None):
+    """`jax.nn.dot_product_attention` under those arguments, written out at its operands' width: its logits
+    scaled (`scale` times the default), biased, then filled with jax.nn's large negative (`JAX_FILL`) wherever the mask of the inputs,
+    causality or a local window of `window` keys back drops a key. jax.nn's own runs its softmax in
+    float32 whatever its operands' (`_dot_product_attention_core`), so on float64 operands it is a second
+    fp32 run and no truth of itself; this is the function it computes."""
+    def attend(q, k, v):
+        logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=_wide(q))
+        logits = logits * q.shape[-1] ** -0.5 * scale
+        if bias is not None:
+            logits = logits + bias(q, k)
+        kept = jnp.ones(logits.shape, bool) if mask is None else mask(q, k)
+        rows, keys = jnp.arange(q.shape[1])[:, None], jnp.arange(k.shape[1])[None, :]
+        if causal:
+            kept &= keys <= rows
+        if window is not None:
+            kept &= rows <= keys + window
+        weights = jax.nn.softmax(jnp.where(kept, logits, JAX_FILL), axis=-1).astype(v.dtype)
+        return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
+    return attend
+
+
 FORMS = {
     "a mask of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, mask=input_mask(q, k), implementation="xla"),
-        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}),
+        lambda q, k, v: {"mask": input_mask(q, k), "mask_fill": JAX_FILL}, jax_nn_written(mask=input_mask)),
     "a mask of its inputs filled with -inf": (
-        masked_attention(keyed_mask), lambda q, k, v: {"mask": keyed_mask(q, k), "mask_fill": -jnp.inf}),
+        masked_attention(keyed_mask), lambda q, k, v: {"mask": keyed_mask(q, k), "mask_fill": -jnp.inf},
+        masked_attention(keyed_mask)),
     "a bias of its inputs": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, bias=input_bias(q, k), implementation="xla"),
-        lambda q, k, v: {"bias": input_bias(q, k)}),
+        lambda q, k, v: {"bias": input_bias(q, k)}, jax_nn_written(bias=input_bias)),
     "twice the default scale": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, scale=2 * q.shape[-1] ** -0.5,
                                                      implementation="xla"),
-        None),
+        None, jax_nn_written(scale=2)),
     "a causal window": (
         lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=True, local_window_size=(15, 0),
                                                      implementation="xla"),
-        lambda q, k, v: {"causal": True, "sliding_window": 16, "mask_fill": JAX_FILL}),
+        lambda q, k, v: {"causal": True, "sliding_window": 16, "mask_fill": JAX_FILL},
+        jax_nn_written(causal=True, window=15)),
     "a softcap": (softcapped_attention,
-                  lambda q, k, v: {"causal": True, "softcap": 50.0, "mask_fill": -jnp.inf}),
+                  lambda q, k, v: {"causal": True, "softcap": 50.0, "mask_fill": -jnp.inf},
+                  softcapped_attention),
 }
-"""Each plain program's attention under a form beside the default scale and a causal mask, and the arguments
-Dew's own attention takes for it, its fill the program's; None where no call of Dew's computes it (a scale
-other than the default: another constant), which the compile point keeps as written. The masks leave rows
-partly masked (a window, causality, -inf's mask) and wholly masked (jax.nn's mask, uniform rows under its
-finite fill); a row -inf masks wholly is NaN, as written, which check 1 does not compare."""
+"""Each plain program's attention under a form beside the default scale and a causal mask, the arguments
+Dew's own attention takes for it, its fill the program's (None where no call of Dew's computes it: a scale
+other than the default is another constant, which the compile point keeps as written), and the program
+whose run on float64 operands is its truth: itself where it is written at its operands' width, jax.nn's
+written out (`jax_nn_written`) where it is jax.nn's. The masks leave rows partly masked (a window,
+causality, -inf's mask) and wholly masked (jax.nn's mask, uniform rows under its finite fill); a row -inf
+masks wholly is NaN, as written, which check 1 does not compare."""
 
 
 @pytest.mark.parametrize("form", list(FORMS))
@@ -375,7 +402,7 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
     from dew.algebra.recognize import KEPT
     from dew.nn.attention import scaled_dot_product_attention
 
-    attend, arguments = FORMS[form]
+    attend, arguments, exact = FORMS[form]
     shapes = (jax.ShapeDtypeStruct((2, 128, 4, 64), jnp.bfloat16),) * 3
 
     def own(q, k, v):
@@ -389,7 +416,7 @@ def test_a_plain_programs_attention_under_each_form_runs_the_kernel_dews_own_cal
     draw = normal_drawn(41, *((2, 64, 4, 32),) * 4, dtype=jnp.bfloat16)
     with generation.chosen(attention="template"):
         attention_on_par(dew.jit(attend), attend, draw, f"dew.jit {form}",
-                         truth=lambda *x: attend(*(a.astype(jnp.float64) for a in x)))
+                         truth=lambda *x: exact(*(a.astype(jnp.float64) for a in x)))
 
 def written_out(*, fill=-jnp.inf, logits_cast=None, initial=-jnp.inf, other_rows=False, sum_cast=None,
                 root=None):
