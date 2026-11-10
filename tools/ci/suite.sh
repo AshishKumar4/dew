@@ -35,7 +35,8 @@ rm -f "$out/gangs.outcome"
 priority=${PRIORITY:+--priority=$PRIORITY}
 # The CPUs .armada.json pins its tasks to (task.cpu), which every map here runs on too: a CPU's arithmetic is its own
 # (2026-11-10: maps that named none landed on AMD 25/1 x86-64-v3 hosts, where sums rounded apart from the pinned).
-pinned="--cpu=$(jq -r '[.task.cpu] | flatten | map("\(.vendor)/\(.family)/\(.model)") | join(",")' .armada.json)"
+# A checkout that pins none names none.
+pinned=$(jq -r '[.task.cpu // empty] | flatten | map("\(.vendor)/\(.family)/\(.model)") | join(",") | select(. != "") | "--cpu=" + .' .armada.json)
 echo "the test cache's policy: ${DEW_TEST_CACHE:-}"
 # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell reaches it and it cancels
 # its armada job; the shell waits on them, where a trap runs.
@@ -53,7 +54,7 @@ if [ -z "${PROVEN:-}" ] && [ -z "${GANGLESS:-}" ]; then
   items=$(python3 tools/armada/ci.py gangs)
   echo "$items" | setsid $armada map --commit="$sha" --items=- --size=medium \
     --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
-    --deadline=$side --gang-start-timeout=300 $priority "$pinned" --label="${LABEL:-$sha}" \
+    --deadline=$side --gang-start-timeout=300 $priority ${pinned:+"$pinned"} --label="${LABEL:-$sha}" \
     -- python3 tools/armada/ci.py pytest \
     --python="$(tr -d '\n' < .python-version)" --report=/tmp/dew-gang.xml \
     -- -s -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py > "$out/gangs.log" 2>&1 &
@@ -91,7 +92,7 @@ if [ -n "${DEW_WHOLE_SUITE:-}" ]; then
   elif [ "$checks" != "[]" ]; then
     echo "$checks" | $armada map --commit="$sha" --items=- --size=medium \
       --pool="$(echo "$checks" | jq length)" --deadline=$side $priority --label="${LABEL:-$sha}" \
-      "$pinned" \
+      ${pinned:+"$pinned"} \
       -- python3 tools/armada/ci.py release --python={python} --tests={tests} --requirement={release} \
       --out=/tmp/dew-release.json > "$out/release.log" 2>&1 || failed=1
     cat "$out/release.log"
