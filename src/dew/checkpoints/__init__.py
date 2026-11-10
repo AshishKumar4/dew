@@ -723,18 +723,28 @@ def _filled(template, restored: dict, step: int):
                             **{name: None for name in OPTIONAL if name not in restored})
 
 
+@dataclasses.dataclass(frozen=True)
+class _ArrayFacts:
+    """An array of a step's item metadata as a holder hands it to a process that lost its copy: its shape
+    and dtype, "key" for a key's, whose own dtype names its implementation, which no check of a restore
+    reads. Written and read by its fields (`dew.registry.to_record`, `from_record`)."""
+
+    shape: tuple[int, ...]
+    dtype: str
+
+
 def _tree_record(tree) -> JSON:
-    """A step's item metadata as JSON: its nesting, and each array's shape and dtype, which a process
-    that lost its local copy reads its restore's checks from (`_StepFacts`)."""
+    """A step's item metadata as JSON: its nesting ({"tree": {...}} a mapping's, {"list": [...]} a
+    sequence's), each array its facts (`_ArrayFacts`), which a process that lost its local copy reads its
+    restore's checks from (`_StepFacts`, `_from_tree_record`)."""
     if isinstance(tree, Mapping):
         return {"tree": {str(key): _tree_record(value) for key, value in tree.items()}}
     if isinstance(tree, (list, tuple)):
         return {"list": [_tree_record(value) for value in tree]}
     if tree is None:
         return None
-    # A key's own dtype names its implementation, which no check of a restore reads.
     key = jnp.issubdtype(tree.dtype, jax.dtypes.prng_key)
-    return {"shape": list(tree.shape), "dtype": "key" if key else str(np.dtype(tree.dtype))}
+    return to_record(_ArrayFacts(tuple(tree.shape), "key" if key else str(np.dtype(tree.dtype))), _ArrayFacts)
 
 
 def _from_tree_record(recorded: JSON):
@@ -749,9 +759,9 @@ def _from_tree_record(recorded: JSON):
         listed = entry["list"]
         assert isinstance(listed, list), "a list record holds a list"
         return [_from_tree_record(value) for value in listed]
-    dtype = _records.text(entry["dtype"], "dtype")
-    return jax.ShapeDtypeStruct(tuple(_records.integers(entry["shape"], "shape")),
-                                jax.random.key(0).dtype if dtype == "key" else np.dtype(dtype))
+    facts = from_record(_ArrayFacts, entry)
+    return jax.ShapeDtypeStruct(facts.shape,
+                                jax.random.key(0).dtype if facts.dtype == "key" else np.dtype(facts.dtype))
 
 
 def _table_record(table: Mapping[str, np.ndarray]) -> JSON:
