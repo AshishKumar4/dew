@@ -66,15 +66,16 @@ def test_a_templates_refusal_reaches_the_forced_call_without_reconstruction():
 
 
 def test_a_tensor_memory_launch_refuses_an_automatic_mesh_axis():
-    from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
+    from dew.nn.kernels.templates import mosaic
+    from dew.nn.kernels.templates.mosaic_sm100 import RINGS
 
     mesh = jax.sharding.AbstractMesh((2,), ("data",), axis_types=(jax.sharding.AxisType.Auto,))
 
     def copy(source, output):
         output[...] = source[...]
 
-    launch = TCGEN05.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
-                            grid_names=("programs",), scratch=(), interpret=True)
+    launch = mosaic.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
+                           grid_names=("programs",), warpgroups=2, family=RINGS.name, interpret=True)
     # A launch is built once for every call of its facts; each call checks the mesh it runs in.
     with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError):
         launch(jnp.zeros((128,), jnp.float32))

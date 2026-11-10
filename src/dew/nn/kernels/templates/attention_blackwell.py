@@ -4,7 +4,7 @@ mainloop on tcgen05 beside it): tcgen05's products with their accumulators in te
 FlashAttention-4 and Tokamax's sm100 kernel hold them, and the template's algebra (`attention_algebra`)
 between the products.
 
-A program is a head's query block of `TCGEN05.rows` rows, in three warpgroups (`schedule`). The
+A program is a head's query block of `RINGS.rows` rows, in three warpgroups (`schedule`). The
 issuing one's load warp fills a ring of key stages and one of value stages (the bundle's streams,
 `mosaic_sm100.RINGS`: their slots released by the products' commit), and its
 product warp issues each step's `S = Q Kᵀ` into tensor memory and, a step behind, `P V` into the output's
@@ -46,7 +46,7 @@ from dew.nn.kernels.templates import (
     swizzling,
 )
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
-from dew.nn.kernels.templates.mosaic_sm100 import ISSUING, RINGS, STORED, TCGEN05, TMEM, Accumulator
+from dew.nn.kernels.templates.mosaic_sm100 import ISSUING, RINGS, STORED, TMEM, Accumulator
 
 CHUNK = 32
 """The output accumulator's columns the correction rescales at a time."""
@@ -136,7 +136,7 @@ def _walked(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     # the call's scale is finite in the product.
     query, scale, power = prescaled(query, scale)
     # Queries and keys padded to whole tiles of both: a program's query block and a walk's key tile.
-    call = padded_call(query, key, value, spans, Hooks(), math.lcm(TCGEN05.rows, tiles.block_k))
+    call = padded_call(query, key, value, spans, Hooks(), math.lcm(RINGS.rows, tiles.block_k))
     spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=scale, natural=natural, prescale=power)
     # Swizzled tiles hold whole 64-element rows of 16-bit operands.
     call = dataclasses.replace(call, **{name: jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % 64),))
@@ -200,13 +200,13 @@ class _Block(NamedTuple):
 
     @property
     def first(self):
-        return lax.axis_index("q_blocks") * TCGEN05.rows
+        return lax.axis_index("q_blocks") * RINGS.rows
 
     @property
     def steps(self):
         if not self.causal:
             return self.blocks
-        return jnp.minimum(pl.cdiv(self.first + TCGEN05.rows, self.block_k), self.blocks)
+        return jnp.minimum(pl.cdiv(self.first + RINGS.rows, self.block_k), self.blocks)
 
 
 def _load(block: _Block, scratch: _Scratch, k_ref, v_ref, *, group: int, tiles: Tiles) -> None:
@@ -231,7 +231,7 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
     then each step's `S = Q Kᵀ` into tensor memory once the softmax has read the last one, and a step behind,
     `P V` into the output's accumulator once its weights are there and the correction has taken the
     accumulator to their maximum."""
-    queries = q_ref.at[block.row, pl.ds(block.first, TCGEN05.rows), block.head]
+    queries = q_ref.at[block.row, pl.ds(block.first, RINGS.rows), block.head]
     RINGS.loaded(((queries, scratch.q_smem, scratch.q_loaded.at[0]),))
 
     def values(index):
@@ -240,9 +240,13 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
         scratch.p_full.wait(scratch.p_full.turn(index))
         pl.when(index > 0)(lambda: scratch.corrected.wait(scratch.corrected.turn(index - 1)))
         consumed = _released(scratch.values, turn)
+        acc = Accumulator(scratch.acc_tmem, scratch.acc_tmem.shape, accumulate=index > 0)
+
+        def product(p_tmem):
+            RINGS.products(acc, p_tmem, v_smem, released=consumed)
+
         for slot, p_tmem in enumerate(scratch.p_tmems):
-            pl.when(lax.rem(index, 2) == slot)(functools.partial(
-                TCGEN05.product, scratch.acc_tmem, p_tmem, v_smem, consumed, accumulate=index > 0))
+            pl.when(lax.rem(index, 2) == slot)(functools.partial(product, p_tmem))
         scratch.o_done.committed(scratch.o_done.turn(index))
 
     @pl.loop(0, block.blocks)
@@ -253,7 +257,8 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
             k_smem = scratch.keys.acquire(turn)
             scores = scratch.scores.turn(index)
             s_tmem = scratch.scores.acquire(scores)
-            TCGEN05.product(s_tmem, scratch.q_smem, k_smem.T, _released(scratch.keys, turn), accumulate=False)
+            RINGS.products(Accumulator(s_tmem, s_tmem.shape), scratch.q_smem, k_smem.T, accumulate=False,
+                           released=_released(scratch.keys, turn))
             scratch.scores.issued(scores)
             pl.when(index > 0)(functools.partial(values, index - 1))
 
@@ -273,7 +278,7 @@ def _softmax(block: _Block, scratch: _Scratch, *, spec: algebra.Forward, tiles: 
     to the step's maximum handed to the correction (`_correction`), and the narrowed weights into tensor
     memory once the last `P V` has read its own; then its rows' maxima and denominators to the correction's
     epilogue."""
-    rows, block_k = TCGEN05.rows, tiles.block_k
+    rows, block_k = RINGS.rows, tiles.block_k
     # A step's tile `PART` columns at a time, its places' layout stated: a full call reads neither, and an
     # iota nothing reads takes no inferred layout (2977).
     q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, PART), 0, layout=TMEM)
@@ -356,7 +361,7 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
     next `P V`; then the epilogue: the output, and each row's maximum (`algebra.walked_launches`' fold
     guard)."""
     out_ref, maxima_ref = outs
-    rows = TCGEN05.rows
+    rows = RINGS.rows
     value_width = int(scratch.acc_tmem.shape[1])
     output = Accumulator(scratch.acc_tmem, (rows, value_width))
 
@@ -376,7 +381,7 @@ def _correction(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward
     scratch.o_done.wait(scratch.o_done.turn(block.steps - 1))
     scratch.finished.wait(scratch.finished.turn(0))
     acc = RINGS.read(output)
-    TCGEN05.loaded()
+    plgpu.wait_load_tmem()
     m, total = (plgpu.load(scratch.rows_smem.at[place], layout=STORED.reduce(1)) for place in (0, 1))
     out = algebra.finish(spec, algebra.Partial(acc, m, total), initial=False)[0]
     mosaic.stored((out,), (out_ref.at[block.row, pl.ds(block.first, rows), block.head],), smem=scratch.o_smem,
@@ -394,7 +399,7 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     batch, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
     group = heads // kv_heads
-    rows, block_k, dtype = TCGEN05.rows, tiles.block_k, query.dtype
+    rows, block_k, dtype = RINGS.rows, tiles.block_k, query.dtype
     # The key tiles holding the call's keys, none of padding alone but a call of no keys' one (its zero
     # values weigh to a zero output, as `padded_call` pads it for).
     blocks = max(1, -(-spec.keys // block_k))
@@ -437,10 +442,10 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
                swizzling.plain((2, rows), jnp.float32), finished,
                mosaic_sm100.operand((rows, value_width), dtype, value_width), mosaic_sm100.vector(rows))
     rows_type = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
-    out, maxima = TCGEN05.kernel(
+    out, maxima = mosaic.kernel(
         kernel, out_type=(jax.ShapeDtypeStruct((batch, queries, heads, value_width), dtype), rows_type),
         grid=(heads, queries // rows, batch), grid_names=("heads", "q_blocks", "batch"), scratch=scratch,
-        interpret=bodies.interpreted(interpret), warpgroups=roles.warpgroups(),
+        interpret=bodies.interpreted(interpret), warpgroups=roles.warpgroups(), family=RINGS.name,
         # A name a form (the default's fold and its natural rewalk compile apart).
         name="attention_forward_tcgen05" + ("_natural" if spec.natural else ""),
     )(query, key, value)
